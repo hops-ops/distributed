@@ -19,15 +19,9 @@ pub(crate) enum CommandCommitProofError {
     },
     OutputTypeMismatch,
     DurableEventMissing,
-    CausalHasNoConfirmations,
-    UnreachableConfirmation {
-        projector: String,
-        expected_facts: Vec<String>,
-        staged_facts: Vec<String>,
-    },
+    EventualHasNoProjectionSelectors,
     UnexpectedProjectionProof,
     MissingProjectionProof,
-    ProjectedHasConfirmations,
     ProjectionOutputTypeMismatch,
     ProjectionWriteMissing {
         model: String,
@@ -56,25 +50,14 @@ impl std::fmt::Display for CommandCommitProofError {
             Self::DurableEventMissing => formatter.write_str(
                 "causal and projected commands require a staged aggregate event or domain event",
             ),
-            Self::CausalHasNoConfirmations => formatter.write_str(
-                "a causal command requires at least one finite projector confirmation",
-            ),
-            Self::UnreachableConfirmation {
-                projector,
-                expected_facts,
-                staged_facts,
-            } => write!(
-                formatter,
-                "projector `{projector}` cannot be reached: expected one of {expected_facts:?}, staged outbox facts were {staged_facts:?}"
+            Self::EventualHasNoProjectionSelectors => formatter.write_str(
+                "an eventual command must declare at least one projection event selector",
             ),
             Self::UnexpectedProjectionProof => formatter.write_str(
                 "succeeded and causal commands cannot carry a same-transaction projection proof",
             ),
             Self::MissingProjectionProof => formatter.write_str(
                 "projected command did not stage its returned read model as an exact upsert",
-            ),
-            Self::ProjectedHasConfirmations => formatter.write_str(
-                "projected command cannot declare asynchronous projector confirmations",
             ),
             Self::ProjectionOutputTypeMismatch => formatter.write_str(
                 "projected command proof is for a different Rust read-model type",

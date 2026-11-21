@@ -1094,7 +1094,6 @@ fn attach_todo_and_chat_command_optimism(
             facts: vec!["todo.completed".into(), "chat.posted".into()],
             models: vec!["TodoView".into(), "ChatView".into()],
             dependencies: Vec::new(),
-            causal_confirmation: false,
         });
     manifest.projection_programs.push(ClientProjectionProgram {
         version: 2,

@@ -790,26 +790,6 @@ impl ProjectionProtocolStore for InMemoryRepository {
         }
     }
 
-    fn projection_obligation_evidence_batch<'a>(
-        &'a self,
-        request: &'a ProjectionObligationEvidenceBatchRequest,
-    ) -> impl Future<Output = Result<ProjectionObligationEvidenceBatch, ProjectionProtocolError>>
-           + Send
-           + 'a {
-        async move {
-            request.validate()?;
-            let protocol = self.projection_protocol.read().map_err(|_| {
-                RepositoryError::LockPoisoned("projection obligation evidence read")
-            })?;
-            let evidence = request
-                .requests
-                .iter()
-                .map(|probe| read_projection_obligation_evidence_from_state(&protocol, probe))
-                .collect::<Result<Vec<_>, _>>()?;
-            Ok(ProjectionObligationEvidenceBatch { evidence })
-        }
-    }
-
     fn projection_causation_evidence<'a>(
         &'a self,
         request: &'a ProjectionCausationEvidenceRequest,

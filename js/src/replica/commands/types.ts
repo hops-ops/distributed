@@ -58,75 +58,11 @@ export type ReplicaCommandEffectExpression =
 	| { readonly kind: 'constant'; readonly value: ReplicaValue }
 	| { readonly kind: 'null' };
 
-export type ReplicaCommandEffectField = {
-	readonly field: string;
-	readonly value: ReplicaCommandEffectExpression;
-};
-
-export type ReplicaCommandEffectKey = {
-	readonly fields: readonly ReplicaCommandEffectField[];
-};
-
 export type ReplicaCommandEffectRelationship = {
 	readonly sourceModel: string;
 	readonly field: string;
 	readonly targetModel: string;
 };
-
-export type ReplicaCommandEffect =
-	| {
-			readonly kind: 'upsert' | 'patch';
-			readonly model: string;
-			readonly key: ReplicaCommandEffectKey;
-			readonly fields: readonly ReplicaCommandEffectField[];
-	  }
-	| {
-			readonly kind: 'delete';
-			readonly model: string;
-			readonly key: ReplicaCommandEffectKey;
-	  }
-	| {
-			readonly kind: 'link' | 'unlink';
-			readonly relationship: ReplicaCommandEffectRelationship;
-			readonly source: ReplicaCommandEffectKey;
-			readonly target: ReplicaCommandEffectKey;
-	  }
-	| {
-			readonly kind: 'invalidate_model';
-			readonly model: string;
-	  }
-	| {
-			readonly kind: 'invalidate_relationship';
-			readonly relationship: ReplicaCommandEffectRelationship;
-			readonly source: ReplicaCommandEffectKey;
-	  };
-
-export type ReplicaCommandEffects = {
-	readonly version: 1;
-	readonly operations: readonly ReplicaCommandEffect[];
-	readonly fallback: 'revalidate';
-};
-
-export type ReplicaCommandConfirmation = {
-	readonly projector: string;
-	readonly model: string;
-	readonly key: ReplicaCommandEffectKey;
-	readonly partition?: ReplicaCommandEffectExpression;
-};
-
-export type ReplicaCommandConfirmations =
-	| {
-			readonly version: 1;
-			readonly kind: 'finite';
-			readonly expected: readonly ReplicaCommandConfirmation[];
-			readonly fallback: 'revalidate';
-	  }
-	| {
-			readonly version: 1;
-			readonly kind: 'unavailable';
-			readonly expected: readonly [];
-			readonly fallback: 'revalidate';
-	  };
 
 export type ReplicaCommandDirectProjection = {
 	readonly topology: {
@@ -145,7 +81,7 @@ export type ReplicaCommandDirectProjection = {
  *
  * `dependencies` are the role-visible physical/model dependencies which task 9
  * may hand to the replica revalidator. `required` means the command cannot be
- * proven by its local effect/confirmation contract alone.
+ * proven by its projection contract alone.
  */
 export type ReplicaCommandRevalidationPlan = {
 	readonly version: 1;
@@ -183,9 +119,6 @@ export type ReplicaCommandArtifact<TInput = void, TOutput = unknown> = {
 	readonly consistency: DistributedCommandConsistency;
 	/** Compiler-owned projection contract. Absence means no invented delta. */
 	readonly projection?: ReplicaCommandProjection;
-	/** Artifact v1 effects and confirmations are deliberately not decoded. */
-	readonly effects?: never;
-	readonly confirmations?: never;
 	readonly directProjection?: ReplicaCommandDirectProjection;
 	readonly trustedPresets?: readonly ReplicaTrustedPresetDescriptor[];
 	readonly revalidation: ReplicaCommandRevalidationPlan;
@@ -193,57 +126,6 @@ export type ReplicaCommandArtifact<TInput = void, TOutput = unknown> = {
 	readonly __input?: TInput;
 	readonly __output?: TOutput;
 };
-
-export type ReplicaPreparedEffectField = {
-	readonly field: string;
-	readonly value: ReplicaValue;
-};
-
-export type ReplicaPreparedEffectKey = {
-	readonly fields: readonly ReplicaPreparedEffectField[];
-};
-
-export type ReplicaPreparedCommandEffect =
-	| {
-			readonly kind: 'upsert' | 'patch';
-			readonly model: string;
-			readonly key: ReplicaPreparedEffectKey;
-			readonly fields: readonly ReplicaPreparedEffectField[];
-	  }
-	| {
-			readonly kind: 'delete';
-			readonly model: string;
-			readonly key: ReplicaPreparedEffectKey;
-	  }
-	| {
-			readonly kind: 'link' | 'unlink';
-			readonly relationship: ReplicaCommandEffectRelationship;
-			readonly source: ReplicaPreparedEffectKey;
-			readonly target: ReplicaPreparedEffectKey;
-	  }
-	| {
-			readonly kind: 'invalidate_model';
-			readonly model: string;
-	  }
-	| {
-			readonly kind: 'invalidate_relationship';
-			readonly relationship: ReplicaCommandEffectRelationship;
-			readonly source: ReplicaPreparedEffectKey;
-	  };
-
-export type ReplicaPreparedConfirmation = {
-	readonly projector: string;
-	readonly model: string;
-	readonly key: ReplicaPreparedEffectKey;
-	readonly partition?: ReplicaValue;
-};
-
-export type ReplicaPreparedConfirmations =
-	| {
-			readonly kind: 'finite';
-			readonly expected: readonly ReplicaPreparedConfirmation[];
-	  }
-	| { readonly kind: 'unavailable' };
 
 export type DeepReadonly<T> = T extends (...args: never[]) => unknown
 	? T
@@ -275,7 +157,6 @@ export type ReplicaPreparedCommand<TInput = void, TOutput = unknown> = {
 		readonly fallback: 'revalidate';
 	};
 	readonly projection?: PreparedCommandProjection;
-	readonly confirmations?: ReplicaPreparedConfirmations;
 	readonly directProjection?: {
 		readonly topology: ReplicaCommandDirectProjection['topology'];
 		readonly model: string;
@@ -319,11 +200,6 @@ export type ReplicaReceiptVerification =
 	| {
 			readonly kind: 'deferred';
 			readonly revalidate: boolean;
-	  }
-	| {
-			readonly kind: 'revalidate';
-			readonly revalidate: true;
-			readonly reason: 'confirmation_unavailable';
 	  };
 
 export type ReplicaCommandContractErrorCode =

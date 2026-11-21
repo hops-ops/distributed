@@ -95,16 +95,10 @@ export type {
 export type {
 	PrepareReplicaCommandOptions,
 	ReplicaCommandArtifact,
-	ReplicaCommandConfirmation,
-	ReplicaCommandConfirmations,
 	ReplicaCommandContractErrorCode,
 	ReplicaCommandDirectProjection,
-	ReplicaCommandEffect,
 	ReplicaCommandEffectExpression,
-	ReplicaCommandEffectField,
-	ReplicaCommandEffectKey,
 	ReplicaCommandEffectRelationship,
-	ReplicaCommandEffects,
 	ReplicaCommandGenerators,
 	ReplicaCommandInputDefault,
 	ReplicaCommandInputDefaults,
@@ -116,11 +110,6 @@ export type {
 	ReplicaCommandVariables,
 	ReplicaTrustedPresetDescriptor,
 	ReplicaPreparedCommand,
-	ReplicaPreparedCommandEffect,
-	ReplicaPreparedConfirmation,
-	ReplicaPreparedConfirmations,
-	ReplicaPreparedEffectField,
-	ReplicaPreparedEffectKey,
 	ReplicaReceiptVerification
 } from './commands.js';
 export { createWasmJsonPure } from './projection-delta/index.js';

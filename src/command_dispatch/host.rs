@@ -689,37 +689,6 @@ impl CommandHost for HttpCommandHost {
     }
 }
 
-/// Local dispatcher is a causal [`CommandHost`]. GraphQL must use this
-/// trait object, not [`LocalCommandDispatcher::service`].
-#[async_trait]
-impl CommandHost for super::LocalCommandDispatcher {
-    async fn invoke(
-        &self,
-        command: &str,
-        command_id: &str,
-        input: Value,
-        session: Session,
-        principal: VerifiedPrincipal,
-        protocol: Option<ProtocolResponseAccumulator>,
-    ) -> Result<CausalDispatchResult, CausalDispatchError> {
-        LocalCommandHost::new(Arc::clone(self.service()))
-            .invoke(command, command_id, input, session, principal, protocol)
-            .await
-    }
-
-    async fn status(
-        &self,
-        command_id: &str,
-        session: &Session,
-        principal: VerifiedPrincipal,
-        protocol: Option<ProtocolResponseAccumulator>,
-    ) -> Result<CausalCommandPublicStatus, CausalDispatchError> {
-        LocalCommandHost::new(Arc::clone(self.service()))
-            .status(command_id, session, principal, protocol)
-            .await
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

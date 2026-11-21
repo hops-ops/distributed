@@ -10,7 +10,7 @@ mod client_surface_parity_tests {
 
     use super::*;
     use crate::command::CommandConsistency;
-    use crate::command::{CommandEffects, TypedCommandContract};
+    use crate::command::TypedCommandContract;
     use crate::command::{CommandInputType, CommandOutputType, CommandTypeDef, CommandTypeField};
     use crate::graphql::commands::TypedCommandInventory;
     #[cfg(feature = "sqlite")]
@@ -78,8 +78,6 @@ mod client_surface_parity_tests {
             output_type_id: TypeId::of::<O>(),
             consistency: CommandConsistency::Succeeded,
             input_defaults: Vec::new(),
-            effects: CommandEffects::revalidate(),
-            confirmations: Vec::new(),
             projected_model: None,
             direct_projection: None,
             projections: Default::default(),
@@ -1426,7 +1424,7 @@ mod client_surface_parity_tests {
         }
         assert_eq!(
             manifest.schema_fingerprint,
-            "sha256:cce38712ab7d84a934fa10bf1272d292d20f746aea5bf2e485fe15b2527517c0"
+            "sha256:a183d191dcaedbd88466fcefb6ac7ff83e7733bd69bbd90180a97d157ba2deec"
         );
     }
 
@@ -2009,28 +2007,28 @@ mod client_surface_parity_tests {
 
     #[cfg(feature = "sqlite")]
     const SQLITE_RESTRICTED_GOLDENS: ArtifactGoldens = ArtifactGoldens {
-        manifest: "sha256:7c8a181165a416610142c06f6b0ddca34358d884b738af10e11bf9b928817bed",
+        manifest: "sha256:9d6a7a152ac4ec6cd935048df3e5e6e1d0108373ae9e862df227a3ca80dd6e17",
         static_sdl: "sha256:03252ba251b1ddac611fe567d816f780f0876f9f6ce263be95a3480f88fc2283",
         runtime_sdl: "sha256:3d099b8c0b27f0dcbdd677199f767fcc5993071e06b2c0a7d4aa02caf4e5f4ac",
     };
 
     #[cfg(feature = "sqlite")]
     const SQLITE_ADMIN_GOLDENS: ArtifactGoldens = ArtifactGoldens {
-        manifest: "sha256:827e381234e72fa315daffa7a018f2c92f964d75ef70fbc86983b3aa704e52d9",
+        manifest: "sha256:15828e5a01528e188c833fdac7b3cf7e37d815bb91f559884a2f78da9c8a2627",
         static_sdl: "sha256:128b85bcd6485d14de62b0976e9f12e8b35ad9e7d96a5627d1edcfcabdb591b3",
         runtime_sdl: "sha256:c0b6d600d353357ab4f393897fb6b7ee51f69546f7a4cc4b6786e42abe621f5c",
     };
 
     #[cfg(feature = "postgres")]
     const POSTGRES_RESTRICTED_GOLDENS: ArtifactGoldens = ArtifactGoldens {
-        manifest: "sha256:7c8a181165a416610142c06f6b0ddca34358d884b738af10e11bf9b928817bed",
+        manifest: "sha256:9d6a7a152ac4ec6cd935048df3e5e6e1d0108373ae9e862df227a3ca80dd6e17",
         static_sdl: "sha256:03252ba251b1ddac611fe567d816f780f0876f9f6ce263be95a3480f88fc2283",
         runtime_sdl: "sha256:3d099b8c0b27f0dcbdd677199f767fcc5993071e06b2c0a7d4aa02caf4e5f4ac",
     };
 
     #[cfg(feature = "postgres")]
     const POSTGRES_ADMIN_GOLDENS: ArtifactGoldens = ArtifactGoldens {
-        manifest: "sha256:8e123332eb9ae3364290429e30feeee8a1da3cbad4004224382b8e6128c918a2",
+        manifest: "sha256:cb6940a57989377e2f6ae1caf34ddb52b6bc73c8d6971e9f430ea3b6e9b834f6",
         static_sdl: "sha256:afe92660c1700845ed5f3e0ddaacc4b481799c39f86b8eacecb46d1b8f99d421",
         runtime_sdl: "sha256:de4885736fdf22a57ccc55160d63b6d1a7fdb33728dec399e8a81d54ce7e8c09",
     };

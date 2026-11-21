@@ -388,8 +388,6 @@ pub(super) fn client_manifest_from_surface_with_execution(
                 consistency,
                 direct_projection,
                 input_defaults,
-                effects: None,
-                confirmations: None,
                 projection,
                 trusted_presets,
             },
@@ -410,16 +408,6 @@ pub(super) fn client_manifest_from_surface_with_execution(
         command_status,
     };
 
-    let confirming_projectors: BTreeSet<&str> = surface
-        .commands
-        .iter()
-        .flat_map(|command| {
-            command
-                .confirmations
-                .iter()
-                .map(|confirmation| confirmation.projector.as_str())
-        })
-        .collect();
     let mut projectors: Vec<ClientProjector> = surface
         .projectors
         .iter()
@@ -429,7 +417,6 @@ pub(super) fn client_manifest_from_surface_with_execution(
             facts: sorted_unique(projector.facts.clone()),
             models: sorted_unique(projector.models.clone()),
             dependencies: sorted_unique(projector.dependencies.clone()),
-            causal_confirmation: confirming_projectors.contains(projector.name.as_str()),
         })
         .collect();
     projectors.sort_by(|a, b| a.name.cmp(&b.name));

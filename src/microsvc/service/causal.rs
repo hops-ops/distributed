@@ -20,9 +20,8 @@ use crate::microsvc::error::HandlerError;
 use crate::microsvc::session::Session;
 #[cfg(feature = "graphql")]
 use crate::projection_protocol::{
-    ProjectionCausationEvidenceRequest, ProjectionObligationEvidence,
-    ProjectionObligationEvidenceBatchRequest, ProjectionObligationEvidenceRequest,
-    ProjectionObservationKind, ProjectionRecordScope, SameTransactionProjectionEvidence,
+    ProjectionCausationEvidenceRequest, ProjectionObservationKind,
+    SameTransactionProjectionEvidence,
 };
 #[cfg(feature = "graphql")]
 use crate::repository::CommitBatch;
@@ -123,22 +122,6 @@ impl From<HandlerError> for CausalDispatchError {
     }
 }
 
-/// Exact compiler-bound projection obligation retained by the durable command
-/// replay.
-///
-/// The canonical scope remains a crate-private typed value. A transport layer
-/// may hand it to the protocol token codec, but this type deliberately has no
-/// serialization implementation that could expose topology, partition, or key
-/// bytes directly.
-#[cfg(feature = "graphql")]
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct CausalCommandProjectionObligation {
-    pub(crate) projector: String,
-    pub(crate) model: String,
-    pub(crate) scope: ProjectionRecordScope,
-    pub(crate) observation_kind: ProjectionObservationKind,
-}
-
 /// Durable receipt material for one exact command attempt.
 ///
 /// `direct_projection` is decoded from the versioned ledger replay envelope;
@@ -152,7 +135,6 @@ pub(crate) struct CausalCommandReceiptSource {
     pub(crate) consistency: CommandConsistency,
     pub(crate) state: CommandLedgerState,
     pub(crate) outcome: Value,
-    pub(crate) obligations: Vec<CausalCommandProjectionObligation>,
     pub(crate) projection_metadata: Option<crate::graphql::protocol::CommandProjectionMetadataV1>,
     pub(crate) direct_projection: Option<SameTransactionProjectionEvidence>,
 }
@@ -173,19 +155,6 @@ impl CausalCommandReceiptSource {
                     "stored direct projection evidence is invalid: {error}"
                 ))
             })?;
-        let obligations = replay
-            .projection_obligations
-            .into_iter()
-            .map(|obligation| CausalCommandProjectionObligation {
-                projector: obligation.projector,
-                model: obligation.model,
-                scope: obligation.scope,
-                // The current command compiler binds finite confirmations only
-                // to relational records. Persisting dependency-vs-record kind
-                // becomes mandatory before embedded confirmations are enabled.
-                observation_kind: ProjectionObservationKind::Record,
-            })
-            .collect();
         let projection_metadata = replay
             .projection_metadata
             .as_deref()
@@ -203,7 +172,6 @@ impl CausalCommandReceiptSource {
             consistency,
             state: replay.state,
             outcome: replay.outcome,
-            obligations,
             projection_metadata,
             direct_projection,
         })
@@ -293,12 +261,6 @@ impl ExternalCausalAttempt {
                 )));
             }
         };
-        if !result.receipt.obligations.is_empty() && result.receipt.projection_metadata.is_none() {
-            return Err(CausalDispatchError::Internal(
-                "cell wait-path returned legacy projection obligations without their canonical key identity"
-                    .into(),
-            ));
-        }
         let binding = self.attempt.external_binding().cloned().ok_or_else(|| {
             CausalDispatchError::Internal(
                 "external command attempt lost its immutable route binding".into(),
@@ -327,13 +289,7 @@ impl ExternalCausalAttempt {
                 .map_err(internal_ledger_error)
         } else {
             self.attempt
-                .complete_external(
-                    binding,
-                    state,
-                    result.payload().clone(),
-                    Vec::new(),
-                    self.retention,
-                )
+                .complete_external(binding, state, result.payload().clone(), self.retention)
                 .map_err(internal_ledger_error)
         }
     }
@@ -481,7 +437,6 @@ impl CausalDispatchResult {
                 .then(|| self.receipt.causation_id.clone()),
             consistency: Some(self.receipt.consistency),
             outcome: Some(self.payload.clone()),
-            obligations: self.receipt.obligations.clone(),
             projection_metadata: self.receipt.projection_metadata.clone(),
             projection_revalidate: false,
             evidence,
@@ -546,7 +501,6 @@ impl CausalDispatchResult {
                 consistency: crate::command::CommandConsistency::Succeeded,
                 state,
                 outcome: Value::Null,
-                obligations: Vec::new(),
                 projection_metadata: None,
                 direct_projection: None,
             },
@@ -621,7 +575,6 @@ pub struct CausalCommandPublicStatus {
     pub(crate) causation_id: Option<String>,
     pub(crate) consistency: Option<CommandConsistency>,
     pub(crate) outcome: Option<Value>,
-    pub(crate) obligations: Vec<CausalCommandProjectionObligation>,
     pub(crate) projection_metadata: Option<crate::graphql::protocol::CommandProjectionMetadataV1>,
     /// Historical modeled work was authenticated against an exact Draining
     /// binding, but its old-scope delta is not applicable to this client.
@@ -640,7 +593,6 @@ impl CausalCommandPublicStatus {
             causation_id: None,
             consistency: None,
             outcome: None,
-            obligations: Vec::new(),
             projection_metadata: None,
             projection_revalidate: false,
             evidence: Vec::new(),
@@ -968,7 +920,6 @@ where
             causation_id: None,
             consistency: Some(consistency),
             outcome: None,
-            obligations: Vec::new(),
             projection_metadata: None,
             projection_revalidate: false,
             evidence: Vec::new(),
@@ -982,7 +933,6 @@ where
             causation_id: Some(causation_id.as_str().to_string()),
             consistency: Some(consistency),
             outcome: None,
-            obligations: Vec::new(),
             projection_metadata: None,
             projection_revalidate: false,
             evidence: Vec::new(),
@@ -1021,8 +971,7 @@ where
                     if receipt
                         .projection_metadata
                         .as_ref()
-                        .is_some_and(|metadata| !metadata.obligations.is_empty())
-                        || !receipt.obligations.is_empty() =>
+                        .is_some_and(|metadata| !metadata.obligations.is_empty()) =>
                 {
                     let (_, evidence) = evaluate_pending_projection_evidence(
                         repository,
@@ -1043,9 +992,7 @@ where
                     (0..receipt
                         .projection_metadata
                         .as_ref()
-                        .map_or(receipt.obligations.len(), |metadata| {
-                            metadata.obligations.len()
-                        }))
+                        .map_or(0, |metadata| metadata.obligations.len()))
                         .map(|obligation_index| CausalCommandProjectionEvidence {
                             obligation_index,
                             state: CausalProjectionEvidenceState::Observed,
@@ -1087,7 +1034,6 @@ where
                 causation_id: Some(receipt.causation_id),
                 consistency: Some(receipt.consistency),
                 outcome: Some(receipt.outcome),
-                obligations: receipt.obligations,
                 projection_metadata: receipt.projection_metadata,
                 projection_revalidate,
                 evidence,
@@ -1113,123 +1059,27 @@ pub(super) async fn evaluate_pending_projection_evidence<R>(
 where
     R: crate::microsvc::dependencies::CausalHostProjections + Send + Sync,
 {
-    if let Some(metadata) = receipt.projection_metadata.as_ref() {
-        return evaluate_pending_modeled_projection_evidence(
-            repository,
-            receipt,
-            metadata,
-            protocol.ok_or_else(|| {
-                CausalDispatchError::Internal(
-                    "modeled projection status requires authenticated protocol authority".into(),
-                )
-            })?,
-            modeled_plan.ok_or_else(|| {
-                CausalDispatchError::Internal(
-                    "modeled projection status is missing its authenticated status plan".into(),
-                )
-            })?,
+    let metadata = receipt.projection_metadata.as_ref().ok_or_else(|| {
+        CausalDispatchError::Internal(
+            "pending projection replay has no modeled projection metadata".into(),
         )
-        .await;
-    }
-
-    let requests = receipt
-        .obligations
-        .iter()
-        .map(|obligation| {
-            ProjectionObligationEvidenceRequest::new(
-                receipt.causation_id.clone(),
-                obligation.scope.clone(),
-                obligation.observation_kind,
-            )
-        })
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|error| {
-            CausalDispatchError::Internal(format!(
-                "stored projection obligation cannot be evaluated: {error}"
-            ))
-        })?;
-    let request = ProjectionObligationEvidenceBatchRequest::new(requests).map_err(|error| {
-        CausalDispatchError::Internal(format!(
-            "stored projection obligation batch is invalid: {error}"
-        ))
     })?;
-    let batch = repository
-        .command_obligation_evidence(&request)
-        .await
-        .map_err(|error| {
-            CausalDispatchError::Internal(format!(
-                "projection obligation evidence lookup failed: {error}"
-            ))
-        })?;
-    if batch.evidence.len() != receipt.obligations.len() {
-        return Err(CausalDispatchError::Internal(format!(
-            "projection obligation evidence returned {} items for {} exact probes",
-            batch.evidence.len(),
-            receipt.obligations.len()
-        )));
-    }
-
-    let mut evidence = Vec::with_capacity(batch.evidence.len());
-    for (obligation_index, (obligation, item)) in
-        receipt.obligations.iter().zip(batch.evidence).enumerate()
-    {
-        let item = match item {
-            ProjectionObligationEvidence::Pending => CausalCommandProjectionEvidence {
-                obligation_index,
-                state: CausalProjectionEvidenceState::Pending,
-                incarnation: None,
-                revision: None,
-            },
-            ProjectionObligationEvidence::TerminalFailure(_) => CausalCommandProjectionEvidence {
-                obligation_index,
-                state: CausalProjectionEvidenceState::TerminalFailure,
-                incarnation: None,
-                revision: None,
-            },
-            ProjectionObligationEvidence::Observed(observation) => {
-                if observation.causation_id != receipt.causation_id
-                    || observation.kind != obligation.observation_kind
-                    || observation.scope != obligation.scope
-                {
-                    return Err(CausalDispatchError::Internal(
-                        "projection store returned evidence outside the exact obligation probe"
-                            .into(),
-                    ));
-                }
-                let (incarnation, revision) = match observation.revision.as_ref() {
-                    Some(record)
-                        if obligation.observation_kind == ProjectionObservationKind::Record
-                            && record.scope() == &obligation.scope =>
-                    {
-                        (Some(record.incarnation()), Some(record.revision()))
-                    }
-                    None if obligation.observation_kind
-                        == ProjectionObservationKind::Dependency =>
-                    {
-                        (None, None)
-                    }
-                    _ => {
-                        return Err(CausalDispatchError::Internal(
-                            "projection store returned an invalid revision for the obligation kind"
-                                .into(),
-                        ));
-                    }
-                };
-                CausalCommandProjectionEvidence {
-                    obligation_index,
-                    state: CausalProjectionEvidenceState::Observed,
-                    incarnation,
-                    revision,
-                }
-            }
-        };
-        evidence.push(item);
-    }
-
-    // Failure precedence is intentional: a terminal failure must never be
-    // hidden by observations from the remaining obligations.
-    let state = collapse_projection_evidence(&evidence);
-    Ok((state, evidence))
+    evaluate_pending_modeled_projection_evidence(
+        repository,
+        receipt,
+        metadata,
+        protocol.ok_or_else(|| {
+            CausalDispatchError::Internal(
+                "modeled projection status requires authenticated protocol authority".into(),
+            )
+        })?,
+        modeled_plan.ok_or_else(|| {
+            CausalDispatchError::Internal(
+                "modeled projection status is missing its authenticated status plan".into(),
+            )
+        })?,
+    )
+    .await
 }
 
 #[cfg(feature = "graphql")]

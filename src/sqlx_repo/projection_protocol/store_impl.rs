@@ -1034,27 +1034,6 @@ where
         }
     }
 
-    fn projection_obligation_evidence_batch<'a>(
-        &'a self,
-        request: &'a ProjectionObligationEvidenceBatchRequest,
-    ) -> impl Future<Output = Result<ProjectionObligationEvidenceBatch, ProjectionProtocolError>>
-           + Send
-           + 'a {
-        let request = request.clone();
-        async move {
-            request.validate()?;
-            with_projection_read_snapshot(self.pool(), move |connection| {
-                Box::pin(async move {
-                    read_projection_obligation_evidence_batch_in_executor::<DB>(
-                        connection, &request,
-                    )
-                    .await
-                })
-            })
-            .await
-        }
-    }
-
     fn projection_causation_evidence<'a>(
         &'a self,
         request: &'a ProjectionCausationEvidenceRequest,

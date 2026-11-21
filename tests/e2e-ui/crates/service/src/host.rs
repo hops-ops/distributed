@@ -11,7 +11,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use distributed::bus::{PostgresBus, SqliteBus};
-use distributed::command_dispatch::LocalCommandDispatcher;
 use distributed::graphql::IdentityConfig;
 use distributed::microsvc::{spawn_outbox_publish_loop, spawn_service_consumer_loop};
 use distributed::{PostgresLockManager, PostgresRepository, SqliteLockManager, SqliteRepository};
@@ -89,7 +88,6 @@ async fn run_sqlite(
         versions,
     )?;
     let service = Arc::new(service.try_with_graphql(gql)?);
-    let _dispatcher = Arc::new(LocalCommandDispatcher::new(Arc::clone(&service)));
 
     spawn_outbox_publish_loop(
         repo.outbox_store(),
@@ -154,7 +152,6 @@ async fn run_postgres(
         versions,
     )?;
     let service = Arc::new(service.try_with_graphql(gql)?);
-    let _dispatcher = Arc::new(LocalCommandDispatcher::new(Arc::clone(&service)));
 
     spawn_outbox_publish_loop(
         repo.outbox_store(),

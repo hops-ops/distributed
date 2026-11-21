@@ -2140,8 +2140,6 @@ mod tests {
                 },
                 direct_projection: None,
                 input_defaults: None,
-                effects: None,
-                confirmations: None,
                 projection: None,
                 trusted_presets: Vec::new(),
             },

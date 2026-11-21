@@ -10,7 +10,7 @@ use super::key::{
 use super::ProjectionScopeCodecError;
 use crate::projection_protocol::{
     PartitionId, ProjectionRecordScope, ProjectorTopologyId, RecordKey,
-    ResolvedProjectionObligation, MAX_PROJECTION_PARTITION_BYTES, MAX_PROJECTION_RECORD_KEY_BYTES,
+    MAX_PROJECTION_PARTITION_BYTES, MAX_PROJECTION_RECORD_KEY_BYTES,
 };
 use crate::table::{RowKey, TableColumn, TableSchema};
 
@@ -99,27 +99,6 @@ impl ProjectionScopeCodec {
             }
         }
         PartitionId::new(encoder.finish()).map_err(Into::into)
-    }
-
-    /// Lower a command-ledger obligation into its exact durable record scope.
-    #[allow(dead_code)]
-    pub(crate) fn encode_obligation_scope(
-        &self,
-        obligation: &ResolvedProjectionObligation,
-    ) -> Result<ProjectionRecordScope, ProjectionScopeCodecError> {
-        let computed = self.encode_resolved_obligation_scope(
-            &obligation.projector,
-            &obligation.model,
-            &obligation.key,
-            obligation.partition.as_ref(),
-        )?;
-        if computed != obligation.scope {
-            return Err(ProjectionScopeCodecError::StoredScopeMismatch {
-                projector: obligation.projector.clone(),
-                model: obligation.model.clone(),
-            });
-        }
-        Ok(computed)
     }
 
     pub(crate) fn encode_resolved_obligation_scope(

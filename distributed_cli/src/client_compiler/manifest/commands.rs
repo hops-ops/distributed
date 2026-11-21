@@ -66,50 +66,9 @@ pub(crate) fn canonicalize_commands(
                 canonicalize_effect_expression(partition);
             }
         }
-        if let Some(effects) = &mut command.extensions.effects {
-            for effect in &mut effects.operations {
-                canonicalize_effect(effect);
-            }
-        }
-        if let Some(confirmations) = &mut command.extensions.confirmations {
-            for confirmation in &mut confirmations.expected {
-                canonicalize_effect_key(&mut confirmation.key);
-                if let Some(partition) = &mut confirmation.partition {
-                    canonicalize_effect_expression(partition);
-                }
-            }
-        }
     }
     commands.sort_by(|left, right| left.name.cmp(&right.name));
     Ok(())
-}
-
-pub(crate) fn canonicalize_effect(effect: &mut ManifestEffect) {
-    match effect {
-        ManifestEffect::Upsert { key, fields, .. } | ManifestEffect::Patch { key, fields, .. } => {
-            canonicalize_effect_key(key);
-            for field in fields.iter_mut() {
-                canonicalize_effect_expression(&mut field.value);
-            }
-            fields.sort_by(|left, right| left.field.cmp(&right.field));
-        }
-        ManifestEffect::Delete { key, .. } => canonicalize_effect_key(key),
-        ManifestEffect::Link { source, target, .. }
-        | ManifestEffect::Unlink { source, target, .. } => {
-            canonicalize_effect_key(source);
-            canonicalize_effect_key(target);
-        }
-        ManifestEffect::InvalidateRelationship { source, .. } => {
-            canonicalize_effect_key(source);
-        }
-        ManifestEffect::InvalidateModel { .. } => {}
-    }
-}
-
-pub(crate) fn canonicalize_effect_key(key: &mut ManifestEffectKey) {
-    for field in &mut key.fields {
-        canonicalize_effect_expression(&mut field.value);
-    }
 }
 
 pub(crate) fn canonicalize_effect_expression(expression: &mut ManifestEffectExpression) {

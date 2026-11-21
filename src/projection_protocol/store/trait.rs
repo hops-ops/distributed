@@ -126,13 +126,6 @@ pub(crate) trait ProjectionProtocolStore: Send + Sync {
         }
     }
 
-    fn projection_obligation_evidence_batch<'a>(
-        &'a self,
-        request: &'a ProjectionObligationEvidenceBatchRequest,
-    ) -> impl Future<Output = Result<ProjectionObligationEvidenceBatch, ProjectionProtocolError>>
-           + Send
-           + 'a;
-
     fn projection_causation_evidence<'a>(
         &'a self,
         _request: &'a ProjectionCausationEvidenceRequest,

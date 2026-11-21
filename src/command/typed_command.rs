@@ -7,28 +7,18 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 
 use super::direct_projection::{
-    resolve_trusted_preset, CommandDirectProjectionTarget, CommandProjectedModel,
-    CompiledDirectProjectionTarget, DirectProjectionTargetResolutionError,
-    ResolvedDirectProjectionTarget,
+    CommandDirectProjectionTarget, CommandProjectedModel, CompiledDirectProjectionTarget,
+    DirectProjectionTargetResolutionError, ResolvedDirectProjectionTarget,
 };
-use super::effect_wire::CompiledInputDefaults;
-use super::effects::{
-    invalid_confirmation_constant, invalid_expression_constant, CommandEffects, EffectExpression,
-};
+use super::effect_wire::{CommandInputDefault, CompiledInputDefaults};
 use super::outcomes::{Atomic, CommandConsistency, CommandOutcome};
-use super::projection_obligations::{
-    CommandInputDefault, CommandProjectionConfirmation, ProjectionObligationResolutionError,
-};
 use super::projection_proof::{canonical_json, CommandCommitProofError};
 use super::projections::{
     CommandProjectionEvents, CommandProjectionPreview, CommandProjectionPureReduce,
 };
-use super::types::{scalar_type_name, CommandInputType, CommandTypeDef};
+use super::types::{CommandInputType, CommandTypeDef};
 use crate::microsvc::Session;
-use crate::outbox::OutboxMessage;
-use crate::projection_protocol::{
-    ProjectionEpoch, ProjectionScopeCodec, RecordKey, RecordKeyField, ResolvedProjectionObligation,
-};
+use crate::projection_protocol::ProjectionEpoch;
 use crate::read_model::RelationalReadModel;
 
 #[derive(Clone, Debug)]
@@ -42,8 +32,6 @@ pub(crate) struct TypedCommandContract {
     pub output_type_id: TypeId,
     pub consistency: CommandConsistency,
     pub input_defaults: Vec<CommandInputDefault>,
-    pub effects: CommandEffects,
-    pub confirmations: Vec<CommandProjectionConfirmation>,
     /// Present automatically for `Atomic<M>` before Surface ownership is
     /// resolved. This never requires an application declaration.
     pub projected_model: Option<CommandProjectedModel>,
@@ -75,23 +63,8 @@ impl TypedCommandContract {
         let mut roles = self.roles.clone();
         roles.sort();
         roles.dedup();
-        let mut effects = self.effects.clone();
-        effects.canonicalize();
         let mut input_defaults = self.input_defaults.clone();
         input_defaults.sort_by(|left, right| left.path.cmp(&right.path));
-        let mut confirmations = self.confirmations.clone();
-        confirmations.sort_by(|left, right| {
-            serde_json::to_string(&left.canonical_value())
-                .expect("confirmation IR serialization cannot fail")
-                .cmp(
-                    &serde_json::to_string(&right.canonical_value())
-                        .expect("confirmation IR serialization cannot fail"),
-                )
-        });
-        let confirmations = confirmations
-            .iter()
-            .map(CommandProjectionConfirmation::canonical_value)
-            .collect::<Vec<_>>();
         let direct_projection = self
             .direct_projection
             .as_ref()
@@ -112,128 +85,10 @@ impl TypedCommandContract {
             "output": canonical_command_type(&self.output),
             "consistency": self.consistency,
             "input_defaults": input_defaults,
-            "effects": effects,
-            "confirmations": confirmations,
             "projected_model": projected_model,
             "direct_projection": direct_projection,
             "projections": projections,
         }))
-    }
-
-    /// Resolve the finite declaration-owned projection plan from the exact
-    /// canonical GraphQL wire input retained beside the decoded command.
-    ///
-    /// Resolution is pure and must run before commit I/O. Confirmation and key
-    /// field order are retained exactly as declared. Input values and constants
-    /// are cloned without a Rust DTO or SQL codec round trip, while explicit
-    /// null remains distinguishable from an undeclared partition.
-    #[allow(dead_code)]
-    pub(crate) fn resolve_projection_obligations(
-        &self,
-        canonical_wire_input: &serde_json::Value,
-    ) -> Result<Vec<ResolvedProjectionObligation>, ProjectionObligationResolutionError> {
-        self.resolve_projection_obligations_from_session(canonical_wire_input, None)
-    }
-
-    pub(crate) fn resolve_projection_obligations_from_session(
-        &self,
-        canonical_wire_input: &serde_json::Value,
-        session: Option<&Session>,
-    ) -> Result<Vec<ResolvedProjectionObligation>, ProjectionObligationResolutionError> {
-        self.confirmations
-            .iter()
-            .map(|confirmation| {
-                let fields = confirmation
-                    .key
-                    .fields
-                    .iter()
-                    .map(|field| {
-                        let target = format!("key field `{}`", field.field);
-                        resolve_projection_obligation_expression(
-                            canonical_wire_input,
-                            confirmation,
-                            &target,
-                            &field.value,
-                            session,
-                            confirmation
-                                .schema
-                                .and_then(|schema| {
-                                    schema
-                                        .columns
-                                        .iter()
-                                        .find(|column| column.column_name == field.field)
-                                })
-                                .and_then(|column| scalar_type_name(&column.column_type)),
-                        )
-                        .map(|value| RecordKeyField {
-                            field: field.field.clone(),
-                            value,
-                        })
-                    })
-                    .collect::<Result<Vec<_>, _>>()?;
-                let partition = confirmation
-                    .partition
-                    .as_ref()
-                    .map(|expression| {
-                        resolve_projection_obligation_expression(
-                            canonical_wire_input,
-                            confirmation,
-                            "partition",
-                            expression,
-                            session,
-                            Some("String"),
-                        )
-                    })
-                    .transpose()?;
-                let key = RecordKey { fields };
-                let topology = confirmation.protocol_topology.clone().ok_or_else(|| {
-                    ProjectionObligationResolutionError::InvalidBinding {
-                        projector: confirmation.projector.clone(),
-                        model: confirmation.model.clone(),
-                        reason: "missing compiled topology identity".into(),
-                    }
-                })?;
-                let schema = confirmation.schema.ok_or_else(|| {
-                    ProjectionObligationResolutionError::InvalidBinding {
-                        projector: confirmation.projector.clone(),
-                        model: confirmation.model.clone(),
-                        reason: "missing retained relational schema".into(),
-                    }
-                })?;
-                let codec = ProjectionScopeCodec::with_models(
-                    topology,
-                    [(schema.model_name.as_str(), schema)],
-                )
-                .map_err(|error| {
-                    ProjectionObligationResolutionError::InvalidBinding {
-                        projector: confirmation.projector.clone(),
-                        model: confirmation.model.clone(),
-                        reason: error.to_string(),
-                    }
-                })?;
-                let scope = codec
-                    .encode_resolved_obligation_scope(
-                        &confirmation.projector,
-                        &confirmation.model,
-                        &key,
-                        partition.as_ref(),
-                    )
-                    .map_err(
-                        |error| ProjectionObligationResolutionError::InvalidBinding {
-                            projector: confirmation.projector.clone(),
-                            model: confirmation.model.clone(),
-                            reason: error.to_string(),
-                        },
-                    )?;
-                Ok(ResolvedProjectionObligation {
-                    projector: confirmation.projector.clone(),
-                    model: confirmation.model.clone(),
-                    key,
-                    partition,
-                    scope,
-                })
-            })
-            .collect()
     }
 
     pub(crate) fn resolve_direct_projection_target_from_session(
@@ -247,96 +102,16 @@ impl TypedCommandContract {
             .transpose()
     }
 
-    /// Prove that every finite asynchronous confirmation can be driven by a
-    /// fact staged in the durable outbox. Aggregate event records intentionally
-    /// do not count: they are write-side history and have no publication path.
-    pub(super) fn validate_outbox_fact_coverage(
+    /// An eventual command must declare the outward events its projections
+    /// are driven by.
+    pub(super) fn validate_declares_projection_events(
         &self,
-        outbox_messages: &[OutboxMessage],
     ) -> Result<(), CommandCommitProofError> {
-        if self.consistency == CommandConsistency::Eventual
-            && self.confirmations.is_empty()
-            && self.projections.selectors.is_empty()
+        if self.consistency == CommandConsistency::Eventual && self.projections.selectors.is_empty()
         {
-            return Err(CommandCommitProofError::CausalHasNoConfirmations);
-        }
-
-        let staged_facts = outbox_messages
-            .iter()
-            .filter(|message| message.destination.is_none() && message.is_pending())
-            .map(|message| message.event_type.clone())
-            .collect::<BTreeSet<_>>();
-        for confirmation in &self.confirmations {
-            if confirmation
-                .projector_topology
-                .facts
-                .iter()
-                .any(|fact| staged_facts.contains(fact))
-            {
-                continue;
-            }
-            return Err(CommandCommitProofError::UnreachableConfirmation {
-                projector: confirmation.projector.clone(),
-                expected_facts: confirmation.projector_topology.facts.clone(),
-                staged_facts: staged_facts.iter().cloned().collect(),
-            });
+            return Err(CommandCommitProofError::EventualHasNoProjectionSelectors);
         }
         Ok(())
-    }
-}
-
-fn resolve_projection_obligation_expression(
-    canonical_wire_input: &serde_json::Value,
-    confirmation: &CommandProjectionConfirmation,
-    target: &str,
-    expression: &EffectExpression,
-    session: Option<&Session>,
-    expected_scalar: Option<&str>,
-) -> Result<serde_json::Value, ProjectionObligationResolutionError> {
-    match expression {
-        EffectExpression::Input { path } => {
-            let mut value = canonical_wire_input;
-            if path.is_empty() {
-                return Err(ProjectionObligationResolutionError::MissingInputPath {
-                    projector: confirmation.projector.clone(),
-                    model: confirmation.model.clone(),
-                    target: target.to_string(),
-                    path: path.clone(),
-                });
-            }
-            for segment in path {
-                let Some(next) = value.as_object().and_then(|object| object.get(segment)) else {
-                    return Err(ProjectionObligationResolutionError::MissingInputPath {
-                        projector: confirmation.projector.clone(),
-                        model: confirmation.model.clone(),
-                        target: target.to_string(),
-                        path: path.clone(),
-                    });
-                };
-                value = next;
-            }
-            Ok(value.clone())
-        }
-        EffectExpression::Constant { value } => Ok(value.clone()),
-        EffectExpression::Null => Ok(serde_json::Value::Null),
-        EffectExpression::TrustedPreset { name } => {
-            resolve_trusted_preset(session, name, expected_scalar.unwrap_or("String")).ok_or_else(
-                || ProjectionObligationResolutionError::TrustedPresetUnavailable {
-                    projector: confirmation.projector.clone(),
-                    model: confirmation.model.clone(),
-                    target: target.to_string(),
-                    preset: name.clone(),
-                },
-            )
-        }
-        EffectExpression::InvalidConstant { error } => {
-            Err(ProjectionObligationResolutionError::InvalidConstant {
-                projector: confirmation.projector.clone(),
-                model: confirmation.model.clone(),
-                target: target.to_string(),
-                error: error.clone(),
-            })
-        }
     }
 }
 
@@ -413,18 +188,9 @@ impl TypedServiceCommandBinding {
                 ));
             }
             match contract.consistency {
-                CommandConsistency::Eventual
-                    if contract.confirmations.is_empty()
-                        && contract.projections.selectors.is_empty() =>
-                {
+                CommandConsistency::Eventual if contract.projections.selectors.is_empty() => {
                     return Err(format!(
                         "typed causal command `{}` must declare at least one expected projector confirmation",
-                        contract.name
-                    ));
-                }
-                CommandConsistency::Atomic if !contract.confirmations.is_empty() => {
-                    return Err(format!(
-                        "typed projected command `{}` cannot declare asynchronous projector confirmations",
                         contract.name
                     ));
                 }
@@ -486,46 +252,6 @@ impl TypedServiceCommandBinding {
                         contract.name
                     )
                 })?;
-            }
-            if let Some(error) = contract
-                .effects
-                .invalid_constant_error()
-                .or_else(|| {
-                    contract
-                        .confirmations
-                        .iter()
-                        .find_map(invalid_confirmation_constant)
-                })
-                .or_else(|| {
-                    contract
-                        .direct_projection
-                        .as_ref()
-                        .and_then(|target| target.partition.as_ref())
-                        .and_then(invalid_expression_constant)
-                })
-                .or_else(|| {
-                    contract
-                        .projected_model
-                        .as_ref()
-                        .and_then(|model| model.partition.as_ref())
-                        .and_then(invalid_expression_constant)
-                })
-            {
-                return Err(format!(
-                    "typed command `{}` constant effect value failed to serialize: {error}",
-                    contract.name
-                ));
-            }
-            let mut confirmations = BTreeSet::new();
-            for confirmation in &contract.confirmations {
-                let canonical = serde_json::to_string(&confirmation.canonical_value())
-                    .expect("confirmation IR serialization cannot fail");
-                if !confirmations.insert(canonical) {
-                    return Err(format!(
-                        "typed command `{}` repeats an expected projector confirmation",
-                        contract.name
-                    ));
-                }
             }
             types.insert(
                 contract.name.clone(),
@@ -596,8 +322,6 @@ where
             output_type_id: TypeId::of::<K::Payload>(),
             consistency: K::CONSISTENCY,
             input_defaults: Vec::new(),
-            effects: CommandEffects::revalidate(),
-            confirmations: Vec::new(),
             projected_model,
             direct_projection: None,
             projections: CommandProjectionEvents::default(),

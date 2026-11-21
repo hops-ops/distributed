@@ -13,13 +13,7 @@ pub fn surface_for_role(
     grants: &BTreeMap<String, ReadPermission>,
 ) -> Result<Surface, String> {
     // Validate the complete declared topology before authorization filtering.
-    // Only a projector hidden by a valid role selection may become
-    // `confirmation_unavailable`; an omitted catalog topology is an error.
-    validate_command_confirmation_topology(
-        &surface.commands,
-        &surface.projectors,
-        &surface.models,
-    )?;
+    validate_command_projection_topology(&surface.commands, &surface.projectors, &surface.models)?;
     validate_role_grants(surface, role, grants)?;
     let mut models: BTreeMap<String, SurfaceModel> = BTreeMap::new();
 
@@ -204,7 +198,6 @@ pub fn surface_for_role(
     for command in &mut commands {
         command.roles = vec![role.to_string()];
     }
-    sanitize_command_effects_for_models(&mut commands, &models);
 
     let mut projectors = Vec::new();
     for projector in &surface.projectors {
@@ -270,7 +263,6 @@ pub fn surface_for_role(
             modeled,
         });
     }
-    sanitize_command_confirmations(&mut commands, &projectors, &models);
 
     Ok(Surface {
         selection: SurfaceSelection::Role {
@@ -676,12 +668,6 @@ pub fn surface_for_application_contract(
             command
         })
         .collect();
-    sanitize_command_effects_for_models(&mut selected.commands, &selected.models);
-    sanitize_command_confirmations(
-        &mut selected.commands,
-        &selected.projectors,
-        &selected.models,
-    );
     selected
         .commands
         .sort_by(|a, b| a.command_name.cmp(&b.command_name));

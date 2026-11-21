@@ -74,10 +74,10 @@ pub use types::{
     ClientRelationship, ClientRelationshipAggregate, ClientRelationshipKind,
     ClientRelationshipMaintenance, ClientRoot, ClientRootKind, ClientRootOperation,
     ClientRowPolicy, ClientTrustedPresetDescriptor, ClientTypeDef, ClientTypeField,
-    CommandConfirmationsExtension, CommandConsistencyExtension, CommandDirectProjectionExtension,
-    CommandEffectsExtension, CommandInputDefaultsExtension, CommandProjectionArmRef,
-    CommandProjectionExtension, CommandProjectionPreviewOccurrence, CommandProjectionPreviewValue,
-    DistributedClientManifest, ModelNormalization, RelationshipKeyMapping, ScalarCodec,
+    CommandConsistencyExtension, CommandDirectProjectionExtension, CommandInputDefaultsExtension,
+    CommandProjectionArmRef, CommandProjectionExtension, CommandProjectionPreviewOccurrence,
+    CommandProjectionPreviewValue, DistributedClientManifest, ModelNormalization,
+    RelationshipKeyMapping, ScalarCodec,
 };
 pub(crate) use validation::trusted_preset_descriptors;
 

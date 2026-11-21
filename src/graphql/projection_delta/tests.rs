@@ -754,7 +754,6 @@ fn zero_obligation_modeled_metadata_is_revalidated_on_every_receipt_emission() {
             causation_id: Some(TEST_CAUSATION_ID.into()),
             consistency: Some(crate::command::CommandConsistency::Eventual),
             outcome: None,
-            obligations: Vec::new(),
             projection_metadata: Some(metadata),
             projection_revalidate: false,
             evidence: Vec::new(),
@@ -770,7 +769,6 @@ fn zero_obligation_modeled_metadata_is_revalidated_on_every_receipt_emission() {
             consistency: crate::command::CommandConsistency::Eventual,
             state: crate::command_ledger::CommandLedgerState::SucceededPendingProjection,
             outcome: serde_json::json!({"ok": true}),
-            obligations: Vec::new(),
             projection_metadata: Some(metadata),
             direct_projection: None,
         }
@@ -948,7 +946,6 @@ fn zero_occurrence_metadata_is_classified_from_the_current_causal_command_contra
             consistency: crate::command::CommandConsistency::Eventual,
             state: crate::command_ledger::CommandLedgerState::Succeeded,
             outcome: serde_json::json!({"accepted": true}),
-            obligations: Vec::new(),
             projection_metadata: Some(metadata),
             direct_projection: None,
         }
@@ -1170,7 +1167,6 @@ fn wait_path_sealing_retains_event_obligations_and_status_stays_pending_without_
             consistency: CommandConsistency::Eventual,
             state: CommandLedgerState::Succeeded,
             outcome: json!({"accepted": true}),
-            obligations: Vec::new(),
             projection_metadata: None,
             direct_projection: None,
         },
@@ -1244,7 +1240,6 @@ fn wait_path_observation_proof_requires_the_persisted_semantic_program_identity(
             consistency: CommandConsistency::Eventual,
             state: CommandLedgerState::Succeeded,
             outcome: json!({"accepted": true}),
-            obligations: Vec::new(),
             projection_metadata: None,
             direct_projection: None,
         },
@@ -1482,7 +1477,6 @@ fn wait_path_observation_proof_requires_the_persisted_semantic_program_identity(
         causation_id: Some(result.causation_id().into()),
         consistency: Some(CommandConsistency::Eventual),
         outcome: Some(json!({"accepted": true})),
-        obligations: Vec::new(),
         projection_metadata: Some(metadata),
         projection_revalidate: false,
         evidence: vec![CausalCommandProjectionEvidence {
@@ -1523,7 +1517,6 @@ fn wait_path_sealing_keeps_atomic_and_unselected_commands_without_metadata() {
                 consistency: CommandConsistency::Eventual,
                 state: CommandLedgerState::Succeeded,
                 outcome: json!({"accepted": true}),
-                obligations: Vec::new(),
                 projection_metadata: None,
                 direct_projection: None,
             },
@@ -1951,7 +1944,6 @@ fn active_metadata_revalidates_but_remains_queryable_while_projection_is_drainin
             consistency: crate::command::CommandConsistency::Eventual,
             state: crate::command_ledger::CommandLedgerState::Atomic,
             outcome: serde_json::json!({"id": "todo-draining-status"}),
-            obligations: Vec::new(),
             projection_metadata: Some(exact_scope_metadata),
             direct_projection: None,
         })
@@ -2011,7 +2003,6 @@ fn active_metadata_revalidates_but_remains_queryable_while_projection_is_drainin
             causation_id: Some(TEST_CAUSATION_ID.into()),
             consistency: Some(crate::command::CommandConsistency::Eventual),
             outcome: None,
-            obligations: Vec::new(),
             projection_metadata: Some(metadata.clone()),
             projection_revalidate: true,
             evidence: vec![CausalCommandProjectionEvidence {
@@ -2050,7 +2041,6 @@ fn active_metadata_revalidates_but_remains_queryable_while_projection_is_drainin
             consistency: crate::command::CommandConsistency::Eventual,
             state: crate::command_ledger::CommandLedgerState::SucceededPendingProjection,
             outcome: serde_json::json!({"id": "todo-draining-status"}),
-            obligations: Vec::new(),
             projection_metadata: Some(metadata),
             direct_projection: None,
         })
@@ -2118,7 +2108,6 @@ fn lifecycle_status_rejects_changed_deployment_identity_and_mixed_fanout_tamperi
                 consistency: crate::command::CommandConsistency::Eventual,
                 state: crate::command_ledger::CommandLedgerState::SucceededPendingProjection,
                 outcome: serde_json::json!({"id": "todo-lifecycle-hostile"}),
-                obligations: Vec::new(),
                 projection_metadata: Some(metadata),
                 direct_projection: None,
             })

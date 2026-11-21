@@ -21,11 +21,6 @@ pub(crate) enum ProjectionScopeCodecError {
         expected: String,
         actual: String,
     },
-    #[allow(dead_code)]
-    StoredScopeMismatch {
-        projector: String,
-        model: String,
-    },
     UnknownModel {
         projector: String,
         model: String,
@@ -108,10 +103,6 @@ impl fmt::Display for ProjectionScopeCodecError {
             Self::ProjectorMismatch { expected, actual } => write!(
                 formatter,
                 "projection scope belongs to projector `{expected}`, not `{actual}`"
-            ),
-            Self::StoredScopeMismatch { projector, model } => write!(
-                formatter,
-                "stored projection obligation `{projector}`/`{model}` scope does not match its canonical logical fields"
             ),
             Self::UnknownModel { projector, model } => write!(
                 formatter,

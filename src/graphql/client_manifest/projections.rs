@@ -1435,12 +1435,9 @@ mod tests {
             }),
             consistency: CommandConsistency::Succeeded,
             input_defaults: Vec::new(),
-            effects: None,
-            confirmations: Vec::new(),
             projected_model: None,
             direct_projection: None,
             projections: Default::default(),
-            confirmation_unavailable: false,
         }
     }
 
@@ -1760,12 +1757,9 @@ mod tests {
                 path: vec!["todo_id".into()],
                 generator: InputDefaultGenerator::UuidV7,
             }],
-            effects: None,
-            confirmations: Vec::new(),
             projected_model: None,
             direct_projection: None,
             projections: Default::default(),
-            confirmation_unavailable: false,
         };
         command.projections.add_event_set(crate::events![PreviewA]);
 

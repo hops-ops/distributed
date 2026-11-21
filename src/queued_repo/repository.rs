@@ -20,7 +20,6 @@ use crate::projection_protocol::{
     ProjectionCommitResult, ProjectionFailure, ProjectionFailureBatch, ProjectionFailureLocation,
     ProjectionGeneration, ProjectionInputCursor, ProjectionInputDisposition,
     ProjectionLiveRecordBatch, ProjectionLiveRecordBatchRequest, ProjectionModelOwnership,
-    ProjectionObligationEvidenceBatch, ProjectionObligationEvidenceBatchRequest,
     ProjectionObservation, ProjectionObservationKind, ProjectionPartitionRuntimeState,
     ProjectionProtocolError, ProjectionProtocolStore, ProjectionQuerySnapshot,
     ProjectionQuerySnapshotBatch, ProjectionQuerySnapshotBatchRequest,
@@ -341,20 +340,6 @@ where
     L: LockManager,
 {
     #[cfg(feature = "graphql")]
-    fn command_obligation_evidence<'a>(
-        &'a self,
-        request: &'a crate::projection_protocol::ProjectionObligationEvidenceBatchRequest,
-    ) -> impl std::future::Future<
-        Output = Result<
-            crate::projection_protocol::ProjectionObligationEvidenceBatch,
-            crate::projection_protocol::ProjectionProtocolError,
-        >,
-    > + Send
-           + 'a {
-        self.inner.command_obligation_evidence(request)
-    }
-
-    #[cfg(feature = "graphql")]
     fn command_causation_evidence<'a>(
         &'a self,
         request: &'a crate::projection_protocol::ProjectionCausationEvidenceRequest,
@@ -465,15 +450,6 @@ where
     ) -> impl Future<Output = Result<ProjectionQuerySnapshotBatch, ProjectionProtocolError>> + Send + 'a
     {
         self.inner.projection_query_snapshot_batch(request)
-    }
-
-    fn projection_obligation_evidence_batch<'a>(
-        &'a self,
-        request: &'a ProjectionObligationEvidenceBatchRequest,
-    ) -> impl Future<Output = Result<ProjectionObligationEvidenceBatch, ProjectionProtocolError>>
-           + Send
-           + 'a {
-        self.inner.projection_obligation_evidence_batch(request)
     }
 
     fn projection_causation_evidence<'a>(

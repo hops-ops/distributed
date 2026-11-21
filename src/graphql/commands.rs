@@ -82,12 +82,9 @@ impl TypedCommandInventory {
                     output: SurfaceCommandShape::Typed(surface_type(&contract.output)),
                     consistency: contract.consistency,
                     input_defaults: contract.input_defaults.clone(),
-                    effects: Some(contract.effects.clone()),
-                    confirmations: contract.confirmations.clone(),
                     projected_model: contract.projected_model.clone(),
                     direct_projection: contract.direct_projection.clone(),
                     projections: contract.projections.clone(),
-                    confirmation_unavailable: false,
                 }
             })
             .collect()
@@ -98,7 +95,7 @@ impl TypedCommandInventory {
         self.contracts.clone()
     }
 
-    /// Bind every confirmation and ordinary `Atomic<M>` target to the exact
+    /// Bind every ordinary `Atomic<M>` target to the exact
     /// compiled projector registry. Runtime lowering never reconstructs
     /// authority from projector/model strings.
     #[cfg(feature = "graphql")]
@@ -134,50 +131,6 @@ impl TypedCommandInventory {
 
         for contract in &mut self.contracts {
             let name = &contract.name;
-            for confirmation in &mut contract.confirmations {
-                let projector = projectors
-                    .iter()
-                    .find(|projector| projector.name == confirmation.projector)
-                    .ok_or_else(|| {
-                        format!(
-                            "typed command `{name}` expects unknown projector `{}`",
-                            confirmation.projector
-                        )
-                    })?;
-                let binding_facts = projector.binding_facts();
-                let binding_models = projector.binding_models();
-                if !confirmation.topology_matches(
-                    &projector.name,
-                    &binding_facts,
-                    &binding_models,
-                    &projector.partition,
-                ) {
-                    return Err(format!(
-                        "typed command `{name}` captured projector `{}` topology identity does not match the registered projector facts/models",
-                        confirmation.projector
-                    ));
-                }
-                if !confirmation.partition_matches(&projector.partition) {
-                    return Err(format!(
-                        "typed command `{name}` confirmation for projector `{}` does not provide the partition mapping required by its declaration",
-                        confirmation.projector
-                    ));
-                }
-                if !binding_models
-                    .iter()
-                    .any(|model| model == &confirmation.model)
-                {
-                    return Err(format!(
-                        "typed command `{name}` expects projector `{}` to confirm model `{}`, but that model is not in the projector topology",
-                        confirmation.projector, confirmation.model
-                    ));
-                }
-                let (topology, _) = compiled_projectors
-                    .get(&projector.name)
-                    .expect("every registered projector was compiled above");
-                confirmation.bind_protocol_topology(topology.clone());
-            }
-
             if contract.consistency != CommandConsistency::Atomic {
                 continue;
             }

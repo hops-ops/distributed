@@ -483,7 +483,7 @@ fn modeled_surface_with_base(
 }
 
 fn projected_surface() -> Surface {
-    use crate::command::{CommandEffects, CommandProjectedModel, EffectExpression};
+    use crate::command::{CommandProjectedModel, EffectExpression};
 
     let todo_schema: &'static TableSchema = Box::leak(Box::new(todos()));
     let mut surface = build_surface(&[todo_schema.clone(), users()], &SurfaceOptions::sqlite())
@@ -525,8 +525,6 @@ fn projected_surface() -> Surface {
         }),
         consistency: CommandConsistency::Atomic,
         input_defaults: Vec::new(),
-        effects: Some(CommandEffects::revalidate()),
-        confirmations: Vec::new(),
         projected_model: Some(CommandProjectedModel {
             output_type_id: TypeId::of::<()>(),
             model: "TodoView".into(),
@@ -538,7 +536,6 @@ fn projected_surface() -> Surface {
         }),
         direct_projection: None,
         projections: Default::default(),
-        confirmation_unavailable: false,
     }];
     surface.commands_attached = true;
     surface
@@ -603,58 +600,6 @@ fn projected_command_exports_opaque_role_safe_direct_target() {
     assert!(!wire.contains("UserView"));
     assert!(!wire.contains("users"));
     assert!(!wire.contains("user.changed"));
-}
-
-#[test]
-fn legacy_effect_presets_are_not_v2_client_authority() {
-    use crate::command::{
-        CommandEffect, CommandEffects, EffectExpression, EffectFieldValue, EffectKey,
-    };
-
-    let mut full = projected_surface();
-    full.commands[0].effects = Some(CommandEffects::new([CommandEffect::Patch {
-        model: "TodoView".into(),
-        key: EffectKey {
-            fields: vec![EffectFieldValue {
-                field: "todo_id".into(),
-                value: EffectExpression::Input {
-                    path: vec!["todo_id".into()],
-                },
-            }],
-        },
-        fields: vec![EffectFieldValue {
-            field: "owner_id".into(),
-            value: EffectExpression::TrustedPreset {
-                name: "x-user-id".into(),
-            },
-        }],
-    }]));
-    let selected = surface_for_role(
-        &full,
-        "user",
-        &BTreeMap::from([
-            ("TodoView".into(), read().all_columns()),
-            ("UserView".into(), read().all_columns()),
-        ]),
-    )
-    .expect("role selection");
-    let manifest = client_manifest_from_surface(
-        "todos-service",
-        ClientSurfaceIdentity::role("user"),
-        &selected,
-    )
-    .expect("trusted preset descriptor manifest");
-
-    assert!(manifest.commands[0].extensions.trusted_presets.is_empty());
-    let wire = serde_json::to_value(manifest).expect("manifest JSON");
-    assert!(wire["commands"][0]["extensions"].get("effects").is_none());
-    assert!(wire["commands"][0]["extensions"]
-        .get("confirmations")
-        .is_none());
-    assert!(
-        !wire.to_string().contains("preset-value"),
-        "static artifacts must never freeze a runtime preset value"
-    );
 }
 
 #[test]
@@ -831,7 +776,7 @@ fn role_manifest_is_deterministic_and_hides_denied_identity_and_commands() {
     assert_eq!(first.schema_fingerprint, second.schema_fingerprint);
     assert_eq!(
         first.schema_fingerprint,
-        "sha256:d0e8509749ca7a9a4a1b48a785e448bb5e798e6376f920bc15ec9c07ac314d7c"
+        "sha256:d8bb6c9435afa563ff389501f005aaeec2dce269b751de0a40b191a74cc7a615"
     );
     assert_eq!(
         first.protocol_fingerprint,
@@ -930,11 +875,10 @@ fn role_manifest_is_deterministic_and_hides_denied_identity_and_commands() {
         .iter()
         .any(|command| command.name == "todo.force_archive"));
     assert_eq!(first.commands[0].grants, vec!["user"]);
-    assert!(first.commands.iter().all(|command| {
-        command.extensions.consistency.kind == "succeeded"
-            && command.extensions.effects.is_none()
-            && command.extensions.confirmations.is_none()
-    }));
+    assert!(first
+        .commands
+        .iter()
+        .all(|command| command.extensions.consistency.kind == "succeeded"));
 
     let json = serde_json::to_string(&first).unwrap();
     assert!(!json.contains("secret"));
@@ -1036,7 +980,7 @@ fn role_and_application_partition_manifests_hide_raw_paths_and_denied_values() {
 }
 
 #[test]
-fn manifest_v2_decode_rejects_unknown_versions_fields_and_legacy_authority() {
+fn manifest_v2_decode_rejects_unknown_versions_and_fields() {
     let full = full_surface();
     let selected = surface_for_role(&full, "user", &grants()["user"]).unwrap();
     let baseline = client_manifest_from_surface(
@@ -1061,29 +1005,9 @@ fn manifest_v2_decode_rejects_unknown_versions_fields_and_legacy_authority() {
     slots["commands"][0]["extensions"]["version"] = serde_json::json!(1);
     assert!(serde_json::from_value::<DistributedClientManifest>(slots).is_err());
 
-    for legacy in ["effects", "confirmations"] {
-        let mut hostile = value.clone();
-        hostile["commands"][0]["extensions"][legacy] = serde_json::json!(null);
-        assert!(
-            serde_json::from_value::<DistributedClientManifest>(hostile).is_err(),
-            "v2 must reject even null legacy `{legacy}` authority"
-        );
-    }
-
-    let mut mixed = value.clone();
-    mixed["commands"][0]["extensions"]["projection"] = serde_json::json!({
-        "version": 1,
-        "event_set": [],
-        "program_arms": [],
-        "preview_occurrences": [],
-        "fallback": "revalidate"
-    });
-    mixed["commands"][0]["extensions"]["effects"] = serde_json::json!({
-        "version": 1,
-        "operations": [],
-        "fallback": "revalidate"
-    });
-    assert!(serde_json::from_value::<DistributedClientManifest>(mixed).is_err());
+    let mut unknown_slot = value.clone();
+    unknown_slot["commands"][0]["extensions"]["effects"] = serde_json::json!(null);
+    assert!(serde_json::from_value::<DistributedClientManifest>(unknown_slot).is_err());
 
     for version in [1, 3] {
         let mut program = value.clone();

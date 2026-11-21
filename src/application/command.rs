@@ -74,7 +74,7 @@ pub struct EventSpec {
 
 /// The portable half of one typed command declaration.
 ///
-/// The effect, default, confirmation, and projection values are copied from
+/// The default and projection values are copied from
 /// the existing typed-command IR. They remain explicit JSON-shaped data; no
 /// handler symbol, Rust `TypeId`, closure, or machine path is retained.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -87,15 +87,9 @@ pub struct CommandSpec {
     pub output: CommandTypeSpec,
     pub consistency: CommandConsistency,
     pub defaults: serde_json::Value,
-    pub effects: serde_json::Value,
     pub emits: Vec<EventSpec>,
     pub applies: serde_json::Value,
     pub projection_contract: serde_json::Value,
-    /// Declaration-owned projector/model/key confirmations. These are the
-    /// portable proof inputs; topology pointers and schemas are intentionally
-    /// reduced to their canonical identities by `canonical_value()`.
-    #[serde(default)]
-    pub confirmations: Vec<serde_json::Value>,
     /// Canonical direct-projection proof material, if the outcome is Atomic.
     /// The erased Rust type identity is never copied into this value.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -141,7 +135,7 @@ pub struct CommandDefinition {
     spec: CommandSpec,
     /// The exact typed declaration that produced `spec`. This is retained for
     /// contract-only composition so Surface authorization can bind from the
-    /// declaration-owned GraphQL shapes and effects without reconstructing a
+    /// declaration-owned GraphQL shapes without reconstructing a
     /// lossy command from public JSON.
     typed_contract: Option<TypedCommandContract>,
     mount: Option<CommandMount>,
@@ -270,11 +264,9 @@ impl CommandSpec {
             output,
             consistency,
             defaults: serde_json::Value::Array(Vec::new()),
-            effects: serde_json::Value::Null,
             emits: Vec::new(),
             applies: serde_json::Value::Array(Vec::new()),
             projection_contract: serde_json::Value::Null,
-            confirmations: Vec::new(),
             direct_projection: None,
             projected_model: None,
             fingerprint: String::new(),
@@ -315,9 +307,6 @@ impl CommandSpec {
         if self.consistency != exposed.consistency {
             mismatches.push("consistency");
         }
-        if exposed.confirmation_unavailable {
-            mismatches.push("confirmation availability");
-        }
         if !mismatches.is_empty() {
             return Err(ApplicationError::Collision {
                 kind: "command",
@@ -328,9 +317,6 @@ impl CommandSpec {
                 ),
             });
         }
-        let confirmations = exposed.confirmations.as_array().cloned().ok_or_else(|| {
-            ApplicationError::InvalidSpec("surface confirmations must be an array".into())
-        })?;
         self.input = exposed
             .input
             .clone()
@@ -347,10 +333,8 @@ impl CommandSpec {
             })?;
         self.roles = exposed.roles.clone();
         self.defaults = exposed.defaults.clone();
-        self.effects = exposed.effects.clone();
         self.applies = exposed.applies.clone();
         self.projection_contract = exposed.projection_contract.clone();
-        self.confirmations = confirmations;
         self.direct_projection = exposed.direct_projection.clone();
         self.projected_model = exposed.projected_model.clone();
         self.refresh_fingerprint()?;
@@ -373,11 +357,6 @@ impl CommandSpec {
     ) -> ApplicationResult<Self> {
         let projection_contract = serde_json::to_value(&contract.projections)?;
         let applies = serde_json::to_value(&contract.projections.previews)?;
-        let confirmations = contract
-            .confirmations
-            .iter()
-            .map(crate::command::CommandProjectionConfirmation::canonical_value)
-            .collect();
         let direct_projection = contract
             .direct_projection
             .as_ref()
@@ -420,11 +399,9 @@ impl CommandSpec {
             output: CommandTypeSpec::from(&contract.output),
             consistency: contract.consistency,
             defaults: serde_json::to_value(&contract.input_defaults)?,
-            effects: serde_json::to_value(&contract.effects)?,
             emits,
             applies,
             projection_contract,
-            confirmations,
             direct_projection,
             projected_model: contract
                 .projected_model
@@ -490,12 +467,8 @@ impl CommandSpec {
             validate_text("event body codec", &event.body_codec)?;
         }
         validate_json_contract("command defaults", &self.defaults)?;
-        validate_json_contract("command effects", &self.effects)?;
         validate_json_contract("command applies", &self.applies)?;
         validate_json_contract("command projection contract", &self.projection_contract)?;
-        for confirmation in &self.confirmations {
-            validate_json_contract("command confirmation", confirmation)?;
-        }
         if let Some(direct) = &self.direct_projection {
             validate_json_contract("command direct projection", direct)?;
         }

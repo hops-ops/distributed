@@ -17,8 +17,8 @@ use crate::command::CommandConsistency;
 use crate::command_ledger::CommandLedgerState;
 use crate::graphql::projection_delta::runtime::ModeledProjectionStatusDisposition;
 use crate::microsvc::{
-    CausalCommandProjectionObligation, CausalCommandPublicState, CausalCommandPublicStatus,
-    CausalCommandReceiptSource, CausalProjectionEvidenceState,
+    CausalCommandPublicState, CausalCommandPublicStatus, CausalCommandReceiptSource,
+    CausalProjectionEvidenceState,
 };
 
 #[derive(Serialize)]
@@ -673,9 +673,7 @@ impl ProtocolResponseAccumulator {
         let obligation_count = receipt
             .projection_metadata
             .as_ref()
-            .map_or(receipt.obligations.len(), |metadata| {
-                metadata.obligations.len()
-            });
+            .map_or(0, |metadata| metadata.obligations.len());
         let observed = if receipt.state == CommandLedgerState::Atomic {
             (0..obligation_count).collect::<Vec<_>>()
         } else {
@@ -687,7 +685,6 @@ impl ProtocolResponseAccumulator {
             &receipt.causation_id,
             command_state(receipt.state),
             receipt.consistency,
-            &receipt.obligations,
             receipt.projection_metadata.as_ref(),
             receipt.direct_projection.as_ref(),
             &observed,
@@ -723,7 +720,6 @@ impl ProtocolResponseAccumulator {
                 causation_id,
                 public_command_state(status.state),
                 consistency,
-                &status.obligations,
                 status.projection_metadata.as_ref(),
                 status.direct_projection.as_ref(),
                 &observed,
@@ -745,15 +741,11 @@ impl ProtocolResponseAccumulator {
         causation_id: &str,
         state: DistributedCommandState,
         consistency: CommandConsistency,
-        obligations: &[CausalCommandProjectionObligation],
         projection_metadata: Option<&super::CommandProjectionMetadataV1>,
         direct_projection: Option<&crate::projection_protocol::SameTransactionProjectionEvidence>,
         observed_obligation_indices: &[usize],
         projection_disposition: Option<DistributedProjectionDisposition>,
     ) -> Result<DistributedCommandMetadata, ProtocolAccumulatorError> {
-        if projection_metadata.is_some() && !obligations.is_empty() {
-            return Err(ProtocolAccumulatorError::Encoding);
-        }
         if let Some(metadata) = projection_metadata {
             // Modeled metadata is a request-authorized capability even when it
             // carries no finite obligations and the ledger state is already
@@ -780,9 +772,7 @@ impl ProtocolResponseAccumulator {
         if projection_disposition.is_some() && projection_metadata.is_none() {
             return Err(ProtocolAccumulatorError::Encoding);
         }
-        if projection_disposition.is_some()
-            && (!obligations.is_empty() || direct_projection.is_some())
-        {
+        if projection_disposition.is_some() && direct_projection.is_some() {
             return Err(ProtocolAccumulatorError::Encoding);
         }
         if projection_disposition.is_some() {
@@ -798,25 +788,8 @@ impl ProtocolResponseAccumulator {
                 records: Vec::new(),
             });
         }
-        let mut expects = obligations
-            .iter()
-            .map(|obligation| {
-                self.issue_projection_obligation_scope(
-                    causation_id,
-                    &obligation.projector,
-                    &obligation.model,
-                    obligation.observation_kind,
-                    &obligation.scope,
-                )
-                .map(|scope_token| DistributedProjectionExpectation {
-                    projection: obligation.projector.clone(),
-                    model: obligation.model.clone(),
-                    scope_token,
-                })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        if let Some(metadata) = projection_metadata {
-            expects.extend(
+        let expects = projection_metadata
+            .map(|metadata| {
                 metadata
                     .obligations
                     .iter()
@@ -829,9 +802,10 @@ impl ProtocolResponseAccumulator {
                             }
                         })
                     })
-                    .collect::<Result<Vec<_>, _>>()?,
-            );
-        }
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .transpose()?
+            .unwrap_or_default();
         let mut seen_observations = std::collections::BTreeSet::new();
         let observations = observed_obligation_indices
             .iter()
@@ -839,38 +813,18 @@ impl ProtocolResponseAccumulator {
                 if !seen_observations.insert(*index) {
                     return Err(ProtocolAccumulatorError::Encoding);
                 }
-                match projection_metadata {
-                    Some(metadata) => {
-                        let obligation = metadata
-                            .obligations
-                            .get(*index)
-                            .ok_or(ProtocolAccumulatorError::Encoding)?;
-                        let (projection, model) = modeled_obligation_label(metadata, obligation)?;
-                        Ok(DistributedProjectionObservation {
-                            causation_id: causation_id.to_string(),
-                            projection,
-                            model,
-                            scope_token: obligation.scope_token.clone(),
-                        })
-                    }
-                    None => {
-                        let obligation = obligations
-                            .get(*index)
-                            .ok_or(ProtocolAccumulatorError::Encoding)?;
-                        Ok(DistributedProjectionObservation {
-                            causation_id: causation_id.to_string(),
-                            projection: obligation.projector.clone(),
-                            model: obligation.model.clone(),
-                            scope_token: self.issue_projection_obligation_scope(
-                                causation_id,
-                                &obligation.projector,
-                                &obligation.model,
-                                obligation.observation_kind,
-                                &obligation.scope,
-                            )?,
-                        })
-                    }
-                }
+                let metadata = projection_metadata.ok_or(ProtocolAccumulatorError::Encoding)?;
+                let obligation = metadata
+                    .obligations
+                    .get(*index)
+                    .ok_or(ProtocolAccumulatorError::Encoding)?;
+                let (projection, model) = modeled_obligation_label(metadata, obligation)?;
+                Ok(DistributedProjectionObservation {
+                    causation_id: causation_id.to_string(),
+                    projection,
+                    model,
+                    scope_token: obligation.scope_token.clone(),
+                })
             })
             .collect::<Result<Vec<_>, ProtocolAccumulatorError>>()?;
         let records = direct_projection

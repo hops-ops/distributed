@@ -1,7 +1,7 @@
 use std::any::TypeId;
 
 use super::*;
-use crate::command::{CommandEffects, TypedCommandContract};
+use crate::command::TypedCommandContract;
 use crate::graphql::commands::TypedCommandInventory;
 use crate::graphql::permissions::read;
 
@@ -271,8 +271,6 @@ fn test_command(
         output_type_id,
         consistency: CommandConsistency::Succeeded,
         input_defaults: Vec::new(),
-        effects: CommandEffects::revalidate(),
-        confirmations: Vec::new(),
         projected_model: None,
         direct_projection: None,
         projections: Default::default(),
@@ -999,12 +997,9 @@ fn projected_output_reuse_and_sdl_emission_use_the_same_exact_predicate() {
         output: SurfaceCommandShape::Typed(output),
         consistency: CommandConsistency::Atomic,
         input_defaults: Vec::new(),
-        effects: Some(CommandEffects::revalidate()),
-        confirmations: Vec::new(),
         projected_model: Some(projected_model.clone()),
         direct_projection: None,
         projections: Default::default(),
-        confirmation_unavailable: false,
     };
     let one_string_field = |name: &str| SurfaceTypeDef {
         name: name.into(),
@@ -1067,179 +1062,6 @@ fn surface_for_role_drops_ungranted_columns_and_models() {
     let empty = surface_for_role(&full, "anon", &BTreeMap::new()).unwrap();
     assert!(empty.models.is_empty());
     assert!(empty.query_fields.is_empty());
-}
-
-#[test]
-fn role_surface_legacy_effects_never_become_v2_client_authority() {
-    let mut full = build_surface(&[orders()], &SurfaceOptions::sqlite()).unwrap();
-    let input = SurfaceTypeDef {
-        name: "UpdateOrderInput".into(),
-        fields: vec![
-            SurfaceTypeField {
-                unsigned_integer: None,
-                name: "order_id".into(),
-                type_name: "String".into(),
-                nullable: false,
-                list: false,
-                item_nullable: false,
-                nested: None,
-            },
-            SurfaceTypeField {
-                unsigned_integer: None,
-                name: "customer_id".into(),
-                type_name: "String".into(),
-                nullable: false,
-                list: false,
-                item_nullable: false,
-                nested: None,
-            },
-        ],
-    };
-    let key = EffectKey {
-        fields: vec![EffectFieldValue {
-            field: "order_id".into(),
-            value: EffectExpression::Input {
-                path: vec!["order_id".into()],
-            },
-        }],
-    };
-    let denied_field_command = SurfaceCommand {
-        command_name: "order.assign_customer".into(),
-        field_name: "order_assign_customer".into(),
-        roles: Vec::new(),
-        input: SurfaceCommandShape::Typed(input.clone()),
-        output: SurfaceCommandShape::Typed(SurfaceTypeDef {
-            name: "AssignCustomerPayload".into(),
-            fields: vec![SurfaceTypeField {
-                unsigned_integer: None,
-                name: "order_id".into(),
-                type_name: "String".into(),
-                nullable: false,
-                list: false,
-                item_nullable: false,
-                nested: None,
-            }],
-        }),
-        consistency: CommandConsistency::Succeeded,
-        input_defaults: Vec::new(),
-        effects: Some(CommandEffects::new([CommandEffect::Patch {
-            model: "OrderView".into(),
-            key: key.clone(),
-            fields: vec![EffectFieldValue {
-                field: "customer_id".into(),
-                value: EffectExpression::Input {
-                    path: vec!["customer_id".into()],
-                },
-            }],
-        }])),
-        confirmations: Vec::new(),
-        projected_model: None,
-        direct_projection: None,
-        projections: Default::default(),
-        confirmation_unavailable: false,
-    };
-    let trusted_preset_command = SurfaceCommand {
-        command_name: "order.apply_preset".into(),
-        field_name: "order_apply_preset".into(),
-        roles: Vec::new(),
-        input: SurfaceCommandShape::Typed(input),
-        output: SurfaceCommandShape::Typed(SurfaceTypeDef {
-            name: "ApplyPresetPayload".into(),
-            fields: vec![SurfaceTypeField {
-                unsigned_integer: None,
-                name: "order_id".into(),
-                type_name: "String".into(),
-                nullable: false,
-                list: false,
-                item_nullable: false,
-                nested: None,
-            }],
-        }),
-        consistency: CommandConsistency::Succeeded,
-        input_defaults: Vec::new(),
-        effects: Some(CommandEffects::new([CommandEffect::Patch {
-            model: "OrderView".into(),
-            key,
-            fields: vec![EffectFieldValue {
-                field: "status".into(),
-                value: EffectExpression::TrustedPreset {
-                    name: "tenant-secret".into(),
-                },
-            }],
-        }])),
-        confirmations: Vec::new(),
-        projected_model: None,
-        direct_projection: None,
-        projections: Default::default(),
-        confirmation_unavailable: false,
-    };
-    full.commands = vec![denied_field_command, trusted_preset_command];
-    validate_and_canonicalize_commands(&full.models, &full.comparison_ops, &mut full.commands)
-        .unwrap();
-
-    let selected = surface_for_role(
-        &full,
-        "user",
-        &BTreeMap::from([("OrderView".into(), read().columns(["order_id", "status"]))]),
-    )
-    .unwrap();
-    let denied = selected
-        .commands
-        .iter()
-        .find(|command| command.command_name == "order.assign_customer")
-        .expect("denied-field command");
-    assert!(denied
-        .effects
-        .as_ref()
-        .is_some_and(|effects| effects.operations.is_empty()));
-    let trusted = selected
-        .commands
-        .iter()
-        .find(|command| command.command_name == "order.apply_preset")
-        .expect("trusted-preset command");
-    assert!(trusted
-        .effects
-        .as_ref()
-        .is_some_and(|effects| !effects.operations.is_empty()));
-
-    let manifest = super::super::client_manifest_from_surface(
-        "orders",
-        super::super::ClientSurfaceIdentity::role("user"),
-        &selected,
-    )
-    .unwrap();
-    let denied = manifest
-        .commands
-        .iter()
-        .find(|command| command.name == "order.assign_customer")
-        .expect("denied-field manifest command");
-    assert!(denied.extensions.effects.is_none());
-    assert!(denied.extensions.trusted_presets.is_empty());
-    let denied_effects_json = serde_json::to_string(&denied.extensions.effects).unwrap();
-    assert!(
-        !denied_effects_json.contains("customer_id"),
-        "{denied_effects_json}"
-    );
-    assert!(
-        !denied_effects_json.contains("tenant-secret"),
-        "{denied_effects_json}"
-    );
-
-    let trusted = manifest
-        .commands
-        .iter()
-        .find(|command| command.name == "order.apply_preset")
-        .expect("trusted-preset manifest command");
-    assert!(trusted.extensions.effects.is_none());
-    assert!(trusted.extensions.trusted_presets.is_empty());
-    let trusted_json = serde_json::to_string(trusted).unwrap();
-    assert!(!trusted_json.contains("tenant-secret"), "{trusted_json}");
-    let preset_descriptors_json =
-        serde_json::to_string(&trusted.extensions.trusted_presets).unwrap();
-    assert!(
-        !preset_descriptors_json.contains("\"value\":"),
-        "{preset_descriptors_json}"
-    );
 }
 
 #[test]
@@ -1954,12 +1776,9 @@ fn constant_validation_uses_exact_wire_scalar_domains() {
         }),
         consistency: CommandConsistency::Succeeded,
         input_defaults: Vec::new(),
-        effects: Some(CommandEffects::revalidate()),
-        confirmations: Vec::new(),
         projected_model: None,
         direct_projection: None,
         projections: Default::default(),
-        confirmation_unavailable: false,
     };
     let constant = |value| EffectExpression::Constant { value };
     let column = |name: &str, scalar: &str| ColumnField {
@@ -1992,56 +1811,6 @@ fn constant_validation_uses_exact_wire_scalar_domains() {
     }
 }
 
-#[test]
-fn missing_surface_primary_key_column_is_a_configuration_error_not_a_panic() {
-    let surface = build_surface(&[orders()], &SurfaceOptions::sqlite()).unwrap();
-    let mut model = surface.models["OrderView"].clone();
-    model.columns.retain(|column| column.name != "order_id");
-    let models = BTreeMap::from([("OrderView".into(), model)]);
-    let command = SurfaceCommand {
-        command_name: "order.patch".into(),
-        field_name: "order_patch".into(),
-        roles: Vec::new(),
-        input: SurfaceCommandShape::None,
-        output: SurfaceCommandShape::Typed(SurfaceTypeDef {
-            name: "PatchOrderPayload".into(),
-            fields: vec![SurfaceTypeField {
-                unsigned_integer: None,
-                name: "order_id".into(),
-                type_name: "String".into(),
-                nullable: false,
-                list: false,
-                item_nullable: false,
-                nested: None,
-            }],
-        }),
-        consistency: CommandConsistency::Succeeded,
-        input_defaults: Vec::new(),
-        effects: Some(CommandEffects::revalidate()),
-        confirmations: Vec::new(),
-        projected_model: None,
-        direct_projection: None,
-        projections: Default::default(),
-        confirmation_unavailable: false,
-    };
-    let key = EffectKey {
-        fields: vec![EffectFieldValue {
-            field: "order_id".into(),
-            value: EffectExpression::Constant {
-                value: serde_json::json!("order-1"),
-            },
-        }],
-    };
-
-    let result =
-        std::panic::catch_unwind(|| validate_effect_key(&models, &command, "OrderView", &key));
-    let error = result
-        .expect("malformed Surface metadata must not panic")
-        .expect_err("missing primary-key column must fail closed");
-    assert!(error.contains("missing or hidden on the selected Surface"));
-}
-
-/// A7: role×dialect inventory + IR→SDL ops stay aligned (portable fixture).
 #[test]
 fn a7_role_dialect_parity_inventory_and_sdl_ops() {
     use super::super::sdl::{graphql_sdl_for_role, SdlOptions};

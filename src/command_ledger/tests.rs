@@ -11,8 +11,7 @@ use crate::outbox_worker::OutboxStore;
 use crate::projection_protocol::{
     PartitionId, ProjectionChange, ProjectionChangeCursor, ProjectionChangeKind, ProjectionEpoch,
     ProjectionObservation, ProjectionObservationKind, ProjectionRecordMetadata,
-    ProjectionRecordScope, ProjectorTopologyId, RecordKey, RecordKeyField, RecordRevision,
-    ResolvedProjectionObligation, SameTransactionProjectionEvidence,
+    ProjectionRecordScope, ProjectorTopologyId, RecordRevision, SameTransactionProjectionEvidence,
 };
 use crate::read_model::{ReadModelWritePlanBuilder, RelationalReadModel};
 use crate::repository::{
@@ -81,33 +80,6 @@ fn conformance_table_registry() -> TableSchemaRegistry {
     registry
 }
 
-fn resolved_obligation(marker: &str) -> ResolvedProjectionObligation {
-    let projector = format!("projector-{marker}");
-    let topology =
-        crate::projection_protocol::ProjectorTopologyId::new(1, &projector, [7; 32]).unwrap();
-    let partition =
-        crate::projection_protocol::PartitionId::new(b"test-partition".to_vec()).unwrap();
-    let scope = crate::projection_protocol::ProjectionRecordScope::new(
-        topology,
-        partition,
-        "LedgerConformanceView",
-        format!("key-{marker}").into_bytes(),
-    )
-    .unwrap();
-    ResolvedProjectionObligation {
-        projector,
-        model: "LedgerConformanceView".into(),
-        key: RecordKey {
-            fields: vec![RecordKeyField {
-                field: "id".into(),
-                value: serde_json::json!({"wire": marker, "wide": "18446744073709551615"}),
-            }],
-        },
-        partition: Some(serde_json::Value::Null),
-        scope,
-    }
-}
-
 fn direct_projection_evidence(marker: &str) -> SameTransactionProjectionEvidence {
     let topology = ProjectorTopologyId::new(1, "ledger-direct-projector", [0x42; 32]).unwrap();
     let partition = PartitionId::new(format!("partition:{marker}")).unwrap();
@@ -170,10 +142,7 @@ fn fresh_attempt() -> CommandAttempt {
         .unwrap()
 }
 
-fn completed_replay_record(
-    state: CommandLedgerState,
-    obligations: Vec<ResolvedProjectionObligation>,
-) -> CommandLedgerRecord {
+fn completed_replay_record(state: CommandLedgerState) -> CommandLedgerRecord {
     let request = reservation(&Uuid::now_v7().to_string(), 1, 2).unwrap();
     let started = SystemTime::UNIX_EPOCH + Duration::from_secs(100);
     let mut row = CommandLedgerRecord::initial(&request, started).unwrap();
@@ -184,7 +153,6 @@ fn completed_replay_record(
         serde_json::json!({
             "version": COMMAND_REPLAY_VERSION,
             "outcome": {"ok": true},
-            "projection_obligations": obligations,
         })
         .to_string(),
     );
@@ -327,7 +295,6 @@ where
             binding,
             TerminalCommandState::Succeeded,
             serde_json::json!({"remote": true}),
-            Vec::new(),
             Duration::from_secs(300),
         )
         .unwrap();
@@ -411,7 +378,6 @@ where
         other => panic!("sealed external completion should replay, got {other:?}"),
     };
     assert_eq!(replay.state, CommandLedgerState::SucceededPendingProjection);
-    assert_eq!(replay.projection_obligations, Vec::new());
     assert_eq!(
         replay.projection_metadata.as_deref(),
         Some(metadata_bytes.as_slice())
@@ -439,7 +405,6 @@ where
         external_binding("orders-3"),
         TerminalCommandState::Succeeded,
         serde_json::json!({"wrong": true}),
-        Vec::new(),
         Duration::from_secs(300),
     );
     assert!(matches!(wrong_binding, Err(CommandLedgerError::Invalid(_))));
@@ -468,7 +433,6 @@ where
             external_binding("orders-4"),
             TerminalCommandState::Succeeded,
             serde_json::json!({"winner": false}),
-            Vec::new(),
             Duration::from_secs(300),
         )
         .unwrap();
@@ -481,7 +445,6 @@ where
             external_binding("orders-4"),
             TerminalCommandState::Succeeded,
             serde_json::json!({"winner": true}),
-            Vec::new(),
             Duration::from_secs(300),
         )
         .unwrap();
@@ -519,7 +482,6 @@ where
         external_binding("orders-5"),
         TerminalCommandState::Succeeded,
         serde_json::json!({"external": true}),
-        Vec::new(),
         Duration::from_secs(300),
     );
     assert!(matches!(
@@ -577,7 +539,6 @@ where
             external_binding("orders-6"),
             TerminalCommandState::Succeeded,
             serde_json::json!({"reclaimed": true}),
-            Vec::new(),
             Duration::from_secs(300),
         )
         .unwrap();
@@ -687,7 +648,6 @@ where
     assert_eq!(reserved_replay.state, CommandLedgerState::Succeeded);
     assert_eq!(reserved_replay.causation_id, causation);
     assert_eq!(reserved_replay.outcome, expected_outcome);
-    assert!(reserved_replay.projection_obligations.is_empty());
 }
 
 async fn concurrent_reservations_have_one_winner_and_one_causation<R>(repo: &R)
@@ -786,20 +746,23 @@ where
             "terminal": ledger_state.as_str(),
             "index": index,
         });
-        let expected_obligations =
-            if terminal_state == TerminalCommandState::SucceededPendingProjection {
-                vec![resolved_obligation(&format!("terminal-{index}"))]
-            } else {
-                Vec::new()
-            };
-        let mut completion = attempt
-            .complete_with_obligations(
+        let expected_metadata = (terminal_state
+            == TerminalCommandState::SucceededPendingProjection)
+            .then(|| format!(r#"{{"terminal":{index}}}"#).into_bytes());
+        let mut completion = match expected_metadata.clone() {
+            Some(metadata) => attempt.complete_with_projection_metadata(
                 terminal_state,
                 expected_outcome.clone(),
-                expected_obligations.clone(),
+                metadata,
                 Duration::from_secs(300),
-            )
-            .unwrap();
+            ),
+            None => attempt.complete(
+                terminal_state,
+                expected_outcome.clone(),
+                Duration::from_secs(300),
+            ),
+        }
+        .unwrap();
         let expected_direct_projection =
             (terminal_state == TerminalCommandState::Atomic).then(|| {
                 let evidence = direct_projection_evidence(&format!("terminal-{index}"));
@@ -830,12 +793,12 @@ where
         assert_eq!(first.state, ledger_state);
         assert_eq!(first.causation_id, causation);
         assert_eq!(first.outcome, expected_outcome);
-        assert_eq!(first.projection_obligations, expected_obligations);
+        assert_eq!(first.projection_metadata, expected_metadata);
         assert_eq!(first.direct_projection, expected_direct_projection);
     }
 }
 
-async fn response_loss_replays_outcome_and_projection_obligations<R>(repo: &R)
+async fn response_loss_replays_outcome_and_projection_metadata<R>(repo: &R)
 where
     R: CommandLedgerAdapterConformance,
 {
@@ -843,12 +806,12 @@ where
     let attempt = acquire(repo, reservation(&id, 31, 32).unwrap()).await;
     let causation = attempt.causation_id().clone();
     let expected_outcome = serde_json::json!({"order_id": "response-lost"});
-    let expected_obligations = vec![resolved_obligation("response-loss")];
+    let expected_metadata = br#"{"marker":"response-loss"}"#.to_vec();
     let completion = attempt
-        .complete_with_obligations(
+        .complete_with_projection_metadata(
             TerminalCommandState::SucceededPendingProjection,
             expected_outcome.clone(),
-            expected_obligations.clone(),
+            expected_metadata.clone(),
             Duration::from_secs(300),
         )
         .unwrap();
@@ -868,7 +831,7 @@ where
             assert_eq!(replay.state, CommandLedgerState::SucceededPendingProjection);
             assert_eq!(replay.causation_id, causation);
             assert_eq!(replay.outcome, expected_outcome);
-            assert_eq!(replay.projection_obligations, expected_obligations);
+            assert_eq!(replay.projection_metadata, Some(expected_metadata));
         }
         other => panic!("retry after response loss should replay, got {other:?}"),
     }
@@ -1241,7 +1204,7 @@ where
     concurrent_reservations_have_one_winner_and_one_causation(repo).await;
     expired_lease_reclaims_through_the_adapter_clock(repo).await;
     terminal_replays_are_deterministic(repo).await;
-    response_loss_replays_outcome_and_projection_obligations(repo).await;
+    response_loss_replays_outcome_and_projection_metadata(repo).await;
     retryable_unknown_reclaims_with_stable_causation(repo).await;
     principal_partitions_are_isolated(repo).await;
     committed_events_and_outbox_round_trip_ledger_causation(repo).await;
@@ -1379,28 +1342,11 @@ fn stale_attempt_cannot_complete_after_reclaim() {
 }
 
 #[test]
-fn completion_rejects_inconsistent_projection_obligation_states() {
-    for state in [
-        TerminalCommandState::Succeeded,
-        TerminalCommandState::Atomic,
-        TerminalCommandState::Rejected,
-    ] {
-        assert!(matches!(
-            fresh_attempt().complete_with_obligations(
-                state,
-                serde_json::json!({"ok": true}),
-                vec![resolved_obligation("unexpected")],
-                Duration::from_secs(300),
-            ),
-            Err(CommandLedgerError::Invalid(_))
-        ));
-    }
-
+fn completion_requires_projection_metadata_for_pending_projection() {
     assert!(matches!(
-        fresh_attempt().complete_with_obligations(
+        fresh_attempt().complete(
             TerminalCommandState::SucceededPendingProjection,
             serde_json::json!({"ok": true}),
-            Vec::new(),
             Duration::from_secs(300),
         ),
         Err(CommandLedgerError::Invalid(_))
@@ -1419,108 +1365,15 @@ fn completion_rejects_inconsistent_projection_obligation_states() {
             )
             .is_ok());
     }
-    assert!(fresh_attempt()
-        .complete_with_obligations(
-            TerminalCommandState::SucceededPendingProjection,
-            serde_json::json!({"ok": true}),
-            vec![resolved_obligation("pending")],
-            Duration::from_secs(300),
-        )
-        .is_ok());
 }
 
 #[test]
-fn completion_rejects_malformed_projection_obligations() {
-    let mut blank_projector = resolved_obligation("blank-projector");
-    blank_projector.projector = " \t".into();
-    let mut blank_model = resolved_obligation("blank-model");
-    blank_model.model = "\n".into();
-    let mut empty_key = resolved_obligation("empty-key");
-    empty_key.key.fields.clear();
-    let mut blank_field = resolved_obligation("blank-field");
-    blank_field.key.fields[0].field = "  ".into();
-    let mut duplicate_field = resolved_obligation("duplicate-field");
-    duplicate_field
-        .key
-        .fields
-        .push(duplicate_field.key.fields[0].clone());
-
-    for malformed in [
-        blank_projector,
-        blank_model,
-        empty_key,
-        blank_field,
-        duplicate_field,
-    ] {
-        assert!(matches!(
-            fresh_attempt().complete_with_obligations(
-                TerminalCommandState::SucceededPendingProjection,
-                serde_json::json!({"ok": true}),
-                vec![malformed],
-                Duration::from_secs(300),
-            ),
-            Err(CommandLedgerError::Invalid(_))
-        ));
-    }
-}
-
-#[test]
-fn replay_rejects_inconsistent_projection_obligation_states() {
-    for state in [
-        CommandLedgerState::Succeeded,
-        CommandLedgerState::Atomic,
-        CommandLedgerState::Rejected,
-    ] {
-        let row = completed_replay_record(state, vec![resolved_obligation("unexpected")]);
-        assert!(row.validate_stored_shape().is_ok());
-        assert!(matches!(row.replay(), Err(CommandLedgerError::Corrupt(_))));
-    }
-
+fn replay_rejects_pending_projection_states_without_projection_metadata() {
     for state in [
         CommandLedgerState::SucceededPendingProjection,
         CommandLedgerState::ProjectionFailed,
     ] {
-        let row = completed_replay_record(state, Vec::new());
-        assert!(row.validate_stored_shape().is_ok());
-        assert!(matches!(row.replay(), Err(CommandLedgerError::Corrupt(_))));
-    }
-
-    let projection_failed = completed_replay_record(
-        CommandLedgerState::ProjectionFailed,
-        vec![resolved_obligation("failed")],
-    );
-    let replay = projection_failed.replay().unwrap();
-    assert_eq!(replay.state, CommandLedgerState::ProjectionFailed);
-    assert_eq!(replay.projection_obligations.len(), 1);
-}
-
-#[test]
-fn replay_rejects_malformed_projection_obligations() {
-    let mut blank_projector = resolved_obligation("blank-projector");
-    blank_projector.projector = " ".into();
-    let mut blank_model = resolved_obligation("blank-model");
-    blank_model.model.clear();
-    let mut empty_key = resolved_obligation("empty-key");
-    empty_key.key.fields.clear();
-    let mut blank_field = resolved_obligation("blank-field");
-    blank_field.key.fields[0].field = "\r\n".into();
-    let mut duplicate_field = resolved_obligation("duplicate-field");
-    duplicate_field
-        .key
-        .fields
-        .push(duplicate_field.key.fields[0].clone());
-
-    for malformed in [
-        blank_projector,
-        blank_model,
-        empty_key,
-        blank_field,
-        duplicate_field,
-    ] {
-        let row = completed_replay_record(
-            CommandLedgerState::SucceededPendingProjection,
-            vec![malformed],
-        );
+        let row = completed_replay_record(state);
         assert!(row.validate_stored_shape().is_ok());
         assert!(matches!(row.replay(), Err(CommandLedgerError::Corrupt(_))));
     }
@@ -1532,14 +1385,12 @@ fn replay_validates_envelope_and_returns_only_the_outcome() {
     let reservation = reservation(&id, 1, 2).unwrap();
     let started = SystemTime::UNIX_EPOCH + Duration::from_secs(100);
     let mut row = CommandLedgerRecord::initial(&reservation, started).unwrap();
-    let obligation = resolved_obligation("round-trip");
     let completion = row
         .acquired_attempt()
         .unwrap()
-        .complete_with_obligations(
-            TerminalCommandState::SucceededPendingProjection,
+        .complete(
+            TerminalCommandState::Succeeded,
             serde_json::json!({"order_id": "o-1"}),
-            vec![obligation.clone()],
             Duration::from_secs(300),
         )
         .unwrap();
@@ -1547,27 +1398,11 @@ fn replay_validates_envelope_and_returns_only_the_outcome() {
         .unwrap();
     let replay = row.replay().unwrap();
     assert_eq!(replay.outcome, serde_json::json!({"order_id": "o-1"}));
-    assert_eq!(replay.projection_obligations, vec![obligation.clone()]);
 
     row.outcome_json = Some(r#"{"version":1,"outcome":null}"#.into());
     assert!(matches!(row.replay(), Err(CommandLedgerError::Corrupt(_))));
 
-    let mut obligation_with_unknown_field = serde_json::to_value(obligation).unwrap();
-    obligation_with_unknown_field
-        .as_object_mut()
-        .unwrap()
-        .insert("unknown".into(), serde_json::json!(true));
-    row.outcome_json = Some(
-        serde_json::json!({
-            "version": 1,
-            "outcome": null,
-            "projection_obligations": [obligation_with_unknown_field],
-        })
-        .to_string(),
-    );
-    assert!(matches!(row.replay(), Err(CommandLedgerError::Corrupt(_))));
-
-    row.outcome_json = Some(r#"{"version":2,"outcome":null,"projection_obligations":[]}"#.into());
+    row.outcome_json = Some(r#"{"version":3,"outcome":null,"unknown":[]}"#.into());
     assert!(matches!(row.replay(), Err(CommandLedgerError::Corrupt(_))));
 }
 
@@ -1601,12 +1436,9 @@ fn modeled_projection_metadata_replays_exact_bytes_without_plaintext_scope_mater
         Some(metadata.as_slice())
     );
     assert_eq!(first.projection_metadata, second.projection_metadata);
-    assert!(first.projection_obligations.is_empty());
 
-    row.outcome_json = Some(
-        r#"{"version":2,"outcome":null,"projection_obligations":[],"projection_metadata":"not/canonical"}"#
-            .into(),
-    );
+    row.outcome_json =
+        Some(r#"{"version":3,"outcome":null,"projection_metadata":"not/canonical"}"#.into());
     assert!(matches!(row.replay(), Err(CommandLedgerError::Corrupt(_))));
 }
 
@@ -1870,7 +1702,7 @@ async fn sqlite_terminal_replay_survives_pool_drop_and_reopen() {
     let attempt = acquire(&repo, request).await;
     let expected_causation = attempt.causation_id().clone();
     let expected_outcome = serde_json::json!({"order_id": "restart-order"});
-    let expected_obligations = vec![resolved_obligation("sqlite-restart")];
+    let expected_metadata = br#"{"marker":"sqlite-restart"}"#.to_vec();
 
     let aggregate_id = format!("sqlite-restart-stream-{}", Uuid::now_v7());
     let identity = StreamIdentity::new("command-ledger-restart", &aggregate_id).unwrap();
@@ -1881,10 +1713,10 @@ async fn sqlite_terminal_replay_survives_pool_drop_and_reopen() {
         OutboxMessage::create(&outbox_id, "SqliteRestartCommitted", b"{}".to_vec()).unwrap();
 
     let completion = attempt
-        .complete_with_obligations(
+        .complete_with_projection_metadata(
             TerminalCommandState::SucceededPendingProjection,
             expected_outcome.clone(),
-            expected_obligations.clone(),
+            expected_metadata.clone(),
             Duration::from_secs(300),
         )
         .unwrap();
@@ -1905,7 +1737,6 @@ async fn sqlite_terminal_replay_survives_pool_drop_and_reopen() {
             external_binding,
             TerminalCommandState::Succeeded,
             serde_json::json!({"remote": "restart"}),
-            Vec::new(),
             Duration::from_secs(300),
         )
         .unwrap();
@@ -1935,7 +1766,7 @@ async fn sqlite_terminal_replay_survives_pool_drop_and_reopen() {
     assert_eq!(replay.state, CommandLedgerState::SucceededPendingProjection);
     assert_eq!(replay.causation_id, expected_causation);
     assert_eq!(replay.outcome, expected_outcome);
-    assert_eq!(replay.projection_obligations, expected_obligations);
+    assert_eq!(replay.projection_metadata, Some(expected_metadata));
 
     let stored_stream = reopened
         .get_stream(&identity)

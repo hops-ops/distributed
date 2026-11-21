@@ -620,7 +620,6 @@ mod client_surface_tests {
             .find(|projector| projector.name == "project_blob")
             .expect("Blob direct owner should be exported");
         assert!(owner.facts.is_empty());
-        assert!(!owner.causal_confirmation);
 
         let repository = InMemoryRepository::new();
         let service = build_service(

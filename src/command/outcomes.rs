@@ -35,34 +35,25 @@ mod sealed {
 
 /// A successfully committed command result.
 ///
-/// There is intentionally no public constructor. The durable command
-/// committer is the only framework component allowed to create this wrapper.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Succeeded<T> {
-    payload: T,
-}
+/// A type-level marker: it names the outcome and its payload type and is
+/// never constructed.
+pub struct Succeeded<T>(std::marker::PhantomData<fn() -> T>);
 
 /// Eventual aggregate + read-model update: domain events committed; projectors
 /// apply later. Client may use `.applies` previews until obligations complete.
 ///
-/// There is intentionally no public constructor. The durable command
-/// committer is the only framework component allowed to create this wrapper.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Eventual<T> {
-    payload: T,
-}
+/// A type-level marker: it names the outcome and its payload type and is
+/// never constructed.
+pub struct Eventual<T>(std::marker::PhantomData<fn() -> T>);
 
 /// Atomic aggregate + read-model update: exact row staged and returned in the
 /// command transaction (`readmodel(row).…commit()?.atomic()`).
 ///
-/// There is intentionally no public constructor. The durable command
-/// committer is the only framework component allowed to create this wrapper.
+/// A type-level marker: it names the outcome and its payload type and is
+/// never constructed.
 /// `T` must be a relational read model, and preparation is available only
 /// through the framework-owned workspace that stages the exact row upsert.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Atomic<T> {
-    payload: T,
-}
+pub struct Atomic<T>(std::marker::PhantomData<fn() -> T>);
 
 macro_rules! committed_outcome {
     ($wrapper:ident, $kind:expr) => {
@@ -74,14 +65,6 @@ macro_rules! committed_outcome {
         {
             type Payload = T;
             const CONSISTENCY: CommandConsistency = $kind;
-
-            fn payload(&self) -> &T {
-                &self.payload
-            }
-
-            fn __finalize_committed(payload: T) -> Self {
-                Self::from_committed_payload(payload)
-            }
 
             fn __command_output_type() -> CommandTypeDef {
                 T::command_type()
@@ -101,14 +84,6 @@ where
 {
     type Payload = T;
     const CONSISTENCY: CommandConsistency = CommandConsistency::Atomic;
-
-    fn payload(&self) -> &T {
-        &self.payload
-    }
-
-    fn __finalize_committed(payload: T) -> Self {
-        Self::from_committed_payload(payload)
-    }
 
     fn __command_output_type() -> CommandTypeDef {
         read_model_command_type::<T>()
@@ -134,30 +109,6 @@ where
     }
 }
 
-macro_rules! crate_committed_constructor {
-    ($wrapper:ident) => {
-        impl<T> $wrapper<T> {
-            /// The ledger-aware committer is the only intended caller.
-            pub(crate) fn from_committed_payload(payload: T) -> Self {
-                Self { payload }
-            }
-        }
-    };
-}
-
-crate_committed_constructor!(Succeeded);
-crate_committed_constructor!(Eventual);
-
-impl<T> Atomic<T>
-where
-    T: RelationalReadModel,
-{
-    /// Created only after a proof-bearing staged projection commits.
-    fn from_committed_payload(payload: T) -> Self {
-        Self { payload }
-    }
-}
-
 impl<T> sealed::PreparableOutcome for Succeeded<T> {}
 impl<T> sealed::PreparableOutcome for Eventual<T> {}
 
@@ -165,11 +116,6 @@ impl<T> sealed::PreparableOutcome for Eventual<T> {}
 pub trait CommandOutcome: sealed::Outcome + Send + Sync + 'static {
     type Payload: Serialize + Send + Sync + 'static;
     const CONSISTENCY: CommandConsistency;
-
-    fn payload(&self) -> &Self::Payload;
-
-    #[doc(hidden)]
-    fn __finalize_committed(payload: Self::Payload) -> Self;
 
     #[doc(hidden)]
     fn __command_output_type() -> CommandTypeDef;
@@ -292,14 +238,11 @@ impl<K: CommandOutcome> PreparedCommand<K> {
                 if self.projection_proof.is_some() || modeled_direct_plan.is_some() {
                     return Err(CommandCommitProofError::UnexpectedProjectionProof);
                 }
-                contract.validate_outbox_fact_coverage(outbox_messages)
+                contract.validate_declares_projection_events()
             }
             CommandConsistency::Atomic => {
                 if !has_staged_aggregate_events && outbox_messages.is_empty() {
                     return Err(CommandCommitProofError::DurableEventMissing);
-                }
-                if !contract.confirmations.is_empty() {
-                    return Err(CommandCommitProofError::ProjectedHasConfirmations);
                 }
                 let proof = self
                     .projection_proof
@@ -325,14 +268,9 @@ impl<K: CommandOutcome> PreparedCommand<K> {
     }
 
     /// The durable committer is the sole intended consumer.
-    pub(crate) fn finalize_after_commit(self) -> (K, serde_json::Value) {
-        let payload = self
-            .payload
-            .expect("prepared command payload is materialized before commit");
-        let serialized_payload = self
-            .serialized_payload
-            .expect("prepared command payload is serialized before commit");
-        (K::__finalize_committed(payload), serialized_payload)
+    pub(crate) fn finalize_after_commit(self) -> serde_json::Value {
+        self.serialized_payload
+            .expect("prepared command payload is serialized before commit")
     }
 
     /// Materialize the typed result from the exact modeled full-row upsert.

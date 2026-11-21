@@ -53,26 +53,6 @@ impl<T> CausalRepositoryBackend for T where
 
 pub(crate) trait CausalHostProjections: Send + Sync {
     #[cfg(feature = "graphql")]
-    fn command_obligation_evidence<'a>(
-        &'a self,
-        _request: &'a crate::projection_protocol::ProjectionObligationEvidenceBatchRequest,
-    ) -> impl std::future::Future<
-        Output = Result<
-            crate::projection_protocol::ProjectionObligationEvidenceBatch,
-            crate::projection_protocol::ProjectionProtocolError,
-        >,
-    > + Send
-           + 'a {
-        async {
-            Err(
-                crate::projection_protocol::ProjectionProtocolError::InvalidBatch(
-                    "command-only cells do not query projection evidence".into(),
-                ),
-            )
-        }
-    }
-
-    #[cfg(feature = "graphql")]
     fn command_causation_evidence<'a>(
         &'a self,
         _request: &'a crate::projection_protocol::ProjectionCausationEvidenceRequest,
@@ -108,19 +88,6 @@ pub(crate) trait CausalHostProjections: Send + Sync {
 macro_rules! direct_causal_projection_methods {
     () => {
         #[cfg(feature = "graphql")]
-        async fn command_obligation_evidence(
-            &self,
-            request: &crate::projection_protocol::ProjectionObligationEvidenceBatchRequest,
-        ) -> Result<
-            crate::projection_protocol::ProjectionObligationEvidenceBatch,
-            crate::projection_protocol::ProjectionProtocolError,
-        > {
-            crate::projection_protocol::ProjectionProtocolStore::projection_obligation_evidence_batch(
-                self, request,
-            ).await
-        }
-
-        #[cfg(feature = "graphql")]
         async fn command_causation_evidence(
             &self,
             request: &crate::projection_protocol::ProjectionCausationEvidenceRequest,
@@ -130,7 +97,8 @@ macro_rules! direct_causal_projection_methods {
         > {
             crate::projection_protocol::ProjectionProtocolStore::projection_causation_evidence(
                 self, request,
-            ).await
+            )
+            .await
         }
 
         async fn __register_direct_projection_models(
@@ -140,7 +108,8 @@ macro_rules! direct_causal_projection_methods {
         ) -> Result<(), crate::projection_protocol::ProjectionProtocolError> {
             crate::projection_protocol::ProjectionProtocolStore::register_projection_models(
                 self, topology, ownership,
-            ).await
+            )
+            .await
         }
     };
 }
