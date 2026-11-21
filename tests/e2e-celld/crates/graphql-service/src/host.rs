@@ -97,7 +97,7 @@ async fn run_postgres(
                 .with_bus(nats.clone())
         });
     }
-    spawn_zitadel_scrape(repo.clone());
+    spawn_zitadel_scrape(service.clone());
 
     eprintln!(
         "e2e-celld (postgres) listening on http://{} — cell wait-path; bus drain; @live stays here",
@@ -136,15 +136,7 @@ async fn connect_nats(url: &str) -> Result<NatsBus, Box<dyn std::error::Error + 
     Ok(bus)
 }
 
-fn spawn_zitadel_scrape<R>(repo: R)
-where
-    R: distributed::TransactionalCommit
-        + distributed::ReadModelWritePlanStore
-        + Clone
-        + Send
-        + Sync
-        + 'static,
-{
+fn spawn_zitadel_scrape(service: Arc<Service>) {
     match ZitadelScrapeConfig::from_env() {
         Some(cfg) if cfg.background_enabled() || cfg.on_start => {
             eprintln!(
@@ -153,7 +145,7 @@ where
                 cfg.interval.as_secs(),
                 cfg.on_start
             );
-            spawn_scrape_loop(repo, cfg);
+            spawn_scrape_loop(service, cfg);
         }
         Some(_) => {
             eprintln!(

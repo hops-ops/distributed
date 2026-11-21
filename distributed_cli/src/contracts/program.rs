@@ -406,14 +406,15 @@ fn identity_digest(domain: &str, bytes: &[u8]) -> String {
 mod tests {
     use super::*;
     use std::path::PathBuf;
-    use std::time::{SystemTime, UNIX_EPOCH};
 
     fn temp_dir() -> PathBuf {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let path = std::env::temp_dir().join(format!("client-program-{nanos}"));
+        // Unique per call: tests run in parallel and the clock alone repeats.
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "client-program-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
         fs::create_dir_all(&path).unwrap();
         path
     }

@@ -162,7 +162,6 @@ where
 impl<D, I, K> TypedRouteBuilder<D, I, K>
 where
     D: CausalRouteDependencies + Send + Sync + 'static,
-    D::Aggregate: Aggregate + Send + Sync + 'static,
     I: serde::de::DeserializeOwned + Send + 'static,
     K: CommandOutcome,
 {
@@ -197,7 +196,15 @@ where
             self.requires,
         )
     }
+}
 
+impl<D, I, K> TypedRouteBuilder<D, I, K>
+where
+    D: CausalRouteDependencies + Send + Sync + 'static,
+    D::Aggregate: Aggregate + Send + Sync + 'static,
+    I: serde::de::DeserializeOwned + Send + 'static,
+    K: CommandOutcome,
+{
     /// Load the aggregate by an id taken from the command input; `NotFound`
     /// when it does not exist.
     ///

@@ -18,9 +18,12 @@ use distributed::cell_host::{InternalHttpSecret, CELL_INTERNAL_SECRET_HEADER};
 use distributed::command_dispatch::SharedCommandHost;
 use distributed::gateway::{native::*, *};
 use distributed::graphql::identity::OidcGatewayProvider;
-use distributed::microsvc::{HandlerError, Service, Session};
+use distributed::microsvc::{CausalDispatchError, Service, Session};
+use e2e_celld_identity::handlers::ingestors::{zitadel, zitadel_scrape};
 use serde_json::{json, Value};
 
+/// The request's headers, for the ingestor's authenticity check only: they
+/// are never the session a command runs with.
 fn session_from_headers(headers: &HeaderMap) -> Session {
     let mut vars = HashMap::new();
     for (name, value) in headers.iter() {
@@ -31,32 +34,17 @@ fn session_from_headers(headers: &HeaderMap) -> Session {
     Session::from_map(vars)
 }
 
-fn status_for_error(error: &HandlerError) -> StatusCode {
-    match error {
-        HandlerError::UnknownCommand(_) | HandlerError::NotFound(_) => StatusCode::NOT_FOUND,
-        HandlerError::DecodeFailed(_) | HandlerError::GuardRejected(_) => StatusCode::BAD_REQUEST,
-        HandlerError::Rejected(_) => StatusCode::UNPROCESSABLE_ENTITY,
-        HandlerError::Unauthorized(_) => StatusCode::UNAUTHORIZED,
-        HandlerError::Repository(_) | HandlerError::Other(_) => StatusCode::INTERNAL_SERVER_ERROR,
-        _ => StatusCode::INTERNAL_SERVER_ERROR,
-    }
-}
-
-async fn dispatch_named(
-    service: Arc<Service>,
-    headers: HeaderMap,
-    input: Value,
-    command: &'static str,
-) -> impl IntoResponse {
-    let session = session_from_headers(&headers);
-    match service.dispatch(command, input, session).await {
+/// The HTTP answer of a ledgered command.
+fn command_response(command: &str, result: Result<Value, CausalDispatchError>) -> Response {
+    match result {
         Ok(value) => (StatusCode::OK, Json(value)).into_response(),
-        Err(err) => {
-            let status = status_for_error(&err);
+        Err(error) => {
+            let status = StatusCode::from_u16(error.status_code())
+                .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
             if status.is_server_error() {
-                eprintln!("microsvc command `{command}` failed: {err}");
+                eprintln!("command `{command}` failed: {error}");
             }
-            let body = json!({ "error": err.client_facing_message() });
+            let body = json!({ "code": error.code(), "error": error.client_message() });
             (status, Json(body)).into_response()
         }
     }
@@ -123,16 +111,28 @@ pub async fn serve(
     let mut internal = Router::new()
         .route(
             "/zitadel.ingress.v1",
-            post(move |headers: HeaderMap, Json(input): Json<Value>| {
+            post(move |headers: HeaderMap, Json(body): Json<Value>| {
                 let svc = ingress.clone();
-                async move { dispatch_named(svc, headers, input, "zitadel.ingress.v1").await }
+                async move {
+                    let caller = session_from_headers(&headers);
+                    command_response(
+                        zitadel::COMMAND,
+                        zitadel::receive(&svc, &caller, body).await,
+                    )
+                }
             }),
         )
         .route(
             "/zitadel.scrape.v1",
-            post(move |headers: HeaderMap, Json(input): Json<Value>| {
+            post(move |headers: HeaderMap| {
                 let svc = scrape.clone();
-                async move { dispatch_named(svc, headers, input, "zitadel.scrape.v1").await }
+                async move {
+                    let caller = session_from_headers(&headers);
+                    command_response(
+                        zitadel_scrape::COMMAND,
+                        zitadel_scrape::receive(&svc, &caller).await,
+                    )
+                }
             }),
         );
     internal = internal.route(

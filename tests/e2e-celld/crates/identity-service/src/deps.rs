@@ -1,9 +1,5 @@
 use distributed::microsvc::RepoReadModelDependencies;
-use distributed::{AggregateRepository, QueuedRepository};
+use distributed::AggregateRepository;
 
-use crate::aggregate::Identity;
-
-pub type QueuedStore<R, L> = QueuedRepository<R, L>;
-
-pub type IdentityRepo<R, L> = AggregateRepository<QueuedStore<R, L>, Identity>;
-pub type AuthDeps<R, L, S> = RepoReadModelDependencies<IdentityRepo<R, L>, S>;
+/// Stores, no aggregate: the commands publish provider messages only.
+pub type AuthDeps<R, S> = RepoReadModelDependencies<AggregateRepository<R, ()>, S>;

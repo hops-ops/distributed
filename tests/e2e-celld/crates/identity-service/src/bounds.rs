@@ -2,8 +2,7 @@
 
 use distributed::microsvc::{CausalProjectionStore, CausalRepositoryBackend};
 use distributed::{
-    GetStream, LockManager, ReadModelWritePlanStore, RelationalReadModelQueryStore,
-    TransactionalCommit,
+    GetStream, ReadModelWritePlanStore, RelationalReadModelQueryStore, TransactionalCommit,
 };
 
 pub trait EventStore:
@@ -14,9 +13,6 @@ impl<T> EventStore for T where
     T: CausalRepositoryBackend + GetStream + TransactionalCommit + Clone + Send + Sync + 'static
 {
 }
-
-pub trait Locks: LockManager + Clone + 'static {}
-impl<T> Locks for T where T: LockManager + Clone + 'static {}
 
 pub trait ReadStore:
     CausalProjectionStore

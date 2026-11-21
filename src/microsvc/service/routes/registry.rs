@@ -18,7 +18,6 @@ use super::erased::{CausalStatusFuture, CausalStatusRoute};
 use super::execute::RegisteredCausalHandler;
 use super::outbox_wiring::{DynBusPublisher, OutboxConfigurator};
 use super::spec::HandlerSpec;
-use crate::aggregate::Aggregate;
 use crate::application::{CommandMount, CommandMountRegistrar, CommandSpec};
 use crate::bus::{Message, MessageKind, OrderedDelivery};
 #[cfg(feature = "graphql")]
@@ -420,7 +419,6 @@ impl<D: Send + Sync + 'static> Routes<D> {
     ) -> Self
     where
         D: CausalRouteDependencies,
-        D::Aggregate: Aggregate + Send + Sync + 'static,
         I: serde::de::DeserializeOwned + Send + 'static,
         K: CommandOutcome,
     {

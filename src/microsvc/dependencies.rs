@@ -1,6 +1,6 @@
 //! Typed dependency wrappers for microsvc handlers.
 
-use crate::aggregate::{Aggregate, AggregateRepository};
+use crate::aggregate::AggregateRepository;
 use crate::command_ledger::{
     CausalGetStream, CausalRepositoryIdentity, CausalTransactionalCommit, CommandLedgerStore,
 };
@@ -133,6 +133,12 @@ where
 /// Compile-time extraction of the one aggregate repository owned by a typed
 /// causal route bundle.
 ///
+/// The repository carries what every typed command needs (the ledger, the
+/// transactional commit, the outbox) and, for a bundle with an aggregate,
+/// what loads it. `Aggregate` is `()` for a bundle without one
+/// ([`Routes::for_stores`](crate::microsvc::Routes::for_stores)): its commands
+/// run the same pipeline and commit no stream.
+///
 /// This is public only because it appears in the bounds of the public route
 /// builder; the framework supplies the implementations. Application handlers
 /// never receive the dependency value or the underlying backend through the
@@ -140,7 +146,7 @@ where
 #[doc(hidden)]
 pub trait CausalRouteDependencies {
     type Backend: CausalRepositoryBackend;
-    type Aggregate: Aggregate;
+    type Aggregate: Send + Sync + 'static;
 
     #[doc(hidden)]
     fn __causal_aggregate_repository(&self)
@@ -317,7 +323,7 @@ impl<R, A> HasRepo for AggregateRepository<R, A> {
 impl<R, A> CausalRouteDependencies for AggregateRepository<R, A>
 where
     R: CausalRepositoryBackend,
-    A: Aggregate,
+    A: Send + Sync + 'static,
 {
     type Backend = R;
     type Aggregate = A;
@@ -361,7 +367,7 @@ impl<R> HasRepo for RepoDependencies<R> {
 impl<R, A> CausalRouteDependencies for RepoDependencies<AggregateRepository<R, A>>
 where
     R: CausalRepositoryBackend,
-    A: Aggregate,
+    A: Send + Sync + 'static,
 {
     type Backend = R;
     type Aggregate = A;
@@ -419,7 +425,7 @@ impl<R, S> HasRepo for RepoReadModelDependencies<R, S> {
 impl<R, A, S> CausalRouteDependencies for RepoReadModelDependencies<AggregateRepository<R, A>, S>
 where
     R: CausalRepositoryBackend,
-    A: Aggregate,
+    A: Send + Sync + 'static,
 {
     type Backend = R;
     type Aggregate = A;
