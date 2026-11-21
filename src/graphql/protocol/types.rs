@@ -56,8 +56,7 @@ pub(crate) struct DistributedCommandMetadata {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) projection_disposition: Option<DistributedProjectionDisposition>,
     pub(crate) expects: Vec<DistributedProjectionExpectation>,
-    /// Exact role-safe actual delta and opaque modeled obligations. Legacy
-    /// compiler confirmations remain in `expects` during the migration.
+    /// Exact role-safe actual delta and opaque modeled obligations.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) projection: Option<super::CommandProjectionMetadataV1>,
     /// Exact finite obligations already observed for this authorized command.

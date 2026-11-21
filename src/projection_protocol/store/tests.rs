@@ -1,5 +1,4 @@
 use super::*;
-use crate::projection_protocol::{RecordKey, ResolvedProjectionObligation};
 use crate::table::{
     DeleteTableRowMutation, ExpectedVersion, PrimaryKey, RowKey, RowValue, TableSchema,
 };
@@ -207,40 +206,6 @@ fn record_expectations_and_mutation_kinds_fail_closed() {
         ),
         Err(ProjectionProtocolError::InvalidBatch(_))
     ));
-}
-
-#[test]
-fn absent_and_explicit_null_obligation_partitions_survive_round_trip() {
-    let topology = ProjectorTopologyId::new(1, "todos", [9; 32]).unwrap();
-    let partition = super::super::PartitionId::new(b"unit".to_vec()).unwrap();
-    let scope = super::super::ProjectionRecordScope::new(
-        topology,
-        partition,
-        "TodoView",
-        b"todo-1".to_vec(),
-    )
-    .unwrap();
-    let absent = ResolvedProjectionObligation {
-        projector: "todos".into(),
-        model: "TodoView".into(),
-        key: RecordKey { fields: Vec::new() },
-        partition: None,
-        scope,
-    };
-    let explicit_null = ResolvedProjectionObligation {
-        partition: Some(serde_json::Value::Null),
-        ..absent.clone()
-    };
-    let absent_json = serde_json::to_value(&absent).unwrap();
-    let null_json = serde_json::to_value(&explicit_null).unwrap();
-    assert!(absent_json.get("partition").is_none());
-    assert_eq!(null_json.get("partition"), Some(&serde_json::Value::Null));
-    assert_eq!(
-        serde_json::from_value::<ResolvedProjectionObligation>(null_json)
-            .unwrap()
-            .partition,
-        Some(serde_json::Value::Null)
-    );
 }
 
 #[test]

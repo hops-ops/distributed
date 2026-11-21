@@ -3,8 +3,7 @@ use super::*;
 use crate::command::CommandConsistency;
 use crate::command_ledger::CommandLedgerState;
 use crate::microsvc::{
-    CausalCommandProjectionObligation, CausalCommandPublicState, CausalCommandPublicStatus,
-    CausalCommandReceiptSource, CausalProjectionEvidenceState,
+    CausalCommandPublicState, CausalCommandPublicStatus, CausalCommandReceiptSource,
 };
 use crate::projection_protocol::{
     PartitionId, ProjectionChange, ProjectionChangeCursor, ProjectionChangeKind, ProjectionEpoch,
@@ -100,38 +99,21 @@ fn command(id: &str) -> DistributedCommandMetadata {
     }
 }
 
-fn receipt() -> CausalCommandReceiptSource {
+fn record_scope() -> ProjectionRecordScope {
     let topology = ProjectorTopologyId::new(1, "todos", [17; 32]).unwrap();
     let partition =
         PartitionId::new(br#"["tenant-private-900719925474099312345"]"#.to_vec()).unwrap();
-    let scope = ProjectionRecordScope::new(
+    ProjectionRecordScope::new(
         topology,
         partition,
         "TodoView",
         br#"["9223372036854775807","child-private"]"#.to_vec(),
     )
-    .unwrap();
-    CausalCommandReceiptSource {
-        command_id: "0190a000-0000-7000-8000-000000000042".into(),
-        command_name: "todo.complete".into(),
-        causation_id: "0190a000-0000-7000-8000-000000000017".into(),
-        consistency: CommandConsistency::Eventual,
-        state: CommandLedgerState::SucceededPendingProjection,
-        outcome: serde_json::json!({ "accepted": true }),
-        obligations: vec![CausalCommandProjectionObligation {
-            projector: "todos".into(),
-            model: "TodoView".into(),
-            scope,
-            observation_kind: ProjectionObservationKind::Record,
-        }],
-        projection_metadata: None,
-        direct_projection: None,
-    }
+    .unwrap()
 }
 
 fn direct_projected_receipt() -> CausalCommandReceiptSource {
-    let mut receipt = receipt();
-    let scope = receipt.obligations[0].scope.clone();
+    let scope = record_scope();
     let revision = RecordRevision::new(scope.clone(), 3, 9_007_199_254_740_991).unwrap();
     let change = ProjectionChangeCursor::new(
         scope.topology().clone(),
@@ -140,9 +122,16 @@ fn direct_projected_receipt() -> CausalCommandReceiptSource {
         17,
     )
     .unwrap();
-    receipt.consistency = CommandConsistency::Atomic;
-    receipt.state = CommandLedgerState::Atomic;
-    receipt.obligations.clear();
+    let mut receipt = CausalCommandReceiptSource {
+        command_id: "0190a000-0000-7000-8000-000000000042".into(),
+        command_name: "todo.complete".into(),
+        causation_id: "0190a000-0000-7000-8000-000000000017".into(),
+        consistency: CommandConsistency::Atomic,
+        state: CommandLedgerState::Atomic,
+        outcome: serde_json::json!({ "accepted": true }),
+        projection_metadata: None,
+        direct_projection: None,
+    };
     receipt.direct_projection = Some(SameTransactionProjectionEvidence {
         records: vec![ProjectionRecordMetadata {
             source_snapshot: None,
@@ -265,47 +254,6 @@ fn accumulator_is_idempotent_and_rejects_ambiguous_receipts() {
 }
 
 #[test]
-fn durable_receipts_issue_stable_generation_bound_non_disclosing_obligations() {
-    let receipt = receipt();
-    let first = accumulator(11, "principal-a", "sha256:schema-a");
-    first.record_receipt(&receipt).unwrap();
-    let first = serde_json::to_value(first.snapshot().unwrap()).unwrap();
-    let first_token = first["command"]["expects"][0]["scopeToken"]
-        .as_str()
-        .unwrap();
-    assert_eq!(first["command"]["state"], "succeeded_pending_projection");
-    assert_eq!(first["command"]["consistency"], "eventual");
-    assert!(!first_token.contains("tenant-private"));
-    assert!(!first_token.contains("9223372036854775807"));
-    assert!(!first_token.contains("child-private"));
-
-    let replay = accumulator(11, "principal-a", "sha256:schema-a");
-    replay.record_receipt(&receipt).unwrap();
-    let replay = serde_json::to_value(replay.snapshot().unwrap()).unwrap();
-    assert_eq!(
-        first_token,
-        replay["command"]["expects"][0]["scopeToken"]
-            .as_str()
-            .unwrap()
-    );
-
-    for changed in [
-        accumulator(12, "principal-a", "sha256:schema-a"),
-        accumulator(11, "principal-b", "sha256:schema-a"),
-        accumulator(11, "principal-a", "sha256:schema-b"),
-    ] {
-        changed.record_receipt(&receipt).unwrap();
-        let changed = serde_json::to_value(changed.snapshot().unwrap()).unwrap();
-        assert_ne!(
-            first_token,
-            changed["command"]["expects"][0]["scopeToken"]
-                .as_str()
-                .unwrap()
-        );
-    }
-}
-
-#[test]
 fn direct_projected_receipt_replays_exact_record_revision_as_decimal_strings() {
     let receipt = direct_projected_receipt();
     let first = accumulator(17, "principal-a", "sha256:schema-a");
@@ -339,7 +287,6 @@ fn unknown_status_does_not_fabricate_receipt_identity() {
             causation_id: None,
             consistency: None,
             outcome: None,
-            obligations: Vec::new(),
             projection_metadata: None,
             projection_revalidate: false,
             evidence: Vec::new(),
@@ -348,45 +295,6 @@ fn unknown_status_does_not_fabricate_receipt_identity() {
         .unwrap();
     let envelope = serde_json::to_value(accumulator.snapshot().unwrap()).unwrap();
     assert!(envelope.get("command").is_none());
-}
-
-#[test]
-fn projected_status_exposes_only_matching_opaque_observations() {
-    let source = receipt();
-    let accumulator = accumulator(5, "principal-a", "sha256:schema-a");
-    accumulator
-        .record_status(&CausalCommandPublicStatus {
-            state: CausalCommandPublicState::Atomic,
-            command_id: source.command_id,
-            command_name: Some(source.command_name),
-            causation_id: Some(source.causation_id.clone()),
-            consistency: Some(source.consistency),
-            outcome: Some(source.outcome),
-            obligations: source.obligations,
-            projection_metadata: None,
-            projection_revalidate: false,
-            evidence: vec![crate::microsvc::CausalCommandProjectionEvidence {
-                obligation_index: 0,
-                state: CausalProjectionEvidenceState::Observed,
-                incarnation: Some(1),
-                revision: Some(7),
-            }],
-            direct_projection: None,
-        })
-        .unwrap();
-    let command = serde_json::to_value(accumulator.snapshot().unwrap()).unwrap()["command"].clone();
-    assert_eq!(command["state"], "atomic");
-    assert_eq!(
-        command["observations"][0]["causationId"],
-        source.causation_id
-    );
-    assert_eq!(
-        command["observations"][0]["scopeToken"],
-        command["expects"][0]["scopeToken"]
-    );
-    let encoded = command.to_string();
-    assert!(!encoded.contains("tenant-private"));
-    assert!(!encoded.contains("9223372036854775807"));
 }
 
 #[test]
@@ -400,8 +308,7 @@ fn revision_and_resume_tokens_are_scoped_comparable_and_tamper_evident() {
         .unwrap();
     assert_ne!(snapshot_scope, other_operation);
 
-    let receipt = receipt();
-    let scope = &receipt.obligations[0].scope;
+    let scope = &record_scope();
     let record_scope = accumulator.issue_record_scope(scope).unwrap();
     assert_eq!(record_scope, accumulator.issue_record_scope(scope).unwrap());
     assert!(!record_scope.as_str().contains("tenant-private"));
@@ -432,27 +339,6 @@ fn revision_and_resume_tokens_are_scoped_comparable_and_tamper_evident() {
         OpaqueProtocolToken::parse("v1.live-resume.not/canonical"),
         Err(ProtocolTokenError::Malformed)
     );
-}
-
-#[test]
-fn observation_tokens_exactly_match_receipt_obligations() {
-    let receipt = receipt();
-    let accumulator = accumulator(41, "principal-a", "sha256:schema-a");
-    accumulator.record_receipt(&receipt).unwrap();
-    let expectation = accumulator.snapshot().unwrap().command.unwrap().expects[0]
-        .scope_token
-        .clone();
-    let obligation = &receipt.obligations[0];
-    let observed = accumulator
-        .issue_projection_obligation_scope(
-            &receipt.causation_id,
-            &obligation.projector,
-            &obligation.model,
-            obligation.observation_kind,
-            &obligation.scope,
-        )
-        .unwrap();
-    assert_eq!(expectation, observed);
 }
 
 #[test]

@@ -1941,10 +1941,6 @@ where
                 .decode::<I>()
                 .map_err(|error| CausalDispatchError::BadRequest(error.to_string()))?;
             let (input, wire, input_digest) = typed.into_parts();
-            let projection_obligations = self
-                .contract
-                .resolve_projection_obligations_from_session(&wire, Some(&session))
-                .map_err(|error| CausalDispatchError::Internal(error.to_string()))?;
             let direct_projection_target = self
                 .contract
                 .resolve_direct_projection_target_from_session(&wire, Some(&session))
@@ -2105,16 +2101,6 @@ where
                     if self.contract.consistency != CommandConsistency::Atomic
                         && !self.contract.projections.selectors.is_empty() =>
                 {
-                    if !projection_obligations.is_empty() {
-                        return abandon_causal_attempt(
-                        repository,
-                        attempt,
-                        self.contract.consistency,
-                        "typed command cannot mix modeled projection metadata with legacy confirmations"
-                            .to_owned(),
-                    )
-                    .await;
-                    }
                     let occurrences = match parts.prepared_domain_occurrences() {
                         Ok(occurrences) => occurrences,
                         Err(error) => {
@@ -2208,10 +2194,8 @@ where
                 (Some(_), CommandConsistency::Atomic) => unreachable!(
                     "same-transaction commands do not persist eventual modeled metadata"
                 ),
-                (None, CommandConsistency::Succeeded) if self.contract.confirmations.is_empty() => {
-                    TerminalCommandState::Succeeded
-                }
-                (None, CommandConsistency::Succeeded | CommandConsistency::Eventual) => {
+                (None, CommandConsistency::Succeeded) => TerminalCommandState::Succeeded,
+                (None, CommandConsistency::Eventual) => {
                     TerminalCommandState::SucceededPendingProjection
                 }
                 (None, CommandConsistency::Atomic) => TerminalCommandState::Atomic,
@@ -2250,10 +2234,9 @@ where
                         policy.replay_retention,
                         retention_expires_at,
                     ),
-                (None, None) => attempt.complete_with_obligations(
+                (None, None) => attempt.complete(
                     terminal_state,
                     replay_payload.clone(),
-                    projection_obligations,
                     policy.replay_retention,
                 ),
                 _ => unreachable!("modeled projection bytes and lifetime are derived together"),
@@ -2677,14 +2660,8 @@ where
                 })?;
                 let mut current_without_owner = current.clone();
                 current_without_owner.direct_projection = None;
-                for confirmation in &mut current_without_owner.confirmations {
-                    confirmation.clear_protocol_topology();
-                }
                 let mut bound_without_owner = bound.clone();
                 bound_without_owner.direct_projection = None;
-                for confirmation in &mut bound_without_owner.confirmations {
-                    confirmation.clear_protocol_topology();
-                }
                 if current.input_type_id != bound.input_type_id
                     || current.output_type_id != bound.output_type_id
                 {
@@ -2701,7 +2678,6 @@ where
                     ));
                 }
                 let contract = handler.contract_mut();
-                contract.confirmations = bound.confirmations.clone();
                 contract.direct_projection = bound.direct_projection.clone();
             }
         }

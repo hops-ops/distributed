@@ -117,8 +117,7 @@ pub use service::{
 };
 #[cfg(feature = "graphql")]
 pub(crate) use service::{
-    CausalCommandProjectionObligation, CausalCommandPublicState, CausalCommandReceiptSource,
-    CausalProjectionEvidenceState,
+    CausalCommandPublicState, CausalCommandReceiptSource, CausalProjectionEvidenceState,
 };
 #[cfg(feature = "graphql")]
 pub use service::{CausalCommandPublicStatus, CausalDispatchError, CausalDispatchResult};

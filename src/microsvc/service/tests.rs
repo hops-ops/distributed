@@ -1386,7 +1386,6 @@ async fn causal_dispatch_receipt_and_status_use_the_exact_durable_replay() {
     assert_eq!(first.receipt.command_id, command_id);
     assert_eq!(first.receipt.state, CommandLedgerState::Succeeded);
     assert_eq!(first.receipt.consistency, CommandConsistency::Succeeded);
-    assert!(first.receipt.obligations.is_empty());
     assert!(first.receipt.direct_projection.is_none());
     assert_eq!(handler_calls.load(Ordering::SeqCst), 1);
 
@@ -1402,7 +1401,6 @@ async fn causal_dispatch_receipt_and_status_use_the_exact_durable_replay() {
     );
     assert_eq!(status.consistency, Some(CommandConsistency::Succeeded));
     assert_eq!(status.outcome, Some(first.payload));
-    assert!(status.obligations.is_empty());
     assert!(status.evidence.is_empty());
     assert!(status.direct_projection.is_none());
 }
@@ -2261,10 +2259,7 @@ async fn causal_prepared_batch_failure_rolls_back_every_atomic_participant() {
 
 #[cfg(all(feature = "graphql", feature = "sqlite"))]
 #[tokio::test]
-async fn causal_dispatch_replay_contains_resolved_projection_obligation() {
-    // Separately authored command_confirmations! is removed. Succeeded commands
-    // without modeled `.emits` finish without finite projection obligations; the
-    // outbox fact still stages for downstream projectors.
+async fn succeeded_causal_dispatch_replays_and_stages_its_outbox_fact() {
     let repository = crate::SqliteRepository::connect_and_migrate("sqlite::memory:")
         .await
         .expect("framework migrations should apply");
@@ -2338,7 +2333,6 @@ async fn causal_dispatch_replay_contains_resolved_projection_obligation() {
         .await
         .expect("status should load");
     assert_eq!(status.consistency, Some(CommandConsistency::Succeeded));
-    assert!(status.obligations.is_empty());
 
     let lookup = service
         .lookup_causal_command(
@@ -2349,10 +2343,10 @@ async fn causal_dispatch_replay_contains_resolved_projection_obligation() {
         )
         .await
         .expect("same principal should be able to recover its command");
-    let CommandLookup::Replay(replay) = lookup else {
-        panic!("completed command should be replayable");
-    };
-    assert!(replay.projection_obligations.is_empty());
+    assert!(
+        matches!(lookup, CommandLookup::Replay(_)),
+        "completed command should be replayable"
+    );
 
     let pending = repository.outbox_store().pending(10).await.unwrap();
     assert_eq!(pending.len(), 1);
@@ -3186,7 +3180,6 @@ async fn projected_command_auto_binds_bootstraps_and_replays_exact_direct_eviden
         .expect("direct projected status should use ledger replay evidence");
     assert_eq!(direct_status.state, CausalCommandPublicState::Atomic);
     assert_eq!(direct_status.consistency, Some(CommandConsistency::Atomic));
-    assert!(direct_status.obligations.is_empty());
     assert!(direct_status.evidence.is_empty());
     let direct_status_evidence = direct_status
         .direct_projection

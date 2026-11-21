@@ -87,16 +87,7 @@ pub(in crate::graphql::surface) fn validate_and_canonicalize_commands(
             .canonicalize_and_validate(&command.command_name)?;
         validate_command_input_defaults(command)?;
         validate_command_projection_previews(command)?;
-        validate_command_effects(models, command)?;
-        validate_command_confirmations(models, command)?;
-        command.confirmations.sort_by(|left, right| {
-            serde_json::to_string(&left.canonical_value())
-                .expect("confirmation IR serialization cannot fail")
-                .cmp(
-                    &serde_json::to_string(&right.canonical_value())
-                        .expect("confirmation IR serialization cannot fail"),
-                )
-        });
+        validate_command_projection_contract(models, command)?;
     }
     commands.sort_by(|a, b| a.command_name.cmp(&b.command_name));
     Ok(())
@@ -269,23 +260,14 @@ pub(in crate::graphql::surface) fn validate_command_input_defaults(
     Ok(())
 }
 
-pub(in crate::graphql::surface) fn validate_command_confirmations(
+pub(in crate::graphql::surface) fn validate_command_projection_contract(
     models: &BTreeMap<String, SurfaceModel>,
     command: &SurfaceCommand,
 ) -> Result<(), String> {
-    validate_projection_confirmation_count(&command.command_name, command.confirmations.len())?;
     match command.consistency {
-        CommandConsistency::Eventual
-            if command.confirmations.is_empty() && command.projections.selectors.is_empty() =>
-        {
+        CommandConsistency::Eventual if command.projections.selectors.is_empty() => {
             return Err(format!(
                 "typed causal command `{}` must declare at least one expected projector confirmation",
-                command.command_name
-            ));
-        }
-        CommandConsistency::Atomic if !command.confirmations.is_empty() => {
-            return Err(format!(
-                "typed projected command `{}` cannot declare asynchronous projector confirmations",
                 command.command_name
             ));
         }
@@ -355,42 +337,6 @@ pub(in crate::graphql::surface) fn validate_command_confirmations(
             )?;
         }
     }
-    if command.confirmation_unavailable {
-        return Err(format!(
-            "catalog command `{}` cannot start with an unavailable confirmation plan",
-            command.command_name
-        ));
-    }
-
-    let mut seen = BTreeSet::new();
-    for confirmation in &command.confirmations {
-        if confirmation.projector.trim().is_empty() {
-            return Err(format!(
-                "typed command `{}` confirmation projector must not be empty",
-                command.command_name
-            ));
-        }
-        validate_effect_key(models, command, &confirmation.model, &confirmation.key)?;
-        if let Some(partition) = &confirmation.partition {
-            validate_effect_expression(
-                command,
-                partition,
-                &ColumnField {
-                    name: "projector partition".into(),
-                    scalar: "String".into(),
-                    nullable: false,
-                },
-            )?;
-        }
-        let identity =
-            serde_json::to_string(confirmation).expect("confirmation IR serialization cannot fail");
-        if !seen.insert(identity) {
-            return Err(format!(
-                "typed command `{}` repeats an expected projector confirmation",
-                command.command_name
-            ));
-        }
-    }
     Ok(())
 }
 
@@ -426,50 +372,6 @@ pub(in crate::graphql::surface) fn bind_surface_direct_projection_targets(
     }
 
     for command in commands {
-        for confirmation in &mut command.confirmations {
-            let projector = projectors
-                .iter()
-                .find(|projector| projector.name == confirmation.projector)
-                .ok_or_else(|| {
-                    format!(
-                        "typed command `{}` expects unknown projector `{}`",
-                        command.command_name, confirmation.projector
-                    )
-                })?;
-            let binding_facts = projector.binding_facts();
-            let binding_models = projector.binding_models();
-            if !confirmation.topology_matches(
-                &projector.name,
-                &binding_facts,
-                &binding_models,
-                &projector.partition,
-            ) {
-                return Err(format!(
-                    "typed command `{}` captured projector `{}` topology identity does not match the registered projector facts/models",
-                    command.command_name, confirmation.projector
-                ));
-            }
-            if !confirmation.partition_matches(&projector.partition) {
-                return Err(format!(
-                    "typed command `{}` confirmation for projector `{}` does not provide the partition mapping required by its declaration",
-                    command.command_name, confirmation.projector
-                ));
-            }
-            if !binding_models
-                .iter()
-                .any(|model| model == &confirmation.model)
-            {
-                return Err(format!(
-                    "typed command `{}` expects projector `{}` to confirm model `{}`, but that model is not in the projector topology",
-                    command.command_name, confirmation.projector, confirmation.model
-                ));
-            }
-            let (topology, _) = compiled_projectors
-                .get(&projector.name)
-                .expect("every registered projector was compiled above");
-            confirmation.bind_protocol_topology(topology.clone());
-        }
-
         if command.consistency != CommandConsistency::Atomic {
             continue;
         }
@@ -554,7 +456,7 @@ pub(in crate::graphql::surface) fn bind_surface_direct_projection_targets(
     Ok(())
 }
 
-pub(in crate::graphql::surface) fn validate_command_confirmation_topology(
+pub(in crate::graphql::surface) fn validate_command_projection_topology(
     commands: &[SurfaceCommand],
     projectors: &[SurfaceProjectionOwner],
     models: &BTreeMap<String, SurfaceModel>,
@@ -598,47 +500,6 @@ pub(in crate::graphql::surface) fn validate_command_confirmation_topology(
     }
 
     for command in commands {
-        for confirmation in &command.confirmations {
-            let projector = projectors
-                .iter()
-                .find(|projector| projector.name == confirmation.projector)
-                .ok_or_else(|| {
-                    format!(
-                        "typed command `{}` expects unknown projector `{}`",
-                        command.command_name, confirmation.projector
-                    )
-                })?;
-            if !projector
-                .models
-                .iter()
-                .any(|model| model == &confirmation.model)
-            {
-                return Err(format!(
-                    "typed command `{}` expects projector `{}` to confirm model `{}`, but that model is not in the projector topology",
-                    command.command_name, confirmation.projector, confirmation.model
-                ));
-            }
-            if !confirmation.topology_matches(
-                &projector.name,
-                &projector.facts,
-                &projector.models,
-                &projector.partition,
-            ) {
-                return Err(format!(
-                    "typed command `{}` captured projector `{}` topology identity does not match the registered projector facts/models",
-                    command.command_name, confirmation.projector
-                ));
-            }
-            let (expected_topology, _) = compiled_projectors
-                .get(&projector.name)
-                .expect("every registered projector was compiled above");
-            if confirmation.protocol_topology() != Some(expected_topology) {
-                return Err(format!(
-                    "typed command `{}` confirmation for projector `{}` is not bound to the exact compiled schema topology",
-                    command.command_name, confirmation.projector
-                ));
-            }
-        }
         if let Some(target) = &command.direct_projection {
             let projector = projectors
                 .iter()

@@ -42,8 +42,8 @@ pub(crate) use causal::CausalCommandProjectionEvidence;
 pub use causal::GraphqlServiceBindError;
 #[cfg(feature = "graphql")]
 pub(crate) use causal::{
-    CausalCommandProjectionObligation, CausalCommandPublicState, CausalCommandReceiptSource,
-    CausalProjectionEvidenceState, ExternalCausalReservation,
+    CausalCommandPublicState, CausalCommandReceiptSource, CausalProjectionEvidenceState,
+    ExternalCausalReservation,
 };
 #[cfg(feature = "graphql")]
 pub use causal::{CausalCommandPublicStatus, CausalDispatchError, CausalDispatchResult};

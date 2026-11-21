@@ -5,11 +5,11 @@ use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::projection_protocol::{ResolvedProjectionObligation, SameTransactionProjectionEvidence};
+use crate::projection_protocol::SameTransactionProjectionEvidence;
 
 use super::{
-    ids::COMMAND_REPLAY_VERSION, state::validate_projection_obligation_semantics, AttemptFence,
-    AttemptToken, CanonicalInputHash, CausationId, CommandAttempt, CommandCompletion,
+    ids::COMMAND_REPLAY_VERSION, state::validate_replay_state_without_projection_metadata,
+    AttemptFence, AttemptToken, CanonicalInputHash, CausationId, CommandAttempt, CommandCompletion,
     CommandContractFingerprint, CommandLedgerError, CommandLedgerKey, CommandLedgerState,
     CommandLookup, CommandLookupScope, CommandReplay, CommandReservation,
     ExternalCommandCompletion, ExternalDispatchBinding, ReservationOutcome,
@@ -511,33 +511,6 @@ impl CommandLedgerRecord {
                 self.key.command_id()
             ))
         })?;
-        let projection_obligations_value =
-            envelope.remove("projection_obligations").ok_or_else(|| {
-                CommandLedgerError::Corrupt(format!(
-                    "command `{}` replay envelope has no projection obligations",
-                    self.key.command_id()
-                ))
-            })?;
-        let projection_obligations: Vec<ResolvedProjectionObligation> =
-            serde_json::from_value(projection_obligations_value.clone()).map_err(|error| {
-                CommandLedgerError::Corrupt(format!(
-                    "command `{}` replay projection obligations are invalid: {error}",
-                    self.key.command_id()
-                ))
-            })?;
-        let canonical_projection_obligations = serde_json::to_value(&projection_obligations)
-            .map_err(|error| {
-                CommandLedgerError::Corrupt(format!(
-                    "command `{}` replay projection obligations cannot be normalized: {error}",
-                    self.key.command_id()
-                ))
-            })?;
-        if canonical_projection_obligations != projection_obligations_value {
-            return Err(CommandLedgerError::Corrupt(format!(
-                "command `{}` replay projection obligations contain unknown or non-canonical fields",
-                self.key.command_id()
-            )));
-        }
         let projection_metadata = envelope
             .remove("projection_metadata")
             .map(|value| {
@@ -569,21 +542,13 @@ impl CommandLedgerRecord {
                 Ok(bytes)
             })
             .transpose()?;
-        if projection_metadata.is_some() && !projection_obligations.is_empty() {
-            return Err(CommandLedgerError::Corrupt(format!(
-                "command `{}` replay mixes legacy and modeled projection obligations",
-                self.key.command_id()
-            )));
-        }
         if projection_metadata.is_none() {
-            validate_projection_obligation_semantics(self.state, &projection_obligations).map_err(
-                |error| {
-                    CommandLedgerError::Corrupt(format!(
-                        "command `{}` replay projection obligations are inconsistent: {error}",
-                        self.key.command_id()
-                    ))
-                },
-            )?;
+            validate_replay_state_without_projection_metadata(self.state).map_err(|error| {
+                CommandLedgerError::Corrupt(format!(
+                    "command `{}` replay is inconsistent: {error}",
+                    self.key.command_id()
+                ))
+            })?;
         }
         let direct_projection = envelope.remove("direct_projection");
         match (&direct_projection, self.state) {
@@ -623,7 +588,6 @@ impl CommandLedgerRecord {
             state: self.state,
             causation_id: self.causation_id.clone(),
             outcome,
-            projection_obligations,
             projection_metadata,
             direct_projection,
         })

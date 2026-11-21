@@ -1181,8 +1181,6 @@ fn validate_surface(
             validate_command_type_spec(output)?;
         }
         validate_json_contract("surface command defaults", &command.defaults)?;
-        validate_json_contract("surface command effects", &command.effects)?;
-        validate_json_contract("surface command confirmations", &command.confirmations)?;
         validate_json_contract(
             "surface command projection contract",
             &command.projection_contract,
@@ -1680,7 +1678,6 @@ fn validate_surface_command_ownership(
         || exposed.output.as_ref() != Some(&authoritative.output)
         || exposed.consistency != authoritative.consistency
         || canonical_json(&exposed.defaults) != canonical_json(&authoritative.defaults)
-        || canonical_json(&exposed.effects) != canonical_json(&authoritative.effects)
         || canonical_json(&exposed.applies) != canonical_json(&authoritative.applies)
         || canonical_json(&exposed.projection_contract)
             != canonical_json(&authoritative.projection_contract)
@@ -1691,14 +1688,6 @@ fn validate_surface_command_ownership(
             kind: "command",
             identity: authoritative.id.clone(),
             reason: "surface command is not compatible with its application declaration".into(),
-        });
-    }
-    let authoritative_confirmations = serde_json::to_value(&authoritative.confirmations)?;
-    if canonical_json(&exposed.confirmations) != canonical_json(&authoritative_confirmations) {
-        return Err(ApplicationError::Collision {
-            kind: "command",
-            identity: authoritative.id.clone(),
-            reason: "surface command confirmation material is stale".into(),
         });
     }
     Ok(())
@@ -1807,12 +1796,9 @@ fn surface_contract_from_spec(surface: &SurfaceSpec) -> ApplicationResult<serde_
                 "output": surface_command_type_value(command.output.as_ref()),
                 "consistency": command.consistency,
                 "input_defaults": command.defaults,
-                "effects": command.effects,
-                "confirmations": command.confirmations,
                 "projected_model": command.projected_model,
                 "direct_projection": command.direct_projection,
                 "projections": command.projection_contract,
-                "confirmation_unavailable": command.confirmation_unavailable,
             })
         })
         .collect::<Vec<_>>();

@@ -238,14 +238,11 @@ impl<K: CommandOutcome> PreparedCommand<K> {
                 if self.projection_proof.is_some() || modeled_direct_plan.is_some() {
                     return Err(CommandCommitProofError::UnexpectedProjectionProof);
                 }
-                contract.validate_outbox_fact_coverage(outbox_messages)
+                contract.validate_declares_projection_events()
             }
             CommandConsistency::Atomic => {
                 if !has_staged_aggregate_events && outbox_messages.is_empty() {
                     return Err(CommandCommitProofError::DurableEventMissing);
-                }
-                if !contract.confirmations.is_empty() {
-                    return Err(CommandCommitProofError::ProjectedHasConfirmations);
                 }
                 let proof = self
                     .projection_proof

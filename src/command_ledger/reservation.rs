@@ -7,14 +7,14 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::projection_protocol::{
-    ResolvedProjectionObligation, SameTransactionProjectionBatch, SameTransactionProjectionEvidence,
+    SameTransactionProjectionBatch, SameTransactionProjectionEvidence,
 };
 use crate::repository::CommitBatch;
 
 use super::{
-    ids::COMMAND_REPLAY_VERSION, state::validate_projection_obligation_semantics, AttemptToken,
-    CanonicalInputHash, CausationId, CommandContractFingerprint, CommandId, CommandLedgerError,
-    CommandLedgerKey, CommandLedgerState, TerminalCommandState, SHA256_BYTES,
+    ids::COMMAND_REPLAY_VERSION, state::validate_replay_state_without_projection_metadata,
+    AttemptToken, CanonicalInputHash, CausationId, CommandContractFingerprint, CommandId,
+    CommandLedgerError, CommandLedgerKey, CommandLedgerState, TerminalCommandState, SHA256_BYTES,
 };
 
 const EXTERNAL_BINDING_VERSION: u16 = 1;
@@ -289,24 +289,7 @@ impl CommandAttempt {
         outcome: Value,
         retention: Duration,
     ) -> Result<CommandCompletion, CommandLedgerError> {
-        self.complete_with_replay_metadata(state, outcome, Vec::new(), None, retention, None)
-    }
-
-    pub(crate) fn complete_with_obligations(
-        self,
-        state: TerminalCommandState,
-        outcome: Value,
-        projection_obligations: Vec<ResolvedProjectionObligation>,
-        retention: Duration,
-    ) -> Result<CommandCompletion, CommandLedgerError> {
-        self.complete_with_replay_metadata(
-            state,
-            outcome,
-            projection_obligations,
-            None,
-            retention,
-            None,
-        )
+        self.complete_with_replay_metadata(state, outcome, None, retention, None)
     }
 
     /// Complete an externally dispatched command without appending local
@@ -318,18 +301,9 @@ impl CommandAttempt {
         binding: ExternalDispatchBinding,
         state: TerminalCommandState,
         outcome: Value,
-        projection_obligations: Vec<ResolvedProjectionObligation>,
         retention: Duration,
     ) -> Result<ExternalCommandCompletion, CommandLedgerError> {
-        self.complete_external_with_replay_metadata(
-            binding,
-            state,
-            outcome,
-            projection_obligations,
-            None,
-            retention,
-            None,
-        )
+        self.complete_external_with_replay_metadata(binding, state, outcome, None, retention, None)
     }
 
     /// Complete a remote command while retaining the exact sealed projection
@@ -350,7 +324,6 @@ impl CommandAttempt {
             binding,
             state,
             outcome,
-            Vec::new(),
             Some(projection_metadata),
             retention,
             Some(retention_expires_at),
@@ -362,7 +335,6 @@ impl CommandAttempt {
         binding: ExternalDispatchBinding,
         state: TerminalCommandState,
         outcome: Value,
-        projection_obligations: Vec<ResolvedProjectionObligation>,
         projection_metadata: Option<Vec<u8>>,
         retention: Duration,
         retention_expires_at: Option<SystemTime>,
@@ -380,7 +352,6 @@ impl CommandAttempt {
         let completion = self.complete_with_replay_metadata(
             state,
             outcome,
-            projection_obligations,
             projection_metadata,
             retention,
             retention_expires_at,
@@ -413,7 +384,6 @@ impl CommandAttempt {
         self.complete_with_replay_metadata(
             state,
             outcome,
-            Vec::new(),
             Some(projection_metadata),
             retention,
             None,
@@ -437,7 +407,6 @@ impl CommandAttempt {
         self.complete_with_replay_metadata(
             state,
             outcome,
-            Vec::new(),
             Some(projection_metadata),
             retention,
             Some(retention_expires_at),
@@ -448,36 +417,22 @@ impl CommandAttempt {
         self,
         state: TerminalCommandState,
         outcome: Value,
-        projection_obligations: Vec<ResolvedProjectionObligation>,
         projection_metadata: Option<Vec<u8>>,
         retention: Duration,
         retention_expires_at: Option<SystemTime>,
     ) -> Result<CommandCompletion, CommandLedgerError> {
         validate_positive_duration("command replay retention", retention)?;
         if projection_metadata.is_none() {
-            validate_projection_obligation_semantics(state.into(), &projection_obligations)
+            validate_replay_state_without_projection_metadata(state.into())
                 .map_err(CommandLedgerError::Invalid)?;
         }
         validate_projection_metadata_bytes(state.into(), projection_metadata.as_deref())?;
-        if projection_metadata.is_some() && !projection_obligations.is_empty() {
-            return Err(CommandLedgerError::Invalid(
-                "command replay cannot mix legacy and modeled projection obligations".into(),
-            ));
-        }
         let mut replay = serde_json::Map::from_iter([
             (
                 "version".into(),
                 Value::from(u64::from(COMMAND_REPLAY_VERSION)),
             ),
             ("outcome".into(), outcome),
-            (
-                "projection_obligations".into(),
-                serde_json::to_value(projection_obligations).map_err(|error| {
-                    CommandLedgerError::Invalid(format!(
-                        "command replay obligations failed to serialize before commit: {error}"
-                    ))
-                })?,
-            ),
         ]);
         if let Some(projection_metadata) = projection_metadata {
             replay.insert(
@@ -579,7 +534,6 @@ pub(crate) struct CommandReplay {
     pub(crate) state: CommandLedgerState,
     pub(crate) causation_id: CausationId,
     pub(crate) outcome: Value,
-    pub(crate) projection_obligations: Vec<ResolvedProjectionObligation>,
     /// Exact canonical role-safe delta and opaque obligation bytes.
     pub(crate) projection_metadata: Option<Vec<u8>>,
     /// Exact original direct-projection revision/change evidence.

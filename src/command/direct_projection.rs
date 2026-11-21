@@ -4,7 +4,6 @@ use std::sync::Arc;
 
 use super::effect_wire::{EffectWireCompatible, EffectWireString, TypedEffectExpression};
 use super::effects::EffectExpression;
-use super::projection_obligations::ProjectorTopologyIdentity;
 use super::projection_proof::canonical_json;
 use crate::microsvc::Session;
 use crate::projection::executor::resolved_partition_json;
@@ -487,12 +486,6 @@ pub(crate) enum DirectProjectionTargetResolutionError {
         target: String,
         preset: String,
     },
-    InvalidConstant {
-        projector: String,
-        model: String,
-        target: String,
-        error: String,
-    },
     InvalidTarget {
         projector: String,
         model: String,
@@ -521,15 +514,6 @@ impl std::fmt::Display for DirectProjectionTargetResolutionError {
             } => write!(
                 formatter,
                 "direct projection `{projector}`/`{model}` {target} uses unavailable trusted preset `{preset}`",
-            ),
-            Self::InvalidConstant {
-                projector,
-                model,
-                target,
-                error,
-            } => write!(
-                formatter,
-                "direct projection `{projector}`/`{model}` {target} contains an invalid constant: {error}",
             ),
             Self::InvalidTarget {
                 projector,
@@ -631,13 +615,44 @@ fn resolve_direct_projection_expression(
                 },
             )
         }
-        EffectExpression::InvalidConstant { error } => {
-            Err(DirectProjectionTargetResolutionError::InvalidConstant {
-                projector: target.projector.clone(),
-                model: target.model.clone(),
-                target: field.to_string(),
-                error: error.clone(),
-            })
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ProjectorTopologyIdentity {
+    name: String,
+    facts: Vec<String>,
+    models: Vec<String>,
+    partition: ProjectionPartitionSpec,
+}
+
+impl ProjectorTopologyIdentity {
+    fn new(
+        name: &str,
+        facts: &[String],
+        models: &[String],
+        partition: &ProjectionPartitionSpec,
+    ) -> Self {
+        let mut facts = facts.to_vec();
+        facts.sort();
+        facts.dedup();
+        let mut models = models.to_vec();
+        models.sort();
+        models.dedup();
+        Self {
+            name: name.to_string(),
+            facts,
+            models,
+            partition: partition.clone(),
         }
+    }
+
+    fn canonical_value(&self) -> serde_json::Value {
+        canonical_json(&serde_json::json!({
+            "name": self.name,
+            "facts": self.facts,
+            "models": self.models,
+            "partition": self.partition,
+        }))
     }
 }

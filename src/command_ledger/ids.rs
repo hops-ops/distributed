@@ -5,7 +5,7 @@ use uuid::{Uuid, Variant};
 use super::CommandLedgerError;
 
 pub(crate) const SHA256_BYTES: usize = 32;
-pub(super) const COMMAND_REPLAY_VERSION: u16 = 2;
+pub(super) const COMMAND_REPLAY_VERSION: u16 = 3;
 
 /// Opaque identity for one concrete leaf repository instance.
 ///

@@ -59,38 +59,6 @@ const PROJECTION_SOURCE_PARTITION_DIGEST_DOMAIN: &[u8] =
     b"distributed.projection.source-partition.v1\0";
 const PROJECTION_RECORD_KEY_DIGEST_DOMAIN: &[u8] = b"distributed.projection.record-key.v1\0";
 
-/// One declaration-owned projection obligation after every portable command
-/// expression has been resolved against the retained canonical GraphQL input.
-///
-/// The command ledger persists this adapter-neutral value. Projector
-/// registration later lowers it through the same scope codec that encodes
-/// projector-side rows, so there is no second string or key interpretation.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct ResolvedProjectionObligation {
-    pub(crate) projector: String,
-    pub(crate) model: String,
-    pub(crate) key: RecordKey,
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        deserialize_with = "deserialize_present_json_value"
-    )]
-    pub(crate) partition: Option<serde_json::Value>,
-    /// Canonical topology/partition/key identity computed by the bound compiler
-    /// before ledger I/O. Consumers validate the logical fields against this
-    /// exact scope; they never rebind old strings under a newer topology.
-    pub(crate) scope: ProjectionRecordScope,
-}
-
-fn deserialize_present_json_value<'de, D>(
-    deserializer: D,
-) -> Result<Option<serde_json::Value>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    serde_json::Value::deserialize(deserializer).map(Some)
-}
-
 /// Complete projection key in declaration order.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct RecordKey {

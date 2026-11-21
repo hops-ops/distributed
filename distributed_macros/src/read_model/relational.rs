@@ -39,43 +39,22 @@ pub(super) fn expand_relational_read_model(
         .map(|column| quote! { #column.to_string() })
         .collect::<Vec<_>>();
 
-    let effect_key_name = format_ident!("__Distributed{}EffectKey", name);
-    let mut effect_key_fields = Vec::new();
-    let mut effect_key_values = Vec::new();
     for primary_key_column in &primary_key_fields {
-        let (field, _attrs) = fields
-            .iter()
-            .zip(field_attrs)
-            .find(|(field, attrs)| {
-                if attrs.relationship.is_some() || attrs.skip_query {
-                    return false;
-                }
-                let Some(ident) = &field.ident else {
-                    return false;
-                };
+        let has_field = fields.iter().zip(field_attrs).any(|(field, attrs)| {
+            if attrs.relationship.is_some() || attrs.skip_query {
+                return false;
+            }
+            field.ident.as_ref().is_some_and(|ident| {
                 let field_name = ident.to_string();
                 attrs.column.as_deref().unwrap_or(&field_name) == primary_key_column
             })
-            .ok_or_else(|| {
-                syn::Error::new(
-                    proc_macro2::Span::call_site(),
-                    format!(
-                        "primary-key column `{primary_key_column}` has no effect-key field on `{model_name}`"
-                    ),
-                )
-            })?;
-        let ident = field
-            .ident
-            .as_ref()
-            .expect("named read-model fields were validated");
-        let ty = &field.ty;
-        let marker = format_ident!("__Distributed{}EffectModelField_{}", name, ident);
-        effect_key_fields.push(quote! {
-            pub #ident: #framework::command::TypedEffectExpression<#ty>
         });
-        effect_key_values.push(quote! {
-            #framework::command::__effect_key_field::<#marker>(value.#ident)
-        });
+        if !has_field {
+            return Err(syn::Error::new(
+                proc_macro2::Span::call_site(),
+                format!("primary-key column `{primary_key_column}` has no field on `{model_name}`"),
+            ));
+        }
     }
 
     let mut column_defs = Vec::new();
@@ -307,20 +286,6 @@ pub(super) fn expand_relational_read_model(
         syn::LitStr::new(&projection_schema_fingerprint, Span::call_site());
 
     Ok(quote! {
-        #[doc(hidden)]
-        #[allow(non_camel_case_types)]
-        #visibility struct #effect_key_name {
-            #(#effect_key_fields),*
-        }
-
-        impl ::core::convert::From<#effect_key_name>
-            for #framework::command::TypedEffectKey<#name>
-        {
-            fn from(value: #effect_key_name) -> Self {
-                #framework::command::__effect_key::<#name>(vec![#(#effect_key_values),*])
-            }
-        }
-
         #(#effect_markers)*
 
         impl #framework::RelationalReadModel for #name {

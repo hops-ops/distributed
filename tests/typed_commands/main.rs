@@ -1399,8 +1399,6 @@ async fn succeeded_command_without_preview_exports_modeled_revalidation_contract
         .unwrap();
 
     assert_eq!(command.extensions.consistency.kind, "succeeded");
-    assert!(command.extensions.effects.is_none());
-    assert!(command.extensions.confirmations.is_none());
     let projection = command.extensions.projection.as_ref().unwrap();
     assert_eq!(projection.fallback, ClientProjectionFallback::Revalidate);
     assert_eq!(projection.program_arms.len(), 1);
@@ -1453,8 +1451,6 @@ async fn generated_input_default_is_reused_as_the_effect_key_and_fingerprinted()
     assert_eq!(defaults.defaults.len(), 1);
     assert_eq!(defaults.defaults[0]["path"], serde_json::json!(["id"]));
     assert_eq!(defaults.defaults[0]["generator"], "uuid_v7");
-    assert!(command.extensions.effects.is_none());
-    assert!(command.extensions.confirmations.is_none());
     let projection = command.extensions.projection.as_ref().unwrap();
     let arm = &manifest.projection_programs[0].arms[0];
     let ClientProjectionPartition::Expression {
@@ -1610,8 +1606,6 @@ async fn json_container_leaves_reach_the_manifest() {
         .client_manifest_for_role("anonymous")
         .unwrap();
     let command = &manifest.commands[0];
-    assert!(command.extensions.effects.is_none());
-    assert!(command.extensions.confirmations.is_none());
     let projection = command.extensions.projection.as_ref().unwrap();
     assert_eq!(projection.fallback, ClientProjectionFallback::Revalidate);
     let preview = &projection.preview_occurrences[0];
@@ -1705,8 +1699,6 @@ async fn embedded_primary_keys_reject_keyed_effects_while_composite_keys_remain_
         ["tenant_id", "id"]
     );
     let command = &composite_manifest.commands[0];
-    assert!(command.extensions.effects.is_none());
-    assert!(command.extensions.confirmations.is_none());
     assert!(command.extensions.projection.is_some());
     let operation = &composite_manifest.projection_programs[0].arms[0].operations[0];
     assert_eq!(operation.kind, ClientProjectionMutationKind::Patch);
@@ -1762,8 +1754,6 @@ async fn embedded_models_retain_global_revalidation_for_modeled_projections() {
         distributed::graphql::ModelNormalization::Embedded
     );
     let command = &manifest.commands[0];
-    assert!(command.extensions.effects.is_none());
-    assert!(command.extensions.confirmations.is_none());
     assert_eq!(
         command.extensions.projection.as_ref().unwrap().fallback,
         ClientProjectionFallback::Revalidate
@@ -1826,8 +1816,6 @@ async fn succeeded_emitted_event_exports_a_modeled_causal_projection() {
         .find(|command| command.name == "plan.create")
         .unwrap();
     assert_eq!(command.extensions.consistency.kind, "succeeded");
-    assert!(command.extensions.effects.is_none());
-    assert!(command.extensions.confirmations.is_none());
     let projection = command.extensions.projection.as_ref().unwrap();
     assert_eq!(projection.program_arms.len(), 1);
     assert_eq!(projection.program_arms[0].event.name, "plan.changed");
@@ -1859,8 +1847,6 @@ async fn text_backed_enum_constant_reaches_a_valid_client_manifest() {
         .unwrap();
     let manifest = engine.client_manifest_for_role("anonymous").unwrap();
     let command = &manifest.commands[0];
-    assert!(command.extensions.effects.is_none());
-    assert!(command.extensions.confirmations.is_none());
     assert!(command.extensions.projection.is_some());
     let status = &manifest.projection_programs[0].arms[0].operations[0]
         .fields
@@ -1903,8 +1889,6 @@ async fn nonfinite_float_constant_is_rejected_but_explicit_null_is_portable() {
         .client_manifest_for_role("anonymous")
         .unwrap();
     let command = &manifest.commands[0];
-    assert!(command.extensions.effects.is_none());
-    assert!(command.extensions.confirmations.is_none());
     assert!(command.extensions.projection.is_some());
     let value = &manifest.projection_programs[0].arms[0].operations[0]
         .fields
@@ -1948,8 +1932,6 @@ async fn json_backed_constants_reject_nonfinite_floats_but_preserve_json_null() 
         .client_manifest_for_role("anonymous")
         .unwrap();
     let command = &manifest.commands[0];
-    assert!(command.extensions.effects.is_none());
-    assert!(command.extensions.confirmations.is_none());
     assert!(command.extensions.projection.is_some());
     let value = &manifest.projection_programs[0].arms[0].operations[0]
         .fields
@@ -2016,8 +1998,6 @@ async fn role_redaction_replaces_an_unsafe_modeled_projection_with_revalidation(
     let manifest = engine.client_manifest_for_role("user").unwrap();
     let command = &manifest.commands[0];
     assert!(command.extensions.input_defaults.is_some());
-    assert!(command.extensions.effects.is_none());
-    assert!(command.extensions.confirmations.is_none());
     let projection = command.extensions.projection.as_ref().unwrap();
     assert_eq!(projection.fallback, ClientProjectionFallback::Revalidate);
     let operation = &manifest.projection_programs[0].arms[0].operations[0];

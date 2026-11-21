@@ -341,20 +341,6 @@ where
     L: LockManager,
 {
     #[cfg(feature = "graphql")]
-    fn command_obligation_evidence<'a>(
-        &'a self,
-        request: &'a crate::projection_protocol::ProjectionObligationEvidenceBatchRequest,
-    ) -> impl std::future::Future<
-        Output = Result<
-            crate::projection_protocol::ProjectionObligationEvidenceBatch,
-            crate::projection_protocol::ProjectionProtocolError,
-        >,
-    > + Send
-           + 'a {
-        self.inner.command_obligation_evidence(request)
-    }
-
-    #[cfg(feature = "graphql")]
     fn command_causation_evidence<'a>(
         &'a self,
         request: &'a crate::projection_protocol::ProjectionCausationEvidenceRequest,

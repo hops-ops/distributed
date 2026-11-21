@@ -1,11 +1,6 @@
 use super::*;
 use crate::command::{CommandInputType, CommandOutputType, CommandTypeDef, CommandTypeField};
-use crate::microsvc::Session;
 use crate::outbox::OutboxMessage;
-use crate::projection_protocol::{
-    ProjectionPartitionSpec, ProjectorTopologyId, ResolvedProjectionObligation,
-};
-use crate::table::{ColumnType, PrimaryKey, TableColumn, TableKind, TableSchema};
 use serde::{Deserialize, Serialize};
 use std::any::TypeId;
 
@@ -18,7 +13,7 @@ fn command_ledger_fingerprint_preserves_the_v1_canonical_contract() {
     let hex: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
     assert_eq!(
         hex,
-        "39cd9dbf7a1b3a17e0ee5c04841af2af95b0ba391c07eced4c4e1a80d9e55be5"
+        "fbc22caa3a5bd390cf7c17b63c0fc61304bc8706af47dd67e9ee40e63e40195a"
     );
 }
 
@@ -524,317 +519,6 @@ fn repeated_preview_declarations_preserve_synthetic_occurrence_order() {
     ));
 }
 
-fn confirmation_with_facts(facts: &[&str]) -> CommandProjectionConfirmation {
-    CommandProjectionConfirmation {
-        projector: "project_todos".into(),
-        model: "TodoView".into(),
-        key: EffectKey { fields: Vec::new() },
-        partition: None,
-        projector_topology: ProjectorTopologyIdentity::new(
-            "project_todos",
-            &facts
-                .iter()
-                .map(|fact| (*fact).to_string())
-                .collect::<Vec<_>>(),
-            &["TodoView".into()],
-            &ProjectionPartitionSpec::unit(),
-        ),
-        protocol_topology: None,
-        schema: None,
-    }
-}
-
-#[test]
-fn confirmation_inventory_matches_the_bounded_status_batch() {
-    let maximum = crate::projection_protocol::MAX_PROJECTION_EVIDENCE_BATCH_ITEMS;
-    validate_projection_confirmation_count("todo.update", maximum)
-        .expect("the adapter's exact maximum must be accepted");
-    let error = validate_projection_confirmation_count("todo.update", maximum + 1)
-        .expect_err("one more confirmation must fail before service traffic");
-    assert!(error.contains(&format!("maximum is {maximum}")), "{error}");
-}
-
-fn confirmation_with_key(
-    projector: &str,
-    fields: impl IntoIterator<Item = (&'static str, EffectExpression)>,
-    partition: Option<EffectExpression>,
-) -> CommandProjectionConfirmation {
-    let fields = fields
-        .into_iter()
-        .map(|(field, value)| EffectFieldValue {
-            field: field.into(),
-            value,
-        })
-        .collect::<Vec<_>>();
-    let columns = fields
-        .iter()
-        .map(|field| TableColumn {
-            primary_key: true,
-            ..TableColumn::new(&field.field, &field.field, ColumnType::Json)
-        })
-        .collect::<Vec<_>>();
-    let primary_key = fields.iter().map(|field| field.field.as_str());
-    let schema = Box::leak(Box::new(TableSchema {
-        model_name: "TodoView".into(),
-        table_name: "todo_views".into(),
-        columns,
-        primary_key: PrimaryKey::new(primary_key),
-        version_column: None,
-        foreign_keys: Vec::new(),
-        indexes: Vec::new(),
-        relationships: Vec::new(),
-        kind: TableKind::ReadModel,
-    }));
-    CommandProjectionConfirmation {
-        projector: projector.into(),
-        model: "TodoView".into(),
-        key: EffectKey { fields },
-        partition,
-        projector_topology: ProjectorTopologyIdentity::new(
-            projector,
-            &["todo.changed".into()],
-            &["TodoView".into()],
-            &ProjectionPartitionSpec::unit(),
-        ),
-        protocol_topology: Some(ProjectorTopologyId::new(1, projector, [3; 32]).unwrap()),
-        schema: Some(schema),
-    }
-}
-
-#[test]
-fn projection_obligations_resolve_nested_canonical_wire_paths_in_declaration_order() {
-    let mut contract = typed_command::<Input, Succeeded<Payload>>("todo.update").into_contract();
-    contract.confirmations = vec![
-        confirmation_with_key(
-            "project_second",
-            [
-                (
-                    "tenant_id",
-                    EffectExpression::Input {
-                        path: vec!["scope".into(), "tenantId".into()],
-                    },
-                ),
-                (
-                    "id",
-                    EffectExpression::Input {
-                        path: vec!["todoId".into()],
-                    },
-                ),
-            ],
-            Some(EffectExpression::Input {
-                path: vec!["scope".into(), "tenantId".into()],
-            }),
-        ),
-        confirmation_with_key(
-            "project_first",
-            [(
-                "id",
-                EffectExpression::Input {
-                    path: vec!["todoId".into()],
-                },
-            )],
-            None,
-        ),
-    ];
-    let canonical_wire = serde_json::json!({
-        "scope": { "tenantId": "tenant-7" },
-        "todoId": "todo-1"
-    });
-
-    let resolved = contract
-        .resolve_projection_obligations(&canonical_wire)
-        .unwrap();
-
-    assert_eq!(
-        resolved
-            .iter()
-            .map(|obligation| obligation.projector.as_str())
-            .collect::<Vec<_>>(),
-        ["project_second", "project_first"]
-    );
-    assert_eq!(
-        resolved[0]
-            .key
-            .fields
-            .iter()
-            .map(|field| field.field.as_str())
-            .collect::<Vec<_>>(),
-        ["tenant_id", "id"]
-    );
-    assert_eq!(resolved[0].key.fields[0].value, "tenant-7");
-    assert_eq!(resolved[0].key.fields[1].value, "todo-1");
-    assert_eq!(resolved[0].partition, Some(serde_json::json!("tenant-7")));
-    assert_eq!(resolved[1].key.fields[0].value, "todo-1");
-    assert_eq!(resolved[1].partition, None);
-}
-
-#[test]
-fn projection_obligations_preserve_constants_and_nulls_through_serde() {
-    let mut contract = typed_command::<Input, Succeeded<Payload>>("todo.update").into_contract();
-    let constant = serde_json::json!({
-        "nested": [1, "two", null],
-        "large": u64::MAX,
-    });
-    contract.confirmations = vec![confirmation_with_key(
-        "project_todos",
-        [(
-            "constant_key",
-            EffectExpression::Constant {
-                value: constant.clone(),
-            },
-        )],
-        Some(EffectExpression::Null),
-    )];
-
-    let resolved = contract
-        .resolve_projection_obligations(&serde_json::json!({}))
-        .unwrap();
-
-    assert_eq!(resolved[0].key.fields[0].value, constant);
-    assert_eq!(resolved[0].partition, Some(serde_json::Value::Null));
-
-    let encoded = serde_json::to_value(&resolved).unwrap();
-    assert!(encoded[0]["partition"].is_null());
-    let decoded: Vec<ResolvedProjectionObligation> = serde_json::from_value(encoded).unwrap();
-    assert_eq!(decoded, resolved);
-}
-
-#[test]
-fn projection_obligation_resolution_fails_on_absent_input_paths() {
-    let mut contract = typed_command::<Input, Succeeded<Payload>>("todo.update").into_contract();
-    contract.confirmations = vec![confirmation_with_key(
-        "project_todos",
-        [(
-            "tenant_id",
-            EffectExpression::Input {
-                path: vec!["scope".into(), "tenantId".into()],
-            },
-        )],
-        None,
-    )];
-
-    let error = contract
-        .resolve_projection_obligations(&serde_json::json!({ "scope": null }))
-        .unwrap_err();
-
-    assert!(matches!(
-        error,
-        ProjectionObligationResolutionError::MissingInputPath { path, .. }
-            if path == ["scope", "tenantId"]
-    ));
-}
-
-#[test]
-fn projection_obligation_resolution_rejects_unresolved_private_expressions() {
-    let mut contract = typed_command::<Input, Succeeded<Payload>>("todo.update").into_contract();
-    contract.confirmations = vec![confirmation_with_key(
-        "project_todos",
-        [(
-            "tenant_id",
-            EffectExpression::TrustedPreset {
-                name: "tenant".into(),
-            },
-        )],
-        None,
-    )];
-    assert!(matches!(
-        contract.resolve_projection_obligations(&serde_json::json!({})),
-        Err(ProjectionObligationResolutionError::TrustedPresetUnavailable {
-            preset,
-            ..
-        }) if preset == "tenant"
-    ));
-    let mut session = Session::new();
-    session.set("tenant", "\"tenant-7\"");
-    let resolved = contract
-        .resolve_projection_obligations_from_session(&serde_json::json!({}), Some(&session))
-        .expect("server Session resolves the declared JSON-typed preset");
-    assert_eq!(resolved[0].key.fields[0].value, "tenant-7");
-    session.set("tenant", "not-json");
-    assert!(matches!(
-        contract
-            .resolve_projection_obligations_from_session(&serde_json::json!({}), Some(&session),),
-        Err(ProjectionObligationResolutionError::TrustedPresetUnavailable { .. })
-    ));
-
-    contract.confirmations = vec![confirmation_with_key(
-        "project_todos",
-        [],
-        Some(EffectExpression::InvalidConstant {
-            error: "not portable".into(),
-        }),
-    )];
-    assert!(matches!(
-        contract.resolve_projection_obligations(&serde_json::json!({})),
-        Err(ProjectionObligationResolutionError::InvalidConstant {
-            target,
-            error,
-            ..
-        }) if target == "partition" && error == "not portable"
-    ));
-}
-
-#[test]
-fn projection_obligation_resolution_is_empty_without_confirmations() {
-    let contract = typed_command::<Input, Succeeded<Payload>>("todo.check").into_contract();
-
-    assert!(contract
-        .resolve_projection_obligations(&serde_json::json!("unused"))
-        .unwrap()
-        .is_empty());
-}
-
-#[test]
-fn finite_confirmation_requires_a_reachable_staged_outbox_fact() {
-    let mut contract = typed_command::<Input, Succeeded<Payload>>("todo.create").into_contract();
-    contract.confirmations = vec![confirmation_with_facts(&["todo.created", "todo.recreated"])];
-    let prepared = PreparedCommand::<Succeeded<Payload>>::prepare(Payload {
-        id: "todo-1".into(),
-    })
-    .unwrap();
-
-    let no_fact = prepared
-        .validate_commit_evidence(&contract, false, &[], &[], None)
-        .unwrap_err();
-    assert!(matches!(
-        no_fact,
-        CommandCommitProofError::UnreachableConfirmation { .. }
-    ));
-
-    let unrelated = OutboxMessage::create("message-1", "account.changed", Vec::new()).unwrap();
-    assert!(matches!(
-        prepared.validate_commit_evidence(&contract, false, &[unrelated], &[], None),
-        Err(CommandCommitProofError::UnreachableConfirmation { .. })
-    ));
-
-    let reachable = OutboxMessage::create("message-2", "todo.created", Vec::new()).unwrap();
-    prepared
-        .validate_commit_evidence(&contract, false, &[reachable], &[], None)
-        .unwrap();
-
-    let directed =
-        OutboxMessage::create_to("message-3", "todo.created", "todo-projector", Vec::new())
-            .unwrap();
-    assert!(matches!(
-        prepared.validate_commit_evidence(&contract, false, &[directed], &[], None),
-        Err(CommandCommitProofError::UnreachableConfirmation { .. })
-    ));
-
-    let mut published = OutboxMessage::create("message-4", "todo.created", Vec::new()).unwrap();
-    published.status = crate::outbox::OutboxMessageStatus::Published;
-    assert!(matches!(
-        prepared.validate_commit_evidence(&contract, false, &[published], &[], None),
-        Err(CommandCommitProofError::UnreachableConfirmation { .. })
-    ));
-
-    let mut failed = OutboxMessage::create("message-5", "todo.created", Vec::new()).unwrap();
-    failed.status = crate::outbox::OutboxMessageStatus::Failed;
-    assert!(matches!(
-        prepared.validate_commit_evidence(&contract, false, &[failed], &[], None),
-        Err(CommandCommitProofError::UnreachableConfirmation { .. })
-    ));
-}
-
 #[test]
 fn succeeded_without_confirmations_allows_an_empty_domain_batch() {
     let contract = typed_command::<Input, Succeeded<Payload>>("todo.check").into_contract();
@@ -882,73 +566,6 @@ fn per_route_fingerprint_is_stable_and_contract_sensitive() {
 }
 
 #[test]
-fn command_fingerprints_canonicalize_nested_json_object_keys() {
-    fn contract_with_constant(order: [&str; 2]) -> TypedCommandContract {
-        let mut value = serde_json::Map::new();
-        for key in order {
-            value.insert(
-                key.into(),
-                serde_json::json!(if key == "a" { 1 } else { 2 }),
-            );
-        }
-        let mut contract =
-            typed_command::<Input, Succeeded<Payload>>("todo.update").into_contract();
-        contract.effects = CommandEffects::new([CommandEffect::Patch {
-            model: "Todo".into(),
-            key: EffectKey {
-                fields: vec![EffectFieldValue {
-                    field: "id".into(),
-                    value: EffectExpression::Input {
-                        path: vec!["id".into()],
-                    },
-                }],
-            },
-            fields: vec![EffectFieldValue {
-                field: "metadata".into(),
-                value: EffectExpression::Constant {
-                    value: serde_json::Value::Object(value),
-                },
-            }],
-        }]);
-        contract
-    }
-
-    let reverse_insertion = contract_with_constant(["z", "a"]);
-    let sorted_insertion = contract_with_constant(["a", "z"]);
-    assert_eq!(
-        reverse_insertion.fingerprint_bytes(),
-        sorted_insertion.fingerprint_bytes()
-    );
-
-    let route_fingerprint = format!(
-        "sha256:{}",
-        reverse_insertion
-            .fingerprint_bytes()
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect::<String>()
-    );
-    let reverse_binding =
-        TypedServiceCommandBinding::from_contracts("todos", &[reverse_insertion]).unwrap();
-    let sorted_binding =
-        TypedServiceCommandBinding::from_contracts("todos", &[sorted_insertion]).unwrap();
-    assert_eq!(
-        reverse_binding.structural_fingerprint,
-        sorted_binding.structural_fingerprint
-    );
-    assert_eq!(
-        (
-            route_fingerprint.as_str(),
-            reverse_binding.structural_fingerprint.as_str(),
-        ),
-        (
-            "sha256:316da00fdf3cfb8ebc2ffdc2b01ef2c39c2a424c06384cc3206984d37f050799",
-            "sha256:f12034f9fbb4390014593a372303ad4389397916ee66fca6288f8ccba3be9dce",
-        )
-    );
-}
-
-#[test]
 fn binding_rejects_missing_command_type_ids() {
     let mut contract = typed_command::<Input, Succeeded<Payload>>("todo.create").into_contract();
     contract.input.type_id = None;
@@ -957,7 +574,7 @@ fn binding_rejects_missing_command_type_ids() {
 }
 
 #[test]
-fn binding_canonicalizes_fields_and_roles_but_preserves_effect_order() {
+fn binding_canonicalizes_fields_and_roles() {
     let mut first = typed_command::<Input, Succeeded<Payload>>("todo.create")
         .roles(["writer", "admin"])
         .into_contract();
@@ -970,14 +587,6 @@ fn binding_canonicalizes_fields_and_roles_but_preserves_effect_order() {
         item_nullable: false,
         nested: None,
     });
-    first.effects.operations = vec![
-        CommandEffect::InvalidateModel {
-            model: "Zed".into(),
-        },
-        CommandEffect::InvalidateModel {
-            model: "Alpha".into(),
-        },
-    ];
 
     let mut second = first.clone();
     second.roles.reverse();
@@ -985,30 +594,4 @@ fn binding_canonicalizes_fields_and_roles_but_preserves_effect_order() {
     let first = TypedServiceCommandBinding::from_contracts("todos", &[first]).unwrap();
     let second = TypedServiceCommandBinding::from_contracts("todos", &[second]).unwrap();
     assert_eq!(first, second);
-
-    let mut reordered = typed_command::<Input, Succeeded<Payload>>("todo.create")
-        .roles(["writer", "admin"])
-        .into_contract();
-    reordered.input.fields.push(CommandTypeField {
-        unsigned_integer: None,
-        name: "z_extra".into(),
-        type_name: "String".into(),
-        nullable: true,
-        list: false,
-        item_nullable: false,
-        nested: None,
-    });
-    reordered.effects.operations = vec![
-        CommandEffect::InvalidateModel {
-            model: "Alpha".into(),
-        },
-        CommandEffect::InvalidateModel {
-            model: "Zed".into(),
-        },
-    ];
-    let reordered = TypedServiceCommandBinding::from_contracts("todos", &[reordered]).unwrap();
-    assert_ne!(
-        first.structural_fingerprint,
-        reordered.structural_fingerprint
-    );
 }

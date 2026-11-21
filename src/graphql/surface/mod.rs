@@ -14,11 +14,9 @@ use sha2::{Digest, Sha256};
 
 use super::filter::{validate_row_policy_operand_literal, FilterExpr, Operand};
 use crate::command::{
-    compiled_direct_projection_target, validate_projection_confirmation_count, CommandConsistency,
-    CommandDirectProjectionTarget, CommandEffect, CommandEffects, CommandInputDefault,
-    CommandProjectedModel, CommandProjectionConfirmation, CommandProjectionEvents,
+    compiled_direct_projection_target, CommandConsistency, CommandDirectProjectionTarget,
+    CommandInputDefault, CommandProjectedModel, CommandProjectionEvents,
     CommandProjectionPreviewSource, CompiledDirectProjectionTarget, EffectExpression,
-    EffectFieldValue, EffectKey, EffectRelationship,
 };
 use crate::projection_protocol::ProjectionModelOwnership;
 use crate::projection_protocol::ProjectionPartitionSpec;
@@ -73,7 +71,7 @@ pub use types::{
 pub(crate) use commands::projected_output_reuses_surface_model;
 pub(in crate::graphql::surface) use commands::{
     bind_surface_direct_projection_targets, validate_and_canonicalize_commands,
-    validate_command_confirmation_topology,
+    validate_command_projection_topology,
 };
 pub(in crate::graphql::surface) use effects::*;
 pub(in crate::graphql::surface) use identity::*;

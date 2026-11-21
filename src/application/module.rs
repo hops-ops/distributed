@@ -289,13 +289,10 @@ pub struct SurfaceCommandSpec {
     pub output: Option<CommandTypeSpec>,
     pub consistency: crate::command::CommandConsistency,
     pub defaults: serde_json::Value,
-    pub effects: serde_json::Value,
-    pub confirmations: serde_json::Value,
     pub projection_contract: serde_json::Value,
     pub applies: serde_json::Value,
     pub direct_projection: Option<serde_json::Value>,
     pub projected_model: Option<String>,
-    pub confirmation_unavailable: bool,
 }
 
 /// Authorized, placement-independent surface identity.
@@ -545,8 +542,6 @@ fn surface_command_spec(command: &SurfaceCommand) -> ApplicationResult<SurfaceCo
         output: surface_shape_spec(&command.output),
         consistency: command.consistency,
         defaults: serde_json::to_value(&command.input_defaults)?,
-        effects: serde_json::to_value(&command.effects)?,
-        confirmations: serde_json::to_value(&command.confirmations)?,
         projection_contract: serde_json::to_value(&command.projections)?,
         applies: serde_json::to_value(&command.projections.previews)?,
         direct_projection: command
@@ -557,7 +552,6 @@ fn surface_command_spec(command: &SurfaceCommand) -> ApplicationResult<SurfaceCo
             .projected_model
             .as_ref()
             .map(|model| model.model.clone()),
-        confirmation_unavailable: command.confirmation_unavailable,
     })
 }
 

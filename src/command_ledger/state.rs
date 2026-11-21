@@ -1,7 +1,3 @@
-use std::collections::HashSet;
-
-use crate::projection_protocol::ResolvedProjectionObligation;
-
 use super::CommandLedgerError;
 
 /// Durable command lifecycle. `Unknown` is intentionally not stored: absence
@@ -81,76 +77,24 @@ impl From<TerminalCommandState> for CommandLedgerState {
     }
 }
 
-pub(super) fn validate_projection_obligation_semantics(
+/// A replay without modeled projection metadata has no pending projection
+/// work to describe, so only settled states may carry one.
+pub(super) fn validate_replay_state_without_projection_metadata(
     state: CommandLedgerState,
-    obligations: &[ResolvedProjectionObligation],
 ) -> Result<(), String> {
     match state {
         CommandLedgerState::Succeeded
         | CommandLedgerState::Atomic
-        | CommandLedgerState::Rejected => {
-            if !obligations.is_empty() {
-                return Err(format!(
-                    "state `{}` must not contain projection obligations",
-                    state.as_str()
-                ));
-            }
-        }
+        | CommandLedgerState::Rejected => Ok(()),
         CommandLedgerState::SucceededPendingProjection | CommandLedgerState::ProjectionFailed => {
-            if obligations.is_empty() {
-                return Err(format!(
-                    "state `{}` must contain at least one projection obligation",
-                    state.as_str()
-                ));
-            }
-        }
-        _ => {
-            return Err(format!(
-                "state `{}` cannot contain a replay payload",
+            Err(format!(
+                "state `{}` requires modeled projection metadata",
                 state.as_str()
-            ));
+            ))
         }
+        _ => Err(format!(
+            "state `{}` cannot contain a replay payload",
+            state.as_str()
+        )),
     }
-
-    for (obligation_index, obligation) in obligations.iter().enumerate() {
-        if obligation.projector.trim().is_empty() {
-            return Err(format!(
-                "projection obligation {obligation_index} has a blank projector"
-            ));
-        }
-        if obligation.model.trim().is_empty() {
-            return Err(format!(
-                "projection obligation {obligation_index} has a blank model"
-            ));
-        }
-        if obligation.scope.topology().name() != obligation.projector
-            || obligation.scope.model() != obligation.model
-        {
-            return Err(format!(
-                "projection obligation {obligation_index} logical projector/model does not match its exact canonical scope"
-            ));
-        }
-        if obligation.key.fields.is_empty() {
-            return Err(format!(
-                "projection obligation {obligation_index} has no key fields"
-            ));
-        }
-
-        let mut seen_fields = HashSet::with_capacity(obligation.key.fields.len());
-        for (field_index, field) in obligation.key.fields.iter().enumerate() {
-            if field.field.trim().is_empty() {
-                return Err(format!(
-                    "projection obligation {obligation_index} key field {field_index} has a blank name"
-                ));
-            }
-            if !seen_fields.insert(field.field.as_str()) {
-                return Err(format!(
-                    "projection obligation {obligation_index} contains duplicate key field `{}`",
-                    field.field
-                ));
-            }
-        }
-    }
-
-    Ok(())
 }

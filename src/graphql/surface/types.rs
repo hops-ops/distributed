@@ -210,14 +210,9 @@ pub struct SurfaceCommand {
     pub output: SurfaceCommandShape,
     pub consistency: CommandConsistency,
     pub(crate) input_defaults: Vec<CommandInputDefault>,
-    pub(crate) effects: Option<CommandEffects>,
-    pub(crate) confirmations: Vec<CommandProjectionConfirmation>,
     pub(crate) projected_model: Option<CommandProjectedModel>,
     pub(crate) direct_projection: Option<CommandDirectProjectionTarget>,
     pub(crate) projections: CommandProjectionEvents,
-    /// Authorization selection erased at least one required confirmation.
-    /// No hidden projector/model/key IDs may survive into client artifacts.
-    pub(crate) confirmation_unavailable: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -712,12 +707,9 @@ impl Surface {
                     "output": command_shape_value(&command.output),
                     "consistency": command.consistency,
                     "input_defaults": command.input_defaults,
-                    "effects": command.effects,
-                    "confirmations": command.confirmations,
                     "projected_model": command.projected_model.as_ref().map(|model| model.model.clone()),
                     "direct_projection": command.direct_projection.as_ref().map(|target| target.canonical_value()),
                     "projections": command.projections,
-                    "confirmation_unavailable": command.confirmation_unavailable,
                 })
             })
             .collect::<Vec<_>>();
@@ -839,7 +831,7 @@ impl Surface {
                 &self.projectors,
                 &self.models,
             )?;
-            validate_command_confirmation_topology(&self.commands, &self.projectors, &self.models)?;
+            validate_command_projection_topology(&self.commands, &self.projectors, &self.models)?;
         }
         self.commands_attached = true;
         Ok(self)
@@ -1091,7 +1083,7 @@ impl Surface {
         bind_surface_direct_projection_targets(&mut self.commands, &out, &self.models)?;
         self.projectors = out;
         self.projectors_attached = true;
-        validate_command_confirmation_topology(&self.commands, &self.projectors, &self.models)?;
+        validate_command_projection_topology(&self.commands, &self.projectors, &self.models)?;
         Ok(self)
     }
 }

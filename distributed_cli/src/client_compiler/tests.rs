@@ -609,8 +609,7 @@ fn projected_manifest() -> JsonValue {
         "name": "todos",
         "facts": [],
         "models": ["Todo"],
-        "dependencies": ["todo_rows"],
-        "causal_confirmation": false
+        "dependencies": ["todo_rows"]
     }]);
     value["protocol_operations"] = json!({
         "version": 1,
@@ -3204,8 +3203,7 @@ fn command_protocol_and_extensions_are_preserved_exactly() {
         "name": "todos",
         "facts": ["TodoCreated"],
         "models": ["Todo"],
-        "dependencies": ["todo_rows"],
-        "causal_confirmation": true
+        "dependencies": ["todo_rows"]
     }]);
     value["protocol_operations"] = json!({
         "version": 1,
@@ -3981,8 +3979,6 @@ fn manifest_v2_parses_exact_projection_program_binding_and_preview_contract() {
         super::manifest::ManifestProjectionPartition::Expression { .. }
     ));
     assert_eq!(parsed.projection_bindings.len(), 1);
-    assert!(parsed.commands[0].extensions.effects.is_none());
-    assert!(parsed.commands[0].extensions.confirmations.is_none());
     assert_eq!(
         parsed.commands[0]
             .extensions
@@ -4011,11 +4007,11 @@ fn manifest_v2_has_no_legacy_projection_or_command_authority_decoder() {
         .expect_err("command extensions v1 must fail closed");
     assert_eq!(error.code, "client.manifest.command_extensions");
 
-    let mut legacy_effects = projected_manifest();
-    legacy_effects["commands"][0]["extensions"]["effects"] =
+    let mut unknown_extension = projected_manifest();
+    unknown_extension["commands"][0]["extensions"]["effects"] =
         json!({"version": 1, "operations": [], "fallback": "revalidate"});
-    let error = ClientManifest::parse(legacy_effects, &ClientSurfaceSelector::role("user"))
-        .expect_err("legacy effects must not deserialize");
+    let error = ClientManifest::parse(unknown_extension, &ClientSurfaceSelector::role("user"))
+        .expect_err("unknown command extension slots must not deserialize");
     assert_eq!(error.code, "client.manifest.invalid");
 
     let mut unknown_projection_field = manifest();
@@ -4097,7 +4093,6 @@ fn projected_command_requires_exact_role_safe_direct_projection() {
     let parsed = ClientManifest::parse(value, &ClientSurfaceSelector::role("user"))
         .expect("valid projected direct target");
     assert!(parsed.projectors[0].facts.is_empty());
-    assert!(!parsed.projectors[0].causal_confirmation);
     let direct = parsed.commands[0]
         .extensions
         .direct_projection
@@ -4138,16 +4133,6 @@ fn projected_command_requires_exact_role_safe_direct_projection() {
     let error = ClientManifest::parse(non_projected, &ClientSurfaceSelector::role("user"))
         .expect_err("succeeded commands cannot carry direct projection metadata");
     assert_eq!(error.code, "client.manifest.direct_projection_unexpected");
-
-    let mut impossible_confirmation = projected_manifest();
-    impossible_confirmation["projectors"][0]["causal_confirmation"] = json!(true);
-    refresh_schema_fingerprint(&mut impossible_confirmation);
-    let error = ClientManifest::parse(
-        impossible_confirmation,
-        &ClientSurfaceSelector::role("user"),
-    )
-    .expect_err("a direct-only owner cannot confirm asynchronous work");
-    assert_eq!(error.code, "client.manifest.projector_inventory");
 
     let mut embedded = projected_manifest();
     embedded["models"][0]["normalization"] = json!({"kind": "embedded"});

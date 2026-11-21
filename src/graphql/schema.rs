@@ -1198,7 +1198,7 @@ mod causal_command_schema_tests {
     use std::sync::Arc;
 
     use super::*;
-    use crate::command::{CommandConsistency, CommandEffects};
+    use crate::command::CommandConsistency;
     use crate::command_dispatch::{LocalCommandHost, SharedCommandHost};
     use crate::graphql::protocol::{
         DistributedEnvelopeV1, ProtocolResponseAccumulator, ProtocolTokenCodec,
@@ -1255,12 +1255,9 @@ mod causal_command_schema_tests {
                 }),
                 consistency: CommandConsistency::Succeeded,
                 input_defaults: Vec::new(),
-                effects: Some(CommandEffects::revalidate()),
-                confirmations: Vec::new(),
                 projected_model: None,
                 direct_projection: None,
                 projections: Default::default(),
-                confirmation_unavailable: false,
             }],
             commands_attached: true,
             projectors: Vec::new(),
