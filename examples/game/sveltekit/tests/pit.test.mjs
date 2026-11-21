@@ -504,7 +504,18 @@ test('sign in, join, move, kill, walk through rooms on celld, live read models f
 		// The left room goes dormant, then asleep, live on both minimaps —
 		// although Bob, next door, watches it (a passive watcher keeps no
 		// room awake).
-		await page.waitForSelector('[data-testid=room-pit\\.0\\.0][data-status=hibernated]', { timeout: 30_000 });
+		await page.waitForSelector('[data-testid=room-pit\\.0\\.0][data-status=hibernated]', { timeout: 30_000 }).catch(async (error) => {
+			// Say who could be holding the room awake before failing.
+			for (const [who, p] of [['ana', page], ['bob', bob]]) {
+				const dead = await p.evaluate(() => document.querySelector('canvas')?.dataset.dead);
+				console.error(`${who}: at ${await here(p)}, dead ${dead}, near [${await nearRooms(p)}], sees pit.0.0 ${await roomStatus(p, 'pit.0.0')}`);
+			}
+			// The room's own account of what keeps it awake.
+			const info = await fetch(`${celld.url}/zones/pit.0.0/info`).then((r) => r.json()).catch((e) => ({ error: String(e) }));
+			const { status, ticking, players, near, pendingWork, observers, factsInFlight, error: failed } = info;
+			console.error(`pit.0.0: ${JSON.stringify({ status, ticking, players, near, pendingWork, observers, factsInFlight, failed })}`);
+			throw error;
+		});
 		await bob.waitForSelector('[data-testid=room-pit\\.0\\.0][data-status=hibernated]', { timeout: 10_000 });
 		assert.equal(await roomStatus(page, 'pit.1.0'), 'active');
 		// Ana walks back: the entrance wakes from its snapshot.
