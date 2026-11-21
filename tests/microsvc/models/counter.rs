@@ -30,20 +30,20 @@ impl Counter {
 }
 
 /// Command payload: create a new counter.
-#[derive(Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, distributed::CommandInput)]
 pub struct CreateCounter {
     pub id: String,
 }
 
 /// Command payload: increment a counter.
-#[derive(Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, distributed::CommandInput)]
 pub struct IncrementCounter {
     pub id: String,
     pub amount: i64,
 }
 
 /// Command payload: decrement a counter.
-#[derive(Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, distributed::CommandInput)]
 pub struct DecrementCounter {
     pub id: String,
     pub amount: i64,

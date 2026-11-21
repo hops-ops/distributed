@@ -1,19 +1,33 @@
 //! Handler: whoami
 //!
-//! Returns the authenticated user's ID from the session.
+//! Returns the authenticated user's ID from the session. It declares no
+//! role, so any caller may run it; the handler itself requires a user.
 
-use distributed::microsvc::{Context, HandlerError};
-use serde_json::{json, Value};
+use distributed::command::{typed_command, PreparedCommand, Succeeded, TypedCommand};
+use distributed::microsvc::{CausalCommandContext, HandlerError};
+use serde::{Deserialize, Serialize};
 
-use super::Repo;
+use crate::models::counter::Counter;
 
 pub const COMMAND: &str = "session.identify";
 
-pub fn guard(_ctx: &Context<Repo>) -> bool {
-    true
+#[derive(Debug, Deserialize, distributed::CommandInput)]
+pub struct Input {}
+
+#[derive(Debug, Serialize, distributed::CommandOutput)]
+pub struct Output {
+    pub user_id: String,
 }
 
-pub async fn handle(ctx: &Context<'_, Repo>) -> Result<Value, HandlerError> {
-    let user_id = ctx.user_id()?;
-    Ok(json!({ "user_id": user_id }))
+pub fn command() -> TypedCommand<Input, Succeeded<Output>> {
+    typed_command::<Input, Succeeded<Output>>(COMMAND)
+}
+
+pub async fn handle(
+    ctx: &CausalCommandContext<'_, Counter>,
+    _input: Input,
+) -> Result<PreparedCommand<Succeeded<Output>>, HandlerError> {
+    let user_id = ctx.user_id()?.to_string();
+    PreparedCommand::prepare(Output { user_id })
+        .map_err(|error| HandlerError::Other(Box::new(error)))
 }

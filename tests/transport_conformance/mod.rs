@@ -21,7 +21,11 @@ use distributed::bus::{
     run_source, Handlers, MessagePublisher, MessageSource, ReceivedMessage, RunOptions,
     TransportError,
 };
-use distributed::microsvc::{Context, HandlerError, Message, MessageKind, Routes, Service};
+use distributed::command::{typed_command, PreparedCommand, Succeeded};
+use distributed::microsvc::{
+    CausalCommandContext, Context, HandlerError, Message, MessageKind, Routes, Service,
+    TRANSPORT_MESSAGE_ID_CLAIM, TRANSPORT_ROLE,
+};
 use distributed::OutboxDispatcher;
 use distributed::{
     CommitBatch, InMemoryOutboxStore, InMemoryRepository, OutboxMessage, OutboxMessageStatus,
@@ -536,20 +540,12 @@ pub use ids::{run_token, unique};
 /// A `Service` whose single handler records each message's id into `rec`;
 /// `kind` selects command vs event registration.
 pub fn recording_for(name: &str, kind: MessageKind, rec: Arc<Mutex<Vec<String>>>) -> Arc<Service> {
-    let leaked: &'static str = Box::leak(name.to_string().into_boxed_str());
-    let routes = Routes::new().with_dependencies(());
-    let registered = match kind {
-        MessageKind::Command => routes.command(leaked),
-        MessageKind::Event => routes.event(leaked),
+    // A typed command needs a service identity for its ledger.
+    let service = match kind {
+        MessageKind::Command => Service::new().named("recorder"),
+        MessageKind::Event => Service::new(),
     };
-    Arc::new(
-        Service::new().routes(registered.handle(move |ctx: &Context<()>| {
-            rec.lock()
-                .unwrap()
-                .push(ctx.message().id().unwrap_or_default().to_string());
-            async move { Ok(json!({})) }
-        })),
-    )
+    Arc::new(recording(service, name, kind, rec))
 }
 
 /// Like [`recording_for`], but names the service so consumer-group / queue
@@ -560,22 +556,64 @@ pub fn named_recording_for(
     kind: MessageKind,
     rec: Arc<Mutex<Vec<String>>>,
 ) -> Arc<Service> {
+    Arc::new(recording(
+        Service::new().named(service_name.to_string()),
+        name,
+        kind,
+        rec,
+    ))
+}
+
+#[derive(Debug, serde::Deserialize, distributed::CommandInput)]
+struct RecordedInput {}
+
+#[derive(Debug, serde::Serialize, distributed::CommandOutput)]
+struct Recorded {}
+
+fn recording(
+    service: Service,
+    name: &str,
+    kind: MessageKind,
+    rec: Arc<Mutex<Vec<String>>>,
+) -> Service {
     let leaked: &'static str = Box::leak(name.to_string().into_boxed_str());
-    let routes = Routes::new().with_dependencies(());
-    let registered = match kind {
-        MessageKind::Command => routes.command(leaked),
-        MessageKind::Event => routes.event(leaked),
-    };
-    Arc::new(
-        Service::new()
-            .named(service_name.to_string())
-            .routes(registered.handle(move |ctx: &Context<()>| {
-                rec.lock()
-                    .unwrap()
-                    .push(ctx.message().id().unwrap_or_default().to_string());
-                async move { Ok(json!({})) }
-            })),
-    )
+    match kind {
+        // A bus-delivered command: it declares the transport role, and the
+        // delivery's message id is the claim the transport sets.
+        MessageKind::Command => {
+            let ledger = InMemoryRepository::new();
+            service.routes(
+                Routes::for_stores(ledger.clone(), ledger)
+                    .typed_command(
+                        typed_command::<RecordedInput, Succeeded<Recorded>>(leaked)
+                            .roles([TRANSPORT_ROLE]),
+                    )
+                    .handle(
+                        move |ctx: &CausalCommandContext<'_, ()>, _input: RecordedInput| {
+                            rec.lock().unwrap().push(
+                                ctx.claim(TRANSPORT_MESSAGE_ID_CLAIM)
+                                    .unwrap_or_default()
+                                    .to_string(),
+                            );
+                            async {
+                                PreparedCommand::prepare(Recorded {})
+                                    .map_err(|error| HandlerError::Other(Box::new(error)))
+                            }
+                        },
+                    ),
+            )
+        }
+        MessageKind::Event => {
+            service.routes(Routes::new().with_dependencies(()).event(leaked).handle(
+                move |ctx: &Context<()>| {
+                    rec.lock()
+                        .unwrap()
+                        .push(ctx.message().id().unwrap_or_default().to_string());
+                    async move { Ok(json!({})) }
+                },
+            ))
+        }
+    }
 }
 
 // ============================================================================

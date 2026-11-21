@@ -1,18 +1,26 @@
-use distributed::microsvc::{Context, HandlerError};
-use serde_json::{json, Value};
+use distributed::command::{typed_command, PreparedCommand, Succeeded, TypedCommand};
+use distributed::microsvc::{CausalCommandContext, HandlerError};
+use serde::Serialize;
 
 use crate::checkout::{json_outbox_event, seat_command, seat_event, AddSeat, SeatAdded};
-use crate::seat_inventory_service::{Seat, SeatRepo};
+use crate::seat_inventory_service::Seat;
 
 pub const COMMAND: &str = seat_command::ADD;
 
-pub fn guard(ctx: &Context<SeatRepo>) -> bool {
-    ctx.has_fields(&["seat_id", "category"])
+#[derive(Debug, Serialize, distributed::CommandOutput)]
+pub struct Output {
+    pub seat_id: String,
 }
 
-pub async fn handle(ctx: &Context<'_, SeatRepo>) -> Result<Value, HandlerError> {
-    let msg = ctx.input::<AddSeat>()?;
-    let mut seat = Seat::default();
+pub fn command() -> TypedCommand<AddSeat, Succeeded<Output>> {
+    typed_command::<AddSeat, Succeeded<Output>>(COMMAND)
+}
+
+pub async fn handle(
+    ctx: &CausalCommandContext<'_, Seat>,
+    msg: AddSeat,
+) -> Result<PreparedCommand<Succeeded<Output>>, HandlerError> {
+    let mut seat = ctx.repo().create();
     seat.add(msg.seat_id.clone(), msg.category.clone())?;
 
     let event = SeatAdded {
@@ -20,7 +28,7 @@ pub async fn handle(ctx: &Context<'_, SeatRepo>) -> Result<Value, HandlerError> 
         category: msg.category.clone(),
     };
     let out = json_outbox_event(&msg.seat_id, seat_event::ADDED, &event)?;
-    ctx.repo().outbox(out).commit(&mut seat).await?;
-
-    Ok(json!({ "seat_id": msg.seat_id }))
+    ctx.repo().outbox(out).commit(seat)?.succeeded(Output {
+        seat_id: msg.seat_id,
+    })
 }

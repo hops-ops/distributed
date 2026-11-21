@@ -22,7 +22,7 @@ use distributed::bus::{
 };
 use distributed::command::{typed_command, PreparedCommand, Succeeded};
 use distributed::microsvc::{
-    CausalCommandContext, Context, HandlerError, PortableCommand, Routes, Service,
+    CausalCommandContext, HandlerError, PortableCommand, Routes, Service,
     TRANSPORT_MESSAGE_ID_CLAIM, TRANSPORT_ROLE, TRANSPORT_USER_ID,
 };
 use distributed::{sourced, AggregateRepository, Entity, GetStream, StreamIdentity};
@@ -158,25 +158,13 @@ where
         + Sync
         + 'static,
 {
-    Service::new()
-        .named("counters")
-        .routes(
-            Routes::new()
-                .with_repo(AggregateRepository::<R, Counter>::new(repo))
-                .mount(Bump(BUMP, &[TRANSPORT_ROLE]))
-                .mount(Bump(ADMIN_BUMP, &["admin"]))
-                .mount(Bump(OPEN_BUMP, &[])),
-        )
-        // A legacy handler beside the typed ones keeps working as before.
-        .routes(
-            Routes::new()
-                .with_dependencies(())
-                .command("legacy.ping")
-                .handle(|ctx: &Context<()>| {
-                    let user = ctx.user_id().map(str::to_string);
-                    async move { Ok(json!({ "user": user.ok() })) }
-                }),
-        )
+    Service::new().named("counters").routes(
+        Routes::new()
+            .with_repo(AggregateRepository::<R, Counter>::new(repo))
+            .mount(Bump(BUMP, &[TRANSPORT_ROLE]))
+            .mount(Bump(ADMIN_BUMP, &["admin"]))
+            .mount(Bump(OPEN_BUMP, &[])),
+    )
 }
 
 fn command(name: &str, message_id: &str, counter: &str, mode: &str) -> Message {
@@ -367,19 +355,6 @@ macro_rules! scenarios {
             binary.content_type = "application/octet-stream".into();
             let error = deliver(&service, &binary).await.unwrap_err();
             assert!(error.is_permanent(), "{error}");
-        }
-
-        #[tokio::test]
-        async fn legacy_handlers_keep_the_session_the_message_carries() {
-            let db = $fresh.await;
-            let repo: $repo_ty = db.repo().await;
-            let service = service(repo);
-            let message = Message::new("legacy.ping", MessageKind::Command, b"{}".to_vec())
-                .with_metadata("x-user-id", "user-7");
-            assert_eq!(
-                service.dispatch_message(&message).await.unwrap(),
-                json!({ "user": "user-7" })
-            );
         }
 
         /// The whole consumer loop: an in-memory bus delivers the service's

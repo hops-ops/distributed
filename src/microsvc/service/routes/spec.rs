@@ -39,8 +39,8 @@ pub struct HandlerSpec {
 }
 
 impl HandlerSpec {
-    /// A command handler that consumes JSON payloads.
-    pub const fn command(name: &'static str) -> Self {
+    /// A typed command.
+    pub(crate) const fn command(name: &'static str) -> Self {
         Self {
             names: HandlerNames::One(name),
             kind: MessageKind::Command,

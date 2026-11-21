@@ -163,6 +163,28 @@ pub(crate) fn handler_error_status(error: &HandlerError) -> &'static str {
     }
 }
 
+/// The dispatch status of a typed command that did not succeed, in the
+/// vocabulary [`handler_error_status`] already uses.
+#[cfg(feature = "metrics")]
+pub(crate) fn causal_error_status(error: &crate::microsvc::CausalDispatchError) -> &'static str {
+    use crate::microsvc::CausalDispatchError as Error;
+    match error {
+        Error::BadRequest(_) => dispatch_status::DECODE_FAILED,
+        Error::Unauthorized | Error::Forbidden => dispatch_status::UNAUTHORIZED,
+        Error::Rejected { status: 404, .. } => dispatch_status::NOT_FOUND,
+        Error::Rejected {
+            status: 401 | 403, ..
+        } => dispatch_status::UNAUTHORIZED,
+        Error::Rejected { status, .. } if *status < 500 => dispatch_status::REJECTED,
+        Error::CommandIdReuse | Error::Expired => dispatch_status::REJECTED,
+        Error::Handler(error) => handler_error_status(error),
+        Error::InProgress
+        | Error::ConcurrentWrite
+        | Error::Internal(_)
+        | Error::Rejected { .. } => dispatch_status::OTHER_ERROR,
+    }
+}
+
 #[cfg(feature = "metrics")]
 pub(crate) fn handler_message_label<'a>(message: &'a str, error: Option<&HandlerError>) -> &'a str {
     if matches!(error, Some(HandlerError::UnknownCommand(_))) {

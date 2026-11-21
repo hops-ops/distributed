@@ -58,32 +58,30 @@ impl Board {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, distributed::CommandInput)]
 pub struct OpenBoard {
     pub id: String,
     pub name: String,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, distributed::CommandInput)]
 pub struct AddCard {
     pub id: String,
     pub card_id: String,
     pub column: String,
     pub title: String,
-    #[serde(default)]
     pub labels: Vec<String>,
-    #[serde(default)]
     pub assignee: Option<String>,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, distributed::CommandInput)]
 pub struct MoveCard {
     pub id: String,
     pub card_id: String,
     pub column: String,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, distributed::CommandInput)]
 pub struct RemoveCard {
     pub id: String,
     pub card_id: String,

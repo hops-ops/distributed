@@ -693,7 +693,7 @@ network servers.
 - **ReadModel**: Query-optimized relational projection state for UI/API reads. Read models may be updated atomically with a command or eventually from published messages.
 - **GraphqlEngine**: Deny-by-default GraphQL surface over registered read-model tables: role-scoped columns/row filters, optional command mutations, live subscriptions via `ChangeHub`, and identity modes (`OidcBearer`, `TrustedProxy`, `Hybrid`, `DevHeaders`).
 - **Bus / BusConsumer**: The service bus facade — `send`/`publish` (produce) and `listen`/`subscribe` (consume), implemented by a per-transport `*Bus` type.
-- **microsvc::Service**: Convention-based async command/event handler framework with pluggable transports (HTTP, gRPC, bus, GraphQL mutations, direct dispatch).
+- **microsvc::Service**: Convention-based async command/event handler framework with pluggable transports (HTTP, gRPC, bus, GraphQL mutations, in-process dispatch).
 
 ## Terminology And CQRS Boundaries
 
@@ -1327,7 +1327,9 @@ single-node deployments, not as a high-throughput broker replacement.
 `KnativeBus` implements only `Bus` (produce → broker-ingress POST). It has no
 in-process consume loop: `KnativeBus::manifests(&plan, &subscriptions)` renders the
 role-based `Broker` + per-name `Trigger` YAML, and the service mounts
-`cloud_events_router` so those Triggers reach `dispatch_message`.
+`cloud_events_router` so those Triggers reach `dispatch_message`. A command a
+Trigger delivers runs as the transport identity, so its declaration lists
+`TRANSPORT_ROLE`, and the CloudEvent id is the id its ledger deduplicates on.
 
 ### Running, retries and dead letters
 
@@ -1508,120 +1510,134 @@ does not change Eventual projection confirmation or Atomic response sealing.
 
 ## Microservice Framework (`microsvc`)
 
-The `microsvc` module provides a convention-based async command/event handler framework. Register handlers on typed `Routes<D>` bundles, collect them into a non-generic `Service`, then expose that service over HTTP, gRPC, the bus, or direct dispatch.
+The `microsvc` module provides a convention-based async command/event handler framework. Register typed commands and event handlers on `Routes<D>` bundles, collect them into a non-generic `Service`, then expose that service over HTTP, gRPC, the bus, or in-process dispatch. Every command, from every ingress, is typed, authorized by its declared roles, and recorded in the command ledger under its command ID.
 
 ### Defining a Service
 
-A `Routes<D>` bundle is generic over a dependency type `D` that handlers read via `ctx`. Build one fluently from `Routes::new()`: add `.with_repo(repo)` for aggregate command handlers, `.with_read_model_store(store)` for projection handlers (chain both when a handler needs both), or `.with_dependencies(deps)` for custom dependencies. Add one or more route bundles to `Service::new()` with `.routes(routes)`, then use `.with_bus(bus)` to consume from / publish to a transport.
+A `Routes<D>` bundle is generic over a dependency type `D`. Build one fluently from `Routes::new()`: add `.with_repo(repo)` for aggregate command handlers, `.with_read_model_store(store)` for projection handlers (chain both when a handler needs both), or `.with_dependencies(deps)` for event handlers with custom dependencies. Add one or more route bundles to `Service::new().named(..)` with `.routes(routes)`, then use `.with_bus(bus)` to consume from / publish to a transport. A service that runs commands must be named: the name scopes its command ledger.
 
-Handlers are registered with a fluent builder. `.command(name)` / `.event(name)` start a registration; `.handle(closure)` adds an unguarded handler and `.guarded(guard, closure)` adds a guarded one. The handler closure receives `&Context<D>` and returns a future:
+Commands are registered with a fluent builder. `.typed_command(declaration)` starts a registration; `.handle(handler)` adds an unguarded handler and `.guarded(guard, handler)` adds a guarded one. The handler receives `&CausalCommandContext<A>` and the decoded input, and returns the prepared commit:
 
 ```rust,ignore
 use std::sync::Arc;
-use distributed::microsvc::{Context, HandlerError, Routes, Service, Session};
+use distributed::command::{typed_command, PreparedCommand, Succeeded};
+use distributed::command_dispatch::VerifiedPrincipal;
+use distributed::microsvc::{CausalCommandContext, HandlerError, Routes, Service, Session};
 use distributed::{AggregateBuilder, InMemoryRepository, Queueable};
 use serde_json::json;
 
+async fn initialize(
+    ctx: &CausalCommandContext<'_, Counter>,
+    input: CreateCounter,
+) -> Result<PreparedCommand<Succeeded<CounterValue>>, HandlerError> {
+    let mut counter = ctx.repo().create();
+    counter.create(input.id)?;
+    let value = counter.value;
+    ctx.repo().commit(counter)?.succeeded(CounterValue { value })
+}
+
+async fn increment(
+    ctx: &CausalCommandContext<'_, Counter>,
+    input: IncrementCounter,
+) -> Result<PreparedCommand<Succeeded<CounterValue>>, HandlerError> {
+    let mut counter = ctx.repo().get(&input.id).await?
+        .ok_or_else(|| HandlerError::NotFound(input.id.clone()))?;
+    counter.increment(input.amount)?;
+    let value = counter.value;
+    ctx.repo().commit(counter)?.succeeded(CounterValue { value })
+}
+
 let routes = Routes::new()
     .with_repo(InMemoryRepository::new().queued().aggregate::<Counter>())
-    .command("counter.initialize")
-    .handle(|ctx: &Context<Repo>| {
-        let input = ctx.input::<CreateCounter>();
-        async move {
-            let input = input?;
-            let mut counter = Counter::default();
-            counter.create(input.id.clone())?;
-            ctx.repo().commit(&mut counter).await?;
-            Ok(json!({ "id": input.id }))
-        }
-    })
-    .command("counter.increment")
-    .handle(|ctx: &Context<Repo>| {
-        let input = ctx.input::<IncrementCounter>();
-        async move {
-            let input = input?;
-            let mut counter = ctx.repo().get(&input.id).await?
-                .ok_or_else(|| HandlerError::NotFound(input.id.clone()))?;
-            counter.increment(input.amount)?;
-            ctx.repo().commit(&mut counter).await?;
-            Ok(json!({ "value": counter.value }))
-        }
-    });
-let service = Arc::new(Service::new().routes(routes));
+    .typed_command(typed_command::<CreateCounter, Succeeded<CounterValue>>("counter.initialize"))
+    .handle(initialize)
+    .typed_command(typed_command::<IncrementCounter, Succeeded<CounterValue>>("counter.increment"))
+    .handle(increment);
+let service = Arc::new(Service::new().named("counters").routes(routes));
 
-// Direct dispatch
+// In-process dispatch: a UUIDv7 command ID and the principal the caller verified
 let _result = service
-    .dispatch("counter.initialize", json!({ "id": "c1" }), Session::new())
+    .dispatch_causal(
+        "counter.initialize",
+        "0190a000-0000-7000-8000-000000000001",
+        json!({ "id": "c1" }),
+        Session::new(),
+        VerifiedPrincipal::internal("counters-job")?,
+    )
     .await?;
 ```
 
-### Guards
+`CreateCounter` and `IncrementCounter` derive `Deserialize` and `distributed::CommandInput`; `CounterValue` derives `Serialize` and `distributed::CommandOutput`. The handler stages its commit and returns; the framework writes it with the ledger receipt in one transaction, so dispatching the same command ID again replays the receipt instead of running the handler.
 
-`.guarded(guard, handler)` runs the guard before the handler — if it returns `false`, the command is rejected:
+### Roles and Guards
+
+A command declares the roles that may run it with `.roles([..])`; a session without one of them is refused before the handler or guard runs. A command with no declared roles admits any caller. `.guarded(guard, handler)` then runs the guard before the handler — if it returns `false`, the command is rejected:
 
 ```rust,ignore
 let routes = routes
-    .command("admin.reset")
+    .typed_command(typed_command::<ResetInput, Succeeded<ResetOutput>>("admin.reset").roles(["admin"]))
     .guarded(
-        |ctx: &Context<Repo>| ctx.role() == Some("admin"),
-        |_ctx: &Context<Repo>| async { Ok(json!({ "reset": true })) },
+        |ctx: &CausalCommandContext<'_, Counter>| ctx.claim("x-region") == Some("eu"),
+        reset,
     );
 ```
 
 ### Handler File Convention
 
-For larger services, organize handlers into separate files. Each handler module exports a `COMMAND` (or `EVENT` / `EVENTS`) name, a `guard`, and an async `handle`:
+For larger services, organize handlers into separate files. Each command module exports a `COMMAND` name, a `command()` declaration, and an async `handle`:
 
 ```rust,ignore
 // src/handlers/counter_create.rs
-use serde::Deserialize;
-use serde_json::{json, Value};
-use distributed::microsvc::{Context, HandlerError};
-use super::Repo;
+use serde::{Deserialize, Serialize};
+use distributed::command::{typed_command, PreparedCommand, Succeeded, TypedCommand};
+use distributed::microsvc::{CausalCommandContext, HandlerError};
 use crate::models::counter::Counter;
 
 pub const COMMAND: &str = "counter.initialize";
 
-#[derive(Deserialize)]
-struct Input { id: String }
+#[derive(Debug, Deserialize, distributed::CommandInput)]
+pub struct Input { pub id: String }
 
-pub fn guard(ctx: &Context<Repo>) -> bool {
-    ctx.has_fields(&["id"])
+#[derive(Debug, Serialize, distributed::CommandOutput)]
+pub struct Output { pub id: String }
+
+pub fn command() -> TypedCommand<Input, Succeeded<Output>> {
+    typed_command::<Input, Succeeded<Output>>(COMMAND).roles(["user"])
 }
 
-pub async fn handle(ctx: &Context<'_, Repo>) -> Result<Value, HandlerError> {
-    let input = ctx.input::<Input>()?;
-
+pub async fn handle(
+    ctx: &CausalCommandContext<'_, Counter>,
+    input: Input,
+) -> Result<PreparedCommand<Succeeded<Output>>, HandlerError> {
     if ctx.repo().get(&input.id).await?.is_some() {
         return Err(HandlerError::Rejected(format!("counter {} already exists", input.id)));
     }
 
-    let mut counter = Counter::default();
+    let mut counter = ctx.repo().create();
     counter.create(input.id.clone())?;
 
     // `counter.initialized` is domain-marked on the aggregate.
-    ctx.repo().publish_events().commit(&mut counter).await?;
-
-    Ok(json!({ "id": input.id }))
+    ctx.repo().publish_events().commit(counter)?.succeeded(Output { id: input.id })
 }
 ```
 
-Register them with the `routes!` macro:
+Register them on the route bundle:
 
 ```rust,ignore
-let routes = distributed::routes!(
-    Routes::new().with_repo(InMemoryRepository::new().queued().aggregate::<Counter>()),
-    command handlers::counter_create,
-    command handlers::counter_increment,
-);
-let service = Service::new().routes(routes);
+let routes = Routes::new()
+    .with_repo(InMemoryRepository::new().queued().aggregate::<Counter>())
+    .typed_command(handlers::counter_create::command())
+    .handle(handlers::counter_create::handle)
+    .typed_command(handlers::counter_increment::command())
+    .handle(handlers::counter_increment::handle);
+let service = Service::new().named("counters").routes(routes);
 ```
 
-Event projection handlers use `EVENT` / `EVENTS` and `event handlers::...` in the same way; inside the handler, `ctx.message()` gives the raw transport `Message` and `ctx.input::<T>()` decodes its payload.
+Event projection handlers export `EVENT` / `EVENTS`, a `guard(ctx) -> bool` and an async `handle(ctx) -> Result<Value, HandlerError>`, and register with the `routes!` macro: `distributed::routes!(routes, event handlers::counter_rebuilt, events handlers::counter_projection)`. Inside an event handler, `ctx.message()` gives the raw transport `Message` and `ctx.input::<T>()` decodes its payload.
 
 ### HTTP Transport (requires `http` feature)
 
-The `http` feature adds an axum-based HTTP transport. Every registered command becomes a `POST /:command` endpoint. Request headers flow into the `Session` verbatim — including identity claims, which the framework does **not** authenticate. Deploy behind a trusted proxy that strips client-supplied identity headers and injects authenticated ones (see [Security / Trust Boundary](#security--trust-boundary)).
+The `http` feature adds an axum-based HTTP transport. With `Service::with_http_command_routes()`, every registered command becomes a `POST /:command` endpoint whose body is `{ "commandId", "input" }`. Request headers flow into the `Session` verbatim — including identity claims, which the framework does **not** authenticate. Deploy behind a trusted proxy that strips client-supplied identity headers and injects authenticated ones (see [Security / Trust Boundary](#security--trust-boundary)).
 
 ```rust,ignore
 use std::sync::Arc;
@@ -1638,17 +1654,23 @@ Routes:
 
 | Method | Path | Description |
 |---|---|---|
-| `POST` | `/:command` | Dispatch a command. Body = JSON input, headers = session variables. |
+| `POST` | `/:command` | Dispatch a command. Body = `{ "commandId", "input" }`, headers = session variables. A body without a `commandId` is a 400. |
 | `GET` | `/health` | Health check: `{ "ok": true, "commands": ["counter.initialize", ...] }` |
 
 ```bash
 curl -X POST http://localhost:3000/counter.initialize \
   -H 'Content-Type: application/json' \
   -H 'x-user-id: user-42' \
-  -d '{"id": "c1"}'
+  -H 'x-roles: user' \
+  -d '{"commandId": "0190a000-0000-7000-8000-000000000001", "input": {"id": "c1"}}'
+# => {"payload": {"id": "c1"}, "receipt": {"commandId": "...", "causationId": "...", "state": "succeeded"}}
 
 curl http://localhost:3000/health
 ```
+
+The command ID is a client-created UUIDv7: retrying a request with the same ID
+replays the committed receipt. A command needs an authenticated user
+(`x-user-id`), and a role its declaration grants.
 
 `x-user-id` / `x-roles` are convenience keys for `Session::user_id()` /
 `Session::roles()` only — not a required protocol. Your gateway can inject any
@@ -1705,7 +1727,7 @@ microsvc::serve_grpc(service, "[::1]:50051").await?;
 
 | RPC | Input | Output | Description |
 |---|---|---|---|
-| `Dispatch` | `GrpcRequest` | `GrpcResponse` | Dispatch a command. `input` = JSON string, `session_variables` = metadata map. |
+| `Dispatch` | `GrpcRequest` | `GrpcResponse` | Dispatch a command. `input` = the JSON string `{ "commandId", "input" }`, `session_variables` = metadata map. |
 | `Health` | `HealthRequest` | `HealthResponse` | Health check. |
 
 Session handling mirrors HTTP — gRPC metadata headers are merged with payload `session_variables`. **Transport metadata (trusted, proxy-injected) takes precedence over the client-controlled payload**, so a client cannot spoof identity via the request body. See [Security / Trust Boundary](#security--trust-boundary) below. Errors are returned inside `GrpcResponse.status` (HTTP-style status codes) with internal (5xx) error detail masked to a generic message, keeping client behavior identical across transports.
@@ -1716,27 +1738,30 @@ Attach a bus with `service.with_bus(bus)` and drive it with `run(opts)`: it
 derives `listen` (point-to-point commands) and `subscribe` (fan-out events) from
 the registered handlers, and makes `repo.outbox(msg).commit(agg)` publish on
 commit. The same `Service` can handle commands from multiple transports
-simultaneously — HTTP, gRPC, bus, and direct dispatch all share the same handlers
-and repository. For finer-grained control, call the `listen` / `subscribe` facade
+simultaneously — HTTP, gRPC, bus, and in-process dispatch all share the same handlers,
+repository and command ledger. A bus delivers a command as the transport
+identity: the command must declare `TRANSPORT_ROLE` in its roles and the
+message must carry an id, which the ledger deduplicates redeliveries on. For finer-grained control, call the `listen` / `subscribe` facade
 methods directly. See [Service Bus](#service-bus) above.
 
 ### Error Handling
 
-`HandlerError` maps to HTTP-style status codes:
+A command that does not commit returns a `CausalDispatchError`; the HTTP and
+gRPC transports answer with its status and a `{ "code", "error" }` body. A
+handler's `HandlerError` becomes the recorded rejection of that command ID:
 
-| Variant | Status Code |
-|---|---|
-| `UnknownCommand` | 404 |
-| `DecodeFailed` | 400 |
-| `GuardRejected` | 400 |
-| `Rejected` | 422 |
-| `NotFound` | 404 |
-| `Unauthorized` | 401 |
-| `Repository` | 500 |
-| `Other` | 500 |
+| Cause | Status | `code` |
+|---|---|---|
+| Unknown command, bad envelope, input that does not decode | 400 | `BAD_REQUEST` |
+| No authenticated user (or handler `Unauthorized`) | 401 | `UNAUTHORIZED` |
+| Session lacks a declared role | 403 | `FORBIDDEN` |
+| Handler `NotFound` | 404 | `NOT_FOUND` |
+| Command ID reused for different input, or still in progress | 409 | `COMMAND_ID_REUSE` / `COMMAND_IN_PROGRESS` |
+| Handler `Rejected`, guard returned `false` | 422 | `REJECTED` |
+| Repository or other host failure | 500 | `INTERNAL` |
 
 Internal (5xx) errors are **masked** before being returned to clients — the
-response body carries a generic `"Internal server error"` so SQL text, driver
+response body carries a generic `"internal error"` so SQL text, driver
 detail, or internal paths never leak. The original error is logged
 server-side. Client-fault (4xx) errors keep their descriptive message. This
 applies identically to the HTTP and gRPC transports.

@@ -1,5 +1,7 @@
 mod checkout;
 mod checkout_saga_service;
+#[path = "../support/commands.rs"]
+mod commands;
 #[path = "../support/env.rs"]
 mod env_support;
 #[path = "../support/ids.rs"]
@@ -45,14 +47,14 @@ async fn dispatch<C>(service: &Service, command: &str, input: C)
 where
     C: Serialize,
 {
-    service
-        .dispatch(
-            command,
-            serde_json::to_value(input).expect("command should encode"),
-            Session::new(),
-        )
-        .await
-        .unwrap_or_else(|err| panic!("{command} should dispatch: {err:?}"));
+    commands::dispatch(
+        service,
+        command,
+        serde_json::to_value(input).expect("command should encode"),
+        Session::new(),
+    )
+    .await
+    .unwrap_or_else(|err| panic!("{command} should dispatch: {err:?}"));
 }
 
 struct FlowIds {
@@ -658,11 +660,16 @@ async fn checkout_commands_can_be_http_service() {
     let client = reqwest::Client::new();
     let started = client
         .post(format!("{base}/{}", checkout_command::START))
-        .json(&StartCheckout {
-            checkout_id: "checkout-http".to_string(),
-            seat_id: "B-2".to_string(),
-            seat_category: "floor".to_string(),
-        })
+        // The identity a trusted proxy injects.
+        .header("x-user-id", "user-1")
+        .json(&serde_json::json!({
+            "commandId": commands::command_id(),
+            "input": StartCheckout {
+                checkout_id: "checkout-http".to_string(),
+                seat_id: "B-2".to_string(),
+                seat_category: "floor".to_string(),
+            },
+        }))
         .send()
         .await
         .expect("HTTP checkout service should accept start request");
@@ -689,13 +696,17 @@ async fn checkout_commands_can_be_grpc_service() {
     let started = client
         .dispatch(distributed::microsvc::grpc::GrpcRequest {
             command: checkout_command::START.to_string(),
-            input: serde_json::to_string(&StartCheckout {
-                checkout_id: "checkout-grpc".to_string(),
-                seat_id: "C-4".to_string(),
-                seat_category: "box".to_string(),
+            input: serde_json::json!({
+                "commandId": commands::command_id(),
+                "input": StartCheckout {
+                    checkout_id: "checkout-grpc".to_string(),
+                    seat_id: "C-4".to_string(),
+                    seat_category: "box".to_string(),
+                },
             })
-            .expect("start command should encode"),
-            session_variables: Default::default(),
+            .to_string(),
+            // The identity a trusted gateway supplies.
+            session_variables: [("x-user-id".to_string(), "user-1".to_string())].into(),
         })
         .await
         .expect("gRPC checkout service should accept start request")

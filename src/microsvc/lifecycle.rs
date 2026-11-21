@@ -383,31 +383,60 @@ mod tests {
     /// the filesystem would see the file the test has just rewritten.
     #[tokio::test]
     async fn a_closed_gate_refuses_a_write_without_reading_the_membership_file() {
-        use crate::microsvc::{HandlerError, Routes, Service, Session};
+        use crate::command::{typed_command, PreparedCommand, Succeeded};
+        use crate::command_dispatch::VerifiedPrincipal;
+        use crate::microsvc::{
+            CausalCommandContext, CausalDispatchError, HandlerError, Routes, Service, Session,
+        };
+
+        #[derive(serde::Deserialize, crate::CommandInput)]
+        struct Ping {}
+        #[derive(serde::Serialize, crate::CommandOutput)]
+        struct Pong {
+            pong: bool,
+        }
 
         let service = |gate: &LifecycleGate| {
+            let repository = crate::InMemoryRepository::new();
             Service::new()
-                .routes(Routes::new().with_dependencies(()).command("ping").handle(
-                    |_ctx: &crate::microsvc::Context<'_, ()>| async { Ok(json!({ "pong": true })) },
-                ))
+                .named("lifecycle")
+                .routes(
+                    Routes::for_stores(repository.clone(), repository)
+                        .typed_command(typed_command::<Ping, Succeeded<Pong>>("ping"))
+                        .handle(|_ctx: &CausalCommandContext<'_, ()>, _input: Ping| async {
+                            Ok(PreparedCommand::prepare(Pong { pong: true }).unwrap())
+                        }),
+                )
                 .with_lifecycle(gate.clone())
+        };
+        let ping = |service: Service| async move {
+            service
+                .dispatch_causal(
+                    "ping",
+                    &uuid::Uuid::now_v7().hyphenated().to_string(),
+                    json!({}),
+                    Session::new(),
+                    VerifiedPrincipal::internal("lifecycle-test").unwrap(),
+                )
+                .await
         };
         let never = Duration::from_secs(3600);
 
         let demoted = Supervisor::new("preparing");
         let gate = demoted.gate(never);
         demoted.write("active");
-        let refused = service(&gate)
-            .dispatch("ping", json!({}), Session::new())
-            .await;
-        assert!(matches!(refused, Err(HandlerError::ApplicationReloading)));
+        let refused = ping(service(&gate)).await;
+        assert!(matches!(
+            refused,
+            Err(CausalDispatchError::Handler(
+                HandlerError::ApplicationReloading
+            ))
+        ));
 
         let active = Supervisor::new("active");
         let gate = active.gate(never);
         active.write("preparing");
-        let accepted = service(&gate)
-            .dispatch("ping", json!({}), Session::new())
-            .await;
+        let accepted = ping(service(&gate)).await;
         assert_eq!(accepted.unwrap(), json!({ "pong": true }));
     }
 }

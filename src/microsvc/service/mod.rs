@@ -1,30 +1,31 @@
 //! Routes and service dispatch for microsvc.
 //!
-//! `Routes<D>` holds one dependency value and its command/event handlers.
-//! `Service` is the deployment-level router that collects one or more route
-//! bundles. Each handler receives a `Context<D>` and returns
-//! `Result<Value, HandlerError>`.
+//! `Routes<D>` holds one dependency value and its typed commands and event
+//! handlers. `Service` is the deployment-level router that collects one or
+//! more route bundles. A command handler receives a `CausalCommandContext`
+//! and its decoded input and returns a `PreparedCommand`; an event handler
+//! receives a `Context<D>` and returns `Result<Value, HandlerError>`.
 //!
 //! ## Example
 //!
-//! The handler closure returns a future, and `dispatch` is awaited:
+//! An event handler closure returns a future, and `dispatch_message` is
+//! awaited:
 //!
 //! ```ignore
-//! use distributed::microsvc;
+//! use distributed::microsvc::{self, Message, MessageKind};
 //! use serde_json::json;
 //!
 //! let routes = microsvc::Routes::new()
 //!     .with_dependencies(())
-//!     .command("order.create")
+//!     .event("order.created")
 //!     .handle(|ctx| {
-//!         let input = ctx.input::<CreateOrderInput>();
+//!         let input = ctx.input::<OrderCreated>();
 //!         async move { Ok(json!({ "id": input?.id })) }
 //!     });
 //! let service = microsvc::Service::new().routes(routes);
 //!
-//! let result = service
-//!     .dispatch("order.create", json!({"id": "1"}), Session::new())
-//!     .await?;
+//! let message = Message::new("order.created", MessageKind::Event, br#"{"id":"1"}"#.to_vec());
+//! let result = service.dispatch_message(&message).await?;
 //! ```
 
 mod causal;
@@ -58,7 +59,7 @@ pub(crate) use routes::DynBusPublisher;
 #[cfg(background_workers)]
 pub(crate) use routes::LedgerCompaction;
 pub use routes::{
-    DeliveryKind, HandlerNames, HandlerSpec, PortableCommand, RouteBuilder, Routes,
+    DeliveryKind, EventRouteBuilder, HandlerNames, HandlerSpec, PortableCommand, Routes,
     ThinCommandBuilder, ThinCommandInvoked, ThinCommandLoaded, TypedRouteBuilder,
 };
 pub use runtime::{Service, DEFAULT_DELIVERY_LANE};

@@ -11,7 +11,7 @@ mod registry;
 mod spec;
 
 pub use builder::{
-    PortableCommand, RouteBuilder, ThinCommandBuilder, ThinCommandInvoked, ThinCommandLoaded,
+    EventRouteBuilder, PortableCommand, ThinCommandBuilder, ThinCommandInvoked, ThinCommandLoaded,
     TypedRouteBuilder,
 };
 pub(crate) use erased::LedgerCompaction;

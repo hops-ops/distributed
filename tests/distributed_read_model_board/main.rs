@@ -10,6 +10,8 @@
 //!   its board (`belongs_to`).
 
 mod board_service;
+#[path = "../support/commands.rs"]
+mod commands;
 mod projections_service;
 mod query_service;
 mod read_models;
@@ -32,14 +34,14 @@ async fn dispatch<C>(service: &Service, command: &str, input: C)
 where
     C: Serialize,
 {
-    service
-        .dispatch(
-            command,
-            serde_json::to_value(input).expect("command should encode"),
-            Session::new(),
-        )
-        .await
-        .unwrap_or_else(|err| panic!("{command} should dispatch: {err:?}"));
+    commands::dispatch(
+        service,
+        command,
+        serde_json::to_value(input).expect("command should encode"),
+        Session::new(),
+    )
+    .await
+    .unwrap_or_else(|err| panic!("{command} should dispatch: {err:?}"));
 }
 
 /// Forward the board's outbox events onto the bus. Board events are fan-out

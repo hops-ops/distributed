@@ -1,29 +1,38 @@
-use distributed::microsvc::{Context, HandlerError};
-use serde_json::{json, Value};
+use distributed::command::{typed_command, PreparedCommand, Succeeded, TypedCommand};
+use distributed::microsvc::{CausalCommandContext, HandlerError};
+use serde::Serialize;
 
 use crate::board_service::handlers::board_state_message;
-use crate::board_service::{Board, BoardRepo, OpenBoard};
+use crate::board_service::{Board, OpenBoard};
 
 pub const COMMAND: &str = "board.open";
 
-pub fn guard(ctx: &Context<BoardRepo>) -> bool {
-    ctx.has_fields(&["id", "name"])
+#[derive(Debug, Serialize, distributed::CommandOutput)]
+pub struct Output {
+    pub id: String,
 }
 
-pub async fn handle(ctx: &Context<'_, BoardRepo>) -> Result<Value, HandlerError> {
-    let input = ctx.input::<OpenBoard>()?;
-    if ctx.repo().peek(&input.id).await?.is_some() {
+pub fn command() -> TypedCommand<OpenBoard, Succeeded<Output>> {
+    typed_command::<OpenBoard, Succeeded<Output>>(COMMAND)
+}
+
+pub async fn handle(
+    ctx: &CausalCommandContext<'_, Board>,
+    input: OpenBoard,
+) -> Result<PreparedCommand<Succeeded<Output>>, HandlerError> {
+    if ctx.repo().get(&input.id).await?.is_some() {
         return Err(HandlerError::Rejected(format!(
             "board {} already exists",
             input.id
         )));
     }
 
-    let mut board = Board::default();
+    let mut board = ctx.repo().create();
     board.open(input.id.clone(), input.name.clone())?;
 
     let outbox = board_state_message(&board, "board.opened")?;
-    ctx.repo().outbox(outbox).commit(&mut board).await?;
-
-    Ok(json!({ "id": input.id }))
+    ctx.repo()
+        .outbox(outbox)
+        .commit(board)?
+        .succeeded(Output { id: input.id })
 }

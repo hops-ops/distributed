@@ -2,15 +2,22 @@ use super::*;
 
 pub const COMMAND: &str = "payment.process";
 
-pub fn guard(ctx: &Context<Repo>) -> bool {
-    ctx.has_fields(&["saga_id", "order_id", "amount_cents"])
+#[derive(Debug, Serialize, distributed::CommandOutput)]
+pub struct Output {
+    pub payment_id: String,
 }
 
-pub async fn handle(ctx: &Context<'_, Repo>) -> Result<Value, HandlerError> {
-    let input = ctx.input::<ProcessPaymentMsg>()?;
+/// Delivered by the saga over the bus, so it declares the transport role.
+pub fn command() -> TypedCommand<ProcessPaymentMsg, Succeeded<Output>> {
+    typed_command::<ProcessPaymentMsg, Succeeded<Output>>(COMMAND).roles([TRANSPORT_ROLE])
+}
 
+pub async fn handle(
+    ctx: &CausalCommandContext<'_, Payment>,
+    input: ProcessPaymentMsg,
+) -> Result<PreparedCommand<Succeeded<Output>>, HandlerError> {
     let payment_id = format!("pay-{}", input.order_id);
-    let mut payment = Payment::new();
+    let mut payment = ctx.repo().create();
     payment.initiate(
         payment_id.clone(),
         input.order_id.clone(),
@@ -29,6 +36,8 @@ pub async fn handle(ctx: &Context<'_, Repo>) -> Result<Value, HandlerError> {
         },
     )?;
 
-    ctx.repo().outbox(msg).commit(&mut payment).await?;
-    Ok(json!({ "payment_id": payment_id }))
+    ctx.repo()
+        .outbox(msg)
+        .commit(payment)?
+        .succeeded(Output { payment_id })
 }

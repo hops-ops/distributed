@@ -60,8 +60,8 @@ impl SagaCommand {
         }
     }
 
-    /// A command with a JSON payload (what `microsvc` handlers decode with
-    /// `ctx.input`).
+    /// A command with a JSON payload: the input of the destination's typed
+    /// command, which must declare the transport role.
     pub fn json<T: Serialize>(
         destination: impl Into<String>,
         command_type: impl Into<String>,

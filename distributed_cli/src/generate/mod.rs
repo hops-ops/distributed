@@ -126,7 +126,7 @@ impl Scaffold {
         files.push(file("src/main.rs", self.main_rs()));
         files.push(file("src/manifest.rs", self.manifest_rs()));
         files.push(file("src/service.rs", self.service_rs()));
-        if !self.models.is_empty() || (self.query_api && !self.commands.is_empty()) {
+        if !self.models.is_empty() || !self.commands.is_empty() {
             files.push(file("src/models/mod.rs", self.models_mod_rs()));
             for model in &self.models {
                 files.push(file(
@@ -254,12 +254,15 @@ mod tests {
         let project = generate_service_scaffold(spec("orders")).unwrap();
         let service = contents(&project, "src/service.rs");
         assert!(
-            service.contains("distributed::routes!("),
-            "service.rs should register handlers with routes!:\n{service}"
+            service.contains(".typed_command(handlers::")
+                && service.contains(
+                    "AggregateRepository::<_, crate::models::CommandAggregate>::new(repo.clone())"
+                ),
+            "service.rs should register typed commands on a route bundle:\n{service}"
         );
         assert!(
-            service.contains("Routes::new().with_dependencies(repo)"),
-            "service.rs should build a typed route bundle:\n{service}"
+            !service.contains("command handlers::"),
+            "commands are not registered through routes!:\n{service}"
         );
         assert!(
             service.contains(".with_http_command_routes()"),
@@ -268,6 +271,41 @@ mod tests {
         // `Service` is no longer generic and `register_handlers!` no longer exists.
         assert!(!service.contains("Service<"));
         assert!(!service.contains("register_handlers!"));
+    }
+
+    #[test]
+    fn knative_commands_declare_the_transport_role_and_events_use_routes() {
+        let mut s = spec("orders");
+        s.transport = ServiceTransport::Knative;
+        s.commands = vec!["orders.create".to_string()];
+        s.events = vec!["orders.shipped".to_string()];
+        let project = generate_service_scaffold(s).unwrap();
+        let service = contents(&project, "src/service.rs");
+        assert!(
+            service.contains("distributed::routes!(")
+                && service.contains("Routes::new().with_dependencies(repo.clone())")
+                && service.contains("event handlers::"),
+            "event handlers register through routes!:\n{service}"
+        );
+        assert!(
+            !service.contains(".with_http_command_routes()"),
+            "a Knative service takes its commands from triggers:\n{service}"
+        );
+        let command = project
+            .files
+            .iter()
+            .find(|file| {
+                file.contents
+                    .contains("pub const COMMAND: &str = \"orders.create\";")
+            })
+            .expect("the command handler is generated");
+        assert!(
+            command
+                .contents
+                .contains(r#".roles(["user", TRANSPORT_ROLE])"#),
+            "a trigger-delivered command must declare the transport role:\n{}",
+            command.contents
+        );
     }
 
     #[test]

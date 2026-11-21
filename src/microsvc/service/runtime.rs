@@ -831,7 +831,69 @@ impl Service {
         .await
     }
 
+    /// Every typed dispatch that is not a transport delivery: it records the
+    /// dispatch metric and runs inside the dispatch span. A transport
+    /// delivery is measured by [`dispatch_lane_message`](Self::dispatch_lane_message).
     async fn dispatch_causal_with_receipt_inner(
+        &self,
+        command: &str,
+        command_id: &str,
+        input: Value,
+        session: Session,
+        principal: VerifiedPrincipal,
+        seal_modeled_projection: Option<&SealModeledProjection<'_>>,
+    ) -> Result<CausalDispatchResult, CausalDispatchError> {
+        #[cfg(feature = "metrics")]
+        let started = Instant::now();
+        #[cfg(feature = "otel")]
+        let span_message = Message {
+            id: Some(command_id.to_string()),
+            name: command.to_string(),
+            kind: MessageKind::Command,
+            payload: Vec::new(),
+            content_type: "application/json".to_string(),
+            metadata: session
+                .variables()
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect(),
+        };
+        let work = self.execute_causal(
+            command,
+            command_id,
+            input,
+            session,
+            principal,
+            seal_modeled_projection,
+        );
+        #[cfg(feature = "otel")]
+        let result = self.in_dispatch_span(&span_message, work).await;
+        #[cfg(not(feature = "otel"))]
+        let result = work.await;
+        #[cfg(feature = "metrics")]
+        {
+            // An unregistered name is a caller's string: one fixed label.
+            let known = self.typed_command_routes(command).is_ok();
+            crate::metrics::record_microsvc_dispatch(
+                self.name(),
+                MessageKind::Command,
+                if known {
+                    command
+                } else {
+                    crate::telemetry::metric_values::UNKNOWN_MESSAGE
+                },
+                match &result {
+                    Ok(_) => crate::telemetry::dispatch_status::SUCCESS,
+                    Err(_) if !known => crate::telemetry::dispatch_status::UNKNOWN_COMMAND,
+                    Err(error) => crate::telemetry::causal_error_status(error),
+                },
+                started.elapsed(),
+            );
+        }
+        result
+    }
+
+    async fn execute_causal(
         &self,
         command: &str,
         command_id: &str,
@@ -974,72 +1036,11 @@ impl Service {
             .await
     }
 
-    /// Dispatch a command by name.
-    ///
-    /// Builds a `Context` from the input and session, looks up the handler,
-    /// runs the guard (if any), then calls the handler.
-    pub async fn dispatch(
-        &self,
-        command: &str,
-        input: Value,
-        session: Session,
-    ) -> Result<Value, HandlerError> {
-        #[cfg(feature = "metrics")]
-        let started = Instant::now();
-        let result = self.dispatch_command_inner(command, input, session).await;
-        #[cfg(feature = "metrics")]
-        {
-            let error = result.as_ref().err();
-            crate::metrics::record_microsvc_dispatch(
-                self.name(),
-                MessageKind::Command,
-                crate::telemetry::handler_message_label(command, error),
-                error
-                    .map(crate::telemetry::handler_error_status)
-                    .unwrap_or(crate::telemetry::dispatch_status::SUCCESS),
-                started.elapsed(),
-            );
-        }
-        result
-    }
-
-    async fn dispatch_command_inner(
-        &self,
-        command: &str,
-        input: Value,
-        session: Session,
-    ) -> Result<Value, HandlerError> {
-        self.ensure_mutations_open()?;
-        if !self.handles_message(MessageKind::Command, command) {
-            return Err(HandlerError::UnknownCommand(command.to_string()));
-        }
-
-        let payload = serde_json::to_vec(&input).map_err(|e| {
-            HandlerError::DecodeFailed(format!("invalid JSON input for command '{command}': {e}"))
-        })?;
-        let metadata = session
-            .variables()
-            .iter()
-            .map(|(key, value)| (key.clone(), value.clone()))
-            .collect();
-        let message = Message {
-            id: None,
-            name: command.to_string(),
-            kind: MessageKind::Command,
-            payload,
-            content_type: "application/json".to_string(),
-            metadata,
-        };
-
-        let route_indices = self.lane_route_indices(&message, None)?;
-        self.in_dispatch_span(
-            &message,
-            self.invoke(&message, input, session, None, route_indices),
-        )
-        .await
-    }
-
     /// Dispatch a transport message.
+    ///
+    /// An event runs its event handlers. A command runs its typed command
+    /// through the ledger as the transport identity: the command must
+    /// declare [`TRANSPORT_ROLE`] and the message must carry an id.
     pub async fn dispatch_message(&self, message: &Message) -> Result<Value, HandlerError> {
         self.dispatch_ordered_message(message, None).await
     }
@@ -1114,19 +1115,18 @@ impl Service {
                 Err(err) => return Err(err),
             }
         };
-        // A command name has one route. A typed one runs through the ledger.
+        // A command name has one route, and it runs through the ledger.
         if message.kind == MessageKind::Command {
-            let typed = self.routes[route_indices[0]].typed_command_contract(&message.name);
-            if let Some(contract) = typed {
-                let declared = contract.roles.iter().any(|role| role == TRANSPORT_ROLE);
-                return self
-                    .in_dispatch_span(
-                        message,
-                        self.dispatch_transport_command(message, input, declared),
-                    )
-                    .await
-                    .map_err(transport_command_error);
-            }
+            let declared = self.routes[route_indices[0]]
+                .typed_command_contract(&message.name)
+                .is_some_and(|contract| contract.roles.iter().any(|role| role == TRANSPORT_ROLE));
+            return self
+                .in_dispatch_span(
+                    message,
+                    self.dispatch_transport_command(message, input, declared),
+                )
+                .await
+                .map_err(transport_command_error);
         }
         let session = message_to_session(message);
         self.in_dispatch_span(
@@ -1162,15 +1162,17 @@ impl Service {
                 "typed causal dispatch requires Service::named identity".into(),
             )
         })?;
-        self.dispatch_causal(
+        self.execute_causal(
             &message.name,
             &transport_command_id(service_id, &message.name, message_id),
             input,
             transport_session(message, message_id),
             VerifiedPrincipal::internal(TRANSPORT_USER_ID)
                 .expect("the transport subject is a non-empty constant"),
+            None,
         )
         .await
+        .map(|result| result.payload)
     }
 
     fn lane_route_indices(

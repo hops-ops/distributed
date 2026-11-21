@@ -1,13 +1,10 @@
 //! Payment service handlers.
 
-use distributed::microsvc::{Context, HandlerError};
-use distributed::{AggregateRepository, InMemoryLockManager, InMemoryRepository, QueuedRepository};
-use serde_json::{json, Value};
+use distributed::command::{typed_command, PreparedCommand, Succeeded, TypedCommand};
+use distributed::microsvc::{CausalCommandContext, HandlerError, TRANSPORT_ROLE};
+use serde::Serialize;
 
 use super::messages::*;
 use crate::order::Payment;
-
-pub type Repo =
-    AggregateRepository<QueuedRepository<InMemoryRepository, InMemoryLockManager>, Payment>;
 
 pub mod process;

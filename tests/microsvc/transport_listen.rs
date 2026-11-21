@@ -10,20 +10,29 @@
 use std::sync::Arc;
 
 use distributed::bus::{Bus, BusConsumer, FailurePolicy, InMemoryBus, RunOptions};
-use distributed::microsvc::{Message, MessageKind, Routes, Service, Session};
+use distributed::microsvc::{Message, MessageKind, Routes, Service, TRANSPORT_ROLE};
 use distributed::{AggregateBuilder, InMemoryRepository, Queueable};
 use serde_json::json;
 
-use crate::handlers;
+use crate::commands::dispatch;
+use crate::handlers::{self, user_session};
 use crate::models::counter::Counter;
 
 fn counter_service(store: InMemoryRepository) -> Arc<Service> {
-    Arc::new(Service::new().routes(distributed::routes!(
-        Routes::new().with_repo(store.queued().aggregate::<Counter>()),
-        command handlers::counter_create,
-        command handlers::counter_increment,
-        command handlers::whoami,
-    )))
+    Arc::new(
+        Service::new().named("counters").routes(
+            Routes::new()
+                .with_repo(store.queued().aggregate::<Counter>())
+                .typed_command(handlers::counter_create::command())
+                .handle(handlers::counter_create::handle)
+                .typed_command(handlers::counter_increment::command())
+                .handle(handlers::counter_increment::handle)
+                // `whoami` declares no role; a bus delivers only commands
+                // that opt in.
+                .typed_command(handlers::whoami::command().roles([TRANSPORT_ROLE]))
+                .handle(handlers::whoami::handle),
+        ),
+    )
 }
 
 fn command(name: &str, id: &str, payload: &str) -> Message {
@@ -69,9 +78,8 @@ async fn tolerates_handler_failures_and_keeps_processing() {
     let service = counter_service(store.clone());
 
     // A failing message (increment a counter that was never created → NotFound)
-    // must not wedge the consumer. NotFound is retryable, so it is delivered
-    // again (the failed handler's load does not keep the aggregate's lock)
-    // and dead-lettered at the attempt limit.
+    // must not wedge the consumer. The ledger records the refusal, so the
+    // delivery fails permanently and is dead-lettered.
     bus.send_message(command(
         "counter.increment",
         "counter.rejected",
@@ -128,10 +136,14 @@ async fn coexists_with_direct_dispatch() {
         .expect("listen should drain c1's create");
 
     // c2 created via direct dispatch on the same service.
-    service
-        .dispatch("counter.initialize", json!({ "id": "c2" }), Session::new())
-        .await
-        .expect("direct dispatch should create c2");
+    dispatch(
+        &service,
+        "counter.initialize",
+        json!({ "id": "c2" }),
+        user_session("user-1"),
+    )
+    .await
+    .expect("direct dispatch should create c2");
 
     let repo = store.queued().aggregate::<Counter>();
     let c1: Counter = repo.get("c1").await.unwrap().unwrap();
@@ -141,41 +153,49 @@ async fn coexists_with_direct_dispatch() {
 }
 
 #[tokio::test]
-async fn metadata_becomes_session() {
+async fn bus_commands_run_as_the_transport_identity() {
     let bus = InMemoryBus::new();
     let service = counter_service(InMemoryRepository::new());
 
-    // `whoami` reads `ctx.user_id()`, which the runner derives from the message
-    // metadata (`message_to_session` lowercases keys into session variables).
-    bus.send_message(
-        command("session.identify", "cmd-1", "{}").with_metadata("x-user-id", "user-42"),
-    )
-    .await
-    .expect("whoami should enqueue");
-
-    // Stop on permanent failure so a missing session user would surface as Err;
-    // `whoami` succeeding proves the metadata became the session.
+    // `whoami` reads `ctx.user_id()`. A bus authenticates nobody, so the
+    // command runs as the transport identity whatever the message says.
+    // Stop on permanent failure so a session without a user would surface.
+    bus.send_message(command("session.identify", "cmd-1", "{}"))
+        .await
+        .expect("whoami should enqueue");
     bus.listen(
         service.clone(),
         RunOptions::until_idle().with_failure_policy(FailurePolicy::Stop),
     )
     .await
-    .expect("whoami should succeed because metadata became the session");
+    .expect("whoami should succeed as the transport identity");
 
-    // Negative control: without metadata, whoami has no user (permanent
-    // Unauthorized) and the Stop policy surfaces the failure.
-    bus.send_message(command("session.identify", "cmd-2", "{}"))
-        .await
-        .expect("whoami should enqueue");
+    // Negative control: a command that does not declare the transport role
+    // is refused, whatever identity the message's metadata claims.
+    let users_only = Arc::new(
+        Service::new().named("counters").routes(
+            Routes::new()
+                .with_repo(InMemoryRepository::new().queued().aggregate::<Counter>())
+                .typed_command(handlers::whoami::command().roles([handlers::USER_ROLE]))
+                .handle(handlers::whoami::handle),
+        ),
+    );
+    bus.send_message(
+        command("session.identify", "cmd-2", "{}")
+            .with_metadata("x-user-id", "user-42")
+            .with_metadata("x-roles", handlers::USER_ROLE),
+    )
+    .await
+    .expect("whoami should enqueue");
     let result = bus
         .listen(
-            service.clone(),
+            users_only,
             RunOptions::until_idle().with_failure_policy(FailurePolicy::Stop),
         )
         .await;
     assert!(
         result.is_err(),
-        "without metadata, whoami has no session user and must fail"
+        "a command that does not declare the transport role must be refused"
     );
 }
 
@@ -184,14 +204,22 @@ async fn multiple_services_on_different_queues() {
     let bus = InMemoryBus::new();
     let store = InMemoryRepository::new();
 
-    let service_a = Arc::new(Service::new().routes(distributed::routes!(
-        Routes::new().with_repo(store.clone().queued().aggregate::<Counter>()),
-        command handlers::counter_create,
-    )));
-    let service_b = Arc::new(Service::new().routes(distributed::routes!(
-        Routes::new().with_repo(store.clone().queued().aggregate::<Counter>()),
-        command handlers::counter_increment,
-    )));
+    let service_a = Arc::new(
+        Service::new().named("counter-create").routes(
+            Routes::new()
+                .with_repo(store.clone().queued().aggregate::<Counter>())
+                .typed_command(handlers::counter_create::command())
+                .handle(handlers::counter_create::handle),
+        ),
+    );
+    let service_b = Arc::new(
+        Service::new().named("counter-increment").routes(
+            Routes::new()
+                .with_repo(store.clone().queued().aggregate::<Counter>())
+                .typed_command(handlers::counter_increment::command())
+                .handle(handlers::counter_increment::handle),
+        ),
+    );
 
     // Each service drains only its own command queue from the shared bus, so the
     // two never compete: service_a takes `counter.initialize`, service_b takes

@@ -2,13 +2,20 @@ use super::*;
 
 pub const COMMAND: &str = "inventory.reserve";
 
-pub fn guard(ctx: &Context<Repo>) -> bool {
-    ctx.has_fields(&["saga_id", "order_id", "sku", "quantity"])
+#[derive(Debug, Serialize, distributed::CommandOutput)]
+pub struct Output {
+    pub reserved: u32,
 }
 
-pub async fn handle(ctx: &Context<'_, Repo>) -> Result<Value, HandlerError> {
-    let input = ctx.input::<ReserveInventoryMsg>()?;
+/// Delivered by the saga over the bus, so it declares the transport role.
+pub fn command() -> TypedCommand<ReserveInventoryMsg, Succeeded<Output>> {
+    typed_command::<ReserveInventoryMsg, Succeeded<Output>>(COMMAND).roles([TRANSPORT_ROLE])
+}
 
+pub async fn handle(
+    ctx: &CausalCommandContext<'_, Inventory>,
+    input: ReserveInventoryMsg,
+) -> Result<PreparedCommand<Succeeded<Output>>, HandlerError> {
     let mut inv = ctx
         .repo()
         .get(&input.sku)
@@ -30,6 +37,7 @@ pub async fn handle(ctx: &Context<'_, Repo>) -> Result<Value, HandlerError> {
         },
     )?;
 
-    ctx.repo().outbox(msg).commit(&mut inv).await?;
-    Ok(json!({ "reserved": input.quantity }))
+    ctx.repo().outbox(msg).commit(inv)?.succeeded(Output {
+        reserved: input.quantity,
+    })
 }

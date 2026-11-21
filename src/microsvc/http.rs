@@ -4,8 +4,10 @@
 //!
 //! ## Routes
 //!
-//! - `POST /{command}` — dispatch a command when [`Service::with_http_command_routes`]
-//!   is set. Body = JSON input, request headers → Session.
+//! - `POST /{command}` — dispatch a typed command when
+//!   [`Service::with_http_command_routes`] is set. Body =
+//!   `{ "commandId", "input" }`, request headers → Session. A body without a
+//!   `commandId` is a 400.
 //! - `GET /health` — health check returning `{ "ok": true, "commands": [...] }`.
 //! - `GET /metrics` — Prometheus text metrics (requires the `metrics` feature);
 //!   unauthenticated by design and intended for private scrape networks only.
@@ -18,12 +20,13 @@
 //!
 //! let service = Arc::new(
 //!     microsvc::Service::new()
+//!         .named("counters")
 //!         .with_http_command_routes()
 //!         .routes(
 //!             microsvc::Routes::new()
 //!                 .with_repo(InMemoryRepository::new().queued().aggregate::<Counter>())
-//!                 .command("counter.create")
-//!                 .handle(|ctx| { /* ... */ })
+//!                 .typed_command(counter_create::command())
+//!                 .handle(counter_create::handle)
 //!         )
 //! );
 //!
@@ -125,8 +128,8 @@ async fn metrics_handler(State(service): State<Arc<Service>>) -> impl IntoRespon
 
 /// `POST /{command}` — dispatch a command with JSON body and headers as session.
 ///
-/// `{ "commandId", "input" }` is the causal wait-path. Other JSON is legacy
-/// fire-and-forget `dispatch`. Identity is taken from headers, never the body.
+/// The body is `{ "commandId", "input" }`; anything else is a 400. Identity
+/// is taken from headers, never the body.
 async fn command_handler(
     State(service): State<Arc<Service>>,
     Path(command): Path<String>,
@@ -134,7 +137,7 @@ async fn command_handler(
     Json(body): Json<Value>,
 ) -> impl IntoResponse {
     let session = session_from_headers(&headers);
-    let wait_path = match super::wait_path::parse_wait_path_body(&body) {
+    let (command_id, input) = match super::wait_path::parse_wait_path_body(&body) {
         Ok(wait_path) => wait_path,
         Err(error) => {
             return (
@@ -144,44 +147,30 @@ async fn command_handler(
                 .into_response();
         }
     };
-    if let Some((command_id, input)) = wait_path {
-        return match super::wait_path::dispatch_wait_path(
-            service.as_ref(),
-            &command,
-            &command_id,
-            input,
-            session,
+    match super::wait_path::dispatch_wait_path(
+        service.as_ref(),
+        &command,
+        &command_id,
+        input,
+        session,
+    )
+    .await
+    {
+        Ok(result) => (
+            StatusCode::OK,
+            Json(super::wait_path::wait_path_response(&result)),
         )
-        .await
-        {
-            Ok(result) => (
-                StatusCode::OK,
-                Json(super::wait_path::wait_path_response(&result)),
-            )
-                .into_response(),
-            Err(super::CausalDispatchError::Handler(HandlerError::ApplicationReloading)) => {
-                reloading_response()
-            }
-            Err(err) => {
-                let status = StatusCode::from_u16(err.status_code())
-                    .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-                if status.is_server_error() {
-                    eprintln!("microsvc command `{command}` failed: {err}");
-                }
-                let body = super::wait_path::wait_path_error_response(&err);
-                (status, Json(body)).into_response()
-            }
-        };
-    }
-    match service.dispatch(&command, body, session).await {
-        Ok(value) => (StatusCode::OK, Json(value)).into_response(),
-        Err(HandlerError::ApplicationReloading) => reloading_response(),
+            .into_response(),
+        Err(super::CausalDispatchError::Handler(HandlerError::ApplicationReloading)) => {
+            reloading_response()
+        }
         Err(err) => {
-            let status = status_for_error(&err);
+            let status = StatusCode::from_u16(err.status_code())
+                .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
             if status.is_server_error() {
                 eprintln!("microsvc command `{command}` failed: {err}");
             }
-            let body = json!({ "error": err.client_facing_message() });
+            let body = super::wait_path::wait_path_error_response(&err);
             (status, Json(body)).into_response()
         }
     }
@@ -198,23 +187,6 @@ fn reloading_response() -> axum::response::Response {
         })),
     )
         .into_response()
-}
-
-fn status_for_error(error: &HandlerError) -> StatusCode {
-    match error {
-        HandlerError::ApplicationReloading => StatusCode::SERVICE_UNAVAILABLE,
-        HandlerError::UnknownCommand(_) | HandlerError::NotFound(_) => StatusCode::NOT_FOUND,
-        HandlerError::DecodeFailed(_) | HandlerError::GuardRejected(_) => StatusCode::BAD_REQUEST,
-        HandlerError::Rejected(_) => StatusCode::UNPROCESSABLE_ENTITY,
-        HandlerError::Unauthorized(_) => StatusCode::UNAUTHORIZED,
-        HandlerError::Repository(_)
-        | HandlerError::Projection(_)
-        | HandlerError::UnqualifiedProjectionDelivery(_)
-        | HandlerError::ProjectionRepairPending { .. }
-        | HandlerError::ProjectionTerminalRecorded { .. }
-        | HandlerError::ProjectionDeliveryHalted { .. }
-        | HandlerError::Other(_) => StatusCode::INTERNAL_SERVER_ERROR,
-    }
 }
 
 /// Extract session variables from HTTP headers.
@@ -242,7 +214,7 @@ mod tests {
     use crate::repository::RepositoryError;
 
     #[test]
-    fn status_for_error_maps_all_handler_errors() {
+    fn handler_errors_map_to_http_statuses() {
         let cases = vec![
             (
                 HandlerError::UnknownCommand("missing".into()),
@@ -279,9 +251,8 @@ mod tests {
         ];
 
         for (error, expected) in cases {
-            let status = status_for_error(&error);
+            let status = StatusCode::from_u16(error.status_code()).unwrap();
             assert_eq!(status, expected);
-            assert_eq!(status.as_u16(), error.status_code());
             assert!(!status.is_success());
         }
     }

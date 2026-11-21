@@ -1,28 +1,35 @@
 //! Handler: counter.increment
 
-use distributed::microsvc::{Context, HandlerError};
-use serde::Deserialize;
-use serde_json::{json, Value};
+use distributed::command::{typed_command, PreparedCommand, Succeeded, TypedCommand};
+use distributed::microsvc::{CausalCommandContext, HandlerError, TRANSPORT_ROLE};
+use serde::{Deserialize, Serialize};
 
-use super::{counter_state_message, Repo};
+use super::{counter_state_message, USER_ROLE};
 use crate::models::counter::Counter;
 
 pub const COMMAND: &str = "counter.increment";
 
-#[derive(Deserialize)]
+#[derive(Debug, Deserialize, distributed::CommandInput)]
 pub struct Input {
     pub id: String,
     pub amount: i64,
 }
 
-pub fn guard(ctx: &Context<Repo>) -> bool {
-    ctx.has_fields(&["id", "amount"])
+#[derive(Debug, Serialize, distributed::CommandOutput)]
+pub struct Output {
+    pub id: String,
+    pub value: i64,
 }
 
-pub async fn handle(ctx: &Context<'_, Repo>) -> Result<Value, HandlerError> {
-    let input = ctx.input::<Input>()?;
+pub fn command() -> TypedCommand<Input, Succeeded<Output>> {
+    typed_command::<Input, Succeeded<Output>>(COMMAND).roles([USER_ROLE, TRANSPORT_ROLE])
+}
 
-    let mut counter: Counter = ctx
+pub async fn handle(
+    ctx: &CausalCommandContext<'_, Counter>,
+    input: Input,
+) -> Result<PreparedCommand<Succeeded<Output>>, HandlerError> {
+    let mut counter = ctx
         .repo()
         .get(&input.id)
         .await?
@@ -31,8 +38,13 @@ pub async fn handle(ctx: &Context<'_, Repo>) -> Result<Value, HandlerError> {
     counter.increment(input.amount)?;
 
     let message = counter_state_message(&counter, "counter.incremented")?;
+    let value = counter.value;
 
-    ctx.repo().outbox(message).commit(&mut counter).await?;
-
-    Ok(json!({ "id": input.id, "value": counter.value }))
+    ctx.repo()
+        .outbox(message)
+        .commit(counter)?
+        .succeeded(Output {
+            id: input.id,
+            value,
+        })
 }

@@ -135,15 +135,11 @@ fn wait_service_with_repo(repo: distributed::InMemoryRepository) -> Arc<Service>
         .succeeded(|aggregate, _principal| IdPayload {
             id: aggregate.entity().id().to_string(),
         });
-    let ping = Routes::new().with_dependencies(()).command("ping").handle(
-        |_ctx: &distributed::microsvc::Context<'_, ()>| async { Ok(json!({ "pong": true })) },
-    );
     Arc::new(
         Service::new()
             .named("causal-wait-path")
             .with_http_command_routes()
-            .routes(causal)
-            .routes(ping),
+            .routes(causal),
     )
 }
 
@@ -1359,7 +1355,15 @@ async fn bus_send_has_no_reply_value() {
 
 #[tokio::test]
 async fn same_host_listen_ping_and_http_wait_path() {
+    #[derive(Debug, serde::Deserialize, distributed::CommandInput)]
+    struct PingInput {}
+    #[derive(Debug, serde::Serialize, distributed::CommandOutput)]
+    struct Pong {
+        pong: bool,
+    }
+
     let bus = InMemoryBus::new();
+    let ping_repo = InMemoryRepository::new();
     let service = Arc::new(
         Service::new()
             .named("causal-wait-path")
@@ -1380,11 +1384,19 @@ async fn same_host_listen_ping_and_http_wait_path() {
                         id: aggregate.entity().id().to_string(),
                     }),
             )
-            .routes(Routes::new().with_dependencies(()).command("ping").handle(
-                |_ctx: &distributed::microsvc::Context<'_, ()>| async {
-                    Ok(json!({ "pong": true }))
-                },
-            ))
+            .routes(
+                Routes::for_stores(ping_repo.clone(), ping_repo)
+                    .typed_command(
+                        typed_command::<PingInput, Succeeded<Pong>>("ping")
+                            .roles([distributed::microsvc::TRANSPORT_ROLE]),
+                    )
+                    .handle(
+                        |_ctx: &CausalCommandContext<'_, ()>, _input: PingInput| async {
+                            PreparedCommand::prepare(Pong { pong: true })
+                                .map_err(|error| HandlerError::Other(Box::new(error)))
+                        },
+                    ),
+            )
             .with_bus(bus.clone()),
     );
     {
@@ -1396,7 +1408,16 @@ async fn same_host_listen_ping_and_http_wait_path() {
                 .await;
         });
     }
-    bus.send("ping", b"{}".to_vec()).await.unwrap();
+    bus.send_message(
+        distributed::bus::Message::new(
+            "ping",
+            distributed::bus::MessageKind::Command,
+            b"{}".to_vec(),
+        )
+        .with_id("ping-1"),
+    )
+    .await
+    .unwrap();
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
     let base = start_http(Arc::clone(&service)).await;

@@ -7,10 +7,13 @@ use super::{handlers, CheckoutRepo};
 pub fn service(repo: CheckoutRepo) -> Arc<Service> {
     Arc::new(
         Service::new()
+            .named("checkout-saga")
             .with_http_command_routes()
             .routes(distributed::routes!(
-                Routes::new().with_repo(repo),
-                command handlers::start,
+                Routes::new()
+                    .with_repo(repo)
+                    .typed_command(handlers::start::command())
+                    .handle(handlers::start::handle),
                 event handlers::record_seat_reserved,
             )),
     )
