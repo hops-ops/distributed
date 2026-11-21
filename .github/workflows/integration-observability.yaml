@@ -36,8 +36,9 @@ jobs:
           toolchain: stable
       - uses: Swatinem/rust-cache@v2
         with:
-          shared-key: observability
-          save-if: ${{ github.event_name != 'pull_request' }}
+          # The distributed_cli job writes this cache.
+          shared-key: cli
+          save-if: false
       - name: Install promtool
         run: |
           VERSION=3.4.1

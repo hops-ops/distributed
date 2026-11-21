@@ -58,7 +58,6 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: |
-            . -> target
             examples/game/server -> target
             examples/game/cells -> target
           shared-key: game-demos
