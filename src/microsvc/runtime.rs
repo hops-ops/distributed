@@ -54,15 +54,7 @@ impl Service {
             DEFAULT_PUBLISH_LEASE,
             DEFAULT_MAX_PUBLISH_ATTEMPTS,
         );
-        #[cfg(any(
-            feature = "http",
-            feature = "grpc",
-            feature = "postgres",
-            feature = "sqlite",
-            feature = "nats",
-            feature = "rabbitmq",
-            feature = "kafka",
-        ))]
+        #[cfg(background_workers)]
         self.start_ledger_compaction();
 
         self.set_runner(Box::new(
@@ -102,16 +94,7 @@ impl Service {
     /// Worker id is `drain:<pid>` so claims never collide with the immediate
     /// hook's `microsvc-immediate:<pid>`. Spawn it next to [`run`](Self::run);
     /// this does not start a task.
-    #[cfg(any(
-        feature = "http",
-        feature = "grpc",
-        feature = "postgres",
-        feature = "sqlite",
-        feature = "nats",
-        feature = "rabbitmq",
-        feature = "kafka",
-        test,
-    ))]
+    #[cfg(any(background_workers, test))]
     pub fn outbox_drain<S, P>(
         store: S,
         publisher: P,

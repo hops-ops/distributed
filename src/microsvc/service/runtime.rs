@@ -74,15 +74,7 @@ pub struct Service {
     #[cfg(feature = "graphql")]
     graphql: Option<std::sync::Arc<crate::graphql::GraphqlEngine>>,
     /// Started by `with_bus`; stops when the service is dropped.
-    #[cfg(any(
-        feature = "http",
-        feature = "grpc",
-        feature = "postgres",
-        feature = "sqlite",
-        feature = "nats",
-        feature = "rabbitmq",
-        feature = "kafka",
-    ))]
+    #[cfg(background_workers)]
     ledger_compaction: Option<crate::microsvc::workers::LedgerCompactionWorker>,
 }
 
@@ -103,15 +95,7 @@ impl Service {
             http_command_routes: false,
             #[cfg(feature = "graphql")]
             graphql: None,
-            #[cfg(any(
-                feature = "http",
-                feature = "grpc",
-                feature = "postgres",
-                feature = "sqlite",
-                feature = "nats",
-                feature = "rabbitmq",
-                feature = "kafka",
-            ))]
+            #[cfg(background_workers)]
             ledger_compaction: None,
         }
     }
@@ -799,13 +783,7 @@ impl Service {
                 "external typed causal dispatch requires Service::named identity".into(),
             )
         })?;
-        let route_index = self
-            .index
-            .get(&MessageKind::Command)
-            .and_then(|commands| commands.get(command))
-            .and_then(|indices| (indices.len() == 1).then_some(indices[0]))
-            .ok_or_else(|| CausalDispatchError::BadRequest("unknown typed command".into()))?;
-        self.routes[route_index]
+        self.typed_command_routes(command)?
             .reserve_external(
                 command,
                 service_id,
@@ -828,15 +806,22 @@ impl Service {
         attempt: ExternalCausalAttempt,
         result: &CausalDispatchResult,
     ) -> Result<(), CausalDispatchError> {
-        let route_index = self
-            .index
+        self.typed_command_routes(command)?
+            .complete_external(command, attempt, result)
+            .await
+    }
+
+    /// The one route bundle that registers `command`.
+    fn typed_command_routes(
+        &self,
+        command: &str,
+    ) -> Result<&dyn ErasedRoutes, CausalDispatchError> {
+        self.index
             .get(&MessageKind::Command)
             .and_then(|commands| commands.get(command))
             .and_then(|indices| (indices.len() == 1).then_some(indices[0]))
-            .ok_or_else(|| CausalDispatchError::BadRequest("unknown typed command".into()))?;
-        self.routes[route_index]
-            .complete_external(command, attempt, result)
-            .await
+            .map(|route_index| self.routes[route_index].as_ref())
+            .ok_or_else(|| CausalDispatchError::BadRequest("unknown typed command".into()))
     }
 
     /// Mark a remote attempt retryable after a transport/protocol failure.
@@ -846,13 +831,7 @@ impl Service {
         command: &str,
         attempt: ExternalCausalAttempt,
     ) -> Result<(), CausalDispatchError> {
-        let route_index = self
-            .index
-            .get(&MessageKind::Command)
-            .and_then(|commands| commands.get(command))
-            .and_then(|indices| (indices.len() == 1).then_some(indices[0]))
-            .ok_or_else(|| CausalDispatchError::BadRequest("unknown typed command".into()))?;
-        self.routes[route_index]
+        self.typed_command_routes(command)?
             .abandon_external(command, attempt)
             .await
     }
@@ -954,13 +933,7 @@ impl Service {
                 "typed causal dispatch requires Service::named identity".into(),
             )
         })?;
-        let route_index = self
-            .index
-            .get(&MessageKind::Command)
-            .and_then(|commands| commands.get(command))
-            .and_then(|indices| (indices.len() == 1).then_some(indices[0]))
-            .ok_or_else(|| CausalDispatchError::BadRequest("unknown typed command".into()))?;
-        self.routes[route_index]
+        self.typed_command_routes(command)?
             .dispatch_causal(
                 command,
                 service_id,
@@ -1082,13 +1055,7 @@ impl Service {
                 "typed causal lookup requires Service::named identity".into(),
             )
         })?;
-        let route_index = self
-            .index
-            .get(&MessageKind::Command)
-            .and_then(|commands| commands.get(command))
-            .and_then(|indices| (indices.len() == 1).then_some(indices[0]))
-            .ok_or_else(|| CausalDispatchError::BadRequest("unknown typed command".into()))?;
-        self.routes[route_index]
+        self.typed_command_routes(command)?
             .lookup_causal(command, service_id, command_id, session, principal)
             .await
     }
@@ -1426,15 +1393,7 @@ impl Service {
 
     /// Run command-ledger compaction beside the outbox drain for as long as
     /// this service lives.
-    #[cfg(any(
-        feature = "http",
-        feature = "grpc",
-        feature = "postgres",
-        feature = "sqlite",
-        feature = "nats",
-        feature = "rabbitmq",
-        feature = "kafka",
-    ))]
+    #[cfg(background_workers)]
     pub(crate) fn start_ledger_compaction(&mut self) {
         let ledgers = self.command_ledgers();
         self.ledger_compaction = (!ledgers.is_empty())

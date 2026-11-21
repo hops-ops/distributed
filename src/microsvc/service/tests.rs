@@ -1,14 +1,6 @@
 #[cfg(feature = "graphql")]
 use super::causal::collapse_projection_evidence;
-#[cfg(any(
-    feature = "http",
-    feature = "grpc",
-    feature = "postgres",
-    feature = "sqlite",
-    feature = "nats",
-    feature = "rabbitmq",
-    feature = "kafka"
-))]
+#[cfg(background_workers)]
 use super::routes::LedgerCompaction;
 use super::*;
 use crate::aggregate::Aggregate;
@@ -22,15 +14,7 @@ use crate::command::{CommandInputType, CommandOutputType, CommandTypeDef, Comman
 #[cfg(feature = "graphql")]
 use crate::command_dispatch::SharedCommandHost;
 use crate::command_dispatch::VerifiedPrincipal;
-#[cfg(any(
-    feature = "http",
-    feature = "grpc",
-    feature = "postgres",
-    feature = "sqlite",
-    feature = "nats",
-    feature = "rabbitmq",
-    feature = "kafka"
-))]
+#[cfg(background_workers)]
 use crate::command_ledger::CommandLedgerState;
 use crate::command_ledger::{
     AttemptFence, CausalCommitBatch, CausalGetStream, CausalRepositoryIdentity,
@@ -4434,15 +4418,7 @@ macro_rules! ledger_compaction_routes {
     };
 }
 
-#[cfg(any(
-    feature = "http",
-    feature = "grpc",
-    feature = "postgres",
-    feature = "sqlite",
-    feature = "nats",
-    feature = "rabbitmq",
-    feature = "kafka"
-))]
+#[cfg(background_workers)]
 macro_rules! ledger_compaction_service {
     ($repository:expr) => {
         Service::new()
@@ -4451,15 +4427,7 @@ macro_rules! ledger_compaction_service {
     };
 }
 
-#[cfg(any(
-    feature = "http",
-    feature = "grpc",
-    feature = "postgres",
-    feature = "sqlite",
-    feature = "nats",
-    feature = "rabbitmq",
-    feature = "kafka"
-))]
+#[cfg(background_workers)]
 async fn reserve_for_compaction<R: CommandLedgerStore>(
     repository: &R,
 ) -> (CommandLedgerKey, crate::command_ledger::CommandAttempt) {
@@ -4487,15 +4455,7 @@ async fn reserve_for_compaction<R: CommandLedgerStore>(
     }
 }
 
-#[cfg(any(
-    feature = "http",
-    feature = "grpc",
-    feature = "postgres",
-    feature = "sqlite",
-    feature = "nats",
-    feature = "rabbitmq",
-    feature = "kafka"
-))]
+#[cfg(background_workers)]
 /// Writes a terminal row whose retention lapses 50 ms after commit, a
 /// terminal row retained for 300 s and an in-progress row, then runs the
 /// worker's pass until the first one is due. The ledger has no injectable
@@ -4566,15 +4526,7 @@ where
     ));
 }
 
-#[cfg(any(
-    feature = "http",
-    feature = "grpc",
-    feature = "postgres",
-    feature = "sqlite",
-    feature = "nats",
-    feature = "rabbitmq",
-    feature = "kafka"
-))]
+#[cfg(background_workers)]
 #[tokio::test]
 async fn ledger_worker_pass_compacts_only_expired_rows_in_memory() {
     let repository = InMemoryRepository::new();
@@ -4606,15 +4558,7 @@ async fn service_compacts_each_command_repository_once() {
     assert_eq!(service.command_ledgers().len(), 2);
 }
 
-#[cfg(any(
-    feature = "http",
-    feature = "grpc",
-    feature = "postgres",
-    feature = "sqlite",
-    feature = "nats",
-    feature = "rabbitmq",
-    feature = "kafka"
-))]
+#[cfg(background_workers)]
 /// `with_bus` starts the worker: with no explicit pass, the expired row is
 /// compacted. Tokio time is paused, so the worker's interval elapses as soon
 /// as the runtime is idle; the row's retention is wall-clock time.
@@ -4652,15 +4596,7 @@ async fn with_bus_runs_ledger_compaction() {
     drop(service);
 }
 
-#[cfg(any(
-    feature = "http",
-    feature = "grpc",
-    feature = "postgres",
-    feature = "sqlite",
-    feature = "nats",
-    feature = "rabbitmq",
-    feature = "kafka"
-))]
+#[cfg(background_workers)]
 #[tokio::test]
 async fn dropping_the_ledger_compaction_worker_stops_it() {
     let ledger: LedgerCompaction = Arc::new(|_| Box::pin(async { Ok(0) }));

@@ -71,8 +71,23 @@ impl Dialect {
     }
 }
 
+/// Features that link a tokio runtime the service spawns its background
+/// workers on (outbox drain, ledger compaction).
+const BACKGROUND_WORKER_FEATURES: [&str; 7] = [
+    "HTTP", "GRPC", "POSTGRES", "SQLITE", "NATS", "RABBITMQ", "KAFKA",
+];
+
 fn main() {
     emit_migration_inventory();
+
+    // One name for the feature list, so every site gates on the same set.
+    println!("cargo:rustc-check-cfg=cfg(background_workers)");
+    if BACKGROUND_WORKER_FEATURES
+        .iter()
+        .any(|feature| std::env::var_os(format!("CARGO_FEATURE_{feature}")).is_some())
+    {
+        println!("cargo:rustc-cfg=background_workers");
+    }
 
     // Only run gRPC codegen when the "grpc" feature is enabled.
     // Cargo sets CARGO_FEATURE_GRPC when compiling with --features grpc.
