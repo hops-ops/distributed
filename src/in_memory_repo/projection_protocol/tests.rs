@@ -1,4 +1,4 @@
-use std::sync::{Arc, LazyLock};
+use std::sync::LazyLock;
 use std::time::Duration;
 
 use super::*;
@@ -8,15 +8,14 @@ use crate::command_ledger::{
     PrincipalPartitionId, ReservationOutcome, TerminalCommandState,
 };
 use crate::projection_protocol::{
-    ProjectionGraphSnapshotRequest, ProjectionInputFingerprint, ProjectionModelOwnership,
-    ProjectionObservationRequest, ProjectionQuerySnapshotRequest, ProjectionRecordMutation,
-    ProjectionScopeCodec, TrustedProjectionInput,
+    ProjectionInputFingerprint, ProjectionModelOwnership, ProjectionObservationRequest,
+    ProjectionQuerySnapshotRequest, ProjectionRecordMutation, ProjectionScopeCodec,
+    TrustedProjectionInput,
 };
 use crate::repository::{CommitBatch, ReadModelWritePlanStore};
 use crate::table::{
-    ColumnType, DeleteTableRowMutation, ExpectedVersion, ForeignKey, PrimaryKey, RelationshipDef,
-    RelationshipKind, RowKey, RowValue, RowValues, RowWriteMode, TableColumn, TableKind,
-    TableRowMutation, TableSchema,
+    ColumnType, DeleteTableRowMutation, ExpectedVersion, PrimaryKey, RowKey, RowValue, RowValues,
+    RowWriteMode, TableColumn, TableKind, TableRowMutation, TableSchema,
 };
 
 fn topology() -> ProjectorTopologyId {
@@ -96,217 +95,6 @@ fn schema() -> &'static TableSchema {
         kind: TableKind::ReadModel,
     });
     &SCHEMA
-}
-
-fn graph_parent_schema() -> &'static TableSchema {
-    static SCHEMA: LazyLock<TableSchema> = LazyLock::new(|| TableSchema {
-        model_name: "GraphParentView".into(),
-        table_name: "graph_parent_views".into(),
-        columns: vec![
-            TableColumn {
-                primary_key: true,
-                ..TableColumn::new("id", "id", ColumnType::Text)
-            },
-            TableColumn::new("parent_id", "parent_id", ColumnType::Text),
-        ],
-        primary_key: PrimaryKey::new(["id"]),
-        version_column: None,
-        foreign_keys: Vec::new(),
-        indexes: Vec::new(),
-        relationships: vec![
-            RelationshipDef {
-                references: None,
-                field_name: "children".into(),
-                kind: RelationshipKind::HasMany,
-                target_model: "GraphChildView".into(),
-                foreign_key: Some("parent_id".into()),
-                through: None,
-                target_foreign_key: None,
-            },
-            RelationshipDef {
-                references: None,
-                field_name: "featured_children".into(),
-                kind: RelationshipKind::HasMany,
-                target_model: "GraphChildView".into(),
-                foreign_key: Some("parent_id".into()),
-                through: None,
-                target_foreign_key: None,
-            },
-        ],
-        kind: TableKind::ReadModel,
-    });
-    &SCHEMA
-}
-
-fn graph_child_schema() -> &'static TableSchema {
-    static SCHEMA: LazyLock<TableSchema> = LazyLock::new(|| TableSchema {
-        model_name: "GraphChildView".into(),
-        table_name: "graph_child_views".into(),
-        columns: vec![
-            TableColumn {
-                primary_key: true,
-                ..TableColumn::new("id", "id", ColumnType::Text)
-            },
-            TableColumn {
-                foreign_key: Some(ForeignKey::new("graph_parent_views", "id")),
-                ..TableColumn::new("parent_id", "parent_id", ColumnType::Text)
-            },
-        ],
-        primary_key: PrimaryKey::new(["id"]),
-        version_column: None,
-        foreign_keys: Vec::new(),
-        indexes: Vec::new(),
-        relationships: Vec::new(),
-        kind: TableKind::ReadModel,
-    });
-    &SCHEMA
-}
-
-fn graph_ownership() -> Vec<ProjectionModelOwnership> {
-    vec![
-        ProjectionModelOwnership::new("GraphParentView", "graph_parent_views").unwrap(),
-        ProjectionModelOwnership::new("GraphChildView", "graph_child_views").unwrap(),
-    ]
-}
-
-#[tokio::test]
-async fn graph_snapshots_follow_composite_candidate_keys_and_keep_pk_scopes() {
-    let mut parent = graph_parent_schema().clone();
-    parent.relationships.truncate(1);
-    parent.relationships[0].foreign_key = Some("tenant,key".into());
-    parent.relationships[0].references = Some("tenant,key".into());
-    let mut child = graph_child_schema().clone();
-    child.relationships.push(RelationshipDef {
-        field_name: "parent".into(),
-        kind: RelationshipKind::BelongsTo,
-        target_model: parent.model_name.clone(),
-        foreign_key: Some("tenant,key".into()),
-        references: Some("tenant,key".into()),
-        through: None,
-        target_foreign_key: None,
-    });
-    for schema in [&mut parent, &mut child] {
-        schema
-            .columns
-            .push(TableColumn::new("tenant", "tenant", ColumnType::Text));
-        schema.columns.push(TableColumn {
-            nullable: true,
-            ..TableColumn::new("key", "key", ColumnType::Text)
-        });
-    }
-    parent.indexes.push(crate::table::TableIndex {
-        name: None,
-        columns: vec!["tenant".into(), "key".into()],
-        unique: true,
-    });
-    let parent: &'static TableSchema = Box::leak(Box::new(parent));
-    let child: &'static TableSchema = Box::leak(Box::new(child));
-    let codec = ProjectionScopeCodec::with_models(
-        topology(),
-        [
-            (parent.model_name.as_str(), parent),
-            (child.model_name.as_str(), child),
-        ],
-    )
-    .unwrap();
-    let key = |id: &str| RowKey::new([("id", RowValue::String(id.into()))]);
-    let mutation =
-        |schema: &'static TableSchema, id: &str, tenant: &str, candidate: Option<&str>| {
-            let row_key = key(id);
-            let mut values = RowValues::new();
-            values.insert("id", RowValue::String(id.into()));
-            values.insert("parent_id", RowValue::String("unused".into()));
-            values.insert("tenant", RowValue::String(tenant.into()));
-            values.insert(
-                "key",
-                candidate
-                    .map(|v| RowValue::String(v.into()))
-                    .unwrap_or(RowValue::Null),
-            );
-            ProjectionRecordMutation::new(
-                codec
-                    .encode_row_scope_in_partition(&schema.model_name, partition(), &row_key)
-                    .unwrap(),
-                TableMutation::UpsertRow(TableRowMutation {
-                    schema,
-                    key: row_key,
-                    values,
-                    expected_version: ExpectedVersion::Any,
-                    mode: RowWriteMode::Upsert,
-                }),
-                ProjectionRecordExpectation::Missing,
-                RecordTransition::Upsert,
-            )
-            .unwrap()
-        };
-    let repository = InMemoryRepository::new();
-    repository
-        .register_projection_models(&topology(), &graph_ownership())
-        .await
-        .unwrap();
-    repository
-        .commit_projection(ProjectionCommitBatch {
-            input: input(
-                1,
-                b"candidate-graph",
-                "candidate-message",
-                "candidate-cause",
-                ProjectionGeneration::initial(),
-            ),
-            change_epoch: change_epoch(),
-            ownership: graph_ownership(),
-            observations: vec![],
-            mutations: vec![
-                mutation(parent, "opaque-a", "a", Some("same")),
-                mutation(parent, "opaque-b", "b", Some("same")),
-                mutation(parent, "null-target", "a", None),
-                mutation(child, "source", "a", Some("same")),
-                mutation(child, "null-source", "a", None),
-            ],
-        })
-        .await
-        .unwrap();
-    for (schema, id, field, target, expected) in [
-        (child, "source", "parent", parent, Some("opaque-a")),
-        (parent, "opaque-a", "children", child, Some("source")),
-        (parent, "opaque-b", "children", child, None),
-        (child, "null-source", "parent", parent, None),
-        (parent, "null-target", "children", child, None),
-    ] {
-        let root = ProjectionQuerySnapshotRequest::new(
-            &codec,
-            Some(&serde_json::json!("tenant-a")),
-            &schema.model_name,
-            key(id),
-            vec![],
-        )
-        .unwrap();
-        let request = ProjectionGraphSnapshotRequest::new(
-            root,
-            [(field.into(), Arc::new(target.clone()))],
-            2,
-        )
-        .unwrap();
-        let snapshot = repository
-            .projection_graph_snapshot(&request)
-            .await
-            .unwrap();
-        let rows = &snapshot.includes[field].rows;
-        assert_eq!(rows.len(), usize::from(expected.is_some()), "{id}/{field}");
-        if let Some(expected) = expected {
-            assert_eq!(
-                rows[0].row.as_ref().unwrap().get("id"),
-                Some(&RowValue::String(expected.into()))
-            );
-            assert_eq!(
-                rows[0].scope,
-                codec
-                    .encode_row_scope_in_partition(&target.model_name, partition(), &key(expected))
-                    .unwrap()
-            );
-            assert!(rows[0].record.is_some());
-        }
-    }
 }
 
 fn scope_codec() -> ProjectionScopeCodec {
@@ -484,23 +272,6 @@ fn upsert_table_mutation(valid: bool) -> TableMutation {
     })
 }
 
-fn snapshot_request() -> ProjectionQuerySnapshotRequest {
-    ProjectionQuerySnapshotRequest::new(
-        &scope_codec(),
-        Some(&serde_json::json!("tenant-a")),
-        "TodoView",
-        record_key(),
-        vec![crate::projection_protocol::ProjectionCheckpointProbe::new(
-            topology(),
-            partition(),
-            source(),
-            ProjectionEpoch::new("source-v1").unwrap(),
-            ProjectionGeneration::initial(),
-        )],
-    )
-    .unwrap()
-}
-
 fn mutation(
     expectation: ProjectionRecordExpectation,
     kind: RecordTransition,
@@ -571,22 +342,7 @@ fn remove_physical_row(repository: &InMemoryRepository) {
 }
 
 #[test]
-fn query_snapshot_probe_and_batch_bounds_are_explicit() {
-    let request = snapshot_request();
-    assert!(ProjectionQuerySnapshotBatchRequest::new(vec![
-        request.clone();
-        crate::projection_protocol::MAX_PROJECTION_QUERY_BATCH_ROWS
-    ])
-    .is_ok());
-    assert!(matches!(
-        ProjectionQuerySnapshotBatchRequest::new(vec![
-            request;
-            crate::projection_protocol::MAX_PROJECTION_QUERY_BATCH_ROWS + 1
-        ]),
-        Err(ProjectionProtocolError::InvalidBatch(message))
-            if message.contains("maximum")
-    ));
-
+fn query_snapshot_probe_bounds_are_explicit() {
     let probes = (0..crate::projection_protocol::MAX_PROJECTION_QUERY_CHECKPOINT_PROBES)
         .map(|index| {
             crate::projection_protocol::ProjectionCheckpointProbe::new(
@@ -610,19 +366,6 @@ fn query_snapshot_probe_and_batch_bounds_are_explicit() {
         probes.clone(),
     )
     .is_ok());
-    let max_probe_request = ProjectionQuerySnapshotRequest::new(
-        &scope_codec(),
-        Some(&serde_json::json!("tenant-a")),
-        "TodoView",
-        record_key(),
-        probes.clone(),
-    )
-    .unwrap();
-    assert!(matches!(
-        ProjectionQuerySnapshotBatchRequest::new(vec![max_probe_request; 33]),
-        Err(ProjectionProtocolError::InvalidBatch(message))
-            if message.contains("aggregate checkpoint probes")
-    ));
     let mut over_limit = probes;
     over_limit.push(crate::projection_protocol::ProjectionCheckpointProbe::new(
         topology(),
@@ -641,170 +384,6 @@ fn query_snapshot_probe_and_batch_bounds_are_explicit() {
         ),
         Err(ProjectionProtocolError::InvalidBatch(message))
             if message.contains("maximum")
-    ));
-
-    let live = (0..crate::projection_protocol::MAX_PROJECTION_EVIDENCE_BATCH_ITEMS)
-        .map(|index| {
-            crate::projection_protocol::ProjectionLiveRecordRequest::new(
-                &scope_codec(),
-                "TodoView",
-                RowKey::new([("id", RowValue::String(format!("todo-{index}")))]),
-            )
-            .unwrap()
-        })
-        .collect::<Vec<_>>();
-    assert!(
-        crate::projection_protocol::ProjectionLiveRecordBatchRequest::new(live.clone()).is_ok()
-    );
-    let mut too_many_live = live;
-    too_many_live.push(
-        crate::projection_protocol::ProjectionLiveRecordRequest::new(
-            &scope_codec(),
-            "TodoView",
-            RowKey::new([("id", RowValue::String("todo-over-limit".into()))]),
-        )
-        .unwrap(),
-    );
-    assert!(matches!(
-        crate::projection_protocol::ProjectionLiveRecordBatchRequest::new(too_many_live),
-        Err(ProjectionProtocolError::InvalidBatch(message))
-            if message.contains("maximum")
-    ));
-}
-
-#[tokio::test]
-async fn unpartitioned_live_record_follows_tombstone_partition_move_and_rejects_ambiguity() {
-    let repository = repository().await;
-    let old_scope = record_scope();
-    let created = repository
-        .commit_projection(batch(
-            input(
-                1,
-                b"old-partition",
-                "move-message-1",
-                "move-cause-1",
-                ProjectionGeneration::initial(),
-            ),
-            vec![mutation(
-                ProjectionRecordExpectation::Missing,
-                RecordTransition::Upsert,
-            )],
-            Vec::new(),
-        ))
-        .await
-        .unwrap()
-        .records
-        .remove(0);
-    let live_request = crate::projection_protocol::ProjectionLiveRecordBatchRequest::new(vec![
-        crate::projection_protocol::ProjectionLiveRecordRequest::new(
-            &scope_codec(),
-            "TodoView",
-            record_key(),
-        )
-        .unwrap(),
-    ])
-    .unwrap();
-    let live = repository
-        .projection_live_record_batch(&live_request)
-        .await
-        .unwrap();
-    assert_eq!(
-        live.records[0].as_ref().unwrap().revision.scope(),
-        &old_scope
-    );
-
-    repository
-        .commit_projection(batch(
-            input(
-                2,
-                b"old-delete",
-                "move-message-2",
-                "move-cause-2",
-                ProjectionGeneration::initial(),
-            ),
-            vec![mutation(
-                ProjectionRecordExpectation::Exact(created.revision),
-                RecordTransition::Delete,
-            )],
-            Vec::new(),
-        ))
-        .await
-        .unwrap();
-    assert_eq!(
-        repository
-            .projection_live_record_batch(&live_request)
-            .await
-            .unwrap()
-            .records,
-        vec![None]
-    );
-
-    let new_partition = scope_codec()
-        .encode_partition(Some(&serde_json::json!("tenant-b")))
-        .unwrap();
-    let new_scope = scope_codec()
-        .encode_row_scope_in_partition("TodoView", new_partition.clone(), &record_key())
-        .unwrap();
-    let new_input = TrustedProjectionInput::mint(
-        ProjectionInputCursor::new(
-            topology(),
-            new_partition,
-            source(),
-            ProjectionEpoch::new("source-v1").unwrap(),
-            1,
-        )
-        .unwrap(),
-        ProjectionInputFingerprint::from_canonical_bytes(b"new-partition"),
-        "move-message-3",
-        "move-cause-3",
-        ProjectionGeneration::initial(),
-        true,
-    )
-    .unwrap();
-    let moved = repository
-        .commit_projection(batch(
-            new_input,
-            vec![ProjectionRecordMutation::new(
-                new_scope.clone(),
-                upsert_table_mutation(true),
-                ProjectionRecordExpectation::Missing,
-                RecordTransition::Upsert,
-            )
-            .unwrap()],
-            Vec::new(),
-        ))
-        .await
-        .unwrap()
-        .records
-        .remove(0);
-    assert_eq!(
-        repository
-            .projection_live_record_batch(&live_request)
-            .await
-            .unwrap()
-            .records[0]
-            .as_ref()
-            .unwrap()
-            .revision
-            .scope(),
-        &new_scope
-    );
-    assert_eq!(moved.revision.scope(), &new_scope);
-
-    // Simulate durable metadata drift that bypassed the normal write
-    // fence. The read path must report corruption rather than choosing.
-    repository
-        .projection_protocol
-        .write()
-        .unwrap()
-        .records
-        .get_mut(&old_scope)
-        .unwrap()
-        .tombstone = false;
-    assert!(matches!(
-        repository.projection_live_record_batch(&live_request).await,
-        Err(ProjectionProtocolError::InvalidBatch(message))
-            if message.contains("ambiguous")
     ));
 }
 

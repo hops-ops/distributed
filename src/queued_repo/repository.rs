@@ -17,14 +17,13 @@ use crate::lock::{InMemoryLockManager, LockGuard, LockManager};
 use crate::projection_protocol::{
     PartitionId, ProjectionCausationEvidenceBatch, ProjectionCausationEvidenceRequest,
     ProjectionChangeCursor, ProjectionChangeRead, ProjectionCheckpoint, ProjectionCommitBatch,
-    ProjectionCommitResult, ProjectionFailure, ProjectionFailureBatch, ProjectionFailureLocation,
-    ProjectionGeneration, ProjectionInputCursor, ProjectionInputDisposition,
-    ProjectionLiveRecordBatch, ProjectionLiveRecordBatchRequest, ProjectionModelOwnership,
-    ProjectionObservation, ProjectionObservationKind, ProjectionPartitionRuntimeState,
-    ProjectionProtocolError, ProjectionProtocolStore, ProjectionQuerySnapshot,
-    ProjectionQuerySnapshotBatch, ProjectionQuerySnapshotBatchRequest,
-    ProjectionQuerySnapshotRequest, ProjectionRecordMetadata, ProjectionRecordScope,
-    ProjectorTopologyId, TrustedProjectionInput,
+    ProjectionCommitResult, ProjectionExecutionSnapshotBatch,
+    ProjectionExecutionSnapshotBatchRequest, ProjectionFailure, ProjectionFailureBatch,
+    ProjectionFailureLocation, ProjectionGeneration, ProjectionInputCursor,
+    ProjectionInputDisposition, ProjectionModelOwnership, ProjectionObservation,
+    ProjectionObservationKind, ProjectionPartitionRuntimeState, ProjectionProtocolError,
+    ProjectionProtocolStore, ProjectionQuerySnapshot, ProjectionQuerySnapshotRequest,
+    ProjectionRecordMetadata, ProjectionRecordScope, ProjectorTopologyId, TrustedProjectionInput,
 };
 use crate::read_model::{ReadModelLoadGraph, ReadModelLoadRequest, ReadModelQueryCapabilities};
 use crate::repository::{
@@ -370,7 +369,6 @@ where
     R: ProjectionProtocolStore,
     L: LockManager,
 {
-    #[cfg(feature = "graphql")]
     async fn projection_rebuild_records(
         &self,
         context: &crate::projection::rebuild::RebuildContext,
@@ -379,7 +377,6 @@ where
         self.inner.projection_rebuild_records(context).await
     }
 
-    #[cfg(feature = "graphql")]
     async fn commit_projection_rebuild(
         &self,
         plan: crate::projection::rebuild::SnapshotProjectionRebuildPlan,
@@ -444,12 +441,13 @@ where
         self.inner.projection_query_snapshot(request)
     }
 
-    fn projection_query_snapshot_batch<'a>(
+    fn projection_execution_snapshot_batch<'a>(
         &'a self,
-        request: &'a ProjectionQuerySnapshotBatchRequest,
-    ) -> impl Future<Output = Result<ProjectionQuerySnapshotBatch, ProjectionProtocolError>> + Send + 'a
-    {
-        self.inner.projection_query_snapshot_batch(request)
+        request: &'a ProjectionExecutionSnapshotBatchRequest,
+    ) -> impl Future<Output = Result<ProjectionExecutionSnapshotBatch, ProjectionProtocolError>>
+           + Send
+           + 'a {
+        self.inner.projection_execution_snapshot_batch(request)
     }
 
     fn projection_causation_evidence<'a>(
@@ -459,14 +457,6 @@ where
            + Send
            + 'a {
         self.inner.projection_causation_evidence(request)
-    }
-
-    fn projection_live_record_batch<'a>(
-        &'a self,
-        request: &'a ProjectionLiveRecordBatchRequest,
-    ) -> impl Future<Output = Result<ProjectionLiveRecordBatch, ProjectionProtocolError>> + Send + 'a
-    {
-        self.inner.projection_live_record_batch(request)
     }
 
     fn projection_partition_runtime_state<'a>(

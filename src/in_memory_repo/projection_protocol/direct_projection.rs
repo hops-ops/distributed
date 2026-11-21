@@ -78,7 +78,7 @@ pub(in crate::in_memory_repo) fn stage_same_transaction_projection(
         staged_rows,
     )?;
     if !staged_rows.contains_key(&lock_key) {
-        return Err(ProjectionProtocolError::InvalidBatch(format!(
+        return Err(corrupt_storage(format!(
             "direct projection upsert left model `{}` without a physical row",
             mutation.scope.model()
         )));

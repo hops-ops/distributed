@@ -13,7 +13,6 @@ where
     for<'q> &'q [u8]: Encode<'q, DB> + Type<DB>,
     for<'r> &'r str: sqlx::ColumnIndex<DB::Row>,
 {
-    #[cfg(feature = "graphql")]
     async fn projection_rebuild_records(
         &self,
         context: &crate::projection::rebuild::RebuildContext,
@@ -21,7 +20,6 @@ where
         self.snapshot_rebuild_records(context).await
     }
 
-    #[cfg(feature = "graphql")]
     async fn commit_projection_rebuild(
         &self,
         plan: crate::projection::rebuild::SnapshotProjectionRebuildPlan,
@@ -735,15 +733,6 @@ where
     ) -> impl Future<Output = Result<Option<ProjectionCheckpoint>, ProjectionProtocolError>> + Send + 'a
     {
         async move {
-            let Some(state) = load_partition(
-                self.pool(),
-                cursor_scope.topology(),
-                cursor_scope.projection_partition(),
-            )
-            .await?
-            else {
-                return Ok(None);
-            };
             let probe = TrustedProjectionInput {
                 cursor: cursor_scope.clone(),
                 fingerprint: ProjectionInputFingerprint::from_digest([0; 32]),
@@ -757,6 +746,19 @@ where
             })?;
             let Some(stored) = current_input_cursor_in_tx(&mut tx, &probe).await? else {
                 return Ok(None);
+            };
+            // The head is read after the checkpoint it bounds: a commit landing
+            // between the two reads can only move the head forward.
+            let Some(state) = load_partition_in_tx(
+                &mut tx,
+                cursor_scope.topology(),
+                cursor_scope.projection_partition(),
+            )
+            .await?
+            else {
+                return Err(corrupt_storage(
+                    "projection checkpoint exists without partition state",
+                ));
             };
             verify_stored_change(&state, &stored.change)?;
             if stored.source_epoch != *cursor_scope.epoch() {
@@ -876,33 +878,6 @@ where
         read_projection_query_snapshot_in_executor(self.pool(), request)
     }
 
-    fn projection_query_snapshot_batch<'a>(
-        &'a self,
-        request: &'a ProjectionQuerySnapshotBatchRequest,
-    ) -> impl Future<Output = Result<ProjectionQuerySnapshotBatch, ProjectionProtocolError>> + Send + 'a
-    {
-        let request = request.clone();
-        async move {
-            request.validate()?;
-            with_projection_read_snapshot(self.pool(), move |connection| {
-                Box::pin(async move {
-                    let mut snapshots = Vec::with_capacity(request.requests.len());
-                    for row_request in &request.requests {
-                        snapshots.push(
-                            read_projection_query_snapshot_in_executor::<DB, _>(
-                                &mut *connection,
-                                row_request,
-                            )
-                            .await?,
-                        );
-                    }
-                    Ok(ProjectionQuerySnapshotBatch { snapshots })
-                })
-            })
-            .await
-        }
-    }
-
     fn projection_execution_snapshot_batch<'a>(
         &'a self,
         request: &'a ProjectionExecutionSnapshotBatchRequest,
@@ -922,23 +897,6 @@ where
         }
     }
 
-    fn projection_graph_snapshot<'a>(
-        &'a self,
-        request: &'a ProjectionGraphSnapshotRequest,
-    ) -> impl Future<Output = Result<ProjectionGraphSnapshot, ProjectionProtocolError>> + Send + 'a
-    {
-        let request = request.clone();
-        async move {
-            validate_projection_graph_snapshot_request(&request)?;
-            with_projection_read_snapshot(self.pool(), move |connection| {
-                Box::pin(async move {
-                    read_projection_graph_snapshot_in_executor::<DB>(connection, &request).await
-                })
-            })
-            .await
-        }
-    }
-
     fn projection_causation_evidence<'a>(
         &'a self,
         request: &'a ProjectionCausationEvidenceRequest,
@@ -951,23 +909,6 @@ where
             with_projection_read_snapshot(self.pool(), move |connection| {
                 Box::pin(async move {
                     read_projection_causation_evidence_in_executor::<DB>(connection, &request).await
-                })
-            })
-            .await
-        }
-    }
-
-    fn projection_live_record_batch<'a>(
-        &'a self,
-        request: &'a ProjectionLiveRecordBatchRequest,
-    ) -> impl Future<Output = Result<ProjectionLiveRecordBatch, ProjectionProtocolError>> + Send + 'a
-    {
-        let request = request.clone();
-        async move {
-            request.validate()?;
-            with_projection_read_snapshot(self.pool(), move |connection| {
-                Box::pin(async move {
-                    read_projection_live_record_batch_in_executor::<DB>(connection, &request).await
                 })
             })
             .await

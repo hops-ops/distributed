@@ -22,7 +22,6 @@ pub mod executor;
 pub mod local_mounts;
 pub mod lower;
 pub mod placement;
-#[cfg(feature = "graphql")]
 pub mod rebuild;
 
 pub use local_mounts::{
@@ -57,5 +56,5 @@ pub use provenance::{
 #[cfg(test)]
 mod tests;
 
-#[cfg(all(test, feature = "graphql"))]
+#[cfg(test)]
 mod source_snapshot_tests;

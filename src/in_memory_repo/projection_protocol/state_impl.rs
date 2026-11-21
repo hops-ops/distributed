@@ -1,35 +1,97 @@
 use super::*;
 
+/// A live record's key may belong to one partition only. `staged` holds the
+/// records a write is about to store over `stored`.
+pub(super) fn ensure_live_record_identity_available(
+    stored: &HashMap<ProjectionRecordScope, ProjectionRecordMetadata>,
+    staged: &HashMap<ProjectionRecordScope, ProjectionRecordMetadata>,
+    metadata: &ProjectionRecordMetadata,
+) -> Result<(), ProjectionProtocolError> {
+    if metadata.tombstone {
+        return Ok(());
+    }
+    let candidate = metadata.revision.scope();
+    let records = staged.iter().chain(
+        stored
+            .iter()
+            .filter(|(scope, _)| !staged.contains_key(*scope)),
+    );
+    for (scope, stored) in records {
+        if stored.tombstone
+            || scope == candidate
+            || scope.topology() != candidate.topology()
+            || scope.model() != candidate.model()
+            || scope.key_digest() != candidate.key_digest()
+        {
+            continue;
+        }
+        if scope.canonical_key_bytes() != candidate.canonical_key_bytes() {
+            return Err(corrupt_storage(format!(
+                "projection live-record key digest collision for model `{}`",
+                candidate.model()
+            )));
+        }
+        return Err(corrupt_storage(format!(
+            "projection live record for model `{}` is already owned by another partition",
+            candidate.model()
+        )));
+    }
+    Ok(())
+}
+
+/// The compaction point that keeps `retention` once a partition's log has
+/// grown to `head`, proven against the stored log. Changes above the stored
+/// head are the caller's own contiguous appends and need no proof.
+pub(super) fn retained_through(
+    partition: Option<&PartitionState>,
+    head: u64,
+    retention: ProjectionChangeRetention,
+) -> Result<u64, ProjectionProtocolError> {
+    let through = head.saturating_sub(retention.max_retained_changes());
+    if let Some(partition) = partition {
+        partition.check_compaction(through.min(partition.change_head))?;
+    }
+    Ok(through)
+}
+
+/// The change that follows `head` in a partition's log. Advances `head`;
+/// storing the change is the caller's.
+pub(super) fn next_change(
+    partition_key: &PartitionKey,
+    change_epoch: &ProjectionEpoch,
+    head: &mut u64,
+    pending: PendingChange,
+) -> Result<ProjectionChange, ProjectionProtocolError> {
+    let position = head
+        .checked_add(1)
+        .ok_or(ProjectionProtocolError::PositionOverflow {
+            domain: "projection change",
+        })?;
+    let cursor = ProjectionChangeCursor::new(
+        partition_key.topology.clone(),
+        partition_key.partition.clone(),
+        change_epoch.clone(),
+        position,
+    )?;
+    *head = position;
+    Ok(ProjectionChange {
+        cursor,
+        kind: pending.kind,
+        causation_id: pending.causation_id,
+        observation_kind: pending.observation_kind,
+        scope: pending.scope,
+        revision: pending.revision,
+        failure_id: pending.failure_id,
+        program_id: pending.program_id,
+    })
+}
+
 impl InMemoryProjectionProtocolState {
     pub(super) fn ensure_live_record_identity_available(
         &self,
         metadata: &ProjectionRecordMetadata,
     ) -> Result<(), ProjectionProtocolError> {
-        if metadata.tombstone {
-            return Ok(());
-        }
-        let candidate = metadata.revision.scope();
-        for (scope, stored) in &self.records {
-            if stored.tombstone
-                || scope == candidate
-                || scope.topology() != candidate.topology()
-                || scope.model() != candidate.model()
-                || scope.key_digest() != candidate.key_digest()
-            {
-                continue;
-            }
-            if scope.canonical_key_bytes() != candidate.canonical_key_bytes() {
-                return Err(ProjectionProtocolError::InvalidBatch(format!(
-                    "projection live-record key digest collision for model `{}`",
-                    candidate.model()
-                )));
-            }
-            return Err(ProjectionProtocolError::InvalidBatch(format!(
-                "projection live record for model `{}` is already owned by another partition",
-                candidate.model()
-            )));
-        }
-        Ok(())
+        ensure_live_record_identity_available(&self.records, &HashMap::new(), metadata)
     }
 
     pub(super) fn require_registered_topology(
@@ -50,21 +112,31 @@ impl InMemoryProjectionProtocolState {
         key: &PartitionKey,
         change_epoch: &ProjectionEpoch,
     ) -> Result<(), ProjectionProtocolError> {
-        match self.partitions.get(key) {
-            Some(partition) => ensure_change_epoch(&partition.change_epoch, change_epoch)?,
-            None => {
-                self.partitions
-                    .insert(key.clone(), PartitionState::new(change_epoch.clone()));
-                self.generations.insert(
-                    GenerationKey {
-                        partition: key.clone(),
-                        generation: ProjectionGeneration::initial(),
-                    },
-                    GenerationLineage::initial(),
-                );
-            }
+        if let Some(partition) = self.partitions.get(key) {
+            ensure_change_epoch(&partition.change_epoch, change_epoch)?;
         }
+        self.partition_mut(key, change_epoch);
         Ok(())
+    }
+
+    /// The partition's state, created at the initial generation on first use.
+    pub(super) fn partition_mut(
+        &mut self,
+        key: &PartitionKey,
+        change_epoch: &ProjectionEpoch,
+    ) -> &mut PartitionState {
+        if !self.partitions.contains_key(key) {
+            self.generations.insert(
+                GenerationKey {
+                    partition: key.clone(),
+                    generation: ProjectionGeneration::initial(),
+                },
+                GenerationLineage::initial(),
+            );
+        }
+        self.partitions
+            .entry(key.clone())
+            .or_insert_with(|| PartitionState::new(change_epoch.clone()))
     }
 
     /// Check an input's durable identities and partition fences, then
@@ -178,8 +250,10 @@ impl InMemoryProjectionProtocolState {
             .or_insert_with(|| input.clone());
     }
 
-    pub(super) fn register_ownership(
-        &mut self,
+    /// Validate a commit's ownership declarations and targets. The caller
+    /// stores the declarations once the whole commit is known to apply.
+    pub(super) fn check_ownership(
+        &self,
         partition: &PartitionKey,
         batch: &ProjectionCommitBatch,
     ) -> Result<(), ProjectionProtocolError> {
@@ -236,11 +310,18 @@ impl InMemoryProjectionProtocolState {
                     declaration.table, other.model
                 )));
             }
-            self.ownership.insert(key, declaration.table.clone());
         }
+        let owned_table = |scope: &ProjectionRecordScope| match batch
+            .ownership
+            .iter()
+            .find(|declaration| declaration.model == scope.model())
+        {
+            Some(declaration) => Ok(declaration.table.as_str()),
+            None => self.owned_table(partition, scope),
+        };
 
         for mutation in &batch.mutations {
-            let table = self.owned_table(partition, &mutation.scope)?;
+            let table = owned_table(&mutation.scope)?;
             if table != mutation.mutation.table_name() {
                 return Err(ProjectionProtocolError::InvalidBatch(format!(
                     "projection model `{}` owns table `{table}`, but its mutation targets `{}`",
@@ -257,7 +338,7 @@ impl InMemoryProjectionProtocolState {
             }
         }
         for observation in &batch.observations {
-            self.owned_table(partition, observation.scope())?;
+            owned_table(observation.scope())?;
         }
         Ok(())
     }
@@ -367,29 +448,9 @@ impl InMemoryProjectionProtocolState {
             .partitions
             .get_mut(partition_key)
             .expect("partition is initialized before appending changes");
-        let position = partition.change_head.checked_add(1).ok_or(
-            ProjectionProtocolError::PositionOverflow {
-                domain: "projection change",
-            },
-        )?;
-        let cursor = ProjectionChangeCursor::new(
-            partition_key.topology.clone(),
-            partition_key.partition.clone(),
-            partition.change_epoch.clone(),
-            position,
-        )?;
-        let change = ProjectionChange {
-            cursor,
-            kind: pending.kind,
-            causation_id: pending.causation_id,
-            observation_kind: pending.observation_kind,
-            scope: pending.scope,
-            revision: pending.revision,
-            failure_id: pending.failure_id,
-            program_id: pending.program_id,
-        };
-        partition.change_head = position;
-        partition.changes.insert(position, change.clone());
+        let mut head = partition.change_head;
+        let change = next_change(partition_key, &partition.change_epoch, &mut head, pending)?;
+        partition.append([change.clone()]);
         Ok(change)
     }
 
@@ -411,28 +472,8 @@ impl InMemoryProjectionProtocolState {
         if through <= partition.compacted_through {
             return Ok(partition.compacted_through);
         }
-        let expected_removed = through - partition.compacted_through;
-        let actual_removed = u64::try_from(
-            partition
-                .changes
-                .range((
-                    std::ops::Bound::Excluded(partition.compacted_through),
-                    std::ops::Bound::Included(through),
-                ))
-                .count(),
-        )
-        .map_err(|_| {
-            ProjectionProtocolError::InvalidBatch(
-                "projection change compaction count exceeds u64".into(),
-            )
-        })?;
-        if actual_removed != expected_removed {
-            return Err(ProjectionProtocolError::InvalidBatch(format!(
-                "projection change compaction expected to remove {expected_removed} contiguous entries but found {actual_removed}"
-            )));
-        }
-        partition.changes.retain(|position, _| *position > through);
-        partition.compacted_through = through;
+        partition.check_compaction(through)?;
+        partition.compact(through);
         Ok(through)
     }
 
@@ -454,5 +495,45 @@ impl InMemoryProjectionProtocolState {
             partition_key,
             head.saturating_sub(retention.max_retained_changes()),
         )
+    }
+}
+
+impl PartitionState {
+    /// Store changes that continue the log at `change_head + 1`.
+    pub(super) fn append(&mut self, changes: impl IntoIterator<Item = ProjectionChange>) {
+        for change in changes {
+            self.change_head = change.cursor.position();
+            self.changes.insert(self.change_head, change);
+        }
+    }
+
+    /// Prove the stored log holds every change a compaction through
+    /// `through` (at most the head) would remove.
+    pub(super) fn check_compaction(&self, through: u64) -> Result<(), ProjectionProtocolError> {
+        if through <= self.compacted_through {
+            return Ok(());
+        }
+        let expected_removed = through - self.compacted_through;
+        let actual_removed = self
+            .changes
+            .range((
+                std::ops::Bound::Excluded(self.compacted_through),
+                std::ops::Bound::Included(through),
+            ))
+            .count() as u64;
+        if actual_removed != expected_removed {
+            return Err(corrupt_storage(format!(
+                "projection change compaction expected to remove {expected_removed} contiguous entries but found {actual_removed}"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Drop every change at or below `through`. Never moves backwards.
+    pub(super) fn compact(&mut self, through: u64) {
+        if through > self.compacted_through {
+            self.changes.retain(|position, _| *position > through);
+            self.compacted_through = through;
+        }
     }
 }

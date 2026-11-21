@@ -226,6 +226,8 @@ pub(in crate::microsvc) fn projection_error_is_retryable(error: &ProjectionProto
         ProjectionProtocolError::Validation(_)
         | ProjectionProtocolError::Table(_)
         | ProjectionProtocolError::InvalidBatch(_)
+        // Redelivery reads the same damaged storage; a repair has to change it.
+        | ProjectionProtocolError::StorageCorruption(_)
         | ProjectionProtocolError::ScopeMismatch { .. }
         | ProjectionProtocolError::IncomparableInput
         | ProjectionProtocolError::InputCorruption

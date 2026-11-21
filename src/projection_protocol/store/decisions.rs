@@ -18,10 +18,7 @@ use crate::ProjectionProgramId;
 
 /// Stored protocol data that contradicts itself. Never caused by a caller.
 pub(crate) fn corrupt_storage(message: impl Into<String>) -> ProjectionProtocolError {
-    ProjectionProtocolError::InvalidBatch(format!(
-        "corrupt projection protocol storage: {}",
-        message.into()
-    ))
+    ProjectionProtocolError::StorageCorruption(message.into())
 }
 
 pub(crate) fn program_id_for_model(

@@ -25,6 +25,9 @@ pub(crate) struct ProjectionCheckpointProbe {
 }
 
 impl ProjectionCheckpointProbe {
+    // Production requests carry no probes yet; only tests ask a query
+    // snapshot for checkpoints.
+    #[cfg(test)]
     pub(crate) fn new(
         topology: ProjectorTopologyId,
         partition: PartitionId,
@@ -152,64 +155,13 @@ pub(crate) struct ProjectionQuerySnapshot {
 
 /// Sanitized live boundary for one exact projector partition, read inside the
 /// same adapter snapshot as a GraphQL query when used by Task 16.
+#[cfg(any(feature = "sqlite", feature = "postgres"))]
+// Only the GraphQL query path reads this outside tests.
+#[cfg_attr(not(feature = "graphql"), allow(dead_code))]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ProjectionPartitionSnapshot {
     pub(crate) head: Option<ProjectionChangeCursor>,
     pub(crate) compacted_through: u64,
-}
-
-/// A bounded set of row/evidence probes that must share one adapter snapshot.
-///
-/// This is the adapter-neutral convenience for known keys. Dynamic GraphQL
-/// list/relationship plans use the SQL repeatable-snapshot session so their
-/// physical membership query runs before these probes on the same connection.
-#[derive(Clone, Debug, PartialEq)]
-pub(crate) struct ProjectionQuerySnapshotBatchRequest {
-    pub(crate) requests: Vec<ProjectionQuerySnapshotRequest>,
-}
-
-impl ProjectionQuerySnapshotBatchRequest {
-    pub(crate) fn new(
-        requests: Vec<ProjectionQuerySnapshotRequest>,
-    ) -> Result<Self, ProjectionProtocolError> {
-        let request = Self { requests };
-        request.validate()?;
-        Ok(request)
-    }
-
-    pub(crate) fn validate(&self) -> Result<(), ProjectionProtocolError> {
-        if self.requests.len() > MAX_PROJECTION_QUERY_BATCH_ROWS {
-            return Err(ProjectionProtocolError::InvalidBatch(format!(
-                "projection query snapshot batch has {} rows; maximum is {}",
-                self.requests.len(),
-                MAX_PROJECTION_QUERY_BATCH_ROWS
-            )));
-        }
-        let checkpoint_probes = self.requests.iter().try_fold(0usize, |total, request| {
-            total
-                .checked_add(request.checkpoint_probes.len())
-                .ok_or_else(|| {
-                    ProjectionProtocolError::InvalidBatch(
-                        "projection query snapshot batch checkpoint-probe count overflowed".into(),
-                    )
-                })
-        })?;
-        if checkpoint_probes > MAX_PROJECTION_QUERY_BATCH_CHECKPOINT_PROBES {
-            return Err(ProjectionProtocolError::InvalidBatch(format!(
-                "projection query snapshot batch has {checkpoint_probes} aggregate checkpoint probes; maximum is {}",
-                MAX_PROJECTION_QUERY_BATCH_CHECKPOINT_PROBES
-            )));
-        }
-        for request in &self.requests {
-            request.validate()?;
-        }
-        Ok(())
-    }
-}
-
-#[derive(Clone, Debug, Default, PartialEq)]
-pub(crate) struct ProjectionQuerySnapshotBatch {
-    pub(crate) snapshots: Vec<ProjectionQuerySnapshot>,
 }
 
 /// One explicitly scoped physical-row/protocol snapshot.
@@ -267,120 +219,6 @@ pub(crate) struct ProjectionExecutionSnapshotBatch {
     pub(crate) snapshots: Vec<ProjectionScopedRowSnapshot>,
 }
 
-/// One validated relationship include in a coherent graph query.
-#[derive(Clone, Debug, PartialEq)]
-pub(crate) struct ProjectionGraphIncludeRequest {
-    pub(crate) relationship: crate::table::RelationshipDef,
-    pub(crate) target_schema: std::sync::Arc<TableSchema>,
-}
-
-/// One coherent root/include graph query.
-#[derive(Clone, Debug, PartialEq)]
-pub(crate) struct ProjectionGraphSnapshotRequest {
-    pub(crate) root: ProjectionQuerySnapshotRequest,
-    pub(crate) includes: std::collections::BTreeMap<String, ProjectionGraphIncludeRequest>,
-    /// Maximum unique root/included record scopes the adapter may return.
-    ///
-    /// This is the caller's remaining execution budget, not a pagination hint:
-    /// adapters must reject a result that would exceed it.
-    pub(crate) max_unique_record_scopes: usize,
-}
-
-impl ProjectionGraphSnapshotRequest {
-    pub(crate) fn new(
-        root: ProjectionQuerySnapshotRequest,
-        includes: impl IntoIterator<Item = (String, std::sync::Arc<TableSchema>)>,
-        max_unique_record_scopes: usize,
-    ) -> Result<Self, ProjectionProtocolError> {
-        root.validate()?;
-        if max_unique_record_scopes == 0
-            || max_unique_record_scopes > MAX_PROJECTION_QUERY_BATCH_ROWS
-        {
-            return Err(ProjectionProtocolError::InvalidBatch(format!(
-                "projection graph snapshot record-scope budget is {max_unique_record_scopes}; expected 1..={MAX_PROJECTION_QUERY_BATCH_ROWS}"
-            )));
-        }
-        let includes = includes.into_iter().collect::<Vec<_>>();
-        let query_scopes = includes.len().checked_add(1).ok_or_else(|| {
-            ProjectionProtocolError::InvalidBatch(
-                "projection graph snapshot query-scope count overflowed".into(),
-            )
-        })?;
-        if query_scopes > MAX_PROJECTION_QUERY_BATCH_ROWS {
-            return Err(ProjectionProtocolError::InvalidBatch(format!(
-                "projection graph snapshot has {query_scopes} query scopes; maximum is {}",
-                MAX_PROJECTION_QUERY_BATCH_ROWS
-            )));
-        }
-        let mut validated = std::collections::BTreeMap::new();
-        for (include, target_schema) in includes {
-            let relationship = root
-                .schema
-                .relationships
-                .iter()
-                .find(|relationship| relationship.field_name == include)
-                .cloned()
-                .ok_or_else(|| {
-                    ProjectionProtocolError::InvalidBatch(format!(
-                        "projection graph snapshot model `{}` has no relationship `{include}`",
-                        root.schema.model_name
-                    ))
-                })?;
-            if matches!(
-                relationship.kind,
-                crate::table::RelationshipKind::ManyToMany
-            ) {
-                return Err(ProjectionProtocolError::InvalidBatch(format!(
-                    "projection graph relationship `{include}` is many-to-many; project an explicit join read model instead"
-                )));
-            }
-            target_schema.validate()?;
-            if relationship.target_model != target_schema.model_name {
-                return Err(ProjectionProtocolError::InvalidBatch(format!(
-                    "projection graph relationship `{include}` targets `{}` but registered schema is `{}`",
-                    relationship.target_model, target_schema.model_name
-                )));
-            }
-            if validated
-                .insert(
-                    include,
-                    ProjectionGraphIncludeRequest {
-                        relationship,
-                        target_schema,
-                    },
-                )
-                .is_some()
-            {
-                return Err(ProjectionProtocolError::InvalidBatch(format!(
-                    "projection graph snapshot repeats an include for model `{}`",
-                    root.schema.model_name
-                )));
-            }
-        }
-        Ok(Self {
-            root,
-            includes: validated,
-            max_unique_record_scopes,
-        })
-    }
-}
-
-/// Included rows and exact protocol revisions returned by one graph snapshot.
-#[derive(Clone, Debug, PartialEq)]
-pub(crate) struct ProjectionGraphIncludeSnapshot {
-    pub(crate) relationship: crate::table::RelationshipDef,
-    pub(crate) target_schema: TableSchema,
-    pub(crate) rows: Vec<ProjectionScopedRowSnapshot>,
-}
-
-/// Root and included rows read with protocol metadata from one adapter
-/// snapshot.
-#[derive(Clone, Debug, PartialEq)]
-pub(crate) struct ProjectionGraphSnapshot {
-    pub(crate) root: ProjectionScopedRowSnapshot,
-    pub(crate) includes: std::collections::BTreeMap<String, ProjectionGraphIncludeSnapshot>,
-}
-
 /// One exact projection observation evidence key.
 ///
 /// The scope is already compiler-bound and canonical. A store must compare all
@@ -435,6 +273,8 @@ pub(crate) struct ProjectionCausationEvidenceRequest {
 }
 
 impl ProjectionCausationEvidenceRequest {
+    // Only the GraphQL command path asks for evidence outside tests.
+    #[cfg_attr(not(feature = "graphql"), allow(dead_code))]
     pub(crate) fn new(
         causation_id: impl Into<String>,
         topologies: Vec<ProjectorTopologyId>,
@@ -493,7 +333,10 @@ pub(crate) struct ProjectionCausationEvidenceBatch {
 ///
 /// The registered codec supplies the topology, schema, and canonical key. The
 /// store may only return a live record after recovering its exact partition
-/// from durable metadata and proving that identity is unique.
+/// from durable metadata and proving that identity is unique. Only the SQL
+/// stores answer it, for the GraphQL query path.
+#[cfg(any(feature = "sqlite", feature = "postgres"))]
+#[cfg_attr(not(feature = "graphql"), allow(dead_code))]
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct ProjectionLiveRecordRequest {
     pub(crate) schema: Arc<TableSchema>,
@@ -503,6 +346,8 @@ pub(crate) struct ProjectionLiveRecordRequest {
     pub(crate) canonical_key_hash: [u8; 32],
 }
 
+#[cfg(any(feature = "sqlite", feature = "postgres"))]
+#[cfg_attr(not(feature = "graphql"), allow(dead_code))]
 impl ProjectionLiveRecordRequest {
     pub(crate) fn new(
         codec: &ProjectionScopeCodec,
@@ -557,11 +402,16 @@ impl ProjectionLiveRecordRequest {
     }
 }
 
+#[cfg(any(feature = "sqlite", feature = "postgres"))]
+// Only the GraphQL query path reads this outside tests.
+#[cfg_attr(not(feature = "graphql"), allow(dead_code))]
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct ProjectionLiveRecordBatchRequest {
     pub(crate) requests: Vec<ProjectionLiveRecordRequest>,
 }
 
+#[cfg(any(feature = "sqlite", feature = "postgres"))]
+#[cfg_attr(not(feature = "graphql"), allow(dead_code))]
 impl ProjectionLiveRecordBatchRequest {
     pub(crate) fn new(
         requests: Vec<ProjectionLiveRecordRequest>,
@@ -597,6 +447,9 @@ impl ProjectionLiveRecordBatchRequest {
 }
 
 /// Results are aligned positionally with the validated request batch.
+#[cfg(any(feature = "sqlite", feature = "postgres"))]
+// Only the GraphQL query path reads this outside tests.
+#[cfg_attr(not(feature = "graphql"), allow(dead_code))]
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct ProjectionLiveRecordBatch {
     pub(crate) records: Vec<Option<ProjectionRecordMetadata>>,

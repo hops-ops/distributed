@@ -10,13 +10,12 @@ use std::sync::Arc;
 
 use super::{
     ProjectionCommitBatch, ProjectionEpoch, ProjectionExecutionSnapshotBatchRequest,
-    ProjectionGraphSnapshotRequest, ProjectionModelOwnership, ProjectionObservationKind,
-    ProjectionObservationRequest, ProjectionObservationTarget, ProjectionProtocolError,
-    ProjectionQuerySnapshotRequest, ProjectionRecordExpectation, ProjectionRecordMutation,
-    ProjectionRecordScope, ProjectionScopeCodec, RecordRevision, RecordTransition,
-    TrustedProjectionInput,
+    ProjectionModelOwnership, ProjectionObservationKind, ProjectionObservationRequest,
+    ProjectionObservationTarget, ProjectionProtocolError, ProjectionQuerySnapshotRequest,
+    ProjectionRecordExpectation, ProjectionRecordMutation, ProjectionRecordScope,
+    ProjectionScopeCodec, RecordRevision, RecordTransition, TrustedProjectionInput,
 };
-use crate::read_model::{RelationalReadModel, RelationalReadModelIncludes};
+use crate::read_model::RelationalReadModel;
 use crate::table::{
     DeleteTableRowMutation, ExpectedVersion, PatchMode, PatchTableRowMutation, RowKey, RowPatch,
     RowWriteMode, TableMutation, TableRowMutation, TableSchema,
@@ -269,40 +268,6 @@ impl ProjectionWorkspace {
             )?);
         }
         ProjectionExecutionSnapshotBatchRequest::new(requests)
-    }
-
-    /// Graph include snapshot builder (protocol store API). Retained for
-    /// adapter conformance; portable projectors use single-scope loads.
-    #[allow(dead_code)]
-    pub(crate) fn graph_snapshot_request<M>(
-        &self,
-        key: RowKey,
-        includes: Vec<String>,
-        max_unique_record_scopes: usize,
-    ) -> Result<ProjectionGraphSnapshotRequest, ProjectionProtocolError>
-    where
-        M: RelationalReadModel + RelationalReadModelIncludes,
-    {
-        let includes = includes
-            .into_iter()
-            .map(|include| {
-                let schema = M::include_target_schema(&include)?;
-                self.ensure_registered_schema(schema)?;
-                Ok((
-                    include,
-                    self.codec
-                        .registered_schema_owned(&schema.model_name)
-                        .map_err(|error| {
-                            ProjectionProtocolError::InvalidBatch(error.to_string())
-                        })?,
-                ))
-            })
-            .collect::<Result<Vec<_>, ProjectionProtocolError>>()?;
-        ProjectionGraphSnapshotRequest::new(
-            self.query_snapshot_request::<M>(key)?,
-            includes,
-            max_unique_record_scopes,
-        )
     }
 
     pub(crate) fn record_scope(

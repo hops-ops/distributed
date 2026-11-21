@@ -108,6 +108,46 @@ mod tests {
         &SCHEMA
     }
 
+    #[test]
+    fn live_record_batch_bounds_are_explicit() {
+        let request = |id: String| {
+            ProjectionLiveRecordRequest::new(
+                &scope_codec(),
+                "SqlTodoView",
+                RowKey::new([("id", RowValue::String(id))]),
+            )
+            .unwrap()
+        };
+        let live = (0..crate::projection_protocol::MAX_PROJECTION_EVIDENCE_BATCH_ITEMS)
+            .map(|index| request(format!("todo-{index}")))
+            .collect::<Vec<_>>();
+        assert!(ProjectionLiveRecordBatchRequest::new(live.clone()).is_ok());
+        let mut too_many = live;
+        too_many.push(request("todo-over-limit".into()));
+        assert!(matches!(
+            ProjectionLiveRecordBatchRequest::new(too_many),
+            Err(ProjectionProtocolError::InvalidBatch(message))
+                if message.contains("maximum")
+        ));
+    }
+
+    /// The live-record read as the GraphQL query path runs it: a validated
+    /// request inside one read snapshot.
+    async fn live_records(
+        repository: &SqlxRepository<sqlx::Sqlite>,
+        request: &ProjectionLiveRecordBatchRequest,
+    ) -> Result<ProjectionLiveRecordBatch, ProjectionProtocolError> {
+        request.validate()?;
+        let request = request.clone();
+        with_projection_read_snapshot(repository.pool(), move |connection| {
+            Box::pin(async move {
+                read_projection_live_record_batch_in_executor::<sqlx::Sqlite>(connection, &request)
+                    .await
+            })
+        })
+        .await
+    }
+
     fn scope_codec() -> ProjectionScopeCodec {
         ProjectionScopeCodec::with_models(topology(), [("SqlTodoView", schema())]).unwrap()
     }
@@ -463,8 +503,7 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(
-            evidence_repository
-                .projection_live_record_batch(&live_request)
+            live_records(&evidence_repository, &live_request)
                 .await
                 .unwrap()
                 .records,
@@ -492,8 +531,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            evidence_repository
-                .projection_live_record_batch(&live_request)
+            live_records(&evidence_repository, &live_request)
                 .await
                 .unwrap()
                 .records[0]
@@ -542,8 +580,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            moved_repository
-                .projection_live_record_batch(&live_request)
+            live_records(&moved_repository, &live_request)
                 .await
                 .unwrap()
                 .records,
@@ -589,8 +626,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            moved_repository
-                .projection_live_record_batch(&live_request)
+            live_records(&moved_repository, &live_request)
                 .await
                 .unwrap()
                 .records[0]
@@ -630,11 +666,8 @@ mod tests {
         .await
         .unwrap();
         assert!(matches!(
-            moved_repository
-                .projection_live_record_batch(&live_request)
-                .await,
-            Err(ProjectionProtocolError::InvalidBatch(message))
-                if message.contains("ambiguous")
+            live_records(&moved_repository, &live_request).await,
+            Err(ProjectionProtocolError::StorageCorruption(_))
         ));
 
         let drift_repository = repository().await;
@@ -666,11 +699,8 @@ mod tests {
         .await
         .unwrap();
         assert!(matches!(
-            drift_repository
-                .projection_live_record_batch(&live_request)
-                .await,
-            Err(ProjectionProtocolError::InvalidBatch(message))
-                if message.contains("canonical key")
+            live_records(&drift_repository, &live_request).await,
+            Err(ProjectionProtocolError::StorageCorruption(_))
         ));
 
         // Keep the compiler from treating the old exact scope as an incidental
@@ -764,18 +794,18 @@ mod tests {
             .unwrap();
         assert_eq!(null_history.observations.len(), 1);
         assert_eq!(null_history.observations[0].program_id, None);
-        let readable = reopened
-            .projection_live_record_batch(
-                &ProjectionLiveRecordBatchRequest::new(vec![ProjectionLiveRecordRequest::new(
-                    &scope_codec(),
-                    "SqlTodoView",
-                    record_key(),
-                )
-                .unwrap()])
-                .unwrap(),
+        let readable = live_records(
+            &reopened,
+            &ProjectionLiveRecordBatchRequest::new(vec![ProjectionLiveRecordRequest::new(
+                &scope_codec(),
+                "SqlTodoView",
+                record_key(),
             )
-            .await
-            .unwrap();
+            .unwrap()])
+            .unwrap(),
+        )
+        .await
+        .unwrap();
         assert!(
             readable.records[0].is_some(),
             "unversioned rows remain readable"

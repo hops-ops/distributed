@@ -1,7 +1,6 @@
 //! Explicit, bounded maintenance for full-state snapshot projections.
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
-use crate::graphql::SurfaceProjector;
 use crate::projection::lower::ProjectionServerExecutorDescriptor;
 use crate::projection_protocol::*;
 use crate::table::{TableMutation, TableWritePlan};
@@ -276,52 +275,32 @@ impl RebuildRow {
 #[allow(private_bounds)]
 impl SnapshotProjectionRebuild {
     /// Capture the current record inventory before reading the source archive.
+    ///
+    /// `topology` is the physical topology the generated `executor` is bound
+    /// to. The caller vouches that this binding is the active local eventual
+    /// one; `SurfaceProjector::begin_snapshot_rebuild` checks that for a
+    /// mounted projector.
     pub async fn begin(
         store: &impl ProjectionProtocolStore,
-        projector: &SurfaceProjector,
+        topology: ProjectorTopologyId,
+        executor: ProjectionServerExecutorDescriptor,
     ) -> Result<Self, ProjectionProtocolError> {
-        let [projection] = projector.modeled.as_slice() else {
-            return Err(invalid(
-                "snapshot rebuild requires exactly one modeled binding",
-            ));
-        };
-        if !projection.is_causally_eligible()
-            || !matches!(
-                projection.route(),
-                crate::projection::placement::ProjectionExecutorRoute::Local { .. }
-            )
-        {
-            return Err(invalid(
-                "snapshot rebuild requires an active local eventual binding",
-            ));
-        }
-        let (program, binding) = projection
-            .raw()
-            .ok_or_else(|| invalid("snapshot rebuild requires a generated binding"))?;
-        if !program.source_snapshots() {
+        if !executor.source_snapshots() {
             return Err(invalid(
                 "snapshot rebuild requires source: aggregate_snapshot",
             ));
         }
-        let physical = binding
-            .physical_topology()
-            .ok_or_else(|| invalid("snapshot rebuild requires a physical topology"))?;
-        let topology =
-            ProjectorTopologyId::new(physical.version(), physical.name(), physical.digest())?;
         let compiled = CompiledProjectionTopology::from_modeled_binding(
             topology,
-            binding
-                .outputs()
+            executor
+                .outputs
+                .models
                 .iter()
-                .map(|o| (o.model(), o.storage(), o.schema())),
+                .map(|o| (o.model.as_str(), o.storage.as_str(), &o.schema)),
         )?;
-        let executor = projection
-            .server_executor()
-            .cloned()
-            .ok_or_else(|| invalid("snapshot rebuild requires a generated executor"))?;
         let context = RebuildContext {
             compiled,
-            epoch: ProjectionEpoch::new(projection.epoch().as_str())?,
+            epoch: ProjectionEpoch::new(executor.epoch)?,
         };
         let expected = store.projection_rebuild_records(&context).await?;
         Ok(Self {

@@ -194,6 +194,25 @@ mod postgres_tests {
             .unwrap()
     }
 
+    /// The live-record read as the GraphQL query path runs it: a validated
+    /// request inside one read snapshot.
+    async fn live_records(
+        repository: &SqlxRepository<sqlx::Postgres>,
+        request: &ProjectionLiveRecordBatchRequest,
+    ) -> Result<ProjectionLiveRecordBatch, ProjectionProtocolError> {
+        request.validate()?;
+        let request = request.clone();
+        with_projection_read_snapshot(repository.pool(), move |connection| {
+            Box::pin(async move {
+                read_projection_live_record_batch_in_executor::<sqlx::Postgres>(
+                    connection, &request,
+                )
+                .await
+            })
+        })
+        .await
+    }
+
     fn scope_codec() -> ProjectionScopeCodec {
         ProjectionScopeCodec::with_models(topology(), [("PostgresProjectionView", schema())])
             .unwrap()
@@ -914,20 +933,20 @@ mod postgres_tests {
             .await
             .unwrap();
         assert_live_snapshot(&committed_12, "12", 2, 4, 12);
-        let committed_live = repository
-            .projection_live_record_batch(
-                &ProjectionLiveRecordBatchRequest::new(vec![
-                    crate::projection_protocol::ProjectionLiveRecordRequest::new(
-                        &scope_codec(),
-                        "PostgresProjectionView",
-                        record_key(),
-                    )
-                    .unwrap(),
-                ])
+        let committed_live = live_records(
+            &repository,
+            &ProjectionLiveRecordBatchRequest::new(vec![
+                crate::projection_protocol::ProjectionLiveRecordRequest::new(
+                    &scope_codec(),
+                    "PostgresProjectionView",
+                    record_key(),
+                )
                 .unwrap(),
-            )
-            .await
-            .unwrap();
+            ])
+            .unwrap(),
+        )
+        .await
+        .unwrap();
         assert_eq!(committed_live.records[0], committed_12.record);
 
         let retained_failure_change: i64 =

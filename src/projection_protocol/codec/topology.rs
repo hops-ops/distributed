@@ -63,7 +63,6 @@ impl CompiledProjectionTopology {
 
     /// Rehydrate one generated modeled executor from its catalog-pinned
     /// physical topology and exact output schemas.
-    #[cfg(feature = "graphql")]
     pub(crate) fn from_modeled_binding<'a>(
         topology: ProjectorTopologyId,
         outputs: impl IntoIterator<Item = (&'a str, &'a str, &'a TableSchema)>,

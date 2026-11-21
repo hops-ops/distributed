@@ -14,9 +14,8 @@ use std::sync::Arc;
 use super::*;
 use crate::repository::{CommitBatch, InboxStore, ReadModelWritePlanStore, TransactionalCommit};
 use crate::table::{
-    ColumnType, DeleteTableRowMutation, ExpectedVersion, ForeignKey, PatchMode,
-    PatchTableRowMutation, PrimaryKey, RelationshipDef, RelationshipKind, RowPatch, RowValue,
-    RowWriteMode, TableColumn, TableKind, TableRowMutation,
+    ColumnType, DeleteTableRowMutation, ExpectedVersion, PatchMode, PatchTableRowMutation,
+    PrimaryKey, RowPatch, RowValue, RowWriteMode, TableColumn, TableKind, TableRowMutation,
 };
 
 const TENANT: &str = "scenario-tenant";
@@ -1373,14 +1372,12 @@ pub(crate) async fn query_snapshot_never_mixes_row_revision_checkpoint_or_resume
     };
     let reader = async {
         while !written.load(std::sync::atomic::Ordering::SeqCst) {
-            let batch = repository
-                .projection_query_snapshot_batch(
-                    &ProjectionQuerySnapshotBatchRequest::new(vec![request(), request()]).unwrap(),
-                )
-                .await
-                .unwrap();
-            assert_eq!(batch.snapshots[0], batch.snapshots[1]);
-            assert_query_snapshot_is_coherent(&batch.snapshots[0]);
+            assert_query_snapshot_is_coherent(
+                &repository
+                    .projection_query_snapshot(&request())
+                    .await
+                    .unwrap(),
+            );
             tokio::task::yield_now().await;
         }
     };
@@ -1393,62 +1390,16 @@ pub(crate) async fn query_snapshot_never_mixes_row_revision_checkpoint_or_resume
     );
 }
 
-/// A parent and a child table whose `parent_id` columns collide by name: the
-/// child's is a foreign key to the parent's `id`, the parent's is plain data.
-fn graph_schemas<S: ProjectionProtocolScenario>(scenario: &S) -> [&'static TableSchema; 2] {
-    let base = &scenario.schema().table_name;
-    let parent_table = format!("{base}_parents");
-    let has_many = |field_name: &str| RelationshipDef {
-        references: None,
-        field_name: field_name.into(),
-        kind: RelationshipKind::HasMany,
-        target_model: "GraphChildView".into(),
-        foreign_key: Some("parent_id".into()),
-        through: None,
-        target_foreign_key: None,
-    };
-    let table = |model_name: &str, table_name: String, parent_id: TableColumn, relationships| {
-        &*Box::leak(Box::new(TableSchema {
-            model_name: model_name.into(),
-            table_name,
-            columns: vec![
-                TableColumn {
-                    primary_key: true,
-                    ..TableColumn::new("id", "id", ColumnType::Text)
-                },
-                parent_id,
-            ],
-            primary_key: PrimaryKey::new(["id"]),
-            version_column: Some(crate::table::DEFAULT_TABLE_VERSION_COLUMN.into()),
-            foreign_keys: Vec::new(),
-            indexes: Vec::new(),
-            relationships,
-            kind: TableKind::ReadModel,
-        }))
-    };
-    [
-        table(
-            "GraphParentView",
-            parent_table.clone(),
-            TableColumn::new("parent_id", "parent_id", ColumnType::Text),
-            vec![has_many("children"), has_many("featured_children")],
-        ),
-        table(
-            "GraphChildView",
-            format!("{base}_children"),
-            TableColumn {
-                foreign_key: Some(ForeignKey::new(parent_table, "id")),
-                ..TableColumn::new("parent_id", "parent_id", ColumnType::Text)
-            },
-            Vec::new(),
-        ),
-    ]
-}
-
-pub(crate) async fn coherent_execution_and_graph_snapshots_use_fk_references_and_unique_scope_budgets(
+/// An execution snapshot answers every requested scope, in request order,
+/// across tables, and a request never names one scope twice.
+pub(crate) async fn execution_snapshot_echoes_every_requested_scope_across_tables(
     scenario: impl ProjectionProtocolScenario,
 ) {
-    let schemas = graph_schemas(&scenario);
+    let base = &scenario.schema().table_name;
+    let schemas = [
+        scenario_schema("SnapshotParentView", format!("{base}_parents")),
+        scenario_schema("SnapshotChildView", format!("{base}_children")),
+    ];
     let [parent, child] = schemas;
     let repository = scenario.store(&schemas).await;
     let create = |schema, columns: &[(&str, &str)]| {
@@ -1464,19 +1415,16 @@ pub(crate) async fn coherent_execution_and_graph_snapshots_use_fk_references_and
         .commit_projection(ProjectionCommitBatch {
             input: scenario.input(
                 1,
-                b"graph",
-                "graph-message-1",
-                "graph-cause-1",
+                b"execution-snapshot",
+                "execution-snapshot-message-1",
+                "execution-snapshot-cause-1",
                 ProjectionGeneration::initial(),
             ),
             change_epoch: scenario.change_epoch(),
             ownership: schemas.iter().map(|schema| ownership(schema)).collect(),
             mutations: vec![
-                // The parent's own `parent_id` deliberately collides with the
-                // child's FK field name. HasMany membership must follow the
-                // target column's FK reference to `id`.
-                create(parent, &[("id", "parent-1"), ("parent_id", "wrong-parent")]),
-                create(child, &[("id", "child-1"), ("parent_id", "parent-1")]),
+                create(parent, &[("id", "parent-1")]),
+                create(child, &[("id", "child-1")]),
             ],
             observations: Vec::new(),
         })
@@ -1514,48 +1462,6 @@ pub(crate) async fn coherent_execution_and_graph_snapshots_use_fk_references_and
         execution_request.requests[0].clone(),
     ])
     .is_err());
-
-    let graph_request = |max_unique| {
-        ProjectionGraphSnapshotRequest::new(
-            root(parent, "parent-1"),
-            [
-                ("children".into(), Arc::new(child.clone())),
-                ("featured_children".into(), Arc::new(child.clone())),
-            ],
-            max_unique,
-        )
-        .unwrap()
-    };
-    let graph = repository
-        .projection_graph_snapshot(&graph_request(2))
-        .await
-        .unwrap();
-    assert_eq!(graph.includes["children"].rows.len(), 1);
-    assert_eq!(graph.includes["featured_children"].rows.len(), 1);
-    assert_eq!(
-        graph.includes["children"].rows[0].scope, graph.includes["featured_children"].rows[0].scope,
-        "two includes may return one shared target scope"
-    );
-    assert_eq!(
-        graph.includes["children"].rows[0]
-            .row
-            .as_ref()
-            .unwrap()
-            .get("parent_id"),
-        Some(&RowValue::String("parent-1".into())),
-        "HasMany follows the target FK reference to root `id`, not the colliding root `parent_id`"
-    );
-
-    let error = repository
-        .projection_graph_snapshot(&graph_request(1))
-        .await
-        .unwrap_err();
-    assert!(
-        matches!(error, ProjectionProtocolError::InvalidBatch(ref message)
-            if message.contains("returned 2 unique record scopes")
-                && message.contains("budget is 1")),
-        "{error}"
-    );
 }
 
 /// One input writing four tables commits every row and every causal artifact.
@@ -2363,8 +2269,7 @@ pub(crate) async fn retention_failure_rolls_back_rows_protocol_and_inbox(
         .await
         .unwrap_err();
     assert!(
-        matches!(error, ProjectionProtocolError::InvalidBatch(ref message)
-            if message.contains("expected to remove 1 ")),
+        matches!(error, ProjectionProtocolError::StorageCorruption(_)),
         "{error}"
     );
 
@@ -2429,8 +2334,7 @@ pub(crate) async fn change_page_with_a_hole_is_rejected(scenario: impl Projectio
         }
     };
     let is_corrupt = |read: Result<ProjectionChangeRead, ProjectionProtocolError>| {
-        matches!(read, Err(ProjectionProtocolError::InvalidBatch(message))
-            if message.contains("corrupt projection protocol storage"))
+        matches!(read, Err(ProjectionProtocolError::StorageCorruption(_)))
     };
     let held = |read: Result<ProjectionChangeRead, ProjectionProtocolError>| match read.unwrap() {
         ProjectionChangeRead::Changes { changes, .. } => positions(&changes),
@@ -3581,7 +3485,7 @@ macro_rules! projection_protocol_scenario_tests {
             source_capability_mismatch_outranks_message_id_reuse,
             change_epoch_is_fixed_per_partition,
             query_snapshot_never_mixes_row_revision_checkpoint_or_resume_head,
-            coherent_execution_and_graph_snapshots_use_fk_references_and_unique_scope_budgets,
+            execution_snapshot_echoes_every_requested_scope_across_tables,
             one_four_table_occurrence_commits_rows_and_every_causal_artifact,
             commit_failure_at_each_position_rolls_back_every_side_effect,
             table_failure_rolls_back_rows_protocol_and_inbox,

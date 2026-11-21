@@ -30,8 +30,8 @@ impl SourceSnapshotVersion {
             || crate::bus::validate_stable_message_id(Some(&self.aggregate_id)).is_err()
             || crate::bus::validate_stable_message_id(Some(&self.occurrence_id)).is_err()
         {
-            return Err(ProjectionProtocolError::InvalidBatch(
-                "invalid stored source snapshot identity".into(),
+            return Err(super::corrupt_storage(
+                "invalid stored source snapshot identity",
             ));
         }
         Ok(())

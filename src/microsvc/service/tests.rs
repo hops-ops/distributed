@@ -30,15 +30,15 @@ use crate::microsvc::HasOutboxStore;
 use crate::microsvc::{Context, HandlerError, RepoReadModelDependencies, Routes, Service, Session};
 use crate::outbox::OutboxMessage;
 use crate::projection_protocol::{
-    PartitionId, ProjectionChangeCursor, ProjectionChangeRead, ProjectionCheckpoint,
-    ProjectionCommitBatch, ProjectionCommitResult, ProjectionFailure, ProjectionFailureBatch,
+    PartitionId, ProjectionCausationEvidenceBatch, ProjectionCausationEvidenceRequest,
+    ProjectionChangeCursor, ProjectionChangeRead, ProjectionCheckpoint, ProjectionCommitBatch,
+    ProjectionCommitResult, ProjectionExecutionSnapshotBatch,
+    ProjectionExecutionSnapshotBatchRequest, ProjectionFailure, ProjectionFailureBatch,
     ProjectionFailureLocation, ProjectionGeneration, ProjectionInputCursor,
-    ProjectionInputDisposition, ProjectionLiveRecordBatch, ProjectionLiveRecordBatchRequest,
-    ProjectionModelOwnership, ProjectionObservation, ProjectionObservationKind,
-    ProjectionPartitionRuntimeState, ProjectionProtocolError, ProjectionProtocolStore,
-    ProjectionQuerySnapshot, ProjectionQuerySnapshotBatch, ProjectionQuerySnapshotBatchRequest,
-    ProjectionQuerySnapshotRequest, ProjectionRecordMetadata, ProjectionRecordScope,
-    ProjectorTopologyId, TrustedProjectionInput,
+    ProjectionInputDisposition, ProjectionModelOwnership, ProjectionObservation,
+    ProjectionObservationKind, ProjectionPartitionRuntimeState, ProjectionProtocolError,
+    ProjectionProtocolStore, ProjectionQuerySnapshot, ProjectionQuerySnapshotRequest,
+    ProjectionRecordMetadata, ProjectionRecordScope, ProjectorTopologyId, TrustedProjectionInput,
 };
 use crate::{
     sourced, AggregateBuilder, AggregateRepository, Entity, InMemoryRepository, Queueable,
@@ -671,6 +671,20 @@ impl crate::microsvc::dependencies::CausalHostProjections for AmbiguousCommitRep
 }
 
 impl ProjectionProtocolStore for AmbiguousCommitRepository {
+    async fn projection_rebuild_records(
+        &self,
+        context: &crate::projection::rebuild::RebuildContext,
+    ) -> Result<Vec<ProjectionRecordMetadata>, ProjectionProtocolError> {
+        self.inner.projection_rebuild_records(context).await
+    }
+
+    async fn commit_projection_rebuild(
+        &self,
+        plan: crate::projection::rebuild::SnapshotProjectionRebuildPlan,
+    ) -> Result<usize, ProjectionProtocolError> {
+        self.inner.commit_projection_rebuild(plan).await
+    }
+
     fn register_projection_models<'a>(
         &'a self,
         topology: &'a ProjectorTopologyId,
@@ -728,20 +742,22 @@ impl ProjectionProtocolStore for AmbiguousCommitRepository {
         self.inner.projection_query_snapshot(request)
     }
 
-    fn projection_query_snapshot_batch<'a>(
+    fn projection_execution_snapshot_batch<'a>(
         &'a self,
-        request: &'a ProjectionQuerySnapshotBatchRequest,
-    ) -> impl Future<Output = Result<ProjectionQuerySnapshotBatch, ProjectionProtocolError>> + Send + 'a
-    {
-        self.inner.projection_query_snapshot_batch(request)
+        request: &'a ProjectionExecutionSnapshotBatchRequest,
+    ) -> impl Future<Output = Result<ProjectionExecutionSnapshotBatch, ProjectionProtocolError>>
+           + Send
+           + 'a {
+        self.inner.projection_execution_snapshot_batch(request)
     }
 
-    fn projection_live_record_batch<'a>(
+    fn projection_causation_evidence<'a>(
         &'a self,
-        request: &'a ProjectionLiveRecordBatchRequest,
-    ) -> impl Future<Output = Result<ProjectionLiveRecordBatch, ProjectionProtocolError>> + Send + 'a
-    {
-        self.inner.projection_live_record_batch(request)
+        request: &'a ProjectionCausationEvidenceRequest,
+    ) -> impl Future<Output = Result<ProjectionCausationEvidenceBatch, ProjectionProtocolError>>
+           + Send
+           + 'a {
+        self.inner.projection_causation_evidence(request)
     }
 
     fn projection_partition_runtime_state<'a>(

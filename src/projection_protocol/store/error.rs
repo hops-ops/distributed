@@ -6,7 +6,10 @@ pub enum ProjectionProtocolError {
     Validation(ProjectionProtocolValidationError),
     Repository(RepositoryError),
     Table(TableStoreError),
+    /// The caller's batch or request is not acceptable.
     InvalidBatch(String),
+    /// Stored protocol data contradicts itself. Never caused by a caller.
+    StorageCorruption(String),
     ScopeMismatch {
         field: &'static str,
     },
@@ -56,6 +59,7 @@ impl fmt::Display for ProjectionProtocolError {
             Self::Repository(error) => write!(formatter, "projection repository error: {error}"),
             Self::Table(error) => write!(formatter, "projection table error: {error}"),
             Self::InvalidBatch(message) => write!(formatter, "invalid projection batch: {message}"),
+            Self::StorageCorruption(message) => write!(formatter, "corrupt projection protocol storage: {message}"),
             Self::ScopeMismatch { field } => write!(formatter, "{field} does not match the projection input scope"),
             Self::IncomparableInput => formatter.write_str("projection input is incomparable with the durable checkpoint"),
             Self::InputCorruption => formatter.write_str("the same projection input cursor was reused with different content"),

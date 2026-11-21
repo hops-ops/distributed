@@ -429,11 +429,7 @@ fn change_page_rejects_a_log_with_holes() {
         )
     };
     let corrupt = |result: Result<ProjectionChangeRead, ProjectionProtocolError>| {
-        matches!(
-            result,
-            Err(ProjectionProtocolError::InvalidBatch(message))
-                if message.contains("corrupt projection protocol storage")
-        )
+        matches!(result, Err(ProjectionProtocolError::StorageCorruption(_)))
     };
 
     assert!(matches!(

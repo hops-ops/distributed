@@ -262,11 +262,9 @@ row revisions rather than comparing browser timestamps.
 Use explicit maintenance, not a startup fallback or republishing loop:
 
 ```rust,ignore
-use distributed::projection::rebuild::SnapshotProjectionRebuild;
-
 // Stop producers, drain outboxes, stop consumers, and back up the read model.
 // Reuse the same generated SurfaceProjector mounted by the application.
-let rebuild = SnapshotProjectionRebuild::begin(&repository, &projector).await?;
+let rebuild = projector.begin_snapshot_rebuild(&repository).await?;
 // Read history AFTER capturing the target inventory. Another authoritative
 // archive can supply these canonical occurrences; rebuilding is bus-neutral.
 let events = nats_bus.retained_domain_events().await?;
