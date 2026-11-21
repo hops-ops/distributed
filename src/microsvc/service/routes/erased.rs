@@ -19,7 +19,6 @@ use crate::command_ledger::{CausalStorageIdentity, CommandLookup, ExternalDispat
 #[cfg(feature = "graphql")]
 use crate::command_ledger::{CommandId, CommandLedgerKey};
 use crate::microsvc::cell_host::CellCommandIdentity;
-use crate::microsvc::error::HandlerError;
 use crate::microsvc::projector::{
     ProjectionRepairHandle, ProjectorRegistration, ProjectorRepairFuture,
     ProjectorRepairLookupFuture,
@@ -171,15 +170,6 @@ pub(in crate::microsvc::service) trait ErasedCausalHandler<D>:
         dependencies: &'a D,
         attempt: ExternalCausalAttempt,
     ) -> ExternalAbandonFuture<'a>;
-
-    /// Run the same typed `handle` inside one cell, without GraphQL receipts.
-    fn invoke_cell<'a>(
-        &'a self,
-        dependencies: &'a D,
-        input: Value,
-        session: Session,
-        shard: &'a StreamIdentity,
-    ) -> Pin<Box<dyn Future<Output = Result<Value, HandlerError>> + Send + 'a>>;
 }
 
 pub(in crate::microsvc::service) trait ErasedRoutes:

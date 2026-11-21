@@ -147,28 +147,6 @@ impl<D: Send + Sync + 'static> Routes<D> {
         command.install(self)
     }
 
-    /// Dispatch a typed causal command inside one cell (no GraphQL envelope).
-    pub(in crate::microsvc) async fn dispatch_cell_command(
-        &self,
-        command: &str,
-        input: Value,
-        session: Session,
-        shard: &StreamIdentity,
-    ) -> Result<Value, HandlerError> {
-        let handler = self
-            .handlers
-            .get(&MessageKind::Command)
-            .and_then(|handlers| handlers.get(command));
-        match handler {
-            Some(RegisteredHandler::Causal(handler)) => {
-                handler
-                    .invoke_cell(&self.dependencies, input, session, shard)
-                    .await
-            }
-            Some(_) | None => Err(HandlerError::UnknownCommand(command.to_string())),
-        }
-    }
-
     /// Dispatch a typed cell command through the same fenced ledger contract
     /// as the in-process causal wait path.
     pub(in crate::microsvc) async fn dispatch_cell_causal(

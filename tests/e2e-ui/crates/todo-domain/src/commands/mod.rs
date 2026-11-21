@@ -78,7 +78,7 @@ mod tests {
 
     #[tokio::test]
     async fn cell_host_dispatches_complete_with_the_same_handle_as_soa() {
-        use distributed::cell_host::AggregateCell;
+        use distributed::cell_host::{AggregateCell, CellCommandIdentity};
         use distributed::microsvc::{Session, USER_ID_KEY};
 
         let cell = AggregateCell::<Todo>::new("todo-1")
@@ -96,8 +96,12 @@ mod tests {
         session.set(USER_ID_KEY, "owner-1");
         session.set("x-roles", "user");
 
-        cell.dispatch(
+        let identity = |command_id| {
+            CellCommandIdentity::new("todo", "owner-1", command_id).expect("command identity")
+        };
+        cell.dispatch_idempotent(
             "todo.create",
+            &identity("0190a000-0000-7000-8000-000000000501"),
             serde_json::json!({
                 "todo_id": "todo-1",
                 "title": "cell complete",
@@ -108,14 +112,15 @@ mod tests {
         .expect("todo.create on cell");
 
         let completed = cell
-            .dispatch(
+            .dispatch_idempotent(
                 "todo.complete",
+                &identity("0190a000-0000-7000-8000-000000000502"),
                 serde_json::json!({ "todo_id": "todo-1" }),
                 session,
             )
             .await
             .expect("todo.complete on cell");
-        assert_eq!(completed["todo_id"], "todo-1");
-        assert_eq!(completed["status"], "completed");
+        assert_eq!(completed.payload()["todo_id"], "todo-1");
+        assert_eq!(completed.payload()["status"], "completed");
     }
 }
