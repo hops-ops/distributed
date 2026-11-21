@@ -325,7 +325,9 @@ mod tests {
         assert!(output.contains("DomainEventContract > :: EVENT_NAME"));
         assert!(output.contains("DomainEventContract > :: EVENT_VERSION"));
         assert!(output.contains("DomainEventBodyContract < T >"));
-        assert!(output.contains("!= < TodoCompleted as distributed :: DomainEvent > :: DESCRIPTOR"));
+        assert!(
+            output.contains("!= < TodoCompleted as distributed :: DomainEvent > :: DESCRIPTOR")
+        );
     }
 
     #[test]
@@ -444,7 +446,7 @@ mod tests {
             roles: ["user", "admin"],
             field: "todos_complete",
             invoke: |todo, _input, principal| todo.complete(principal),
-            payload: |todo| TodoStatusPayload::from_todo(&**todo),
+            payload: |todo, _principal| TodoStatusPayload::from_todo(&**todo),
         };
         let out = crate::command::expand(input).expect("expand").to_string();
         assert!(out.contains("struct Complete"), "{out}");
@@ -506,6 +508,58 @@ mod tests {
         let out = crate::command::expand(input).expect("expand").to_string();
         assert!(out.contains("struct Move"), "{out}");
         assert!(out.contains("fn move_dir"), "{out}");
+    }
+
+    fn thin_command(
+        name: &str,
+        load: proc_macro2::TokenStream,
+        roles: proc_macro2::TokenStream,
+    ) -> syn::Result<String> {
+        crate::command::expand(quote! {
+            name: #name,
+            transition: domain_commands::Create,
+            aggregate: Todo,
+            input: TodoCreateInput,
+            outcome: Eventual<TodoCreatePayload>,
+            shard: |input| input.todo_id.clone(),
+            load: #load,
+            roles: #roles,
+            field: "todos_create",
+            guard: authenticated_user,
+            invoke: |todo, input, principal| todo.create(&input.todo_id, principal),
+            payload: |todo, principal| TodoCreatePayload::new(todo, principal),
+        })
+        .map(|tokens| tokens.to_string())
+    }
+
+    #[test]
+    fn expand_command_thin_form_takes_every_load_and_a_guard() {
+        for (load, method) in [
+            (quote!(required), "load_by"),
+            (quote!(or_create), "load_or_create_by"),
+            (quote!(create), "create_by"),
+        ] {
+            let out = thin_command("todo.create", load, quote!(["user"])).expect("expand");
+            assert!(out.contains(&format!(". {method} (")), "{method}: {out}");
+            assert!(out.contains(". guard (authenticated_user)"), "{out}");
+        }
+    }
+
+    /// The method form and `command!` reject the same names and roles.
+    #[test]
+    fn expand_command_shares_name_and_role_rules_with_the_method_form() {
+        for name in ["create", "Todo.create", "todo..create", "todo.create-now"] {
+            let err = thin_command(name, quote!(create), quote!(["user"])).expect_err(name);
+            assert!(
+                err.to_string().contains("2+ dot-separated snake_case"),
+                "{name}: {err}"
+            );
+        }
+        for roles in [quote!([]), quote!([""]), quote!([user])] {
+            let err = thin_command("todo.create", quote!(create), roles.clone())
+                .expect_err("invalid roles");
+            assert!(err.to_string().contains("roles"), "{roles}: {err}");
+        }
     }
 
     #[test]

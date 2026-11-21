@@ -219,7 +219,7 @@ command! {
     roles: ["user", "admin"],
     field: "todos_complete",
     invoke: |todo, _input, principal| todo.complete(principal),
-    payload: |todo| TodoStatusPayload::from_todo(&**todo),
+    payload: |todo, _principal| TodoStatusPayload::from_todo(&**todo),
 }
 ```
 

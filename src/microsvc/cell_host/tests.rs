@@ -110,7 +110,7 @@ where
             ))
             .load_by(|input: &CompleteInput| Complete::shard(input))
             .invoke(|item, _input, _owner| item.complete())
-            .succeeded(|item| CompletePayload {
+            .succeeded(|item, _principal| CompletePayload {
                 id: item.entity().id().to_string(),
                 done: item.done,
             })

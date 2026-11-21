@@ -14,10 +14,9 @@ mod support;
 
 pub use archive::{archive, Archive, TodoArchiveInput, TodoArchivePayload};
 pub use complete::{complete, Complete, TodoCompleteInput, TodoStatusPayload};
-pub use create::{create, handle_create, Create, TodoCreateInput, TodoCreatePayload};
+pub use create::{create, Create, TodoCreateInput, TodoCreatePayload};
 pub use force_archive::{
-    force_archive, handle_force_archive, ForceArchive, TodoForceArchiveInput,
-    TodoForceArchivePayload,
+    force_archive, ForceArchive, TodoForceArchiveInput, TodoForceArchivePayload,
 };
 pub use purge::{purge, Purge, TodoPurgeInput, TodoPurgePayload};
 pub use rename::{rename, Rename, TodoRenameInput, TodoRenamePayload};

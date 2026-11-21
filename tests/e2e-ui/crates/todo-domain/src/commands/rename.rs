@@ -1,5 +1,5 @@
-use distributed::command::Eventual;
 use distributed::command;
+use distributed::command::Eventual;
 use serde::{Deserialize, Serialize};
 
 use crate::{domain_commands, Todo, TodoState};
@@ -28,7 +28,7 @@ command! {
     roles: ["user", "admin"],
     field: "todos_rename",
     invoke: |todo, input, principal| todo.rename(principal, &input.title),
-    payload: |todo| {
+    payload: |todo, _principal| {
         let state = TodoState::from(&**todo);
         TodoRenamePayload {
             todo_id: state.todo_id,

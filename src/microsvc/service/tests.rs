@@ -1124,7 +1124,7 @@ async fn thin_complete_registers_without_a_handler_context_body() {
             aggregate.record(input.id.clone())?;
             Ok::<_, crate::EventRecordError>(())
         })
-        .succeeded(|aggregate| TypedOutput {
+        .succeeded(|aggregate, _principal| TypedOutput {
             id: aggregate.entity().id().to_string(),
         })
         .typed_command(
@@ -1138,7 +1138,7 @@ async fn thin_complete_registers_without_a_handler_context_body() {
             aggregate.record(input.id.clone())?;
             Ok::<_, crate::EventRecordError>(())
         })
-        .succeeded(|aggregate| TypedOutput {
+        .succeeded(|aggregate, _principal| TypedOutput {
             id: aggregate.entity().id().to_string(),
         });
     let specs = routes.command_specs().expect("thin commands compile");
@@ -1173,6 +1173,99 @@ async fn thin_complete_registers_without_a_handler_context_body() {
         .await
         .expect("thin complete should load, invoke, and commit");
     assert_eq!(completed, json!({ "id": "todo-1" }));
+}
+
+#[cfg(feature = "graphql")]
+fn thin_route<D>(
+    routes: Routes<D>,
+    name: &'static str,
+) -> crate::microsvc::TypedRouteBuilder<D, CausalTestInput, Succeeded<TypedOutput>>
+where
+    D: crate::microsvc::CausalRouteDependencies<Aggregate = CausalDispatcherAggregate>
+        + Send
+        + Sync
+        + 'static,
+{
+    routes.typed_command(
+        typed_command::<CausalTestInput, Succeeded<TypedOutput>>(name).roles(["user"]),
+    )
+}
+
+#[cfg(feature = "graphql")]
+#[tokio::test]
+async fn thin_commands_share_one_load_rule_guard_and_principal() {
+    fn record(
+        aggregate: &mut crate::microsvc::AggregateCheckout<CausalDispatcherAggregate>,
+        input: &CausalTestInput,
+        _principal: &str,
+    ) -> Result<(), crate::EventRecordError> {
+        aggregate.record(input.id.clone())
+    }
+    let id = |input: &CausalTestInput| input.id.clone();
+    // The payload reports the principal, so the test can see what it was given.
+    let who = |_: &crate::microsvc::AggregateCheckout<CausalDispatcherAggregate>,
+               principal: &str| TypedOutput {
+        id: principal.to_string(),
+    };
+
+    let routes =
+        Routes::new().with_repo(InMemoryRepository::new().aggregate::<CausalDispatcherAggregate>());
+    let routes = thin_route(routes, "todo.create")
+        .create_by(id)
+        .invoke(record)
+        .succeeded(who);
+    let routes = thin_route(routes, "todo.touch")
+        .load_or_create_by(id)
+        .invoke(record)
+        .succeeded(who);
+    let routes = thin_route(routes, "todo.complete")
+        .load_by(id)
+        .invoke(record)
+        .succeeded(who);
+    let routes = thin_route(routes, "todo.locked")
+        .load_by(id)
+        .guard(|_| false)
+        .invoke(record)
+        .succeeded(who);
+    let service = Service::new().named("thin-load").routes(routes);
+    let dispatch = |command: &'static str, id: &'static str| {
+        let service = &service;
+        async move {
+            service
+                .dispatch_causal(
+                    command,
+                    &causal_test_command_id(),
+                    causal_test_input(id, "x"),
+                    session_with_role("user"),
+                    causal_test_principal(),
+                )
+                .await
+        }
+    };
+
+    let principal = json!({ "id": "causal-test-subject" });
+    assert_eq!(dispatch("todo.create", "todo-1").await.unwrap(), principal);
+    let duplicate = dispatch("todo.create", "todo-1").await.unwrap_err();
+    assert!(
+        duplicate.to_string().contains("todo-1 already exists"),
+        "create over an existing stream must reject: {duplicate}"
+    );
+    assert_eq!(dispatch("todo.touch", "todo-1").await.unwrap(), principal);
+    assert_eq!(dispatch("todo.touch", "todo-2").await.unwrap(), principal);
+    assert_eq!(
+        dispatch("todo.complete", "todo-2").await.unwrap(),
+        principal
+    );
+    let missing = dispatch("todo.complete", "todo-3").await.unwrap_err();
+    assert!(
+        missing.to_string() == "not found: todo-3",
+        "a required load of a missing stream is NotFound: {missing}"
+    );
+    let refused = dispatch("todo.locked", "todo-1").await.unwrap_err();
+    assert!(
+        refused.to_string().contains("guard"),
+        "a thin command's guard must refuse: {refused:?}"
+    );
 }
 
 #[cfg(feature = "graphql")]

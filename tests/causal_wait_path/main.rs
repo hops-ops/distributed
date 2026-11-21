@@ -121,7 +121,7 @@ fn wait_service_with_repo(repo: distributed::InMemoryRepository) -> Arc<Service>
             aggregate.record(input.id.clone())?;
             Ok::<_, distributed::EventRecordError>(())
         })
-        .succeeded(|aggregate| IdPayload {
+        .succeeded(|aggregate, _principal| IdPayload {
             id: aggregate.entity().id().to_string(),
         })
         .typed_command(
@@ -132,7 +132,7 @@ fn wait_service_with_repo(repo: distributed::InMemoryRepository) -> Arc<Service>
             aggregate.record(input.id.clone())?;
             Ok::<_, distributed::EventRecordError>(())
         })
-        .succeeded(|aggregate| IdPayload {
+        .succeeded(|aggregate, _principal| IdPayload {
             id: aggregate.entity().id().to_string(),
         });
     let ping = Routes::new().with_dependencies(()).command("ping").handle(
@@ -211,7 +211,7 @@ fn sqlite_wait_service(repository: SqliteRepository) -> Arc<Service> {
             aggregate.record(input.id.clone())?;
             Ok::<_, distributed::EventRecordError>(())
         })
-        .succeeded(|aggregate| IdPayload {
+        .succeeded(|aggregate, _principal| IdPayload {
             id: aggregate.entity().id().to_string(),
         });
     Arc::new(
@@ -1321,7 +1321,7 @@ async fn same_host_listen_ping_and_http_wait_path() {
                         aggregate.record(input.id.clone())?;
                         Ok::<_, distributed::EventRecordError>(())
                     })
-                    .succeeded(|aggregate| IdPayload {
+                    .succeeded(|aggregate, _principal| IdPayload {
                         id: aggregate.entity().id().to_string(),
                     }),
             )

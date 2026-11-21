@@ -53,6 +53,7 @@ struct PortableCommandArgs {
 
 enum LoadKind {
     Required,
+    OrCreate,
     Create,
     None,
 }
@@ -100,18 +101,19 @@ impl Parse for PortableCommandArgs {
                     let ident: Ident = input.parse()?;
                     load = match ident.to_string().as_str() {
                         "required" => LoadKind::Required,
+                        "or_create" => LoadKind::OrCreate,
                         "create" => LoadKind::Create,
-                        other => {
-                            return Err(syn::Error::new(
-                                ident.span(),
-                                format!("load must be `required` or `create`, not `{other}`"),
-                            ))
-                        }
+                        other => return Err(syn::Error::new(
+                            ident.span(),
+                            format!(
+                                "load must be `required`, `or_create` or `create`, not `{other}`"
+                            ),
+                        )),
                     };
                 }
                 "roles" => {
                     let expr: Expr = input.parse()?;
-                    roles = lit_strs_from_array(&expr)?;
+                    roles = crate::aggregate_command::role_list(&expr)?;
                 }
                 other => {
                     return Err(syn::Error::new(
@@ -128,10 +130,8 @@ impl Parse for PortableCommandArgs {
         let name = name.ok_or_else(|| input.error("command requires `name: \"...\"`"))?;
         Ok(Self {
             name,
-            transition: transition
-                .ok_or_else(|| input.error("command requires `transition:`"))?,
-            aggregate: aggregate
-                .ok_or_else(|| input.error("command requires `aggregate:`"))?,
+            transition: transition.ok_or_else(|| input.error("command requires `transition:`"))?,
+            aggregate: aggregate.ok_or_else(|| input.error("command requires `aggregate:`"))?,
             input: input_ty.ok_or_else(|| input.error("command requires `input:`"))?,
             outcome: outcome.ok_or_else(|| input.error("command requires `outcome:`"))?,
             shard: shard.ok_or_else(|| input.error("command requires `shard:`"))?,
@@ -150,38 +150,10 @@ impl Parse for PortableCommandArgs {
     }
 }
 
-fn lit_strs_from_array(expr: &Expr) -> syn::Result<Vec<LitStr>> {
-    let Expr::Array(array) = expr else {
-        return Err(syn::Error::new_spanned(
-            expr,
-            "roles must be an array of string literals, e.g. [\"user\", \"admin\"]",
-        ));
-    };
-    array
-        .elems
-        .iter()
-        .map(|elem| match elem {
-            Expr::Lit(syn::ExprLit {
-                lit: syn::Lit::Str(value),
-                ..
-            }) => Ok(value.clone()),
-            other => Err(syn::Error::new_spanned(
-                other,
-                "roles entries must be string literals",
-            )),
-        })
-        .collect()
-}
-
 fn names_from_command(name: &LitStr) -> syn::Result<(Ident, Ident)> {
+    crate::aggregate_command::validate_name(name)?;
     let value = name.value();
     let last = value.rsplit('.').next().unwrap_or(value.as_str());
-    if last.is_empty() || !last.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
-        return Err(syn::Error::new(
-            name.span(),
-            "command name must end in a snake_case ident (e.g. todo.complete)",
-        ));
-    }
     let pascal = last
         .split('_')
         .map(|part| {
@@ -259,22 +231,19 @@ pub fn expand(input: TokenStream) -> syn::Result<TokenStream> {
                 "thin command requires `payload:` (or `handle:` as the escape hatch)",
             )
         })?;
-        if args.guard.is_some() {
-            return Err(syn::Error::new(
-                proc_macro2::Span::call_site(),
-                "guard: is only valid with handle:; thin commands admit via roles",
-            ));
-        }
-        let load = match args.load {
-            LoadKind::Required => quote! { .load_by(|input: &#input_ty| Self::shard(input)) },
-            LoadKind::Create => quote! { .create() },
-            LoadKind::None => {
-                return Err(syn::Error::new(
+        let guard = args.guard.as_ref().map(|guard| quote! { .guard(#guard) });
+        let load =
+            match args.load {
+                LoadKind::Required => quote! { .load_by(|input: &#input_ty| Self::shard(input)) },
+                LoadKind::OrCreate => {
+                    quote! { .load_or_create_by(|input: &#input_ty| Self::shard(input)) }
+                }
+                LoadKind::Create => quote! { .create_by(|input: &#input_ty| Self::shard(input)) },
+                LoadKind::None => return Err(syn::Error::new(
                     proc_macro2::Span::call_site(),
-                    "thin command requires `load: required` or `load: create`",
-                ))
-            }
-        };
+                    "thin command requires `load: required`, `load: or_create` or `load: create`",
+                )),
+            };
         let finish = thin_finish(outcome, payload)?;
         quote! {
             routes
@@ -285,6 +254,7 @@ pub fn expand(input: TokenStream) -> syn::Result<TokenStream> {
                 #authenticated_user_field
                 #preview_reduce_known_record
                 #load
+                #guard
                 .invoke(#invoke)
                 #finish
         }

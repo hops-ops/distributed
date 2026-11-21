@@ -224,7 +224,7 @@ mod live {
                         aggregate.record(input.id.clone())?;
                         Ok::<_, distributed::EventRecordError>(())
                     })
-                    .succeeded(|aggregate| IdPayload {
+                    .succeeded(|aggregate, _principal| IdPayload {
                         id: aggregate.entity().id().to_string(),
                     }),
             )

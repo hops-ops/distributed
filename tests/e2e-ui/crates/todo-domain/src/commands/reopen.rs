@@ -1,5 +1,5 @@
-use distributed::command::Eventual;
 use distributed::command;
+use distributed::command::Eventual;
 use serde::Deserialize;
 
 use super::TodoStatusPayload;
@@ -23,7 +23,7 @@ command! {
     roles: ["user", "admin"],
     field: "todos_reopen",
     invoke: |todo, _input, principal| todo.reopen(principal),
-    payload: |todo| TodoStatusPayload::from_todo(&**todo),
+    payload: |todo, _principal| TodoStatusPayload::from_todo(&**todo),
 }
 
 #[cfg(test)]
