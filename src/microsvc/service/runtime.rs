@@ -17,10 +17,10 @@ use super::causal::{
 };
 use super::helpers::{
     is_json_content_type, message_to_json_input, message_to_session, names_by_kind,
+    transport_command_error, transport_command_id, transport_session,
 };
 #[cfg(feature = "otel")]
 use super::helpers::{microsvc_dispatch_span, microsvc_handler_span};
-use super::request::{CommandRequest, CommandResponse};
 use super::routes::{CausalCommandPolicy, DynBusPublisher, ErasedRoutes, HandlerSpec, Routes};
 use crate::application::{
     Application, ApplicationError, ApplicationResult, CommandDefinition, CommandMount,
@@ -37,7 +37,7 @@ use crate::command_ledger::{CommandLookup, ExternalDispatchBinding};
 use crate::microsvc::error::HandlerError;
 use crate::microsvc::lifecycle::LifecycleGate;
 use crate::microsvc::projector::{ProjectionRepairHandle, ProjectorRegistration};
-use crate::microsvc::session::Session;
+use crate::microsvc::session::{Session, TRANSPORT_ROLE, TRANSPORT_USER_ID};
 
 /// The bus run behavior captured by [`Service::with_bus`](crate::microsvc::Service::with_bus).
 pub(crate) type ServiceRunner = Box<
@@ -372,78 +372,6 @@ impl Service {
         self.register_command_mount_inner(mount)
     }
 
-    /// Invoke a registered mount through the service adapter. The request
-    /// still enters the normal transport boundary, so typed causal routes
-    /// retain their authentication/receipt/projection-proof requirements.
-    pub async fn dispatch_mount(
-        &self,
-        mount: &CommandMount,
-        request: &CommandRequest,
-    ) -> CommandResponse {
-        match self.dispatch_mount_result(mount, request).await {
-            Ok(response) => response,
-            Err(error) => CommandResponse {
-                status: error.status_code(),
-                body: serde_json::json!({ "error": error.to_string() }),
-            },
-        }
-    }
-
-    pub(crate) async fn dispatch_mount_result(
-        &self,
-        mount: &CommandMount,
-        request: &CommandRequest,
-    ) -> Result<CommandResponse, HandlerError> {
-        self.ensure_mutations_open()?;
-        if request.command != mount.spec().id {
-            return Err(HandlerError::Rejected(format!(
-                "command request `{}` does not match mount `{}`",
-                request.command,
-                mount.spec().id
-            )));
-        }
-        if !self.registered_command_mounts.iter().any(|registered| {
-            registered.spec().id == mount.spec().id
-                && registered.spec().fingerprint == mount.spec().fingerprint
-        }) {
-            return Err(HandlerError::Rejected(
-                "command mount was not registered against this service".into(),
-            ));
-        }
-        if mount.typed_route_name().is_some() {
-            return Err(HandlerError::Unauthorized(
-                "typed command mounts require the authenticated causal dispatch adapter".into(),
-            ));
-        }
-        mount.invoke(request).await
-    }
-
-    #[allow(dead_code)]
-    pub(crate) async fn dispatch_registered_mount_causally(
-        &self,
-        mount: &CommandMount,
-        request: &CommandRequest,
-        command_id: &str,
-        session: Session,
-        principal: VerifiedPrincipal,
-    ) -> Result<CausalDispatchResult, CausalDispatchError> {
-        self.ensure_registered_mount(mount)
-            .map_err(CausalDispatchError::Handler)?;
-        if mount.typed_route_name() != Some(request.command.as_str()) {
-            return Err(CausalDispatchError::BadRequest(
-                "typed command mount route identity does not match the request".into(),
-            ));
-        }
-        self.dispatch_causal_with_receipt(
-            &request.command,
-            command_id,
-            request.input.clone(),
-            session,
-            principal,
-        )
-        .await
-    }
-
     fn register_command_mount_inner(&mut self, mount: CommandMount) -> Result<(), HandlerError> {
         let Some(indices) = self
             .index
@@ -498,20 +426,6 @@ impl Service {
         }
         self.registered_command_mounts.push(mount);
         Ok(())
-    }
-
-    #[allow(dead_code)]
-    fn ensure_registered_mount(&self, mount: &CommandMount) -> Result<(), HandlerError> {
-        if self.registered_command_mounts.iter().any(|registered| {
-            registered.spec().id == mount.spec().id
-                && registered.spec().fingerprint == mount.spec().fingerprint
-        }) {
-            Ok(())
-        } else {
-            Err(HandlerError::Rejected(
-                "command mount was not registered against this service".into(),
-            ))
-        }
     }
 
     /// Install the bus run behavior (used by `with_bus`).
@@ -1118,26 +1032,11 @@ impl Service {
         };
 
         let route_indices = self.lane_route_indices(&message, None)?;
-        self.invoke_with_dispatch_span(&message, input, session, None, route_indices)
-            .await
-    }
-
-    /// Dispatch a `CommandRequest`, returning a `CommandResponse`.
-    pub async fn dispatch_request(&self, request: &CommandRequest) -> CommandResponse {
-        let session = Session::from_map(request.session_variables.clone());
-        match self
-            .dispatch(&request.command, request.input.clone(), session)
-            .await
-        {
-            Ok(value) => CommandResponse {
-                status: 200,
-                body: value,
-            },
-            Err(e) => CommandResponse {
-                status: e.status_code(),
-                body: serde_json::json!({ "error": e.to_string() }),
-            },
-        }
+        self.in_dispatch_span(
+            &message,
+            self.invoke(&message, input, session, None, route_indices),
+        )
+        .await
     }
 
     /// Dispatch a transport message.
@@ -1215,9 +1114,63 @@ impl Service {
                 Err(err) => return Err(err),
             }
         };
+        // A command name has one route. A typed one runs through the ledger.
+        if message.kind == MessageKind::Command {
+            let typed = self.routes[route_indices[0]].typed_command_contract(&message.name);
+            if let Some(contract) = typed {
+                let declared = contract.roles.iter().any(|role| role == TRANSPORT_ROLE);
+                return self
+                    .in_dispatch_span(
+                        message,
+                        self.dispatch_transport_command(message, input, declared),
+                    )
+                    .await
+                    .map_err(transport_command_error);
+            }
+        }
         let session = message_to_session(message);
-        self.invoke_with_dispatch_span(message, input, session, ordered, route_indices)
-            .await
+        self.in_dispatch_span(
+            message,
+            self.invoke(message, input, session, ordered, route_indices),
+        )
+        .await
+    }
+
+    /// Run a typed command a transport delivered, as the transport identity.
+    ///
+    /// The command ID derives from the message ID, so a redelivery replays
+    /// the committed receipt and the handler does not run again.
+    async fn dispatch_transport_command(
+        &self,
+        message: &Message,
+        input: Value,
+        declared: bool,
+    ) -> Result<Value, CausalDispatchError> {
+        // An undeclared role list admits any session, so the opt-in is
+        // checked here rather than left to the role grant.
+        if !declared {
+            return Err(CausalDispatchError::Forbidden);
+        }
+        let message_id = message.id().filter(|id| !id.is_empty()).ok_or_else(|| {
+            CausalDispatchError::BadRequest(format!(
+                "command message `{}` has no id, so it cannot be deduplicated",
+                message.name
+            ))
+        })?;
+        let service_id = self.name().ok_or_else(|| {
+            CausalDispatchError::Internal(
+                "typed causal dispatch requires Service::named identity".into(),
+            )
+        })?;
+        self.dispatch_causal(
+            &message.name,
+            &transport_command_id(service_id, &message.name, message_id),
+            input,
+            transport_session(message, message_id),
+            VerifiedPrincipal::internal(TRANSPORT_USER_ID)
+                .expect("the transport subject is a non-empty constant"),
+        )
+        .await
     }
 
     fn lane_route_indices(
@@ -1237,14 +1190,13 @@ impl Service {
             .collect())
     }
 
-    async fn invoke_with_dispatch_span(
+    /// Run `work` inside the dispatch span of `message`, parented on the
+    /// trace context its metadata carries.
+    async fn in_dispatch_span<T>(
         &self,
         message: &Message,
-        input: Value,
-        session: Session,
-        ordered: Option<&OrderedDelivery>,
-        route_indices: Vec<usize>,
-    ) -> Result<Value, HandlerError> {
+        work: impl std::future::Future<Output = T>,
+    ) -> T {
         #[cfg(feature = "otel")]
         {
             use tracing::Instrument as _;
@@ -1254,16 +1206,13 @@ impl Service {
                 &span,
                 &message.metadata,
             );
-            return self
-                .invoke(message, input, session, ordered, route_indices)
-                .instrument(span)
-                .await;
+            return work.instrument(span).await;
         }
 
         #[cfg(not(feature = "otel"))]
         {
-            self.invoke(message, input, session, ordered, route_indices)
-                .await
+            let _ = message;
+            work.await
         }
     }
 
@@ -1484,40 +1433,6 @@ impl Service {
 impl CommandMountRegistrar for Service {
     fn register_command_mount(&mut self, mount: CommandMount) -> Result<(), HandlerError> {
         self.register_command_mount_inner(mount)
-    }
-}
-
-impl crate::application::CommandMountExecution for Service {
-    fn invoke_mount<'a>(
-        &'a self,
-        mount: &'a CommandMount,
-        request: CommandRequest,
-        invocation: crate::application::CommandMountInvocation,
-    ) -> crate::application::CommandMountExecutionFuture<'a> {
-        Box::pin(async move {
-            match invocation {
-                crate::application::CommandMountInvocation::Transport => self
-                    .dispatch_mount_result(mount, &request)
-                    .await
-                    .map(crate::application::CommandMountExecutionResult::Transport)
-                    .map_err(crate::application::CommandMountExecutionError::Handler),
-                crate::application::CommandMountInvocation::Authenticated {
-                    command_id,
-                    session,
-                    principal,
-                } => self
-                    .dispatch_registered_mount_causally(
-                        mount,
-                        &request,
-                        &command_id,
-                        session,
-                        principal,
-                    )
-                    .await
-                    .map(crate::application::CommandMountExecutionResult::Causal)
-                    .map_err(crate::application::CommandMountExecutionError::Causal),
-            }
-        })
     }
 }
 

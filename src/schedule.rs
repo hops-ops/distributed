@@ -563,7 +563,7 @@ pub(crate) fn schedule_command_id(name: &str, generation: u64) -> String {
     hasher.update(name.as_bytes());
     hasher.update([0u8]);
     hasher.update(generation.to_be_bytes());
-    uuid_v7_shaped(hasher)
+    crate::command_ledger::deterministic_command_id(hasher)
 }
 
 /// Command id of one schedule arm held in a shared store (SQL, in-memory):
@@ -585,16 +585,7 @@ pub(crate) fn owned_schedule_command_id(
     hasher.update(name.as_bytes());
     hasher.update([0u8]);
     hasher.update(generation.to_be_bytes());
-    uuid_v7_shaped(hasher)
-}
-
-fn uuid_v7_shaped(hasher: Sha256) -> String {
-    let digest = hasher.finalize();
-    let mut bytes = [0u8; 16];
-    bytes.copy_from_slice(&digest[..16]);
-    bytes[6] = (bytes[6] & 0x0f) | 0x70;
-    bytes[8] = (bytes[8] & 0x3f) | 0x80;
-    uuid::Uuid::from_bytes(bytes).hyphenated().to_string()
+    crate::command_ledger::deterministic_command_id(hasher)
 }
 
 /// How long a schedule waits after a failed attempt: the same backoff type

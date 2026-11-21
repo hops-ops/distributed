@@ -1,7 +1,4 @@
 use std::collections::BTreeSet;
-use std::future::Future;
-use std::pin::Pin;
-use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
@@ -626,23 +623,6 @@ fn validate_json_contract(kind: &'static str, value: &serde_json::Value) -> Appl
     walk(kind, value, 0)
 }
 
-/// Executable command material retained only at the heterogeneous runtime
-/// boundary. Its handler is intentionally absent from serialization. The
-/// boundary is deliberately a callable request/response trait rather than an
-/// `Any` value: a runtime can invoke it without knowing the concrete function
-/// item type or attempting a downcast.
-pub type CommandMountFuture<'a> = Pin<
-    Box<
-        dyn Future<Output = Result<crate::microsvc::CommandResponse, crate::microsvc::HandlerError>>
-            + Send
-            + 'a,
-    >,
->;
-
-pub trait CommandMountHandler: Send + Sync {
-    fn call(&self, request: crate::microsvc::CommandRequest) -> CommandMountFuture<'_>;
-}
-
 /// Explicit registration seam used by service/runtime adapters. A mount is
 /// not executable merely because it contains a value; an adapter must accept
 /// it into its registry before it can be dispatched.
@@ -653,87 +633,13 @@ pub trait CommandMountRegistrar {
     ) -> Result<(), crate::microsvc::HandlerError>;
 }
 
-/// Invocation context for the heterogeneous runtime boundary. The ordinary
-/// transport variant is deliberately unable to execute a typed causal mount;
-/// only the authenticated variant carries the framework-issued principal and
-/// bearer-scoped command identity needed by the existing causal ledger path.
-#[allow(dead_code)]
-#[derive(Debug)]
-pub(crate) enum CommandMountInvocation {
-    Transport,
-    Authenticated {
-        command_id: String,
-        session: crate::microsvc::Session,
-        principal: crate::command_dispatch::VerifiedPrincipal,
-    },
-}
-
-#[allow(dead_code)]
-#[derive(Debug)]
-pub(crate) enum CommandMountExecutionResult {
-    Transport(crate::microsvc::CommandResponse),
-    Causal(crate::microsvc::CausalDispatchResult),
-}
-
-#[allow(dead_code)]
-#[derive(Debug)]
-pub(crate) enum CommandMountExecutionError {
-    Handler(crate::microsvc::HandlerError),
-    Causal(crate::microsvc::CausalDispatchError),
-}
-
-#[allow(dead_code)]
-pub(crate) type CommandMountExecutionFuture<'a> = Pin<
-    Box<
-        dyn Future<Output = Result<CommandMountExecutionResult, CommandMountExecutionError>>
-            + Send
-            + 'a,
-    >,
->;
-
-/// Runtime adapter for mounts whose authorization and causal commit protocol
-/// lives in a service/router. Adapters receive the same mount spec and must
-/// route through the existing `CommandRequest`/`CommandResponse` boundary;
-/// authenticated typed mounts additionally enter the existing causal receipt
-/// and projection-proof protocol.
-#[allow(dead_code)]
-pub(crate) trait CommandMountExecution: Send + Sync {
-    fn invoke_mount<'a>(
-        &'a self,
-        mount: &'a CommandMount,
-        request: crate::microsvc::CommandRequest,
-        invocation: CommandMountInvocation,
-    ) -> CommandMountExecutionFuture<'a>;
-}
-
-struct RequestCommandMountHandler<H>(H);
-
-impl<H, F> CommandMountHandler for RequestCommandMountHandler<H>
-where
-    H: Fn(crate::microsvc::CommandRequest) -> F + Send + Sync,
-    F: Future<Output = Result<crate::microsvc::CommandResponse, crate::microsvc::HandlerError>>
-        + Send
-        + 'static,
-{
-    fn call(&self, request: crate::microsvc::CommandRequest) -> CommandMountFuture<'_> {
-        Box::pin((self.0)(request))
-    }
-}
-
+/// The runtime-facing identity of one command declaration. It carries no
+/// handler: execution is owned by the typed route it names and enters only
+/// through the ledgered causal dispatch path.
+#[derive(Clone)]
 pub struct CommandMount {
     spec: CommandSpec,
-    handler: Option<Arc<dyn CommandMountHandler>>,
     typed_route: Option<String>,
-}
-
-impl Clone for CommandMount {
-    fn clone(&self) -> Self {
-        Self {
-            spec: self.spec.clone(),
-            handler: self.handler.clone(),
-            typed_route: self.typed_route.clone(),
-        }
-    }
 }
 
 impl std::fmt::Debug for CommandMount {
@@ -741,55 +647,24 @@ impl std::fmt::Debug for CommandMount {
         formatter
             .debug_struct("CommandMount")
             .field("command", &self.spec.id)
-            .field("callable", &self.handler.is_some())
             .field("typed_route", &self.typed_route)
             .finish()
     }
 }
 
 impl CommandMount {
-    /// Create a contract-only mount with no executable handler.
+    /// Create a contract-only mount bound to no route.
     pub fn contract(spec: CommandSpec) -> Self {
         Self {
             spec,
-            handler: None,
             typed_route: None,
         }
-    }
-
-    /// Erase one executable handler without changing the portable spec.
-    pub fn from_handler<H>(spec: CommandSpec, handler: H) -> Self
-    where
-        H: CommandMountHandler + 'static,
-    {
-        Self {
-            spec,
-            handler: Some(Arc::new(handler)),
-            typed_route: None,
-        }
-    }
-
-    /// Adapt an owned request handler to the type-erased mount boundary.
-    /// Request and response values remain the existing transport types and
-    /// failures retain the framework's typed [`HandlerError`].
-    pub fn from_request_handler<H, F>(spec: CommandSpec, handler: H) -> Self
-    where
-        H: Fn(crate::microsvc::CommandRequest) -> F + Send + Sync + 'static,
-        F: Future<Output = Result<crate::microsvc::CommandResponse, crate::microsvc::HandlerError>>
-            + Send
-            + 'static,
-    {
-        Self::from_handler(spec, RequestCommandMountHandler(handler))
     }
 
     /// Create the runtime-facing registration token for a typed causal route.
-    /// The token deliberately contains no fake handler closure: execution is
-    /// owned by the registered typed route and can only enter through the
-    /// authenticated causal protocol.
     pub fn from_typed_route(spec: CommandSpec, route_name: impl Into<String>) -> Self {
         Self {
             spec,
-            handler: None,
             typed_route: Some(route_name.into()),
         }
     }
@@ -800,34 +675,6 @@ impl CommandMount {
 
     pub(crate) fn typed_route_name(&self) -> Option<&str> {
         self.typed_route.as_deref()
-    }
-
-    /// Invoke the erased handler. Contract-only mounts fail closed with a
-    /// typed authorization error instead of pretending that a mount is
-    /// executable.
-    pub fn invoke(&self, request: &crate::microsvc::CommandRequest) -> CommandMountFuture<'_> {
-        match &self.handler {
-            Some(handler) => handler.call(request.clone()),
-            None => Box::pin(async {
-                Err(crate::microsvc::HandlerError::Unauthorized(
-                    "command mount has no runtime handler".into(),
-                ))
-            }),
-        }
-    }
-
-    /// Invoke through a registered runtime adapter. Typed mounts must receive
-    /// an authenticated invocation context; the adapter then enters the
-    /// existing causal route, preserving authorization, receipts, and
-    /// projection proofs. A transport-only invocation remains fail-closed.
-    #[allow(dead_code)]
-    pub(crate) fn invoke_with<'a, E: CommandMountExecution>(
-        &'a self,
-        executor: &'a E,
-        request: &crate::microsvc::CommandRequest,
-        invocation: CommandMountInvocation,
-    ) -> CommandMountExecutionFuture<'a> {
-        executor.invoke_mount(self, request.clone(), invocation)
     }
 
     /// Register this mount with an explicit runtime adapter.

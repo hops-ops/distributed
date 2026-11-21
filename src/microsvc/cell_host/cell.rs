@@ -16,7 +16,6 @@ use super::store::{
 use super::{CausalDispatchError, CausalDispatchResult};
 use crate::aggregate::{Aggregate, AggregateRepository};
 use crate::entity::EventRecord;
-use crate::microsvc::error::HandlerError;
 use crate::microsvc::service::{PortableCommand, Routes};
 use crate::microsvc::session::Session;
 use crate::microsvc::HasOutboxStore;
@@ -204,27 +203,6 @@ where
     /// True when this cell has only command mounts (no projectors/GraphQL services).
     pub fn is_command_only(&self) -> bool {
         self.routes.is_command_only()
-    }
-
-    /// Dispatch a mounted command through the cell-local workspace adapter.
-    pub async fn dispatch(
-        &self,
-        command: &str,
-        input: Value,
-        session: Session,
-    ) -> Result<Value, HandlerError> {
-        #[cfg(all(feature = "workers-rs", target_arch = "wasm32"))]
-        let _command = self
-            .begin_command()
-            .await
-            .map_err(|error| HandlerError::Other(Box::new(error)))?;
-        let result = self
-            .routes
-            .dispatch_cell_command(command, input, session, &self.shard)
-            .await;
-        #[cfg(all(feature = "workers-rs", target_arch = "wasm32"))]
-        self.reschedule_after_command().await;
-        result
     }
 
     /// Dispatch a wait-path command through this cell's fenced command ledger.

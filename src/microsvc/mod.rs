@@ -105,9 +105,9 @@ pub(crate) use service::ExternalCausalReservation;
 pub use service::GraphqlServiceBindError;
 pub use service::{
     invoke_transition, load_for_command, require_loaded, CausalCommandContext, CausalCommitBuilder,
-    CausalRepository, CommandLoad, CommandRequest, CommandResponse, DeliveryKind, HandlerNames,
-    HandlerSpec, PortableCommand, PreparedCausalCommit, PreparedCommandHandler, RouteBuilder,
-    Routes, Service, ThinCommandBuilder, ThinCommandInvoked, ThinCommandLoaded, TypedRouteBuilder,
+    CausalRepository, CommandLoad, DeliveryKind, HandlerNames, HandlerSpec, PortableCommand,
+    PreparedCausalCommit, PreparedCommandHandler, RouteBuilder, Routes, Service,
+    ThinCommandBuilder, ThinCommandInvoked, ThinCommandLoaded, TypedRouteBuilder,
     DEFAULT_DELIVERY_LANE,
 };
 #[cfg(feature = "graphql")]
@@ -121,7 +121,9 @@ pub use workers::{
 };
 #[cfg(any(feature = "http", feature = "grpc"))]
 pub(crate) mod wait_path;
-pub use session::{Session, ROLE_KEY, USER_ID_KEY};
+pub use session::{
+    Session, ROLE_KEY, TRANSPORT_MESSAGE_ID_CLAIM, TRANSPORT_ROLE, TRANSPORT_USER_ID, USER_ID_KEY,
+};
 
 /// Maximum accepted HTTP request body size for the microsvc ingresses, in bytes
 /// (1 MiB).

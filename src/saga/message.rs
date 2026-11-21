@@ -258,6 +258,25 @@ impl SagaReply {
         )
     }
 
+    /// From the session of a typed command a transport delivered
+    /// (`ctx.session()` in the handler): the saga headers arrive as claims
+    /// and the saga command id as
+    /// [`TRANSPORT_MESSAGE_ID_CLAIM`](crate::microsvc::TRANSPORT_MESSAGE_ID_CLAIM).
+    /// Fails when the command was not delivered by a transport or was not
+    /// sent by a saga.
+    pub fn from_session(session: &crate::microsvc::Session) -> Result<Self, SagaError> {
+        let id = session
+            .get(crate::microsvc::TRANSPORT_MESSAGE_ID_CLAIM)
+            .ok_or_else(|| SagaError::Malformed("saga command has no id".into()))?;
+        Self::from_parts(
+            id,
+            session
+                .variables()
+                .iter()
+                .map(|(key, value)| (key.as_str(), value.as_str())),
+        )
+    }
+
     /// The command id this reply answers (useful as the participant's own
     /// dedupe / tombstone key).
     pub fn command_id(&self) -> &str {

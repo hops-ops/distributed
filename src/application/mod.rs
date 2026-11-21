@@ -24,12 +24,7 @@ pub use capability::{
 };
 pub use command::{
     admit_command_session, command_roles_require_principal, CommandDefinition, CommandMount,
-    CommandMountFuture, CommandMountHandler, CommandMountRegistrar, CommandSpec, CommandTypeField,
-    CommandTypeSpec, EventSpec, TypeSpec,
-};
-pub(crate) use command::{
-    CommandMountExecution, CommandMountExecutionError, CommandMountExecutionFuture,
-    CommandMountExecutionResult, CommandMountInvocation,
+    CommandMountRegistrar, CommandSpec, CommandTypeField, CommandTypeSpec, EventSpec, TypeSpec,
 };
 pub use error::{ApplicationError, ApplicationResult};
 pub use identity::{canonical_json, sha256_fingerprint, LogicalId};

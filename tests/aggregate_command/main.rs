@@ -4,7 +4,7 @@
 //! generated registration matches the hand-written form (command specs,
 //! GraphQL SDL and the client manifest).
 
-use distributed::cell_host::AggregateCell;
+use distributed::cell_host::{AggregateCell, CausalDispatchError, CellCommandIdentity};
 use distributed::command::{Eventual, PreparedCommand, Succeeded};
 use distributed::microsvc::{
     require_loaded, CausalCommandContext, HandlerError, Session, USER_ID_KEY,
@@ -213,6 +213,27 @@ fn session(user: Option<&str>) -> Session {
     session
 }
 
+/// One ledgered command: a fresh command ID in the session principal's
+/// partition (the role check refuses a session without one).
+async fn dispatch(
+    cell: &AggregateCell<Hero>,
+    command: &str,
+    input: serde_json::Value,
+    session: Session,
+) -> Result<serde_json::Value, CausalDispatchError> {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let next = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let identity = CellCommandIdentity::new(
+        "heroes",
+        session.user_id().unwrap_or("anonymous"),
+        format!("0190a000-0000-7000-8000-{next:012}"),
+    )?;
+    let result = cell
+        .dispatch_idempotent(command, &identity, input, session)
+        .await?;
+    Ok(result.payload().clone())
+}
+
 fn cell(id: &str) -> AggregateCell<Hero> {
     AggregateCell::<Hero>::new(id)
         .unwrap()
@@ -224,90 +245,109 @@ fn cell(id: &str) -> AggregateCell<Hero> {
 #[tokio::test]
 async fn generated_handlers_bind_the_session_principal_and_commit() {
     let cell = cell("h1");
-    let created = cell
-        .dispatch(
-            "hero.create",
-            json!({ "hero_id": "h1", "name": "Ana" }),
-            session(Some("ana")),
-        )
-        .await
-        .unwrap();
+    let created = dispatch(
+        &cell,
+        "hero.create",
+        json!({ "hero_id": "h1", "name": "Ana" }),
+        session(Some("ana")),
+    )
+    .await
+    .unwrap();
     assert_eq!(
         created,
         json!({ "hero_id": "h1", "name": "Ana", "items": 0 })
     );
-    let equipped = cell
-        .dispatch(
-            "hero.equip",
-            json!({ "hero_id": "h1", "slot": "hand", "item": "sword" }),
-            session(Some("ana")),
-        )
-        .await
-        .unwrap();
+    let equipped = dispatch(
+        &cell,
+        "hero.equip",
+        json!({ "hero_id": "h1", "slot": "hand", "item": "sword" }),
+        session(Some("ana")),
+    )
+    .await
+    .unwrap();
     assert_eq!(equipped["items"], 1);
     // Domain errors become rejections; the owner check sees the session's
     // principal, never the input.
-    let stolen = cell
-        .dispatch(
-            "hero.equip",
-            json!({ "hero_id": "h1", "slot": "hand", "item": "axe" }),
-            session(Some("bo")),
-        )
-        .await;
+    let stolen = dispatch(
+        &cell,
+        "hero.equip",
+        json!({ "hero_id": "h1", "slot": "hand", "item": "axe" }),
+        session(Some("bo")),
+    )
+    .await;
     assert!(
-        matches!(&stolen, Err(HandlerError::Rejected(m)) if m == "not your hero"),
+        matches!(&stolen, Err(CausalDispatchError::Rejected { message, .. }) if message == "rejected: not your hero"),
         "{stolen:?}"
     );
-    // No session principal: refused before the aggregate is touched.
-    let anonymous = cell
-        .dispatch(
-            "hero.equip",
-            json!({ "hero_id": "h1", "slot": "hand", "item": "axe" }),
-            session(None),
-        )
-        .await;
-    assert!(anonymous.is_err(), "{anonymous:?}");
+    // No session principal: refused by the role check, before the ledger.
+    let anonymous = dispatch(
+        &cell,
+        "hero.equip",
+        json!({ "hero_id": "h1", "slot": "hand", "item": "axe" }),
+        session(None),
+    )
+    .await;
+    assert!(
+        matches!(anonymous, Err(CausalDispatchError::Unauthorized)),
+        "{anonymous:?}"
+    );
     // Unknown fields (an attempt to pass identity) are refused by the input.
-    let forged = cell
-        .dispatch(
-            "hero.equip",
-            json!({ "hero_id": "h1", "slot": "hand", "item": "axe", "actor": "ana" }),
-            session(Some("bo")),
-        )
-        .await;
-    assert!(forged.is_err(), "{forged:?}");
+    let forged = dispatch(
+        &cell,
+        "hero.equip",
+        json!({ "hero_id": "h1", "slot": "hand", "item": "axe", "actor": "ana" }),
+        session(Some("bo")),
+    )
+    .await;
+    assert!(
+        matches!(forged, Err(CausalDispatchError::BadRequest(_))),
+        "{forged:?}"
+    );
     let hero = cell.load().await.unwrap().unwrap();
     assert_eq!(hero.slots, [("hand".to_string(), "sword".to_string())]);
     assert_eq!(hero.owner, "ana");
 
     // `load = required` on a missing aggregate.
-    let missing = AggregateCell::<Hero>::new("nobody")
-        .unwrap()
-        .mount(Equip)
-        .dispatch(
-            "hero.equip",
-            json!({ "hero_id": "nobody", "slot": "hand", "item": "axe" }),
-            session(Some("ana")),
-        )
-        .await;
-    assert!(missing.is_err(), "{missing:?}");
+    let nobody = AggregateCell::<Hero>::new("nobody").unwrap().mount(Equip);
+    let missing = dispatch(
+        &nobody,
+        "hero.equip",
+        json!({ "hero_id": "nobody", "slot": "hand", "item": "axe" }),
+        session(Some("ana")),
+    )
+    .await;
+    assert!(
+        matches!(
+            missing,
+            Err(CausalDispatchError::Rejected { status: 404, .. })
+        ),
+        "{missing:?}"
+    );
 }
 
 #[tokio::test]
 async fn or_create_sharded_by_principal_returns_the_recorded_position() {
     let cell = AggregateCell::<Hero>::new("cy").unwrap().mount(Nap);
-    let first = cell
-        .dispatch("hero.nap", json!({ "minutes": 5 }), session(Some("cy")))
-        .await
-        .unwrap();
+    let first = dispatch(
+        &cell,
+        "hero.nap",
+        json!({ "minutes": 5 }),
+        session(Some("cy")),
+    )
+    .await
+    .unwrap();
     // created (1) + napped (2)
     assert_eq!(first["sequence"], 2);
     assert_eq!(first["naps"], 1);
     assert!(first["at_ms"].as_u64().unwrap() > 1_600_000_000_000);
-    let second = cell
-        .dispatch("hero.nap", json!({ "minutes": 5 }), session(Some("cy")))
-        .await
-        .unwrap();
+    let second = dispatch(
+        &cell,
+        "hero.nap",
+        json!({ "minutes": 5 }),
+        session(Some("cy")),
+    )
+    .await
+    .unwrap();
     assert_eq!(second["sequence"], 3);
     assert_eq!(second["hero_id"], "cy");
     let history = cell.history().await.unwrap();

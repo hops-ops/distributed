@@ -11,6 +11,11 @@
 //! into the HTTP body and classifies a `HandlerError` to pick the status code —
 //! neither of which the bus's `MessageRouter::dispatch` (unit-returning) exposes.
 //!
+//! A CloudEvent is an event unless it carries the `sourcedkind: command`
+//! extension attribute `KnativeBus` stamps on the commands it sends. A typed
+//! command delivered here runs through the command ledger as the transport
+//! identity, with the CloudEvent `id` as the message id it deduplicates on.
+//!
 //! Acknowledgement is the HTTP response:
 //!
 //! - handler success → `200 OK` (the only ack);
@@ -109,6 +114,11 @@ fn parse_cloud_event(headers: &HeaderMap, body: &Bytes) -> Result<Message, Strin
     } else {
         parse_binary(headers, body)
     }?;
+    // `KnativeBus` stamps the kind as the `sourcedkind` extension attribute.
+    // Anything but `command` is an event, as on every other transport.
+    if let Some(kind) = message.metadata("sourcedkind") {
+        message.kind = MessageKind::from_str_lossy(kind);
+    }
     inject_http_trace_context(headers, &mut message.metadata);
     Ok(message)
 }

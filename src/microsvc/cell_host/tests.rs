@@ -140,6 +140,10 @@ fn owner_session() -> Session {
     session
 }
 
+fn command_identity(command_id: &str) -> CellCommandIdentity {
+    CellCommandIdentity::new("cell-test-service", "principal-alice", command_id).unwrap()
+}
+
 struct Publish;
 
 impl<D> PortableCommand<D> for Publish
@@ -306,27 +310,29 @@ async fn cell_dispatches_complete_with_the_same_portable_command_as_soa() {
     fn_send_sync(&cell);
 
     let created = cell
-        .dispatch(
+        .dispatch_idempotent(
             "cell_item.create",
+            &command_identity("0190a000-0000-7000-8000-000000000430"),
             json!({ "id": "item-1", "title": "ship" }),
             owner_session(),
         )
         .await
         .expect("create");
-    assert_eq!(created["id"], "item-1");
+    assert_eq!(created.payload()["id"], "item-1");
     let loaded = cell.load().await.expect("load");
     assert_eq!(loaded.expect("resident").title, "ship");
 
     let completed = cell
-        .dispatch(
+        .dispatch_idempotent(
             "cell_item.complete",
+            &command_identity("0190a000-0000-7000-8000-000000000431"),
             json!({ "id": "item-1" }),
             owner_session(),
         )
         .await
         .expect("complete");
-    assert_eq!(completed["id"], "item-1");
-    assert_eq!(completed["done"], true);
+    assert_eq!(completed.payload()["id"], "item-1");
+    assert_eq!(completed.payload()["done"], true);
 
     let snap = cell
         .cached_snapshot()
@@ -623,8 +629,9 @@ async fn cell_complete_rejects_a_different_shard_id() {
         .unwrap()
         .mount(Create)
         .mount(Complete);
-    cell.dispatch(
+    cell.dispatch_idempotent(
         "cell_item.create",
+        &command_identity("0190a000-0000-7000-8000-000000000432"),
         json!({ "id": "item-1", "title": "ship" }),
         owner_session(),
     )
@@ -632,8 +639,9 @@ async fn cell_complete_rejects_a_different_shard_id() {
     .unwrap();
 
     let error = cell
-        .dispatch(
+        .dispatch_idempotent(
             "cell_item.complete",
+            &command_identity("0190a000-0000-7000-8000-000000000433"),
             json!({ "id": "item-2" }),
             owner_session(),
         )
@@ -775,15 +783,17 @@ async fn reference_host_applies_the_sealed_row_reducer_on_commit() {
         .unwrap()
         .mount(Create)
         .mount(Complete);
-    cell.dispatch(
+    cell.dispatch_idempotent(
         "cell_item.create",
+        &command_identity("0190a000-0000-7000-8000-000000000434"),
         json!({ "id": "item-s", "title": "seal" }),
         owner_session(),
     )
     .await
     .unwrap();
-    cell.dispatch(
+    cell.dispatch_idempotent(
         "cell_item.complete",
+        &command_identity("0190a000-0000-7000-8000-000000000435"),
         json!({ "id": "item-s" }),
         owner_session(),
     )

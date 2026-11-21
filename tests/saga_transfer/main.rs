@@ -11,6 +11,12 @@
 //! compensated transfer so a late action is rejected. Time is a
 //! `ManualClock`; the test "network" delivers outbox rows whose `deliver_at`
 //! is due on that clock, so timeouts fire without sleeping.
+//!
+//! Each participant is a `Service` of typed commands that declare the
+//! transport role. The network hands a saga command to it as a bus message,
+//! so the command ledger deduplicates a redelivery (its command id derives
+//! from the saga command id) and the wallet keeps no dedupe record of its
+//! own. The wallet still keeps its tombstones: those are domain state.
 
 #[cfg(feature = "sqlite")]
 #[path = "../support/sqlite.rs"]
@@ -22,6 +28,11 @@ use std::time::{Duration, SystemTime};
 
 use serde::{Deserialize, Serialize};
 
+use distributed::bus::Message;
+use distributed::command::{typed_command, PreparedCommand, Succeeded};
+use distributed::microsvc::{
+    CausalCommandContext, HandlerError, PortableCommand, Routes, Service, TRANSPORT_ROLE,
+};
 use distributed::saga::SagaCursor;
 use distributed::{
     sourced, AggregateBuilder, AggregateRepository, ClaimOutboxMessages, Entity,
@@ -39,13 +50,10 @@ pub struct Wallet {
     pub entity: Entity,
     balance: i64,
     accepts_credit: bool,
-    /// Transfers whose action applied here (dedupe).
+    /// Transfers whose action applied here (what a compensation undoes).
     applied: BTreeSet<String>,
     /// Compensated transfers (tombstones: a late action is rejected).
     cancelled: BTreeSet<String>,
-    /// Saga command ids already handled (the participant's dedupe record;
-    /// a consumer inbox receipt keyed by the command id works the same way).
-    handled: BTreeSet<String>,
 }
 
 #[allow(dead_code)]
@@ -59,28 +67,16 @@ impl Wallet {
     }
 
     #[event("moved")]
-    pub fn moved(&mut self, command: String, transfer: String, delta: i64) {
+    pub fn moved(&mut self, transfer: String, delta: i64) {
         self.balance += delta;
         self.applied.insert(transfer);
-        self.handled.insert(command);
     }
 
     #[event("cancelled")]
-    pub fn cancelled(&mut self, command: String, transfer: String, delta: i64) {
+    pub fn cancelled(&mut self, transfer: String, delta: i64) {
         self.balance += delta;
         self.applied.remove(&transfer);
         self.cancelled.insert(transfer);
-        self.handled.insert(command);
-    }
-
-    #[event("rejected")]
-    pub fn rejected(&mut self, command: String) {
-        self.handled.insert(command);
-    }
-
-    #[event("acknowledged")]
-    pub fn acknowledged(&mut self, command: String) {
-        self.handled.insert(command);
     }
 
     pub fn balance(&self) -> i64 {
@@ -88,7 +84,7 @@ impl Wallet {
     }
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, distributed::CommandInput)]
 struct MoveCmd {
     transfer: String,
     wallet: String,
@@ -176,18 +172,113 @@ impl SagaDefinition for Transfer {
 }
 
 // ===========================================================================
-// Participant handler: one cell, one atomic commit (wallet + reply)
+// Participant: one cell, a service of typed commands. One commit carries the
+// wallet's events, the saga reply and the ledger receipt.
 // ===========================================================================
 
+const WALLET_COMMANDS: [&str; 4] = [
+    "wallet.debit",
+    "wallet.credit",
+    "wallet.refund",
+    "wallet.reverse_credit",
+];
+
+#[derive(Debug, Serialize, distributed::CommandOutput)]
+struct MoveOutcome {
+    applied: bool,
+}
+
+/// One saga command. The ledger has already settled whether this command id
+/// ran before, so the handler holds no dedupe of its own; what it decides
+/// from wallet state (funds, tombstones) is the domain's.
+async fn handle_move(
+    ctx: &CausalCommandContext<'_, Wallet>,
+    cmd: MoveCmd,
+) -> Result<PreparedCommand<Succeeded<MoveOutcome>>, HandlerError> {
+    let reply = SagaReply::from_session(ctx.session())
+        .map_err(|error| HandlerError::Rejected(error.to_string()))?;
+    let mut wallet = ctx
+        .get(&cmd.wallet)
+        .await?
+        .ok_or_else(|| HandlerError::NotFound(cmd.wallet.clone()))?;
+    let transfer = cmd.transfer;
+    let command = ctx.command_name();
+    let outcome = match command {
+        "wallet.debit" | "wallet.credit" => {
+            let debit = command == "wallet.debit";
+            if wallet.cancelled.contains(&transfer) {
+                Err("transfer was cancelled")
+            } else if debit && wallet.balance < cmd.amount {
+                Err("insufficient funds")
+            } else if !debit && !wallet.accepts_credit {
+                Err("wallet does not accept credits")
+            } else {
+                let delta = if debit { -cmd.amount } else { cmd.amount };
+                wallet
+                    .moved(transfer, delta)
+                    .map_err(|error| HandlerError::Rejected(error.to_string()))?;
+                Ok(())
+            }
+        }
+        // A compensation: idempotent across saga attempts (each attempt is a
+        // new command id, so the ledger does not stop it), and a tombstone
+        // when its action never applied here.
+        _ => {
+            if !wallet.cancelled.contains(&transfer) {
+                let delta = match (wallet.applied.contains(&transfer), command) {
+                    (false, _) => 0,
+                    (true, "wallet.refund") => cmd.amount,
+                    (true, _) => -cmd.amount,
+                };
+                wallet
+                    .cancelled(transfer, delta)
+                    .map_err(|error| HandlerError::Rejected(error.to_string()))?;
+            }
+            Ok(())
+        }
+    };
+    // A refusal is still a committed command: it carries the `failed` reply.
+    // Returning `Err` would record the rejection but stage no reply.
+    let reply = match outcome {
+        Ok(()) => reply.succeeded(format!("receipt:{}", reply.command_id()).into_bytes()),
+        Err(reason) => reply.failed(reason),
+    }
+    .map_err(|error| HandlerError::Rejected(error.to_string()))?;
+    ctx.outbox(reply).commit(wallet)?.succeeded(MoveOutcome {
+        applied: outcome.is_ok(),
+    })
+}
+
+struct WalletCommand(&'static str);
+
+impl<D> PortableCommand<D> for WalletCommand
+where
+    D: distributed::microsvc::CausalRouteDependencies<Aggregate = Wallet> + Send + Sync + 'static,
+{
+    fn install(self, routes: Routes<D>) -> Routes<D> {
+        routes
+            .typed_command(
+                typed_command::<MoveCmd, Succeeded<MoveOutcome>>(self.0).roles([TRANSPORT_ROLE]),
+            )
+            .handle(handle_move)
+    }
+}
+
 struct Cell {
+    service: Service,
     wallets: AggregateRepository<InMemoryRepository, Wallet>,
     outbox: InMemoryOutboxStore,
 }
 
 impl Cell {
-    fn new() -> Self {
+    fn new(name: &str) -> Self {
         let repo = InMemoryRepository::new();
+        let mut routes = Routes::new().with_repo(repo.clone().aggregate::<Wallet>());
+        for command in WALLET_COMMANDS {
+            routes = routes.mount(WalletCommand(command));
+        }
         Self {
+            service: Service::new().named(name).routes(routes),
             outbox: repo.outbox_store(),
             wallets: repo.aggregate::<Wallet>(),
         }
@@ -203,56 +294,11 @@ impl Cell {
         self.wallets.get(id).await.unwrap().unwrap().balance()
     }
 
+    /// Deliver a saga command as a bus consumer would: the outbox row
+    /// becomes a transport message and the service dispatches it.
     async fn handle(&self, command: &OutboxMessage) {
-        let reply = SagaReply::from_outbox(command).unwrap();
-        let cmd: MoveCmd = serde_json::from_slice(&command.payload).unwrap();
-        let mut wallet = self.wallets.get(&cmd.wallet).await.unwrap().unwrap();
-        if wallet.handled.contains(command.id()) {
-            return; // redelivery: effects and reply were committed the first time
-        }
-        let t = cmd.transfer.clone();
-        let c = command.id().to_string();
-        let outcome = match command.event_type.as_str() {
-            "wallet.debit" | "wallet.credit" => {
-                let debit = command.event_type == "wallet.debit";
-                if wallet.cancelled.contains(&t) {
-                    Err("transfer was cancelled")
-                } else if debit && wallet.balance < cmd.amount {
-                    Err("insufficient funds")
-                } else if !debit && !wallet.accepts_credit {
-                    Err("wallet does not accept credits")
-                } else {
-                    let delta = if debit { -cmd.amount } else { cmd.amount };
-                    wallet.moved(c.clone(), t, delta).unwrap();
-                    Ok(())
-                }
-            }
-            "wallet.refund" | "wallet.reverse_credit" => {
-                if !wallet.cancelled.contains(&t) {
-                    let delta = match (wallet.applied.contains(&t), command.event_type.as_str()) {
-                        (false, _) => 0, // tombstone only: action never applied
-                        (true, "wallet.refund") => cmd.amount,
-                        (true, _) => -cmd.amount,
-                    };
-                    wallet.cancelled(c.clone(), t, delta).unwrap();
-                } else {
-                    wallet.acknowledged(c.clone()).unwrap();
-                }
-                Ok(())
-            }
-            other => panic!("unexpected command {other}"),
-        };
-        let reply = match outcome {
-            Ok(()) => reply.succeeded(format!("receipt:{c}").into_bytes()),
-            Err(reason) => {
-                wallet.rejected(c).unwrap();
-                reply.failed(reason)
-            }
-        }
-        .unwrap();
-        self.wallets
-            .outbox(reply)
-            .commit(&mut wallet)
+        self.service
+            .dispatch_message(&Message::from(command.clone()))
             .await
             .unwrap();
     }
@@ -282,8 +328,8 @@ impl World {
             saga_outbox: saga_repo.outbox_store(),
             saga: SagaRunner::with_clock(saga_repo, clock.clone()),
             clock,
-            source: Cell::new(),
-            target: Cell::new(),
+            source: Cell::new(SOURCE_CELL),
+            target: Cell::new(TARGET_CELL),
             down: Mutex::new(HashSet::new()),
         };
         world.source.open("alice", 100, true).await;
@@ -534,6 +580,51 @@ async fn compensation_timeouts_retry_then_mark_stuck() {
     world.clock.advance(Duration::from_secs(11));
     world.pump().await;
     assert_eq!(world.saga_state("t-5").await.status(), SagaStatus::Stuck);
+}
+
+/// The ledger makes a redelivered saga command a replay: the wallet changes
+/// once and one reply exists, committed with the first run.
+#[tokio::test]
+async fn redelivered_saga_command_applies_once_and_replies_once() {
+    let world = World::new(true).await;
+    world.set_down(TARGET_CELL, true);
+    world.saga.start("t-9", World::data(5)).await.unwrap();
+    let commands = world.take_due(&world.saga_outbox).await;
+    let debit = commands
+        .iter()
+        .find(|m| m.destination.as_deref() == Some(SOURCE_CELL))
+        .unwrap();
+
+    world.source.handle(debit).await;
+    // The reply is durable as soon as the first delivery returns.
+    let replies = world.source.outbox.pending(10).await.unwrap();
+    assert_eq!(replies.len(), 1);
+    assert_eq!(replies[0].id(), format!("{}:reply", debit.id()));
+
+    for _redelivery in 0..3 {
+        world.source.handle(debit).await;
+    }
+    assert_eq!(world.balances().await.0, 95, "debit applied once");
+    let wallet = world.source.wallets.get("alice").await.unwrap().unwrap();
+    assert_eq!(wallet.entity.version(), 2, "opened, then moved once");
+    let replies = world.take_due(&world.source.outbox).await;
+    assert_eq!(replies.len(), 1, "exactly one reply");
+
+    // A rejection is deduplicated the same way: one `failed` reply.
+    let world = World::new(true).await;
+    world.saga.start("t-10", World::data(500)).await.unwrap();
+    let commands = world.take_due(&world.saga_outbox).await;
+    let debit = commands
+        .iter()
+        .find(|m| m.destination.as_deref() == Some(SOURCE_CELL))
+        .unwrap();
+    world.source.handle(debit).await;
+    world.source.handle(debit).await;
+    let replies = world.take_due(&world.source.outbox).await;
+    assert_eq!(replies.len(), 1);
+    assert_eq!(world.balances().await.0, 100);
+    let wallet = world.source.wallets.get("alice").await.unwrap().unwrap();
+    assert_eq!(wallet.entity.version(), 1, "a refusal changes nothing");
 }
 
 #[tokio::test]

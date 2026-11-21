@@ -27,9 +27,7 @@ use crate::graphql::{SurfaceDirectProjection, SurfaceProjector};
 #[cfg(feature = "graphql")]
 use crate::microsvc::cell_host::{CelldCommandHost, InternalHttpSecret};
 use crate::microsvc::HasOutboxStore;
-use crate::microsvc::{
-    CommandRequest, Context, HandlerError, RepoReadModelDependencies, Routes, Service, Session,
-};
+use crate::microsvc::{Context, HandlerError, RepoReadModelDependencies, Routes, Service, Session};
 use crate::outbox::OutboxMessage;
 use crate::projection_protocol::{
     PartitionId, ProjectionChangeCursor, ProjectionChangeRead, ProjectionCheckpoint,
@@ -4207,98 +4205,6 @@ async fn guard_checks_session() {
     let mut session = Session::new();
     session.set(crate::microsvc::ROLE_KEY, "admin");
     assert!(service.dispatch("admin", json!({}), session).await.is_ok());
-}
-
-#[tokio::test]
-async fn dispatch_request_success() {
-    let service = test_service(
-        test_routes()
-            .command("ping")
-            .handle(|_ctx: &Context<()>| async move { Ok(json!({ "pong": true })) }),
-    );
-    let request = CommandRequest {
-        command: "ping".to_string(),
-        input: json!({}),
-        session_variables: HashMap::new(),
-    };
-    let response = service.dispatch_request(&request).await;
-    assert_eq!(response.status, 200);
-    assert_eq!(response.body, json!({ "pong": true }));
-}
-
-#[tokio::test]
-async fn dispatch_request_error_codes() {
-    let service = test_service(
-        test_routes()
-            .command("reject")
-            .handle(|_: &Context<()>| async move { Err(HandlerError::Rejected("no".into())) })
-            .command("unauth")
-            .handle(|ctx: &Context<()>| {
-                let user_id = ctx.user_id().map(|s| s.to_string());
-                async move {
-                    let _ = user_id?;
-                    Ok(json!({}))
-                }
-            }),
-    );
-
-    let resp = service
-        .dispatch_request(&CommandRequest {
-            command: "unknown".to_string(),
-            input: json!({}),
-            session_variables: HashMap::new(),
-        })
-        .await;
-    assert_eq!(resp.status, 404);
-
-    let resp = service
-        .dispatch_request(&CommandRequest {
-            command: "reject".to_string(),
-            input: json!({}),
-            session_variables: HashMap::new(),
-        })
-        .await;
-    assert_eq!(resp.status, 422);
-
-    let resp = service
-        .dispatch_request(&CommandRequest {
-            command: "unauth".to_string(),
-            input: json!({}),
-            session_variables: HashMap::new(),
-        })
-        .await;
-    assert_eq!(resp.status, 401);
-}
-
-#[tokio::test]
-async fn dispatch_request_passes_session() {
-    let service = test_service(test_routes().command("whoami").handle(|ctx: &Context<()>| {
-        let user_id = ctx.user_id().map(|s| s.to_string());
-        async move {
-            let user_id = user_id?;
-            Ok(json!({ "user_id": user_id }))
-        }
-    }));
-    let mut vars = HashMap::new();
-    vars.insert(
-        crate::microsvc::USER_ID_KEY.to_string(),
-        "user-99".to_string(),
-    );
-    let request = CommandRequest {
-        command: "whoami".to_string(),
-        input: json!({}),
-        session_variables: vars,
-    };
-    let response = service.dispatch_request(&request).await;
-    assert_eq!(response.status, 200);
-    assert_eq!(response.body, json!({ "user_id": "user-99" }));
-}
-
-#[test]
-fn command_request_requires_session_variables_field() {
-    let json = r#"{"command":"ping","input":{}}"#;
-    let result: Result<CommandRequest, _> = serde_json::from_str(json);
-    assert!(result.is_err());
 }
 
 type LaneLog = std::sync::Arc<std::sync::Mutex<Vec<String>>>;
