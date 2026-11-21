@@ -2181,6 +2181,13 @@ Application code does not invoke the client compiler directly or commit its
 outputs. `distributed client-manifest` and `distributed client` are internal
 compiler primitives used by the lifecycle, not parallel application workflows.
 
+`distributed dev` tells each supervised process whether it belongs to the
+active generation. A process honours that by composing its services with
+`.with_lifecycle(LifecycleGate::from_env())` (resolved once, cloned into every
+`Service`): outside the active generation, writes fail with
+`ApplicationReloading`. Without the call a service is always open. See
+[`docs/reloading-event-delivery.md`](docs/reloading-event-delivery.md).
+
 See [`js/README.md`](js/README.md) for the package API and
 [`tests/e2e-ui/README.md`](tests/e2e-ui/README.md) for the complete integration
 flow.

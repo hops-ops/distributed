@@ -203,6 +203,15 @@ pub(super) type ExternalCompletionFuture<'a> =
 pub(super) type ExternalAbandonFuture<'a> =
     Pin<Box<dyn Future<Output = Result<(), CausalDispatchError>> + Send + 'a>>;
 
+/// One bounded compaction pass over a command ledger, owning its repository
+/// handle so a background worker can run it.
+#[cfg(feature = "graphql")]
+pub(crate) type LedgerCompaction = Arc<
+    dyn Fn(usize) -> Pin<Box<dyn Future<Output = Result<u64, CommandLedgerError>> + Send>>
+        + Send
+        + Sync,
+>;
+
 pub(super) trait ErasedCausalHandler<D>: Send + Sync {
     fn contract(&self) -> &TypedCommandContract;
 
@@ -220,6 +229,9 @@ pub(super) trait ErasedCausalHandler<D>: Send + Sync {
 
     #[cfg(feature = "graphql")]
     fn storage_identity(&self, dependencies: &D) -> CausalStorageIdentity;
+
+    #[cfg(feature = "graphql")]
+    fn ledger_compaction(&self, dependencies: &D) -> LedgerCompaction;
 
     #[cfg(feature = "graphql")]
     #[allow(clippy::too_many_arguments)]
@@ -445,6 +457,10 @@ pub(super) trait ErasedRoutes: Send + Sync {
     /// The repository every typed command of this bundle commits to.
     #[cfg(feature = "graphql")]
     fn causal_storage_identity(&self) -> Option<CausalStorageIdentity>;
+
+    /// Compaction of the ledger in that repository.
+    #[cfg(feature = "graphql")]
+    fn ledger_compaction(&self) -> Option<LedgerCompaction>;
 
     /// The consistency of this bundle's `command`, if `session` is still
     /// granted it and its contract still has `fingerprint`.
@@ -2200,6 +2216,15 @@ where
     }
 
     #[cfg(feature = "graphql")]
+    fn ledger_compaction(&self, dependencies: &D) -> LedgerCompaction {
+        let repository = dependencies.__causal_aggregate_repository().repo().clone();
+        Arc::new(move |limit| {
+            let repository = repository.clone();
+            Box::pin(async move { repository.compact_expired_commands(limit).await })
+        })
+    }
+
+    #[cfg(feature = "graphql")]
     fn dispatch<'a>(
         &'a self,
         dependencies: &'a D,
@@ -2728,6 +2753,13 @@ where
         self.causal_handlers()
             .next()
             .map(|handler| handler.storage_identity(&self.dependencies))
+    }
+
+    #[cfg(feature = "graphql")]
+    fn ledger_compaction(&self) -> Option<LedgerCompaction> {
+        self.causal_handlers()
+            .next()
+            .map(|handler| handler.ledger_compaction(&self.dependencies))
     }
 
     #[cfg(feature = "graphql")]

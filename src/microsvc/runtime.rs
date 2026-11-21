@@ -37,7 +37,9 @@ impl Service {
     ///   (fan-out).
     ///
     /// The worker also polls pending rows, so a crash between commit and
-    /// publish is recovered in-process. Spawn a separate
+    /// publish is recovered in-process. Beside it, a second worker tombstones
+    /// expired rows of the typed commands' ledgers in bounded batches until
+    /// the service is dropped. Spawn a separate
     /// [`crate::OutboxDrainRunner`] next to `run` only when you want an extra
     /// competing drainer.
     pub fn with_bus<B>(mut self, bus: B) -> Self
@@ -52,6 +54,8 @@ impl Service {
             DEFAULT_PUBLISH_LEASE,
             DEFAULT_MAX_PUBLISH_ATTEMPTS,
         );
+        #[cfg(feature = "graphql")]
+        self.start_ledger_compaction();
 
         self.set_runner(Box::new(
             move |service: Arc<Service>, options: RunOptions| {

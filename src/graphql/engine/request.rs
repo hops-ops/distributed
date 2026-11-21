@@ -28,16 +28,36 @@ impl ProtocolPreparationError {
 }
 
 impl GraphqlEngine {
+    /// Whether `request` is a mutation this engine must not run: the bound
+    /// service's lifecycle gate is closed.
+    ///
+    /// The service checks the same gate for every write it runs. The engine
+    /// checks too because its mutations may go to a command host with no
+    /// service in this process, and because the refusal is a GraphQL
+    /// response, not a resolver error.
+    pub(crate) fn refuses_mutation(&self, request: &mut Request) -> bool {
+        !self.inner.lifecycle.mutations_open()
+            && selected_operation_type(request)
+                == Some(async_graphql::parser::types::OperationType::Mutation)
+    }
+
     pub async fn execute(&self, session: &Session, mut request: Request) -> Response {
+        if self.refuses_mutation(&mut request) {
+            return lifecycle_mutation_rejected();
+        }
+        self.execute_admitted(session, request).await
+    }
+
+    /// [`Self::execute`] for a caller that has already asked
+    /// [`Self::refuses_mutation`] and answered a refusal its own way.
+    pub(crate) async fn execute_admitted(
+        &self,
+        session: &Session,
+        mut request: Request,
+    ) -> Response {
         #[cfg(feature = "gateway-delivery")]
         if delivery::action(&request).as_deref() == Some("validate") {
             return self.validate_delivery(session, request).await;
-        }
-        if selected_operation_type(&mut request)
-            == Some(async_graphql::parser::types::OperationType::Mutation)
-            && !crate::microsvc::lifecycle_mutations_open()
-        {
-            return lifecycle_mutation_rejected();
         }
         let authority = match resolve_execution_authority(&self.inner, session, &request) {
             Ok(authority) => authority,
@@ -120,10 +140,7 @@ impl GraphqlEngine {
         session: &Session,
         mut request: Request,
     ) -> BoxStream<'static, async_graphql::Response> {
-        if selected_operation_type(&mut request)
-            == Some(async_graphql::parser::types::OperationType::Mutation)
-            && !crate::microsvc::lifecycle_mutations_open()
-        {
+        if self.refuses_mutation(&mut request) {
             return stream::once(async { lifecycle_mutation_rejected() }).boxed();
         }
         let authority = match resolve_execution_authority(&self.inner, session, &request) {

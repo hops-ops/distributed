@@ -415,8 +415,10 @@ pub fn build(repo: ServiceRepo) -> Arc<Service> {{
 }}
 
 fn build_service(repo: ServiceRepo) -> Service {{
+    // Under `distributed dev`, only the active generation may write.
     let service = Service::new()
-        .named({service_name});
+        .named({service_name})
+        .with_lifecycle(distributed::microsvc::LifecycleGate::from_env());
 {typed_route_attachments}{event_route_attachment}    service
 }}
 
@@ -461,7 +463,13 @@ pub fn build(repo: ServiceRepo) -> Arc<Service> {{
     let routes = distributed::routes!(
         Routes::new().with_dependencies(repo),
 {registrations}    );
-    Arc::new(Service::new().named({service_name}){http_command_opt_in}.routes(routes))
+    // Under `distributed dev`, only the active generation may write.
+    Arc::new(
+        Service::new()
+            .named({service_name})
+            .with_lifecycle(distributed::microsvc::LifecycleGate::from_env()){http_command_opt_in}
+            .routes(routes),
+    )
 }}
 
 pub fn descriptor() -> ServiceDescriptor {{

@@ -57,6 +57,11 @@ impl GraphqlEngine {
         self.inner.service_id.as_deref()
     }
 
+    /// The lifecycle gate taken from the bound service.
+    pub(crate) fn lifecycle(&self) -> &crate::microsvc::LifecycleGate {
+        &self.inner.lifecycle
+    }
+
     pub(crate) fn typed_command_binding(&self) -> Option<&TypedServiceCommandBinding> {
         self.inner.command_binding.as_ref()
     }

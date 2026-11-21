@@ -33,16 +33,9 @@ use crate::command_ledger::{CommandId, CommandLedgerKey, CommandLookup, Principa
 #[cfg(feature = "graphql")]
 use crate::graphql::identity::VerifiedPrincipal;
 use crate::microsvc::error::HandlerError;
+use crate::microsvc::lifecycle::LifecycleGate;
 use crate::microsvc::projector::{ProjectionRepairHandle, ProjectorRegistration};
 use crate::microsvc::session::Session;
-
-fn ensure_lifecycle_mutations_open() -> Result<(), HandlerError> {
-    if crate::microsvc::lifecycle_mutations_open() {
-        Ok(())
-    } else {
-        Err(HandlerError::ApplicationReloading)
-    }
-}
 
 /// The bus run behavior captured by [`Service::with_bus`](crate::microsvc::Service::with_bus).
 pub(crate) type ServiceRunner = Box<
@@ -71,11 +64,16 @@ pub struct Service {
     causal_command_policy: CausalCommandPolicy,
     runner: Option<ServiceRunner>,
     registered_command_mounts: Vec<CommandMount>,
+    /// Admits or refuses every write this service is asked to run.
+    lifecycle: LifecycleGate,
     /// When true, HTTP mounts `POST /{command}`. Off by default — GraphQL,
     /// health, and in-process `dispatch` stay available without this.
     http_command_routes: bool,
     #[cfg(feature = "graphql")]
     graphql: Option<std::sync::Arc<crate::graphql::GraphqlEngine>>,
+    /// Started by `with_bus`; stops when the service is dropped.
+    #[cfg(feature = "graphql")]
+    ledger_compaction: Option<crate::microsvc::workers::LedgerCompactionWorker>,
 }
 
 impl Service {
@@ -91,9 +89,38 @@ impl Service {
             causal_command_policy: CausalCommandPolicy::default(),
             runner: None,
             registered_command_mounts: Vec::new(),
+            lifecycle: LifecycleGate::always_open(),
             http_command_routes: false,
             #[cfg(feature = "graphql")]
             graphql: None,
+            #[cfg(feature = "graphql")]
+            ledger_compaction: None,
+        }
+    }
+
+    /// Refuse writes while `lifecycle` is closed: commands, typed commands
+    /// and bus deliveries fail with [`HandlerError::ApplicationReloading`].
+    ///
+    /// A service is always open unless given a gate. A process that
+    /// `distributed dev` may run passes [`LifecycleGate::from_env`], resolved
+    /// once and cloned into every service it builds. Set it before building a
+    /// GraphQL engine from this service: the engine takes the service's gate.
+    pub fn with_lifecycle(mut self, lifecycle: LifecycleGate) -> Self {
+        self.lifecycle = lifecycle;
+        self
+    }
+
+    /// The gate set by [`Self::with_lifecycle`].
+    #[cfg(feature = "graphql")]
+    pub(crate) fn lifecycle(&self) -> &LifecycleGate {
+        &self.lifecycle
+    }
+
+    fn ensure_mutations_open(&self) -> Result<(), HandlerError> {
+        if self.lifecycle.mutations_open() {
+            Ok(())
+        } else {
+            Err(HandlerError::ApplicationReloading)
         }
     }
 
@@ -208,6 +235,11 @@ impl Service {
         match (typed_commands.is_empty(), engine.typed_command_binding()) {
             (true, None) => {}
             (_, Some(engine_binding)) => {
+                if !engine.lifecycle().is(&self.lifecycle) {
+                    return Err(GraphqlServiceBindError(
+                        "GraphQL engine and service have different lifecycle gates; call Service::with_lifecycle before building the engine from the service".into(),
+                    ));
+                }
                 let service_binding = self
                     .typed_command_binding()
                     .map_err(GraphqlServiceBindError)?;
@@ -360,7 +392,7 @@ impl Service {
         mount: &CommandMount,
         request: &CommandRequest,
     ) -> Result<CommandResponse, HandlerError> {
-        ensure_lifecycle_mutations_open()?;
+        self.ensure_mutations_open()?;
         if request.command != mount.spec().id {
             return Err(HandlerError::Rejected(format!(
                 "command request `{}` does not match mount `{}`",
@@ -745,7 +777,8 @@ impl Service {
         principal: VerifiedPrincipal,
         binding: ExternalDispatchBinding,
     ) -> Result<ExternalCausalReservation, CausalDispatchError> {
-        ensure_lifecycle_mutations_open().map_err(CausalDispatchError::Handler)?;
+        self.ensure_mutations_open()
+            .map_err(CausalDispatchError::Handler)?;
         let service_id = self.name().ok_or_else(|| {
             CausalDispatchError::Internal(
                 "external typed causal dispatch requires Service::named identity".into(),
@@ -884,7 +917,8 @@ impl Service {
         principal: VerifiedPrincipal,
         protocol: Option<crate::graphql::protocol::ProtocolResponseAccumulator>,
     ) -> Result<CausalDispatchResult, CausalDispatchError> {
-        ensure_lifecycle_mutations_open().map_err(CausalDispatchError::Handler)?;
+        self.ensure_mutations_open()
+            .map_err(CausalDispatchError::Handler)?;
         let service_id = self.name().ok_or_else(|| {
             CausalDispatchError::Internal(
                 "typed causal dispatch requires Service::named identity".into(),
@@ -1065,7 +1099,7 @@ impl Service {
         input: Value,
         session: Session,
     ) -> Result<Value, HandlerError> {
-        ensure_lifecycle_mutations_open()?;
+        self.ensure_mutations_open()?;
         if !self.handles_message(MessageKind::Command, command) {
             return Err(HandlerError::UnknownCommand(command.to_string()));
         }
@@ -1156,7 +1190,7 @@ impl Service {
         ordered: Option<&OrderedDelivery>,
         lane: Option<usize>,
     ) -> Result<Value, HandlerError> {
-        ensure_lifecycle_mutations_open()?;
+        self.ensure_mutations_open()?;
         if !self.handles_message(message.kind, &message.name) {
             return Err(HandlerError::UnknownCommand(message.name.clone()));
         }
@@ -1341,6 +1375,34 @@ impl Service {
                 service_name.clone(),
             );
         }
+    }
+
+    /// Compaction of every command ledger this service's typed commands
+    /// write, one per repository however many route bundles share it.
+    #[cfg(feature = "graphql")]
+    pub(crate) fn command_ledgers(&self) -> Vec<super::routes::LedgerCompaction> {
+        let mut identities = Vec::new();
+        let mut ledgers = Vec::new();
+        for routes in &self.routes {
+            let Some(identity) = routes.causal_storage_identity() else {
+                continue;
+            };
+            if identities.contains(&identity) {
+                continue;
+            }
+            identities.push(identity);
+            ledgers.extend(routes.ledger_compaction());
+        }
+        ledgers
+    }
+
+    /// Run command-ledger compaction beside the outbox drain for as long as
+    /// this service lives.
+    #[cfg(feature = "graphql")]
+    pub(crate) fn start_ledger_compaction(&mut self) {
+        let ledgers = self.command_ledgers();
+        self.ledger_compaction = (!ledgers.is_empty())
+            .then(|| crate::microsvc::workers::LedgerCompactionWorker::spawn(ledgers));
     }
 
     pub(crate) async fn bootstrap_projectors(&self) -> Result<(), HandlerError> {

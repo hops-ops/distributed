@@ -1241,6 +1241,61 @@ async fn graphql_only_http_host_wait_dispatches_to_writer() {
     assert_eq!(result.state(), "succeeded");
 }
 
+#[tokio::test]
+async fn http_host_reports_the_writers_own_error_not_a_generic_rejection() {
+    use distributed::microsvc::CausalDispatchError;
+
+    let base = start_http(wait_service()).await;
+    let host = HttpCommandHost::new(base).expect("valid wait-path URL");
+    let mut session = distributed::microsvc::Session::new();
+    session.set(USER_ID_KEY, "alice");
+    session.set(ROLE_KEY, "user");
+    let principal = VerifiedPrincipal::internal("alice").unwrap();
+
+    let forbidden = host
+        .invoke(
+            "todo.admin_only",
+            "0190a000-0000-7000-8000-000000000107",
+            json!({ "id": "todo-forbidden" }),
+            session.clone(),
+            principal.clone(),
+            None,
+        )
+        .await
+        .expect_err("a user may not run an admin command");
+    assert!(
+        matches!(forbidden, CausalDispatchError::Forbidden),
+        "{forbidden:?}"
+    );
+
+    let command_id = "0190a000-0000-7000-8000-000000000108";
+    host.invoke(
+        "todo.create",
+        command_id,
+        json!({ "id": "todo-reuse-a" }),
+        session.clone(),
+        principal.clone(),
+        None,
+    )
+    .await
+    .expect("first use of the command ID");
+    let reuse = host
+        .invoke(
+            "todo.create",
+            command_id,
+            json!({ "id": "todo-reuse-b" }),
+            session,
+            principal,
+            None,
+        )
+        .await
+        .expect_err("the same command ID with different input");
+    assert!(
+        matches!(reuse, CausalDispatchError::CommandIdReuse),
+        "{reuse:?}"
+    );
+}
+
 #[cfg(feature = "sqlite")]
 #[tokio::test]
 async fn graphql_only_engine_wait_dispatches_to_loopback_writer() {

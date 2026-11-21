@@ -6,10 +6,65 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::bus::{Bus, RetryBackoff, RunOptions, Shutdown};
+#[cfg(feature = "graphql")]
+use crate::microsvc::service::LedgerCompaction;
 use crate::microsvc::Service;
 use crate::outbox_worker::{
     drain_worker_id, BusPublisher, OutboxDispatcher, OutboxDrainRunner, OutboxStore,
 };
+
+/// Rows one compaction pass tombstones per command ledger.
+#[cfg(feature = "graphql")]
+pub(crate) const LEDGER_COMPACTION_BATCH: usize = 256;
+
+/// Time between compaction passes once the expired backlog is below a batch.
+#[cfg(feature = "graphql")]
+pub(crate) const LEDGER_COMPACTION_INTERVAL: Duration = Duration::from_secs(60);
+
+/// One compaction pass: up to `batch` expired rows in each ledger. Returns
+/// the rows compacted; a ledger that fails is logged and left for the next
+/// pass.
+#[cfg(feature = "graphql")]
+pub(crate) async fn compact_command_ledgers(ledgers: &[LedgerCompaction], batch: usize) -> u64 {
+    let mut compacted = 0;
+    for compact in ledgers {
+        match compact(batch).await {
+            Ok(count) => compacted += count,
+            Err(error) => tracing::warn!(%error, "command ledger compaction failed"),
+        }
+    }
+    compacted
+}
+
+/// The command-ledger compaction loop of one [`Service`]; dropping it stops
+/// the loop.
+#[cfg(feature = "graphql")]
+pub(crate) struct LedgerCompactionWorker(tokio::task::JoinHandle<()>);
+
+#[cfg(feature = "graphql")]
+impl LedgerCompactionWorker {
+    /// Compact `ledgers` every [`LEDGER_COMPACTION_INTERVAL`], and again at
+    /// once while a pass still finds a full batch.
+    pub(crate) fn spawn(ledgers: Vec<LedgerCompaction>) -> Self {
+        Self(tokio::spawn(async move {
+            loop {
+                let compacted = compact_command_ledgers(&ledgers, LEDGER_COMPACTION_BATCH).await;
+                if compacted < LEDGER_COMPACTION_BATCH as u64 {
+                    tokio::time::sleep(LEDGER_COMPACTION_INTERVAL).await;
+                } else {
+                    tokio::task::yield_now().await;
+                }
+            }
+        }))
+    }
+}
+
+#[cfg(feature = "graphql")]
+impl Drop for LedgerCompactionWorker {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
 
 /// Spawn the standard outbox drain loop for a bus-backed store.
 ///

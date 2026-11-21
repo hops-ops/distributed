@@ -201,7 +201,7 @@ impl CommandService for GrpcHandler {
                     }
                     Ok(Response::new(GrpcResponse {
                         status: status as u32,
-                        body: json!({ "error": e.client_message() }).to_string(),
+                        body: super::wait_path::wait_path_error_response(&e).to_string(),
                     }))
                 }
             };

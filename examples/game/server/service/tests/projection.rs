@@ -19,7 +19,7 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use async_graphql::Request;
-use distributed::microsvc::{Session, ROLE_KEY, USER_ID_KEY};
+use distributed::microsvc::{LifecycleGate, Session, ROLE_KEY, USER_ID_KEY};
 use distributed::SqliteRepository;
 use distributed_game::{Fact, FactSink, FactStamp};
 use futures_util::StreamExt;
@@ -124,7 +124,7 @@ async fn settled_kills_project_into_live_player_stats() {
         .await
         .unwrap();
     let bus = open_shared_sqlite(&bus_url).await.unwrap();
-    spawn_projector(repo.clone(), bus.clone());
+    spawn_projector(repo.clone(), bus.clone(), LifecycleGate::always_open());
     // The boards are the zone server's store (Redis in the demo; the same
     // in-memory store here). Their `@live` pushes come only from the
     // change notices on the bus.
@@ -250,7 +250,7 @@ async fn settled_kills_project_into_live_player_stats() {
 
     // A second projector over the same cursor (a restart) re-reads nothing
     // twice: the rows still equal the cells.
-    spawn_projector(repo.clone(), bus.clone());
+    spawn_projector(repo.clone(), bus.clone(), LifecycleGate::always_open());
     sink.commit(&kill("k4", "dev-cy", 2, "cy")).await.unwrap();
     eventually("third player", || async { rows(&repo).await.len() == 3 }).await;
     for (player, _, xp, kills, level) in rows(&repo).await {

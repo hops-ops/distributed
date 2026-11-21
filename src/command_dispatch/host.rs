@@ -663,29 +663,26 @@ impl CommandHost for HttpCommandHost {
             .post_wait_path(command, command_id, input, &session)
             .await?;
         if status >= 400 {
-            let message = body
-                .get("error")
-                .and_then(Value::as_str)
-                .unwrap_or("wait-path rejected")
-                .to_string();
-            return Err(CausalDispatchError::Rejected {
-                code: "REJECTED",
-                status,
-                message,
-            });
+            return Err(crate::microsvc::wait_path::wait_path_error(status, &body));
         }
         CausalDispatchResult::from_wait_path_wire(body)
     }
 
+    /// The HTTP wait-path serves `POST /{command}` only: it has no status
+    /// endpoint, so this host cannot tell an unknown command from a
+    /// committed one and says so instead of answering `unknown`. Read status
+    /// from the host that owns the ledger.
     async fn status(
         &self,
-        command_id: &str,
+        _command_id: &str,
         session: &Session,
         principal: VerifiedPrincipal,
         _protocol: Option<ProtocolResponseAccumulator>,
     ) -> Result<CausalCommandPublicStatus, CausalDispatchError> {
         validate_principal_session_if_present(session, &principal)?;
-        Ok(CausalCommandPublicStatus::unknown(command_id))
+        Err(CausalDispatchError::Internal(
+            "the HTTP wait-path has no command status endpoint".into(),
+        ))
     }
 }
 
@@ -751,6 +748,146 @@ mod tests {
             "x".repeat(MAX_TRUSTED_METADATA_BYTES),
         )]);
         assert!(too_large.is_err());
+    }
+
+    /// Serve `status` + `body` for every request and return the base URL.
+    async fn stub_writer(status: u16, body: Value) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = axum::Router::new().fallback(move || {
+            let body = body.clone();
+            async move {
+                (
+                    axum::http::StatusCode::from_u16(status).unwrap(),
+                    axum::Json(body),
+                )
+            }
+        });
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        format!("http://{addr}")
+    }
+
+    async fn invoke_failure(base: &str) -> CausalDispatchError {
+        let mut session = Session::new();
+        session.set(USER_ID_KEY, "alice");
+        HttpCommandHost::new(base)
+            .unwrap()
+            .invoke(
+                "todo.create",
+                "0190a000-0000-7000-8000-000000000001",
+                serde_json::json!({ "id": "todo" }),
+                session,
+                VerifiedPrincipal::internal("alice").unwrap(),
+                None,
+            )
+            .await
+            .expect_err("the stub writer never succeeds")
+    }
+
+    #[tokio::test]
+    async fn remote_server_errors_are_retryable_not_rejections() {
+        for (status, body) in [
+            (
+                500,
+                serde_json::json!({ "code": "INTERNAL", "error": "internal error" }),
+            ),
+            // A proxy or an older writer: no code in the body.
+            (500, serde_json::json!({ "error": "internal error" })),
+            (503, serde_json::json!({ "error": "upstream unavailable" })),
+        ] {
+            let error = invoke_failure(&stub_writer(status, body).await).await;
+            assert!(
+                matches!(&error, CausalDispatchError::Internal(detail)
+                    if detail.contains(&status.to_string())),
+                "HTTP {status} must be retryable, got {error:?}"
+            );
+            assert!(crate::microsvc::cell_host::alarm::is_retryable(&error));
+        }
+    }
+
+    #[tokio::test]
+    async fn remote_retryable_codes_keep_their_meaning() {
+        let error = invoke_failure(
+            &stub_writer(
+                503,
+                serde_json::json!({ "code": "CONCURRENT_WRITE", "error": "retry" }),
+            )
+            .await,
+        )
+        .await;
+        assert!(matches!(error, CausalDispatchError::ConcurrentWrite));
+
+        let error = invoke_failure(
+            &stub_writer(
+                409,
+                serde_json::json!({ "code": "COMMAND_IN_PROGRESS", "error": "busy" }),
+            )
+            .await,
+        )
+        .await;
+        assert!(matches!(error, CausalDispatchError::InProgress));
+    }
+
+    #[tokio::test]
+    async fn remote_business_rejection_keeps_its_code_status_and_message() {
+        let error = invoke_failure(
+            &stub_writer(
+                422,
+                serde_json::json!({ "code": "REJECTED", "error": "todo is already done" }),
+            )
+            .await,
+        )
+        .await;
+        assert!(matches!(
+            &error,
+            CausalDispatchError::Rejected { code: "REJECTED", status: 422, message }
+                if message == "todo is already done"
+        ));
+
+        let error = invoke_failure(
+            &stub_writer(
+                404,
+                serde_json::json!({ "code": "NOT_FOUND", "error": "no such todo" }),
+            )
+            .await,
+        )
+        .await;
+        assert!(matches!(
+            &error,
+            CausalDispatchError::Rejected { code: "NOT_FOUND", status: 404, message }
+                if message == "no such todo"
+        ));
+        assert!(!crate::microsvc::cell_host::alarm::is_retryable(&error));
+    }
+
+    #[tokio::test]
+    async fn a_connection_failure_is_retryable() {
+        // Bind, then close: nothing listens on the port.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+
+        let error = invoke_failure(&format!("http://{addr}")).await;
+        assert!(
+            matches!(&error, CausalDispatchError::Internal(detail)
+                if detail.contains("wait-path HTTP failed")),
+            "got {error:?}"
+        );
+        assert!(crate::microsvc::cell_host::alarm::is_retryable(&error));
+    }
+
+    #[tokio::test]
+    async fn status_is_an_error_because_the_wait_path_has_no_status_endpoint() {
+        let host = HttpCommandHost::new("http://127.0.0.1:1").unwrap();
+        let status = host
+            .status(
+                "0190a000-0000-7000-8000-000000000001",
+                &Session::new(),
+                VerifiedPrincipal::internal("alice").unwrap(),
+                None,
+            )
+            .await;
+        assert!(matches!(status, Err(CausalDispatchError::Internal(_))));
     }
 
     #[tokio::test]

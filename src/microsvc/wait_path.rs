@@ -51,6 +51,51 @@ pub(crate) fn wait_path_response(result: &CausalDispatchResult) -> Value {
     })
 }
 
+/// The body of a failed wait-path response. `code` is what a remote host
+/// rebuilds the error from ([`wait_path_error`]); `error` is the client-safe
+/// message.
+pub(crate) fn wait_path_error_response(error: &CausalDispatchError) -> Value {
+    json!({
+        "code": error.code(),
+        "error": error.client_message(),
+    })
+}
+
+/// Rebuild the error of a failed wait-path response from its HTTP status and
+/// body, as written by [`wait_path_error_response`] or an aggregate cell.
+///
+/// A server error that names no known code (a proxy, a crashed host) is
+/// [`CausalDispatchError::Internal`], which callers retry; only a client
+/// error is a rejection.
+pub(crate) fn wait_path_error(status: u16, body: &Value) -> CausalDispatchError {
+    let message = body
+        .get("error")
+        .and_then(Value::as_str)
+        .unwrap_or("wait-path rejected")
+        .to_string();
+    let code = body.get("code").and_then(Value::as_str);
+    let rejected = |code, message| CausalDispatchError::Rejected {
+        code,
+        status,
+        message,
+    };
+    match code {
+        Some("BAD_REQUEST") => CausalDispatchError::BadRequest(message),
+        Some("FORBIDDEN") => CausalDispatchError::Forbidden,
+        Some("COMMAND_ID_REUSE") => CausalDispatchError::CommandIdReuse,
+        Some("COMMAND_IN_PROGRESS") => CausalDispatchError::InProgress,
+        Some("COMMAND_EXPIRED") => CausalDispatchError::Expired,
+        Some("CONCURRENT_WRITE") => CausalDispatchError::ConcurrentWrite,
+        Some("UNAUTHORIZED") => rejected("UNAUTHORIZED", message),
+        Some("NOT_FOUND") => rejected("NOT_FOUND", message),
+        Some("REJECTED") => rejected("REJECTED", message),
+        _ if status >= 500 || code == Some("INTERNAL") => {
+            CausalDispatchError::Internal(format!("wait-path failed with HTTP {status}: {message}"))
+        }
+        _ => rejected("REJECTED", message),
+    }
+}
+
 pub(crate) async fn dispatch_wait_path(
     service: &Service,
     command: &str,

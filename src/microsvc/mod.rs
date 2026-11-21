@@ -95,6 +95,7 @@ pub use descriptor::{
     TransportDescriptor,
 };
 pub use error::HandlerError;
+pub use lifecycle::LifecycleGate;
 pub use projector::{
     CausalProjectorContext, CausalProjectorRouteBuilder, LoadedProjection, ProjectionRepairHandle,
     ProjectionRepairHandleParseError,
@@ -148,16 +149,6 @@ pub use session::{Session, ROLE_KEY, USER_ID_KEY};
 /// larger payloads.
 #[cfg(feature = "http")]
 pub const MAX_HTTP_BODY_BYTES: usize = 1024 * 1024;
-
-/// Fail closed for writes unless the supervisor admits this process instance
-/// to the active application generation. Outside dev there is no lifecycle
-/// directory, so ordinary production/runtime embedding remains unchanged.
-pub(crate) fn lifecycle_mutations_open() -> bool {
-    if std::env::var_os("DISTRIBUTED_LIFECYCLE_DIR").is_none() {
-        return true;
-    }
-    lifecycle::membership_from_environment().is_some_and(|member| member.mutations_open)
-}
 
 // HTTP transport (requires "http" feature)
 #[cfg(feature = "http")]

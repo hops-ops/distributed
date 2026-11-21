@@ -133,16 +133,6 @@ async fn command_handler(
     headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> impl IntoResponse {
-    if !super::lifecycle_mutations_open() {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(json!({
-                "code": "APPLICATION_RELOADING",
-                "error": "application generation is not active"
-            })),
-        )
-            .into_response();
-    }
     let session = session_from_headers(&headers);
     #[cfg(feature = "graphql")]
     let wait_path = match super::wait_path::parse_wait_path_body(&body) {
@@ -171,19 +161,23 @@ async fn command_handler(
                 Json(super::wait_path::wait_path_response(&result)),
             )
                 .into_response(),
+            Err(super::CausalDispatchError::Handler(HandlerError::ApplicationReloading)) => {
+                reloading_response()
+            }
             Err(err) => {
                 let status = StatusCode::from_u16(err.status_code())
                     .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
                 if status.is_server_error() {
                     eprintln!("microsvc command `{command}` failed: {err}");
                 }
-                let body = json!({ "error": err.client_message() });
+                let body = super::wait_path::wait_path_error_response(&err);
                 (status, Json(body)).into_response()
             }
         };
     }
     match service.dispatch(&command, body, session).await {
         Ok(value) => (StatusCode::OK, Json(value)).into_response(),
+        Err(HandlerError::ApplicationReloading) => reloading_response(),
         Err(err) => {
             let status = status_for_error(&err);
             if status.is_server_error() {
@@ -193,6 +187,19 @@ async fn command_handler(
             (status, Json(body)).into_response()
         }
     }
+}
+
+/// The response to a command refused by the service's
+/// [`LifecycleGate`](super::LifecycleGate).
+fn reloading_response() -> axum::response::Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(json!({
+            "code": "APPLICATION_RELOADING",
+            "error": "application generation is not active"
+        })),
+    )
+        .into_response()
 }
 
 fn status_for_error(error: &HandlerError) -> StatusCode {
