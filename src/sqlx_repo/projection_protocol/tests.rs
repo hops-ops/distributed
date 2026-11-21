@@ -776,7 +776,7 @@ mod tests {
             vec![None]
         );
 
-        let created = evidence_repository
+        evidence_repository
             .commit_projection(batch(
                 input(
                     1,
@@ -808,77 +808,6 @@ mod tests {
                 .scope(),
             &scope
         );
-        let observed = crate::projection_protocol::ProjectionObligationEvidenceRequest::new(
-            "evidence-cause",
-            scope.clone(),
-            ProjectionObservationKind::Record,
-        )
-        .unwrap();
-        let pending = crate::projection_protocol::ProjectionObligationEvidenceRequest::new(
-            "pending-cause",
-            scope.clone(),
-            ProjectionObservationKind::Record,
-        )
-        .unwrap();
-        let before_failure = evidence_repository
-            .projection_obligation_evidence_batch(
-                &ProjectionObligationEvidenceBatchRequest::new(vec![
-                    observed.clone(),
-                    pending.clone(),
-                ])
-                .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert!(matches!(
-            &before_failure.evidence[0],
-            ProjectionObligationEvidence::Observed(observation)
-                if observation.change == created.changes[0].cursor
-        ));
-        assert_eq!(
-            before_failure.evidence[1],
-            ProjectionObligationEvidence::Pending
-        );
-
-        let failure = evidence_repository
-            .record_projection_failure(
-                ProjectionFailureBatch::new(
-                    input(
-                        2,
-                        b"evidence-failed",
-                        "evidence-message-2",
-                        "evidence-cause",
-                        ProjectionGeneration::initial(),
-                    ),
-                    change_epoch(),
-                    "evidence-failure",
-                    "decode_error",
-                    b"bad evidence payload".to_vec(),
-                )
-                .unwrap(),
-            )
-            .await
-            .unwrap();
-        evidence_repository
-            .compact_projection_changes(&failure.change)
-            .await
-            .unwrap();
-        let after_failure = evidence_repository
-            .projection_obligation_evidence_batch(
-                &ProjectionObligationEvidenceBatchRequest::new(vec![observed, pending]).unwrap(),
-            )
-            .await
-            .unwrap();
-        assert!(matches!(
-            &after_failure.evidence[0],
-            ProjectionObligationEvidence::TerminalFailure(stored)
-                if stored == &failure
-        ));
-        assert_eq!(
-            after_failure.evidence[1],
-            ProjectionObligationEvidence::Pending
-        );
-
         let moved_repository = repository().await;
         let old_scope = record_scope();
         let old = moved_repository

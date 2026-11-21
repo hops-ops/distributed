@@ -904,8 +904,7 @@ test('artifact v1 is rejected at the public boundary', () => {
 			prepareReplicaCommand(
 				{
 					...artifact(),
-					version: 1,
-					effects: { version: 1, operations: [], fallback: 'revalidate' }
+					version: 1
 				},
 				{ id: 'todo-1', title: 'preview' },
 				{ commandId: COMMAND_A }

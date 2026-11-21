@@ -6,10 +6,7 @@ import {
 } from './constants.js';
 import type {
 	ReplicaCommandArtifact,
-	ReplicaCommandEffect,
 	ReplicaCommandEffectExpression,
-	ReplicaCommandEffectField,
-	ReplicaCommandEffectKey,
 	ReplicaCommandEffectRelationship,
 	ReplicaCommandInputDefaults,
 	ReplicaCommandShape,
@@ -41,12 +38,6 @@ export function validateArtifact<TInput, TOutput>(
 	allowTrustedPresets: boolean
 ): readonly ReplicaTrustedPresetDescriptor[] {
 	if (artifact.version !== 2) artifactInvalid('artifact.version');
-	if (
-		Object.prototype.hasOwnProperty.call(artifact, 'effects') ||
-		Object.prototype.hasOwnProperty.call(artifact, 'confirmations')
-	) {
-		artifactInvalid('artifact.version');
-	}
 	nonempty(artifact.name, 'artifact.name');
 	if (!GRAPHQL_NAME.test(artifact.mutationField)) {
 		artifactInvalid('artifact.mutationField');
@@ -430,59 +421,6 @@ export function validateDefaults(
 	}
 }
 
-export function validateConfirmations<TInput, TOutput>(
-	artifact: Readonly<{
-		confirmations?: import('./types.js').ReplicaCommandConfirmations;
-		consistency: ReplicaCommandArtifact<TInput, TOutput>['consistency'];
-		input: ReplicaCommandArtifact<TInput, TOutput>['input'];
-	}>
-): void {
-	const confirmations = artifact.confirmations;
-	if (confirmations === undefined) {
-		if (artifact.consistency === 'eventual') {
-			artifactInvalid('artifact.confirmations');
-		}
-		return;
-	}
-	if (
-		confirmations.version !== 1 ||
-		confirmations.fallback !== 'revalidate' ||
-		!Array.isArray(confirmations.expected)
-	) {
-		artifactInvalid('artifact.confirmations');
-	}
-	if (confirmations.kind === 'unavailable') {
-		if (confirmations.expected.length !== 0) {
-			artifactInvalid('artifact.confirmations.expected');
-		}
-	} else if (confirmations.kind === 'finite') {
-		if (confirmations.expected.length === 0) {
-			artifactInvalid('artifact.confirmations.expected');
-		}
-	} else {
-		artifactInvalid('artifact.confirmations.kind');
-	}
-	if (artifact.consistency === 'atomic') {
-		artifactInvalid('artifact.confirmations');
-	}
-	if (confirmations.kind === 'finite') {
-		for (let index = 0; index < confirmations.expected.length; index += 1) {
-			const confirmation = confirmations.expected[index]!;
-			const path = `artifact.confirmations.expected[${index}]`;
-			requiredString(confirmation.projector, `${path}.projector`);
-			requiredString(confirmation.model, `${path}.model`);
-			validateKeyArtifact(confirmation.key, artifact.input, `${path}.key`);
-			if (confirmation.partition !== undefined) {
-				validateExpressionArtifact(
-					confirmation.partition,
-					artifact.input,
-					`${path}.partition`
-				);
-			}
-		}
-	}
-}
-
 export function validateDirectProjection<TInput, TOutput>(
 	artifact: ReplicaCommandArtifact<TInput, TOutput>
 ): void {
@@ -573,80 +511,6 @@ export function validateRevalidation<TInput, TOutput>(
 		!plan.required
 	) {
 		artifactInvalid('artifact.revalidation.required');
-	}
-}
-
-export function validateEffectArtifact(
-	effect: ReplicaCommandEffect,
-	input: ReplicaCommandShape,
-	path: string
-): void {
-	if (effect === null || typeof effect !== 'object') artifactInvalid(path);
-	switch (effect.kind) {
-		case 'upsert':
-		case 'patch':
-			requiredString(effect.model, `${path}.model`);
-			validateKeyArtifact(effect.key, input, `${path}.key`);
-			validateFieldsArtifact(effect.fields, input, `${path}.fields`);
-			return;
-		case 'delete':
-			requiredString(effect.model, `${path}.model`);
-			validateKeyArtifact(effect.key, input, `${path}.key`);
-			return;
-		case 'link':
-		case 'unlink':
-			validateRelationshipArtifact(
-				effect.relationship,
-				`${path}.relationship`
-			);
-			validateKeyArtifact(effect.source, input, `${path}.source`);
-			validateKeyArtifact(effect.target, input, `${path}.target`);
-			return;
-		case 'invalidate_model':
-			requiredString(effect.model, `${path}.model`);
-			return;
-		case 'invalidate_relationship':
-			validateRelationshipArtifact(
-				effect.relationship,
-				`${path}.relationship`
-			);
-			validateKeyArtifact(effect.source, input, `${path}.source`);
-			return;
-		default:
-			artifactInvalid(`${path}.kind`);
-	}
-}
-
-export function validateKeyArtifact(
-	key: ReplicaCommandEffectKey,
-	input: ReplicaCommandShape,
-	path: string
-): void {
-	if (
-		key === null ||
-		typeof key !== 'object' ||
-		!Array.isArray(key.fields) ||
-		key.fields.length === 0
-	) {
-		artifactInvalid(path);
-	}
-	validateFieldsArtifact(key.fields, input, `${path}.fields`);
-}
-
-export function validateFieldsArtifact(
-	fields: readonly ReplicaCommandEffectField[],
-	input: ReplicaCommandShape,
-	path: string
-): void {
-	if (!Array.isArray(fields)) artifactInvalid(path);
-	const names = new Set<string>();
-	for (let index = 0; index < fields.length; index += 1) {
-		const field = fields[index]!;
-		const fieldPath = `${path}[${index}]`;
-		const name = requiredString(field.field, `${fieldPath}.field`);
-		if (names.has(name)) artifactInvalid(`${fieldPath}.field`);
-		names.add(name);
-		validateExpressionArtifact(field.value, input, `${fieldPath}.value`);
 	}
 }
 

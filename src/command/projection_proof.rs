@@ -19,7 +19,7 @@ pub(crate) enum CommandCommitProofError {
     },
     OutputTypeMismatch,
     DurableEventMissing,
-    CausalHasNoConfirmations,
+    EventualHasNoProjectionSelectors,
     UnexpectedProjectionProof,
     MissingProjectionProof,
     ProjectionOutputTypeMismatch,
@@ -50,8 +50,8 @@ impl std::fmt::Display for CommandCommitProofError {
             Self::DurableEventMissing => formatter.write_str(
                 "causal and projected commands require a staged aggregate event or domain event",
             ),
-            Self::CausalHasNoConfirmations => formatter.write_str(
-                "a causal command requires at least one finite projector confirmation",
+            Self::EventualHasNoProjectionSelectors => formatter.write_str(
+                "an eventual command must declare at least one projection event selector",
             ),
             Self::UnexpectedProjectionProof => formatter.write_str(
                 "succeeded and causal commands cannot carry a same-transaction projection proof",

@@ -19,8 +19,7 @@ use crate::projection_protocol::{
     ProjectionFailureBatch, ProjectionFailureLocation, ProjectionGeneration,
     ProjectionGraphIncludeSnapshot, ProjectionGraphSnapshot, ProjectionGraphSnapshotRequest,
     ProjectionInputCursor, ProjectionInputDisposition, ProjectionInputFingerprint,
-    ProjectionLiveRecordBatch, ProjectionLiveRecordBatchRequest, ProjectionObligationEvidence,
-    ProjectionObligationEvidenceBatch, ProjectionObligationEvidenceBatchRequest,
+    ProjectionLiveRecordBatch, ProjectionLiveRecordBatchRequest,
     ProjectionObligationEvidenceRequest, ProjectionObservation, ProjectionObservationKind,
     ProjectionObservationTarget, ProjectionPartitionRuntimeState, ProjectionPendingRetry,
     ProjectionProtocolError, ProjectionProtocolStore, ProjectionQuerySnapshot,
@@ -53,8 +52,8 @@ pub(super) use state::{reject_causal_owned_plans, InMemoryProjectionProtocolStat
 
 use read_helpers::{
     read_projection_execution_snapshot_batch_from_state, read_projection_graph_snapshot_from_state,
-    read_projection_live_record_from_state, read_projection_obligation_evidence_from_state,
-    read_projection_query_snapshot_from_state, validate_observation_from_state,
+    read_projection_live_record_from_state, read_projection_query_snapshot_from_state,
+    validate_observation_from_state,
 };
 use state::*;
 use util::storage_key_belongs_to_table;

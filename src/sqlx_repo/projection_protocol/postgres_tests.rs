@@ -1159,25 +1159,6 @@ mod postgres_tests {
             1,
             5,
         );
-        let causal_probe = crate::projection_protocol::ProjectionObligationEvidenceRequest::new(
-            "postgres-cause-5",
-            scope(),
-            ProjectionObservationKind::Record,
-        )
-        .unwrap();
-        assert!(matches!(
-            repository
-                .projection_obligation_evidence_batch(
-                    &ProjectionObligationEvidenceBatchRequest::new(vec![causal_probe.clone()])
-                        .unwrap(),
-                )
-                .await
-                .unwrap()
-                .evidence
-                .as_slice(),
-            [ProjectionObligationEvidence::Observed(_)]
-        ));
-
         assert_eq!(
             repository
                 .commit_projection(batch(
@@ -1650,19 +1631,6 @@ mod postgres_tests {
             retained_failure_change, 0,
             "bounded retention must compact the failure change before evidence lookup"
         );
-        assert!(matches!(
-            repository
-                .projection_obligation_evidence_batch(
-                    &ProjectionObligationEvidenceBatchRequest::new(vec![causal_probe]).unwrap(),
-                )
-                .await
-                .unwrap()
-                .evidence
-                .as_slice(),
-            [ProjectionObligationEvidence::TerminalFailure(stored)]
-                if stored == &failure
-        ));
-
         let physical_version: i64 = sqlx::query_scalar(
             "SELECT _sourced_version FROM postgres_projection_views WHERE id = $1",
         )

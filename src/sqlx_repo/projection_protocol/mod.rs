@@ -30,11 +30,10 @@ use crate::projection_protocol::{
     ProjectionGraphIncludeSnapshot, ProjectionGraphSnapshot, ProjectionGraphSnapshotRequest,
     ProjectionInputCursor, ProjectionInputDisposition, ProjectionInputFingerprint,
     ProjectionLiveRecordBatch, ProjectionLiveRecordBatchRequest, ProjectionModelOwnership,
-    ProjectionObligationEvidence, ProjectionObligationEvidenceBatch,
-    ProjectionObligationEvidenceBatchRequest, ProjectionObservation, ProjectionObservationKind,
-    ProjectionObservationTarget, ProjectionPartitionRuntimeState, ProjectionPartitionSnapshot,
-    ProjectionPendingRetry, ProjectionProtocolError, ProjectionProtocolStore,
-    ProjectionQuerySnapshot, ProjectionQuerySnapshotBatch, ProjectionQuerySnapshotBatchRequest,
+    ProjectionObservation, ProjectionObservationKind, ProjectionObservationTarget,
+    ProjectionPartitionRuntimeState, ProjectionPartitionSnapshot, ProjectionPendingRetry,
+    ProjectionProtocolError, ProjectionProtocolStore, ProjectionQuerySnapshot,
+    ProjectionQuerySnapshotBatch, ProjectionQuerySnapshotBatchRequest,
     ProjectionQuerySnapshotRequest, ProjectionRecordExpectation, ProjectionRecordMetadata,
     ProjectionRecordScope, ProjectionScopeCodec, ProjectionScopedRowSnapshot, ProjectionSource,
     ProjectorTopologyId, RecordRevision, RecordTransition, SameTransactionProjectionBatch,
@@ -74,7 +73,6 @@ use reads::*;
 pub(crate) use reads::{
     apply_same_transaction_projection_in_tx, read_projection_causation_evidence_in_executor,
     read_projection_changes_in_executor, read_projection_live_record_batch_in_executor,
-    read_projection_obligation_evidence_batch_in_executor,
     read_projection_query_snapshot_in_executor, with_projection_read_snapshot,
 };
 use types::*;

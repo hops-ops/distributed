@@ -51,8 +51,10 @@ where
 }
 
 #[test]
-fn neutral_declarations_preserve_the_pre_extraction_artifact() {
-    // Captured from d188010d before changing the command implementation.
+fn neutral_declarations_match_the_frozen_artifact() {
+    // The fixture is the current neutral spec and SDL. It was captured at
+    // d188010d and edited since: `effects` and `confirmations` left the spec
+    // and its fingerprint changed when those protocols were deleted.
     let expected: serde_json::Value =
         serde_json::from_str(include_str!("fixtures/core-command-contract-v1.json")).unwrap();
     assert_eq!(

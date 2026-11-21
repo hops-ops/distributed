@@ -109,7 +109,7 @@ impl TypedCommandContract {
     ) -> Result<(), CommandCommitProofError> {
         if self.consistency == CommandConsistency::Eventual && self.projections.selectors.is_empty()
         {
-            return Err(CommandCommitProofError::CausalHasNoConfirmations);
+            return Err(CommandCommitProofError::EventualHasNoProjectionSelectors);
         }
         Ok(())
     }

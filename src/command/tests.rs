@@ -520,7 +520,7 @@ fn repeated_preview_declarations_preserve_synthetic_occurrence_order() {
 }
 
 #[test]
-fn succeeded_without_confirmations_allows_an_empty_domain_batch() {
+fn succeeded_allows_an_empty_domain_batch() {
     let contract = typed_command::<Input, Succeeded<Payload>>("todo.check").into_contract();
     let prepared = PreparedCommand::<Succeeded<Payload>>::prepare(Payload {
         id: "todo-1".into(),
@@ -533,7 +533,7 @@ fn succeeded_without_confirmations_allows_an_empty_domain_batch() {
 }
 
 #[test]
-fn causal_without_a_finite_confirmation_fails_at_commit_validation() {
+fn eventual_without_projection_selectors_fails_at_commit_validation() {
     let contract = typed_command::<Input, Eventual<Payload>>("todo.create").into_contract();
     let prepared = PreparedCommand::<Eventual<Payload>>::prepare(Payload {
         id: "todo-1".into(),
@@ -545,7 +545,7 @@ fn causal_without_a_finite_confirmation_fails_at_commit_validation() {
         prepared
             .validate_commit_evidence(&contract, false, &[fact], &[], None)
             .unwrap_err(),
-        CommandCommitProofError::CausalHasNoConfirmations
+        CommandCommitProofError::EventualHasNoProjectionSelectors
     );
 }
 

@@ -40,8 +40,7 @@ use crate::projection_protocol::{
     ProjectionCommitBatch, ProjectionCommitResult, ProjectionFailure, ProjectionFailureBatch,
     ProjectionFailureLocation, ProjectionGeneration, ProjectionInputCursor,
     ProjectionInputDisposition, ProjectionLiveRecordBatch, ProjectionLiveRecordBatchRequest,
-    ProjectionModelOwnership, ProjectionObligationEvidenceBatch,
-    ProjectionObligationEvidenceBatchRequest, ProjectionObservation, ProjectionObservationKind,
+    ProjectionModelOwnership, ProjectionObservation, ProjectionObservationKind,
     ProjectionPartitionRuntimeState, ProjectionProtocolError, ProjectionProtocolStore,
     ProjectionQuerySnapshot, ProjectionQuerySnapshotBatch, ProjectionQuerySnapshotBatchRequest,
     ProjectionQuerySnapshotRequest, ProjectionRecordMetadata, ProjectionRecordScope,
@@ -771,15 +770,6 @@ impl ProjectionProtocolStore for AmbiguousCommitRepository {
     ) -> impl Future<Output = Result<ProjectionQuerySnapshotBatch, ProjectionProtocolError>> + Send + 'a
     {
         self.inner.projection_query_snapshot_batch(request)
-    }
-
-    fn projection_obligation_evidence_batch<'a>(
-        &'a self,
-        request: &'a ProjectionObligationEvidenceBatchRequest,
-    ) -> impl Future<Output = Result<ProjectionObligationEvidenceBatch, ProjectionProtocolError>>
-           + Send
-           + 'a {
-        self.inner.projection_obligation_evidence_batch(request)
     }
 
     fn projection_live_record_batch<'a>(
