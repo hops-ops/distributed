@@ -5,6 +5,10 @@ use crate::lock::{LockError, RetryClass};
 use crate::table::TableStoreError;
 use crate::EventRecordError;
 
+/// Load-run-commit attempts before a persistent
+/// [`RepositoryError::ConcurrentWrite`] is surfaced.
+pub(crate) const CONCURRENT_WRITE_RETRIES: usize = 3;
+
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum RepositoryError {

@@ -124,10 +124,10 @@ fn direct_projection_evidence(marker: &str) -> SameTransactionProjectionEvidence
     }
 }
 
-fn attach_test_direct_projection(
-    mut completion: CommandCompletion,
+fn attach_test_direct_projection<'a>(
+    mut completion: CommandCompletion<'a>,
     marker: &str,
-) -> CommandCompletion {
+) -> CommandCompletion<'a> {
     completion
         .attach_direct_projection(&direct_projection_evidence(marker))
         .unwrap();
@@ -611,10 +611,9 @@ where
     assert_eq!(
         repo.lookup_command(
             &key,
-            CommandLookupScope::CommandContract {
-                command_name: "order.create",
-                contract_fingerprint: &wrong_contract,
-            },
+            CommandLookupScope::Route(&|command, fingerprint| {
+                command == "order.create" && fingerprint == &wrong_contract
+            }),
         )
         .await
         .unwrap(),
@@ -625,10 +624,9 @@ where
     let contract_lookup = repo
         .lookup_command(
             &key,
-            CommandLookupScope::CommandContract {
-                command_name: "order.create",
-                contract_fingerprint: &current_contract,
-            },
+            CommandLookupScope::Route(&|command, fingerprint| {
+                command == "order.create" && fingerprint == &current_contract
+            }),
         )
         .await
         .unwrap();
@@ -1385,9 +1383,8 @@ fn replay_validates_envelope_and_returns_only_the_outcome() {
     let reservation = reservation(&id, 1, 2).unwrap();
     let started = SystemTime::UNIX_EPOCH + Duration::from_secs(100);
     let mut row = CommandLedgerRecord::initial(&reservation, started).unwrap();
-    let completion = row
-        .acquired_attempt()
-        .unwrap()
+    let attempt = row.acquired_attempt().unwrap();
+    let completion = attempt
         .complete(
             TerminalCommandState::Succeeded,
             serde_json::json!({"order_id": "o-1"}),
@@ -1414,9 +1411,8 @@ fn modeled_projection_metadata_replays_exact_bytes_without_plaintext_scope_mater
     let mut row = CommandLedgerRecord::initial(&reservation, started).unwrap();
     let metadata =
         br#"{"role_safe":true,"opaque_scope":"v1.projection-obligation.token"}"#.to_vec();
-    let completion = row
-        .acquired_attempt()
-        .unwrap()
+    let attempt = row.acquired_attempt().unwrap();
+    let completion = attempt
         .complete_with_projection_metadata(
             TerminalCommandState::SucceededPendingProjection,
             serde_json::json!({"todo_id": "todo-1"}),
@@ -1448,9 +1444,8 @@ fn modeled_projection_metadata_and_ledger_share_one_absolute_retention_deadline(
     let started = SystemTime::UNIX_EPOCH + Duration::from_secs(100);
     let deadline = started + Duration::from_secs(301);
     let mut row = CommandLedgerRecord::initial(&request, started).unwrap();
-    let completion = row
-        .acquired_attempt()
-        .unwrap()
+    let attempt = row.acquired_attempt().unwrap();
+    let completion = attempt
         .complete_with_projection_metadata_until(
             TerminalCommandState::SucceededPendingProjection,
             serde_json::json!({"todo_id": "todo-deadline"}),

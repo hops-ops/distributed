@@ -13,6 +13,7 @@ mod traits;
 mod validation;
 
 pub use error::RepositoryError;
+pub(crate) use error::CONCURRENT_WRITE_RETRIES;
 pub use identity::StreamIdentity;
 pub use inbox::{InboxOutcome, InboxReceipt};
 pub use traits::{

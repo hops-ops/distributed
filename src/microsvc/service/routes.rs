@@ -1,7 +1,7 @@
 use super::causal::{
-    abandon_attempt, handler_error_code, internal_ledger_error, load_committed_result,
-    rejection_outcome, resolve_ambiguous_lookup, CausalDispatchError, CausalDispatchResult,
-    CommandIngress, ModeledProjectionMetadata,
+    abandon_attempt, handler_error_code, internal_ledger_error, rejection_outcome,
+    resolve_ambiguous_lookup, CausalDispatchError, CausalDispatchResult, CommandIngress,
+    ModeledProjectionMetadata,
 };
 #[cfg(feature = "graphql")]
 use super::causal::{
@@ -23,13 +23,13 @@ use crate::command::{
 };
 use crate::command_ledger::{
     CanonicalInputHash, CausalCommitBatch, CausalTransactionalCommit, CommandAttempt,
-    CommandLedgerStore, ReservationOutcome, TerminalCommandState,
+    CommandContractFingerprint, CommandLedgerError, CommandLedgerStore, ReservationOutcome,
+    TerminalCommandState,
 };
 #[cfg(feature = "graphql")]
 use crate::command_ledger::{
-    CausalRepositoryIdentity, CommandContractFingerprint, CommandId, CommandLedgerKey,
-    CommandLookup, CommandLookupScope, CommandReservation, ExternalDispatchBinding,
-    PrincipalPartitionId,
+    CausalRepositoryIdentity, CausalStorageIdentity, CommandId, CommandLedgerKey, CommandLookup,
+    CommandLookupScope, CommandReservation, ExternalDispatchBinding, PrincipalPartitionId,
 };
 #[cfg(feature = "graphql")]
 use crate::graphql::identity::VerifiedPrincipal;
@@ -187,6 +187,11 @@ pub(super) type CausalHandlerFuture<'a> =
 pub(super) type CausalStatusFuture<'a> = Pin<
     Box<dyn Future<Output = Result<CausalCommandPublicStatus, CausalDispatchError>> + Send + 'a>,
 >;
+/// The consistency of the route a caller may read a ledger row through,
+/// given the command name and contract fingerprint the row stores.
+#[cfg(feature = "graphql")]
+pub(super) type CausalStatusRoute<'a> =
+    dyn Fn(&str, &[u8; 32]) -> Option<CommandConsistency> + Send + Sync + 'a;
 #[cfg(feature = "graphql")]
 pub(super) type ExternalReservationFuture<'a> = Pin<
     Box<dyn Future<Output = Result<ExternalCausalReservation, CausalDispatchError>> + Send + 'a>,
@@ -201,11 +206,20 @@ pub(super) type ExternalAbandonFuture<'a> =
 pub(super) trait ErasedCausalHandler<D>: Send + Sync {
     fn contract(&self) -> &TypedCommandContract;
 
+    /// The ledger fingerprint of [`Self::contract`].
     #[cfg(feature = "graphql")]
-    fn contract_mut(&mut self) -> &mut TypedCommandContract;
+    fn contract_fingerprint(&self) -> &CommandContractFingerprint;
+
+    /// Bind the Surface-resolved owner of an `Atomic` command's projection.
+    /// The only way a registered contract changes.
+    #[cfg(feature = "graphql")]
+    fn bind_direct_projection(
+        &mut self,
+        direct_projection: Option<crate::command::CommandDirectProjectionTarget>,
+    );
 
     #[cfg(feature = "graphql")]
-    fn storage_identity(&self, dependencies: &D) -> crate::command_ledger::CausalStorageIdentity;
+    fn storage_identity(&self, dependencies: &D) -> CausalStorageIdentity;
 
     #[cfg(feature = "graphql")]
     #[allow(clippy::too_many_arguments)]
@@ -241,14 +255,16 @@ pub(super) trait ErasedCausalHandler<D>: Send + Sync {
         principal: VerifiedPrincipal,
     ) -> Pin<Box<dyn Future<Output = Result<CommandLookup, CausalDispatchError>> + Send + 'a>>;
 
+    /// The status of the one ledger row under `key` in this handler's
+    /// repository, whichever route wrote it: `route` names the route that
+    /// may see a row.
     #[cfg(feature = "graphql")]
     fn status<'a>(
         &'a self,
         dependencies: &'a D,
-        service_id: &'a str,
+        key: &'a CommandLedgerKey,
         command_id: &'a CommandId,
-        principal_partition: &'a PrincipalPartitionId,
-        session: &'a Session,
+        route: &'a CausalStatusRoute<'a>,
         protocol: Option<crate::graphql::protocol::ProtocolResponseAccumulator>,
     ) -> CausalStatusFuture<'a>;
 
@@ -296,6 +312,9 @@ where
     K: CommandOutcome,
 {
     contract: TypedCommandContract,
+    /// `contract.fingerprint_bytes()`, computed whenever the contract is set:
+    /// at registration and in `bind_direct_projection`, its only mutation.
+    fingerprint: CommandContractFingerprint,
     guard: Option<Arc<CausalGuardFn<A>>>,
     handle: Arc<PreparedHandlerFn<A, I, K>>,
     /// The route declared [`Capability::Clock`](crate::schedule::Capability):
@@ -325,6 +344,7 @@ where
         requires_scheduling: bool,
     ) -> Self {
         Self {
+            fingerprint: CommandContractFingerprint::new(contract.fingerprint_bytes()),
             contract,
             guard,
             handle,
@@ -422,13 +442,27 @@ pub(super) trait ErasedRoutes: Send + Sync {
         principal: VerifiedPrincipal,
     ) -> Pin<Box<dyn Future<Output = Result<CommandLookup, CausalDispatchError>> + Send + 'a>>;
 
+    /// The repository every typed command of this bundle commits to.
+    #[cfg(feature = "graphql")]
+    fn causal_storage_identity(&self) -> Option<CausalStorageIdentity>;
+
+    /// The consistency of this bundle's `command`, if `session` is still
+    /// granted it and its contract still has `fingerprint`.
+    #[cfg(feature = "graphql")]
+    fn causal_status_route(
+        &self,
+        command: &str,
+        fingerprint: &[u8; 32],
+        session: &Session,
+    ) -> Option<CommandConsistency>;
+
+    /// One ledger lookup of `key` in this bundle's repository.
     #[cfg(feature = "graphql")]
     fn causal_command_status<'a>(
         &'a self,
-        service_id: &'a str,
+        key: &'a CommandLedgerKey,
         command_id: &'a CommandId,
-        principal_partition: &'a PrincipalPartitionId,
-        session: &'a Session,
+        route: &'a CausalStatusRoute<'a>,
         protocol: Option<crate::graphql::protocol::ProtocolResponseAccumulator>,
     ) -> CausalStatusFuture<'a>;
 
@@ -1509,14 +1543,19 @@ impl<D: Send + Sync + 'static> Routes<D> {
         self
     }
 
-    pub(super) fn typed_contracts(&self) -> Vec<&TypedCommandContract> {
+    fn causal_handlers(&self) -> impl Iterator<Item = &dyn ErasedCausalHandler<D>> {
         self.handlers
             .values()
             .flat_map(HashMap::values)
             .filter_map(|handler| match handler {
-                RegisteredHandler::Causal(handler) => Some(handler.contract()),
+                RegisteredHandler::Causal(handler) => Some(handler.as_ref()),
                 RegisteredHandler::Legacy { .. } | RegisteredHandler::Projector(_) => None,
             })
+    }
+
+    pub(super) fn typed_contracts(&self) -> Vec<&TypedCommandContract> {
+        self.causal_handlers()
+            .map(|handler| handler.contract())
             .collect()
     }
 
@@ -1713,25 +1752,27 @@ where
 {
     /// The one transaction that settles `attempt`. An error is the detail to
     /// abandon the attempt with.
-    fn commit_batch(
-        &mut self,
+    fn commit_batch<'b>(
+        &'b mut self,
         ingress: &CommandIngress<'_>,
-        attempt: CommandAttempt,
+        attempt: &'b CommandAttempt,
         retention: Duration,
-    ) -> Result<CausalCommitBatch<'_>, String> {
+    ) -> Result<CausalCommitBatch<'b>, String> {
         let payload = self.prepared.serialized_payload().clone();
-        let mut batch = self
+        let batch = self
             .parts
             .prepare_commit_batch()
             .map_err(|error| format!("causal commit batch preparation failed: {error}"))?;
         let outcome = match ingress {
             CommandIngress::Service { .. } => {
-                // Stamp causation. Rows are committed pending; the publisher claims.
+                // Rows are committed pending; the publisher claims them by ID.
                 if self.publisher.is_some() {
-                    for message in &mut batch.outbox_messages {
-                        message.overwrite_causation_id(attempt.causation_id().as_str());
-                        self.outbox_ids.push(message.id().to_string());
-                    }
+                    self.outbox_ids.extend(
+                        batch
+                            .outbox_messages
+                            .iter()
+                            .map(|message| message.id().to_string()),
+                    );
                 }
                 payload
             }
@@ -1795,6 +1836,10 @@ where
     /// refusal commits a terminal rejection, any other failure before the
     /// commit abandons the attempt, and a commit that did not report success
     /// is resolved from the ledger.
+    ///
+    /// A commit that lost an optimistic stream-version race rolled back, so
+    /// the attempt is still this caller's: the handler runs again on the
+    /// reloaded aggregate, a bounded number of times.
     async fn execute_typed_command<D>(
         &self,
         dependencies: &D,
@@ -1814,16 +1859,15 @@ where
         let typed = canonical
             .decode::<I>()
             .map_err(|error| CausalDispatchError::BadRequest(error.to_string()))?;
-        let (input, wire, input_digest) = typed.into_parts();
-        let direct_projection_target = match &ingress {
-            CommandIngress::Service { .. } => self
-                .contract
-                .resolve_direct_projection_target_from_session(&wire, Some(&session))
-                .map_err(|error| CausalDispatchError::Internal(error.to_string()))?,
-            CommandIngress::Cell { .. } => None,
-        };
-        let reservation =
-            ingress.reservation(&self.contract, CanonicalInputHash::new(input_digest))?;
+        let (input, wire, payload, input_digest) = typed.into_parts();
+        let direct_projection_target = self
+            .direct_projection_target(&ingress, &wire, &session)
+            .map_err(CausalDispatchError::Internal)?;
+        let reservation = ingress.reservation(
+            &self.contract.name,
+            self.fingerprint,
+            CanonicalInputHash::new(input_digest),
+        )?;
 
         let aggregate_repository = dependencies.__causal_aggregate_repository();
         let repository = aggregate_repository.repo();
@@ -1860,92 +1904,7 @@ where
 
         let fence = attempt.fence();
         let retention = ingress.policy().replay_retention;
-        let mut staged = self
-            .stage_command(
-                &ingress,
-                aggregate_repository,
-                &attempt,
-                &session,
-                input,
-                &wire,
-                direct_projection_target,
-            )
-            .await;
-        let batch = match &mut staged {
-            Ok(staged) => staged.commit_batch(&ingress, attempt, retention),
-            Err(Failure::Reject {
-                code,
-                status,
-                message,
-            }) => attempt
-                .complete(
-                    TerminalCommandState::Rejected,
-                    rejection_outcome(code, *status, message),
-                    retention,
-                )
-                .map(|completion| CausalCommitBatch::new(CommitBatch::empty(), completion))
-                .map_err(|error| error.to_string()),
-            Err(Failure::Abandon(detail)) => Err(std::mem::take(detail)),
-        };
-        let batch = match batch {
-            Ok(batch) => batch,
-            Err(detail) => {
-                return abandon_attempt(repository, &ingress, consistency, fence, detail).await;
-            }
-        };
-        if let Err(error) = repository.commit_causal_batch(batch).await {
-            return resolve_ambiguous_lookup(
-                repository,
-                &ingress,
-                consistency,
-                fence,
-                error.to_string(),
-            )
-            .await;
-        }
-
-        // Committed: the attempt is terminal, as the rejection or the receipt.
-        let mut staged = staged?;
-        staged.parts.mark_committed_state().map_err(|error| {
-            CausalDispatchError::Internal(format!(
-                "committed causal workspace cleanup failed: {error}"
-            ))
-        })?;
-        if let Some(publisher) = staged.publisher {
-            publisher.publish_after_commit(staged.outbox_ids).await;
-        }
-        let serialized = staged.prepared.finalize_after_commit();
-        let result = load_committed_result(repository, &ingress, consistency, &fence).await?;
-        if result.payload != serialized {
-            return Err(CausalDispatchError::Internal(
-                "durable command replay outcome differs from the committed handler payload".into(),
-            ));
-        }
-        Ok(result)
-    }
-
-    /// Run the guard and the handler under `attempt` and validate what they
-    /// staged. Nothing is written: the caller commits or settles the failure.
-    #[allow(clippy::too_many_arguments)]
-    async fn stage_command<'a, R>(
-        &self,
-        ingress: &CommandIngress<'_>,
-        aggregate_repository: &'a crate::aggregate::AggregateRepository<R, A>,
-        attempt: &CommandAttempt,
-        session: &Session,
-        input: I,
-        wire: &Value,
-        direct_projection_target: Option<crate::command::ResolvedDirectProjectionTarget>,
-    ) -> Result<StagedCommand<'a, A, K>, Failure>
-    where
-        R: CausalRepositoryBackend,
-    {
         let causation_id = attempt.causation_id();
-        let payload = serde_json::to_vec(wire).map_err(|error| {
-            Failure::Abandon(format!(
-                "canonical command input could not be encoded: {error}"
-            ))
-        })?;
         let mut metadata = session
             .variables()
             .iter()
@@ -1965,9 +1924,154 @@ where
             metadata,
         };
 
+        // A run consumes its decoded input and projection target. Both are
+        // pure functions of the canonical input, so a rerun derives them again.
+        let mut decoded = Some((input, direct_projection_target));
+        let mut runs = 0;
+        let (staged, replay) = loop {
+            runs += 1;
+            let decoded = match decoded.take() {
+                Some(decoded) => Ok(decoded),
+                None => serde_json::from_value::<I>(wire.clone())
+                    .map_err(Failure::abandon)
+                    .and_then(|input| {
+                        let target = self
+                            .direct_projection_target(&ingress, &wire, &session)
+                            .map_err(Failure::Abandon)?;
+                        Ok((input, target))
+                    }),
+            };
+            let mut staged = match decoded {
+                Ok((input, direct_projection_target)) => {
+                    self.stage_command(
+                        &ingress,
+                        aggregate_repository,
+                        &message,
+                        causation_id,
+                        &session,
+                        input,
+                        direct_projection_target,
+                    )
+                    .await
+                }
+                Err(failure) => Err(failure),
+            };
+            let batch = match &mut staged {
+                Ok(staged) => staged.commit_batch(&ingress, &attempt, retention),
+                Err(Failure::Reject {
+                    code,
+                    status,
+                    message,
+                }) => attempt
+                    .complete(
+                        TerminalCommandState::Rejected,
+                        rejection_outcome(code, *status, message),
+                        retention,
+                    )
+                    .map(|completion| CausalCommitBatch::new(CommitBatch::empty(), completion))
+                    .map_err(|error| error.to_string()),
+                Err(Failure::Abandon(detail)) => Err(std::mem::take(detail)),
+            };
+            let batch = match batch {
+                Ok(batch) => batch,
+                Err(detail) => {
+                    return abandon_attempt(
+                        repository,
+                        &ingress,
+                        consistency,
+                        fence,
+                        CausalDispatchError::Internal(detail),
+                    )
+                    .await;
+                }
+            };
+            match repository.commit_causal_batch(batch).await {
+                Ok(completion) => {
+                    let replay = completion.into_replay(&self.contract.name);
+                    break (staged, replay);
+                }
+                // The only failure known to have rolled back.
+                Err(CommandLedgerError::Storage(crate::RepositoryError::ConcurrentWrite {
+                    ..
+                })) => {
+                    if runs < crate::repository::CONCURRENT_WRITE_RETRIES {
+                        continue;
+                    }
+                    return abandon_attempt(
+                        repository,
+                        &ingress,
+                        consistency,
+                        fence,
+                        CausalDispatchError::ConcurrentWrite,
+                    )
+                    .await;
+                }
+                Err(error) => {
+                    return resolve_ambiguous_lookup(
+                        repository,
+                        &ingress,
+                        consistency,
+                        fence,
+                        CausalDispatchError::Internal(error.to_string()),
+                    )
+                    .await;
+                }
+            }
+        };
+
+        // Committed: the attempt is terminal, as the rejection or the receipt.
+        let mut staged = staged?;
+        staged.parts.mark_committed_state().map_err(|error| {
+            CausalDispatchError::Internal(format!(
+                "committed causal workspace cleanup failed: {error}"
+            ))
+        })?;
+        if let Some(publisher) = staged.publisher {
+            publisher.publish_after_commit(staged.outbox_ids).await;
+        }
+        // The receipt is the committed completion itself, decoded exactly as
+        // a later replay of this command ID decodes the stored row.
+        ingress
+            .replay(consistency, replay.map_err(internal_ledger_error)?)
+            .map(CausalDispatchResult::fresh)
+    }
+
+    /// The projection row an `Atomic` service command owns for this input.
+    fn direct_projection_target(
+        &self,
+        ingress: &CommandIngress<'_>,
+        wire: &Value,
+        session: &Session,
+    ) -> Result<Option<crate::command::ResolvedDirectProjectionTarget>, String> {
+        match ingress {
+            CommandIngress::Service { .. } => self
+                .contract
+                .resolve_direct_projection_target_from_session(wire, Some(session))
+                .map_err(|error| error.to_string()),
+            CommandIngress::Cell { .. } => Ok(None),
+        }
+    }
+
+    /// Run the guard and the handler on a fresh workspace and validate what
+    /// they staged. Nothing is written: the caller commits or settles the
+    /// failure.
+    #[allow(clippy::too_many_arguments)]
+    async fn stage_command<'a, R>(
+        &self,
+        ingress: &CommandIngress<'_>,
+        aggregate_repository: &'a crate::aggregate::AggregateRepository<R, A>,
+        message: &Message,
+        causation_id: &crate::command_ledger::CausationId,
+        session: &Session,
+        input: I,
+        direct_projection_target: Option<crate::command::ResolvedDirectProjectionTarget>,
+    ) -> Result<StagedCommand<'a, A, K>, Failure>
+    where
+        R: CausalRepositoryBackend,
+    {
         let workspace = CausalWorkspace::new(aggregate_repository)
             .with_scheduling_declared(self.requires_scheduling);
-        let context = CausalCommandContext::new(&message, session, &workspace);
+        let context = CausalCommandContext::new(message, session, &workspace);
         if self.guard.as_ref().is_some_and(|guard| !guard(&context)) {
             return Err(Failure::Reject {
                 code: "REJECTED",
@@ -2074,12 +2178,21 @@ where
     }
 
     #[cfg(feature = "graphql")]
-    fn contract_mut(&mut self) -> &mut TypedCommandContract {
-        &mut self.contract
+    fn contract_fingerprint(&self) -> &CommandContractFingerprint {
+        &self.fingerprint
     }
 
     #[cfg(feature = "graphql")]
-    fn storage_identity(&self, dependencies: &D) -> crate::command_ledger::CausalStorageIdentity {
+    fn bind_direct_projection(
+        &mut self,
+        direct_projection: Option<crate::command::CommandDirectProjectionTarget>,
+    ) {
+        self.contract.direct_projection = direct_projection;
+        self.fingerprint = CommandContractFingerprint::new(self.contract.fingerprint_bytes());
+    }
+
+    #[cfg(feature = "graphql")]
+    fn storage_identity(&self, dependencies: &D) -> CausalStorageIdentity {
         dependencies
             .__causal_aggregate_repository()
             .repo()
@@ -2173,40 +2286,32 @@ where
     fn status<'a>(
         &'a self,
         dependencies: &'a D,
-        service_id: &'a str,
+        key: &'a CommandLedgerKey,
         command_id: &'a CommandId,
-        principal_partition: &'a PrincipalPartitionId,
-        session: &'a Session,
+        route: &'a CausalStatusRoute<'a>,
         protocol: Option<crate::graphql::protocol::ProtocolResponseAccumulator>,
     ) -> CausalStatusFuture<'a> {
         Box::pin(async move {
-            // Status is deliberately non-enumerating: handlers that are no
-            // longer visible under the caller's current grant are skipped as
-            // if no command had ever existed.
-            if ensure_causal_grant(&self.contract, session).is_err() {
-                return Ok(CausalCommandPublicStatus::unknown(command_id.as_str()));
-            }
-
-            let key =
-                CommandLedgerKey::new(service_id, principal_partition.clone(), command_id.clone())
-                    .map_err(internal_ledger_error)?;
-            let contract_fingerprint = self.contract.fingerprint_bytes();
-            let lookup = dependencies
-                .__causal_aggregate_repository()
-                .repo()
-                .lookup_command(
-                    &key,
-                    CommandLookupScope::CommandContract {
-                        command_name: &self.contract.name,
-                        contract_fingerprint: &contract_fingerprint,
-                    },
-                )
+            let repository = dependencies.__causal_aggregate_repository().repo();
+            // Status is deliberately non-enumerating: a row whose route the
+            // caller may not see is answered as if no command had ever existed.
+            let consistency = std::sync::OnceLock::new();
+            let admits = |command: &str, fingerprint: &[u8; 32]| {
+                route(command, fingerprint)
+                    .map(|route| consistency.get_or_init(|| route))
+                    .is_some()
+            };
+            let lookup = repository
+                .lookup_command(key, CommandLookupScope::Route(&admits))
                 .await
                 .map_err(internal_ledger_error)?;
+            let Some(consistency) = consistency.get() else {
+                return Ok(CausalCommandPublicStatus::unknown(command_id.as_str()));
+            };
             evaluate_causal_command_status(
-                dependencies.__causal_aggregate_repository().repo(),
+                repository,
                 command_id,
-                self.contract.consistency,
+                *consistency,
                 lookup,
                 protocol.as_ref(),
             )
@@ -2238,7 +2343,7 @@ where
             let typed = canonical
                 .decode::<I>()
                 .map_err(|error| CausalDispatchError::BadRequest(error.to_string()))?;
-            let (_, _, input_digest) = typed.into_parts();
+            let (_, _, _, input_digest) = typed.into_parts();
             let command_id = CommandId::parse(command_id)
                 .map_err(|error| CausalDispatchError::BadRequest(error.to_string()))?;
             let partition = PrincipalPartitionId::new(principal.partition_for_service(service_id))
@@ -2248,7 +2353,7 @@ where
             let reservation = CommandReservation::new(
                 key,
                 self.contract.name.clone(),
-                CommandContractFingerprint::new(self.contract.fingerprint_bytes()),
+                self.fingerprint,
                 CanonicalInputHash::new(input_digest),
                 policy.attempt_lease,
                 policy.replay_retention,
@@ -2534,8 +2639,7 @@ where
                         current.name
                     ));
                 }
-                let contract = handler.contract_mut();
-                contract.direct_projection = bound.direct_projection.clone();
+                handler.bind_direct_projection(bound.direct_projection.clone());
             }
         }
         Ok(())
@@ -2620,44 +2724,48 @@ where
     }
 
     #[cfg(feature = "graphql")]
+    fn causal_storage_identity(&self) -> Option<CausalStorageIdentity> {
+        self.causal_handlers()
+            .next()
+            .map(|handler| handler.storage_identity(&self.dependencies))
+    }
+
+    #[cfg(feature = "graphql")]
+    fn causal_status_route(
+        &self,
+        command: &str,
+        fingerprint: &[u8; 32],
+        session: &Session,
+    ) -> Option<CommandConsistency> {
+        let Some(RegisteredHandler::Causal(handler)) = self
+            .handlers
+            .get(&MessageKind::Command)
+            .and_then(|handlers| handlers.get(command))
+        else {
+            return None;
+        };
+        let contract = handler.contract();
+        (handler.contract_fingerprint().as_bytes() == fingerprint
+            && ensure_causal_grant(contract, session).is_ok())
+        .then_some(contract.consistency)
+    }
+
+    #[cfg(feature = "graphql")]
     fn causal_command_status<'a>(
         &'a self,
-        service_id: &'a str,
+        key: &'a CommandLedgerKey,
         command_id: &'a CommandId,
-        principal_partition: &'a PrincipalPartitionId,
-        session: &'a Session,
+        route: &'a CausalStatusRoute<'a>,
         protocol: Option<crate::graphql::protocol::ProtocolResponseAccumulator>,
     ) -> CausalStatusFuture<'a> {
-        Box::pin(async move {
-            let mut handlers = self
-                .handlers
-                .get(&MessageKind::Command)
-                .into_iter()
-                .flat_map(HashMap::values)
-                .filter_map(|handler| match handler {
-                    RegisteredHandler::Causal(handler) => Some(handler.as_ref()),
-                    RegisteredHandler::Legacy { .. } | RegisteredHandler::Projector(_) => None,
-                })
-                .collect::<Vec<_>>();
-            handlers.sort_by(|left, right| left.contract().name.cmp(&right.contract().name));
-
-            for handler in handlers {
-                let status = handler
-                    .status(
-                        &self.dependencies,
-                        service_id,
-                        command_id,
-                        principal_partition,
-                        session,
-                        protocol.clone(),
-                    )
-                    .await?;
-                if !status.is_unknown() {
-                    return Ok(status);
-                }
+        // Every typed command of a bundle commits to its one repository, so
+        // any of its handlers reaches the ledger.
+        match self.causal_handlers().next() {
+            Some(handler) => handler.status(&self.dependencies, key, command_id, route, protocol),
+            None => {
+                Box::pin(async move { Ok(CausalCommandPublicStatus::unknown(command_id.as_str())) })
             }
-            Ok(CausalCommandPublicStatus::unknown(command_id.as_str()))
-        })
+        }
     }
 
     #[cfg(feature = "graphql")]
@@ -2747,7 +2855,7 @@ where
     }
 
     #[cfg(feature = "graphql")]
-    fn projected_storage_identities(&self) -> Vec<crate::command_ledger::CausalStorageIdentity> {
+    fn projected_storage_identities(&self) -> Vec<CausalStorageIdentity> {
         self.handlers
             .values()
             .flat_map(|handlers| handlers.values())

@@ -38,6 +38,10 @@ pub enum CausalDispatchError {
         message: String,
     },
     Handler(HandlerError),
+    /// The command kept losing an optimistic stream-version race to
+    /// concurrent writers of its aggregate. Nothing was committed and the
+    /// command ID is released: retrying it runs the command again.
+    ConcurrentWrite,
     Internal(String),
 }
 
@@ -59,6 +63,7 @@ impl CausalDispatchError {
                 422 => "REJECTED",
                 _ => "INTERNAL",
             },
+            Self::ConcurrentWrite => "CONCURRENT_WRITE",
             Self::Internal(_) => "INTERNAL",
         }
     }
@@ -72,6 +77,7 @@ impl CausalDispatchError {
             Self::Expired => 410,
             Self::Rejected { status, .. } => *status,
             Self::Handler(error) => error.status_code(),
+            Self::ConcurrentWrite => 503,
             Self::Internal(_) => 500,
         }
     }
@@ -86,6 +92,7 @@ impl CausalDispatchError {
             Self::InProgress => "command is already in progress".into(),
             Self::Expired => "command ID has expired".into(),
             Self::Handler(error) => error.client_facing_message(),
+            Self::ConcurrentWrite => "command conflicted with concurrent writes; retry".into(),
             Self::Internal(_) => "internal error".into(),
         }
     }
@@ -319,8 +326,7 @@ impl CausalDispatchResult {
         self.replayed
     }
 
-    /// The receipt of the attempt that just committed it (read back from
-    /// the ledger), not a replay.
+    /// The receipt of the attempt that just committed it, not a replay.
     pub(crate) fn fresh(mut self) -> Self {
         self.replayed = false;
         self
@@ -743,7 +749,8 @@ impl CommandIngress<'_> {
     /// from the verified principal, a cell is handed a trusted identity.
     pub(super) fn reservation(
         &self,
-        contract: &TypedCommandContract,
+        command_name: &str,
+        contract_fingerprint: CommandContractFingerprint,
         input_hash: CanonicalInputHash,
     ) -> Result<CommandReservation, CausalDispatchError> {
         let (key, causation_id) = match self {
@@ -768,8 +775,8 @@ impl CommandIngress<'_> {
         let policy = self.policy();
         let reservation = CommandReservation::new(
             key,
-            contract.name.clone(),
-            CommandContractFingerprint::new(contract.fingerprint_bytes()),
+            command_name,
+            contract_fingerprint,
             input_hash,
             policy.attempt_lease,
             policy.replay_retention,
@@ -913,66 +920,39 @@ fn replay_rejection(outcome: Value) -> CausalDispatchError {
     }
 }
 
-/// The receipt the attempt behind `fence` just committed, read back from the
-/// ledger: not a replay.
-pub(super) async fn load_committed_result<R>(
-    repository: &R,
-    ingress: &CommandIngress<'_>,
-    consistency: CommandConsistency,
-    fence: &AttemptFence,
-) -> Result<CausalDispatchResult, CausalDispatchError>
-where
-    R: CommandLedgerStore + Send + Sync,
-{
-    match repository
-        .lookup_command(fence.key(), CommandLookupScope::Attempt(fence))
-        .await
-        .map_err(internal_ledger_error)?
-    {
-        CommandLookup::Replay(replay) => ingress
-            .replay(consistency, replay)
-            .map(CausalDispatchResult::fresh),
-        CommandLookup::Expired => Err(CausalDispatchError::Expired),
-        CommandLookup::InProgress { .. }
-        | CommandLookup::RetryableUnknown { .. }
-        | CommandLookup::Unknown => Err(CausalDispatchError::Internal(
-            "committed command has no exact durable replay receipt".into(),
-        )),
-    }
-}
-
 /// Release an attempt that produced nothing durable, so a retry with the same
-/// command ID runs again instead of waiting out the attempt lease.
+/// command ID runs again instead of waiting out the attempt lease. `error` is
+/// what the caller is told.
 pub(super) async fn abandon_attempt<R>(
     repository: &R,
     ingress: &CommandIngress<'_>,
     consistency: CommandConsistency,
     fence: AttemptFence,
-    detail: String,
+    error: CausalDispatchError,
 ) -> Result<CausalDispatchResult, CausalDispatchError>
 where
     R: CommandLedgerStore + Send + Sync,
 {
     match repository.mark_retryable_unknown(fence.clone()).await {
-        Ok(()) => Err(CausalDispatchError::Internal(detail)),
+        Ok(()) => Err(error),
         Err(CommandLedgerError::AttemptFenced { .. }) => {
-            resolve_ambiguous_lookup(repository, ingress, consistency, fence, detail).await
+            resolve_ambiguous_lookup(repository, ingress, consistency, fence, error).await
         }
-        Err(error) => Err(CausalDispatchError::Internal(format!(
-            "{detail}; failed to mark command retryable: {error}"
+        Err(recovery) => Err(CausalDispatchError::Internal(format!(
+            "{error}; failed to mark command retryable: {recovery}"
         ))),
     }
 }
 
 /// Settle an attempt whose fate this process does not know (a commit that
 /// did not report success, or an abandonment that was fenced): the ledger
-/// decides.
+/// decides. `error` is what the caller is told if the attempt left nothing.
 pub(super) async fn resolve_ambiguous_lookup<R>(
     repository: &R,
     ingress: &CommandIngress<'_>,
     consistency: CommandConsistency,
     fence: AttemptFence,
-    detail: String,
+    error: CausalDispatchError,
 ) -> Result<CausalDispatchResult, CausalDispatchError>
 where
     R: CommandLedgerStore + Send + Sync,
@@ -985,23 +965,23 @@ where
             .replay(consistency, replay)
             .map(CausalDispatchResult::fresh),
         Ok(CommandLookup::Expired) => Err(CausalDispatchError::Expired),
-        Ok(CommandLookup::RetryableUnknown { .. }) => Err(CausalDispatchError::Internal(detail)),
+        Ok(CommandLookup::RetryableUnknown { .. }) => Err(error),
         Ok(CommandLookup::InProgress { .. }) => {
             match repository.mark_retryable_unknown(fence).await {
-                Ok(()) => Err(CausalDispatchError::Internal(detail)),
+                Ok(()) => Err(error),
                 Err(CommandLedgerError::AttemptFenced { .. }) => {
                     Err(CausalDispatchError::InProgress)
                 }
-                Err(error) => Err(CausalDispatchError::Internal(format!(
-                    "{detail}; command recovery failed: {error}"
+                Err(recovery) => Err(CausalDispatchError::Internal(format!(
+                    "{error}; command recovery failed: {recovery}"
                 ))),
             }
         }
         Ok(CommandLookup::Unknown) => Err(CausalDispatchError::Internal(format!(
-            "{detail}; command ledger row disappeared"
+            "{error}; command ledger row disappeared"
         ))),
-        Err(error) => Err(CausalDispatchError::Internal(format!(
-            "{detail}; command outcome lookup failed: {error}"
+        Err(recovery) => Err(CausalDispatchError::Internal(format!(
+            "{error}; command outcome lookup failed: {recovery}"
         ))),
     }
 }

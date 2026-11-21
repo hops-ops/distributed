@@ -383,9 +383,9 @@ impl<H: FactHost> FactBatchSink for CommandFactSink<H> {
 fn classify(error: CausalDispatchError) -> FactError {
     let detail = format!("{}: {error:?}", error.code());
     match &error {
-        CausalDispatchError::InProgress | CausalDispatchError::Internal(_) => {
-            FactError::Retryable(detail)
-        }
+        CausalDispatchError::InProgress
+        | CausalDispatchError::ConcurrentWrite
+        | CausalDispatchError::Internal(_) => FactError::Retryable(detail),
         CausalDispatchError::Rejected { status, .. }
             if *status >= 500 || matches!(*status, 408 | 429) =>
         {

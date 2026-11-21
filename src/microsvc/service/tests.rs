@@ -921,7 +921,7 @@ impl CausalTransactionalCommit for AmbiguousCommitRepository {
     async fn commit_causal_batch<'a>(
         &'a self,
         batch: CausalCommitBatch<'a>,
-    ) -> Result<(), CommandLedgerError> {
+    ) -> Result<crate::command_ledger::CommandCompletion<'a>, CommandLedgerError> {
         let behavior = {
             let mut behavior = self.behavior.lock().map_err(|_| {
                 CommandLedgerError::Storage(crate::RepositoryError::LockPoisoned(
@@ -3495,6 +3495,225 @@ async fn causal_dispatch_reclaims_retryable_attempt_after_precommit_failure() {
     assert_eq!(replay, retried);
     assert_eq!(handler_calls.load(Ordering::SeqCst), 2);
 }
+
+/// What a contended command's handler does between loading its aggregate and
+/// staging its commit. Keyed by aggregate ID, so tests share nothing.
+#[cfg(feature = "graphql")]
+struct Contention {
+    runs: AtomicUsize,
+    after_load:
+        Box<dyn Fn(usize) -> std::pin::Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>,
+}
+
+#[cfg(feature = "graphql")]
+static CONTENTION: std::sync::LazyLock<Mutex<HashMap<String, Arc<Contention>>>> =
+    std::sync::LazyLock::new(Default::default);
+
+#[cfg(feature = "graphql")]
+fn contend(
+    id: &str,
+    after_load: impl Fn(usize) -> std::pin::Pin<Box<dyn Future<Output = ()> + Send>>
+        + Send
+        + Sync
+        + 'static,
+) -> Arc<Contention> {
+    let contention = Arc::new(Contention {
+        runs: AtomicUsize::new(0),
+        after_load: Box::new(after_load),
+    });
+    CONTENTION
+        .lock()
+        .unwrap()
+        .insert(id.to_string(), Arc::clone(&contention));
+    contention
+}
+
+/// Appends one event to the aggregate it loaded (or creates it).
+#[cfg(feature = "graphql")]
+async fn contended_handler(
+    context: &CausalCommandContext<'_, CausalDispatcherAggregate>,
+    input: CausalTestInput,
+) -> Result<PreparedCommand<Succeeded<TypedOutput>>, HandlerError> {
+    let contention = Arc::clone(&CONTENTION.lock().unwrap()[&input.id]);
+    let mut checkout = match context.get(&input.id).await? {
+        Some(checkout) => checkout,
+        None => context.create(),
+    };
+    (contention.after_load)(contention.runs.fetch_add(1, Ordering::SeqCst)).await;
+    checkout
+        .record(input.id.clone())
+        .map_err(|error| HandlerError::Other(Box::new(error)))?;
+    context
+        .commit(checkout)?
+        .succeeded(TypedOutput { id: input.id })
+}
+
+#[cfg(feature = "graphql")]
+fn contended_route<D>(routes: Routes<D>) -> Routes<D>
+where
+    D: crate::microsvc::CausalRouteDependencies<Aggregate = CausalDispatcherAggregate>
+        + Send
+        + Sync
+        + 'static,
+{
+    routes
+        .typed_command(typed_command::<CausalTestInput, Succeeded<TypedOutput>>(
+            "causal.contended",
+        ))
+        .handle(contended_handler)
+}
+
+/// Typed commands hold no lock across the handler: two of them on one
+/// aggregate race on its stream version, and the loser must be re-run on the
+/// winner's state rather than failed.
+#[cfg(feature = "graphql")]
+macro_rules! concurrent_write_tests {
+    ($backend:ident, $repository:expr) => {
+        mod $backend {
+            use super::*;
+
+            #[tokio::test]
+            async fn concurrent_commands_on_one_aggregate_both_commit() {
+                let repository = $repository;
+                let id = concat!(stringify!($backend), "-raced");
+                // Both first runs hold the same loaded version before either
+                // commits. The loser's rerun does not wait.
+                let loaded = Arc::new(tokio::sync::Barrier::new(2));
+                let contention = contend(id, move |run| {
+                    let loaded = Arc::clone(&loaded);
+                    Box::pin(async move {
+                        if run < 2 {
+                            loaded.wait().await;
+                        }
+                    })
+                });
+                let service = Service::new()
+                    .named("causal-tests")
+                    .routes(contended_route(Routes::new().with_repo(
+                        repository.clone().aggregate::<CausalDispatcherAggregate>(),
+                    )));
+                let (first_id, second_id) = (causal_test_command_id(), causal_test_command_id());
+                let dispatch = |command_id| {
+                    service.dispatch_causal_with_receipt(
+                        "causal.contended",
+                        command_id,
+                        causal_test_input(id, "raced"),
+                        Session::new(),
+                        causal_test_principal(),
+                    )
+                };
+
+                let (first, second) = tokio::join!(dispatch(&first_id), dispatch(&second_id));
+
+                let first = first.expect("one command wins the stream version");
+                let second = second.expect("the other is run again and commits");
+                assert!(!first.replayed() && !second.replayed());
+                assert_eq!(
+                    contention.runs.load(Ordering::SeqCst),
+                    3,
+                    "exactly the loser ran again"
+                );
+                let committed = repository
+                    .aggregate::<CausalDispatcherAggregate>()
+                    .get(id)
+                    .await
+                    .unwrap()
+                    .expect("both commands committed to one stream");
+                assert_eq!(committed.entity().version(), 2);
+            }
+
+            #[tokio::test]
+            async fn a_command_that_keeps_losing_is_released_as_concurrent_write() {
+                let repository = $repository;
+                let id = concat!(stringify!($backend), "-starved");
+                // Another writer commits behind every run's loaded version.
+                let interfering = Arc::new(AtomicBool::new(true));
+                let contention = contend(id, {
+                    let (repository, interfering) = (repository.clone(), Arc::clone(&interfering));
+                    move |_run| {
+                        let (repository, interfering) =
+                            (repository.clone(), Arc::clone(&interfering));
+                        Box::pin(async move {
+                            if !interfering.load(Ordering::SeqCst) {
+                                return;
+                            }
+                            let writer = repository.aggregate::<CausalDispatcherAggregate>();
+                            let mut other = writer.get(id).await.unwrap().unwrap_or_default();
+                            other.record(id.to_string()).unwrap();
+                            writer.commit(&mut other).await.unwrap();
+                        })
+                    }
+                });
+                let service = Service::new()
+                    .named("causal-tests")
+                    .routes(contended_route(Routes::new().with_repo(
+                        repository.clone().aggregate::<CausalDispatcherAggregate>(),
+                    )));
+                let command_id = causal_test_command_id();
+                let dispatch = || {
+                    service.dispatch_causal_with_receipt(
+                        "causal.contended",
+                        &command_id,
+                        causal_test_input(id, "starved"),
+                        Session::new(),
+                        causal_test_principal(),
+                    )
+                };
+                let runs = crate::repository::CONCURRENT_WRITE_RETRIES;
+
+                let starved = dispatch().await.expect_err("every run lost the race");
+                assert!(
+                    matches!(starved, CausalDispatchError::ConcurrentWrite),
+                    "unexpected failure: {starved:?}"
+                );
+                assert_eq!(starved.code(), "CONCURRENT_WRITE");
+                assert_eq!(starved.status_code(), 503);
+                assert_eq!(contention.runs.load(Ordering::SeqCst), runs);
+                assert!(matches!(
+                    service
+                        .lookup_causal_command(
+                            "causal.contended",
+                            &command_id,
+                            &Session::new(),
+                            causal_test_principal(),
+                        )
+                        .await
+                        .unwrap(),
+                    CommandLookup::RetryableUnknown { .. }
+                ));
+
+                interfering.store(false, Ordering::SeqCst);
+                let retried = dispatch()
+                    .await
+                    .expect("the same command ID runs again at once");
+                assert!(!retried.replayed());
+                assert_eq!(contention.runs.load(Ordering::SeqCst), runs + 1);
+                let committed = repository
+                    .aggregate::<CausalDispatcherAggregate>()
+                    .get(id)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(
+                    committed.entity().version(),
+                    runs as u64 + 1,
+                    "the other writer's events and this command's one"
+                );
+            }
+        }
+    };
+}
+
+#[cfg(feature = "graphql")]
+concurrent_write_tests!(in_memory, InMemoryRepository::new());
+
+#[cfg(all(feature = "graphql", feature = "sqlite"))]
+concurrent_write_tests!(
+    sqlite,
+    crate::SqliteRepository::connect_and_migrate("sqlite::memory:")
+        .await
+        .expect("framework migrations should apply")
+);
 
 #[tokio::test]
 async fn service_collects_route_bundles_with_different_dependencies() {

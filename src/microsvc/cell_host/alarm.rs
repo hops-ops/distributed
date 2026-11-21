@@ -17,6 +17,8 @@ use super::CausalDispatchError;
 pub(crate) fn is_retryable(error: &CausalDispatchError) -> bool {
     matches!(
         error,
-        CausalDispatchError::InProgress | CausalDispatchError::Internal(_)
+        CausalDispatchError::InProgress
+            | CausalDispatchError::ConcurrentWrite
+            | CausalDispatchError::Internal(_)
     )
 }

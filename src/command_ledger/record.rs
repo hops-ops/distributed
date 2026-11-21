@@ -334,12 +334,8 @@ impl CommandLedgerRecord {
     pub(crate) fn matches_lookup_scope(&self, scope: CommandLookupScope<'_>) -> bool {
         match scope {
             CommandLookupScope::CommandName(expected) => self.command_name == expected,
-            CommandLookupScope::CommandContract {
-                command_name,
-                contract_fingerprint,
-            } => {
-                self.command_name == command_name
-                    && self.contract_fingerprint.as_bytes() == contract_fingerprint
+            CommandLookupScope::Route(admits) => {
+                admits(&self.command_name, self.contract_fingerprint.as_bytes())
             }
             CommandLookupScope::Attempt(attempt) => {
                 self.key == attempt.key
@@ -478,119 +474,13 @@ impl CommandLedgerRecord {
                 self.key.command_id()
             ))
         })?;
-        let envelope: Value = serde_json::from_str(payload).map_err(|error| {
-            CommandLedgerError::Corrupt(format!(
-                "command `{}` outcome is invalid JSON: {error}",
-                self.key.command_id()
-            ))
-        })?;
-        let Value::Object(mut envelope) = envelope else {
-            return Err(CommandLedgerError::Corrupt(format!(
-                "command `{}` replay envelope is not an object",
-                self.key.command_id()
-            )));
-        };
-        let version = envelope
-            .remove("version")
-            .and_then(|value| value.as_u64())
-            .ok_or_else(|| {
-                CommandLedgerError::Corrupt(format!(
-                    "command `{}` replay envelope has no numeric version",
-                    self.key.command_id()
-                ))
-            })?;
-        if version != u64::from(COMMAND_REPLAY_VERSION) {
-            return Err(CommandLedgerError::Corrupt(format!(
-                "command `{}` replay envelope version `{version}` is unsupported",
-                self.key.command_id()
-            )));
-        }
-        let outcome = envelope.remove("outcome").ok_or_else(|| {
-            CommandLedgerError::Corrupt(format!(
-                "command `{}` replay envelope has no outcome",
-                self.key.command_id()
-            ))
-        })?;
-        let projection_metadata = envelope
-            .remove("projection_metadata")
-            .map(|value| {
-                let encoded = value.as_str().ok_or_else(|| {
-                    CommandLedgerError::Corrupt(format!(
-                        "command `{}` replay projection metadata is not an opaque string",
-                        self.key.command_id()
-                    ))
-                })?;
-                let bytes = URL_SAFE_NO_PAD.decode(encoded).map_err(|_| {
-                    CommandLedgerError::Corrupt(format!(
-                        "command `{}` replay projection metadata is not canonical base64url",
-                        self.key.command_id()
-                    ))
-                })?;
-                if URL_SAFE_NO_PAD.encode(&bytes) != encoded {
-                    return Err(CommandLedgerError::Corrupt(format!(
-                        "command `{}` replay projection metadata uses noncanonical base64url",
-                        self.key.command_id()
-                    )));
-                }
-                super::reservation::validate_projection_metadata_bytes(self.state, Some(&bytes))
-                    .map_err(|error| {
-                        CommandLedgerError::Corrupt(format!(
-                            "command `{}` replay projection metadata is invalid: {error}",
-                            self.key.command_id()
-                        ))
-                    })?;
-                Ok(bytes)
-            })
-            .transpose()?;
-        if projection_metadata.is_none() {
-            validate_replay_state_without_projection_metadata(self.state).map_err(|error| {
-                CommandLedgerError::Corrupt(format!(
-                    "command `{}` replay is inconsistent: {error}",
-                    self.key.command_id()
-                ))
-            })?;
-        }
-        let direct_projection = envelope.remove("direct_projection");
-        match (&direct_projection, self.state) {
-            (Some(value), CommandLedgerState::Atomic) => {
-                SameTransactionProjectionEvidence::validate_replay_value(value).map_err(
-                    |error| {
-                        CommandLedgerError::Corrupt(format!(
-                            "command `{}` replay direct projection is invalid: {error}",
-                            self.key.command_id()
-                        ))
-                    },
-                )?;
-            }
-            (None, CommandLedgerState::Atomic) => {
-                return Err(CommandLedgerError::Corrupt(format!(
-                    "command `{}` projected replay has no exact direct projection evidence",
-                    self.key.command_id()
-                )));
-            }
-            (Some(_), _) => {
-                return Err(CommandLedgerError::Corrupt(format!(
-                    "command `{}` non-projected replay contains direct projection evidence",
-                    self.key.command_id()
-                )));
-            }
-            (None, _) => {}
-        }
-        if !envelope.is_empty() {
-            return Err(CommandLedgerError::Corrupt(format!(
-                "command `{}` replay envelope has unknown fields",
-                self.key.command_id()
-            )));
-        }
-        Ok(CommandReplay {
-            command_id: self.key.command_id.clone(),
-            command_name: self.command_name.clone(),
-            state: self.state,
-            causation_id: self.causation_id.clone(),
-            outcome,
-            projection_metadata,
-            direct_projection,
-        })
+        decode_replay(
+            &self.key.command_id,
+            &self.command_name,
+            self.state,
+            &self.causation_id,
+            payload,
+        )
     }
 
     pub(crate) fn lookup(&self) -> Result<CommandLookup, CommandLedgerError> {
@@ -674,6 +564,130 @@ fn system_time_from_unix_millis(value: u64) -> Result<SystemTime, CommandLedgerE
         .ok_or_else(|| {
             CommandLedgerError::Corrupt("cell command ledger timestamp is out of range".into())
         })
+}
+
+/// Decode a stored replay envelope. A committed completion and a row read
+/// back from storage both come through here, so they cannot disagree.
+pub(super) fn decode_replay(
+    id: &super::CommandId,
+    command_name: &str,
+    state: CommandLedgerState,
+    causation_id: &CausationId,
+    payload: &str,
+) -> Result<CommandReplay, CommandLedgerError> {
+    let command_id = id.as_str();
+    let envelope: Value = serde_json::from_str(payload).map_err(|error| {
+        CommandLedgerError::Corrupt(format!(
+            "command `{}` outcome is invalid JSON: {error}",
+            command_id
+        ))
+    })?;
+    let Value::Object(mut envelope) = envelope else {
+        return Err(CommandLedgerError::Corrupt(format!(
+            "command `{}` replay envelope is not an object",
+            command_id
+        )));
+    };
+    let version = envelope
+        .remove("version")
+        .and_then(|value| value.as_u64())
+        .ok_or_else(|| {
+            CommandLedgerError::Corrupt(format!(
+                "command `{}` replay envelope has no numeric version",
+                command_id
+            ))
+        })?;
+    if version != u64::from(COMMAND_REPLAY_VERSION) {
+        return Err(CommandLedgerError::Corrupt(format!(
+            "command `{}` replay envelope version `{version}` is unsupported",
+            command_id
+        )));
+    }
+    let outcome = envelope.remove("outcome").ok_or_else(|| {
+        CommandLedgerError::Corrupt(format!(
+            "command `{}` replay envelope has no outcome",
+            command_id
+        ))
+    })?;
+    let projection_metadata = envelope
+        .remove("projection_metadata")
+        .map(|value| {
+            let encoded = value.as_str().ok_or_else(|| {
+                CommandLedgerError::Corrupt(format!(
+                    "command `{}` replay projection metadata is not an opaque string",
+                    command_id
+                ))
+            })?;
+            let bytes = URL_SAFE_NO_PAD.decode(encoded).map_err(|_| {
+                CommandLedgerError::Corrupt(format!(
+                    "command `{}` replay projection metadata is not canonical base64url",
+                    command_id
+                ))
+            })?;
+            if URL_SAFE_NO_PAD.encode(&bytes) != encoded {
+                return Err(CommandLedgerError::Corrupt(format!(
+                    "command `{}` replay projection metadata uses noncanonical base64url",
+                    command_id
+                )));
+            }
+            super::reservation::validate_projection_metadata_bytes(state, Some(&bytes)).map_err(
+                |error| {
+                    CommandLedgerError::Corrupt(format!(
+                        "command `{}` replay projection metadata is invalid: {error}",
+                        command_id
+                    ))
+                },
+            )?;
+            Ok(bytes)
+        })
+        .transpose()?;
+    if projection_metadata.is_none() {
+        validate_replay_state_without_projection_metadata(state).map_err(|error| {
+            CommandLedgerError::Corrupt(format!(
+                "command `{}` replay is inconsistent: {error}",
+                command_id
+            ))
+        })?;
+    }
+    let direct_projection = envelope.remove("direct_projection");
+    match (&direct_projection, state) {
+        (Some(value), CommandLedgerState::Atomic) => {
+            SameTransactionProjectionEvidence::validate_replay_value(value).map_err(|error| {
+                CommandLedgerError::Corrupt(format!(
+                    "command `{}` replay direct projection is invalid: {error}",
+                    command_id
+                ))
+            })?;
+        }
+        (None, CommandLedgerState::Atomic) => {
+            return Err(CommandLedgerError::Corrupt(format!(
+                "command `{}` projected replay has no exact direct projection evidence",
+                command_id
+            )));
+        }
+        (Some(_), _) => {
+            return Err(CommandLedgerError::Corrupt(format!(
+                "command `{}` non-projected replay contains direct projection evidence",
+                command_id
+            )));
+        }
+        (None, _) => {}
+    }
+    if !envelope.is_empty() {
+        return Err(CommandLedgerError::Corrupt(format!(
+            "command `{}` replay envelope has unknown fields",
+            command_id
+        )));
+    }
+    Ok(CommandReplay {
+        command_id: id.clone(),
+        command_name: command_name.to_string(),
+        state: state,
+        causation_id: causation_id.clone(),
+        outcome,
+        projection_metadata,
+        direct_projection,
+    })
 }
 
 fn checked_deadline(

@@ -368,6 +368,41 @@ async fn cell_dispatches_complete_with_the_same_portable_command_as_soa() {
     assert_eq!(loaded.entity.snapshot_version(), 2);
 }
 
+/// The first dispatch answers from the completion it committed, a retry from
+/// the stored row: the two must be the same receipt.
+#[tokio::test]
+async fn first_dispatch_returns_the_receipt_its_replay_returns() {
+    let cell = AggregateCell::<CellItem>::new("receipt-item")
+        .unwrap()
+        .mount(Publish);
+    let identity = CellCommandIdentity::new(
+        "cell-test-service",
+        "principal-alice",
+        "0190a000-0000-7000-8000-000000000406",
+    )
+    .unwrap();
+    let input = json!({ "id": "receipt-item", "title": "once" });
+
+    let first = cell
+        .dispatch_idempotent(
+            "cell_item.publish",
+            &identity,
+            input.clone(),
+            owner_session(),
+        )
+        .await
+        .unwrap();
+    let replay = cell
+        .dispatch_idempotent("cell_item.publish", &identity, input, owner_session())
+        .await
+        .unwrap();
+
+    assert!(!first.replayed());
+    assert!(replay.replayed());
+    assert_eq!(first.projection_events().len(), 1);
+    assert_eq!(first, replay.fresh());
+}
+
 #[tokio::test]
 async fn cell_wait_path_replays_the_same_command_without_new_domain_effects() {
     let cell = AggregateCell::<CellItem>::new("item-ledger")
