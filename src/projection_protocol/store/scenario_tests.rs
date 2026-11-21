@@ -629,3 +629,350 @@ pub(crate) async fn tombstone_requires_explicit_exact_recreation(
     assert!(!recreated.tombstone);
     assert!(scenario.row_exists(&repository).await);
 }
+
+fn source_snapshot(sequence: u64) -> crate::projection_protocol::SourceSnapshotVersion {
+    serde_json::from_value(serde_json::json!({
+        "aggregate_type": "todo",
+        "aggregate_id": "todo-1",
+        "sequence": sequence,
+        "publication_ordinal": 0,
+        "occurrence_id": format!("occurrence-{sequence}"),
+        "occurrence_fingerprint": vec![sequence; 32],
+    }))
+    .unwrap()
+}
+
+/// Create then delete the scenario record, optionally source-fenced, and
+/// return the tombstone.
+async fn tombstone<S: ProjectionProtocolScenario>(
+    scenario: &S,
+    repository: &S::Store,
+    source_fenced: bool,
+) -> ProjectionRecordMetadata {
+    let mut revision = None;
+    for (position, kind) in [(1, RecordTransition::Upsert), (2, RecordTransition::Delete)] {
+        let mut mutation = scenario.mutation(
+            revision
+                .take()
+                .map_or(ProjectionRecordExpectation::Missing, |revision| {
+                    ProjectionRecordExpectation::Exact(revision)
+                }),
+            kind,
+        );
+        mutation.source_snapshot = source_fenced.then(|| source_snapshot(position));
+        let record = repository
+            .commit_projection(scenario.batch(
+                scenario.input(
+                    position,
+                    format!("tombstone-{position}").as_bytes(),
+                    &format!("tombstone-message-{position}"),
+                    &format!("tombstone-cause-{position}"),
+                    ProjectionGeneration::initial(),
+                ),
+                vec![mutation],
+                Vec::new(),
+            ))
+            .await
+            .unwrap()
+            .records
+            .pop()
+            .unwrap();
+        revision = Some(record.revision.clone());
+        if kind == RecordTransition::Delete {
+            assert!(record.tombstone);
+            return record;
+        }
+    }
+    unreachable!()
+}
+
+fn confirm_existing<S: ProjectionProtocolScenario>(
+    scenario: &S,
+    revision: RecordRevision,
+) -> ProjectionCommitBatch {
+    scenario.batch(
+        scenario.input(
+            3,
+            b"late-confirmation",
+            "late-confirmation-message",
+            "late-confirmation-cause",
+            ProjectionGeneration::initial(),
+        ),
+        Vec::new(),
+        vec![ProjectionObservationRequest {
+            kind: ProjectionObservationKind::Record,
+            target: ProjectionObservationTarget::ExistingRecord(revision),
+        }],
+    )
+}
+
+/// A deleted row that carries no source fence proves nothing about a later
+/// input, so that input cannot confirm it.
+pub(crate) async fn existing_record_observation_rejects_an_unfenced_tombstone(
+    scenario: impl ProjectionProtocolScenario,
+) {
+    let repository = scenario.repository().await;
+    let deleted = tombstone(&scenario, &repository, false).await;
+    assert!(matches!(
+        repository
+            .commit_projection(confirm_existing(&scenario, deleted.revision))
+            .await,
+        Err(ProjectionProtocolError::RecordTombstoned { .. })
+    ));
+}
+
+/// A source-fenced tombstone is the newest state of its stream: a stale
+/// input confirms it rather than failing.
+pub(crate) async fn existing_record_observation_confirms_a_source_fenced_tombstone(
+    scenario: impl ProjectionProtocolScenario,
+) {
+    let repository = scenario.repository().await;
+    let deleted = tombstone(&scenario, &repository, true).await;
+    let confirmed = repository
+        .commit_projection(confirm_existing(&scenario, deleted.revision.clone()))
+        .await
+        .unwrap();
+    assert_eq!(confirmed.outcome, ProjectionCommitOutcome::Applied);
+    let evidence = repository
+        .projection_causation_evidence(
+            &ProjectionCausationEvidenceRequest::new(
+                "late-confirmation-cause",
+                vec![scenario.topology()],
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(evidence.observations.len(), 1);
+    assert_eq!(evidence.observations[0].revision, Some(deleted.revision));
+}
+
+/// Causation evidence is ordered by the canonical bytes of each scope, on
+/// every backend, never by a storage digest or database collation.
+pub(crate) async fn causation_evidence_is_ordered_by_canonical_scope_bytes(
+    scenario: impl ProjectionProtocolScenario,
+) {
+    let repository = scenario.repository().await;
+    let model = scenario.ownership().model;
+    let partitions = [
+        scenario.partition(),
+        ProjectionScopeCodec::new(scenario.topology())
+            .encode_partition(Some(&serde_json::json!("evidence-order-tenant")))
+            .unwrap(),
+    ];
+    let mut expected = Vec::new();
+    for (index, partition) in partitions.iter().enumerate() {
+        let scopes = [b"e".as_slice(), b"B", b"d", b"a", b"C", b"aa"].map(|key| {
+            ProjectionRecordScope::new(scenario.topology(), partition.clone(), &model, key).unwrap()
+        });
+        expected.extend(scopes.iter().cloned());
+        repository
+            .commit_projection(
+                scenario.batch(
+                    scenario.input_for_partition(
+                        partition.clone(),
+                        1,
+                        format!("evidence-order-{index}").as_bytes(),
+                        &format!("evidence-order-message-{index}"),
+                        "evidence-order-cause",
+                    ),
+                    Vec::new(),
+                    scopes
+                        .into_iter()
+                        .map(|scope| ProjectionObservationRequest {
+                            kind: ProjectionObservationKind::Dependency,
+                            target: ProjectionObservationTarget::Dependency(scope),
+                        })
+                        .collect(),
+                ),
+            )
+            .await
+            .unwrap();
+    }
+    expected.sort_by_key(|scope| {
+        (
+            scope.projection_partition().canonical_bytes().to_vec(),
+            scope.canonical_key_bytes().to_vec(),
+        )
+    });
+
+    let evidence = repository
+        .projection_causation_evidence(
+            &ProjectionCausationEvidenceRequest::new(
+                "evidence-order-cause",
+                vec![scenario.topology()],
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        evidence
+            .observations
+            .into_iter()
+            .map(|observation| observation.scope)
+            .collect::<Vec<_>>(),
+        expected
+    );
+}
+
+/// One physical row has one owning projection partition. Another partition
+/// creating the same key is told the record exists; it is not a malformed
+/// batch.
+pub(crate) async fn another_partition_cannot_create_an_owned_row(
+    scenario: impl ProjectionProtocolScenario,
+) {
+    let repository = scenario.repository().await;
+    let create = || {
+        scenario.mutation(
+            ProjectionRecordExpectation::Missing,
+            RecordTransition::Upsert,
+        )
+    };
+    repository
+        .commit_projection(scenario.batch(
+            scenario.input(
+                1,
+                b"owner-create",
+                "owner-create-message",
+                "owner-create-cause",
+                ProjectionGeneration::initial(),
+            ),
+            vec![create()],
+            Vec::new(),
+        ))
+        .await
+        .unwrap();
+
+    let other_partition = ProjectionScopeCodec::new(scenario.topology())
+        .encode_partition(Some(&serde_json::json!("other-owner-tenant")))
+        .unwrap();
+    let mut intruding = create();
+    intruding.scope = ProjectionRecordScope::new(
+        scenario.topology(),
+        other_partition.clone(),
+        intruding.scope.model(),
+        intruding.scope.canonical_key_bytes(),
+    )
+    .unwrap();
+    let scope = intruding.scope.clone();
+    assert!(matches!(
+        repository
+            .commit_projection(scenario.batch(
+                scenario.input_for_partition(
+                    other_partition,
+                    1,
+                    b"intruder-create",
+                    "intruder-create-message",
+                    "intruder-create-cause",
+                ),
+                vec![intruding],
+                Vec::new(),
+            ))
+            .await,
+        Err(ProjectionProtocolError::RecordAlreadyExists { .. })
+    ));
+    assert_eq!(repository.projection_record(&scope).await.unwrap(), None);
+    assert!(scenario.row_exists(&repository).await);
+}
+
+/// An input that contradicts its source's registered capability is corrupt,
+/// whatever else is wrong with it: corruption outranks message-ID reuse.
+pub(crate) async fn source_capability_mismatch_outranks_message_id_reuse(
+    scenario: impl ProjectionProtocolScenario,
+) {
+    let repository = scenario.repository().await;
+    repository
+        .commit_projection(scenario.batch(
+            scenario.input(
+                1,
+                b"capability-one",
+                "capability-message",
+                "capability-cause",
+                ProjectionGeneration::initial(),
+            ),
+            Vec::new(),
+            Vec::new(),
+        ))
+        .await
+        .unwrap();
+    let contradicting = TrustedProjectionInput::mint(
+        scenario.input_cursor(2),
+        ProjectionInputFingerprint::from_canonical_bytes(b"capability-two"),
+        "capability-message",
+        "capability-cause",
+        ProjectionGeneration::initial(),
+        false,
+    )
+    .unwrap();
+
+    assert!(matches!(
+        repository
+            .projection_input_disposition(&contradicting)
+            .await,
+        Err(ProjectionProtocolError::InputCorruption)
+    ));
+    assert!(matches!(
+        repository
+            .commit_projection(scenario.batch(contradicting, Vec::new(), Vec::new()))
+            .await,
+        Err(ProjectionProtocolError::InputCorruption)
+    ));
+}
+
+/// A partition's change epoch is part of its scope. A writer naming another
+/// epoch is told which scope field disagrees.
+pub(crate) async fn change_epoch_is_fixed_per_partition(scenario: impl ProjectionProtocolScenario) {
+    let repository = scenario.repository().await;
+    repository
+        .commit_projection(scenario.batch(
+            scenario.input(
+                1,
+                b"epoch-one",
+                "epoch-message-1",
+                "epoch-cause-1",
+                ProjectionGeneration::initial(),
+            ),
+            Vec::new(),
+            Vec::new(),
+        ))
+        .await
+        .unwrap();
+    let next = scenario.input(
+        2,
+        b"epoch-two",
+        "epoch-message-2",
+        "epoch-cause-2",
+        ProjectionGeneration::initial(),
+    );
+    let other_epoch = ProjectionEpoch::new("another-change-epoch").unwrap();
+    let mut batch = scenario.batch(next.clone(), Vec::new(), Vec::new());
+    batch.change_epoch = other_epoch.clone();
+
+    let is_epoch_mismatch = |error: ProjectionProtocolError| {
+        matches!(
+            error,
+            ProjectionProtocolError::ScopeMismatch {
+                field: "projection change epoch"
+            }
+        )
+    };
+    assert!(is_epoch_mismatch(
+        repository.commit_projection(batch).await.unwrap_err()
+    ));
+    assert!(is_epoch_mismatch(
+        repository
+            .record_projection_failure(
+                ProjectionFailureBatch::new(
+                    next,
+                    other_epoch,
+                    "epoch-failure",
+                    "decode_error",
+                    b"bad payload".to_vec(),
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap_err()
+    ));
+}

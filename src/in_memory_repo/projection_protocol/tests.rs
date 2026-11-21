@@ -10,8 +10,8 @@ use crate::command_ledger::{
 use crate::projection_protocol::{
     ProjectionExecutionSnapshotBatchRequest, ProjectionGraphSnapshotRequest,
     ProjectionInputFingerprint, ProjectionModelOwnership, ProjectionObservationRequest,
-    ProjectionQuerySnapshotRequest, ProjectionRecordMutation, ProjectionScopeCodec,
-    TrustedProjectionInput,
+    ProjectionObservationTarget, ProjectionQuerySnapshotRequest, ProjectionRecordMutation,
+    ProjectionScopeCodec, TrustedProjectionInput,
 };
 use crate::repository::{CommitBatch, ReadModelWritePlanStore, TransactionalCommit};
 use crate::table::{
@@ -2470,6 +2470,42 @@ async fn failure_recording_is_idempotent_for_exact_batch() {
 }
 
 #[tokio::test]
+async fn existing_record_observation_rejects_an_unfenced_tombstone() {
+    crate::projection_protocol::scenario_tests::existing_record_observation_rejects_an_unfenced_tombstone(ProjectionScenario).await;
+}
+
+#[tokio::test]
+async fn existing_record_observation_confirms_a_source_fenced_tombstone() {
+    crate::projection_protocol::scenario_tests::existing_record_observation_confirms_a_source_fenced_tombstone(ProjectionScenario).await;
+}
+
+#[tokio::test]
+async fn causation_evidence_is_ordered_by_canonical_scope_bytes() {
+    crate::projection_protocol::scenario_tests::causation_evidence_is_ordered_by_canonical_scope_bytes(ProjectionScenario).await;
+}
+
+#[tokio::test]
+async fn another_partition_cannot_create_an_owned_row() {
+    crate::projection_protocol::scenario_tests::another_partition_cannot_create_an_owned_row(
+        ProjectionScenario,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn source_capability_mismatch_outranks_message_id_reuse() {
+    crate::projection_protocol::scenario_tests::source_capability_mismatch_outranks_message_id_reuse(ProjectionScenario).await;
+}
+
+#[tokio::test]
+async fn change_epoch_is_fixed_per_partition() {
+    crate::projection_protocol::scenario_tests::change_epoch_is_fixed_per_partition(
+        ProjectionScenario,
+    )
+    .await;
+}
+
+#[tokio::test]
 async fn physical_rows_must_match_projection_record_metadata() {
     let create_with_orphan_row = repository().await;
     insert_physical_row(&create_with_orphan_row);
@@ -2490,8 +2526,7 @@ async fn physical_rows_must_match_projection_record_metadata() {
                 Vec::new(),
             ))
             .await,
-        Err(ProjectionProtocolError::InvalidBatch(message))
-            if message.contains("physical row to be absent")
+        Err(ProjectionProtocolError::RecordAlreadyExists { .. })
     ));
     assert!(create_with_orphan_row
         .projection_record(&record_scope())
@@ -2562,8 +2597,7 @@ async fn physical_rows_must_match_projection_record_metadata() {
                     Vec::new(),
                 ))
                 .await,
-            Err(ProjectionProtocolError::InvalidBatch(message))
-                if message.contains("physical row to be present")
+            Err(ProjectionProtocolError::RecordMissing { .. })
         ));
         assert_eq!(
             repository.projection_record(&record_scope()).await.unwrap(),
@@ -2651,8 +2685,7 @@ async fn physical_rows_must_match_projection_record_metadata() {
                 Vec::new(),
             ))
             .await,
-        Err(ProjectionProtocolError::InvalidBatch(message))
-            if message.contains("physical row to be absent")
+        Err(ProjectionProtocolError::RecordAlreadyExists { .. })
     ));
     assert_eq!(
         recreate_with_row

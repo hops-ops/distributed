@@ -9,8 +9,11 @@ use std::sync::Arc;
 
 use super::InMemoryRepository;
 use crate::projection_protocol::{
-    change_kind_for_mutation, checked_next, checked_projection_graph_materialization,
-    failure_matches_batch, projection_relationship_values, table_model_name,
+    change_kind_for_mutation, change_page, change_read_window,
+    checked_projection_graph_materialization, classify_input, corrupt_storage, ensure_active_input,
+    ensure_change_epoch, failure_matches_batch, next_record, plan_repair, program_id_for_model,
+    projection_relationship_values, resolve_observation, sort_causation_evidence, table_model_name,
+    validate_input_identity, validate_pending_retry, validate_physical_row,
     validate_projection_graph_snapshot_request, PartitionId, ProjectionCausationEvidenceBatch,
     ProjectionCausationEvidenceRequest, ProjectionChange, ProjectionChangeCursor,
     ProjectionChangeKind, ProjectionChangeRead, ProjectionChangeRetention, ProjectionCheckpoint,
@@ -18,10 +21,9 @@ use crate::projection_protocol::{
     ProjectionExecutionSnapshotBatch, ProjectionExecutionSnapshotBatchRequest, ProjectionFailure,
     ProjectionFailureBatch, ProjectionFailureLocation, ProjectionGeneration,
     ProjectionGraphIncludeSnapshot, ProjectionGraphSnapshot, ProjectionGraphSnapshotRequest,
-    ProjectionInputCursor, ProjectionInputDisposition, ProjectionInputFingerprint,
-    ProjectionLiveRecordBatch, ProjectionLiveRecordBatchRequest,
-    ProjectionObligationEvidenceRequest, ProjectionObservation, ProjectionObservationKind,
-    ProjectionObservationTarget, ProjectionPartitionRuntimeState, ProjectionPendingRetry,
+    ProjectionInputCursor, ProjectionInputDisposition, ProjectionLiveRecordBatch,
+    ProjectionLiveRecordBatchRequest, ProjectionObligationEvidenceRequest, ProjectionObservation,
+    ProjectionObservationKind, ProjectionPartitionRuntimeState, ProjectionPendingRetry,
     ProjectionProtocolError, ProjectionProtocolStore, ProjectionQuerySnapshot,
     ProjectionQuerySnapshotBatch, ProjectionQuerySnapshotBatchRequest,
     ProjectionQuerySnapshotRequest, ProjectionRecordExpectation, ProjectionRecordMetadata,

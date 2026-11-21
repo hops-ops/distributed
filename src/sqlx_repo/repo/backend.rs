@@ -260,6 +260,12 @@ pub trait SqlxRepoBackend: SqlxReadModelBackend {
     /// SQL expression producing the database's current timestamp, used for
     /// server-side `updated_at` maintenance.
     const NOW: &'static str;
+    /// Statement that opens a transaction which reads before it writes.
+    /// SQLite must take the write lock up front: a deferred transaction that
+    /// read and then writes is refused outright when another connection
+    /// committed in between, where waiting for the lock is what
+    /// `busy_timeout` is for.
+    const BEGIN_READ_THEN_WRITE: &'static str;
     /// Command-ledger projection with timestamp columns normalized for
     /// [`decode_timestamp`](Self::decode_timestamp) and JSON surfaced as text.
     const COMMAND_LEDGER_SELECT: &'static str;

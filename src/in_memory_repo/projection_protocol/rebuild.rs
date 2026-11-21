@@ -81,7 +81,7 @@ impl InMemoryRepository {
             let current = staged.records.get(&row.scope);
             row.verify_physical(current, staged_rows.contains_key(&row.mutation.lock_key()))?;
             let (kind, expectation) = row.transition(current);
-            let (revision, tombstone) = staged.next_record(&row.scope, &expectation, kind, true)?;
+            let (revision, tombstone) = next_record(&row.scope, &expectation, kind, current, true)?;
             let change = staged.append_change(
                 &partition,
                 PendingChange {

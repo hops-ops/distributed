@@ -68,9 +68,10 @@ where
         }
     }
 
+    // A plain stream append reads the stream versions before it inserts.
     let mut tx = repository
         .pool
-        .begin()
+        .begin_with(DB::BEGIN_READ_THEN_WRITE)
         .await
         .map_err(|err| repository_storage_error::<DB>("begin commit transaction", err))?;
     if let Some(completion) = completion.as_ref() {

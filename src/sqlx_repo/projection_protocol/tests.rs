@@ -2291,6 +2291,140 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sqlite_existing_record_observation_rejects_an_unfenced_tombstone() {
+        crate::projection_protocol::scenario_tests::existing_record_observation_rejects_an_unfenced_tombstone(ProjectionScenario).await;
+    }
+
+    #[tokio::test]
+    async fn sqlite_existing_record_observation_confirms_a_source_fenced_tombstone() {
+        crate::projection_protocol::scenario_tests::existing_record_observation_confirms_a_source_fenced_tombstone(ProjectionScenario).await;
+    }
+
+    #[tokio::test]
+    async fn sqlite_causation_evidence_is_ordered_by_canonical_scope_bytes() {
+        crate::projection_protocol::scenario_tests::causation_evidence_is_ordered_by_canonical_scope_bytes(ProjectionScenario).await;
+    }
+
+    #[tokio::test]
+    async fn sqlite_another_partition_cannot_create_an_owned_row() {
+        crate::projection_protocol::scenario_tests::another_partition_cannot_create_an_owned_row(
+            ProjectionScenario,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn sqlite_source_capability_mismatch_outranks_message_id_reuse() {
+        crate::projection_protocol::scenario_tests::source_capability_mismatch_outranks_message_id_reuse(ProjectionScenario).await;
+    }
+
+    #[tokio::test]
+    async fn sqlite_change_epoch_is_fixed_per_partition() {
+        crate::projection_protocol::scenario_tests::change_epoch_is_fixed_per_partition(
+            ProjectionScenario,
+        )
+        .await;
+    }
+
+    /// Commit and failure read the registered topology before they take
+    /// the partition lock, so they must hold the write lock from the start.
+    /// While another connection holds it they wait; a deferred transaction
+    /// would be refused as busy the moment it tried to write.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn sqlite_projection_commit_and_failure_wait_for_a_concurrent_writer() {
+        let database_path = std::env::temp_dir().join(format!(
+            "distributed-projection-write-wait-{}.sqlite",
+            uuid::Uuid::now_v7()
+        ));
+        let pool = SqlitePoolOptions::new()
+            .max_connections(3)
+            .connect_with(
+                SqliteConnectOptions::new()
+                    .filename(&database_path)
+                    .create_if_missing(true),
+            )
+            .await
+            .unwrap();
+        let repository = SqlxRepository::<sqlx::Sqlite>::new(pool);
+        repository.migrate().await.unwrap();
+        let mut registry = TableSchemaRegistry::new();
+        registry.register_schema(schema().clone()).unwrap();
+        repository
+            .bootstrap_table_schema_for_dev(&registry)
+            .await
+            .unwrap();
+        repository
+            .register_projection_models(&topology(), &[ownership()])
+            .await
+            .unwrap();
+
+        let commit = {
+            let repository = repository.clone();
+            async move {
+                repository
+                    .commit_projection(batch(
+                        input(
+                            1,
+                            b"wait-one",
+                            "wait-message-1",
+                            "wait-cause-1",
+                            ProjectionGeneration::initial(),
+                        ),
+                        Vec::new(),
+                        Vec::new(),
+                    ))
+                    .await
+                    .map(|_| ())
+                    .map_err(|error| error.to_string())
+            }
+        };
+        while_another_connection_writes(repository.pool(), commit).await;
+        let failure = {
+            let repository = repository.clone();
+            async move {
+                repository
+                    .record_projection_failure(
+                        ProjectionFailureBatch::new(
+                            input(
+                                2,
+                                b"wait-two",
+                                "wait-message-2",
+                                "wait-cause-2",
+                                ProjectionGeneration::initial(),
+                            ),
+                            change_epoch(),
+                            "wait-failure",
+                            "decode_error",
+                            b"bad payload".to_vec(),
+                        )
+                        .unwrap(),
+                    )
+                    .await
+                    .map(|_| ())
+                    .map_err(|error| error.to_string())
+            }
+        };
+        while_another_connection_writes(repository.pool(), failure).await;
+        repository.pool().close().await;
+        let _ = std::fs::remove_file(database_path);
+    }
+
+    /// Run `operation` while another connection holds the write lock: it must
+    /// still be waiting after a pause, and succeed once the lock is released.
+    async fn while_another_connection_writes(
+        pool: &sqlx::SqlitePool,
+        operation: impl std::future::Future<Output = Result<(), String>> + Send + 'static,
+    ) {
+        let writer = pool.begin_with("BEGIN IMMEDIATE").await.unwrap();
+        let mut operation = tokio::spawn(operation);
+        let waited =
+            tokio::time::timeout(std::time::Duration::from_millis(200), &mut operation).await;
+        assert!(waited.is_err(), "did not wait for the writer: {waited:?}");
+        writer.commit().await.unwrap();
+        operation.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
     async fn sqlite_tombstone_requires_explicit_exact_recreation() {
         crate::projection_protocol::scenario_tests::tombstone_requires_explicit_exact_recreation(
             ProjectionScenario,

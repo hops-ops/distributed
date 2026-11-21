@@ -1856,4 +1856,251 @@ mod postgres_tests {
                 && changes[0].cursor.position() == compacted_through + 3
         ));
     }
+
+    /// The shared conformance suite against a server that keeps its data.
+    /// Every scenario gets its own topology and table, so scenarios in one
+    /// run never meet. Like the rest of this file it needs the fresh database
+    /// `make test-local` creates (failure IDs are store-wide), and each test
+    /// takes the suite lock because other tests here assert on database-wide
+    /// notifications.
+    struct PostgresScenario {
+        url: String,
+        /// Unique per scenario; a topology is identified by its digest.
+        id: uuid::Uuid,
+        schema: &'static TableSchema,
+    }
+
+    impl PostgresScenario {
+        fn new() -> Option<Self> {
+            let url = crate::test_env::require_service(
+                "DISTRIBUTED_TEST_POSTGRES_URL",
+                "Postgres projection protocol conformance test",
+            )?;
+            let id = uuid::Uuid::now_v7();
+            let schema = Box::leak(Box::new(TableSchema {
+                model_name: "ScenarioView".into(),
+                table_name: format!("scenario_{}", id.simple()),
+                ..schema().clone()
+            }));
+            Some(Self { url, id, schema })
+        }
+
+        fn topology_digest(&self, role: u8) -> [u8; 32] {
+            let mut digest = [role; 32];
+            digest[..16].copy_from_slice(self.id.as_bytes());
+            digest
+        }
+
+        fn key() -> RowKey {
+            RowKey::new([("id", RowValue::String("todo-1".into()))])
+        }
+    }
+
+    impl crate::projection_protocol::scenario_tests::ProjectionProtocolScenario for PostgresScenario {
+        type Store = SqlxRepository<sqlx::Postgres>;
+
+        async fn repository(&self) -> Self::Store {
+            let repository = SqlxRepository::<sqlx::Postgres>::connect_and_migrate(&self.url)
+                .await
+                .unwrap();
+            let mut registry = TableSchemaRegistry::new();
+            registry.register_schema(self.schema.clone()).unwrap();
+            repository
+                .bootstrap_table_schema_for_dev(&registry)
+                .await
+                .unwrap();
+            repository
+                .register_projection_models(&self.topology(), &[self.ownership()])
+                .await
+                .unwrap();
+            repository
+        }
+
+        fn topology(&self) -> ProjectorTopologyId {
+            ProjectorTopologyId::new(1, &self.schema.table_name, self.topology_digest(1)).unwrap()
+        }
+
+        fn other_topology(&self) -> ProjectorTopologyId {
+            ProjectorTopologyId::new(
+                1,
+                format!("other_{}", self.schema.table_name),
+                self.topology_digest(2),
+            )
+            .unwrap()
+        }
+
+        fn partition(&self) -> PartitionId {
+            ProjectionScopeCodec::new(self.topology())
+                .encode_partition(Some(&serde_json::json!("scenario-tenant")))
+                .unwrap()
+        }
+
+        fn change_epoch(&self) -> ProjectionEpoch {
+            change_epoch()
+        }
+
+        fn ownership(&self) -> ProjectionModelOwnership {
+            ProjectionModelOwnership::new(&self.schema.model_name, &self.schema.table_name).unwrap()
+        }
+
+        fn mutation(
+            &self,
+            expectation: ProjectionRecordExpectation,
+            kind: RecordTransition,
+        ) -> ProjectionRecordMutation {
+            let table = match kind {
+                RecordTransition::Delete => TableMutation::DeleteRow(DeleteTableRowMutation {
+                    schema: self.schema,
+                    key: Self::key(),
+                    expected_version: ExpectedVersion::Any,
+                }),
+                RecordTransition::Upsert | RecordTransition::Recreate => {
+                    let mut values = RowValues::new();
+                    values.insert("id", RowValue::String("todo-1".into()));
+                    values.insert("value", RowValue::String("scenario".into()));
+                    TableMutation::UpsertRow(TableRowMutation {
+                        schema: self.schema,
+                        key: Self::key(),
+                        values,
+                        expected_version: ExpectedVersion::Any,
+                        mode: RowWriteMode::Upsert,
+                    })
+                }
+            };
+            let scope = ProjectionScopeCodec::with_models(
+                self.topology(),
+                [(self.schema.model_name.as_str(), self.schema)],
+            )
+            .unwrap()
+            .encode_row_scope_in_partition(&self.schema.model_name, self.partition(), &Self::key())
+            .unwrap();
+            ProjectionRecordMutation::new(scope, table, expectation, kind).unwrap()
+        }
+
+        async fn row_exists(&self, repository: &Self::Store) -> bool {
+            sqlx::query(sqlx::AssertSqlSafe(format!(
+                "SELECT 1 FROM {} WHERE id = 'todo-1'",
+                self.schema.table_name
+            )))
+            .fetch_optional(repository.pool())
+            .await
+            .unwrap()
+            .is_some()
+        }
+    }
+
+    #[tokio::test]
+    async fn postgres_input_disposition_is_read_only_exact_and_repair_fenced() {
+        let Some(scenario) = PostgresScenario::new() else {
+            return;
+        };
+        let _test_guard = POSTGRES_PROJECTION_TEST_LOCK.lock().await;
+        crate::projection_protocol::scenario_tests::input_disposition_is_read_only_exact_and_repair_fenced(scenario).await;
+    }
+
+    #[tokio::test]
+    async fn postgres_identical_redelivery_advances_only_broker_checkpoint() {
+        let Some(scenario) = PostgresScenario::new() else {
+            return;
+        };
+        let _test_guard = POSTGRES_PROJECTION_TEST_LOCK.lock().await;
+        crate::projection_protocol::scenario_tests::identical_redelivery_advances_only_broker_checkpoint(scenario).await;
+    }
+
+    #[tokio::test]
+    async fn postgres_message_identity_is_topology_wide_across_projection_partitions() {
+        let Some(scenario) = PostgresScenario::new() else {
+            return;
+        };
+        let _test_guard = POSTGRES_PROJECTION_TEST_LOCK.lock().await;
+        crate::projection_protocol::scenario_tests::message_identity_is_topology_wide_across_projection_partitions(scenario).await;
+    }
+
+    #[tokio::test]
+    async fn postgres_failure_recording_is_idempotent_for_exact_batch() {
+        let Some(scenario) = PostgresScenario::new() else {
+            return;
+        };
+        let _test_guard = POSTGRES_PROJECTION_TEST_LOCK.lock().await;
+        crate::projection_protocol::scenario_tests::failure_recording_is_idempotent_for_exact_batch(scenario).await;
+    }
+
+    #[tokio::test]
+    async fn postgres_registered_table_ownership_rejects_other_topology() {
+        let Some(scenario) = PostgresScenario::new() else {
+            return;
+        };
+        let _test_guard = POSTGRES_PROJECTION_TEST_LOCK.lock().await;
+        crate::projection_protocol::scenario_tests::registered_table_ownership_rejects_other_topology(scenario).await;
+    }
+
+    #[tokio::test]
+    async fn postgres_tombstone_requires_explicit_exact_recreation() {
+        let Some(scenario) = PostgresScenario::new() else {
+            return;
+        };
+        let _test_guard = POSTGRES_PROJECTION_TEST_LOCK.lock().await;
+        crate::projection_protocol::scenario_tests::tombstone_requires_explicit_exact_recreation(
+            scenario,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn postgres_existing_record_observation_rejects_an_unfenced_tombstone() {
+        let Some(scenario) = PostgresScenario::new() else {
+            return;
+        };
+        let _test_guard = POSTGRES_PROJECTION_TEST_LOCK.lock().await;
+        crate::projection_protocol::scenario_tests::existing_record_observation_rejects_an_unfenced_tombstone(scenario).await;
+    }
+
+    #[tokio::test]
+    async fn postgres_existing_record_observation_confirms_a_source_fenced_tombstone() {
+        let Some(scenario) = PostgresScenario::new() else {
+            return;
+        };
+        let _test_guard = POSTGRES_PROJECTION_TEST_LOCK.lock().await;
+        crate::projection_protocol::scenario_tests::existing_record_observation_confirms_a_source_fenced_tombstone(scenario).await;
+    }
+
+    #[tokio::test]
+    async fn postgres_causation_evidence_is_ordered_by_canonical_scope_bytes() {
+        let Some(scenario) = PostgresScenario::new() else {
+            return;
+        };
+        let _test_guard = POSTGRES_PROJECTION_TEST_LOCK.lock().await;
+        crate::projection_protocol::scenario_tests::causation_evidence_is_ordered_by_canonical_scope_bytes(scenario).await;
+    }
+
+    #[tokio::test]
+    async fn postgres_another_partition_cannot_create_an_owned_row() {
+        let Some(scenario) = PostgresScenario::new() else {
+            return;
+        };
+        let _test_guard = POSTGRES_PROJECTION_TEST_LOCK.lock().await;
+        crate::projection_protocol::scenario_tests::another_partition_cannot_create_an_owned_row(
+            scenario,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn postgres_source_capability_mismatch_outranks_message_id_reuse() {
+        let Some(scenario) = PostgresScenario::new() else {
+            return;
+        };
+        let _test_guard = POSTGRES_PROJECTION_TEST_LOCK.lock().await;
+        crate::projection_protocol::scenario_tests::source_capability_mismatch_outranks_message_id_reuse(scenario).await;
+    }
+
+    #[tokio::test]
+    async fn postgres_change_epoch_is_fixed_per_partition() {
+        let Some(scenario) = PostgresScenario::new() else {
+            return;
+        };
+        let _test_guard = POSTGRES_PROJECTION_TEST_LOCK.lock().await;
+        crate::projection_protocol::scenario_tests::change_epoch_is_fixed_per_partition(scenario)
+            .await;
+    }
 }

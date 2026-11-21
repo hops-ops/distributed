@@ -7,13 +7,6 @@ pub(super) fn protocol_storage_error<DB: SqlxRepoBackend>(
     ProjectionProtocolError::Repository(repository_storage_error::<DB>(operation, error))
 }
 
-pub(super) fn corrupt_storage(message: impl Into<String>) -> ProjectionProtocolError {
-    ProjectionProtocolError::InvalidBatch(format!(
-        "corrupt projection protocol storage: {}",
-        message.into()
-    ))
-}
-
 pub(super) fn to_i64<DB: SqlxRepoBackend>(
     value: u64,
     field: &'static str,
