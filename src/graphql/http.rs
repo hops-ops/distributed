@@ -14,7 +14,7 @@ use axum::routing::{get, post};
 use axum::Router;
 use futures_util::stream::BoxStream;
 
-use crate::command_dispatch::{LocalCommandDispatcher, LocalCommandHost, SharedCommandHost};
+use crate::command_dispatch::{LocalCommandHost, SharedCommandHost};
 use crate::microsvc::{Service, Session, MAX_HTTP_BODY_BYTES, USER_ID_KEY};
 
 use super::engine::GraphqlEngine;
@@ -239,21 +239,6 @@ pub fn graphql_router_with_service(engine: Arc<GraphqlEngine>, service: Arc<Serv
         .validate_graphql_engine(&engine)
         .unwrap_or_else(|error| panic!("cannot serve GraphQL with this service: {error}"));
     graphql_router_with_host(engine, Arc::new(LocalCommandHost::new(service)))
-}
-
-/// GraphQL router whose mutations dispatch through a local
-/// [`LocalCommandDispatcher`] as a [`crate::command_dispatch::CommandHost`].
-///
-/// Does **not** unwrap [`LocalCommandDispatcher::service`] into GraphQL
-/// request data (`DCS-AC-007.1`). Schema/client compilation never requires
-/// this handle. [`RemoteCommandDispatcher`] HTTPS-mTLS
-/// (`APPROVED_REMOTE_DISPATCH_PROFILE`) stays the CMP task-20 envelope;
-/// wait-path remote is [`crate::command_dispatch::HttpCommandHost`].
-pub fn graphql_router_with_dispatcher(
-    engine: Arc<GraphqlEngine>,
-    dispatcher: Arc<LocalCommandDispatcher>,
-) -> Router {
-    graphql_router_with_host(engine, dispatcher)
 }
 
 /// GraphQL router that wait-dispatches through an explicit command host.
@@ -750,24 +735,6 @@ mod connection_init_tests {
     fn websocket_request_context_retains_command_host_not_service() {
         let service = Arc::new(Service::new());
         let host: SharedCommandHost = Arc::new(LocalCommandHost::new(Arc::clone(&service)));
-        let request = request_with_context(
-            Request::new("{ __typename }"),
-            None,
-            Some(Arc::clone(&host)),
-        );
-        assert!(request.data.get(&TypeId::of::<Arc<Service>>()).is_none());
-        request
-            .data
-            .get(&TypeId::of::<SharedCommandHost>())
-            .and_then(|host| host.downcast_ref::<SharedCommandHost>())
-            .expect("command host request data");
-    }
-
-    #[test]
-    fn dispatcher_as_command_host_does_not_put_service_in_request_data() {
-        let service = Arc::new(Service::new());
-        let dispatcher = Arc::new(LocalCommandDispatcher::new(Arc::clone(&service)));
-        let host: SharedCommandHost = dispatcher;
         let request = request_with_context(
             Request::new("{ __typename }"),
             None,

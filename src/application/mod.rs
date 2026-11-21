@@ -17,7 +17,6 @@ mod plan;
 mod projection_contract;
 mod registration;
 mod runtime;
-mod runtime_host;
 mod topology;
 
 pub use capability::{
@@ -55,7 +54,6 @@ pub(crate) use projection_contract::compact_projection_program_contract;
 pub use projection_contract::expand_projection_program_contract;
 pub use registration::{Application, ApplicationBuilder, ContractCompiler};
 pub use runtime::{Runtime, RuntimeDialect};
-pub use runtime_host::{bind_single_process, CapabilityProviders, RuntimeHost};
 pub use topology::TopologyIntent;
 
 /// Compile-time duplicate check emitted by the module macro for generated
