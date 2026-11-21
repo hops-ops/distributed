@@ -39,14 +39,15 @@ mod runtime;
 #[cfg(all(feature = "graphql", test))]
 pub(crate) use causal::CausalCommandProjectionEvidence;
 #[cfg(feature = "graphql")]
+pub use causal::CausalCommandPublicStatus;
+#[cfg(feature = "graphql")]
 pub use causal::GraphqlServiceBindError;
 #[cfg(feature = "graphql")]
 pub(crate) use causal::{
     CausalCommandPublicState, CausalCommandReceiptSource, CausalProjectionEvidenceState,
     ExternalCausalReservation,
 };
-#[cfg(feature = "graphql")]
-pub use causal::{CausalCommandPublicStatus, CausalDispatchError, CausalDispatchResult};
+pub use causal::{CausalDispatchError, CausalDispatchResult};
 #[allow(unused_imports)] // public API surface for handler-owned projected commits
 pub use handlers::StagedProjectedRow;
 pub use handlers::{

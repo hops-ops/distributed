@@ -36,14 +36,15 @@ mod store;
 mod wire;
 
 // Schedule types under their old cell-host paths, for the host's own code.
+pub use crate::microsvc::service::{CausalDispatchError, CausalDispatchResult};
 #[allow(unused_imports)]
 pub(crate) use crate::schedule::{
     schedule_session, ArmedSchedule, FailedSchedule, FiredSchedule, Schedule, ScheduleError,
     ScheduleFireReport, ScheduleWrite, HOST_NOW_CLAIM, MAX_SCHEDULE_WRITES_PER_COMMAND,
 };
 pub use causal::{
-    CellCommandIdentity, CellDispatchError, CellDispatchResult, CELL_CAUSATION_ID_HEADER,
-    CELL_PRINCIPAL_PARTITION_HEADER, CELL_SERVICE_ID_HEADER,
+    CellCommandIdentity, CELL_CAUSATION_ID_HEADER, CELL_PRINCIPAL_PARTITION_HEADER,
+    CELL_SERVICE_ID_HEADER,
 };
 pub use cell::{instance_name, parent_cell_name, AggregateCell, CellBatchCommand, CellNamespace};
 #[cfg(feature = "workers-rs")]

@@ -1,39 +1,33 @@
-#[cfg(feature = "graphql")]
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
-#[cfg(feature = "graphql")]
 use serde_json::Value;
 
-#[cfg(feature = "graphql")]
+use super::routes::CausalCommandPolicy;
 use crate::command::{CommandConsistency, TypedCommandContract};
-#[cfg(feature = "graphql")]
-use crate::command_ledger::CausalTransactionalCommit;
-#[cfg(feature = "graphql")]
 use crate::command_ledger::{
-    AttemptFence, CausalCommitBatch, CausationId, CommandAttempt, CommandId, CommandLedgerError,
-    CommandLedgerState, CommandLedgerStore, CommandLookup, CommandLookupScope, CommandReplay,
-    TerminalCommandState,
+    AttemptFence, CanonicalInputHash, CausationId, CommandContractFingerprint, CommandId,
+    CommandLedgerError, CommandLedgerKey, CommandLedgerState, CommandLedgerStore, CommandLookup,
+    CommandLookupScope, CommandReplay, CommandReservation, PrincipalPartitionId,
 };
 #[cfg(feature = "graphql")]
+use crate::command_ledger::{CommandAttempt, TerminalCommandState};
+use crate::microsvc::cell_host::{CellCommandIdentity, CellProjectionEventWireItem};
 use crate::microsvc::error::HandlerError;
-#[cfg(feature = "graphql")]
 use crate::microsvc::session::Session;
+use crate::projection_protocol::SameTransactionProjectionEvidence;
 #[cfg(feature = "graphql")]
-use crate::projection_protocol::{
-    ProjectionCausationEvidenceRequest, ProjectionObservationKind,
-    SameTransactionProjectionEvidence,
-};
-#[cfg(feature = "graphql")]
-use crate::repository::CommitBatch;
+use crate::projection_protocol::{ProjectionCausationEvidenceRequest, ProjectionObservationKind};
+use crate::repository::StreamIdentity;
 
 /// Stable transport classification for a typed causal command dispatch.
 ///
 /// Public receipt/status envelopes map this private error set onto a stable
 /// mutation edge without exposing repository details.
 #[derive(Debug)]
-#[cfg(feature = "graphql")]
 pub enum CausalDispatchError {
     BadRequest(String),
+    /// A caller the host could not authenticate (aggregate-cell ingress).
+    Unauthorized,
     Forbidden,
     CommandIdReuse,
     InProgress,
@@ -47,11 +41,11 @@ pub enum CausalDispatchError {
     Internal(String),
 }
 
-#[cfg(feature = "graphql")]
 impl CausalDispatchError {
     pub fn code(&self) -> &'static str {
         match self {
             Self::BadRequest(_) => "BAD_REQUEST",
+            Self::Unauthorized => "UNAUTHORIZED",
             Self::Forbidden => "FORBIDDEN",
             Self::CommandIdReuse => "COMMAND_ID_REUSE",
             Self::InProgress => "COMMAND_IN_PROGRESS",
@@ -72,6 +66,7 @@ impl CausalDispatchError {
     pub fn status_code(&self) -> u16 {
         match self {
             Self::BadRequest(_) => 400,
+            Self::Unauthorized => 401,
             Self::Forbidden => 403,
             Self::CommandIdReuse | Self::InProgress => 409,
             Self::Expired => 410,
@@ -85,6 +80,7 @@ impl CausalDispatchError {
         match self {
             Self::BadRequest(message) => message.clone(),
             Self::Rejected { message, .. } => message.clone(),
+            Self::Unauthorized => "missing authenticated principal".into(),
             Self::Forbidden => "command is not allowed".into(),
             Self::CommandIdReuse => "command ID was already used for different input".into(),
             Self::InProgress => "command is already in progress".into(),
@@ -95,7 +91,6 @@ impl CausalDispatchError {
     }
 }
 
-#[cfg(feature = "graphql")]
 impl std::fmt::Display for CausalDispatchError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -105,7 +100,6 @@ impl std::fmt::Display for CausalDispatchError {
     }
 }
 
-#[cfg(feature = "graphql")]
 impl std::error::Error for CausalDispatchError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
@@ -115,7 +109,6 @@ impl std::error::Error for CausalDispatchError {
     }
 }
 
-#[cfg(feature = "graphql")]
 impl From<HandlerError> for CausalDispatchError {
     fn from(error: HandlerError) -> Self {
         Self::Handler(error)
@@ -126,7 +119,6 @@ impl From<HandlerError> for CausalDispatchError {
 ///
 /// `direct_projection` is decoded from the versioned ledger replay envelope;
 /// it is never reconstructed from the current read-model row.
-#[cfg(feature = "graphql")]
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct CausalCommandReceiptSource {
     pub(crate) command_id: String,
@@ -135,11 +127,12 @@ pub(crate) struct CausalCommandReceiptSource {
     pub(crate) consistency: CommandConsistency,
     pub(crate) state: CommandLedgerState,
     pub(crate) outcome: Value,
+    /// Only a GraphQL host seals and reads modeled projection metadata.
+    #[cfg(feature = "graphql")]
     pub(crate) projection_metadata: Option<crate::graphql::protocol::CommandProjectionMetadataV1>,
     pub(crate) direct_projection: Option<SameTransactionProjectionEvidence>,
 }
 
-#[cfg(feature = "graphql")]
 impl CausalCommandReceiptSource {
     pub(super) fn from_replay(
         consistency: CommandConsistency,
@@ -155,6 +148,7 @@ impl CausalCommandReceiptSource {
                     "stored direct projection evidence is invalid: {error}"
                 ))
             })?;
+        #[cfg(feature = "graphql")]
         let projection_metadata = replay
             .projection_metadata
             .as_deref()
@@ -172,6 +166,7 @@ impl CausalCommandReceiptSource {
             consistency,
             state: replay.state,
             outcome: replay.outcome,
+            #[cfg(feature = "graphql")]
             projection_metadata,
             direct_projection,
         })
@@ -179,14 +174,14 @@ impl CausalCommandReceiptSource {
 }
 
 /// Successful typed causal dispatch plus its exact durable receipt source.
-#[cfg(feature = "graphql")]
 #[derive(Clone, Debug, PartialEq)]
 pub struct CausalDispatchResult {
     pub(crate) payload: Value,
     pub(crate) receipt: CausalCommandReceiptSource,
-    /// Domain-event evidence used to seal wait-path projection metadata.
-    /// Transport delivery remains owned by the aggregate cell and Queue.
-    pub(crate) projection_events: Vec<crate::OutboxMessage>,
+    /// Domain-event evidence an aggregate cell committed with the command,
+    /// used to seal wait-path projection metadata. Transport delivery remains
+    /// owned by the aggregate cell and Queue.
+    pub(crate) projection_events: Vec<CellProjectionEventWireItem>,
     /// The command ledger replayed an earlier receipt (the command id was
     /// already settled); the handler did not run again.
     pub(crate) replayed: bool,
@@ -295,7 +290,6 @@ impl ExternalCausalAttempt {
     }
 }
 
-#[cfg(feature = "graphql")]
 impl CausalDispatchResult {
     /// Handler payload returned to the wait-path caller.
     pub fn payload(&self) -> &Value {
@@ -308,8 +302,10 @@ impl CausalDispatchResult {
         self
     }
 
-    /// Domain events committed by the wait-path command for projection sealing.
-    pub fn projection_events(&self) -> &[crate::OutboxMessage] {
+    /// Domain events an aggregate cell committed with the command: exact
+    /// confirmation evidence retained with its retry receipt. Delivery may
+    /// have already removed all of the command's outbox rows.
+    pub fn projection_events(&self) -> &[CellProjectionEventWireItem] {
         &self.projection_events
     }
 
@@ -340,6 +336,25 @@ impl CausalDispatchResult {
         self.receipt.state.as_str()
     }
 
+    /// The standard wait-path response body (`{payload, receipt: {commandId,
+    /// causationId, state, replayed}, events}`) every command host decodes
+    /// ([`Self::from_wait_path_wire`]).
+    pub fn wait_path_wire(&self) -> Value {
+        serde_json::json!({
+            "payload": self.payload,
+            "receipt": {
+                "commandId": self.command_id(),
+                "causationId": self.causation_id(),
+                "state": self.state(),
+                "replayed": self.replayed,
+            },
+            "events": self.projection_events,
+        })
+    }
+}
+
+#[cfg(feature = "graphql")]
+impl CausalDispatchResult {
     /// Fill Eventual modeled projection metadata from cell-committed domain
     /// events. The generated replica requires the same projection delta local
     /// dispatch records, independently of how those events are transported.
@@ -357,8 +372,18 @@ impl CausalDispatchResult {
         {
             return Ok(self);
         }
-        let occurrences = self
+        let events = self
             .projection_events
+            .iter()
+            .cloned()
+            .map(CellProjectionEventWireItem::try_into_message)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| {
+                CausalDispatchError::Internal(format!(
+                    "invalid cell projection event response: {error}"
+                ))
+            })?;
+        let occurrences = events
             .iter()
             .map(|row| {
                 row.domain_event_occurrence().map_err(|error| {
@@ -372,7 +397,7 @@ impl CausalDispatchResult {
             .iter()
             .find_map(|occurrence| occurrence.metadata().get("causation_id").cloned())
             .or_else(|| {
-                self.projection_events
+                events
                     .iter()
                     .find_map(|row| row.metadata.get("causation_id").cloned())
             })
@@ -463,7 +488,7 @@ impl CausalDispatchResult {
             payload: Value,
             receipt: ReceiptWire,
             #[serde(default)]
-            events: Vec<crate::microsvc::cell_host::CellProjectionEventWireItem>,
+            events: Vec<CellProjectionEventWireItem>,
         }
 
         let wire: ResponseWire = serde_json::from_value(body).map_err(|error| {
@@ -481,18 +506,17 @@ impl CausalDispatchResult {
             |err| CausalDispatchError::Internal(format!("wait-path receipt state: {err}")),
         )?;
         let replayed = wire.receipt.replayed.unwrap_or(false);
-        let projection_events =
-            crate::microsvc::cell_host::parse_cell_projection_events(&serde_json::json!({
-                "events": wire.events
-            }))
-            .map_err(|error| {
-                CausalDispatchError::Internal(format!(
-                    "invalid cell projection event response: {error}"
-                ))
-            })?;
+        crate::microsvc::cell_host::parse_cell_projection_events(&serde_json::json!({
+            "events": wire.events
+        }))
+        .map_err(|error| {
+            CausalDispatchError::Internal(format!(
+                "invalid cell projection event response: {error}"
+            ))
+        })?;
         Ok(Self {
             payload: wire.payload,
-            projection_events,
+            projection_events: wire.events,
             replayed,
             receipt: CausalCommandReceiptSource {
                 command_id: wire.receipt.command_id,
@@ -622,7 +646,6 @@ impl std::fmt::Display for GraphqlServiceBindError {
 #[cfg(feature = "graphql")]
 impl std::error::Error for GraphqlServiceBindError {}
 
-#[cfg(feature = "graphql")]
 pub(super) fn ensure_causal_grant(
     contract: &TypedCommandContract,
     session: &Session,
@@ -642,19 +665,146 @@ pub(super) fn ensure_causal_grant(
     }
 }
 
-#[cfg(feature = "graphql")]
-pub(super) fn causal_handler_error_code(error: &HandlerError) -> &'static str {
+/// A modeled command's projection metadata, as sealed into its ledger receipt.
+#[cfg_attr(not(feature = "graphql"), allow(dead_code))]
+pub(super) struct ModeledProjectionMetadata {
+    pub(super) canonical_bytes: Vec<u8>,
+    pub(super) expires_at: SystemTime,
+    /// Projectors still owe obligations for this command.
+    pub(super) pending: bool,
+}
+
+/// Seals the modeled projection metadata of the domain events a command is
+/// about to commit. Only a GraphQL host holds the protocol authority for it.
+pub(super) type SealModeledProjection<'a> = dyn Fn(
+        CausationId,
+        Duration,
+        &[crate::DomainEventOccurrence],
+    ) -> Result<ModeledProjectionMetadata, String>
+    + Send
+    + Sync
+    + 'a;
+
+/// Where a typed command entered the host. Everything the one command
+/// pipeline (`execute_typed_command`) does differently per ingress is decided
+/// by this value.
+pub(super) enum CommandIngress<'a> {
+    /// A service's GraphQL or wait-path ingress, for a verified principal.
+    #[cfg_attr(not(feature = "graphql"), allow(dead_code))]
+    Service {
+        service_id: &'a str,
+        principal_partition: String,
+        command_id: &'a str,
+        policy: CausalCommandPolicy,
+        seal_modeled_projection: Option<&'a SealModeledProjection<'a>>,
+    },
+    /// One aggregate cell. It commits only its own stream and keeps the
+    /// command's domain events in the ledger receipt.
+    Cell {
+        identity: &'a CellCommandIdentity,
+        shard: &'a StreamIdentity,
+    },
+}
+
+impl CommandIngress<'_> {
+    pub(super) fn policy(&self) -> CausalCommandPolicy {
+        match self {
+            Self::Service { policy, .. } => *policy,
+            Self::Cell { .. } => CausalCommandPolicy::default(),
+        }
+    }
+
+    /// Whether this ingress runs `contract` for `session` at all.
+    pub(super) fn admit(
+        &self,
+        contract: &TypedCommandContract,
+        session: &Session,
+    ) -> Result<(), CausalDispatchError> {
+        let granted = ensure_causal_grant(contract, session);
+        match self {
+            Self::Service { .. } => granted,
+            Self::Cell { .. } => {
+                granted.map_err(|error| match error {
+                    CausalDispatchError::Handler(_) => CausalDispatchError::Unauthorized,
+                    other => other,
+                })?;
+                if contract.consistency == CommandConsistency::Atomic {
+                    return Err(CausalDispatchError::BadRequest(
+                        "atomic typed commands require a same-transaction relational projection host"
+                            .into(),
+                    ));
+                }
+                Ok(())
+            }
+        }
+    }
+
+    /// The ledger reservation of this command: a service derives its key
+    /// from the verified principal, a cell is handed a trusted identity.
+    pub(super) fn reservation(
+        &self,
+        contract: &TypedCommandContract,
+        input_hash: CanonicalInputHash,
+    ) -> Result<CommandReservation, CausalDispatchError> {
+        let (key, causation_id) = match self {
+            Self::Service {
+                service_id,
+                principal_partition,
+                command_id,
+                ..
+            } => {
+                let command_id = CommandId::parse(command_id)
+                    .map_err(|error| CausalDispatchError::BadRequest(error.to_string()))?;
+                let partition = PrincipalPartitionId::new(principal_partition.clone())
+                    .map_err(internal_ledger_error)?;
+                let key = CommandLedgerKey::new(*service_id, partition, command_id)
+                    .map_err(internal_ledger_error)?;
+                (key, None)
+            }
+            Self::Cell { identity, .. } => {
+                (identity.key().clone(), identity.causation_id().cloned())
+            }
+        };
+        let policy = self.policy();
+        let reservation = CommandReservation::new(
+            key,
+            contract.name.clone(),
+            CommandContractFingerprint::new(contract.fingerprint_bytes()),
+            input_hash,
+            policy.attempt_lease,
+            policy.replay_retention,
+        )
+        .map_err(internal_ledger_error)?;
+        Ok(match causation_id {
+            Some(causation_id) => reservation.with_causation_id(causation_id),
+            None => reservation,
+        })
+    }
+
+    /// Render a ledger replay as this ingress's dispatch result.
+    pub(super) fn replay(
+        &self,
+        consistency: CommandConsistency,
+        replay: CommandReplay,
+    ) -> Result<CausalDispatchResult, CausalDispatchError> {
+        let result = replay_result(consistency, replay)?;
+        match self {
+            Self::Service { .. } => Ok(result),
+            Self::Cell { .. } => crate::microsvc::cell_host::causal::open_cell_receipt(result),
+        }
+    }
+}
+
+pub(super) fn handler_error_code(error: &HandlerError) -> &'static str {
     match error.status_code() {
         400 => "BAD_REQUEST",
         401 => "UNAUTHORIZED",
         403 => "FORBIDDEN",
         404 => "NOT_FOUND",
-        422 => "REJECTED",
         _ => "REJECTED",
     }
 }
 
-#[cfg(feature = "graphql")]
 pub(super) fn internal_ledger_error(error: CommandLedgerError) -> CausalDispatchError {
     CausalDispatchError::Internal(error.to_string())
 }
@@ -693,7 +843,8 @@ where
     }
 }
 
-#[cfg(feature = "graphql")]
+/// A ledger replay whose stored outcome is the handler payload. A rejection
+/// replays as the error it was.
 pub(super) fn replay_result(
     consistency: CommandConsistency,
     replay: CommandReplay,
@@ -711,7 +862,7 @@ pub(super) fn replay_result(
                 replayed: true,
             })
         }
-        CommandLedgerState::Rejected => replay_rejection(replay.outcome),
+        CommandLedgerState::Rejected => Err(replay_rejection(replay.outcome)),
         CommandLedgerState::InProgress
         | CommandLedgerState::RetryableUnknown
         | CommandLedgerState::Expired => Err(CausalDispatchError::Internal(
@@ -720,90 +871,55 @@ pub(super) fn replay_result(
     }
 }
 
-#[cfg(feature = "graphql")]
-pub(super) fn replay_rejection(
-    outcome: Value,
-) -> Result<CausalDispatchResult, CausalDispatchError> {
-    let error = outcome
-        .get("error")
-        .and_then(Value::as_object)
-        .ok_or_else(|| CausalDispatchError::Internal("stored rejection is malformed".into()))?;
+/// The ledger outcome of a terminal rejection.
+pub(super) fn rejection_outcome(code: &str, status: u16, message: &str) -> Value {
+    serde_json::json!({
+        "error": {
+            "code": code,
+            "status": status,
+            "message": message,
+        }
+    })
+}
+
+fn replay_rejection(outcome: Value) -> CausalDispatchError {
+    let invalid = |what: &str| CausalDispatchError::Internal(format!("stored rejection {what}"));
+    let Some(error) = outcome.get("error").and_then(Value::as_object) else {
+        return invalid("is malformed");
+    };
     let code = match error.get("code").and_then(Value::as_str) {
         Some("BAD_REQUEST") => "BAD_REQUEST",
         Some("UNAUTHORIZED") => "UNAUTHORIZED",
         Some("FORBIDDEN") => "FORBIDDEN",
         Some("NOT_FOUND") => "NOT_FOUND",
         Some("REJECTED") => "REJECTED",
-        _ => {
-            return Err(CausalDispatchError::Internal(
-                "stored rejection code is invalid".into(),
-            ));
-        }
+        _ => return invalid("code is invalid"),
     };
-    let status = error
+    let Some(status) = error
         .get("status")
         .and_then(Value::as_u64)
         .and_then(|status| u16::try_from(status).ok())
         .filter(|status| (400..500).contains(status))
-        .ok_or_else(|| {
-            CausalDispatchError::Internal("stored rejection status is invalid".into())
-        })?;
-    let message = error
-        .get("message")
-        .and_then(Value::as_str)
-        .ok_or_else(|| CausalDispatchError::Internal("stored rejection message is invalid".into()))?
-        .to_string();
-    Err(CausalDispatchError::Rejected {
+    else {
+        return invalid("status is invalid");
+    };
+    let Some(message) = error.get("message").and_then(Value::as_str) else {
+        return invalid("message is invalid");
+    };
+    CausalDispatchError::Rejected {
         code,
         status,
-        message,
-    })
-}
-
-#[cfg(feature = "graphql")]
-pub(super) async fn commit_causal_rejection<R>(
-    repository: &R,
-    attempt: CommandAttempt,
-    consistency: CommandConsistency,
-    retention: Duration,
-    code: &'static str,
-    status: u16,
-    message: String,
-) -> Result<CausalDispatchResult, CausalDispatchError>
-where
-    R: CommandLedgerStore + CausalTransactionalCommit + Send + Sync,
-{
-    let outcome = serde_json::json!({
-        "error": {
-            "code": code,
-            "status": status,
-            "message": message,
-        }
-    });
-    let fence = attempt.fence();
-    let completion = attempt
-        .complete(TerminalCommandState::Rejected, outcome, retention)
-        .map_err(internal_ledger_error)?;
-    match repository
-        .commit_causal_batch(CausalCommitBatch::new(CommitBatch::empty(), completion))
-        .await
-    {
-        Ok(()) => Err(CausalDispatchError::Rejected {
-            code,
-            status,
-            message,
-        }),
-        Err(error) => {
-            recover_causal_commit_error(repository, fence, consistency, error.to_string()).await
-        }
+        message: message.to_string(),
     }
 }
 
-#[cfg(feature = "graphql")]
-pub(super) async fn load_committed_dispatch_result<R>(
+/// The receipt the attempt behind `fence` just committed, read back from the
+/// ledger: not a replay.
+pub(super) async fn load_committed_result<R>(
     repository: &R,
-    fence: &AttemptFence,
+    ingress: &CommandIngress<'_>,
     consistency: CommandConsistency,
+    fence: &AttemptFence,
 ) -> Result<CausalDispatchResult, CausalDispatchError>
 where
     R: CommandLedgerStore + Send + Sync,
@@ -813,10 +929,9 @@ where
         .await
         .map_err(internal_ledger_error)?
     {
-        // The receipt this attempt just wrote: not a replay.
-        CommandLookup::Replay(replay) => {
-            replay_result(consistency, replay).map(CausalDispatchResult::fresh)
-        }
+        CommandLookup::Replay(replay) => ingress
+            .replay(consistency, replay)
+            .map(CausalDispatchResult::fresh),
         CommandLookup::Expired => Err(CausalDispatchError::Expired),
         CommandLookup::InProgress { .. }
         | CommandLookup::RetryableUnknown { .. }
@@ -826,21 +941,22 @@ where
     }
 }
 
-#[cfg(feature = "graphql")]
-pub(super) async fn abandon_causal_attempt<R>(
+/// Release an attempt that produced nothing durable, so a retry with the same
+/// command ID runs again instead of waiting out the attempt lease.
+pub(super) async fn abandon_attempt<R>(
     repository: &R,
-    attempt: CommandAttempt,
+    ingress: &CommandIngress<'_>,
     consistency: CommandConsistency,
+    fence: AttemptFence,
     detail: String,
 ) -> Result<CausalDispatchResult, CausalDispatchError>
 where
     R: CommandLedgerStore + Send + Sync,
 {
-    let fence = attempt.fence();
     match repository.mark_retryable_unknown(fence.clone()).await {
         Ok(()) => Err(CausalDispatchError::Internal(detail)),
         Err(CommandLedgerError::AttemptFenced { .. }) => {
-            resolve_ambiguous_lookup(repository, fence, consistency, detail).await
+            resolve_ambiguous_lookup(repository, ingress, consistency, fence, detail).await
         }
         Err(error) => Err(CausalDispatchError::Internal(format!(
             "{detail}; failed to mark command retryable: {error}"
@@ -848,24 +964,14 @@ where
     }
 }
 
-#[cfg(feature = "graphql")]
-pub(super) async fn recover_causal_commit_error<R>(
-    repository: &R,
-    fence: AttemptFence,
-    consistency: CommandConsistency,
-    detail: String,
-) -> Result<CausalDispatchResult, CausalDispatchError>
-where
-    R: CommandLedgerStore + Send + Sync,
-{
-    resolve_ambiguous_lookup(repository, fence, consistency, detail).await
-}
-
-#[cfg(feature = "graphql")]
+/// Settle an attempt whose fate this process does not know (a commit that
+/// did not report success, or an abandonment that was fenced): the ledger
+/// decides.
 pub(super) async fn resolve_ambiguous_lookup<R>(
     repository: &R,
-    fence: AttemptFence,
+    ingress: &CommandIngress<'_>,
     consistency: CommandConsistency,
+    fence: AttemptFence,
     detail: String,
 ) -> Result<CausalDispatchResult, CausalDispatchError>
 where
@@ -875,9 +981,9 @@ where
         .lookup_command(fence.key(), CommandLookupScope::Attempt(&fence))
         .await
     {
-        Ok(CommandLookup::Replay(replay)) => {
-            replay_result(consistency, replay).map(CausalDispatchResult::fresh)
-        }
+        Ok(CommandLookup::Replay(replay)) => ingress
+            .replay(consistency, replay)
+            .map(CausalDispatchResult::fresh),
         Ok(CommandLookup::Expired) => Err(CausalDispatchError::Expired),
         Ok(CommandLookup::RetryableUnknown { .. }) => Err(CausalDispatchError::Internal(detail)),
         Ok(CommandLookup::InProgress { .. }) => {

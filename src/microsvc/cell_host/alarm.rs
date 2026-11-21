@@ -10,13 +10,13 @@
 
 pub(crate) use crate::schedule::*;
 
-use super::causal::CellDispatchError;
+use super::CausalDispatchError;
 
 /// Whether a dispatch failure should be retried rather than disarm the
 /// schedule.
-pub(crate) fn is_retryable(error: &CellDispatchError) -> bool {
+pub(crate) fn is_retryable(error: &CausalDispatchError) -> bool {
     matches!(
         error,
-        CellDispatchError::InProgress | CellDispatchError::Internal(_)
+        CausalDispatchError::InProgress | CausalDispatchError::Internal(_)
     )
 }

@@ -1,10 +1,12 @@
+use super::causal::{
+    abandon_attempt, handler_error_code, internal_ledger_error, load_committed_result,
+    rejection_outcome, resolve_ambiguous_lookup, CausalDispatchError, CausalDispatchResult,
+    CommandIngress, ModeledProjectionMetadata,
+};
 #[cfg(feature = "graphql")]
 use super::causal::{
-    abandon_causal_attempt, causal_handler_error_code, commit_causal_rejection,
-    ensure_causal_grant, evaluate_causal_command_status, internal_ledger_error,
-    load_committed_dispatch_result, recover_causal_commit_error, replay_result,
-    CausalCommandPublicStatus, CausalDispatchError, CausalDispatchResult, ExternalCausalAttempt,
-    ExternalCausalReservation,
+    ensure_causal_grant, evaluate_causal_command_status, replay_result, CausalCommandPublicStatus,
+    ExternalCausalAttempt, ExternalCausalReservation, SealModeledProjection,
 };
 use super::handlers::{
     boxed_causal_guard, boxed_handler, boxed_prepared_handler, CausalCommandContext, CausalGuardFn,
@@ -20,25 +22,26 @@ use crate::command::{
     CompiledInputDefaults, TypedCommand, TypedCommandContract,
 };
 use crate::command_ledger::{
-    CanonicalInputHash, CausalCommitBatch, CausalTransactionalCommit, CommandContractFingerprint,
-    CommandLedgerStore, CommandReservation, ReservationOutcome, TerminalCommandState,
+    CanonicalInputHash, CausalCommitBatch, CausalTransactionalCommit, CommandAttempt,
+    CommandLedgerStore, ReservationOutcome, TerminalCommandState,
 };
 #[cfg(feature = "graphql")]
 use crate::command_ledger::{
-    CausalRepositoryIdentity, CommandId, CommandLedgerKey, CommandLookup, CommandLookupScope,
-    ExternalDispatchBinding, PrincipalPartitionId,
+    CausalRepositoryIdentity, CommandContractFingerprint, CommandId, CommandLedgerKey,
+    CommandLookup, CommandLookupScope, CommandReservation, ExternalDispatchBinding,
+    PrincipalPartitionId,
 };
 #[cfg(feature = "graphql")]
 use crate::graphql::identity::VerifiedPrincipal;
 use crate::graphql::SurfaceProjector;
 use crate::microsvc::causal::CausalWorkspace;
-use crate::microsvc::cell_host::{CellCommandIdentity, CellDispatchError, CellDispatchResult};
+use crate::microsvc::cell_host::CellCommandIdentity;
 use crate::microsvc::context::Context;
 #[cfg(feature = "graphql")]
 use crate::microsvc::dependencies::CausalHostProjections;
 use crate::microsvc::dependencies::{
-    CausalProjectionRouteDependencies, CausalRouteDependencies, ConfigurableOutboxPublisher,
-    HasOutboxStore, HasReadModelStore, HasRepo,
+    CausalProjectionRouteDependencies, CausalRepositoryBackend, CausalRouteDependencies,
+    ConfigurableOutboxPublisher, HasOutboxStore, HasReadModelStore, HasRepo,
 };
 use crate::microsvc::error::HandlerError;
 use crate::microsvc::projector::{
@@ -65,7 +68,7 @@ use crate::outbox_worker::{
 };
 #[cfg(feature = "graphql")]
 use crate::projection_protocol::{CompiledProjectionTopology, ProjectorTopologyId};
-use crate::repository::{StreamIdentity, TransactionalCommit};
+use crate::repository::{CommitBatch, StreamIdentity, TransactionalCommit};
 use serde_json::Value;
 #[cfg(feature = "graphql")]
 use std::collections::BTreeMap;
@@ -165,7 +168,6 @@ enum RegisteredHandler<D> {
 }
 
 #[derive(Clone, Copy)]
-#[cfg_attr(not(feature = "graphql"), allow(dead_code))]
 pub(super) struct CausalCommandPolicy {
     pub(super) attempt_lease: Duration,
     pub(super) replay_retention: Duration,
@@ -179,7 +181,6 @@ impl Default for CausalCommandPolicy {
         }
     }
 }
-#[cfg(feature = "graphql")]
 pub(super) type CausalHandlerFuture<'a> =
     Pin<Box<dyn Future<Output = Result<CausalDispatchResult, CausalDispatchError>> + Send + 'a>>;
 #[cfg(feature = "graphql")]
@@ -196,8 +197,6 @@ pub(super) type ExternalCompletionFuture<'a> =
 #[cfg(feature = "graphql")]
 pub(super) type ExternalAbandonFuture<'a> =
     Pin<Box<dyn Future<Output = Result<(), CausalDispatchError>> + Send + 'a>>;
-pub(super) type CellCausalHandlerFuture<'a> =
-    Pin<Box<dyn Future<Output = Result<CellDispatchResult, CellDispatchError>> + Send + 'a>>;
 
 pub(super) trait ErasedCausalHandler<D>: Send + Sync {
     fn contract(&self) -> &TypedCommandContract;
@@ -229,7 +228,7 @@ pub(super) trait ErasedCausalHandler<D>: Send + Sync {
         input: Value,
         session: Session,
         shard: &'a StreamIdentity,
-    ) -> CellCausalHandlerFuture<'a>;
+    ) -> CausalHandlerFuture<'a>;
 
     #[cfg(feature = "graphql")]
     #[allow(dead_code)]
@@ -1142,7 +1141,7 @@ impl<D: Send + Sync + 'static> Routes<D> {
         input: Value,
         session: Session,
         shard: &StreamIdentity,
-    ) -> Result<CellDispatchResult, CellDispatchError> {
+    ) -> Result<CausalDispatchResult, CausalDispatchError> {
         let handler = self
             .handlers
             .get(&MessageKind::Command)
@@ -1153,7 +1152,7 @@ impl<D: Send + Sync + 'static> Routes<D> {
                     .dispatch_cell_causal(&self.dependencies, identity, input, session, shard)
                     .await
             }
-            Some(_) | None => Err(CellDispatchError::BadRequest(format!(
+            Some(_) | None => Err(CausalDispatchError::BadRequest(format!(
                 "`{command}` is not a typed causal command"
             ))),
         }
@@ -1645,6 +1644,407 @@ impl<D: Send + Sync + 'static> CommandMountRegistrar for Routes<D> {
     }
 }
 
+/// Why a reserved attempt stops before its commit.
+enum Failure {
+    /// The command was refused: record a terminal rejection every retry
+    /// replays.
+    Reject {
+        code: &'static str,
+        status: u16,
+        message: String,
+    },
+    /// Nothing durable was produced: release the attempt so a retry runs.
+    Abandon(String),
+}
+
+impl Failure {
+    fn abandon(error: impl std::fmt::Display) -> Self {
+        Self::Abandon(error.to_string())
+    }
+}
+
+impl From<HandlerError> for Failure {
+    fn from(error: HandlerError) -> Self {
+        if error.status_code() < 500 {
+            Self::Reject {
+                code: handler_error_code(&error),
+                status: error.status_code(),
+                message: error.client_facing_message(),
+            }
+        } else {
+            Self::abandon(error)
+        }
+    }
+}
+
+impl From<Failure> for CausalDispatchError {
+    fn from(failure: Failure) -> Self {
+        match failure {
+            Failure::Reject {
+                code,
+                status,
+                message,
+            } => Self::Rejected {
+                code,
+                status,
+                message,
+            },
+            Failure::Abandon(detail) => Self::Internal(detail),
+        }
+    }
+}
+
+/// A handled command, validated and ready to commit under its attempt.
+struct StagedCommand<'a, A, K: CommandOutcome> {
+    parts: crate::microsvc::causal::CausalWorkspaceParts<A>,
+    prepared: crate::command::PreparedCommand<K>,
+    state: TerminalCommandState,
+    modeled_projection: Option<ModeledProjectionMetadata>,
+    direct_projection: Option<crate::projection_protocol::SameTransactionProjectionBatch>,
+    /// A service hands the rows it commits to its outbox publisher.
+    publisher: Option<&'a OutboxPublisherConfig>,
+    outbox_ids: Vec<String>,
+}
+
+impl<A, K> StagedCommand<'_, A, K>
+where
+    A: Aggregate + Send + Sync + 'static,
+    K: CommandOutcome,
+{
+    /// The one transaction that settles `attempt`. An error is the detail to
+    /// abandon the attempt with.
+    fn commit_batch(
+        &mut self,
+        ingress: &CommandIngress<'_>,
+        attempt: CommandAttempt,
+        retention: Duration,
+    ) -> Result<CausalCommitBatch<'_>, String> {
+        let payload = self.prepared.serialized_payload().clone();
+        let mut batch = self
+            .parts
+            .prepare_commit_batch()
+            .map_err(|error| format!("causal commit batch preparation failed: {error}"))?;
+        let outcome = match ingress {
+            CommandIngress::Service { .. } => {
+                // Stamp causation. Rows are committed pending; the publisher claims.
+                if self.publisher.is_some() {
+                    for message in &mut batch.outbox_messages {
+                        message.overwrite_causation_id(attempt.causation_id().as_str());
+                        self.outbox_ids.push(message.id().to_string());
+                    }
+                }
+                payload
+            }
+            CommandIngress::Cell { shard, .. } => {
+                crate::microsvc::cell_host::validate_cell_projection_events(&batch.outbox_messages)
+                    .map_err(|error| {
+                        format!("cell projection events violate response bounds: {error}")
+                    })?;
+                if let Some(foreign) = batch
+                    .streams
+                    .iter()
+                    .find(|stream| stream.identity != **shard)
+                {
+                    return Err(format!(
+                        "cell `{shard}` cannot commit stream `{}`",
+                        foreign.identity
+                    ));
+                }
+                serde_json::to_value(crate::microsvc::cell_host::causal::CellCommandReplay {
+                    payload,
+                    events: batch
+                        .outbox_messages
+                        .iter()
+                        .map(crate::microsvc::cell_host::CellProjectionEventWireItem::from_message)
+                        .collect(),
+                })
+                .map_err(|error| format!("cell command replay could not be encoded: {error}"))?
+            }
+        };
+        let completion = match self.modeled_projection.take() {
+            Some(modeled) => attempt.complete_with_projection_metadata_until(
+                self.state,
+                outcome,
+                modeled.canonical_bytes,
+                retention,
+                modeled.expires_at,
+            ),
+            None => attempt.complete(self.state, outcome, retention),
+        }
+        .map_err(|error| error.to_string())?;
+        Ok(match self.direct_projection.take() {
+            Some(direct_projection) => {
+                CausalCommitBatch::with_direct_projection(batch, completion, direct_projection)
+            }
+            None => CausalCommitBatch::new(batch, completion),
+        })
+    }
+}
+
+impl<A, I, K> RegisteredCausalHandler<A, I, K>
+where
+    A: Aggregate + Send + Sync + 'static,
+    I: serde::de::DeserializeOwned + Send + 'static,
+    K: CommandOutcome,
+{
+    /// The typed command pipeline, for every ingress: admit, reserve the
+    /// command ID in the ledger, run the handler, and commit its events with
+    /// the terminal receipt in one transaction.
+    ///
+    /// Once the reservation is acquired every exit settles the attempt: a
+    /// refusal commits a terminal rejection, any other failure before the
+    /// commit abandons the attempt, and a commit that did not report success
+    /// is resolved from the ledger.
+    async fn execute_typed_command<D>(
+        &self,
+        dependencies: &D,
+        ingress: CommandIngress<'_>,
+        input: Value,
+        session: Session,
+    ) -> Result<CausalDispatchResult, CausalDispatchError>
+    where
+        D: CausalRouteDependencies<Aggregate = A> + Send + Sync + 'static,
+        D::Backend: TransactionalCommit,
+    {
+        let consistency = self.contract.consistency;
+        ingress.admit(&self.contract, &session)?;
+
+        let canonical = canonicalize_command_input(&self.contract.input, input)
+            .map_err(|error| CausalDispatchError::BadRequest(error.to_string()))?;
+        let typed = canonical
+            .decode::<I>()
+            .map_err(|error| CausalDispatchError::BadRequest(error.to_string()))?;
+        let (input, wire, input_digest) = typed.into_parts();
+        let direct_projection_target = match &ingress {
+            CommandIngress::Service { .. } => self
+                .contract
+                .resolve_direct_projection_target_from_session(&wire, Some(&session))
+                .map_err(|error| CausalDispatchError::Internal(error.to_string()))?,
+            CommandIngress::Cell { .. } => None,
+        };
+        let reservation =
+            ingress.reservation(&self.contract, CanonicalInputHash::new(input_digest))?;
+
+        let aggregate_repository = dependencies.__causal_aggregate_repository();
+        let repository = aggregate_repository.repo();
+        let session = stamped_session(self.requires_clock, repository, session)
+            .await
+            .map_err(|error| CausalDispatchError::Internal(error.to_string()))?;
+        #[cfg(feature = "graphql")]
+        if let Some(target) = direct_projection_target.as_ref() {
+            let (topology, ownership) = target.registration();
+            self.direct_projection_bootstrap
+                .get_or_try_init(|| async {
+                    repository
+                        .__register_direct_projection_models(topology, ownership)
+                        .await
+                        .map_err(|error| {
+                            CausalDispatchError::Internal(format!(
+                                "direct projection ownership bootstrap failed: {error}"
+                            ))
+                        })
+                })
+                .await?;
+        }
+        let attempt = match repository
+            .reserve_command(reservation)
+            .await
+            .map_err(internal_ledger_error)?
+        {
+            ReservationOutcome::Acquired(attempt) => attempt,
+            ReservationOutcome::InProgress { .. } => return Err(CausalDispatchError::InProgress),
+            ReservationOutcome::Replay(replay) => return ingress.replay(consistency, replay),
+            ReservationOutcome::Conflict => return Err(CausalDispatchError::CommandIdReuse),
+            ReservationOutcome::Expired => return Err(CausalDispatchError::Expired),
+        };
+
+        let fence = attempt.fence();
+        let retention = ingress.policy().replay_retention;
+        let mut staged = self
+            .stage_command(
+                &ingress,
+                aggregate_repository,
+                &attempt,
+                &session,
+                input,
+                &wire,
+                direct_projection_target,
+            )
+            .await;
+        let batch = match &mut staged {
+            Ok(staged) => staged.commit_batch(&ingress, attempt, retention),
+            Err(Failure::Reject {
+                code,
+                status,
+                message,
+            }) => attempt
+                .complete(
+                    TerminalCommandState::Rejected,
+                    rejection_outcome(code, *status, message),
+                    retention,
+                )
+                .map(|completion| CausalCommitBatch::new(CommitBatch::empty(), completion))
+                .map_err(|error| error.to_string()),
+            Err(Failure::Abandon(detail)) => Err(std::mem::take(detail)),
+        };
+        let batch = match batch {
+            Ok(batch) => batch,
+            Err(detail) => {
+                return abandon_attempt(repository, &ingress, consistency, fence, detail).await;
+            }
+        };
+        if let Err(error) = repository.commit_causal_batch(batch).await {
+            return resolve_ambiguous_lookup(
+                repository,
+                &ingress,
+                consistency,
+                fence,
+                error.to_string(),
+            )
+            .await;
+        }
+
+        // Committed: the attempt is terminal, as the rejection or the receipt.
+        let mut staged = staged?;
+        staged.parts.mark_committed_state().map_err(|error| {
+            CausalDispatchError::Internal(format!(
+                "committed causal workspace cleanup failed: {error}"
+            ))
+        })?;
+        if let Some(publisher) = staged.publisher {
+            publisher.publish_after_commit(staged.outbox_ids).await;
+        }
+        let serialized = staged.prepared.finalize_after_commit();
+        let result = load_committed_result(repository, &ingress, consistency, &fence).await?;
+        if result.payload != serialized {
+            return Err(CausalDispatchError::Internal(
+                "durable command replay outcome differs from the committed handler payload".into(),
+            ));
+        }
+        Ok(result)
+    }
+
+    /// Run the guard and the handler under `attempt` and validate what they
+    /// staged. Nothing is written: the caller commits or settles the failure.
+    #[allow(clippy::too_many_arguments)]
+    async fn stage_command<'a, R>(
+        &self,
+        ingress: &CommandIngress<'_>,
+        aggregate_repository: &'a crate::aggregate::AggregateRepository<R, A>,
+        attempt: &CommandAttempt,
+        session: &Session,
+        input: I,
+        wire: &Value,
+        direct_projection_target: Option<crate::command::ResolvedDirectProjectionTarget>,
+    ) -> Result<StagedCommand<'a, A, K>, Failure>
+    where
+        R: CausalRepositoryBackend,
+    {
+        let causation_id = attempt.causation_id();
+        let payload = serde_json::to_vec(wire).map_err(|error| {
+            Failure::Abandon(format!(
+                "canonical command input could not be encoded: {error}"
+            ))
+        })?;
+        let mut metadata = session
+            .variables()
+            .iter()
+            .filter(|(name, _)| !name.eq_ignore_ascii_case(crate::trace_context::CAUSATION_ID))
+            .map(|(name, value)| (name.clone(), value.clone()))
+            .collect::<Vec<_>>();
+        metadata.push((
+            crate::trace_context::CAUSATION_ID.to_string(),
+            causation_id.as_str().to_string(),
+        ));
+        let message = Message {
+            id: Some(attempt.key().command_id().to_string()),
+            name: self.contract.name.clone(),
+            kind: MessageKind::Command,
+            payload,
+            content_type: "application/json".into(),
+            metadata,
+        };
+
+        let workspace = CausalWorkspace::new(aggregate_repository)
+            .with_scheduling_declared(self.requires_scheduling);
+        let context = CausalCommandContext::new(&message, session, &workspace);
+        if self.guard.as_ref().is_some_and(|guard| !guard(&context)) {
+            return Err(Failure::Reject {
+                code: "REJECTED",
+                status: 422,
+                message: format!("guard rejected command: {}", self.contract.name),
+            });
+        }
+        let mut prepared = (self.handle)(&context, input).await?;
+
+        let mut parts = workspace.into_parts().map_err(Failure::abandon)?;
+        parts
+            .prepare_domain_publications(causation_id.as_str())
+            .map_err(Failure::abandon)?;
+        parts
+            .validate_prepared(&self.contract, &mut prepared)
+            .map_err(Failure::abandon)?;
+
+        let (modeled_projection, direct_projection, publisher) = match ingress {
+            CommandIngress::Service {
+                policy,
+                seal_modeled_projection,
+                ..
+            } => {
+                let modeled_projection = match seal_modeled_projection {
+                    Some(seal)
+                        if self.contract.consistency != CommandConsistency::Atomic
+                            && !self.contract.projections.selectors.is_empty() =>
+                    {
+                        let occurrences = parts
+                            .prepared_domain_occurrences()
+                            .map_err(Failure::abandon)?;
+                        Some(
+                            seal(causation_id.clone(), policy.replay_retention, occurrences)
+                                .map_err(Failure::Abandon)?,
+                        )
+                    }
+                    _ => None,
+                };
+                let direct_projection = parts
+                    .seal_direct_projection(
+                        &prepared,
+                        direct_projection_target,
+                        causation_id.as_str(),
+                    )
+                    .map_err(Failure::abandon)?;
+                (
+                    modeled_projection,
+                    direct_projection,
+                    aggregate_repository.outbox_publisher(),
+                )
+            }
+            // A cell seals no projections and its Queue owns delivery.
+            CommandIngress::Cell { .. } => (None, None, None),
+        };
+        let pending_projection = modeled_projection.as_ref().map(|modeled| modeled.pending);
+        let state = match (ingress, self.contract.consistency, pending_projection) {
+            (CommandIngress::Cell { .. }, _, _) => TerminalCommandState::Succeeded,
+            (_, CommandConsistency::Atomic, _) => TerminalCommandState::Atomic,
+            (_, _, Some(false)) | (_, CommandConsistency::Succeeded, None) => {
+                TerminalCommandState::Succeeded
+            }
+            (_, _, Some(true)) | (_, CommandConsistency::Eventual, None) => {
+                TerminalCommandState::SucceededPendingProjection
+            }
+        };
+        Ok(StagedCommand {
+            parts,
+            prepared,
+            state,
+            modeled_projection,
+            direct_projection,
+            publisher,
+            outbox_ids: Vec::new(),
+        })
+    }
+}
+
 impl<D, A, I, K> ErasedCausalHandler<D> for RegisteredCausalHandler<A, I, K>
 where
     D: CausalRouteDependencies<Aggregate = A> + Send + Sync + 'static,
@@ -1664,247 +2064,13 @@ where
         input: Value,
         session: Session,
         shard: &'a StreamIdentity,
-    ) -> CellCausalHandlerFuture<'a> {
-        Box::pin(async move {
-            match crate::application::admit_command_session(
-                &self.contract.roles,
-                session.user_id(),
-                &session.roles(),
-            ) {
-                Ok(()) => {}
-                Err("unauthenticated") => return Err(CellDispatchError::Unauthorized),
-                Err(_) => return Err(CellDispatchError::Forbidden),
-            }
-            if self.contract.consistency == CommandConsistency::Atomic {
-                return Err(CellDispatchError::BadRequest(
-                    "atomic typed commands require a same-transaction relational projection host"
-                        .into(),
-                ));
-            }
-
-            let canonical = canonicalize_command_input(&self.contract.input, input)
-                .map_err(|error| CellDispatchError::BadRequest(error.to_string()))?;
-            let typed = canonical
-                .decode::<I>()
-                .map_err(|error| CellDispatchError::BadRequest(error.to_string()))?;
-            let (input, wire, input_digest) = typed.into_parts();
-            let policy = CausalCommandPolicy::default();
-            let reservation = CommandReservation::new(
-                identity.key().clone(),
-                self.contract.name.clone(),
-                CommandContractFingerprint::new(self.contract.fingerprint_bytes()),
-                CanonicalInputHash::new(input_digest),
-                policy.attempt_lease,
-                policy.replay_retention,
-            )
-            .map_err(crate::microsvc::cell_host::causal::internal_ledger_error)?;
-            let reservation = match identity.causation_id() {
-                Some(causation_id) => reservation.with_causation_id(causation_id.clone()),
-                None => reservation,
-            };
-
-            let aggregate_repository = dependencies.__causal_aggregate_repository();
-            let repository = aggregate_repository.repo();
-            let session = stamped_session(self.requires_clock, repository, session)
-                .await
-                .map_err(|error| CellDispatchError::Internal(error.to_string()))?;
-            let attempt = match repository
-                .reserve_command(reservation)
-                .await
-                .map_err(crate::microsvc::cell_host::causal::internal_ledger_error)?
-            {
-                ReservationOutcome::Acquired(attempt) => attempt,
-                ReservationOutcome::InProgress { .. } => {
-                    return Err(CellDispatchError::InProgress);
-                }
-                ReservationOutcome::Replay(replay) => {
-                    return crate::microsvc::cell_host::causal::replay_result(replay, true);
-                }
-                ReservationOutcome::Conflict => return Err(CellDispatchError::CommandIdReuse),
-                ReservationOutcome::Expired => return Err(CellDispatchError::Expired),
-            };
-
-            let payload = serde_json::to_vec(&wire).map_err(|error| {
-                CellDispatchError::Internal(format!(
-                    "canonical cell command input could not be encoded: {error}"
-                ))
-            })?;
-            let mut metadata = session
-                .variables()
-                .iter()
-                .filter(|(name, _)| !name.eq_ignore_ascii_case(crate::trace_context::CAUSATION_ID))
-                .map(|(name, value)| (name.clone(), value.clone()))
-                .collect::<Vec<_>>();
-            metadata.push((
-                crate::trace_context::CAUSATION_ID.to_string(),
-                attempt.causation_id().as_str().to_string(),
-            ));
-            let message = Message {
-                id: Some(identity.command_id().to_string()),
-                name: self.contract.name.clone(),
-                kind: MessageKind::Command,
-                payload,
-                content_type: "application/json".into(),
-                metadata,
-            };
-
-            let workspace = CausalWorkspace::new(aggregate_repository)
-                .with_scheduling_declared(self.requires_scheduling);
-            let context = CausalCommandContext::new(&message, &session, &workspace);
-            if self.guard.as_ref().is_some_and(|guard| !guard(&context)) {
-                return crate::microsvc::cell_host::causal::commit_rejection(
-                    repository,
-                    attempt,
-                    policy.replay_retention,
-                    "REJECTED",
-                    422,
-                    format!("guard rejected command: {}", self.contract.name),
-                )
-                .await;
-            }
-
-            let mut prepared = match (self.handle)(&context, input).await {
-                Ok(prepared) => prepared,
-                Err(error) if error.status_code() < 500 => {
-                    return crate::microsvc::cell_host::causal::commit_rejection(
-                        repository,
-                        attempt,
-                        policy.replay_retention,
-                        crate::microsvc::cell_host::causal::handler_error_code(&error),
-                        error.status_code(),
-                        error.client_facing_message(),
-                    )
-                    .await;
-                }
-                Err(error) => {
-                    return crate::microsvc::cell_host::causal::abandon_attempt(
-                        repository,
-                        attempt,
-                        error.to_string(),
-                    )
-                    .await;
-                }
-            };
-
-            let mut parts = match workspace.into_parts() {
-                Ok(parts) => parts,
-                Err(error) => {
-                    return crate::microsvc::cell_host::causal::abandon_attempt(
-                        repository,
-                        attempt,
-                        error.to_string(),
-                    )
-                    .await;
-                }
-            };
-            if let Err(error) = parts.prepare_domain_publications(attempt.causation_id().as_str()) {
-                return crate::microsvc::cell_host::causal::abandon_attempt(
-                    repository,
-                    attempt,
-                    error.to_string(),
-                )
-                .await;
-            }
-            if let Err(error) = parts.validate_prepared(&self.contract, &mut prepared) {
-                return crate::microsvc::cell_host::causal::abandon_attempt(
-                    repository,
-                    attempt,
-                    error.to_string(),
-                )
-                .await;
-            }
-
-            let replay_payload = prepared.serialized_payload().clone();
-            let batch = match parts.prepare_commit_batch() {
-                Ok(batch) => batch,
-                Err(error) => {
-                    return crate::microsvc::cell_host::causal::abandon_attempt(
-                        repository,
-                        attempt,
-                        format!("cell causal commit batch preparation failed: {error}"),
-                    )
-                    .await;
-                }
-            };
-            if let Err(error) =
-                crate::microsvc::cell_host::validate_cell_projection_events(&batch.outbox_messages)
-            {
-                drop(batch);
-                return crate::microsvc::cell_host::causal::abandon_attempt(
-                    repository,
-                    attempt,
-                    format!("cell projection events violate response bounds: {error}"),
-                )
-                .await;
-            }
-            let foreign_stream = batch
-                .streams
-                .iter()
-                .find(|stream| stream.identity != *shard)
-                .map(|stream| stream.identity.to_string());
-            if let Some(foreign_stream) = foreign_stream {
-                drop(batch);
-                return crate::microsvc::cell_host::causal::abandon_attempt(
-                    repository,
-                    attempt,
-                    format!("cell `{shard}` cannot commit stream `{foreign_stream}`"),
-                )
-                .await;
-            }
-
-            let fence = attempt.fence();
-            let replay = crate::microsvc::cell_host::causal::CellCommandReplay {
-                payload: replay_payload.clone(),
-                events: batch
-                    .outbox_messages
-                    .iter()
-                    .map(crate::microsvc::cell_host::CellProjectionEventWireItem::from_message)
-                    .collect(),
-            };
-            let replay = serde_json::to_value(replay).map_err(|error| {
-                CellDispatchError::Internal(format!(
-                    "cell command replay could not be encoded: {error}"
-                ))
-            })?;
-            let completion = attempt
-                .complete(
-                    TerminalCommandState::Succeeded,
-                    replay,
-                    policy.replay_retention,
-                )
-                .map_err(crate::microsvc::cell_host::causal::internal_ledger_error)?;
-            match repository
-                .commit_causal_batch(CausalCommitBatch::new(batch, completion))
-                .await
-            {
-                Ok(()) => {
-                    parts.mark_committed_state().map_err(|error| {
-                        CellDispatchError::Internal(format!(
-                            "committed cell workspace cleanup failed: {error}"
-                        ))
-                    })?;
-                    let serialized = prepared.finalize_after_commit();
-                    let result = crate::microsvc::cell_host::causal::load_committed_result(
-                        repository, &fence, false,
-                    )
-                    .await?;
-                    if result.payload() != &serialized {
-                        return Err(CellDispatchError::Internal(
-                            "durable cell replay differs from the committed handler payload".into(),
-                        ));
-                    }
-                    Ok(result)
-                }
-                Err(error) => {
-                    crate::microsvc::cell_host::causal::recover_commit_error(
-                        repository,
-                        fence,
-                        error.to_string(),
-                    )
-                    .await
-                }
-            }
-        })
+    ) -> CausalHandlerFuture<'a> {
+        Box::pin(self.execute_typed_command(
+            dependencies,
+            CommandIngress::Cell { identity, shard },
+            input,
+            session,
+        ))
     }
 
     #[cfg(feature = "graphql")]
@@ -1933,356 +2099,47 @@ where
         protocol: Option<crate::graphql::protocol::ProtocolResponseAccumulator>,
     ) -> CausalHandlerFuture<'a> {
         Box::pin(async move {
-            ensure_causal_grant(&self.contract, &session)?;
-
-            let canonical = canonicalize_command_input(&self.contract.input, input)
-                .map_err(|error| CausalDispatchError::BadRequest(error.to_string()))?;
-            let typed = canonical
-                .decode::<I>()
-                .map_err(|error| CausalDispatchError::BadRequest(error.to_string()))?;
-            let (input, wire, input_digest) = typed.into_parts();
-            let direct_projection_target = self
-                .contract
-                .resolve_direct_projection_target_from_session(&wire, Some(&session))
-                .map_err(|error| CausalDispatchError::Internal(error.to_string()))?;
-
-            let command_id = CommandId::parse(command_id)
-                .map_err(|error| CausalDispatchError::BadRequest(error.to_string()))?;
-            let partition = PrincipalPartitionId::new(principal.partition_for_service(service_id))
-                .map_err(internal_ledger_error)?;
-            let key = CommandLedgerKey::new(service_id, partition, command_id)
-                .map_err(internal_ledger_error)?;
-            let reservation = CommandReservation::new(
-                key,
-                self.contract.name.clone(),
-                CommandContractFingerprint::new(self.contract.fingerprint_bytes()),
-                CanonicalInputHash::new(input_digest),
-                policy.attempt_lease,
-                policy.replay_retention,
-            )
-            .map_err(internal_ledger_error)?;
-
-            let aggregate_repository = dependencies.__causal_aggregate_repository();
-            let repository = aggregate_repository.repo();
-            let session = stamped_session(self.requires_clock, repository, session)
-                .await
-                .map_err(|error| CausalDispatchError::Internal(error.to_string()))?;
-            if let Some(target) = direct_projection_target.as_ref() {
-                let (topology, ownership) = target.registration();
-                self.direct_projection_bootstrap
-                    .get_or_try_init(|| async {
-                        repository
-                            .__register_direct_projection_models(topology, ownership)
-                            .await
-                            .map_err(|error| {
-                                CausalDispatchError::Internal(format!(
-                                    "direct projection ownership bootstrap failed: {error}"
-                                ))
-                            })
-                    })
-                    .await?;
-            }
-            let attempt = match repository
-                .reserve_command(reservation)
-                .await
-                .map_err(internal_ledger_error)?
-            {
-                ReservationOutcome::Acquired(attempt) => attempt,
-                ReservationOutcome::InProgress { .. } => {
-                    return Err(CausalDispatchError::InProgress);
-                }
-                ReservationOutcome::Replay(replay) => {
-                    return replay_result(self.contract.consistency, replay);
-                }
-                ReservationOutcome::Conflict => return Err(CausalDispatchError::CommandIdReuse),
-                ReservationOutcome::Expired => return Err(CausalDispatchError::Expired),
-            };
-
-            let payload = serde_json::to_vec(&wire).map_err(|error| {
-                CausalDispatchError::Internal(format!(
-                    "canonical command input could not be encoded: {error}"
-                ))
-            })?;
-            let mut metadata = session
-                .variables()
-                .iter()
-                .filter(|(name, _)| !name.eq_ignore_ascii_case(crate::trace_context::CAUSATION_ID))
-                .map(|(name, value)| (name.clone(), value.clone()))
-                .collect::<Vec<_>>();
-            metadata.push((
-                crate::trace_context::CAUSATION_ID.to_string(),
-                attempt.causation_id().as_str().to_string(),
-            ));
-            let message = Message {
-                id: Some(attempt.key().command_id().to_string()),
-                name: self.contract.name.clone(),
-                kind: MessageKind::Command,
-                payload,
-                content_type: "application/json".into(),
-                metadata,
-            };
-
-            let workspace = CausalWorkspace::new(aggregate_repository)
-                .with_scheduling_declared(self.requires_scheduling);
-            let context = CausalCommandContext::new(&message, &session, &workspace);
-            if self.guard.as_ref().is_some_and(|guard| !guard(&context)) {
-                return commit_causal_rejection(
-                    repository,
-                    attempt,
-                    self.contract.consistency,
-                    policy.replay_retention,
-                    "REJECTED",
-                    422,
-                    format!("guard rejected command: {}", self.contract.name),
-                )
-                .await;
-            }
-
-            let mut prepared = match (self.handle)(&context, input).await {
-                Ok(prepared) => prepared,
-                Err(error) if error.status_code() < 500 => {
-                    let code = causal_handler_error_code(&error);
-                    let status = error.status_code();
-                    let message = error.client_facing_message();
-                    return commit_causal_rejection(
-                        repository,
-                        attempt,
-                        self.contract.consistency,
-                        policy.replay_retention,
-                        code,
-                        status,
-                        message,
-                    )
-                    .await;
-                }
-                Err(error) => {
-                    return abandon_causal_attempt(
-                        repository,
-                        attempt,
-                        self.contract.consistency,
-                        error.to_string(),
-                    )
-                    .await;
-                }
-            };
-
-            let mut parts = match workspace.into_parts() {
-                Ok(parts) => parts,
-                Err(error) => {
-                    return abandon_causal_attempt(
-                        repository,
-                        attempt,
-                        self.contract.consistency,
-                        error.to_string(),
-                    )
-                    .await;
-                }
-            };
-            if let Err(error) = parts.prepare_domain_publications(attempt.causation_id().as_str()) {
-                return abandon_causal_attempt(
-                    repository,
-                    attempt,
-                    self.contract.consistency,
-                    error.to_string(),
-                )
-                .await;
-            }
-            if let Err(error) = parts.validate_prepared(&self.contract, &mut prepared) {
-                return abandon_causal_attempt(
-                    repository,
-                    attempt,
-                    self.contract.consistency,
-                    error.to_string(),
-                )
-                .await;
-            }
-            let projection_metadata = match protocol.as_ref() {
-                Some(protocol)
-                    if self.contract.consistency != CommandConsistency::Atomic
-                        && !self.contract.projections.selectors.is_empty() =>
-                {
-                    let occurrences = match parts.prepared_domain_occurrences() {
-                        Ok(occurrences) => occurrences,
-                        Err(error) => {
-                            return abandon_causal_attempt(
-                                repository,
-                                attempt,
-                                self.contract.consistency,
-                                error.to_string(),
-                            )
-                            .await;
-                        }
-                    };
-                    match protocol.projection_metadata_for_actual(
-                        attempt.causation_id().clone(),
-                        policy.replay_retention,
-                        occurrences,
-                        &self.contract.projections.selectors,
-                    ) {
-                        Ok(metadata) => Some(metadata),
-                        Err(error) => {
-                            return abandon_causal_attempt(
-                                repository,
-                                attempt,
-                                self.contract.consistency,
-                                error.to_string(),
-                            )
-                            .await;
-                        }
-                    }
-                }
-                _ => None,
-            };
-            let projection_retention_expires_at = match projection_metadata
-                .as_ref()
-                .map(crate::graphql::protocol::CommandProjectionMetadataV1::expires_at)
-                .transpose()
-            {
-                Ok(deadline) => deadline,
-                Err(error) => {
-                    return abandon_causal_attempt(
-                        repository,
-                        attempt,
-                        self.contract.consistency,
-                        format!("modeled projection metadata lifetime failed: {error}"),
-                    )
-                    .await;
-                }
-            };
-            let projection_metadata_bytes = match projection_metadata
-                .as_ref()
-                .map(crate::graphql::protocol::CommandProjectionMetadataV1::canonical_bytes)
-                .transpose()
-            {
-                Ok(bytes) => bytes,
-                Err(error) => {
-                    return abandon_causal_attempt(
-                        repository,
-                        attempt,
-                        self.contract.consistency,
-                        format!("modeled projection metadata encoding failed: {error}"),
-                    )
-                    .await;
-                }
-            };
-            let direct_projection = match parts.seal_direct_projection(
-                &prepared,
-                direct_projection_target,
-                attempt.causation_id().as_str(),
-            ) {
-                Ok(direct_projection) => direct_projection,
-                Err(error) => {
-                    return abandon_causal_attempt(
-                        repository,
-                        attempt,
-                        self.contract.consistency,
-                        error.to_string(),
-                    )
-                    .await;
-                }
-            };
-
-            let terminal_state = match (&projection_metadata, self.contract.consistency) {
-                (Some(metadata), CommandConsistency::Succeeded | CommandConsistency::Eventual)
-                    if metadata.obligations.is_empty() =>
-                {
-                    TerminalCommandState::Succeeded
-                }
-                (Some(_), CommandConsistency::Succeeded | CommandConsistency::Eventual) => {
-                    TerminalCommandState::SucceededPendingProjection
-                }
-                (Some(_), CommandConsistency::Atomic) => unreachable!(
-                    "same-transaction commands do not persist eventual modeled metadata"
-                ),
-                (None, CommandConsistency::Succeeded) => TerminalCommandState::Succeeded,
-                (None, CommandConsistency::Eventual) => {
-                    TerminalCommandState::SucceededPendingProjection
-                }
-                (None, CommandConsistency::Atomic) => TerminalCommandState::Atomic,
-            };
-            let replay_payload = prepared.serialized_payload().clone();
-            let publisher = aggregate_repository.outbox_publisher();
-            let mut batch = match parts.prepare_commit_batch() {
-                Ok(batch) => batch,
-                Err(error) => {
-                    return abandon_causal_attempt(
-                        repository,
-                        attempt,
-                        self.contract.consistency,
-                        format!("causal commit batch preparation failed: {error}"),
-                    )
-                    .await;
-                }
-            };
-
-            // Stamp causation. Rows are committed pending; the publisher claims.
-            let mut outbox_ids = Vec::new();
-            if publisher.is_some() {
-                for message in &mut batch.outbox_messages {
-                    message.overwrite_causation_id(attempt.causation_id().as_str());
-                    outbox_ids.push(message.id().to_string());
-                }
-            }
-
-            let fence = attempt.fence();
-            let completion = match (projection_metadata_bytes, projection_retention_expires_at) {
-                (Some(metadata), Some(retention_expires_at)) => attempt
-                    .complete_with_projection_metadata_until(
-                        terminal_state,
-                        replay_payload.clone(),
-                        metadata,
-                        policy.replay_retention,
-                        retention_expires_at,
-                    ),
-                (None, None) => attempt.complete(
-                    terminal_state,
-                    replay_payload.clone(),
-                    policy.replay_retention,
-                ),
-                _ => unreachable!("modeled projection bytes and lifetime are derived together"),
-            }
-            .map_err(internal_ledger_error)?;
-            let causal_batch = match direct_projection {
-                Some(direct_projection) => {
-                    CausalCommitBatch::with_direct_projection(batch, completion, direct_projection)
-                }
-                None => CausalCommitBatch::new(batch, completion),
-            };
-            match repository.commit_causal_batch(causal_batch).await {
-                Ok(()) => {
-                    parts.mark_committed_state().map_err(|error| {
-                        CausalDispatchError::Internal(format!(
-                            "committed causal workspace cleanup failed: {error}"
-                        ))
+            let seal_modeled_projection = protocol.as_ref().map(|protocol| {
+                move |causation_id: crate::command_ledger::CausationId,
+                      retention: Duration,
+                      occurrences: &[crate::DomainEventOccurrence]|
+                      -> Result<ModeledProjectionMetadata, String> {
+                    let metadata = protocol
+                        .projection_metadata_for_actual(
+                            causation_id,
+                            retention,
+                            occurrences,
+                            &self.contract.projections.selectors,
+                        )
+                        .map_err(|error| error.to_string())?;
+                    let expires_at = metadata.expires_at().map_err(|error| {
+                        format!("modeled projection metadata lifetime failed: {error}")
                     })?;
-                    if let Some(config) = publisher {
-                        config.publish_after_commit(outbox_ids).await;
-                    }
-                    let serialized = prepared.finalize_after_commit();
-                    let result = load_committed_dispatch_result(
-                        repository,
-                        &fence,
-                        self.contract.consistency,
-                    )
-                    .await?;
-                    if result.payload != serialized {
-                        return Err(CausalDispatchError::Internal(
-                            "durable command replay outcome differs from the committed handler payload"
-                                .into(),
-                        ));
-                    }
-                    Ok(result)
+                    let canonical_bytes = metadata.canonical_bytes().map_err(|error| {
+                        format!("modeled projection metadata encoding failed: {error}")
+                    })?;
+                    Ok(ModeledProjectionMetadata {
+                        canonical_bytes,
+                        expires_at,
+                        pending: !metadata.obligations.is_empty(),
+                    })
                 }
-                Err(error) => {
-                    recover_causal_commit_error(
-                        repository,
-                        fence,
-                        self.contract.consistency,
-                        error.to_string(),
-                    )
-                    .await
-                }
-            }
+            });
+            self.execute_typed_command(
+                dependencies,
+                CommandIngress::Service {
+                    service_id,
+                    principal_partition: principal.partition_for_service(service_id),
+                    command_id,
+                    policy,
+                    seal_modeled_projection: seal_modeled_projection
+                        .as_ref()
+                        .map(|seal| seal as &SealModeledProjection<'_>),
+                },
+                input,
+                session,
+            )
+            .await
         })
     }
 

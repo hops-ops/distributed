@@ -1395,6 +1395,70 @@ async fn causal_dispatch_receipt_and_status_use_the_exact_durable_replay() {
     assert!(status.direct_projection.is_none());
 }
 
+/// An eventual command needs modeled projection metadata for its terminal
+/// receipt. Dispatched without a GraphQL request authority there is none, so
+/// the attempt's completion is refused after the reservation was acquired.
+/// That exit must release the attempt: the retry runs the handler again
+/// instead of answering `InProgress` until the attempt lease expires.
+#[cfg(feature = "graphql")]
+#[tokio::test]
+async fn a_failure_after_the_reservation_releases_the_attempt_for_an_immediate_retry() {
+    let handler_calls = Arc::new(AtomicUsize::new(0));
+    let route_calls = Arc::clone(&handler_calls);
+    let service = Service::new().named("causal-tests").routes(
+        Routes::new()
+            .with_repo(InMemoryRepository::new().aggregate::<CausalDispatcherAggregate>())
+            .typed_command(
+                typed_command::<CausalTestInput, Eventual<TypedOutput>>("causal.unsealed")
+                    .emits(crate::events![CausalLifecycleRecorded]),
+            )
+            .handle(
+                move |context: &CausalCommandContext<'_, CausalDispatcherAggregate>,
+                      input: CausalTestInput| {
+                    let calls = Arc::clone(&route_calls);
+                    let result = (|| {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        let mut checkout = context.create();
+                        checkout.record_lifecycle(input.id.clone(), input.label)?;
+                        context
+                            .publish_events()
+                            .commit(checkout)?
+                            .eventual(TypedOutput { id: input.id })
+                    })();
+                    async move { result }
+                },
+            ),
+    );
+    let command_id = causal_test_command_id();
+    let dispatch = || {
+        service.dispatch_causal(
+            "causal.unsealed",
+            &command_id,
+            causal_test_input("todo-unsealed", "first"),
+            Session::new(),
+            causal_test_principal(),
+        )
+    };
+
+    let first = dispatch()
+        .await
+        .expect_err("the receipt cannot be completed");
+    assert!(
+        matches!(&first, CausalDispatchError::Internal(detail)
+            if detail.contains("requires modeled projection metadata")),
+        "unexpected first failure: {first:?}"
+    );
+    assert_eq!(handler_calls.load(Ordering::SeqCst), 1);
+
+    let retry = dispatch().await.expect_err("the retry fails the same way");
+    assert!(
+        matches!(&retry, CausalDispatchError::Internal(detail)
+            if detail.contains("requires modeled projection metadata")),
+        "the retry must run again, not find the first attempt in progress: {retry:?}"
+    );
+    assert_eq!(handler_calls.load(Ordering::SeqCst), 2);
+}
+
 #[cfg(feature = "graphql")]
 #[test]
 fn causal_status_projection_failure_precedes_observed_and_pending_evidence() {

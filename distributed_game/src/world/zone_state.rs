@@ -372,7 +372,7 @@ pub mod celld_worker {
     use ::worker::{Bucket, Method, Request, Response, Result};
     use base64::Engine as _;
     use distributed::cell_host::{
-        CellCommandIdentity, CellDispatchError, CellWaitPathRequest,
+        CausalDispatchError, CellCommandIdentity, CellWaitPathRequest,
         CELL_PRINCIPAL_PARTITION_HEADER, CELL_SERVICE_ID_HEADER,
     };
     use distributed::microsvc::Session;
@@ -391,7 +391,7 @@ pub mod celld_worker {
         Ok(Response::from_json(&body)?.with_status(status))
     }
 
-    fn error_response(error: CellDispatchError) -> Result<Response> {
+    fn error_response(error: CausalDispatchError) -> Result<Response> {
         json_status(
             json!({ "error": error.client_message(), "code": error.code() }),
             error.status_code(),
@@ -435,12 +435,14 @@ pub mod celld_worker {
                 let body: Value = match req.json().await {
                     Ok(body) => body,
                     Err(_) => {
-                        return error_response(CellDispatchError::BadRequest("invalid JSON".into()))
+                        return error_response(CausalDispatchError::BadRequest(
+                            "invalid JSON".into(),
+                        ))
                     }
                 };
                 let parsed = match CellWaitPathRequest::parse(body) {
                     Ok(parsed) => parsed,
-                    Err(error) => return error_response(CellDispatchError::BadRequest(error)),
+                    Err(error) => return error_response(CausalDispatchError::BadRequest(error)),
                 };
                 let header = |name: &str| req.headers().get(name).ok().flatten();
                 let identity = match (
@@ -453,7 +455,7 @@ pub mod celld_worker {
                             Err(error) => return error_response(error),
                         }
                     }
-                    _ => return error_response(CellDispatchError::Unauthorized),
+                    _ => return error_response(CausalDispatchError::Unauthorized),
                 };
                 let mut session = Session::new();
                 for key in [distributed::USER_ID_KEY, distributed::microsvc::ROLE_KEY] {
@@ -485,14 +487,14 @@ pub mod celld_worker {
             Some(SnapshotBytes::Blob(blob)) => {
                 let object = bucket.get(blob.key.clone()).execute().await?;
                 let Some(body) = object.as_ref().and_then(|object| object.body()) else {
-                    return error_response(CellDispatchError::Internal(format!(
+                    return error_response(CausalDispatchError::Internal(format!(
                         "zone-state blob {} is missing",
                         blob.key
                     )));
                 };
                 let bytes = body.bytes().await?;
                 if bytes.len() as u64 != blob.len || sha256_hex(&bytes) != blob.sha256 {
-                    return error_response(CellDispatchError::Internal(format!(
+                    return error_response(CausalDispatchError::Internal(format!(
                         "zone-state blob {} does not match its digest",
                         blob.key
                     )));
@@ -520,13 +522,13 @@ pub mod celld_worker {
         let wire: WireSave = match serde_json::from_value(input) {
             Ok(wire) => wire,
             Err(error) => {
-                return error_response(CellDispatchError::BadRequest(format!(
+                return error_response(CausalDispatchError::BadRequest(format!(
                     "zone_state.save input: {error}"
                 )))
             }
         };
         let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(&wire.state_b64) else {
-            return error_response(CellDispatchError::BadRequest(
+            return error_response(CausalDispatchError::BadRequest(
                 "state_b64 is not base64".into(),
             ));
         };
@@ -592,7 +594,7 @@ pub mod celld_worker {
                 json_status(dispatch.wait_path_wire(), 200)
             }
             Err(error) => {
-                if let CellDispatchError::Internal(message) = &error {
+                if let CausalDispatchError::Internal(message) = &error {
                     ::worker::console_error!("zone-state {command}: {message}");
                 }
                 // Refused (stale or invalid): the upload is nobody's.

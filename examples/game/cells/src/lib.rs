@@ -49,7 +49,7 @@
 
 use distributed::bus::{CelldQueueEnvelope, CelldQueueHttpPublisher, CelldQueueRelay};
 use distributed::cell_host::{
-    AggregateCell, CellDispatchError, CelldOutbox, InternalHttpSecret, CELL_INTERNAL_SECRET_ENV,
+    AggregateCell, CausalDispatchError, CelldOutbox, InternalHttpSecret, CELL_INTERNAL_SECRET_ENV,
     CELL_INTERNAL_SECRET_HEADER, CELL_PRINCIPAL_PARTITION_HEADER, CELL_SERVICE_ID_HEADER,
 };
 use distributed::command::{typed_command, PreparedCommand, Succeeded};
@@ -766,7 +766,7 @@ fn percent_decode(segment: &str) -> Option<String> {
     String::from_utf8(out).ok()
 }
 
-fn authenticate(req: &Request, env: &Env) -> std::result::Result<(), CellDispatchError> {
+fn authenticate(req: &Request, env: &Env) -> std::result::Result<(), CausalDispatchError> {
     let configured = env
         .secret(CELL_INTERNAL_SECRET_ENV)
         .map(|value| value.to_string())
@@ -774,22 +774,22 @@ fn authenticate(req: &Request, env: &Env) -> std::result::Result<(), CellDispatc
             env.var(CELL_INTERNAL_SECRET_ENV)
                 .map(|value| value.to_string())
         })
-        .map_err(|_| CellDispatchError::Internal("internal secret is required".into()))?;
-    let secret = InternalHttpSecret::new(configured).map_err(CellDispatchError::Internal)?;
+        .map_err(|_| CausalDispatchError::Internal("internal secret is required".into()))?;
+    let secret = InternalHttpSecret::new(configured).map_err(CausalDispatchError::Internal)?;
     let candidate = req
         .headers()
         .get(CELL_INTERNAL_SECRET_HEADER)
         .ok()
         .flatten()
-        .ok_or(CellDispatchError::Unauthorized)?;
+        .ok_or(CausalDispatchError::Unauthorized)?;
     if secret.matches(&candidate) {
         Ok(())
     } else {
-        Err(CellDispatchError::Unauthorized)
+        Err(CausalDispatchError::Unauthorized)
     }
 }
 
-fn error_response(error: CellDispatchError) -> Result<Response> {
+fn error_response(error: CausalDispatchError) -> Result<Response> {
     json_status(
         json!({ "error": error.client_message(), "code": error.code() }),
         error.status_code(),

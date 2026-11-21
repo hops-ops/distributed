@@ -7,7 +7,7 @@
 use std::time::{Duration, SystemTime};
 
 use distributed::cell_host::{
-    AggregateCell, CellCommandIdentity, CellDispatchError, CellStreamStore,
+    AggregateCell, CausalDispatchError, CellCommandIdentity, CellStreamStore,
 };
 use distributed::microsvc::{Session, USER_ID_KEY};
 use distributed::{ManualClock, StreamIdentity};
@@ -38,7 +38,7 @@ async fn run<A: distributed::Aggregate + Send + Sync + 'static>(
     id: &str,
     input: Value,
     principal: &str,
-) -> Result<Value, CellDispatchError> {
+) -> Result<Value, CausalDispatchError> {
     let identity = CellCommandIdentity::new(
         "test",
         principal,
@@ -89,7 +89,7 @@ async fn a_boss_kill_ripples_up_and_the_boss_returns() {
     // Only the room itself, only into its own hood.
     let foreign = run(&hood, BOSS_DEFEATED, "f1", fact("x"), "zone:pit.9.9").await;
     assert!(
-        matches!(foreign, Err(CellDispatchError::Rejected { .. })),
+        matches!(foreign, Err(CausalDispatchError::Rejected { .. })),
         "{foreign:?}"
     );
     let other_room = json!({ "hood": hood_shard, "room": "pit.9.9", "generation": 0, "by": "x" });

@@ -1170,7 +1170,9 @@ fn wait_path_sealing_retains_event_obligations_and_status_stays_pending_without_
             projection_metadata: None,
             direct_projection: None,
         },
-        projection_events: vec![event],
+        projection_events: vec![
+            crate::microsvc::cell_host::CellProjectionEventWireItem::from_message(&event),
+        ],
     };
 
     let result = result
@@ -1243,7 +1245,9 @@ fn wait_path_observation_proof_requires_the_persisted_semantic_program_identity(
             projection_metadata: None,
             direct_projection: None,
         },
-        projection_events: vec![event],
+        projection_events: vec![
+            crate::microsvc::cell_host::CellProjectionEventWireItem::from_message(&event),
+        ],
     }
     .seal_wait_path_protocol(&protocol, &contract, Duration::from_secs(60))
     .unwrap();
@@ -1520,7 +1524,10 @@ fn wait_path_sealing_keeps_atomic_and_unselected_commands_without_metadata() {
                 projection_metadata: None,
                 direct_projection: None,
             },
-            projection_events: events,
+            projection_events: events
+                .iter()
+                .map(crate::microsvc::cell_host::CellProjectionEventWireItem::from_message)
+                .collect(),
         }
         .seal_wait_path_protocol(&protocol, &contract, Duration::from_secs(60))
         .unwrap()

@@ -7,9 +7,10 @@
 
 use chat_domain::{post, ChatMessage, ChatMessageState};
 use distributed::cell_host::{
-    AggregateCell, CellCommandIdentity, CellDispatchError, CellDispatchResult, CellWaitPathRequest,
-    CelldOutbox, InternalHttpSecret, CELL_CAUSATION_ID_HEADER, CELL_INTERNAL_SECRET_ENV,
-    CELL_INTERNAL_SECRET_HEADER, CELL_PRINCIPAL_PARTITION_HEADER, CELL_SERVICE_ID_HEADER,
+    AggregateCell, CausalDispatchError, CausalDispatchResult, CellCommandIdentity,
+    CellWaitPathRequest, CelldOutbox, InternalHttpSecret, CELL_CAUSATION_ID_HEADER,
+    CELL_INTERNAL_SECRET_ENV, CELL_INTERNAL_SECRET_HEADER, CELL_PRINCIPAL_PARTITION_HEADER,
+    CELL_SERVICE_ID_HEADER,
 };
 use distributed::microsvc::{Session, ROLE_KEY, USER_ID_KEY};
 use serde::de::DeserializeOwned;
@@ -260,7 +261,7 @@ async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
 fn authenticate_internal_request(
     req: &Request,
     env: &Env,
-) -> std::result::Result<(), CellDispatchError> {
+) -> std::result::Result<(), CausalDispatchError> {
     let configured = env
         .secret(CELL_INTERNAL_SECRET_ENV)
         .map(|value| value.to_string())
@@ -269,23 +270,23 @@ fn authenticate_internal_request(
                 .map(|value| value.to_string())
         })
         .map_err(|_| {
-            CellDispatchError::Internal(format!("{CELL_INTERNAL_SECRET_ENV} is required"))
+            CausalDispatchError::Internal(format!("{CELL_INTERNAL_SECRET_ENV} is required"))
         })?;
-    let secret = InternalHttpSecret::new(configured).map_err(CellDispatchError::Internal)?;
+    let secret = InternalHttpSecret::new(configured).map_err(CausalDispatchError::Internal)?;
     let candidate = req
         .headers()
         .get(CELL_INTERNAL_SECRET_HEADER)
-        .map_err(|_| CellDispatchError::Unauthorized)?
-        .ok_or(CellDispatchError::Unauthorized)?;
+        .map_err(|_| CausalDispatchError::Unauthorized)?
+        .ok_or(CausalDispatchError::Unauthorized)?;
     if !secret.matches(&candidate) {
-        return Err(CellDispatchError::Unauthorized);
+        return Err(CausalDispatchError::Unauthorized);
     }
     Ok(())
 }
 
-fn internal_auth_error(error: CellDispatchError) -> Result<Response> {
+fn internal_auth_error(error: CausalDispatchError) -> Result<Response> {
     match error {
-        CellDispatchError::Unauthorized => json_status(
+        CausalDispatchError::Unauthorized => json_status(
             json!({ "code": "UNAUTHORIZED", "error": "unauthorized" }),
             401,
         ),
@@ -340,7 +341,7 @@ async fn post_chat(
     let session = request_session(req);
     let body = match bounded_json::<Value>(req).await {
         Ok(body) => body,
-        Err(error) => return map_cell_error(CellDispatchError::BadRequest(error.into()), cell),
+        Err(error) => return map_cell_error(CausalDispatchError::BadRequest(error.into()), cell),
     };
     let (command_id, mut input) = match wait_path_parts(&body) {
         Ok(parts) => parts,
@@ -389,16 +390,16 @@ async fn get_todo(cell: &AggregateCell<Todo>, id: &str) -> Result<Response> {
     }
 }
 
-fn wait_path_parts(body: &Value) -> std::result::Result<(String, Value), CellDispatchError> {
+fn wait_path_parts(body: &Value) -> std::result::Result<(String, Value), CausalDispatchError> {
     let request =
-        CellWaitPathRequest::parse(body.clone()).map_err(CellDispatchError::BadRequest)?;
+        CellWaitPathRequest::parse(body.clone()).map_err(CausalDispatchError::BadRequest)?;
     Ok((request.command_id, request.input))
 }
 
 fn request_cell_identity(
     req: &Request,
     command_id: &str,
-) -> std::result::Result<CellCommandIdentity, CellDispatchError> {
+) -> std::result::Result<CellCommandIdentity, CausalDispatchError> {
     let service_id = required_internal_header(req, CELL_SERVICE_ID_HEADER)?;
     let principal_partition = required_internal_header(req, CELL_PRINCIPAL_PARTITION_HEADER)?;
     let identity = CellCommandIdentity::new(service_id, principal_partition, command_id)?;
@@ -411,25 +412,25 @@ fn request_cell_identity(
 fn required_internal_header(
     req: &Request,
     name: &str,
-) -> std::result::Result<String, CellDispatchError> {
+) -> std::result::Result<String, CausalDispatchError> {
     req.headers()
         .get(name)
         .map_err(|error| {
-            CellDispatchError::Internal(format!("could not read internal cell header: {error}"))
+            CausalDispatchError::Internal(format!("could not read internal cell header: {error}"))
         })?
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
-        .ok_or(CellDispatchError::Unauthorized)
+        .ok_or(CausalDispatchError::Unauthorized)
 }
 
 fn optional_internal_header(
     req: &Request,
     name: &str,
-) -> std::result::Result<Option<String>, CellDispatchError> {
+) -> std::result::Result<Option<String>, CausalDispatchError> {
     req.headers()
         .get(name)
         .map_err(|error| {
-            CellDispatchError::Internal(format!("could not read internal cell header: {error}"))
+            CausalDispatchError::Internal(format!("could not read internal cell header: {error}"))
         })
         .map(|value| {
             value
@@ -440,7 +441,7 @@ fn optional_internal_header(
 
 fn wait_path_ok(
     payload: Value,
-    dispatch: &CellDispatchResult,
+    dispatch: &CausalDispatchResult,
     status: u16,
     events: Value,
 ) -> Result<Response> {
@@ -467,7 +468,7 @@ async fn create_todo(
 ) -> Result<Response> {
     let body = match bounded_json::<Value>(req).await {
         Ok(body) => body,
-        Err(error) => return map_cell_error(CellDispatchError::BadRequest(error.into()), cell),
+        Err(error) => return map_cell_error(CausalDispatchError::BadRequest(error.into()), cell),
     };
     let (command_id, input) = match wait_path_parts(&body) {
         Ok(parts) => parts,
@@ -517,7 +518,7 @@ async fn transition_todo(
 ) -> Result<Response> {
     let body = match bounded_json::<Value>(req).await {
         Ok(body) => body,
-        Err(error) => return map_cell_error(CellDispatchError::BadRequest(error.into()), cell),
+        Err(error) => return map_cell_error(CausalDispatchError::BadRequest(error.into()), cell),
     };
     let (command_id, mut input) = match wait_path_parts(&body) {
         Ok(parts) => parts,
@@ -529,7 +530,7 @@ async fn transition_todo(
     };
     let Some(input_object) = input.as_object_mut() else {
         return map_cell_error(
-            CellDispatchError::BadRequest("input must be an object".into()),
+            CausalDispatchError::BadRequest("input must be an object".into()),
             cell,
         );
     };
@@ -586,7 +587,7 @@ fn http_from_command(id: &str, payload: &Value, fallback_title: &str) -> Value {
     Value::Object(body)
 }
 
-fn map_cell_error<A>(error: CellDispatchError, _cell: &AggregateCell<A>) -> Result<Response>
+fn map_cell_error<A>(error: CausalDispatchError, _cell: &AggregateCell<A>) -> Result<Response>
 where
     A: distributed::Aggregate + Send + Sync + 'static,
 {

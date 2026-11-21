@@ -6,7 +6,7 @@
 use std::time::{Duration, SystemTime};
 
 use distributed::cell_host::{
-    AggregateCell, CellCommandIdentity, CellDispatchError, CellStreamStore,
+    AggregateCell, CausalDispatchError, CellCommandIdentity, CellStreamStore,
 };
 use distributed::microsvc::{Session, ROLE_KEY, USER_ID_KEY};
 use distributed::{ManualClock, StreamIdentity};
@@ -40,7 +40,7 @@ async fn start(
     id: &str,
     version: &str,
     admin: bool,
-) -> Result<Value, CellDispatchError> {
+) -> Result<Value, CausalDispatchError> {
     let identity = CellCommandIdentity::new("test", "admin:dev", command_id_for("t", id)).unwrap();
     let input = json!({
         "world": "world", "version": version, "notes": format!("{version} notes"),
