@@ -2,7 +2,7 @@ use super::*;
 
 async fn preflight_command_completion_in_tx<DB>(
     tx: &mut Transaction<'_, DB>,
-    completion: &CommandCompletion,
+    completion: &CommandCompletion<'_>,
 ) -> Result<(), CommandLedgerError>
 where
     DB: SqlxRepoBackend,
@@ -25,7 +25,7 @@ where
 async fn commit_sqlx_batch<'a, DB>(
     repository: &'a SqlxRepository<DB>,
     batch: CommitBatch<'a>,
-    mut completion: Option<CommandCompletion>,
+    mut completion: Option<&mut CommandCompletion<'_>>,
     direct_projection: Option<SameTransactionProjectionBatch>,
 ) -> Result<(), CommandLedgerError>
 where
@@ -245,19 +245,24 @@ where
     fn commit_causal_batch<'a>(
         &'a self,
         batch: CausalCommitBatch<'a>,
-    ) -> impl Future<Output = Result<(), CommandLedgerError>> + Send + 'a {
-        commit_sqlx_batch(
-            self,
-            batch.domain,
-            Some(batch.completion),
-            batch.direct_projection,
-        )
+    ) -> impl Future<Output = Result<CommandCompletion<'a>, CommandLedgerError>> + Send + 'a {
+        async move {
+            let mut completion = batch.completion;
+            commit_sqlx_batch(
+                self,
+                batch.domain,
+                Some(&mut completion),
+                batch.direct_projection,
+            )
+            .await?;
+            Ok(completion)
+        }
     }
 }
 
 async fn complete_command_in_tx<DB>(
     tx: &mut Transaction<'_, DB>,
-    completion: &CommandCompletion,
+    completion: &CommandCompletion<'_>,
 ) -> Result<(), CommandLedgerError>
 where
     DB: SqlxRepoBackend,

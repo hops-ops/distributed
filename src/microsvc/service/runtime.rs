@@ -27,9 +27,9 @@ use crate::bus::{
 };
 use crate::command::{TypedCommandContract, TypedServiceCommandBinding};
 #[cfg(feature = "graphql")]
-use crate::command_ledger::{CommandId, CommandLookup, PrincipalPartitionId};
-#[cfg(feature = "graphql")]
 use crate::command_ledger::ExternalDispatchBinding;
+#[cfg(feature = "graphql")]
+use crate::command_ledger::{CommandId, CommandLedgerKey, CommandLookup, PrincipalPartitionId};
 #[cfg(feature = "graphql")]
 use crate::graphql::identity::VerifiedPrincipal;
 use crate::microsvc::error::HandlerError;
@@ -912,8 +912,9 @@ impl Service {
 
     /// Resolve one client-created command ID without accepting a command name.
     ///
-    /// The verified principal determines the private ledger partition and each
-    /// finite causal handler rechecks its current role grant and contract
+    /// The verified principal determines the private ledger partition. The
+    /// row is looked up once per repository and answered only through the
+    /// route that wrote it, under its current role grant and contract
     /// fingerprint. Malformed, absent, wrong-principal, revoked, drifted, and
     /// ambiguous IDs all collapse to `unknown`.
     #[cfg(feature = "graphql")]
@@ -959,16 +960,32 @@ impl Service {
             PrincipalPartitionId::new(principal.partition_for_service(service_id))
                 .map_err(internal_ledger_error)?;
 
+        let key = CommandLedgerKey::new(service_id, principal_partition, parsed_command_id.clone())
+            .map_err(internal_ledger_error)?;
+
+        // One ledger lookup per repository. The row names the command that
+        // wrote it; only a bundle committing to that repository can own it.
+        let mut repositories = Vec::new();
         let mut found = None;
         for routes in &self.routes {
+            let Some(repository) = routes.causal_storage_identity() else {
+                continue;
+            };
+            if repositories.contains(&repository) {
+                continue;
+            }
+            repositories.push(repository);
+            let route = |command: &str, fingerprint: &[u8; 32]| {
+                let mut owners = self
+                    .routes
+                    .iter()
+                    .filter(|routes| routes.causal_storage_identity() == Some(repository))
+                    .filter_map(|routes| routes.causal_status_route(command, fingerprint, session));
+                let owner = owners.next()?;
+                owners.next().is_none().then_some(owner)
+            };
             let status = routes
-                .causal_command_status(
-                    service_id,
-                    &parsed_command_id,
-                    &principal_partition,
-                    session,
-                    protocol.clone(),
-                )
+                .causal_command_status(&key, &parsed_command_id, &route, protocol.clone())
                 .await?;
             if status.is_unknown() {
                 continue;

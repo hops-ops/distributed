@@ -278,6 +278,7 @@ fn remote_dispatch_error(status: u16, body: &Value) -> CausalDispatchError {
         Some("COMMAND_ID_REUSE") => CausalDispatchError::CommandIdReuse,
         Some("COMMAND_IN_PROGRESS") => CausalDispatchError::InProgress,
         Some("COMMAND_EXPIRED") => CausalDispatchError::Expired,
+        Some("CONCURRENT_WRITE") => CausalDispatchError::ConcurrentWrite,
         Some("INTERNAL") => {
             CausalDispatchError::Internal(format!("cell wait-path failed with HTTP {status}"))
         }

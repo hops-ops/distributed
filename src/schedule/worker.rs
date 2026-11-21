@@ -306,7 +306,9 @@ impl ScheduleWorkerHandle {
 
 fn is_retryable(error: &CausalDispatchError) -> bool {
     match error {
-        CausalDispatchError::InProgress | CausalDispatchError::Internal(_) => true,
+        CausalDispatchError::InProgress
+        | CausalDispatchError::ConcurrentWrite
+        | CausalDispatchError::Internal(_) => true,
         CausalDispatchError::Handler(error) => error.status_code() >= 500,
         CausalDispatchError::Rejected { status, .. } => *status >= 500,
         _ => false,

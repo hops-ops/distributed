@@ -1,11 +1,10 @@
 use crate::aggregate::{AggregateBuilder, AggregateRepository};
 use crate::clock::{Clock, SystemClock};
-use crate::repository::{GetStream, RepositoryError, TransactionalCommit};
+use crate::repository::{
+    GetStream, RepositoryError, TransactionalCommit, CONCURRENT_WRITE_RETRIES,
+};
 
 use super::{Saga, SagaDefinition, SagaError, SagaMessage, SagaOutcome, SagaTransition};
-
-/// Attempts before a persistent `ConcurrentWrite` is surfaced.
-const CONCURRENT_WRITE_RETRIES: usize = 3;
 
 /// Load → transition → commit driver for a [`Saga`].
 ///

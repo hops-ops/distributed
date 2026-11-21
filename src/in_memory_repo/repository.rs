@@ -325,7 +325,7 @@ impl InMemoryRepository {
     fn commit_batch_inner<'a>(
         &'a self,
         batch: CommitBatch<'a>,
-        mut completion: Option<CommandCompletion>,
+        mut completion: Option<&mut CommandCompletion<'_>>,
         direct_projection: Option<SameTransactionProjectionBatch>,
     ) -> Result<(), InMemoryCommitError> {
         let mut batch = batch;
@@ -851,14 +851,15 @@ impl CausalTransactionalCommit for InMemoryRepository {
     fn commit_causal_batch<'a>(
         &'a self,
         batch: CausalCommitBatch<'a>,
-    ) -> impl Future<Output = Result<(), CommandLedgerError>> + Send + 'a {
+    ) -> impl Future<Output = Result<CommandCompletion<'a>, CommandLedgerError>> + Send + 'a {
         async move {
+            let mut completion = batch.completion;
             match self.commit_batch_inner(
                 batch.domain,
-                Some(batch.completion),
+                Some(&mut completion),
                 batch.direct_projection,
             ) {
-                Ok(()) => Ok(()),
+                Ok(()) => Ok(completion),
                 Err(InMemoryCommitError::Repository(error)) => {
                     Err(CommandLedgerError::Storage(error))
                 }

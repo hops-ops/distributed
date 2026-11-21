@@ -46,6 +46,8 @@ impl std::error::Error for CommandInputError {}
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct CanonicalCommandInput {
     wire: Value,
+    /// The canonical encoding the digest was taken over.
+    bytes: Vec<u8>,
     digest: [u8; 32],
 }
 
@@ -75,6 +77,7 @@ impl CanonicalCommandInput {
         Ok(CanonicalTypedCommandInput {
             decoded,
             wire: self.wire,
+            bytes: self.bytes,
             digest: self.digest,
         })
     }
@@ -84,6 +87,7 @@ impl CanonicalCommandInput {
 pub(crate) struct CanonicalTypedCommandInput<I> {
     decoded: I,
     wire: Value,
+    bytes: Vec<u8>,
     digest: [u8; 32],
 }
 
@@ -103,8 +107,10 @@ impl<I> CanonicalTypedCommandInput<I> {
         format!("sha256:{}", hex_digest(&self.digest))
     }
 
-    pub(crate) fn into_parts(self) -> (I, Value, [u8; 32]) {
-        (self.decoded, self.wire, self.digest)
+    /// The decoded input, its canonical wire value, that value's canonical
+    /// encoding, and the digest of the encoding.
+    pub(crate) fn into_parts(self) -> (I, Value, Vec<u8>, [u8; 32]) {
+        (self.decoded, self.wire, self.bytes, self.digest)
     }
 }
 
@@ -116,8 +122,12 @@ pub(crate) fn canonicalize_command_input(
     let bytes = serde_json::to_vec(&wire).map_err(|error| {
         CommandInputError::at("$", format!("cannot be canonically encoded: {error}"))
     })?;
-    let digest: [u8; 32] = Sha256::digest(bytes).into();
-    Ok(CanonicalCommandInput { wire, digest })
+    let digest: [u8; 32] = Sha256::digest(&bytes).into();
+    Ok(CanonicalCommandInput {
+        wire,
+        bytes,
+        digest,
+    })
 }
 
 #[cfg(test)]

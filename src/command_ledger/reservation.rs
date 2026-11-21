@@ -232,8 +232,10 @@ fn validate_positive_duration(label: &str, duration: Duration) -> Result<(), Com
 }
 
 /// Exclusive capability returned to the process that owns the current lease.
-/// It is intentionally not `Clone`: one owned value must be consumed by either
-/// terminal completion or the retryable-unknown transition.
+/// It is intentionally not `Clone`. A local completion borrows it for one
+/// commit transaction: a transaction that rolled back left the ledger row
+/// in progress under this same attempt, so its owner may complete it again.
+/// The stored fence, not this value, decides whether a completion lands.
 pub(crate) struct CommandAttempt {
     pub(super) key: CommandLedgerKey,
     pub(super) contract_fingerprint: CommandContractFingerprint,
@@ -284,11 +286,11 @@ impl CommandAttempt {
     }
 
     pub(crate) fn complete(
-        self,
+        &self,
         state: TerminalCommandState,
         outcome: Value,
         retention: Duration,
-    ) -> Result<CommandCompletion, CommandLedgerError> {
+    ) -> Result<CommandCompletion<'_>, CommandLedgerError> {
         self.complete_with_replay_metadata(state, outcome, None, retention, None)
     }
 
@@ -349,7 +351,13 @@ impl CommandAttempt {
                 "external command completion binding does not match its reservation".into(),
             ));
         }
-        let completion = self.complete_with_replay_metadata(
+        let CommandCompletion {
+            state,
+            replay,
+            retention,
+            retention_expires_at,
+            ..
+        } = self.complete_with_replay_metadata(
             state,
             outcome,
             projection_metadata,
@@ -357,12 +365,12 @@ impl CommandAttempt {
             retention_expires_at,
         )?;
         Ok(ExternalCommandCompletion {
-            attempt: completion.attempt,
+            attempt: self,
             binding,
-            state: completion.state,
-            replay: completion.replay,
-            retention: completion.retention,
-            retention_expires_at: completion.retention_expires_at,
+            state,
+            replay,
+            retention,
+            retention_expires_at,
         })
     }
 
@@ -375,12 +383,12 @@ impl CommandAttempt {
     /// state invariants.
     #[cfg(test)]
     pub(crate) fn complete_with_projection_metadata(
-        self,
+        &self,
         state: TerminalCommandState,
         outcome: Value,
         projection_metadata: Vec<u8>,
         retention: Duration,
-    ) -> Result<CommandCompletion, CommandLedgerError> {
+    ) -> Result<CommandCompletion<'_>, CommandLedgerError> {
         self.complete_with_replay_metadata(
             state,
             outcome,
@@ -397,13 +405,13 @@ impl CommandAttempt {
     /// bytes, preventing a retained ledger tail whose metadata has already
     /// expired.
     pub(crate) fn complete_with_projection_metadata_until(
-        self,
+        &self,
         state: TerminalCommandState,
         outcome: Value,
         projection_metadata: Vec<u8>,
         retention: Duration,
         retention_expires_at: SystemTime,
-    ) -> Result<CommandCompletion, CommandLedgerError> {
+    ) -> Result<CommandCompletion<'_>, CommandLedgerError> {
         self.complete_with_replay_metadata(
             state,
             outcome,
@@ -414,13 +422,13 @@ impl CommandAttempt {
     }
 
     fn complete_with_replay_metadata(
-        self,
+        &self,
         state: TerminalCommandState,
         outcome: Value,
         projection_metadata: Option<Vec<u8>>,
         retention: Duration,
         retention_expires_at: Option<SystemTime>,
-    ) -> Result<CommandCompletion, CommandLedgerError> {
+    ) -> Result<CommandCompletion<'_>, CommandLedgerError> {
         validate_positive_duration("command replay retention", retention)?;
         if projection_metadata.is_none() {
             validate_replay_state_without_projection_metadata(state.into())
@@ -496,17 +504,17 @@ impl AttemptFence {
 
 /// Authorization scope for a command-ledger lookup.
 ///
-/// Public status reads are bound to the selected command route. Ambiguous
-/// commit recovery instead presents the private attempt fence retained by the
+/// Public status reads are bound to a command route. Ambiguous commit
+/// recovery instead presents the private attempt fence retained by the
 /// dispatcher, so it can recover a terminal outcome without trusting a route
 /// name supplied by the caller.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy)]
 pub(crate) enum CommandLookupScope<'a> {
     CommandName(&'a str),
-    CommandContract {
-        command_name: &'a str,
-        contract_fingerprint: &'a [u8; SHA256_BYTES],
-    },
+    /// The row names its own route (command name, contract fingerprint) and
+    /// the caller decides whether that route may see it. A row the caller
+    /// declines is `Unknown`, exactly like an absent one.
+    Route(&'a (dyn Fn(&str, &[u8; SHA256_BYTES]) -> bool + Send + Sync)),
     Attempt(&'a AttemptFence),
 }
 
@@ -602,8 +610,9 @@ pub(crate) enum CommandLookup {
 }
 
 /// Exactly one fenced ledger completion attached to a domain commit.
-pub(crate) struct CommandCompletion {
-    pub(super) attempt: CommandAttempt,
+#[derive(Debug)]
+pub(crate) struct CommandCompletion<'a> {
+    pub(super) attempt: &'a CommandAttempt,
     pub(super) state: TerminalCommandState,
     pub(super) replay: String,
     direct_projection: Option<Value>,
@@ -653,9 +662,24 @@ impl ExternalCommandCompletion {
     }
 }
 
-impl CommandCompletion {
+impl CommandCompletion<'_> {
     pub(crate) fn attempt(&self) -> &CommandAttempt {
-        &self.attempt
+        self.attempt
+    }
+
+    /// The replay every later lookup of this completion returns once its
+    /// transaction committed: decoded from the exact bytes the row stores.
+    pub(crate) fn into_replay(
+        self,
+        command_name: &str,
+    ) -> Result<CommandReplay, CommandLedgerError> {
+        super::record::decode_replay(
+            &self.attempt.key.command_id,
+            command_name,
+            self.state.into(),
+            &self.attempt.causation_id,
+            &self.replay,
+        )
     }
 
     pub(crate) fn state(&self) -> TerminalCommandState {
@@ -747,18 +771,18 @@ impl CommandCompletion {
 /// Existing public domain batch plus exactly one private ledger completion.
 pub(crate) struct CausalCommitBatch<'a> {
     pub(crate) domain: CommitBatch<'a>,
-    pub(crate) completion: CommandCompletion,
+    pub(crate) completion: CommandCompletion<'a>,
     pub(crate) direct_projection: Option<SameTransactionProjectionBatch>,
 }
 
 impl<'a> CausalCommitBatch<'a> {
-    pub(crate) fn new(domain: CommitBatch<'a>, completion: CommandCompletion) -> Self {
+    pub(crate) fn new(domain: CommitBatch<'a>, completion: CommandCompletion<'a>) -> Self {
         Self::build(domain, completion, None)
     }
 
     pub(crate) fn with_direct_projection(
         domain: CommitBatch<'a>,
-        completion: CommandCompletion,
+        completion: CommandCompletion<'a>,
         direct_projection: SameTransactionProjectionBatch,
     ) -> Self {
         Self::build(domain, completion, Some(direct_projection))
@@ -766,7 +790,7 @@ impl<'a> CausalCommitBatch<'a> {
 
     fn build(
         mut domain: CommitBatch<'a>,
-        completion: CommandCompletion,
+        completion: CommandCompletion<'a>,
         direct_projection: Option<SameTransactionProjectionBatch>,
     ) -> Self {
         // The attempt's stable causation is authoritative at the final boundary:

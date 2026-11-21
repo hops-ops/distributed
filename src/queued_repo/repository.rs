@@ -8,8 +8,8 @@ use std::sync::Arc;
 
 use crate::command_ledger::{
     AttemptFence, CausalCommitBatch, CausalGetStream, CausalRepositoryIdentity,
-    CausalStorageIdentity, CausalTransactionalCommit, CommandLedgerError, CommandLedgerKey,
-    CommandLedgerStore, CommandLookup, CommandLookupScope, CommandReservation,
+    CausalStorageIdentity, CausalTransactionalCommit, CommandCompletion, CommandLedgerError,
+    CommandLedgerKey, CommandLedgerStore, CommandLookup, CommandLookupScope, CommandReservation,
     ExternalCommandCompletion, ReservationOutcome,
 };
 use crate::entity::Entity;
@@ -325,7 +325,7 @@ where
     fn commit_causal_batch<'a>(
         &'a self,
         batch: CausalCommitBatch<'a>,
-    ) -> impl Future<Output = Result<(), CommandLedgerError>> + Send + 'a {
+    ) -> impl Future<Output = Result<CommandCompletion<'a>, CommandLedgerError>> + Send + 'a {
         // Causal loads deliberately bypass this wrapper's queue locks, so a
         // causal commit never owns one to release. Delegating without touching
         // the lock manager is essential: a matching lock may belong to an

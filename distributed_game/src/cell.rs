@@ -230,9 +230,9 @@ fn batch_command(
 #[cfg(not(target_arch = "wasm32"))]
 fn classify(error: CausalDispatchError) -> FactError {
     match error {
-        CausalDispatchError::InProgress | CausalDispatchError::Internal(_) => {
-            FactError::Retryable(format!("{error:?}"))
-        }
+        CausalDispatchError::InProgress
+        | CausalDispatchError::ConcurrentWrite
+        | CausalDispatchError::Internal(_) => FactError::Retryable(format!("{error:?}")),
         other => FactError::Permanent(format!("{}: {other:?}", other.code())),
     }
 }

@@ -4,9 +4,9 @@ use crate::entity::Entity;
 use crate::repository::{RepositoryError, StreamIdentity};
 
 use super::{
-    AttemptFence, CausalCommitBatch, CausalStorageIdentity, CommandLedgerError, CommandLedgerKey,
-    CommandLookup, CommandLookupScope, CommandReservation, ExternalCommandCompletion,
-    ReservationOutcome,
+    AttemptFence, CausalCommitBatch, CausalStorageIdentity, CommandCompletion, CommandLedgerError,
+    CommandLedgerKey, CommandLookup, CommandLookupScope, CommandReservation,
+    ExternalCommandCompletion, ReservationOutcome,
 };
 
 /// Read capability used by the causal workspace. Unlike ordinary
@@ -70,8 +70,10 @@ pub(crate) trait CommandLedgerStore: Send + Sync {
 /// Private transaction capability that makes terminal ledger completion an
 /// inseparable participant in the domain commit.
 pub(crate) trait CausalTransactionalCommit: Send + Sync {
+    /// Returns the completion as committed, including evidence the adapter
+    /// allocated inside the transaction.
     fn commit_causal_batch<'a>(
         &'a self,
         batch: CausalCommitBatch<'a>,
-    ) -> impl Future<Output = Result<(), CommandLedgerError>> + Send + 'a;
+    ) -> impl Future<Output = Result<CommandCompletion<'a>, CommandLedgerError>> + Send + 'a;
 }

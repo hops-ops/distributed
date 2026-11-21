@@ -112,7 +112,7 @@ impl CellSqlRepository {
     fn commit(
         &self,
         batch: CommitBatch<'_>,
-        completion: Option<CommandCompletion>,
+        completion: Option<&CommandCompletion<'_>>,
     ) -> Result<(), CommandLedgerError> {
         if !batch.read_model_plans.is_empty() || !batch.inbox_receipts.is_empty() {
             return Err(CommandLedgerError::Invalid(
@@ -329,16 +329,17 @@ impl TransactionalCommit for CellSqlRepository {
     }
 }
 impl CausalTransactionalCommit for CellSqlRepository {
-    async fn commit_causal_batch(
-        &self,
-        batch: CausalCommitBatch<'_>,
-    ) -> Result<(), CommandLedgerError> {
+    async fn commit_causal_batch<'a>(
+        &'a self,
+        batch: CausalCommitBatch<'a>,
+    ) -> Result<CommandCompletion<'a>, CommandLedgerError> {
         if batch.direct_projection.is_some() {
             return Err(CommandLedgerError::Invalid(
                 "aggregate cells do not execute read-model projections".into(),
             ));
         }
-        self.commit(batch.domain, Some(batch.completion))
+        self.commit(batch.domain, Some(&batch.completion))?;
+        Ok(batch.completion)
     }
 }
 

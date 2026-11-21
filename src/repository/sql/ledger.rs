@@ -105,7 +105,7 @@ async fn select<E: SqlExecutor>(
 
 pub(crate) async fn preflight<E: SqlExecutor>(
     executor: &mut E,
-    completion: &CommandCompletion,
+    completion: &CommandCompletion<'_>,
 ) -> Result<(), CommandLedgerError> {
     let fence = completion.attempt_fence();
 
@@ -256,7 +256,7 @@ pub(crate) async fn reclaim<E: SqlExecutor>(
 
 pub(crate) async fn complete<E: SqlExecutor>(
     executor: &mut E,
-    completion: &CommandCompletion,
+    completion: &CommandCompletion<'_>,
 ) -> Result<(), CommandLedgerError> {
     let fence = completion.attempt_fence();
     let attempt_number = signed(fence.attempt_number(), "command ledger attempt number")?;
@@ -395,11 +395,8 @@ pub(crate) async fn lookup(
     scope: CommandLookupScope<'_>,
 ) -> Result<CommandLookup, CommandLedgerError> {
     let expected_name = match scope {
-        CommandLookupScope::CommandName(name)
-        | CommandLookupScope::CommandContract {
-            command_name: name, ..
-        } => Some(name),
-        CommandLookupScope::Attempt(_) => None,
+        CommandLookupScope::CommandName(name) => Some(name),
+        CommandLookupScope::Route(_) | CommandLookupScope::Attempt(_) => None,
     };
     // Reserve SQLite's writer before reading; PostgreSQL also locks the selected row.
     let mut lock = key_filter(

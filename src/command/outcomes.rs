@@ -267,7 +267,7 @@ impl<K: CommandOutcome> PreparedCommand<K> {
         }
     }
 
-    /// The durable committer is the sole intended consumer.
+    #[cfg(test)]
     pub(crate) fn finalize_after_commit(self) -> serde_json::Value {
         self.serialized_payload
             .expect("prepared command payload is serialized before commit")

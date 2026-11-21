@@ -15,8 +15,8 @@ use serde_json::Value;
 use super::sql_store::CellSqlRepository;
 use crate::command_ledger::{
     AttemptFence, CausalCommitBatch, CausalGetStream, CausalRepositoryIdentity,
-    CausalStorageIdentity, CausalTransactionalCommit, CommandLedgerError, CommandLedgerKey,
-    CommandLedgerStore, CommandLookup, CommandLookupScope, CommandReservation,
+    CausalStorageIdentity, CausalTransactionalCommit, CommandCompletion, CommandLedgerError,
+    CommandLedgerKey, CommandLedgerStore, CommandLookup, CommandLookupScope, CommandReservation,
     ExternalCommandCompletion, ReservationOutcome,
 };
 use crate::entity::Entity;
@@ -800,7 +800,7 @@ impl CausalTransactionalCommit for CellStreamStore {
     fn commit_causal_batch<'a>(
         &'a self,
         batch: CausalCommitBatch<'a>,
-    ) -> impl Future<Output = Result<(), CommandLedgerError>> + Send + 'a {
+    ) -> impl Future<Output = Result<CommandCompletion<'a>, CommandLedgerError>> + Send + 'a {
         let mut batch = batch;
         async move {
             self.ensure_batch(&batch.domain)
@@ -816,7 +816,8 @@ impl CausalTransactionalCommit for CellStreamStore {
             let alarms = self
                 .plan_memory_alarms(&mut batch.domain)
                 .map_err(CommandLedgerError::Storage)?;
-            CausalTransactionalCommit::commit_causal_batch(&self.inner, batch).await?;
+            let completion =
+                CausalTransactionalCommit::commit_causal_batch(&self.inner, batch).await?;
             #[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
             if let Some(row) = sealed {
                 self.replace_sealed_row(row)
@@ -825,7 +826,7 @@ impl CausalTransactionalCommit for CellStreamStore {
             #[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
             self.install_memory_alarms(alarms)
                 .map_err(CommandLedgerError::Storage)?;
-            Ok(())
+            Ok(completion)
         }
     }
 }

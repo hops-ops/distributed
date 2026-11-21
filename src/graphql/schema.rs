@@ -878,6 +878,7 @@ pub const ENGINE_ERROR_CODES: &[&str] = &[
     "COMMAND_ID_REUSE",
     "COMMAND_IN_PROGRESS",
     "COMMAND_EXPIRED",
+    "CONCURRENT_WRITE", // command mutations; nothing committed, retry
 ];
 
 /// Map executor error strings to stable client errors (`extensions.code`).
@@ -971,6 +972,7 @@ mod execute_err_mapping_tests {
                 "COMMAND_ID_REUSE",
                 "COMMAND_IN_PROGRESS",
                 "COMMAND_EXPIRED",
+                "CONCURRENT_WRITE",
             ]
         );
     }
