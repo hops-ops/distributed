@@ -16,7 +16,7 @@ use crate::application::{
     DISTRIBUTED_ADMIN_CLIENT_SURFACE, DISTRIBUTED_CLIENT_SURFACE,
     DISTRIBUTED_PUBLIC_CLIENT_SURFACE, E2E_UI_APPLICATION, E2E_UI_MODULE_IDS,
 };
-use crate::modules::projections;
+use crate::modules::{identity, projections};
 
 // Stable only for this local copyable fixture. Real deployments must inject
 // their own per-deployment key rather than copying this development value.
@@ -189,7 +189,12 @@ pub fn application_manifest() -> ApplicationManifest {
     let modules = E2E_UI_MODULE_IDS
         .iter()
         .map(|module_id| {
-            let prefix = format!("{module_id}.");
+            // A module's commands are named `{module}.…`; the identity
+            // module's are named for their provider.
+            let prefix = match *module_id {
+                identity::MODULE_ID => identity::COMMAND_PREFIX.to_string(),
+                module_id => format!("{module_id}."),
+            };
             let definitions = commands
                 .iter()
                 .filter(|command| command.id.starts_with(&prefix))

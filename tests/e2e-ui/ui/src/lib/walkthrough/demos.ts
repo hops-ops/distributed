@@ -51,7 +51,7 @@ pub async fn run(
 
   spawn_outbox_publish_loop(/* outbox → bus */);
   spawn_service_consumer_loop(move || build_service(/* … */).with_bus(bus));
-  spawn_zitadel_scrape(repo.clone()); // only when Zitadel env is set
+  spawn_zitadel_scrape(service.clone()); // only when Zitadel env is set
 
   serve(service, &options).await
 }`
@@ -675,38 +675,34 @@ mutation SaveChatMessage {
 {
 			id: 'service',
 			label: '6 · Service + host',
-			lede: 'The chat module mounts lobby posts. On the one-process playground it also mounts identity ingress. The module mounts the chat projector. `build_service` adds these routes to one Service. On `tests/e2e-celld`, `chat.post` wait-dispatches to a Chat cell; the cell outbox reaches this projector through the celld Queue relay and NATS, so `@live` still runs. The host starts the process. The runner only reads the environment.',
+			lede: 'The chat module mounts lobby posts. The module mounts the chat projector. `build_service` adds these routes to one Service. On `tests/e2e-celld`, `chat.post` wait-dispatches to a Chat cell; the cell outbox reaches this projector through the celld Queue relay and NATS, so `@live` still runs. The host starts the process. The runner only reads the environment.',
 			principle: 'Compose modules into one Service. Let the host start the process. Keep the runner small.',
 			samples: [
 				{
 					file: 'modules/chat.rs · routes()',
-					caption: 'This module mounts ChatMessage commands, Zitadel ingress, and projectors.',
+					caption: 'This module mounts ChatMessage commands and the chat projector.',
 					code: `pub const MODULE_ID: &str = "chat";
 
 pub fn routes<R, L, S>(...) -> ChatRoutes<R, L, S> {
   Routes::for_aggregate::<R, L, ChatMessage, S>(repo, locks, read_models)
     .mount(chat_domain::commands::post())
-    // Zitadel Action ingress + on-demand scrape (non-GraphQL).
-    .command(zitadel::COMMAND)
-    .guarded(zitadel::guard, zitadel::handle)
     .modeled_projector(chat_projector)
     .handle(project_chat_messages::handle)
-    .events(project_auth_user::EVENTS)
-    .guarded(project_auth_user::guard, project_auth_user::handle)
 }`
 				},
 				{
 					file: 'modules/compose.rs · MODULE_IDS + build_service',
 					caption: 'The module list is explicit: todo, chat, blob, and identity.',
 					code: `pub const MODULE_IDS: &[&str] = &[
-  todo::MODULE_ID, chat::MODULE_ID, blob::MODULE_ID, "identity",
+  todo::MODULE_ID, chat::MODULE_ID, blob::MODULE_ID, identity::MODULE_ID,
 ];
 
 Service::new()
   .named("e2e-ui")
   .routes(todo::routes(/* … */))
   .routes(chat::routes(/* … */))  // ← this module
-  .routes(blob::routes(/* … */))`
+  .routes(blob::routes(/* … */))
+  .routes(identity::routes(/* … */))`
 				},
 				...hostAndRunnerSamples,
 				{
@@ -1482,28 +1478,29 @@ IdentityConfig::oidc_bearer(oidc)`
 		{
 			id: 'service',
 			label: '5 · Service + host',
-			lede: 'Identity is not a domain aggregate. Identity is service-crate wiring. That wiring includes OIDC or dev headers, claim maps, and the chat module Zitadel ingress. The ingress fills `AuthUsers`. The host starts the Service. The host also starts the scrape, outbox, and consumer loops. The runner only supplies `DATABASE_URL`, `BIND`, and OIDC environment variables.',
+			lede: 'Identity is not a domain aggregate. Identity is service-crate wiring. That wiring includes OIDC or dev headers, claim maps, and the identity module Zitadel ingress. The ingress fills `AuthUsers`. The host starts the Service. The host also starts the scrape, outbox, and consumer loops. The runner only supplies `DATABASE_URL`, `BIND`, and OIDC environment variables.',
 			principle: 'Keep identity on the transport. Compose modules. Keep domain crates pure.',
 			samples: [
 				{
 					file: 'modules/compose.rs · MODULE_IDS',
-					caption: 'Identity is an inventory slot. Command mounts live on chat, todo, and blob.',
+					caption: 'Identity is a module with no aggregate. It mounts the Zitadel commands and the `AuthUsers` projector.',
 					code: `pub const MODULE_IDS: &[&str] = &[
   todo::MODULE_ID,
   chat::MODULE_ID,
   blob::MODULE_ID,
-  "identity",
+  identity::MODULE_ID,
 ];`
 				},
 				{
-					file: 'modules/chat.rs · Zitadel ingress',
-					caption: 'These are service-crate extension commands. They are not GraphQL user mutations.',
-					code: `.command(handlers::ingestors::zitadel::COMMAND)
-.guarded(zitadel::guard, zitadel::handle)
-.command(handlers::ingestors::zitadel_scrape::COMMAND)
-.guarded(zitadel_scrape::guard, zitadel_scrape::handle)
-.events(project_auth_user::EVENTS)
-.guarded(project_auth_user::guard, project_auth_user::handle)`
+					file: 'modules/identity.rs · Zitadel ingress',
+					caption: 'These are typed commands with no aggregate. Each provider message commits with its command ledger receipt. The HTTP edge checks the shared secret and dispatches them as the ingestor. No user role can call them.',
+					code: `Routes::for_stores(repo, read_models)
+  .typed_command(zitadel::command())
+  .handle(zitadel::handle)
+  .typed_command(zitadel_scrape::command())
+  .handle(zitadel_scrape::Scrape(read_models.clone()))
+  .events(project_auth_user::EVENTS)
+  .guarded(project_auth_user::guard, project_auth_user::handle)`
 				},
 				{
 					file: 'modules/graphql.rs · identity_from_env',
@@ -1551,7 +1548,7 @@ pub struct AuthUsers {
 ];
 
 pub async fn handle<R, L, S>(
-  ctx: &Context<'_, AuthDeps<R, L, S>>,
+  ctx: &Context<'_, AuthDeps<R, S>>,
 ) -> Result<Value, HandlerError> {
   let payload: ZitadelUserPayload = decode_payload(ctx.message())?;
   let name = ctx.message().name();

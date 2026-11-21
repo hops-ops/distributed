@@ -35,13 +35,20 @@ type LoadAggregateFuture<'a, A> =
 
 /// Erases the concrete backend from the handler-facing workspace while
 /// retaining the repository's explicitly non-locking causal load capability.
+///
+/// Both methods exist only for an aggregate: a route bundle with none (`()`)
+/// holds the same store and can call neither.
 trait CausalAggregateStore<A>: Send + Sync {
-    fn load<'a>(&'a self, identity: &'a StreamIdentity) -> LoadAggregateFuture<'a, A>;
+    fn load<'a>(&'a self, identity: &'a StreamIdentity) -> LoadAggregateFuture<'a, A>
+    where
+        A: Aggregate + Send + Sync + 'static;
 
     fn snapshot_writes(
         &self,
         aggregate: &A,
-    ) -> Result<(Vec<SnapshotWrite>, Option<u64>), RepositoryError>;
+    ) -> Result<(Vec<SnapshotWrite>, Option<u64>), RepositoryError>
+    where
+        A: Aggregate + Send + Sync + 'static;
 }
 
 struct AggregateStoreRef<'repo, R, A> {
@@ -51,17 +58,59 @@ struct AggregateStoreRef<'repo, R, A> {
 impl<R, A> CausalAggregateStore<A> for AggregateStoreRef<'_, R, A>
 where
     R: CausalGetStream,
-    A: Aggregate + Send + Sync + 'static,
+    A: Send + Sync + 'static,
 {
-    fn load<'a>(&'a self, identity: &'a StreamIdentity) -> LoadAggregateFuture<'a, A> {
+    fn load<'a>(&'a self, identity: &'a StreamIdentity) -> LoadAggregateFuture<'a, A>
+    where
+        A: Aggregate + Send + Sync + 'static,
+    {
         Box::pin(async move { self.repository.get_causal(identity).await })
     }
 
     fn snapshot_writes(
         &self,
         aggregate: &A,
-    ) -> Result<(Vec<SnapshotWrite>, Option<u64>), RepositoryError> {
+    ) -> Result<(Vec<SnapshotWrite>, Option<u64>), RepositoryError>
+    where
+        A: Aggregate + Send + Sync + 'static,
+    {
         self.repository.snapshot_writes_for(aggregate)
+    }
+}
+
+/// A staged aggregate as the committer uses it. The workspace keeps staged
+/// aggregates behind this, so what it commits does not depend on the route
+/// bundle's aggregate type, or on there being one.
+trait StagedStream: Send + Sync {
+    fn staged_entity(&self) -> &crate::Entity;
+    fn staged_entity_mut(&mut self) -> &mut crate::Entity;
+    fn bind_event(
+        &self,
+        event: &PreparedDomainEvent,
+        ordinal: u32,
+    ) -> Result<crate::DomainEventOccurrence, DomainEventCaptureError>;
+    fn stamp_source(&self, message: &mut OutboxMessage);
+}
+
+impl<A: Aggregate + Send + Sync> StagedStream for A {
+    fn staged_entity(&self) -> &crate::Entity {
+        Aggregate::entity(self)
+    }
+
+    fn staged_entity_mut(&mut self) -> &mut crate::Entity {
+        Aggregate::entity_mut(self)
+    }
+
+    fn bind_event(
+        &self,
+        event: &PreparedDomainEvent,
+        ordinal: u32,
+    ) -> Result<crate::DomainEventOccurrence, DomainEventCaptureError> {
+        event.bind(self, ordinal)
+    }
+
+    fn stamp_source(&self, message: &mut OutboxMessage) {
+        message.set_source(self);
     }
 }
 
@@ -259,9 +308,9 @@ impl From<PrepareCommandError> for CausalWorkspaceError {
     }
 }
 
-struct StagedAggregate<A> {
+struct StagedAggregate {
     identity: StreamIdentity,
-    aggregate: A,
+    aggregate: Box<dyn StagedStream>,
     snapshot_version: Option<u64>,
     publication: AggregatePublication,
 }
@@ -273,8 +322,9 @@ pub(crate) struct AggregatePublication {
     pub(crate) explicit_events: Vec<PreparedDomainEvent>,
 }
 
-struct WorkspaceState<A> {
-    aggregates: Vec<StagedAggregate<A>>,
+#[derive(Default)]
+struct WorkspaceState {
+    aggregates: Vec<StagedAggregate>,
     identities: HashSet<StreamIdentity>,
     outbox_messages: Vec<OutboxMessage>,
     read_model_plans: Vec<TableWritePlan>,
@@ -284,35 +334,20 @@ struct WorkspaceState<A> {
     modeled_direct_projection: Option<ProjectionServerExecutorDescriptor>,
 }
 
-impl<A> Default for WorkspaceState<A> {
-    fn default() -> Self {
-        Self {
-            aggregates: Vec::new(),
-            identities: HashSet::new(),
-            outbox_messages: Vec::new(),
-            read_model_plans: Vec::new(),
-            snapshots: Vec::new(),
-            schedules: Vec::new(),
-            projection_staged: false,
-            modeled_direct_projection: None,
-        }
-    }
-}
-
 /// A handler-scoped unit of work. The concrete repository is erased and never
 /// exposed through this type.
-pub(crate) struct CausalWorkspace<'repo, A>
-where
-    A: Aggregate + Send + Sync + 'static,
-{
+///
+/// `A` is the route bundle's aggregate, or `()` for a bundle with none: such
+/// a workspace stages outbox messages and read-model plans, and no stream.
+pub(crate) struct CausalWorkspace<'repo, A> {
     store: Box<dyn CausalAggregateStore<A> + 'repo>,
-    state: Mutex<WorkspaceState<A>>,
+    state: Mutex<WorkspaceState>,
     scheduling_declared: bool,
 }
 
 impl<'repo, A> CausalWorkspace<'repo, A>
 where
-    A: Aggregate + Send + Sync + 'static,
+    A: Send + Sync + 'static,
 {
     pub(crate) fn new<R>(repository: &'repo AggregateRepository<R, A>) -> Self
     where
@@ -332,7 +367,12 @@ where
         self.scheduling_declared = declared;
         self
     }
+}
 
+impl<A> CausalWorkspace<'_, A>
+where
+    A: Aggregate + Send + Sync + 'static,
+{
     /// Load a full stream through the explicit causal/non-locking capability.
     pub(crate) async fn load(
         &self,
@@ -409,13 +449,15 @@ where
         state.snapshots.append(&mut snapshots);
         state.aggregates.push(StagedAggregate {
             identity,
-            aggregate,
+            aggregate: Box::new(aggregate),
             snapshot_version,
             publication,
         });
         Ok(())
     }
+}
 
+impl<A> CausalWorkspace<'_, A> {
     pub(crate) fn stage_outbox(&self, message: OutboxMessage) -> Result<(), CausalWorkspaceError> {
         self.state
             .lock()
@@ -551,7 +593,7 @@ where
         Ok(prepared)
     }
 
-    pub(crate) fn into_parts(self) -> Result<CausalWorkspaceParts<A>, CausalWorkspaceError> {
+    pub(crate) fn into_parts(self) -> Result<CausalWorkspaceParts, CausalWorkspaceError> {
         let state = self
             .state
             .into_inner()
@@ -574,8 +616,8 @@ where
 
 /// Owned staged work retained by the dispatcher between handler completion and
 /// construction of the ledger-fenced commit batch.
-pub(crate) struct CausalWorkspaceParts<A> {
-    aggregates: Vec<StagedAggregate<A>>,
+pub(crate) struct CausalWorkspaceParts {
+    aggregates: Vec<StagedAggregate>,
     outbox_messages: Vec<OutboxMessage>,
     read_model_plans: Vec<TableWritePlan>,
     snapshots: Vec<SnapshotWrite>,
@@ -593,10 +635,7 @@ pub(crate) struct CausalWorkspaceParts<A> {
     batch_prepared: bool,
 }
 
-impl<A> CausalWorkspaceParts<A>
-where
-    A: Aggregate,
-{
+impl CausalWorkspaceParts {
     /// Bind publication intent to each aggregate's exact final transition after
     /// applying the ledger's authoritative causation ID.
     pub(crate) fn prepare_domain_publications(
@@ -612,9 +651,9 @@ where
         for staged in &mut self.aggregates {
             staged
                 .aggregate
-                .entity_mut()
+                .staged_entity_mut()
                 .overwrite_new_event_causation_id(causation_id);
-            let entity = staged.aggregate.entity();
+            let entity = staged.aggregate.staged_entity();
             entity.domain_event_commit_guard()?;
             let pending = entity.pending_domain_events_for_commit()?;
             if !pending.is_empty()
@@ -642,7 +681,7 @@ where
                     .extend(pending.iter().map(|occurrence| occurrence.id().to_owned()));
             }
 
-            let current_sequence = staged.aggregate.entity().version();
+            let current_sequence = staged.aggregate.staged_entity().version();
             let ordinal_base = pending
                 .iter()
                 .filter(|occurrence| occurrence.aggregate_sequence() == current_sequence)
@@ -652,7 +691,7 @@ where
                     .checked_add(offset)
                     .and_then(|ordinal| ordinal.try_into().ok())
                     .ok_or(DomainEventCaptureError::PublicationOrdinalOverflow)?;
-                let occurrence = event.bind(&staged.aggregate, ordinal)?;
+                let occurrence = staged.aggregate.bind_event(event, ordinal)?;
                 self.domain_event_occurrences.push(occurrence.clone());
                 self.outbox_messages
                     .push(OutboxMessage::from_domain_event_occurrence(&occurrence)?);
@@ -683,7 +722,7 @@ where
             contract,
             self.aggregates
                 .iter()
-                .any(|staged| !staged.aggregate.entity().new_events().is_empty()),
+                .any(|staged| !staged.aggregate.staged_entity().new_events().is_empty()),
             &self.outbox_messages,
             &self.read_model_plans,
             self.resolved_direct_projection.as_ref(),
@@ -787,7 +826,7 @@ where
                     && message.source_aggregate_id.is_none()
                     && message.source_sequence.is_none()
                 {
-                    message.set_source(&staged.aggregate);
+                    staged.aggregate.stamp_source(message);
                 }
             }
         }
@@ -795,7 +834,12 @@ where
         let streams = self
             .aggregates
             .iter_mut()
-            .map(|staged| StreamWrite::new(staged.identity.clone(), staged.aggregate.entity_mut()))
+            .map(|staged| {
+                StreamWrite::new(
+                    staged.identity.clone(),
+                    staged.aggregate.staged_entity_mut(),
+                )
+            })
             .collect();
         let mut batch = CommitBatch::new(streams);
         batch.outbox_messages = std::mem::take(&mut self.outbox_messages);
@@ -809,11 +853,14 @@ where
     pub(crate) fn mark_committed_state(&mut self) -> Result<(), CausalWorkspaceError> {
         for staged in &mut self.aggregates {
             if let Some(version) = staged.snapshot_version {
-                staged.aggregate.entity_mut().set_snapshot_version(version);
+                staged
+                    .aggregate
+                    .staged_entity_mut()
+                    .set_snapshot_version(version);
             }
             staged
                 .aggregate
-                .entity_mut()
+                .staged_entity_mut()
                 .mark_domain_events_committed()?;
         }
         Ok(())
@@ -1207,14 +1254,14 @@ mod tests {
 
         assert!(parts.aggregates.iter().all(|staged| staged
             .aggregate
-            .entity
+            .staged_entity()
             .pending_domain_events()
             .len()
             == 1));
         parts.mark_committed_state().unwrap();
         assert!(parts.aggregates.iter().all(|staged| staged
             .aggregate
-            .entity
+            .staged_entity()
             .pending_domain_events()
             .is_empty()));
     }
@@ -1252,14 +1299,14 @@ mod tests {
         assert_eq!(
             parts.aggregates[0]
                 .aggregate
-                .entity
+                .staged_entity()
                 .pending_domain_events()
                 .len(),
             0
         );
         assert!(parts.aggregates[0]
             .aggregate
-            .entity
+            .staged_entity()
             .domain_event_poison()
             .is_some());
     }

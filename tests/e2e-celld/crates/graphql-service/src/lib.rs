@@ -13,9 +13,7 @@ pub use application::{
     DISTRIBUTED_ADMIN_CLIENT_SURFACE, DISTRIBUTED_CLIENT_SURFACE,
     DISTRIBUTED_PUBLIC_CLIENT_SURFACE, E2E_UI_APPLICATION, E2E_UI_MODULE_IDS,
 };
-pub use e2e_celld_identity::{
-    scrape_users_to_outbox, spawn_scrape_loop, ScrapeReport, ZitadelScrapeConfig,
-};
+pub use e2e_celld_identity::{spawn_scrape_loop, ZitadelScrapeConfig};
 pub use e2e_readmodels::distributed_manifest;
 pub use host::{run, HostOptions};
 pub use modules::compose::build_service;

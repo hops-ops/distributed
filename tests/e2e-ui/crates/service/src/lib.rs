@@ -23,9 +23,7 @@ pub use application::{
     DISTRIBUTED_PUBLIC_CLIENT_SURFACE, E2E_UI_APPLICATION, E2E_UI_MODULE_IDS,
 };
 pub use e2e_readmodels::distributed_manifest;
-pub use handlers::ingestors::zitadel::{
-    scrape_users_to_outbox, spawn_scrape_loop, ScrapeReport, ZitadelScrapeConfig,
-};
+pub use handlers::ingestors::zitadel::{spawn_scrape_loop, ZitadelScrapeConfig};
 pub use host::{run, HostOptions};
 pub use http::{gateway_router, serve};
 pub use modules::compose::build_service;

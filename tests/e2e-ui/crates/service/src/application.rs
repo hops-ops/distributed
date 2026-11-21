@@ -4,7 +4,7 @@
 //! inventory, and re-exports of the composed host APIs. Infrastructure
 //! (dialect, outbox, OIDC serve) stays in `host`; handlers stay in modules.
 
-use crate::modules::{blob, chat, compose, todo};
+use crate::modules::{blob, chat, compose, identity, todo};
 
 /// Stable normal-application surface shared by user and admin sessions.
 pub const DISTRIBUTED_CLIENT_SURFACE: &str = "e2e-ui";
@@ -22,7 +22,10 @@ pub const E2E_UI_MODULE_IDS: &[&str] = compose::MODULE_IDS;
 /// Compile-time proof that module inventory matches bounded-context crates.
 pub const MODULE_DECLARATIONS: &[(&str, &str)] = &[
     (todo::MODULE_ID, "todo commands + projector"),
-    (chat::MODULE_ID, "chat commands + Zitadel extension + projectors"),
+    (chat::MODULE_ID, "chat commands + projector"),
     (blob::MODULE_ID, "blob Atomic commands"),
-    ("identity", "AuthUsers projection via chat module ingestors"),
+    (
+        identity::MODULE_ID,
+        "Zitadel ingress/scrape commands + AuthUsers projector",
+    ),
 ];

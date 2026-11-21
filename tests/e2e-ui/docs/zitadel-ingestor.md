@@ -40,7 +40,7 @@ curl -sS -X POST "http://127.0.0.1:8791/zitadel.scrape.v1" \
   -d '{}'
 ```
 
-The response reports `{ listed, published, skipped, errors }`.
+The response reports `{ listed, published, skipped }`.
 
 ## Verify ingress authentication
 

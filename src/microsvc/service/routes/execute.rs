@@ -13,7 +13,6 @@ use super::erased::{
 };
 #[cfg(feature = "graphql")]
 use super::erased::{CausalStatusFuture, CausalStatusRoute};
-use crate::aggregate::Aggregate;
 use crate::bus::{Message, MessageKind};
 use crate::command::input::canonicalize_command_input;
 use crate::command::{CommandConsistency, CommandOutcome, TypedCommandContract};
@@ -46,7 +45,7 @@ use std::time::Duration;
 
 pub(super) struct RegisteredCausalHandler<A, I, K>
 where
-    A: Aggregate + Send + Sync + 'static,
+    A: 'static,
     K: CommandOutcome,
 {
     contract: TypedCommandContract,
@@ -71,7 +70,7 @@ where
 
 impl<A, I, K> RegisteredCausalHandler<A, I, K>
 where
-    A: Aggregate + Send + Sync + 'static,
+    A: 'static,
     K: CommandOutcome,
 {
     pub(super) fn new(
@@ -166,8 +165,8 @@ impl From<Failure> for CausalDispatchError {
 }
 
 /// A handled command, validated and ready to commit under its attempt.
-struct StagedCommand<'a, A, K: CommandOutcome> {
-    parts: crate::microsvc::causal::CausalWorkspaceParts<A>,
+struct StagedCommand<'a, K: CommandOutcome> {
+    parts: crate::microsvc::causal::CausalWorkspaceParts,
     prepared: crate::command::PreparedCommand<K>,
     state: TerminalCommandState,
     modeled_projection: Option<ModeledProjectionMetadata>,
@@ -177,11 +176,7 @@ struct StagedCommand<'a, A, K: CommandOutcome> {
     outbox_ids: Vec<String>,
 }
 
-impl<A, K> StagedCommand<'_, A, K>
-where
-    A: Aggregate + Send + Sync + 'static,
-    K: CommandOutcome,
-{
+impl<K: CommandOutcome> StagedCommand<'_, K> {
     /// The one transaction that settles `attempt`. An error is the detail to
     /// abandon the attempt with.
     fn commit_batch<'b>(
@@ -256,7 +251,7 @@ where
 
 impl<A, I, K> RegisteredCausalHandler<A, I, K>
 where
-    A: Aggregate + Send + Sync + 'static,
+    A: Send + Sync + 'static,
     I: serde::de::DeserializeOwned + Send + 'static,
     K: CommandOutcome,
 {
@@ -497,7 +492,7 @@ where
         session: &Session,
         input: I,
         direct_projection_target: Option<crate::command::ResolvedDirectProjectionTarget>,
-    ) -> Result<StagedCommand<'a, A, K>, Failure>
+    ) -> Result<StagedCommand<'a, K>, Failure>
     where
         R: CausalRepositoryBackend,
     {
@@ -590,7 +585,7 @@ impl<D, A, I, K> ErasedCausalHandler<D> for RegisteredCausalHandler<A, I, K>
 where
     D: CausalRouteDependencies<Aggregate = A> + Send + Sync + 'static,
     D::Backend: TransactionalCommit,
-    A: Aggregate + Send + Sync + 'static,
+    A: Send + Sync + 'static,
     I: serde::de::DeserializeOwned + Send + 'static,
     K: CommandOutcome,
 {

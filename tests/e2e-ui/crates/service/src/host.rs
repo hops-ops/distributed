@@ -13,7 +13,7 @@ use std::time::Duration;
 use distributed::bus::{PostgresBus, SqliteBus};
 use distributed::graphql::IdentityConfig;
 use distributed::microsvc::{
-    spawn_outbox_publish_loop, spawn_service_consumer_loop, LifecycleGate,
+    spawn_outbox_publish_loop, spawn_service_consumer_loop, LifecycleGate, Service,
 };
 use distributed::{PostgresLockManager, PostgresRepository, SqliteLockManager, SqliteRepository};
 
@@ -111,7 +111,7 @@ async fn run_sqlite(
                 .with_bus(bus)
         });
     }
-    spawn_zitadel_scrape(repo.clone());
+    spawn_zitadel_scrape(service.clone());
 
     eprintln!("e2e-ui (sqlite) listening on http://{}", options.bind);
     serve(service, &options).await?;
@@ -180,22 +180,14 @@ async fn run_postgres(
                 .with_bus(bus)
         });
     }
-    spawn_zitadel_scrape(repo.clone());
+    spawn_zitadel_scrape(service.clone());
 
     eprintln!("e2e-ui (postgres) listening on http://{}", options.bind);
     serve(service, &options).await?;
     Ok(())
 }
 
-fn spawn_zitadel_scrape<R>(repo: R)
-where
-    R: distributed::TransactionalCommit
-        + distributed::ReadModelWritePlanStore
-        + Clone
-        + Send
-        + Sync
-        + 'static,
-{
+fn spawn_zitadel_scrape(service: Arc<Service>) {
     match ZitadelScrapeConfig::from_env() {
         Some(cfg) if cfg.background_enabled() || cfg.on_start => {
             eprintln!(
@@ -204,7 +196,7 @@ where
                 cfg.interval.as_secs(),
                 cfg.on_start
             );
-            spawn_scrape_loop(repo, cfg);
+            spawn_scrape_loop(service, cfg);
         }
         Some(_) => {
             eprintln!(

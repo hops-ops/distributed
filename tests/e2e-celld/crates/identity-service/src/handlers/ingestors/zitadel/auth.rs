@@ -6,7 +6,8 @@
 
 use std::env;
 
-use distributed::microsvc::{HandlerError, Session};
+use distributed::command_dispatch::VerifiedPrincipal;
+use distributed::microsvc::{HandlerError, Session, ROLE_KEY, USER_ID_KEY};
 
 /// Env var for the shared secret (required for fixture/curl path).
 pub const SECRET_ENV: &str = "ZITADEL_INGESTOR_SECRET";
@@ -16,6 +17,28 @@ pub const SECRET_HEADER: &str = "x-zitadel-ingestor-secret";
 
 /// When `1`/`true`, accept native Actions v2 event envelopes without shared secret.
 pub const ALLOW_ACTION_EVENTS_ENV: &str = "ZITADEL_INGESTOR_ALLOW_ACTION_EVENTS";
+
+/// Subject the ingestor's commands run as. The shared secret (or the
+/// process's own scrape loop) is what vouches for it; no caller chooses it.
+pub const INGESTOR_USER_ID: &str = "system:zitadel-ingestor";
+
+/// Role the ingestor's commands declare. It is not the framework's transport
+/// role: declaring that one would let anything that can publish to the bus
+/// run them without the secret.
+pub const INGESTOR_ROLE: &str = "zitadel-ingestor";
+
+/// Session of an ingestor command: the ingestor identity and nothing the
+/// caller sent (the secret stays at the HTTP edge).
+pub fn ingestor_session() -> Session {
+    let mut session = Session::new();
+    session.set(USER_ID_KEY, INGESTOR_USER_ID);
+    session.set(ROLE_KEY, INGESTOR_ROLE);
+    session
+}
+
+pub fn ingestor_principal() -> VerifiedPrincipal {
+    VerifiedPrincipal::internal(INGESTOR_USER_ID).expect("the ingestor subject is not empty")
+}
 
 pub fn configured_secret() -> Option<String> {
     env::var(SECRET_ENV).ok().filter(|s| !s.trim().is_empty())
@@ -85,35 +108,57 @@ pub fn verify_authenticity(session: &Session, is_action_event: bool) -> Result<(
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use std::collections::HashMap;
-    use std::sync::Mutex;
+    use std::sync::{Mutex, MutexGuard};
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
+    /// The ingestor's environment for one test; restored on drop. Tests that
+    /// read it hold one of these, so they do not see each other's settings.
+    pub(in super::super) struct IngestorEnv {
+        previous: [(&'static str, Option<String>); 2],
+        _lock: MutexGuard<'static, ()>,
+    }
+
+    impl IngestorEnv {
+        pub(in super::super) fn set(secret: Option<&str>, allow_actions: bool) -> Self {
+            let lock = ENV_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let previous =
+                [SECRET_ENV, ALLOW_ACTION_EVENTS_ENV].map(|name| (name, env::var(name).ok()));
+            match secret {
+                Some(secret) => env::set_var(SECRET_ENV, secret),
+                None => env::remove_var(SECRET_ENV),
+            }
+            if allow_actions {
+                env::set_var(ALLOW_ACTION_EVENTS_ENV, "1");
+            } else {
+                env::remove_var(ALLOW_ACTION_EVENTS_ENV);
+            }
+            Self {
+                previous,
+                _lock: lock,
+            }
+        }
+    }
+
+    impl Drop for IngestorEnv {
+        fn drop(&mut self) {
+            for (name, value) in &self.previous {
+                match value {
+                    Some(value) => env::set_var(name, value),
+                    None => env::remove_var(name),
+                }
+            }
+        }
+    }
+
     fn with_env(secret: Option<&str>, allow_actions: bool, f: impl FnOnce()) {
-        let _g = ENV_LOCK.lock().unwrap();
-        let prev_s = env::var(SECRET_ENV).ok();
-        let prev_a = env::var(ALLOW_ACTION_EVENTS_ENV).ok();
-        match secret {
-            Some(s) => env::set_var(SECRET_ENV, s),
-            None => env::remove_var(SECRET_ENV),
-        }
-        if allow_actions {
-            env::set_var(ALLOW_ACTION_EVENTS_ENV, "1");
-        } else {
-            env::remove_var(ALLOW_ACTION_EVENTS_ENV);
-        }
+        let _env = IngestorEnv::set(secret, allow_actions);
         f();
-        match prev_s {
-            Some(s) => env::set_var(SECRET_ENV, s),
-            None => env::remove_var(SECRET_ENV),
-        }
-        match prev_a {
-            Some(s) => env::set_var(ALLOW_ACTION_EVENTS_ENV, s),
-            None => env::remove_var(ALLOW_ACTION_EVENTS_ENV),
-        }
     }
 
     fn session(pairs: &[(&str, &str)]) -> Session {

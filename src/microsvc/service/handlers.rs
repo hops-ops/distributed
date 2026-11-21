@@ -40,7 +40,10 @@ pub trait Handler<'a, D: 'a>: Send + Sync {
 
 /// Restricted metadata and staging context for one typed causal command.
 ///
-/// The aggregate type is fixed by the route bundle. The context exposes owned
+/// The aggregate type is fixed by the route bundle; a bundle without an
+/// aggregate ([`Routes::for_stores`](crate::microsvc::Routes::for_stores))
+/// has `A = ()`, and its handlers stage outbox messages and read-model plans
+/// only. The context exposes owned
 /// checkouts and staging operations, but never the dependency value, backend,
 /// raw repository, or a direct I/O commit method; the framework retains this
 /// route's fenced durable commit capability and attaches the command-attempt
@@ -51,10 +54,7 @@ pub trait Handler<'a, D: 'a>: Send + Sync {
 /// reach a global. Such out-of-band effects are outside the causal contract and
 /// may repeat if an expired attempt is reclaimed. Only work staged through this
 /// context receives the at-most-once committed-effects guarantee.
-pub struct CausalCommandContext<'a, A>
-where
-    A: Aggregate + Send + Sync + 'static,
-{
+pub struct CausalCommandContext<'a, A> {
     message: &'a Message,
     session: &'a Session,
     workspace: &'a CausalWorkspace<'a, A>,
@@ -65,10 +65,7 @@ where
 /// It preserves the ordinary repository authoring shape without exposing the
 /// backend or an immediate I/O commit path. Every fluent commit is staged into
 /// the command's fenced workspace for the dispatcher to validate and persist.
-pub struct CausalRepository<'context, 'route, A>
-where
-    A: Aggregate + Send + Sync + 'static,
-{
+pub struct CausalRepository<'context, 'route, A> {
     context: &'context CausalCommandContext<'route, A>,
 }
 
@@ -175,9 +172,7 @@ pub struct CausalCommitBuilder<
     A,
     Publication = NoPublication,
     Projection = NoDirectProjection,
-> where
-    A: Aggregate + Send + Sync + 'static,
-{
+> {
     context: &'context CausalCommandContext<'route, A>,
     publish_captured_events: bool,
     explicit_events: Vec<PreparedDomainEvent>,
@@ -190,8 +185,6 @@ pub struct CausalCommitBuilder<
 
 impl<'context, 'route, A>
     CausalCommitBuilder<'context, 'route, A, NoPublication, NoDirectProjection>
-where
-    A: Aggregate + Send + Sync + 'static,
 {
     fn empty(context: &'context CausalCommandContext<'route, A>) -> Self {
         Self {
@@ -204,6 +197,85 @@ where
             projection: NoDirectProjection,
             _publication: PhantomData,
         }
+    }
+}
+
+impl<'context, 'route, A, Publication, Projection>
+    CausalCommitBuilder<'context, 'route, A, Publication, Projection>
+{
+    /// Stage a low-level integration envelope.
+    ///
+    /// Ordinary aggregate-derived publication should use
+    /// [`publish_events`](Self::publish_events) or [`publish`](Self::publish).
+    pub fn outbox(
+        mut self,
+        message: OutboxMessage,
+    ) -> CausalCommitBuilder<'context, 'route, A, WithPublication, Projection> {
+        self.outbox_messages.push(message);
+        CausalCommitBuilder {
+            context: self.context,
+            publish_captured_events: self.publish_captured_events,
+            explicit_events: self.explicit_events,
+            outbox_messages: self.outbox_messages,
+            read_model_plans: self.read_model_plans,
+            error: self.error,
+            projection: self.projection,
+            _publication: PhantomData,
+        }
+    }
+
+    /// Add an arbitrary existing multi-table relational write plan.
+    ///
+    /// This leg is strongly committed on the server but does not by itself
+    /// unlock the `projected` terminal.
+    pub fn read_models(mut self, plan: ReadModelWritePlanBuilder) -> Self {
+        self.read_model_plans.push(plan);
+        self
+    }
+
+    /// Move the staged legs into the workspace. Performs no repository I/O.
+    fn seal(
+        mut self,
+    ) -> Result<PreparedCausalCommit<'context, 'route, A, Publication, Projection>, HandlerError>
+    {
+        if let Some(error) = self.error.take() {
+            return Err(error);
+        }
+        for message in self.outbox_messages {
+            self.context
+                .workspace
+                .stage_outbox(message)
+                .map_err(workspace_handler_error)?;
+        }
+        for plan in self.read_model_plans {
+            self.context
+                .workspace
+                .stage_read_models(plan)
+                .map_err(workspace_handler_error)?;
+        }
+        Ok(PreparedCausalCommit {
+            context: self.context,
+            projection: self.projection,
+            _publication: PhantomData,
+        })
+    }
+}
+
+impl<'context, 'route, Publication>
+    CausalCommitBuilder<'context, 'route, (), Publication, NoDirectProjection>
+{
+    /// Seal this unit of work of a route bundle without an aggregate: its
+    /// outbox messages and read-model plans commit with the command's ledger
+    /// receipt in one transaction, and no stream is written.
+    ///
+    /// This method is synchronous and performs no repository I/O.
+    pub fn commit(
+        self,
+    ) -> Result<
+        PreparedCausalCommit<'context, 'route, (), Publication, NoDirectProjection>,
+        HandlerError,
+    > {
+        self.seal()
     }
 }
 
@@ -257,36 +329,6 @@ where
         }
     }
 
-    /// Stage a low-level integration envelope.
-    ///
-    /// Ordinary aggregate-derived publication should use
-    /// [`publish_events`](Self::publish_events) or [`publish`](Self::publish).
-    pub fn outbox(
-        mut self,
-        message: OutboxMessage,
-    ) -> CausalCommitBuilder<'context, 'route, A, WithPublication, Projection> {
-        self.outbox_messages.push(message);
-        CausalCommitBuilder {
-            context: self.context,
-            publish_captured_events: self.publish_captured_events,
-            explicit_events: self.explicit_events,
-            outbox_messages: self.outbox_messages,
-            read_model_plans: self.read_model_plans,
-            error: self.error,
-            projection: self.projection,
-            _publication: PhantomData,
-        }
-    }
-
-    /// Add an arbitrary existing multi-table relational write plan.
-    ///
-    /// This leg is strongly committed on the server but does not by itself
-    /// unlock the `projected` terminal.
-    pub fn read_models(mut self, plan: ReadModelWritePlanBuilder) -> Self {
-        self.read_model_plans.push(plan);
-        self
-    }
-
     /// Stage one exact projected read-model row for same-transaction commit.
     ///
     /// Unlocks [`PreparedCausalCommit::projected`] without a placement-selected
@@ -331,26 +373,7 @@ where
     ) -> Result<PreparedCausalCommit<'context, 'route, A, Publication, Projection>, HandlerError>
     {
         self.stage_aggregate(checkout)?;
-        if let Some(error) = self.error.take() {
-            return Err(error);
-        }
-        for message in self.outbox_messages {
-            self.context
-                .workspace
-                .stage_outbox(message)
-                .map_err(workspace_handler_error)?;
-        }
-        for plan in self.read_model_plans {
-            self.context
-                .workspace
-                .stage_read_models(plan)
-                .map_err(workspace_handler_error)?;
-        }
-        Ok(PreparedCausalCommit {
-            context: self.context,
-            projection: self.projection,
-            _publication: PhantomData,
-        })
+        self.seal()
     }
 
     fn stage_aggregate(
@@ -374,19 +397,13 @@ where
 }
 
 /// A causal unit of work sealed by a handler but not yet durably committed.
-pub struct PreparedCausalCommit<'context, 'route, A, Publication, Projection>
-where
-    A: Aggregate + Send + Sync + 'static,
-{
+pub struct PreparedCausalCommit<'context, 'route, A, Publication, Projection> {
     context: &'context CausalCommandContext<'route, A>,
     projection: Projection,
     _publication: PhantomData<fn() -> Publication>,
 }
 
-impl<A, Publication, Projection> PreparedCausalCommit<'_, '_, A, Publication, Projection>
-where
-    A: Aggregate + Send + Sync + 'static,
-{
+impl<A, Publication, Projection> PreparedCausalCommit<'_, '_, A, Publication, Projection> {
     /// Prepare a successful command result with no causal visibility promise.
     pub fn succeeded<T>(self, payload: T) -> Result<PreparedCommand<Succeeded<T>>, HandlerError>
     where
@@ -397,10 +414,7 @@ where
     }
 }
 
-impl<A, Projection> PreparedCausalCommit<'_, '_, A, WithPublication, Projection>
-where
-    A: Aggregate + Send + Sync + 'static,
-{
+impl<A, Projection> PreparedCausalCommit<'_, '_, A, WithPublication, Projection> {
     /// Prepare a causal result. This terminal exists only after a publication
     /// leg; the dispatcher additionally proves actual durable outbox coverage.
     pub fn eventual<T>(self, payload: T) -> Result<PreparedCommand<Eventual<T>>, HandlerError>
@@ -447,10 +461,7 @@ where
     }
 }
 
-impl<'a, A> CausalCommandContext<'a, A>
-where
-    A: Aggregate + Send + Sync + 'static,
-{
+impl<'a, A> CausalCommandContext<'a, A> {
     pub(super) fn new(
         message: &'a Message,
         session: &'a Session,
@@ -503,6 +514,47 @@ where
         self.session.get(name)
     }
 
+    /// Start a unit of work with an arbitrary existing multi-table relational
+    /// plan. This does not unlock the `projected` terminal.
+    pub fn read_models(
+        &self,
+        writes: ReadModelWritePlanBuilder,
+    ) -> CausalCommitBuilder<'_, 'a, A, NoPublication, NoDirectProjection> {
+        CausalCommitBuilder::empty(self).read_models(writes)
+    }
+
+    /// Start a low-level integration-envelope publication unit of work.
+    pub fn outbox(
+        &self,
+        message: OutboxMessage,
+    ) -> CausalCommitBuilder<'_, 'a, A, WithPublication, NoDirectProjection> {
+        CausalCommitBuilder::empty(self).outbox(message)
+    }
+
+    /// The host clock when this command was dispatched: the Durable Object
+    /// clock on celld, the store clock on the reference host and the
+    /// in-memory repository (e.g. a `ManualClock`), the database clock on
+    /// SQL. Never a caller's time. Requires the route to declare
+    /// `.requires(Capability::Clock)`; otherwise an error says so.
+    pub fn now(&self) -> Result<std::time::SystemTime, HandlerError> {
+        crate::schedule::host_now(self.session).ok_or_else(|| {
+            HandlerError::Rejected(
+                "ctx.now() needs a route declared with .requires(Capability::Clock)".into(),
+            )
+        })
+    }
+
+    /// Due time of the schedule that fired this command; `None` for any
+    /// command not dispatched by a schedule.
+    pub fn scheduled_due(&self) -> Option<std::time::SystemTime> {
+        crate::schedule::scheduled_due(self.session)
+    }
+}
+
+impl<'a, A> CausalCommandContext<'a, A>
+where
+    A: Aggregate + Send + Sync + 'static,
+{
     /// Return the capability-restricted repository facade for this causal
     /// command.
     ///
@@ -562,15 +614,6 @@ where
         CausalCommitBuilder::empty(self).publish(event)
     }
 
-    /// Start a unit of work with an arbitrary existing multi-table relational
-    /// plan. This does not unlock the `projected` terminal.
-    pub fn read_models(
-        &self,
-        writes: ReadModelWritePlanBuilder,
-    ) -> CausalCommitBuilder<'_, 'a, A, NoPublication, NoDirectProjection> {
-        CausalCommitBuilder::empty(self).read_models(writes)
-    }
-
     /// Stage one exact projected read-model row for same-transaction commit.
     ///
     /// Prefer rows from [`crate::Mutation::from_state`] so the write matches the
@@ -583,14 +626,6 @@ where
         M: RelationalReadModel + Serialize + Send + Sync + 'static,
     {
         CausalCommitBuilder::empty(self).readmodel(row)
-    }
-
-    /// Start a low-level integration-envelope publication unit of work.
-    pub fn outbox(
-        &self,
-        message: OutboxMessage,
-    ) -> CausalCommitBuilder<'_, 'a, A, WithPublication, NoDirectProjection> {
-        CausalCommitBuilder::empty(self).outbox(message)
     }
 
     /// Schedule (or re-schedule) work for the aggregate this command
@@ -620,25 +655,6 @@ where
             .map_err(workspace_handler_error)
     }
 
-    /// The host clock when this command was dispatched: the Durable Object
-    /// clock on celld, the store clock on the reference host and the
-    /// in-memory repository (e.g. a `ManualClock`), the database clock on
-    /// SQL. Never a caller's time. Requires the route to declare
-    /// `.requires(Capability::Clock)`; otherwise an error says so.
-    pub fn now(&self) -> Result<std::time::SystemTime, HandlerError> {
-        crate::schedule::host_now(self.session).ok_or_else(|| {
-            HandlerError::Rejected(
-                "ctx.now() needs a route declared with .requires(Capability::Clock)".into(),
-            )
-        })
-    }
-
-    /// Due time of the schedule that fired this command; `None` for any
-    /// command not dispatched by a schedule.
-    pub fn scheduled_due(&self) -> Option<std::time::SystemTime> {
-        crate::schedule::scheduled_due(self.session)
-    }
-
     /// Low-level outbox staging retained for framework internals.
     #[cfg(all(test, feature = "graphql", feature = "sqlite"))]
     pub(crate) fn stage_outbox(&self, message: OutboxMessage) -> Result<(), HandlerError> {
@@ -659,7 +675,7 @@ pub(super) fn workspace_handler_error(error: CausalWorkspaceError) -> HandlerErr
 /// itself can repeat after lease expiry; see [`CausalCommandContext`].
 pub trait PreparedCommandHandler<'a, A, I, K>: Send + Sync
 where
-    A: Aggregate + Send + Sync + 'static,
+    A: 'static,
     K: CommandOutcome,
 {
     type Future: Future<Output = Result<PreparedCommand<K>, HandlerError>> + Send + 'a;
@@ -680,7 +696,7 @@ where
 
 impl<'a, A, I, K, F, Fut> PreparedCommandHandler<'a, A, I, K> for F
 where
-    A: Aggregate + Send + Sync + 'static,
+    A: 'static,
     I: 'a,
     K: CommandOutcome,
     F: Fn(&'a CausalCommandContext<'a, A>, I) -> Fut + Send + Sync,
@@ -710,7 +726,7 @@ pub(super) type CausalGuardFn<A> =
 
 pub(super) fn boxed_prepared_handler<A, I, K, F>(handler: F) -> Arc<PreparedHandlerFn<A, I, K>>
 where
-    A: Aggregate + Send + Sync + 'static,
+    A: 'static,
     I: serde::de::DeserializeOwned + Send + 'static,
     K: CommandOutcome,
     F: for<'a> PreparedCommandHandler<'a, A, I, K> + 'static,
@@ -722,7 +738,7 @@ where
 
 pub(super) fn boxed_causal_guard<A, G>(guard: G) -> Arc<CausalGuardFn<A>>
 where
-    A: Aggregate + Send + Sync + 'static,
+    A: 'static,
     G: for<'a> Fn(&CausalCommandContext<'a, A>) -> bool + Send + Sync + 'static,
 {
     Arc::new(guard)

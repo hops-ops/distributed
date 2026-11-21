@@ -16,19 +16,17 @@ pub const EVENTS: &[&str] = &[
     "zitadel.user.machine.created.v1",
 ];
 
-pub fn guard<R, L, S>(_ctx: &Context<AuthDeps<R, L, S>>) -> bool
+pub fn guard<R, S>(_ctx: &Context<AuthDeps<R, S>>) -> bool
 where
     R: crate::bounds::EventStore,
-    L: crate::bounds::Locks,
     S: crate::bounds::ReadStore,
 {
     true
 }
 
-pub async fn handle<R, L, S>(ctx: &Context<'_, AuthDeps<R, L, S>>) -> Result<Value, HandlerError>
+pub async fn handle<R, S>(ctx: &Context<'_, AuthDeps<R, S>>) -> Result<Value, HandlerError>
 where
     R: crate::bounds::EventStore,
-    L: crate::bounds::Locks,
     S: crate::bounds::ReadStore,
 {
     let payload: ZitadelUserPayload = decode_payload(ctx.message())?;

@@ -2,11 +2,8 @@
 
 use blob_domain::BlobGame;
 use chat_domain::ChatMessage;
-use distributed::microsvc::{
-    ConfigurableOutboxPublisher, HasOutboxStore, HasRepo, Service,
-};
+use distributed::microsvc::{ConfigurableOutboxPublisher, HasOutboxStore, HasRepo, Service};
 use distributed::{AggregateBuilder, AggregateRepository, QueuedRepository};
-use e2e_celld_identity::Identity;
 use todo_domain::Todo;
 
 use crate::bounds::{EventStore, Locks, ReadStore};
@@ -46,7 +43,7 @@ where
         HasRepo + HasOutboxStore + ConfigurableOutboxPublisher + Send + Sync + 'static,
     AggregateRepository<QueuedRepository<R, L>, BlobGame>:
         HasRepo + HasOutboxStore + ConfigurableOutboxPublisher + Send + Sync + 'static,
-    AggregateRepository<QueuedRepository<R, L>, Identity>:
+    AggregateRepository<R, ()>:
         HasRepo + HasOutboxStore + ConfigurableOutboxPublisher + Send + Sync + 'static,
 {
     let projections = projections::projection_owners();
@@ -62,16 +59,12 @@ where
         read_models.clone(),
         projections.chat,
     );
-    let blob = blob::routes(
-        repo.clone(),
-        locks.clone(),
-        read_models.clone(),
-        projections.blob,
-    );
-    let identity = identity::routes(repo, locks, read_models);
+    let blob = blob::routes(repo.clone(), locks, read_models.clone(), projections.blob);
+    let identity = identity::routes(repo, read_models);
 
     // GraphQL-only public write surface. POST /todo.* stays 404 (suite T0).
-    // Zitadel Action ingress is the identity crate, re-mounted in `http::serve`.
+    // Zitadel Action ingress is the identity crate; `http::serve` gives its
+    // commands an authenticating edge.
     Service::new()
         .named("e2e-ui")
         .routes(todos)
