@@ -103,12 +103,14 @@ impl Parse for PortableCommandArgs {
                         "required" => LoadKind::Required,
                         "or_create" => LoadKind::OrCreate,
                         "create" => LoadKind::Create,
-                        other => return Err(syn::Error::new(
-                            ident.span(),
-                            format!(
+                        other => {
+                            return Err(syn::Error::new(
+                                ident.span(),
+                                format!(
                                 "load must be `required`, `or_create` or `create`, not `{other}`"
                             ),
-                        )),
+                            ))
+                        }
                     };
                 }
                 "roles" => {
