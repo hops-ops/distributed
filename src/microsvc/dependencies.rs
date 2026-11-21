@@ -31,6 +31,7 @@ pub trait CausalRepositoryBackend:
     + CausalRepositoryIdentity
     + CausalHostProjections
     + TransactionalCommit
+    + Clone
     + Send
     + Sync
     + 'static
@@ -45,6 +46,7 @@ impl<T> CausalRepositoryBackend for T where
         + CausalRepositoryIdentity
         + CausalHostProjections
         + TransactionalCommit
+        + Clone
         + Send
         + Sync
         + 'static

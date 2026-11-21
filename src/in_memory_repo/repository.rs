@@ -146,6 +146,16 @@ impl InMemoryRepository {
         self.causal_storage_identity
     }
 
+    /// The stored state of a ledger row, without the lookup's expiry rule.
+    #[cfg(test)]
+    pub(crate) fn command_ledger_state(
+        &self,
+        key: &CommandLedgerKey,
+    ) -> Option<crate::command_ledger::CommandLedgerState> {
+        let ledger = self.command_ledger.read().unwrap();
+        ledger.get(key).map(|record| record.state)
+    }
+
     #[cfg(test)]
     pub(crate) fn outbox_storage(&self) -> &RwLock<HashMap<String, OutboxMessage>> {
         self.outbox_store.as_ref()

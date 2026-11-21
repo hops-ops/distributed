@@ -327,13 +327,8 @@ async fn graphql_handler(
     headers: axum::http::HeaderMap,
     req: GraphQLRequest,
 ) -> Response {
-    let request = req.into_inner();
-    if !crate::microsvc::lifecycle_mutations_open()
-        && matches!(
-            websocket_operation_type(&request),
-            Ok(OperationType::Mutation)
-        )
-    {
+    let mut request = req.into_inner();
+    if engine.refuses_mutation(&mut request) {
         return lifecycle_reloading_response();
     }
     let identity = match resolve_http_identity(&engine, &headers, &request).await {
@@ -342,7 +337,7 @@ async fn graphql_handler(
     };
     let (session, principal) = identity.into_parts();
     let request = request_with_principal(request, principal);
-    let response = engine.execute(&session, request).await;
+    let response = engine.execute_admitted(&session, request).await;
     GraphQLResponse::from(response).into_response()
 }
 
@@ -351,13 +346,8 @@ async fn graphql_handler_with_service(
     headers: axum::http::HeaderMap,
     req: GraphQLRequest,
 ) -> Response {
-    let request = req.into_inner();
-    if !crate::microsvc::lifecycle_mutations_open()
-        && matches!(
-            websocket_operation_type(&request),
-            Ok(OperationType::Mutation)
-        )
-    {
+    let mut request = req.into_inner();
+    if state.engine.refuses_mutation(&mut request) {
         return lifecycle_reloading_response();
     }
     let identity = match resolve_http_identity(&state.engine, &headers, &request).await {
@@ -372,7 +362,7 @@ async fn graphql_handler_with_service(
     if let Some(host) = &state.host {
         request = request.data(Arc::clone(host));
     }
-    let response = state.engine.execute(&session, request).await;
+    let response = state.engine.execute_admitted(&session, request).await;
     GraphQLResponse::from(response).into_response()
 }
 
@@ -382,18 +372,13 @@ pub async fn microsvc_graphql_handler(
     headers: axum::http::HeaderMap,
     req: GraphQLRequest,
 ) -> Response {
-    let request = req.into_inner();
-    if !crate::microsvc::lifecycle_mutations_open()
-        && matches!(
-            websocket_operation_type(&request),
-            Ok(OperationType::Mutation)
-        )
-    {
-        return lifecycle_reloading_response();
-    }
+    let mut request = req.into_inner();
     let engine = service
         .graphql_engine()
         .expect("graphql route mounted without engine");
+    if engine.refuses_mutation(&mut request) {
+        return lifecycle_reloading_response();
+    }
     let identity = match resolve_http_identity(&engine, &headers, &request).await {
         Ok(identity) => identity,
         Err(AuthError::Unauthorized) => return unauthorized_response(),
@@ -401,7 +386,7 @@ pub async fn microsvc_graphql_handler(
     let (session, principal) = identity.into_parts();
     let host: SharedCommandHost = Arc::new(LocalCommandHost::new(Arc::clone(&service)));
     let request = request_with_principal(request, principal).data(host);
-    let response = engine.execute(&session, request).await;
+    let response = engine.execute_admitted(&session, request).await;
     GraphQLResponse::from(response).into_response()
 }
 

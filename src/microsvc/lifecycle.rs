@@ -4,6 +4,9 @@
 //! a security boundary against an operator who can edit the lifecycle directory.
 use serde::Deserialize;
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -75,30 +78,156 @@ fn resolve(source: &[u8], member_id: &str, instance_id: &str, startup: &str) -> 
     })
 }
 
+/// The supervisor's membership file and this process's launch identity in it.
+struct MembershipFile {
+    state: std::path::PathBuf,
+    member_id: String,
+    instance_id: String,
+    startup: String,
+}
+
+impl MembershipFile {
+    /// `None` unless the supervisor's directory and this process's identity
+    /// are all present and well formed.
+    fn from_env() -> Option<Self> {
+        let root = std::path::PathBuf::from(std::env::var_os("DISTRIBUTED_LIFECYCLE_DIR")?);
+        if !root.is_absolute() {
+            return None;
+        }
+        Some(Self {
+            state: root.join("dev.json"),
+            member_id: std::env::var("DISTRIBUTED_MEMBER_ID").ok()?,
+            instance_id: std::env::var("DISTRIBUTED_PROCESS_INSTANCE_ID").ok()?,
+            startup: std::env::var("DISTRIBUTED_GENERATION_ID").ok()?,
+        })
+    }
+
+    fn read(&self) -> Option<Membership> {
+        let metadata = std::fs::symlink_metadata(&self.state).ok()?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() || metadata.len() > 1024 * 1024
+        {
+            return None;
+        }
+        // Bound the actual read too, even if the file changes after metadata lookup.
+        use std::io::Read;
+        let mut source = Vec::new();
+        std::fs::File::open(&self.state)
+            .ok()?
+            .take(1024 * 1024 + 1)
+            .read_to_end(&mut source)
+            .ok()?;
+        resolve(&source, &self.member_id, &self.instance_id, &self.startup)
+    }
+
+    fn mutations_open(&self) -> bool {
+        self.read().is_some_and(|member| member.mutations_open)
+    }
+}
+
 pub(crate) fn membership_from_environment() -> Option<Membership> {
-    let root = std::path::PathBuf::from(std::env::var_os("DISTRIBUTED_LIFECYCLE_DIR")?);
-    if !root.is_absolute() {
-        return None;
+    MembershipFile::from_env()?.read()
+}
+
+/// How often a supervised [`LifecycleGate`] re-reads the membership file, and
+/// so how stale its answer may be.
+const REFRESH: Duration = Duration::from_millis(50);
+
+/// Whether this process may accept writes.
+///
+/// `distributed dev` runs an application as generations and tells each
+/// process, through a membership file, whether it belongs to the active one.
+/// A process outside it (a generation being replaced, or a candidate not yet
+/// activated) must not write. Resolve the gate once where the process
+/// composes its services and hand it to each with
+/// [`Service::with_lifecycle`](crate::microsvc::Service::with_lifecycle):
+///
+/// ```ignore
+/// let lifecycle = LifecycleGate::from_env();
+/// let service = build_service().with_lifecycle(lifecycle.clone());
+/// ```
+///
+/// The gate answers from memory. A supervised gate follows the membership
+/// file from a background thread every 50 ms, so a demoted process may
+/// accept a write for up to that long after the supervisor fenced it, and a
+/// promoted one refuses for up to that long. The supervisor waits at least
+/// 500 ms after fencing before it replaces a process.
+///
+/// This is dev coordination, not a security boundary.
+#[derive(Clone, Debug, Default)]
+pub struct LifecycleGate {
+    /// `None` when no supervisor governs this process.
+    open: Option<Arc<AtomicBool>>,
+}
+
+impl LifecycleGate {
+    /// A gate that never closes: the process is not run by a supervisor.
+    pub fn always_open() -> Self {
+        Self::default()
     }
-    let state = root.join("dev.json");
-    let metadata = std::fs::symlink_metadata(&state).ok()?;
-    if metadata.file_type().is_symlink() || !metadata.is_file() || metadata.len() > 1024 * 1024 {
-        return None;
+
+    /// The gate the environment asks for. Without `DISTRIBUTED_LIFECYCLE_DIR`
+    /// (anywhere but under `distributed dev`) it is [`Self::always_open`].
+    /// With it, the gate follows `dev.json` in that directory for the member
+    /// named by `DISTRIBUTED_MEMBER_ID`, `DISTRIBUTED_PROCESS_INSTANCE_ID`
+    /// and `DISTRIBUTED_GENERATION_ID`, and stays closed if any of them is
+    /// missing or malformed.
+    ///
+    /// Reads the environment and the file once, here; call it once per
+    /// process and clone the result.
+    pub fn from_env() -> Self {
+        if std::env::var_os("DISTRIBUTED_LIFECYCLE_DIR").is_none() {
+            return Self::always_open();
+        }
+        match MembershipFile::from_env() {
+            Some(file) => Self::watch(file, REFRESH),
+            None => Self::closed(),
+        }
     }
-    // Bound the actual read too, even if the file changes after metadata lookup.
-    use std::io::Read;
-    let mut source = Vec::new();
-    std::fs::File::open(state)
-        .ok()?
-        .take(1024 * 1024 + 1)
-        .read_to_end(&mut source)
-        .ok()?;
-    resolve(
-        &source,
-        &std::env::var("DISTRIBUTED_MEMBER_ID").ok()?,
-        &std::env::var("DISTRIBUTED_PROCESS_INSTANCE_ID").ok()?,
-        &std::env::var("DISTRIBUTED_GENERATION_ID").ok()?,
-    )
+
+    /// A gate that never opens.
+    pub(crate) fn closed() -> Self {
+        Self {
+            open: Some(Arc::new(AtomicBool::new(false))),
+        }
+    }
+
+    /// Follow `file` every `refresh` until the last clone is dropped.
+    fn watch(file: MembershipFile, refresh: Duration) -> Self {
+        let open = Arc::new(AtomicBool::new(file.mutations_open()));
+        let cached = Arc::downgrade(&open);
+        let follower = std::thread::Builder::new()
+            .name("distributed-lifecycle".into())
+            .spawn(move || loop {
+                std::thread::sleep(refresh);
+                let Some(open) = cached.upgrade() else {
+                    return;
+                };
+                open.store(file.mutations_open(), Ordering::Relaxed);
+            });
+        if follower.is_err() {
+            // Nothing follows the supervisor: an open gate would never close.
+            open.store(false, Ordering::Relaxed);
+        }
+        Self { open: Some(open) }
+    }
+
+    /// Whether writes are admitted. Never blocks and never touches the
+    /// filesystem.
+    pub fn mutations_open(&self) -> bool {
+        self.open
+            .as_ref()
+            .is_none_or(|open| open.load(Ordering::Relaxed))
+    }
+
+    /// Whether `other` is a clone of this gate.
+    #[cfg(feature = "graphql")]
+    pub(crate) fn is(&self, other: &Self) -> bool {
+        match (&self.open, &other.open) {
+            (None, None) => true,
+            (Some(left), Some(right)) => Arc::ptr_eq(left, right),
+            _ => false,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -165,5 +294,120 @@ mod tests {
         malformed["active"]["releaseId"] = json!("\ninvalid");
         assert!(check(&malformed, "api-one", "one").is_none());
         assert!(resolve(b"not json", "api", "api-one", "one").is_none());
+    }
+
+    /// A supervisor's lifecycle directory holding `dev.json` for member
+    /// `api`, launched as `api-one` in generation `one`.
+    struct Supervisor(std::path::PathBuf);
+
+    impl Supervisor {
+        fn new(phase: &str) -> Self {
+            let root = std::env::temp_dir().join(format!("lifecycle-{}", uuid::Uuid::now_v7()));
+            std::fs::create_dir_all(&root).unwrap();
+            let supervisor = Self(root);
+            supervisor.write(phase);
+            supervisor
+        }
+
+        /// Replace `dev.json` the way the supervisor does: write, then rename.
+        fn write(&self, phase: &str) {
+            let staged = self.0.join("dev.json.next");
+            let value = state(phase, "one", "api-one", "one");
+            std::fs::write(&staged, serde_json::to_vec(&value).unwrap()).unwrap();
+            std::fs::rename(staged, self.0.join("dev.json")).unwrap();
+        }
+
+        fn gate(&self, refresh: Duration) -> LifecycleGate {
+            LifecycleGate::watch(
+                MembershipFile {
+                    state: self.0.join("dev.json"),
+                    member_id: "api".into(),
+                    instance_id: "api-one".into(),
+                    startup: "one".into(),
+                },
+                refresh,
+            )
+        }
+    }
+
+    impl Drop for Supervisor {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn wait_until(gate: &LifecycleGate, open: bool) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while gate.mutations_open() != open {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the gate never became open={open}"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    #[test]
+    fn a_process_without_a_supervisor_is_always_open() {
+        assert!(LifecycleGate::always_open().mutations_open());
+        assert!(LifecycleGate::default().mutations_open());
+        assert!(!LifecycleGate::closed().mutations_open());
+    }
+
+    #[test]
+    fn a_supervised_gate_follows_the_membership_file() {
+        let supervisor = Supervisor::new("active");
+        let gate = supervisor.gate(Duration::from_millis(2));
+        let clone = gate.clone();
+        assert!(gate.mutations_open(), "the first read is synchronous");
+
+        supervisor.write("preparing");
+        wait_until(&gate, false);
+        assert!(!clone.mutations_open(), "clones share one answer");
+
+        supervisor.write("active");
+        wait_until(&gate, true);
+
+        std::fs::remove_file(supervisor.0.join("dev.json")).unwrap();
+        wait_until(&gate, false);
+    }
+
+    #[test]
+    fn a_gate_starts_closed_for_a_process_that_is_not_a_member() {
+        let supervisor = Supervisor::new("preparing");
+        assert!(!supervisor.gate(Duration::from_secs(3600)).mutations_open());
+    }
+
+    /// The refresh interval is an hour, so nothing re-reads the file during
+    /// the test: every answer comes from memory. A dispatch that consulted
+    /// the filesystem would see the file the test has just rewritten.
+    #[tokio::test]
+    async fn a_closed_gate_refuses_a_write_without_reading_the_membership_file() {
+        use crate::microsvc::{HandlerError, Routes, Service, Session};
+
+        let service = |gate: &LifecycleGate| {
+            Service::new()
+                .routes(Routes::new().with_dependencies(()).command("ping").handle(
+                    |_ctx: &crate::microsvc::Context<'_, ()>| async { Ok(json!({ "pong": true })) },
+                ))
+                .with_lifecycle(gate.clone())
+        };
+        let never = Duration::from_secs(3600);
+
+        let demoted = Supervisor::new("preparing");
+        let gate = demoted.gate(never);
+        demoted.write("active");
+        let refused = service(&gate)
+            .dispatch("ping", json!({}), Session::new())
+            .await;
+        assert!(matches!(refused, Err(HandlerError::ApplicationReloading)));
+
+        let active = Supervisor::new("active");
+        let gate = active.gate(never);
+        active.write("preparing");
+        let accepted = service(&gate)
+            .dispatch("ping", json!({}), Session::new())
+            .await;
+        assert_eq!(accepted.unwrap(), json!({ "pong": true }));
     }
 }

@@ -12,7 +12,9 @@ use std::time::Duration;
 
 use distributed::bus::{PostgresBus, SqliteBus};
 use distributed::graphql::IdentityConfig;
-use distributed::microsvc::{spawn_outbox_publish_loop, spawn_service_consumer_loop};
+use distributed::microsvc::{
+    spawn_outbox_publish_loop, spawn_service_consumer_loop, LifecycleGate,
+};
 use distributed::{PostgresLockManager, PostgresRepository, SqliteLockManager, SqliteRepository};
 
 use crate::{
@@ -61,7 +63,10 @@ async fn run_sqlite(
     bus.ensure_tables().await?;
 
     let change_rx = repo.read_model_changes();
+    // Under `distributed dev`, only the active generation may write.
+    let lifecycle = LifecycleGate::from_env();
     let service = build_service(repo.clone(), locks.clone(), repo.clone())
+        .with_lifecycle(lifecycle.clone())
         .with_bus(SqliteBus::new(repo.pool().clone()).group(BUS_GROUP));
     let versions = if options.delivery != distributed::gateway::DeliveryCapabilities::default() {
         Some(
@@ -101,7 +106,9 @@ async fn run_sqlite(
         let locks = locks.clone();
         spawn_service_consumer_loop(move || {
             let bus = SqliteBus::new(repo.pool().clone()).group(BUS_GROUP);
-            build_service(repo.clone(), locks.clone(), repo.clone()).with_bus(bus)
+            build_service(repo.clone(), locks.clone(), repo.clone())
+                .with_lifecycle(lifecycle.clone())
+                .with_bus(bus)
         });
     }
     spawn_zitadel_scrape(repo.clone());
@@ -125,7 +132,10 @@ async fn run_postgres(
     bus.ensure_tables().await?;
 
     let change_rx = repo.read_model_changes();
+    // Under `distributed dev`, only the active generation may write.
+    let lifecycle = LifecycleGate::from_env();
     let service = build_service(repo.clone(), locks.clone(), repo.clone())
+        .with_lifecycle(lifecycle.clone())
         .with_bus(PostgresBus::new(repo.pool().clone()).group(BUS_GROUP));
     let versions = if options.delivery != distributed::gateway::DeliveryCapabilities::default() {
         Some(
@@ -165,7 +175,9 @@ async fn run_postgres(
         let locks = locks.clone();
         spawn_service_consumer_loop(move || {
             let bus = PostgresBus::new(repo.pool().clone()).group(BUS_GROUP);
-            build_service(repo.clone(), locks.clone(), repo.clone()).with_bus(bus)
+            build_service(repo.clone(), locks.clone(), repo.clone())
+                .with_lifecycle(lifecycle.clone())
+                .with_bus(bus)
         });
     }
     spawn_zitadel_scrape(repo.clone());

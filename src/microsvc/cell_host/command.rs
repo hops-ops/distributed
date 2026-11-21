@@ -251,7 +251,7 @@ impl CelldCommandHost {
             .post_cell_wait_path_with_context(command, command_id, input.clone(), session, &context)
             .await?;
         if status >= 400 {
-            return Err(remote_dispatch_error(status, &body));
+            return Err(crate::microsvc::wait_path::wait_path_error(status, &body));
         }
         let remote = CausalDispatchResult::from_wait_path_wire(body).map_err(|error| {
             CausalDispatchError::Internal(format!("wait-path decode: {error:?}"))
@@ -263,40 +263,6 @@ impl CelldCommandHost {
             }
             None => remote,
         })
-    }
-}
-
-fn remote_dispatch_error(status: u16, body: &Value) -> CausalDispatchError {
-    let message = body
-        .get("error")
-        .and_then(Value::as_str)
-        .unwrap_or("wait-path rejected")
-        .to_string();
-    match body.get("code").and_then(Value::as_str) {
-        Some("BAD_REQUEST") => CausalDispatchError::BadRequest(message),
-        Some("FORBIDDEN") => CausalDispatchError::Forbidden,
-        Some("COMMAND_ID_REUSE") => CausalDispatchError::CommandIdReuse,
-        Some("COMMAND_IN_PROGRESS") => CausalDispatchError::InProgress,
-        Some("COMMAND_EXPIRED") => CausalDispatchError::Expired,
-        Some("CONCURRENT_WRITE") => CausalDispatchError::ConcurrentWrite,
-        Some("INTERNAL") => {
-            CausalDispatchError::Internal(format!("cell wait-path failed with HTTP {status}"))
-        }
-        Some("UNAUTHORIZED") => CausalDispatchError::Rejected {
-            code: "UNAUTHORIZED",
-            status,
-            message,
-        },
-        Some("NOT_FOUND") => CausalDispatchError::Rejected {
-            code: "NOT_FOUND",
-            status,
-            message,
-        },
-        _ => CausalDispatchError::Rejected {
-            code: "REJECTED",
-            status,
-            message,
-        },
     }
 }
 
@@ -390,7 +356,7 @@ impl CommandHost for CelldCommandHost {
             }
         };
         if status >= 400 {
-            let error = remote_dispatch_error(status, &body);
+            let error = crate::microsvc::wait_path::wait_path_error(status, &body);
             let _ = local
                 .service()
                 .abandon_external_causal(command, attempt)

@@ -1,5 +1,7 @@
 #[cfg(feature = "graphql")]
 use super::causal::collapse_projection_evidence;
+#[cfg(feature = "graphql")]
+use super::routes::LedgerCompaction;
 use super::*;
 #[cfg(feature = "graphql")]
 use crate::aggregate::Aggregate;
@@ -4452,4 +4454,370 @@ fn service_without_named_lanes_reports_one_lane() {
 fn default_lane_name_cannot_be_used_as_a_named_lane() {
     let log = lane_log();
     let _ = Service::new().lane(DEFAULT_DELIVERY_LANE, lane_recorder(&log, "x"));
+}
+
+#[cfg(feature = "graphql")]
+macro_rules! ledger_compaction_routes {
+    ($repository:expr, $command:literal) => {
+        Routes::new()
+            .with_repo($repository.clone().aggregate::<CausalDispatcherAggregate>())
+            .typed_command(typed_command::<CausalTestInput, Succeeded<TypedOutput>>(
+                $command,
+            ))
+            .handle(
+                |_context: &CausalCommandContext<'_, CausalDispatcherAggregate>,
+                 input: CausalTestInput| async move {
+                    Ok(
+                        PreparedCommand::<Succeeded<TypedOutput>>::prepare(TypedOutput {
+                            id: input.id,
+                        })
+                        .unwrap(),
+                    )
+                },
+            )
+    };
+}
+
+#[cfg(feature = "graphql")]
+macro_rules! ledger_compaction_service {
+    ($repository:expr) => {
+        Service::new()
+            .named("ledger-compaction")
+            .routes(ledger_compaction_routes!($repository, "ledger.compact"))
+    };
+}
+
+#[cfg(feature = "graphql")]
+async fn reserve_for_compaction<R: CommandLedgerStore>(
+    repository: &R,
+) -> (CommandLedgerKey, crate::command_ledger::CommandAttempt) {
+    use crate::command_ledger::{
+        CanonicalInputHash, CommandContractFingerprint, CommandId, PrincipalPartitionId,
+    };
+    let key = CommandLedgerKey::new(
+        "ledger-compaction",
+        PrincipalPartitionId::new("v1:sha256:principal").unwrap(),
+        CommandId::parse(&causal_test_command_id()).unwrap(),
+    )
+    .unwrap();
+    let reservation = CommandReservation::new(
+        key.clone(),
+        "ledger.compact",
+        CommandContractFingerprint::new([1; 32]),
+        CanonicalInputHash::new([2; 32]),
+        std::time::Duration::from_secs(30),
+        std::time::Duration::from_secs(300),
+    )
+    .unwrap();
+    match repository.reserve_command(reservation).await.unwrap() {
+        ReservationOutcome::Acquired(attempt) => (key, attempt),
+        other => panic!("expected an acquired attempt, got {other:?}"),
+    }
+}
+
+/// Writes a terminal row whose retention lapses 50 ms after commit, a
+/// terminal row retained for 300 s and an in-progress row, then runs the
+/// worker's pass until the first one is due. The ledger has no injectable
+/// clock (the stores use their own), so the pass is polled instead of the
+/// test sleeping for a fixed time.
+#[cfg(feature = "graphql")]
+async fn worker_pass_compacts_only_expired_rows<R>(service: &Service, repository: &R)
+where
+    R: CommandLedgerStore + CausalTransactionalCommit,
+{
+    use crate::command_ledger::TerminalCommandState;
+    use std::time::{Duration, Instant};
+
+    let scope = CommandLookupScope::CommandName("ledger.compact");
+    let complete = |attempt: crate::command_ledger::CommandAttempt, retention: Duration| async move {
+        let completion = attempt
+            .complete(
+                TerminalCommandState::Succeeded,
+                json!({"id": "todo-1"}),
+                retention,
+            )
+            .unwrap();
+        repository
+            .commit_causal_batch(CausalCommitBatch::new(
+                crate::CommitBatch::empty(),
+                completion,
+            ))
+            .await
+            .unwrap();
+    };
+    let (expired, attempt) = reserve_for_compaction(repository).await;
+    complete(attempt, Duration::from_millis(50)).await;
+    let (retained, attempt) = reserve_for_compaction(repository).await;
+    complete(attempt, Duration::from_secs(300)).await;
+    let (in_progress, _attempt) = reserve_for_compaction(repository).await;
+
+    let ledgers = service.command_ledgers();
+    assert_eq!(ledgers.len(), 1);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut compacted = 0;
+    while compacted == 0 {
+        assert!(
+            Instant::now() < deadline,
+            "the expired row was never compacted"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        compacted = crate::microsvc::workers::compact_command_ledgers(&ledgers, 8).await;
+    }
+
+    assert_eq!(compacted, 1, "only the expired row is compacted");
+    assert_eq!(
+        crate::microsvc::workers::compact_command_ledgers(&ledgers, 8).await,
+        0
+    );
+    assert_eq!(
+        repository.lookup_command(&expired, scope).await.unwrap(),
+        CommandLookup::Expired
+    );
+    assert!(matches!(
+        repository.lookup_command(&retained, scope).await.unwrap(),
+        CommandLookup::Replay(_)
+    ));
+    assert!(matches!(
+        repository
+            .lookup_command(&in_progress, scope)
+            .await
+            .unwrap(),
+        CommandLookup::InProgress { .. }
+    ));
+}
+
+#[cfg(feature = "graphql")]
+#[tokio::test]
+async fn ledger_worker_pass_compacts_only_expired_rows_in_memory() {
+    let repository = InMemoryRepository::new();
+    let service = ledger_compaction_service!(repository);
+    worker_pass_compacts_only_expired_rows(&service, &repository).await;
+}
+
+#[cfg(all(feature = "graphql", feature = "sqlite"))]
+#[tokio::test]
+async fn ledger_worker_pass_compacts_only_expired_rows_in_sqlite() {
+    let repository = crate::SqliteRepository::connect_and_migrate("sqlite::memory:")
+        .await
+        .expect("framework migrations should apply");
+    let service = ledger_compaction_service!(repository);
+    worker_pass_compacts_only_expired_rows(&service, &repository).await;
+}
+
+#[cfg(feature = "graphql")]
+#[tokio::test]
+async fn service_compacts_each_command_repository_once() {
+    let shared = InMemoryRepository::new();
+    let other = InMemoryRepository::new();
+    let service = Service::new()
+        .named("ledger-compaction")
+        .routes(ledger_compaction_routes!(shared, "ledger.first"))
+        .routes(ledger_compaction_routes!(shared, "ledger.second"))
+        .routes(ledger_compaction_routes!(other, "ledger.third"))
+        .routes(test_routes());
+
+    assert_eq!(service.command_ledgers().len(), 2);
+}
+
+/// `with_bus` starts the worker: with no explicit pass, the expired row is
+/// compacted. Tokio time is paused, so the worker's interval elapses as soon
+/// as the runtime is idle; the row's retention is wall-clock time.
+#[cfg(feature = "graphql")]
+#[tokio::test(start_paused = true)]
+async fn with_bus_runs_ledger_compaction() {
+    use crate::command_ledger::TerminalCommandState;
+    use std::time::{Duration, Instant};
+
+    let repository = InMemoryRepository::new();
+    let service = ledger_compaction_service!(repository).with_bus(crate::bus::InMemoryBus::new());
+    let (key, attempt) = reserve_for_compaction(&repository).await;
+    let completion = attempt
+        .complete(
+            TerminalCommandState::Succeeded,
+            json!({"id": "todo-1"}),
+            Duration::from_millis(50),
+        )
+        .unwrap();
+    repository
+        .commit_causal_batch(CausalCommitBatch::new(
+            crate::CommitBatch::empty(),
+            completion,
+        ))
+        .await
+        .unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while repository.command_ledger_state(&key) != Some(CommandLedgerState::Expired) {
+        assert!(
+            Instant::now() < deadline,
+            "the worker never compacted the row"
+        );
+        tokio::time::sleep(crate::microsvc::workers::LEDGER_COMPACTION_INTERVAL).await;
+    }
+    drop(service);
+}
+
+#[cfg(feature = "graphql")]
+#[tokio::test]
+async fn dropping_the_ledger_compaction_worker_stops_it() {
+    let ledger: LedgerCompaction = Arc::new(|_| Box::pin(async { Ok(0) }));
+    let worker = crate::microsvc::workers::LedgerCompactionWorker::spawn(vec![ledger.clone()]);
+    drop(worker);
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while Arc::strong_count(&ledger) > 1 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the aborted worker releases its ledgers");
+}
+
+/// One closed gate, every way in: the service refuses the write, and each
+/// transport answers the way it did when it checked the gate itself.
+#[cfg(all(feature = "graphql", feature = "sqlite"))]
+#[tokio::test]
+async fn a_closed_lifecycle_gate_refuses_writes_on_every_transport() {
+    let gated_service =
+        |repository: &crate::SqliteRepository| {
+            Service::new()
+                .named("lifecycle-gate")
+                .with_http_command_routes()
+                .routes(
+                    Routes::new()
+                        .with_repo(repository.clone().aggregate::<CausalDispatcherAggregate>())
+                        .typed_command(typed_command::<CausalTestInput, Succeeded<TypedOutput>>(
+                            "gate.write",
+                        ))
+                        .handle(
+                            |_context: &CausalCommandContext<'_, CausalDispatcherAggregate>,
+                             input: CausalTestInput| async move {
+                                Ok(PreparedCommand::<Succeeded<TypedOutput>>::prepare(
+                                    TypedOutput { id: input.id },
+                                )
+                                .unwrap())
+                            },
+                        ),
+                )
+        };
+    let engine_for = |repository: &crate::SqliteRepository, service: &Service| {
+        crate::graphql::GraphqlEngine::builder(repository)
+            .identity(crate::graphql::IdentityConfig::dev_headers())
+            .protocol_token_key(TEST_PROTOCOL_TOKEN_KEY)
+            .service(service)
+            .build()
+            .expect("the gated service's commands should compile")
+    };
+    let repository = crate::SqliteRepository::connect_and_migrate("sqlite::memory:")
+        .await
+        .expect("framework migrations should apply");
+
+    let service =
+        gated_service(&repository).with_lifecycle(crate::microsvc::LifecycleGate::closed());
+    let engine = engine_for(&repository, &service);
+    let service = Arc::new(service.try_with_graphql(engine).unwrap());
+    let mut session = Session::new();
+    session.set(crate::microsvc::USER_ID_KEY, "alice");
+    let mutation = format!(
+        "mutation {{ gate_write(commandId: \"{}\", input: {{ id: \"todo-1\", label: \"x\" }}) {{ id }} }}",
+        causal_test_command_id()
+    );
+
+    // The service itself.
+    let refused = service
+        .dispatch_causal(
+            "gate.write",
+            &causal_test_command_id(),
+            causal_test_input("todo-1", "x"),
+            session.clone(),
+            causal_test_principal(),
+        )
+        .await;
+    assert!(matches!(
+        refused,
+        Err(CausalDispatchError::Handler(
+            HandlerError::ApplicationReloading
+        ))
+    ));
+
+    // The engine, as a WebSocket or an embedding caller reaches it.
+    let engine = service.graphql_engine().unwrap();
+    let response = engine
+        .execute(&session, async_graphql::Request::new(mutation.clone()))
+        .await;
+    assert_eq!(response.errors.len(), 1);
+    assert_eq!(
+        response.errors[0].message,
+        "application generation is reloading; mutation dispatch is unavailable"
+    );
+    assert!(response.errors[0].extensions.is_none());
+    let read = engine
+        .execute(&session, async_graphql::Request::new("{ __typename }"))
+        .await;
+    assert!(read.errors.is_empty(), "reads stay open: {read:?}");
+
+    // HTTP.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let app = crate::microsvc::router(Arc::clone(&service));
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let client = reqwest::Client::new();
+    let post = |path: &str, body: Value| {
+        let request = client
+            .post(format!("{base}/{path}"))
+            .header(crate::microsvc::USER_ID_KEY, "alice")
+            .json(&body);
+        async move {
+            let response = request.send().await.unwrap();
+            (
+                response.status().as_u16(),
+                response.json::<Value>().await.unwrap(),
+            )
+        }
+    };
+
+    assert_eq!(
+        post("graphql", json!({ "query": mutation })).await,
+        (
+            503,
+            json!({"errors": [{
+                "message": "application generation is reloading",
+                "extensions": { "code": "APPLICATION_RELOADING" }
+            }]})
+        )
+    );
+    assert_eq!(
+        post("graphql", json!({ "query": "{ __typename }" }))
+            .await
+            .0,
+        200
+    );
+    let reloading = json!({
+        "code": "APPLICATION_RELOADING",
+        "error": "application generation is not active"
+    });
+    assert_eq!(
+        post("gate.write", json!({ "id": "todo-1", "label": "x" })).await,
+        (503, reloading.clone())
+    );
+    assert_eq!(
+        post(
+            "gate.write",
+            json!({
+                "commandId": causal_test_command_id(),
+                "input": { "id": "todo-1", "label": "x" }
+            })
+        )
+        .await,
+        (503, reloading)
+    );
+
+    // An engine built before the service was given its gate has the wrong one.
+    let ungated = gated_service(&repository);
+    let engine = engine_for(&repository, &ungated);
+    let mismatch = ungated
+        .with_lifecycle(crate::microsvc::LifecycleGate::closed())
+        .try_with_graphql(engine)
+        .err()
+        .expect("the engine does not share the service's gate");
+    assert!(mismatch.0.contains("lifecycle"), "{}", mismatch.0);
 }

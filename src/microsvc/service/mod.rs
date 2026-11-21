@@ -57,6 +57,8 @@ pub use handlers::{
 pub use invoke::{invoke_transition, load_for_command, require_loaded, CommandLoad};
 pub use request::{CommandRequest, CommandResponse};
 pub(crate) use routes::DynBusPublisher;
+#[cfg(feature = "graphql")]
+pub(crate) use routes::LedgerCompaction;
 pub use routes::{
     DeliveryKind, HandlerNames, HandlerSpec, PortableCommand, RouteBuilder, Routes,
     ThinCommandBuilder, ThinCommandInvoked, ThinCommandLoaded, TypedRouteBuilder,

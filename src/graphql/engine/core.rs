@@ -225,6 +225,8 @@ pub(crate) struct EngineInner {
     /// opt in with [`GraphqlEngineBuilder::service_id`].
     pub service_id: Option<String>,
     pub command_binding: Option<TypedServiceCommandBinding>,
+    /// The bound service's gate: closed, the engine refuses mutations.
+    pub lifecycle: crate::microsvc::LifecycleGate,
     pub causal_storage_identity: Option<crate::command_ledger::CausalStorageIdentity>,
     pub pool: GraphqlPool,
     #[cfg(feature = "gateway-delivery")]
@@ -316,6 +318,7 @@ pub struct GraphqlEngineBuilder {
     pub(crate) protocol_namespace: Option<String>,
     pub(crate) client_applications: BTreeMap<String, ClientApplicationRegistration>,
     pub(crate) command_binding: Option<TypedServiceCommandBinding>,
+    pub(crate) lifecycle: crate::microsvc::LifecycleGate,
     pub(crate) causal_storage_identity: Option<crate::command_ledger::CausalStorageIdentity>,
     pub(crate) pool: GraphqlPool,
     #[cfg(feature = "gateway-delivery")]

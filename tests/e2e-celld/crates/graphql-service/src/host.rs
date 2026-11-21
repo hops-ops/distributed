@@ -11,7 +11,9 @@ use distributed::bus::NatsBus;
 use distributed::cell_host::{CelldCommandHost, InternalHttpSecret};
 use distributed::command_dispatch::SharedCommandHost;
 use distributed::graphql::IdentityConfig;
-use distributed::microsvc::{spawn_outbox_publish_loop, spawn_service_consumer_loop, Service};
+use distributed::microsvc::{
+    spawn_outbox_publish_loop, spawn_service_consumer_loop, LifecycleGate, Service,
+};
 use distributed::BusPublisher;
 use distributed::{PostgresLockManager, PostgresRepository};
 
@@ -62,7 +64,11 @@ async fn run_postgres(
     let nats = connect_nats(&options.nats_url).await?;
 
     let change_rx = repo.read_model_changes();
-    let service = build_service(repo.clone(), locks.clone(), repo.clone()).with_bus(nats.clone());
+    // Under `distributed dev`, only the active generation may write.
+    let lifecycle = LifecycleGate::from_env();
+    let service = build_service(repo.clone(), locks.clone(), repo.clone())
+        .with_lifecycle(lifecycle.clone())
+        .with_bus(nats.clone());
     let gql = build_graphql_engine(&repo, &service, options.identity.clone(), Some(change_rx))?;
     let service = Arc::new(service.try_with_graphql(gql)?);
     let publisher = BusPublisher::new(Arc::new(nats.clone()));
@@ -86,7 +92,9 @@ async fn run_postgres(
         let locks = locks.clone();
         let nats = nats.clone();
         spawn_service_consumer_loop(move || {
-            build_service(repo.clone(), locks.clone(), repo.clone()).with_bus(nats.clone())
+            build_service(repo.clone(), locks.clone(), repo.clone())
+                .with_lifecycle(lifecycle.clone())
+                .with_bus(nats.clone())
         });
     }
     spawn_zitadel_scrape(repo.clone());

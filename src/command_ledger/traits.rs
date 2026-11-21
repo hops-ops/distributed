@@ -60,7 +60,10 @@ pub(crate) trait CommandLedgerStore: Send + Sync {
         completion: ExternalCommandCompletion,
     ) -> impl Future<Output = Result<(), CommandLedgerError>> + Send + '_;
 
-    #[allow(dead_code)]
+    /// Tombstone up to `limit` rows whose retention has lapsed, oldest
+    /// first: the replay payload is dropped and the row stays `expired`, so
+    /// its command ID is never accepted again. Driven by the service's
+    /// background worker, never by a dispatch.
     fn compact_expired_commands(
         &self,
         limit: usize,

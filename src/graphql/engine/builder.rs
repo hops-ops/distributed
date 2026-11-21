@@ -8,6 +8,7 @@ impl GraphqlEngineBuilder {
             protocol_namespace: None,
             client_applications: BTreeMap::new(),
             command_binding: None,
+            lifecycle: crate::microsvc::LifecycleGate::always_open(),
             causal_storage_identity: source.causal_storage_identity,
             pool: source.pool,
             #[cfg(feature = "gateway-delivery")]
@@ -474,6 +475,10 @@ impl GraphqlEngineBuilder {
     /// inventory. This is the authoritative path: no second command list is
     /// accepted, and attachment later verifies the complete structural digest
     /// plus exact Rust input/output `TypeId`s.
+    ///
+    /// The engine also takes the service's
+    /// [`LifecycleGate`](crate::microsvc::LifecycleGate) and refuses those
+    /// mutations while it is closed.
     pub fn service(mut self, service: &Service) -> Self {
         if self.command_binding.is_some() {
             self.pending_errors
@@ -506,6 +511,7 @@ impl GraphqlEngineBuilder {
         }
         self.service_id = Some(binding.service_id.clone());
         self.command_binding = Some(binding);
+        self.lifecycle = service.lifecycle().clone();
         self
     }
 
@@ -1082,6 +1088,7 @@ impl GraphqlEngineBuilder {
         let inner = Arc::new(EngineInner {
             service_id: self.service_id,
             command_binding: self.command_binding,
+            lifecycle: self.lifecycle,
             causal_storage_identity: self.causal_storage_identity,
             pool: self.pool,
             #[cfg(feature = "gateway-delivery")]

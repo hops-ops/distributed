@@ -43,8 +43,8 @@ use distributed::graphql::{
 };
 use distributed::leaderboard::{Board, LeaderboardStore, RedisLeaderboard};
 use distributed::microsvc::{
-    spawn_service_consumer_loop, CausalProjectorContext, HandlerError, ModeledProjection, Routes,
-    Service,
+    spawn_service_consumer_loop, CausalProjectorContext, HandlerError, LifecycleGate,
+    ModeledProjection, Routes, Service,
 };
 use distributed::{
     Application, ApplicationManifest, RelationalReadModel, SqliteRepository, SurfaceSpec,
@@ -154,10 +154,17 @@ pub fn projection_service(read_models: SqliteRepository) -> Service {
 }
 
 /// Run the projector against the bus forever (restarted on errors; the
-/// cursor lives in the read-model database, so a restart resumes).
-pub fn spawn_projector(read_models: SqliteRepository, bus: sqlx::SqlitePool) {
+/// cursor lives in the read-model database, so a restart resumes). It
+/// projects only while `lifecycle` is open.
+pub fn spawn_projector(
+    read_models: SqliteRepository,
+    bus: sqlx::SqlitePool,
+    lifecycle: LifecycleGate,
+) {
     spawn_service_consumer_loop(move || {
-        projection_service(read_models.clone()).with_bus(SqliteBus::new(bus.clone()))
+        projection_service(read_models.clone())
+            .with_lifecycle(lifecycle.clone())
+            .with_bus(SqliteBus::new(bus.clone()))
     });
 }
 
@@ -349,7 +356,8 @@ pub async fn run(options: ServiceOptions) -> Result<(), Box<dyn std::error::Erro
         &options.identity,
         options.protocol_key,
     )?);
-    spawn_projector(repo.clone(), bus_pool.clone());
+    // Under `distributed dev`, only the active generation may project.
+    spawn_projector(repo.clone(), bus_pool.clone(), LifecycleGate::from_env());
     spawn_board_notices(engine.clone(), bus_pool);
     let app = http::router(engine, &options.allowed_origins);
     let listener = tokio::net::TcpListener::bind(&options.bind).await?;
