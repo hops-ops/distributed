@@ -125,9 +125,13 @@ jobs:
           toolchain: stable
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: tests/e2e-celld -> target
-          shared-key: e2e-celld-workspace
-          save-if: ${{ github.event_name != 'pull_request' }}
+          # Same list as the live job below, which writes the cache.
+          workspaces: |
+            . -> target
+            tests/e2e-celld -> target
+            tests/celld/worker -> tests/celld/worker/target
+          shared-key: celld-live
+          save-if: false
       - name: Run e2e-celld workspace tests
         run: cargo test --workspace --verbose
 

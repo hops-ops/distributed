@@ -86,8 +86,9 @@ jobs:
           toolchain: stable
       - uses: Swatinem/rust-cache@v2
         with:
-          shared-key: gateway-auth
-          save-if: ${{ github.event_name != 'pull_request' }}
+          # Same test target as the GraphQL identity job; that job writes the cache.
+          shared-key: graphql
+          save-if: false
       - name: Verify gateway and backend identity
         run: cargo test -p distributed --no-default-features --features gateway,graphql,sqlite --test graphql_identity
       - name: Install pinned auth fixture dependencies
@@ -141,8 +142,9 @@ jobs:
           toolchain: stable
       - uses: Swatinem/rust-cache@v2
         with:
-          shared-key: gateway-freshness
-          save-if: ${{ github.event_name != 'pull_request' }}
+          # The distributed_cli job writes this cache.
+          shared-key: cli
+          save-if: false
       - uses: actions/setup-node@v4
         with:
           node-version: '24'
@@ -223,8 +225,9 @@ jobs:
           workspaces: |
             . -> target
             tests/e2e-ui -> target
-          shared-key: gateway-application
-          save-if: ${{ github.event_name != 'pull_request' }}
+          # Same workspaces as the e2e-ui jobs, whose browser job writes the cache.
+          shared-key: e2e-ui
+          save-if: false
       - uses: taiki-e/install-action@v2
         with:
           tool: wasm-pack
