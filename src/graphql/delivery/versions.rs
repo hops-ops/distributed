@@ -141,7 +141,14 @@ impl GatewayVersionStore {
         match pool {
             #[cfg(feature = "sqlite")]
             GraphqlPool::Sqlite(pool) => {
-                let mut tx = pool.begin().await.map_err(|e| e.to_string())?;
+                // Take the write lock first. A deferred transaction that
+                // reads and then writes is refused outright when another
+                // connection commits in between; waiting for the lock is
+                // what `busy_timeout` is for.
+                let mut tx = pool
+                    .begin_with("BEGIN IMMEDIATE")
+                    .await
+                    .map_err(|e| e.to_string())?;
                 let existing: Vec<String> =
                     sqlx::query_scalar("SELECT name FROM sqlite_master WHERE type='table'")
                         .fetch_all(&mut *tx)
@@ -479,6 +486,66 @@ mod tests {
             serde_json::to_value(restored.current(&adapter, &tables).await.unwrap()).unwrap(),
             before
         );
+    }
+    /// Composition runs `install` while the service's background workers
+    /// already write to the same database. A deferred transaction that read
+    /// and then wrote was refused outright ("database is locked") whenever
+    /// a writer committed in between.
+    #[cfg(feature = "sqlite")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn sqlite_install_waits_for_a_concurrent_writer() {
+        use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let directory =
+            std::env::temp_dir().join(format!("gateway-install-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir(&directory).unwrap();
+        struct Cleanup(std::path::PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(directory.clone());
+        let pool = SqlitePoolOptions::new()
+            .max_connections(3)
+            .connect_with(
+                SqliteConnectOptions::new()
+                    .filename(directory.join("app.sqlite"))
+                    .create_if_missing(true),
+            )
+            .await
+            .unwrap();
+        sqlx::query("CREATE TABLE install_race (id INTEGER PRIMARY KEY, title TEXT NOT NULL)")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let writer = tokio::spawn({
+            let (pool, stop) = (pool.clone(), stop.clone());
+            async move {
+                while !stop.load(Ordering::Relaxed) {
+                    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await.unwrap();
+                    sqlx::query("INSERT INTO install_race (title) VALUES ('row')")
+                        .execute(&mut *tx)
+                        .await
+                        .unwrap();
+                    tx.commit().await.unwrap();
+                }
+            }
+        });
+        let adapter = GraphqlPool::Sqlite(pool.clone());
+        for round in 0..50 {
+            GatewayVersionStore::install(
+                &adapter,
+                &format!("install-race-{round}"),
+                vec!["install_race".to_owned()],
+            )
+            .await
+            .unwrap_or_else(|error| panic!("round {round}: {error}"));
+        }
+        stop.store(true, Ordering::Relaxed);
+        writer.await.unwrap();
     }
     #[cfg(feature = "postgres")]
     #[tokio::test]
