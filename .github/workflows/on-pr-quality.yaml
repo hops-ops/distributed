@@ -1,22 +1,50 @@
 name: Rust Quality Pipeline for PRs
 
+# Runs the whole pipeline three ways:
+#
+# - pull_request: the gate a pull request waits for. It only reads the Rust
+#   dependency caches (`save-if` in each reusable workflow).
+# - push to an integration branch (v5): the same pipeline on the merged
+#   result. This run writes the caches every pull request into that branch
+#   then restores; a pull-request run cannot do that, because a cache written
+#   on a pull request's merge ref is readable by that pull request alone.
+# - merge_group: the same pipeline on a merge-queue candidate, so the queue
+#   can be required on a branch without another workflow.
+#
+# workflow_dispatch runs it on any branch (and writes that branch's caches).
 on:
   pull_request:
+  merge_group:
+  workflow_dispatch:
+  push:
+    branches:
+      - v5
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 jobs:
+  # Each job below carries the same `if`: a pull request whose head is the
+  # integration branch itself (`main <- v5`) has the commit the push run above
+  # is already testing, with the same jobs, and those results show on that
+  # pull request. Running it twice would take every hosted runner slot the
+  # organization has (20) for the length of a run. Fork heads still run.
   contracts:
     name: Run fail-fast contract lifecycle check
+    if: ${{ !(github.event_name == 'pull_request' && github.head_ref == 'v5' && !github.event.pull_request.head.repo.fork) }}
     runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
     steps:
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0
       - name: Resolve PR merge-base
         id: base
+        # Only a pull request has a base ref.
+        if: github.event_name == 'pull_request'
         run: |
           git fetch origin "${{ github.base_ref }}" --depth=1
           base=$(git merge-base HEAD "origin/${{ github.base_ref }}" || true)
@@ -24,6 +52,11 @@ jobs:
           echo "merge-base=${base}"
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
+      # Restores what the distributed_cli job writes on the base branch.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: cli
+          save-if: false
       - name: Run contracts check
         run: cargo run -p distributed_cli --quiet -- contracts check --root . --catalog distributed.contracts.json --output json
 
@@ -31,6 +64,7 @@ jobs:
   # quality.yaml in this directory is the contract for *consumers* (domain
   # crates / Distributed libraries), not for this workspace's entry pipeline.
   quality:
+    if: ${{ !(github.event_name == 'pull_request' && github.head_ref == 'v5' && !github.event.pull_request.head.repo.fork) }}
     uses: unbounded-tech/workflows-rust/.github/workflows/quality.yaml@feat/cargo-publish
     with:
       cargo_build_args: "--verbose"
@@ -38,39 +72,45 @@ jobs:
       cargo_incremental: true
 
   all-features:
+    if: ${{ !(github.event_name == 'pull_request' && github.head_ref == 'v5' && !github.event.pull_request.head.repo.fork) }}
     uses: ./.github/workflows/test-all-features.yaml
 
   services:
+    if: ${{ !(github.event_name == 'pull_request' && github.head_ref == 'v5' && !github.event.pull_request.head.repo.fork) }}
     uses: ./.github/workflows/integration-services.yaml
 
   gateway:
+    if: ${{ !(github.event_name == 'pull_request' && github.head_ref == 'v5' && !github.event.pull_request.head.repo.fork) }}
     uses: ./.github/workflows/integration-gateway.yaml
 
   distributed-cli:
-    needs: [contracts]
+    if: ${{ !(github.event_name == 'pull_request' && github.head_ref == 'v5' && !github.event.pull_request.head.repo.fork) }}
     uses: ./.github/workflows/integration-distributed-cli.yaml
 
   observability:
+    if: ${{ !(github.event_name == 'pull_request' && github.head_ref == 'v5' && !github.event.pull_request.head.repo.fork) }}
     uses: ./.github/workflows/integration-observability.yaml
 
   graphql:
-    needs: [contracts]
+    if: ${{ !(github.event_name == 'pull_request' && github.head_ref == 'v5' && !github.event.pull_request.head.repo.fork) }}
     uses: ./.github/workflows/integration-graphql.yaml
 
   e2e-ui:
-    needs: [contracts]
+    if: ${{ !(github.event_name == 'pull_request' && github.head_ref == 'v5' && !github.event.pull_request.head.repo.fork) }}
     uses: ./.github/workflows/integration-e2e-ui.yaml
 
   js-client:
-    needs: [contracts]
+    if: ${{ !(github.event_name == 'pull_request' && github.head_ref == 'v5' && !github.event.pull_request.head.repo.fork) }}
     uses: ./.github/workflows/integration-js.yaml
 
   game-demos:
-    needs: [contracts]
+    if: ${{ !(github.event_name == 'pull_request' && github.head_ref == 'v5' && !github.event.pull_request.head.repo.fork) }}
     uses: ./.github/workflows/integration-game-demos.yaml
 
   celld:
+    if: ${{ !(github.event_name == 'pull_request' && github.head_ref == 'v5' && !github.event.pull_request.head.repo.fork) }}
     uses: ./.github/workflows/integration-celld.yaml
 
   wasm32-domains:
+    if: ${{ !(github.event_name == 'pull_request' && github.head_ref == 'v5' && !github.event.pull_request.head.repo.fork) }}
     uses: ./.github/workflows/integration-wasm32-domains.yaml

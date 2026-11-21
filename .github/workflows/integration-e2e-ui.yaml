@@ -11,6 +11,10 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  # File and line in backtraces, without the full debug info that makes up
+  # most of a dev build's link time and cache size.
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
+  CARGO_INCREMENTAL: "0"
   # Playwright / Auth.js over HTTP on localhost
   CI: true
 
@@ -18,6 +22,7 @@ jobs:
   offline:
     name: e2e-ui offline (domain + suite + UI unit)
     runs-on: ubuntu-latest
+    timeout-minutes: 12
     defaults:
       run:
         working-directory: tests/e2e-ui
@@ -36,7 +41,8 @@ jobs:
           workspaces: |
             . -> target
             tests/e2e-ui -> target
-          shared-key: e2e-ui-offline
+          shared-key: e2e-ui
+          save-if: false
 
       - uses: actions/setup-node@v7
         with:
@@ -75,7 +81,8 @@ jobs:
           workspaces: |
             . -> target
             tests/e2e-ui -> target
-          shared-key: e2e-ui-browser
+          shared-key: e2e-ui
+          save-if: ${{ github.event_name != 'pull_request' }}
 
       - uses: actions/setup-node@v7
         with:
@@ -228,7 +235,8 @@ jobs:
           workspaces: |
             . -> target
             tests/e2e-ui -> target
-          shared-key: e2e-ui-local-gitops
+          shared-key: e2e-ui
+          save-if: false
 
       - uses: actions/setup-node@v7
         with:

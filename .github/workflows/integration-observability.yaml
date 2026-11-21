@@ -12,14 +12,21 @@ name: Observability Integration Tests
 on:
   workflow_call:
 
+env:
+  CARGO_TERM_COLOR: always
+  # File and line in backtraces, without the full debug info that makes up
+  # most of a dev build's link time and cache size.
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
+  CARGO_INCREMENTAL: "0"
+
 jobs:
-  metrics-exposition:
-    name: Metrics Exposition (promtool)
+  # One runner instead of three: each check is under 90 seconds, and the
+  # runner slots are what a pull request waits for. Every check runs even
+  # when an earlier one fails, so one run lists every failure.
+  observability:
+    name: Observability (promtool, OTLP collector, kubeconform)
     runs-on: ubuntu-latest
-    env:
-      CARGO_TERM_COLOR: always
-      PROMTOOL: /usr/local/bin/promtool
-      DISTRIBUTED_REQUIRE_SERVICES: PROMTOOL
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
         with:
@@ -27,6 +34,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8
         with:
           toolchain: stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: observability
+          save-if: ${{ github.event_name != 'pull_request' }}
       - name: Install promtool
         run: |
           VERSION=3.4.1
@@ -34,24 +45,13 @@ jobs:
             | tar -xz -C /tmp "prometheus-${VERSION}.linux-amd64/promtool"
           sudo mv "/tmp/prometheus-${VERSION}.linux-amd64/promtool" /usr/local/bin/promtool
           promtool --version
-      - name: Run metrics exposition tests
-        run: cargo test --test metrics_exposition --features http,metrics --verbose
-
-  otel-export:
-    name: OTLP Export (collector)
-    runs-on: ubuntu-latest
-    env:
-      CARGO_TERM_COLOR: always
-      OTEL_EXPORTER_OTLP_TRACES_ENDPOINT: http://localhost:4318/v1/traces
-      OTEL_COLLECTOR_TRACES_FILE: ${{ github.workspace }}/target/otel-out/traces.json
-      DISTRIBUTED_REQUIRE_SERVICES: OTEL_EXPORTER_OTLP_TRACES_ENDPOINT,OTEL_COLLECTOR_TRACES_FILE
-    steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
-        with:
-          persist-credentials: false
-      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8
-        with:
-          toolchain: stable
+      - name: Install kubeconform
+        run: |
+          VERSION=0.7.0
+          curl -sSfL "https://github.com/yannh/kubeconform/releases/download/v${VERSION}/kubeconform-linux-amd64.tar.gz" \
+            | tar -xz -C /tmp kubeconform
+          sudo mv /tmp/kubeconform /usr/local/bin/kubeconform
+          kubeconform -v
       # The collector needs a config file mount, which `services:` containers
       # can't express, so start it as a step. `--user 0` lets its file exporter
       # write to the bind-mounted output dir regardless of host uid mapping.
@@ -67,29 +67,24 @@ jobs:
             sleep 1
           done
           echo "collector never became ready"; docker logs otelcol; exit 1
-      - name: Run OTLP export tests
-        run: cargo test --test otel_export --features http,otel --verbose
 
-  scaffold-manifests:
-    name: Scaffolded Manifests (kubeconform)
-    runs-on: ubuntu-latest
-    env:
-      CARGO_TERM_COLOR: always
-    steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
-        with:
-          persist-credentials: false
-      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8
-        with:
-          toolchain: stable
-      - name: Install kubeconform
-        run: |
-          VERSION=0.7.0
-          curl -sSfL "https://github.com/yannh/kubeconform/releases/download/v${VERSION}/kubeconform-linux-amd64.tar.gz" \
-            | tar -xz -C /tmp kubeconform
-          sudo mv /tmp/kubeconform /usr/local/bin/kubeconform
-          kubeconform -v
+      # Each check names only its own services, as its own job did: a check
+      # never sees another check's endpoints.
+      - name: Run metrics exposition tests
+        if: ${{ !cancelled() }}
+        env:
+          PROMTOOL: /usr/local/bin/promtool
+          DISTRIBUTED_REQUIRE_SERVICES: PROMTOOL
+        run: cargo test --test metrics_exposition --features http,metrics --verbose
+      - name: Run OTLP export tests
+        if: ${{ !cancelled() }}
+        env:
+          OTEL_EXPORTER_OTLP_TRACES_ENDPOINT: http://localhost:4318/v1/traces
+          OTEL_COLLECTOR_TRACES_FILE: ${{ github.workspace }}/target/otel-out/traces.json
+          DISTRIBUTED_REQUIRE_SERVICES: OTEL_EXPORTER_OTLP_TRACES_ENDPOINT,OTEL_COLLECTOR_TRACES_FILE
+        run: cargo test --test otel_export --features http,otel --verbose
       - name: Scaffold service with metrics and tracing
+        if: ${{ !cancelled() }}
         run: |
           cargo run -p distributed_cli --bin distributed -- scaffold observability-orders \
             --path target/tmp/scaffold-observability \
@@ -97,6 +92,7 @@ jobs:
             --metrics prometheus --tracing --gitops \
             --force --distributed-path .
       - name: Render chart and validate against CRD schemas
+        if: ${{ !cancelled() }}
         run: |
           helm template obs target/tmp/scaffold-observability/.gitops/deploy \
             --set image.tag=ci-test \

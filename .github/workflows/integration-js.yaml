@@ -12,6 +12,7 @@ jobs:
   quality:
     name: Distributed JS client quality (Node ${{ matrix.node-version }})
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     strategy:
       fail-fast: false
       matrix:

@@ -16,6 +16,10 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  # File and line in backtraces, without the full debug info that makes up
+  # most of a dev build's link time and cache size.
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
+  CARGO_INCREMENTAL: "0"
   # Zitadel owns :18080 in the browser topology.
   CELLD_HTTP_PORT: "18880"
   CELLD_URL: http://127.0.0.1:18880
@@ -46,6 +50,7 @@ jobs:
             tests/celld/fact-worker -> tests/celld/fact-worker/target
             tests/celld/zone-worker -> tests/celld/zone-worker/target
           shared-key: celld-storage
+          save-if: ${{ github.event_name != 'pull_request' }}
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
@@ -107,6 +112,7 @@ jobs:
   e2e-celld:
     name: e2e-celld workspace tests
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     defaults:
       run:
         working-directory: tests/e2e-celld
@@ -121,6 +127,7 @@ jobs:
         with:
           workspaces: tests/e2e-celld -> target
           shared-key: e2e-celld-workspace
+          save-if: ${{ github.event_name != 'pull_request' }}
       - name: Run e2e-celld workspace tests
         run: cargo test --workspace --verbose
 
@@ -145,6 +152,7 @@ jobs:
             tests/e2e-celld -> target
             tests/celld/worker -> tests/celld/worker/target
           shared-key: celld-live
+          save-if: ${{ github.event_name != 'pull_request' }}
 
       - uses: actions/setup-node@v7
         with:

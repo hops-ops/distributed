@@ -16,12 +16,18 @@ name: Game demos smoke
 on:
   workflow_call:
 
+env:
+  CARGO_TERM_COLOR: always
+  # File and line in backtraces, without the full debug info that makes up
+  # most of a dev build's link time and cache size.
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
+  CARGO_INCREMENTAL: "0"
+
 jobs:
   game-demos:
     name: Game demos smoke (examples/game)
     runs-on: ubuntu-latest
-    env:
-      CARGO_TERM_COLOR: always
+    timeout-minutes: 35
     # The shared ticket rate limiter's Lua script and the leaderboard store
     # (conformance suite, projector, GraphQL boards) run against a real Redis.
     services:
@@ -52,9 +58,11 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: |
+            . -> target
             examples/game/server -> target
             examples/game/cells -> target
           shared-key: game-demos
+          save-if: ${{ github.event_name != 'pull_request' }}
       - name: Install celld (pinned) and worker-build
         run: |
           scripts/celld.sh install
