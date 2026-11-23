@@ -17,7 +17,7 @@ import test from 'node:test';
 import { BUTTON, isMob, mobFields, PIT_RULES, playerFields } from '../src/generated/mobpit/index.ts';
 import { createMobPitClient, MobPitApi, roomZone } from '../src/mobpit/client.ts';
 import { DevApi } from '../src/shared/dev-api.ts';
-import { eventually, memoryStorage, sleep, until } from './helpers/demo-server.mjs';
+import { memoryStorage, sleep, until } from './helpers/demo-server.mjs';
 import { largestStep, startPit, walkThroughDoor } from './helpers/mobpit.mjs';
 
 /** One tick's walk (5 m/s at 30 Hz) plus a dash frame's worth of slack. */
@@ -82,12 +82,28 @@ function followersOf(pit, home) {
 		.filter((m) => m.hp > 0 && homeRoom(room, m.from) === home);
 }
 
-/** Shoot down every mob of `home` that followed into this room: until then its crossing keeps `home` awake. */
-async function huntFollowers(pit, home, ms) {
+/**
+ * Wait until `home` is asleep, shooting down every mob of `home` that
+ * followed into this room: its crossing keeps `home` awake. A follower can
+ * come through the doorway a second or more after the player, so this
+ * keeps looking for the whole wait rather than once on arrival.
+ */
+async function asleepAfterHunting(pit, pitApi, home, ms) {
 	const deadline = Date.now() + ms;
-	while (followersOf(pit, home).length > 0) {
-		if (Date.now() > deadline) throw new Error(`a follower from ${home} still alive after ${ms} ms`);
-		await bowFight(pit, 1_000, (m) => homeRoom(pit.room(), m.from) === home);
+	let hunted = false;
+	for (;;) {
+		if (followersOf(pit, home).length > 0) {
+			if (!hunted) console.error(`mob(s) followed from ${home}; hunting them`);
+			hunted = true;
+			await bowFight(pit, 1_000, (m) => homeRoom(pit.room(), m.from) === home);
+		} else if ((await pitApi.roomInfo(home)).awake === false) {
+			return;
+		} else {
+			await sleep(250);
+		}
+		if (Date.now() > deadline) {
+			throw new Error(`timed out waiting for ${home} asleep: ${JSON.stringify(await pitApi.roomInfo(home))}`);
+		}
 	}
 }
 
@@ -116,11 +132,8 @@ test('a doorway into a sleeping room after a bow fight: no correction, no jump',
 			const before = corrections.length;
 			const east = await walkThroughDoor(pit, [1, 0]);
 			assert.equal(east.room, 'pit.1.0');
-			const followed = followersOf(pit, 'pit.0.0').length;
-			if (followed > 0) console.error(`round ${round}: ${followed} mob(s) followed from pit.0.0; hunting them`);
-			await huntFollowers(pit, 'pit.0.0', 60_000);
 			// The room left goes to sleep (the watcher does not keep it awake).
-			await eventually(async () => (await pitApi.roomInfo('pit.0.0')).awake === false, 30_000, 'pit.0.0 asleep');
+			await asleepAfterHunting(pit, pitApi, 'pit.0.0', 90_000);
 			const west = await walkThroughDoor(pit, [-1, 0]);
 			assert.equal(west.room, 'pit.0.0');
 			await sleep(500);
