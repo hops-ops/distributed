@@ -28,10 +28,9 @@ use crate::contracts::{
 };
 use crate::js_framework::watch_local_javascript;
 use crate::lifecycle::{
-    activate_lifecycle_project_generation, discover_lifecycle_project, run_lifecycle_build,
-    run_lifecycle_dev, run_lifecycle_project_build, run_lifecycle_project_dev,
-    DiscoveredLifecycleProject, LifecycleActivation, LifecycleBuildOptions, LifecycleBuildRequest,
-    LifecycleCheckBaseline, LifecycleDevOptions, LifecycleProjectDevOptions,
+    activate_lifecycle_project_generation, discover_lifecycle_project, run_lifecycle_project_build,
+    run_lifecycle_project_dev, DiscoveredLifecycleProject, LifecycleActivation,
+    LifecycleBuildRequest, LifecycleProjectDevOptions, UiAdapter,
 };
 use crate::manifest_harness::{
     resolve_target_manifest_path, run_manifest_harness, HarnessMode, HarnessOptions,
@@ -111,15 +110,6 @@ pub struct BuildArgs {
     /// Project to build; defaults to the current directory
     #[arg(value_name = "PROJECT")]
     pub project: Option<PathBuf>,
-    /// Deprecated alias for the project directory
-    #[arg(long, hide = true, conflicts_with = "project")]
-    pub root: Option<PathBuf>,
-    /// Advanced contract-catalog override, relative to the project
-    #[arg(long, hide = true)]
-    pub catalog: Option<PathBuf>,
-    /// Advanced lifecycle-config override, relative to the project
-    #[arg(long, hide = true)]
-    pub config: Option<PathBuf>,
     /// Advanced generation-store override, relative to the project
     #[arg(long)]
     pub out: Option<PathBuf>,
@@ -145,15 +135,6 @@ pub struct DevArgs {
     /// Project to run; defaults to the current directory
     #[arg(value_name = "PROJECT")]
     pub project: Option<PathBuf>,
-    /// Deprecated alias for the project directory
-    #[arg(long, hide = true, conflicts_with = "project")]
-    pub root: Option<PathBuf>,
-    /// Advanced contract-catalog override, relative to the project
-    #[arg(long, hide = true)]
-    pub catalog: Option<PathBuf>,
-    /// Advanced lifecycle-config override, relative to the project
-    #[arg(long, hide = true)]
-    pub config: Option<PathBuf>,
     /// Advanced generation-store override, relative to the project
     #[arg(long)]
     pub out: Option<PathBuf>,
@@ -721,30 +702,15 @@ fn run_probe(args: &ProbeArgs) -> Result<(), Box<dyn Error>> {
     .into())
 }
 
-#[derive(Debug)]
-enum ResolvedLifecycleProject {
-    Discovered(Box<DiscoveredLifecycleProject>),
-    Files {
-        project: PathBuf,
-        workspace: PathBuf,
-        catalog: PathBuf,
-        config: PathBuf,
-        out: PathBuf,
-    },
-}
-
+/// The project a `build` or `dev` invocation names, discovered from its Cargo
+/// workspace. The project's `.env` files are loaded first: discovery reads the
+/// addresses they may set.
 fn resolve_lifecycle_project(
     project: Option<&Path>,
-    legacy_root: Option<&Path>,
-    catalog: Option<&Path>,
-    config: Option<&Path>,
     out: Option<&Path>,
     command_prefix: &[&str],
-) -> Result<ResolvedLifecycleProject, Box<dyn Error>> {
-    if project.is_some() && legacy_root.is_some() {
-        return Err("pass a project path or --root, not both".into());
-    }
-    let requested = project.or(legacy_root).unwrap_or_else(|| Path::new("."));
+) -> Result<DiscoveredLifecycleProject, Box<dyn Error>> {
+    let requested = project.unwrap_or_else(|| Path::new("."));
     let project = requested.canonicalize().map_err(|error| {
         format!(
             "failed to resolve lifecycle project `{}`: {error}",
@@ -758,85 +724,14 @@ fn resolve_lifecycle_project(
         )
         .into());
     }
-
-    let uses_file_adapter = legacy_root.is_some() || catalog.is_some() || config.is_some();
-    if !uses_file_adapter {
-        load_project_environment(&project)?;
-        let executable = std::env::current_exe()?;
-        return discover_lifecycle_project(&project, executable, command_prefix, out)
-            .map(Box::new)
-            .map(ResolvedLifecycleProject::Discovered)
-            .map_err(Into::into);
-    }
-    if catalog.is_some() != config.is_some() && legacy_root.is_none() {
-        return Err("advanced lifecycle overrides require both --catalog and --config".into());
-    }
-
-    let resolve_input = |provided: Option<&Path>, default: &str, label: &str| {
-        let requested = provided.unwrap_or_else(|| Path::new(default));
-        let candidate = if requested.is_absolute() {
-            requested.to_path_buf()
-        } else {
-            project.join(requested)
-        };
-        candidate.canonicalize().map_err(|error| {
-            let guidance = if provided.is_none() {
-                format!(
-                    "; expected this project to contain `{default}` (run from the project directory or pass the project path)"
-                )
-            } else {
-                String::new()
-            };
-            format!(
-                "failed to resolve lifecycle {label} `{}`: {error}{guidance}",
-                candidate.display()
-            )
-        })
-    };
-    let catalog = resolve_input(catalog, "distributed.contracts.json", "contract catalog")?;
-    let config = resolve_input(config, "distributed.lifecycle.json", "config")?;
-    let requested_out = out.unwrap_or_else(|| Path::new("dist/distributed"));
-    let out = if requested_out.is_absolute() {
-        requested_out.to_path_buf()
-    } else {
-        project.join(requested_out)
-    };
-
-    let mut failures = Vec::new();
-    let mut workspace = None;
-    for candidate in project.ancestors() {
-        if !catalog.starts_with(candidate)
-            || !config.starts_with(candidate)
-            || !out.starts_with(candidate)
-        {
-            continue;
-        }
-        match ContractCatalog::from_path_at_root(&catalog, candidate) {
-            Ok(_) => {
-                workspace = Some(candidate.to_path_buf());
-                break;
-            }
-            Err(error) => failures.push(format!("{}: {error}", candidate.display())),
-        }
-    }
-    let workspace = workspace.ok_or_else(|| {
-        let detail = failures
-            .last()
-            .map(|failure| format!(" Last attempted root: {failure}"))
-            .unwrap_or_default();
-        format!(
-            "unable to discover the workspace for lifecycle project `{}`; no project ancestor resolves every catalog source.{detail}",
-            project.display()
-        )
-    })?;
-
-    Ok(ResolvedLifecycleProject::Files {
-        project,
-        workspace,
-        catalog,
-        config,
+    load_project_environment(&project)?;
+    let executable = std::env::current_exe()?;
+    Ok(discover_lifecycle_project(
+        &project,
+        executable,
+        command_prefix,
         out,
-    })
+    )?)
 }
 
 fn load_project_environment(project: &Path) -> Result<(), Box<dyn Error>> {
@@ -874,104 +769,71 @@ fn stop_on_signals() -> Result<Arc<AtomicBool>, Box<dyn Error>> {
 }
 
 fn run_build(args: &BuildArgs, command_prefix: &[&str]) -> Result<(), Box<dyn Error>> {
-    let resolved = resolve_lifecycle_project(
-        args.project.as_deref(),
-        args.root.as_deref(),
-        args.catalog.as_deref(),
-        args.config.as_deref(),
-        args.out.as_deref(),
-        command_prefix,
-    )?;
+    let project =
+        resolve_lifecycle_project(args.project.as_deref(), args.out.as_deref(), command_prefix)?;
+    let project = &project;
     let stop = stop_on_signals()?;
-    let (report, detail) = match &resolved {
-        ResolvedLifecycleProject::Discovered(project) => {
-            if args.check {
-                prepare_project_javascript(project, true)?;
-            } else {
-                build_project_runtime(project, &stop)?;
-                prepare_project_javascript(project, false)?;
-                if let Some(ui) = &project.ui {
-                    prepare_ui_dependencies(project, ui, &stop)?;
-                }
-                prepare_project_wasm_pures(project).map_err(|error| {
-                    contextualize_project_generation_error(
-                        project,
-                        ProjectGenerationPhase::ApplicationPreflight,
-                        error,
-                    )
-                })?;
-            }
-            eprintln!(
-                "distributed build: introspecting typed application {} (the first run may compile its harness)",
-                project.application_package
-            );
-            let report = run_lifecycle_project_build(
-                &project.plan,
-                &LifecycleBuildRequest {
-                    check: args.check,
-                    check_baseline: LifecycleCheckBaseline::ActiveGeneration,
-                    lock_timeout: Duration::from_millis(args.lock_timeout_ms),
-                    nodes: None,
-                    activation_inputs: None,
-                    cancel: Some(Arc::clone(&stop)),
-                    activation: LifecycleActivation::Deferred,
-                },
-            )
-            .map_err(|error| {
-                contextualize_project_generation_error(
-                    project,
-                    ProjectGenerationPhase::LifecycleBuild,
-                    error,
-                )
-            })?;
-            if !args.check {
-                build_project_ui(project, &report, &stop)?;
-                activate_lifecycle_project_generation(
-                    &project.plan,
-                    &report,
-                    Duration::from_millis(args.lock_timeout_ms),
-                )?;
-            }
-            (report, Some(project))
+    if args.check {
+        prepare_project_javascript(project, true, &stop)?;
+    } else {
+        build_project_runtime(project, &stop)?;
+        prepare_project_javascript(project, false, &stop)?;
+        if let Some(ui) = &project.ui {
+            prepare_ui_dependencies(project, ui, &stop)?;
         }
-        ResolvedLifecycleProject::Files {
-            workspace,
-            catalog,
-            config,
-            out,
-            ..
-        } => (
-            run_lifecycle_build(&LifecycleBuildOptions {
-                root: workspace.clone(),
-                catalog: catalog.clone(),
-                config: config.clone(),
-                out: out.clone(),
-                check: args.check,
-                lock_timeout: Duration::from_millis(args.lock_timeout_ms),
-                nodes: None,
-                activation_inputs: None,
-                cancel: Some(Arc::clone(&stop)),
-            })?,
-            None,
-        ),
-    };
+        prepare_project_wasm_pures(project, &stop).map_err(|error| {
+            contextualize_project_generation_error(
+                project,
+                ProjectGenerationPhase::ApplicationPreflight,
+                error,
+            )
+        })?;
+    }
+    eprintln!(
+        "distributed build: introspecting typed application {} (the first run may compile its harness)",
+        project.application_package
+    );
+    let report = run_lifecycle_project_build(
+        &project.plan,
+        &LifecycleBuildRequest {
+            check: args.check,
+            lock_timeout: Duration::from_millis(args.lock_timeout_ms),
+            nodes: None,
+            activation_inputs: None,
+            cancel: Some(Arc::clone(&stop)),
+            activation: LifecycleActivation::Deferred,
+        },
+    )
+    .map_err(|error| {
+        contextualize_project_generation_error(
+            project,
+            ProjectGenerationPhase::LifecycleBuild,
+            error,
+        )
+    })?;
+    if !args.check {
+        build_project_ui(project, &report, &stop)?;
+        activate_lifecycle_project_generation(
+            &project.plan,
+            &report,
+            Duration::from_millis(args.lock_timeout_ms),
+        )?;
+    }
     match args.output {
         LifecycleOutput::Json => println!("{}", serde_json::to_string(&report)?),
         LifecycleOutput::Human => {
             let mode = if report.check { "check" } else { "build" };
-            if let Some(project) = detail {
-                println!(
-                    "distributed {mode}: project={} application={} runtime={}{}",
-                    project.name,
-                    project.application_package,
-                    project.runtime_binary,
-                    project
-                        .ui
-                        .as_ref()
-                        .map(|ui| format!(" ui={}", ui.display()))
-                        .unwrap_or_default()
-                );
-            }
+            println!(
+                "distributed {mode}: project={} application={} runtime={}{}",
+                project.name,
+                project.application_package,
+                project.runtime_binary,
+                project
+                    .ui
+                    .as_ref()
+                    .map(|ui| format!(" ui={}", ui.root.display()))
+                    .unwrap_or_default()
+            );
             println!(
                 "lifecycle graph: {} generation={} release={} nodes={}",
                 if report.ok { "ok" } else { "drift" },
@@ -1054,7 +916,10 @@ fn is_application_introspection_failure(phase: ProjectGenerationPhase, error: &s
     }
 }
 
-fn prepare_project_wasm_pures(project: &DiscoveredLifecycleProject) -> Result<(), Box<dyn Error>> {
+fn prepare_project_wasm_pures(
+    project: &DiscoveredLifecycleProject,
+    stop: &AtomicBool,
+) -> Result<(), Box<dyn Error>> {
     if project.ui.is_none() {
         return Ok(());
     }
@@ -1069,6 +934,7 @@ fn prepare_project_wasm_pures(project: &DiscoveredLifecycleProject) -> Result<()
             distributed_path: Some(project.distributed_root.clone()),
         },
         HarnessMode::DescribeJson,
+        Some(stop),
     )?;
     let manifest: serde_json::Value = serde_json::from_str(&json)?;
     validate_manifest_json(&manifest)?;
@@ -1076,11 +942,12 @@ fn prepare_project_wasm_pures(project: &DiscoveredLifecycleProject) -> Result<()
         .javascript
         .as_ref()
         .zip(project.ui.as_ref())
-        .map(|(javascript, ui)| javascript.wasm_pack_launcher(ui));
+        .map(|(javascript, ui)| javascript.wasm_pack_launcher(&ui.root));
     build_declared_wasm_pures(
         &manifest,
         &project.cargo_root.join("Cargo.toml"),
         wasm_pack_launcher.as_deref(),
+        Some(stop),
     )?;
     Ok(())
 }
@@ -1091,28 +958,24 @@ fn build_project_ui(
     stop: &AtomicBool,
 ) -> Result<(), Box<dyn Error>> {
     if let Some(ui) = &project.ui {
-        let ui_root = ui;
-        prepare_ui_dependencies(project, ui_root, stop)?;
-        eprintln!(
-            "distributed build: checking SvelteKit UI {}",
-            ui_root.display()
-        );
-        run_project_ui_script(project, generation, ui_root, "check", true, stop)?;
-        eprintln!(
-            "distributed build: compiling SvelteKit UI {}",
-            ui_root.display()
-        );
-        run_project_ui_script(project, generation, ui_root, "build", false, stop)?;
+        prepare_ui_dependencies(project, ui, stop)?;
+        for (step, args) in [("check", &ui.check), ("build", &ui.build)] {
+            if args.is_empty() {
+                continue;
+            }
+            eprintln!("distributed build: UI {step} in {}", ui.root.display());
+            run_project_ui_command(project, generation, ui, step, args, stop)?;
+        }
     }
     Ok(())
 }
 
-fn run_project_ui_script(
+fn run_project_ui_command(
     project: &DiscoveredLifecycleProject,
     generation: &crate::lifecycle::LifecycleBuildReport,
-    ui_root: &Path,
-    script: &str,
-    if_present: bool,
+    ui: &UiAdapter,
+    step: &str,
+    args: &[String],
     stop: &AtomicBool,
 ) -> Result<(), Box<dyn Error>> {
     let lifecycle_dir = if project.plan.out.is_absolute() {
@@ -1120,44 +983,42 @@ fn run_project_ui_script(
     } else {
         project.plan.root.join(&project.plan.out)
     };
-    let mut command = Command::new("npm");
-    command.args(["run", script]);
-    if if_present {
-        command.arg("--if-present");
-    }
+    let mut command = Command::new(&ui.package_manager);
     command
-        .current_dir(ui_root)
+        .args(args)
+        .current_dir(&ui.root)
         .env("DISTRIBUTED_LIFECYCLE_OWNS_CLIENT_COMPILE", "1")
         .env("DISTRIBUTED_LIFECYCLE_PROJECT_ROOT", &project.plan.root)
         .env("DISTRIBUTED_LIFECYCLE_DIR", lifecycle_dir)
         .env(
             "DISTRIBUTED_LIFECYCLE_GENERATION_ID",
             &generation.generation_id,
+        )
+        .env(
+            crate::lifecycle::LIFECYCLE_CLI_EXECUTABLE_ENV,
+            &project.plan.cli_executable,
         );
-    if let Some(executable) = project.plan.cli_executable.as_deref() {
-        command.env(crate::lifecycle::LIFECYCLE_CLI_EXECUTABLE_ENV, executable);
-    }
     finish_project_command(
-        crate::process::run(&mut command, stop)?,
-        &format!("SvelteKit UI `{script}`"),
+        crate::process::run(&mut command, Some(stop))?,
+        &format!("UI {step}"),
     )
 }
 
 fn prepare_ui_dependencies(
     project: &DiscoveredLifecycleProject,
-    ui_root: &Path,
+    ui: &UiAdapter,
     stop: &AtomicBool,
 ) -> Result<(), Box<dyn Error>> {
-    if !ui_root.join("node_modules").is_dir() {
-        install_ui_dependencies(ui_root, stop)?;
+    if !ui.root.join("node_modules").is_dir() {
+        install_ui_dependencies(ui, stop)?;
     }
     let Some(javascript) = &project.javascript else {
         return Ok(());
     };
-    if let Err(error) = javascript.verify_installed(ui_root) {
-        eprintln!("distributed: refreshing SvelteKit dependencies because {error}");
-        install_ui_dependencies(ui_root, stop)?;
-        javascript.verify_installed(ui_root)?;
+    if let Err(error) = javascript.verify_installed(&ui.root) {
+        eprintln!("distributed: refreshing UI dependencies because {error}");
+        install_ui_dependencies(ui, stop)?;
+        javascript.verify_installed(&ui.root)?;
     }
     Ok(())
 }
@@ -1165,36 +1026,37 @@ fn prepare_ui_dependencies(
 fn prepare_project_javascript(
     project: &DiscoveredLifecycleProject,
     check: bool,
+    stop: &AtomicBool,
 ) -> Result<(), Box<dyn Error>> {
     if let Some(javascript) = &project.javascript {
-        javascript.prepare(&project.cargo_root, check)?;
+        javascript.prepare(&project.cargo_root, check, Some(stop))?;
         if check {
             let ui = project
                 .ui
                 .as_ref()
                 .ok_or("Distributed JavaScript package resolved without a UI root")?;
-            javascript.verify_installed(ui)?;
+            javascript.verify_installed(&ui.root)?;
         }
     }
     Ok(())
 }
 
-fn install_ui_dependencies(ui_root: &Path, stop: &AtomicBool) -> Result<(), Box<dyn Error>> {
-    let install = if ui_root.join("package-lock.json").is_file() {
-        "ci"
-    } else {
-        "install"
-    };
+fn install_ui_dependencies(ui: &UiAdapter, stop: &AtomicBool) -> Result<(), Box<dyn Error>> {
+    let install = ui.install.clone().unwrap_or_else(|| {
+        let locked = ui.root.join("package-lock.json").is_file();
+        vec![if locked { "ci" } else { "install" }.to_string()]
+    });
     eprintln!(
-        "distributed: installing SvelteKit dependencies with `npm {install}` in {}",
-        ui_root.display()
+        "distributed: installing UI dependencies with `{} {}` in {}",
+        ui.package_manager,
+        install.join(" "),
+        ui.root.display()
     );
-    run_project_command(
-        ui_root,
-        "npm",
-        &[OsString::from(install)],
-        "SvelteKit dependency install",
-        stop,
+    let mut command = Command::new(&ui.package_manager);
+    command.args(install).current_dir(&ui.root);
+    finish_project_command(
+        crate::process::run(&mut command, Some(stop))?,
+        "UI dependency install",
     )
 }
 
@@ -1209,7 +1071,7 @@ fn run_project_command(
 ) -> Result<(), Box<dyn Error>> {
     let mut command = Command::new(program);
     command.args(args).current_dir(cwd);
-    finish_project_command(crate::process::run(&mut command, stop)?, label)
+    finish_project_command(crate::process::run(&mut command, Some(stop))?, label)
 }
 
 fn finish_project_command(
@@ -1224,74 +1086,36 @@ fn finish_project_command(
 }
 
 fn run_dev(args: &DevArgs, command_prefix: &[&str]) -> Result<(), Box<dyn Error>> {
-    let resolved = resolve_lifecycle_project(
-        args.project.as_deref(),
-        args.root.as_deref(),
-        args.catalog.as_deref(),
-        args.config.as_deref(),
-        args.out.as_deref(),
-        command_prefix,
-    )?;
+    let project =
+        resolve_lifecycle_project(args.project.as_deref(), args.out.as_deref(), command_prefix)?;
     let stop = stop_on_signals()?;
-    let report = match resolved {
-        ResolvedLifecycleProject::Discovered(project) => {
-            prepare_project_javascript(&project, false)?;
-            if let Some(ui) = &project.ui {
-                prepare_ui_dependencies(&project, ui, &stop)?;
-            }
-            eprintln!(
-                "distributed dev: project={} api={} ui={} (Ctrl-C to stop)",
-                project.name,
-                project.runtime_binary,
-                project
-                    .ui
-                    .as_ref()
-                    .map(|ui| ui.display().to_string())
-                    .unwrap_or_else(|| "none".to_string())
-            );
-            run_lifecycle_project_dev(&LifecycleProjectDevOptions {
-                project: project.plan,
-                build: LifecycleBuildRequest {
-                    check: false,
-                    check_baseline: LifecycleCheckBaseline::Workspace,
-                    lock_timeout: Duration::from_millis(args.lock_timeout_ms),
-                    nodes: None,
-                    activation_inputs: None,
-                    cancel: Some(Arc::clone(&stop)),
-                    activation: LifecycleActivation::Immediate,
-                },
-                stop: Arc::clone(&stop),
-                progress: true,
-            })?
-        }
-        ResolvedLifecycleProject::Files {
-            project,
-            workspace,
-            catalog,
-            config,
-            out,
-        } => {
-            eprintln!(
-                "lifecycle dev: starting project={} and waiting for the initial generation (Ctrl-C to stop)",
-                project.display()
-            );
-            run_lifecycle_dev(&LifecycleDevOptions {
-                build: LifecycleBuildOptions {
-                    root: workspace,
-                    catalog,
-                    config,
-                    out,
-                    check: false,
-                    lock_timeout: Duration::from_millis(args.lock_timeout_ms),
-                    nodes: None,
-                    activation_inputs: None,
-                    cancel: Some(Arc::clone(&stop)),
-                },
-                stop: Arc::clone(&stop),
-                progress: true,
-            })?
-        }
-    };
+    prepare_project_javascript(&project, false, &stop)?;
+    if let Some(ui) = &project.ui {
+        prepare_ui_dependencies(&project, ui, &stop)?;
+    }
+    eprintln!(
+        "distributed dev: project={} api={} ui={} (Ctrl-C to stop)",
+        project.name,
+        project.runtime_binary,
+        project
+            .ui
+            .as_ref()
+            .map(|ui| ui.root.display().to_string())
+            .unwrap_or_else(|| "none".to_string())
+    );
+    let report = run_lifecycle_project_dev(&LifecycleProjectDevOptions {
+        project: project.plan,
+        build: LifecycleBuildRequest {
+            check: false,
+            lock_timeout: Duration::from_millis(args.lock_timeout_ms),
+            nodes: None,
+            activation_inputs: None,
+            cancel: Some(Arc::clone(&stop)),
+            activation: LifecycleActivation::Immediate,
+        },
+        stop: Arc::clone(&stop),
+        progress: true,
+    })?;
     println!(
         "lifecycle dev: stopped initial={} final={} rebuilds={}",
         report.initial_generation, report.final_generation, report.rebuilds
@@ -1709,6 +1533,7 @@ fn run_describe(args: &DescribeArgs) -> Result<(), Box<dyn Error>> {
                     distributed_path: args.distributed_path.clone(),
                 },
                 HarnessMode::DescribeJson,
+                None,
             )?;
             let envelope: serde_json::Value = serde_json::from_str(&json)?;
             validate_manifest_json(&envelope)?;
@@ -1722,6 +1547,7 @@ fn run_describe(args: &DescribeArgs) -> Result<(), Box<dyn Error>> {
                     &envelope,
                     &cargo_manifest,
                     args.wasm_pack_launcher.as_deref(),
+                    None,
                 )?;
             }
             println!("{}", serde_json::to_string_pretty(&envelope)?);
@@ -1945,6 +1771,7 @@ fn run_client_manifest(args: &ClientManifestArgs) -> Result<(), Box<dyn Error>> 
             distributed_path: args.distributed_path.clone(),
         },
         HarnessMode::ClientManifest,
+        None,
     )?;
     let manifest: serde_json::Value = serde_json::from_str(&json)?;
     validate_client_manifest_json(&manifest)?;
@@ -1964,6 +1791,7 @@ fn run_game_manifest(args: &GameManifestArgs) -> Result<(), Box<dyn Error>> {
             distributed_path: None,
         },
         HarnessMode::GameManifest,
+        None,
     )?;
     crate::game_client::validate_game_surface(&json)?;
     let value: serde_json::Value = serde_json::from_str(&json)?;
@@ -2048,6 +1876,7 @@ fn run_schema(args: &SchemaArgs) -> Result<(), Box<dyn Error>> {
             distributed_path: args.distributed_path.clone(),
         },
         mode,
+        None,
     ).map_err(|err| -> Box<dyn Error> {
         let msg = err.to_string();
         if msg.contains("graphql_sdl") || msg.contains("no method named `graphql_sdl`") {

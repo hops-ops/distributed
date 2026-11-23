@@ -62,14 +62,15 @@ pub use contracts::{
 pub use game_client::{generate_game_client, validate_game_surface, ImportExtension};
 pub use generate::{generate_service_scaffold, package_name};
 pub use lifecycle::{
-    run_lifecycle_build, run_lifecycle_dev, ArtifactNodeReceipt, BuildDrift,
-    DistributedSourceIdentity, GenerationManifest, LifecycleBuildConfig, LifecycleBuildOptions,
-    LifecycleBuildReport, LifecycleConfig, LifecycleDevConfig, LifecycleDevOptions,
+    activate_lifecycle_project_generation, discover_lifecycle_project, run_lifecycle_project_build,
+    run_lifecycle_project_dev, ArtifactNodeReceipt, BuildDrift, DiscoveredLifecycleProject,
+    DistributedSourceIdentity, GenerationManifest, LifecycleActivation, LifecycleBuildConfig,
+    LifecycleBuildReport, LifecycleBuildRequest, LifecycleConfig, LifecycleDevConfig,
     LifecycleDevProbe, LifecycleDevProcess, LifecycleDevReport, LifecycleError, LifecycleExecutor,
-    LifecycleGraph, LifecycleNode, ReleaseManifest, ReleaseMember,
-    GENERATION_MANIFEST_SCHEMA_VERSION, LIFECYCLE_BUILD_CONFIG_SCHEMA_VERSION,
-    LIFECYCLE_CONFIG_SCHEMA_VERSION, LIFECYCLE_GRAPH_SCHEMA_VERSION, NODE_RECEIPT_SCHEMA_VERSION,
-    RELEASE_MANIFEST_SCHEMA_VERSION,
+    LifecycleGraph, LifecycleNode, LifecycleProjectDevOptions, LifecycleProjectPlan,
+    ReleaseManifest, ReleaseMember, UiAdapter, GENERATION_MANIFEST_SCHEMA_VERSION,
+    LIFECYCLE_BUILD_CONFIG_SCHEMA_VERSION, LIFECYCLE_CONFIG_SCHEMA_VERSION,
+    LIFECYCLE_GRAPH_SCHEMA_VERSION, NODE_RECEIPT_SCHEMA_VERSION, RELEASE_MANIFEST_SCHEMA_VERSION,
 };
 pub use skills::{embedded_skills, generate_skills, EmbeddedFile, EmbeddedSkill, SkillsInitSpec};
 

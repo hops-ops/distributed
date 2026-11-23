@@ -13,6 +13,7 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
 use crate::lifecycle::{digest_bytes, LifecycleError};
@@ -168,11 +169,19 @@ impl JavascriptFrameworkPackage {
         }
     }
 
-    pub(crate) fn prepare(&self, project_root: &Path, check: bool) -> Result<(), LifecycleError> {
+    /// Build a local checkout of the package when it is stale. `stop` is the
+    /// session's stop flag, or `None` outside a session (see
+    /// [`crate::process`]).
+    pub(crate) fn prepare(
+        &self,
+        project_root: &Path,
+        check: bool,
+        stop: Option<&AtomicBool>,
+    ) -> Result<(), LifecycleError> {
         let Some(root) = self.local_root() else {
             return Ok(());
         };
-        prepare_local_package(root, project_root, check)
+        prepare_local_package(root, project_root, check, stop)
     }
 
     pub(crate) fn lifecycle_receipt(&self, project_root: &Path) -> Option<PathBuf> {
@@ -249,7 +258,7 @@ pub(crate) fn watch_local_javascript(
             "failed to resolve local JavaScript watch package: {error}"
         ))
     })?)?;
-    package.prepare(project_root, false)?;
+    package.prepare(project_root, false, None)?;
     let mut observed_source = source_identity(package_root)?;
     loop {
         std::thread::sleep(Duration::from_millis(500));
@@ -263,7 +272,7 @@ pub(crate) fn watch_local_javascript(
         if next_source == observed_source {
             continue;
         }
-        match package.prepare(project_root, false) {
+        match package.prepare(project_root, false, None) {
             Ok(()) => observed_source = next_source,
             Err(error) => {
                 eprintln!("distributed: local JavaScript rebuild failed: {error}");
@@ -276,6 +285,7 @@ fn prepare_local_package(
     root: &Path,
     project_root: &Path,
     check: bool,
+    stop: Option<&AtomicBool>,
 ) -> Result<(), LifecycleError> {
     let package = read_package_json(&root.join("package.json"))?;
     let version = package.version.clone().ok_or_else(|| {
@@ -300,7 +310,7 @@ fn prepare_local_package(
     });
     if current {
         if !check {
-            prepare_local_wasm_pack(root)?;
+            prepare_local_wasm_pack(root, stop)?;
         }
         return Ok(());
     }
@@ -327,14 +337,15 @@ fn prepare_local_package(
             root,
             &[install, "--ignore-scripts"],
             "JavaScript framework dependency install",
+            stop,
         )?;
     }
-    prepare_local_wasm_pack(root)?;
+    prepare_local_wasm_pack(root, stop)?;
     eprintln!(
         "distributed: compiling local {DISTRIBUTED_JS_PACKAGE} from {}",
         root.display()
     );
-    build_local_package_staged(root, &package)?;
+    build_local_package_staged(root, &package, stop)?;
     let output_identity = output_identity(root, &package)?;
     let receipt = JavascriptReceipt {
         schema_version: RECEIPT_SCHEMA_VERSION,
@@ -377,7 +388,7 @@ fn prepare_local_package(
     Ok(())
 }
 
-fn prepare_local_wasm_pack(root: &Path) -> Result<(), LifecycleError> {
+fn prepare_local_wasm_pack(root: &Path, stop: Option<&AtomicBool>) -> Result<(), LifecycleError> {
     let package = root.join("node_modules/wasm-pack/package.json");
     if !package.is_file() {
         return Ok(());
@@ -399,10 +410,15 @@ fn prepare_local_wasm_pack(root: &Path) -> Result<(), LifecycleError> {
         root,
         &["rebuild", "wasm-pack"],
         "JavaScript framework wasm-pack install",
+        stop,
     )
 }
 
-fn build_local_package_staged(root: &Path, package: &PackageJson) -> Result<(), LifecycleError> {
+fn build_local_package_staged(
+    root: &Path,
+    package: &PackageJson,
+    stop: Option<&AtomicBool>,
+) -> Result<(), LifecycleError> {
     let parent = root
         .parent()
         .ok_or_else(|| LifecycleError::new("local JavaScript package has no parent directory"))?;
@@ -436,6 +452,7 @@ fn build_local_package_staged(root: &Path, package: &PackageJson) -> Result<(), 
         stage.path(),
         &["run", "build"],
         "JavaScript framework build",
+        stop,
     )?;
     output_identity(stage.path(), package)?;
     publish_dist(&stage.path().join("dist"), &root.join("dist"))
@@ -548,14 +565,17 @@ fn publish_dist(staged: &Path, destination: &Path) -> Result<(), LifecycleError>
     Ok(())
 }
 
-fn run_npm(root: &Path, args: &[&str], label: &str) -> Result<(), LifecycleError> {
-    let status = Command::new("npm")
-        .args(args)
-        .current_dir(root)
-        .status()
-        .map_err(|error| {
-            LifecycleError::new(format!("failed to start npm for {label}: {error}"))
-        })?;
+fn run_npm(
+    root: &Path,
+    args: &[&str],
+    label: &str,
+    stop: Option<&AtomicBool>,
+) -> Result<(), LifecycleError> {
+    let mut npm = Command::new("npm");
+    npm.args(args).current_dir(root);
+    let status = crate::process::run(&mut npm, stop)
+        .map_err(|error| LifecycleError::new(format!("failed to start npm for {label}: {error}")))?
+        .ok_or_else(|| LifecycleError::new(format!("{label} was stopped")))?;
     if !status.success() {
         return Err(LifecycleError::new(format!("{label} failed with {status}")));
     }

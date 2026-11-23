@@ -25,6 +25,13 @@ binary = "e2e-celld"
 [workspace.metadata.distributed.ui]
 path = "../e2e-ui/ui"
 
+# The same UI as tests/e2e-ui, so the same development environment.
+[workspace.metadata.distributed.ui.env]
+E2E_API_ORIGIN = "{api_url}"
+AUTH_URL = "{ui_url}"
+AUTH_USE_SECURE_COOKIES = "false"
+AUTH_SECRET = "distributed-local-development-only-secret"
+
 [workspace.package]
 version = "0.1.0"
 edition = "2021"

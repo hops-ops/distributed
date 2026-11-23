@@ -10,6 +10,10 @@ resolver = "2"
 [workspace.metadata.distributed.ui]
 path = "../sveltekit"
 
+# Auth.js builds its callback URLs from `AUTH_URL`.
+[workspace.metadata.distributed.ui.env]
+AUTH_URL = "{ui_url}"
+
 [package]
 name = "game_demos"
 version = "0.1.0"

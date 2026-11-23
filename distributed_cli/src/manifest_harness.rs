@@ -9,6 +9,7 @@ use std::error::Error;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::AtomicBool;
 
 use crate::cli::{path_for_toml, resolve_distributed_path};
 use crate::SchemaDialect;
@@ -61,9 +62,15 @@ impl HarnessMode {
     }
 }
 
+/// Compile and run the harness for `options`, returning what it prints.
+///
+/// `stop` is the session's stop flag when a `build` or `dev` session calls
+/// this itself, and `None` in a helper or a one-off command (see
+/// [`crate::process`]).
 pub(crate) fn run_manifest_harness(
     options: &HarnessOptions,
     mode: HarnessMode,
+    stop: Option<&AtomicBool>,
 ) -> Result<String, Box<dyn Error>> {
     let manifest_path =
         resolve_target_manifest_path(&options.path, options.manifest_path.as_deref())?;
@@ -114,15 +121,21 @@ pub(crate) fn run_manifest_harness(
     )?;
 
     let manifest_path = harness_dir.join("Cargo.toml");
-    let output = Command::new("cargo")
+    let mut command = Command::new("cargo");
+    command
         .args([
             "run",
             "--quiet",
             "--manifest-path",
             manifest_path.to_string_lossy().as_ref(),
         ])
-        .env("CARGO_TARGET_DIR", harness_root.join("target"))
-        .output()?;
+        .env("CARGO_TARGET_DIR", harness_root.join("target"));
+    let output = crate::process::output(&mut command, stop)?.ok_or_else(|| {
+        format!(
+            "manifest harness for package `{}` was stopped",
+            package.name
+        )
+    })?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);

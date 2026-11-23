@@ -11,6 +11,7 @@ use std::error::Error;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::AtomicBool;
 
 const MAX_SOURCE_FILES: usize = 20_000;
 const MAX_SOURCE_BYTES: u64 = 128 * 1024 * 1024;
@@ -75,10 +76,13 @@ struct WasmStamp {
     import: String,
 }
 
+/// Compile the browser WASM the manifest declares. `stop` is the session's
+/// stop flag, or `None` outside a session (see [`crate::process`]).
 pub(crate) fn build_declared_wasm_pures(
     manifest: &Value,
     cargo_manifest: &Path,
     wasm_pack_launcher: Option<&Path>,
+    stop: Option<&AtomicBool>,
 ) -> Result<usize, Box<dyn Error>> {
     let pures = collect_wasm_pures(manifest)?;
     if pures.is_empty() {
@@ -86,9 +90,10 @@ pub(crate) fn build_declared_wasm_pures(
     }
     let metadata = cargo_metadata(cargo_manifest)?;
     let project_root = &metadata.workspace_root;
-    let Some(ui_root) = crate::lifecycle::discover_ui(&metadata.metadata, project_root)? else {
+    let Some(ui) = crate::lifecycle::discover_ui(&metadata.metadata, project_root)? else {
         return Ok(0);
     };
+    let ui_root = ui.root;
     let ui_lib = ui_root.join("src/lib");
     let wasm_pack_launcher = wasm_pack_launcher
         .ok_or("browser WASM pures require @hops-ops/distributed in the application UI")?;
@@ -154,6 +159,7 @@ pub(crate) fn build_declared_wasm_pures(
             &destination,
             &stamp_path,
             &stamp,
+            stop,
         )?;
     }
     Ok(pures.len())
@@ -535,6 +541,7 @@ fn build_wasm_pure(
     destination: &Path,
     stamp_path: &Path,
     stamp: &WasmStamp,
+    stop: Option<&AtomicBool>,
 ) -> Result<(), Box<dyn Error>> {
     let parent = destination
         .parent()
@@ -558,22 +565,31 @@ fn build_wasm_pure(
         "distributed: compiling required browser WASM {} from Cargo package {}",
         stamp.import, stamp.rust_package
     );
-    let output = Command::new("node")
+    let mut compiler = Command::new("node");
+    compiler
         .arg(wasm_pack_launcher)
         .arg("build")
         .arg(package_dir)
         .args(["--target", "web", "--out-dir"])
         .arg(stage.path())
-        .args(["--out-name", output_name, "--", "--no-default-features", "--features", "wasm"])
+        .args([
+            "--out-name",
+            output_name,
+            "--",
+            "--no-default-features",
+            "--features",
+            "wasm",
+        ])
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::inherit())
-        .status()
+        .stderr(std::process::Stdio::inherit());
+    let output = crate::process::run(&mut compiler, stop)
         .map_err(|error| {
             format!(
                 "failed to start the @hops-ops/distributed WASM compiler `{}` for pure `{}`; run `distributed build` from `{}`: {error}",
                 wasm_pack_launcher.display(), stamp.import, project_root.display()
             )
-        })?;
+        })?
+        .ok_or_else(|| format!("WASM compiler for pure `{}` was stopped", stamp.import))?;
     if !output.success() {
         return Err(format!(
             "required WASM pure `{}` failed to compile with {output}",
