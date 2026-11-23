@@ -40,9 +40,14 @@ where
             }
             crate::projection_protocol::validate_ownership_batch(ownership)?;
 
-            let mut tx = self.pool().begin().await.map_err(|error| {
-                protocol_storage_error::<DB>("begin projection registration", error)
-            })?;
+            // Registration reads the table fences before it creates them.
+            let mut tx = self
+                .pool()
+                .begin_with(DB::BEGIN_READ_THEN_WRITE)
+                .await
+                .map_err(|error| {
+                    protocol_storage_error::<DB>("begin projection registration", error)
+                })?;
             let ownership_tables = ownership
                 .iter()
                 .map(|declaration| declaration.table.clone())
