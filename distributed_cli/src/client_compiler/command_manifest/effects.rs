@@ -1,18 +1,18 @@
 use std::collections::BTreeSet;
 
 use crate::client_compiler::manifest::{
-    ManifestCommand, ManifestCommandShape, ManifestEffectExpression, ManifestInputDefault,
-    ManifestProjectionPreviewSource,
+    ClientCommand, ClientCommandShape, ClientProjectionPreviewSource, CommandInputDefault,
+    EffectExpression,
 };
 use crate::client_compiler::ClientCompileError;
 
 use super::support::command_error;
 
 pub(super) fn validate_trusted_preset_inventory(
-    command: &ManifestCommand,
+    command: &ClientCommand,
 ) -> Result<(), ClientCompileError> {
-    fn expression_names<'a>(expression: &'a ManifestEffectExpression, out: &mut BTreeSet<&'a str>) {
-        if let ManifestEffectExpression::TrustedPreset { name } = expression {
+    fn expression_names<'a>(expression: &'a EffectExpression, out: &mut BTreeSet<&'a str>) {
+        if let EffectExpression::TrustedPreset { name } = expression {
             out.insert(name);
         }
     }
@@ -25,7 +25,7 @@ pub(super) fn validate_trusted_preset_inventory(
     if let Some(projection) = &command.extensions.projection {
         for occurrence in &projection.preview_occurrences {
             for value in &occurrence.values {
-                if let ManifestProjectionPreviewSource::TrustedPreset { name, .. } = &value.source {
+                if let ClientProjectionPreviewSource::TrustedPreset { name, .. } = &value.source {
                     referenced.insert(name);
                 }
             }
@@ -49,9 +49,9 @@ pub(super) fn validate_trusted_preset_inventory(
 }
 
 pub(super) fn validate_defaults(
-    command: &ManifestCommand,
+    command: &ClientCommand,
     version: u32,
-    defaults: &[ManifestInputDefault],
+    defaults: &[CommandInputDefault],
 ) -> Result<(), ClientCompileError> {
     if version != 1 || defaults.is_empty() {
         return Err(command_error(
@@ -60,7 +60,7 @@ pub(super) fn validate_defaults(
             "input_defaults must be version 1 with at least one entry",
         ));
     }
-    let ManifestCommandShape::Object { definition } = &command.input else {
+    let ClientCommandShape::Object { definition } = &command.input else {
         return Err(command_error(
             command,
             "client.manifest.input_default_path",

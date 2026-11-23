@@ -577,7 +577,9 @@ fn projected_command_exports_opaque_role_safe_direct_target() {
     assert_eq!(direct.model, "TodoView");
     assert_eq!(
         direct.partition,
-        Some(serde_json::json!({"kind": "input", "path": ["todo_id"]}))
+        Some(EffectExpression::Input {
+            path: vec!["todo_id".into()]
+        })
     );
     assert_eq!(direct.change_epoch, "todo-domain-v1");
 
@@ -805,7 +807,7 @@ fn role_manifest_is_deterministic_and_hides_denied_identity_and_commands() {
         }
     );
     assert_eq!(
-        trusted_preset_descriptors(&first).unwrap(),
+        trusted_preset_descriptors(&first.models, &first.commands).unwrap(),
         vec![ClientTrustedPresetDescriptor {
             name: "x-user-id".into(),
             codec: "string".into(),
@@ -873,7 +875,7 @@ fn role_manifest_is_deterministic_and_hides_denied_identity_and_commands() {
     assert!(first
         .commands
         .iter()
-        .all(|command| command.extensions.consistency.kind == "succeeded"));
+        .all(|command| command.extensions.consistency.kind == CommandConsistency::Succeeded));
 
     let json = serde_json::to_string(&first).unwrap();
     assert!(!json.contains("secret"));
@@ -1191,7 +1193,7 @@ fn active_causal_modeled_projection_exports_exact_command_plan() {
     assert_eq!(manifest.projection_bindings.len(), 1);
     assert_eq!(
         manifest.projection_bindings[0].state,
-        ClientProjectionBindingState::Active
+        ProjectionBindingState::Active
     );
     let operation = &manifest.projection_programs[0].arms[0].operations[0];
     assert_eq!(operation.key.len(), 1);
@@ -1318,12 +1320,12 @@ fn draining_and_background_bindings_are_visible_but_cannot_mint_command_work() {
         (
             ProjectionBindingState::Draining,
             ProjectionExecutionClass::Causal,
-            ClientProjectionBindingState::Draining,
+            ProjectionBindingState::Draining,
         ),
         (
             ProjectionBindingState::Active,
             ProjectionExecutionClass::Background,
-            ClientProjectionBindingState::Active,
+            ProjectionBindingState::Active,
         ),
     ] {
         let full = modeled_surface(state, class);
@@ -1350,9 +1352,12 @@ fn draining_and_background_bindings_are_visible_but_cannot_mint_command_work() {
 #[test]
 fn draining_manifest_compiles_current_revalidation_without_projection_authority() {
     use crate::projection::placement::{ProjectionBindingState, ProjectionExecutionClass};
+    // The compiler links the non-test build of this crate, so its manifest
+    // type is not `crate`'s here: hand it the manifest as the JSON a service
+    // exports.
     use distributed_cli::{
         compile_client, ClientCompileInput, ClientDocument,
-        ClientSurfaceSelector as CompilerSurfaceSelector,
+        ClientSurfaceIdentity as CompilerSurfaceIdentity,
     };
 
     let full = modeled_causal_surface(
@@ -1368,16 +1373,17 @@ fn draining_manifest_compiles_current_revalidation_without_projection_authority(
     .unwrap();
     assert_eq!(
         manifest.projection_bindings[0].state,
-        ClientProjectionBindingState::Draining
+        ProjectionBindingState::Draining
     );
-    let project = compile_client(ClientCompileInput::new(
+    let project = ClientCompileInput::from_manifest_json(
         serde_json::to_value(manifest).unwrap(),
-        CompilerSurfaceSelector::role("admin"),
+        CompilerSurfaceIdentity::role("admin"),
         vec![ClientDocument::new(
             "src/routes/todos/+page.graphql",
             "query Todos { todos { todo_id } }",
         )],
-    ))
+    )
+    .and_then(compile_client)
     .expect("compile the server-generated Draining manifest");
     let generated = project
         .files

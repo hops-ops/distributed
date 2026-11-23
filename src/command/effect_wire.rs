@@ -202,17 +202,23 @@ pub trait EffectRelationshipMarker {
     const FIELD: &'static str;
 }
 
+/// How a generated canonical-input default is produced.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub(crate) enum InputDefaultGenerator {
+pub enum InputDefaultGenerator {
     UuidV7,
     Ulid,
 }
 
+/// One generated default of a command's canonical input.
+///
+/// The client manifest serializes this struct directly, so the field order
+/// is part of the manifest bytes and its schema fingerprint.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct CommandInputDefault {
-    pub path: Vec<String>,
+#[serde(deny_unknown_fields)]
+pub struct CommandInputDefault {
     pub generator: InputDefaultGenerator,
+    pub path: Vec<String>,
 }
 
 /// One compile-checked generated canonical-input default.

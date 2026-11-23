@@ -260,7 +260,7 @@ mod client_contract {
             ClientCommandShape, ClientProjectionExpression, ClientProjectionMutationKind,
         };
         use distributed_cli::{
-            compile_client, ClientCompileInput, ClientDocument, ClientSurfaceSelector,
+            compile_client, ClientCompileInput, ClientDocument, ClientSurfaceIdentity,
         };
 
         let mounts = LocalProjectionMountsBuilder::new("members", "events")
@@ -344,8 +344,8 @@ mod client_contract {
             assert_eq!(command.extensions.trusted_presets[0].name, "x-user-id");
 
             let compiled = compile_client(ClientCompileInput::new(
-                serde_json::to_value(&manifest).unwrap(),
-                ClientSurfaceSelector::role("user"),
+                manifest.clone(),
+                ClientSurfaceIdentity::role("user"),
                 vec![ClientDocument::new(
                     "src/routes/members/+page.graphql",
                     "query Members @load { flat_members { id user_id } }",

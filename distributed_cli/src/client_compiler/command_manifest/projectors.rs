@@ -1,13 +1,13 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::client_compiler::manifest::{ManifestModel, ManifestProjector};
+use crate::client_compiler::manifest::{ClientModel, ClientProjector};
 use crate::client_compiler::ClientCompileError;
 
 use super::support::{invalid, nonempty};
 
 pub(super) fn validate_projector_inventory(
-    projectors: &[ManifestProjector],
-    models: &BTreeMap<String, ManifestModel>,
+    projectors: &[ClientProjector],
+    models: &BTreeMap<String, ClientModel>,
 ) -> Result<(), ClientCompileError> {
     let mut names = BTreeSet::new();
     for projector in projectors {

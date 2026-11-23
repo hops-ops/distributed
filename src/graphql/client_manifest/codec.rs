@@ -255,7 +255,13 @@ pub(super) fn scalar_codec(scalar: &str) -> Option<&'static str> {
     }
 }
 
-pub(super) fn protocol_fingerprint() -> Result<String, ClientManifestError> {
+/// Fingerprint of the client protocol family this crate speaks: the wire
+/// versions and scalar codecs every manifest it exports (or accepts) uses.
+///
+/// # Errors
+///
+/// Never in practice; the material is plain data.
+pub fn client_protocol_fingerprint() -> Result<String, ClientManifestError> {
     #[derive(Serialize)]
     struct ProtocolMaterial {
         manifest_version: u32,

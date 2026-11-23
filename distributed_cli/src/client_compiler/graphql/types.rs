@@ -249,7 +249,7 @@ pub(crate) struct CompiledFilterPlan {
     pub(crate) input: Option<CompiledArgument>,
     pub(crate) fields: Vec<CompiledFilterField>,
     pub(crate) relationships: Vec<CompiledRelationshipPlan>,
-    pub(crate) row_policy: ManifestRowPolicy,
+    pub(crate) row_policy: ClientRowPolicy,
     pub(super) variable_constraints: BTreeMap<String, VariableUseConstraint>,
 }
 
@@ -306,9 +306,9 @@ pub(crate) struct CompiledFilterField {
 pub(crate) struct CompiledRelationshipPlan {
     pub(crate) field: String,
     pub(crate) target_model: String,
-    pub(crate) kind: ManifestRelationshipKind,
-    pub(crate) key_mapping: ManifestRelationshipKeyMapping,
-    pub(crate) maintenance: ManifestRelationshipMaintenance,
+    pub(crate) kind: ClientRelationshipKind,
+    pub(crate) key_mapping: RelationshipKeyMapping,
+    pub(crate) maintenance: ClientRelationshipMaintenance,
     pub(crate) dependencies: Vec<String>,
 }
 

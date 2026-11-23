@@ -1,8 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::client_compiler::manifest::{
-    ManifestCommand, ManifestCommandShape, ManifestConsistencyKind, ManifestModel, ManifestRoot,
-    ManifestTypeDef, RootOperation,
+    ClientCommand, ClientCommandShape, ClientModel, ClientRoot, ClientRootOperation, ClientTypeDef,
+    CommandConsistency,
 };
 use crate::client_compiler::ClientCompileError;
 
@@ -15,8 +15,8 @@ pub(super) enum CommandTypeKind {
 }
 
 pub(super) fn projected_output_typename<'a>(
-    command: &ManifestCommand,
-    models: &'a BTreeMap<String, ManifestModel>,
+    command: &ClientCommand,
+    models: &'a BTreeMap<String, ClientModel>,
 ) -> Option<&'a str> {
     if let Some(target) = command.extensions.direct_projection.as_ref() {
         if let Some(model) = models.get(&target.model) {
@@ -24,10 +24,10 @@ pub(super) fn projected_output_typename<'a>(
         }
     }
     let consistency = &command.extensions.consistency;
-    if consistency.kind != ManifestConsistencyKind::Atomic {
+    if consistency.kind != CommandConsistency::Atomic {
         return None;
     }
-    let ManifestCommandShape::Object { definition } = &command.output else {
+    let ClientCommandShape::Object { definition } = &command.output else {
         return None;
     };
     models
@@ -37,8 +37,8 @@ pub(super) fn projected_output_typename<'a>(
 }
 
 pub(super) fn occupied_surface_types(
-    models: &BTreeMap<String, ManifestModel>,
-    roots: &BTreeMap<(RootOperation, String), ManifestRoot>,
+    models: &BTreeMap<String, ClientModel>,
+    roots: &BTreeMap<(ClientRootOperation, String), ClientRoot>,
     scalar_codecs: &BTreeMap<String, String>,
 ) -> BTreeSet<String> {
     let mut occupied = ["Query", "Mutation", "Subscription", "order_by"]
@@ -83,17 +83,17 @@ pub(super) fn occupied_surface_types(
 }
 
 pub(super) fn validate_shape(
-    shape: &ManifestCommandShape,
+    shape: &ClientCommandShape,
     kind: CommandTypeKind,
     scalar_codecs: &BTreeMap<String, String>,
     label: &str,
     occupied_types: &BTreeSet<String>,
     allowed_occupied_type: Option<&str>,
-    definitions: &mut BTreeMap<String, (CommandTypeKind, ManifestTypeDef)>,
+    definitions: &mut BTreeMap<String, (CommandTypeKind, ClientTypeDef)>,
 ) -> Result<(), ClientCompileError> {
     match shape {
-        ManifestCommandShape::None => Ok(()),
-        ManifestCommandShape::Object { definition } => validate_type_def(
+        ClientCommandShape::None => Ok(()),
+        ClientCommandShape::Object { definition } => validate_type_def(
             definition,
             kind,
             scalar_codecs,
@@ -106,13 +106,13 @@ pub(super) fn validate_shape(
 }
 
 fn validate_type_def(
-    definition: &ManifestTypeDef,
+    definition: &ClientTypeDef,
     kind: CommandTypeKind,
     scalar_codecs: &BTreeMap<String, String>,
     label: &str,
     occupied_types: &BTreeSet<String>,
     allowed_occupied_type: Option<&str>,
-    definitions: &mut BTreeMap<String, (CommandTypeKind, ManifestTypeDef)>,
+    definitions: &mut BTreeMap<String, (CommandTypeKind, ClientTypeDef)>,
 ) -> Result<(), ClientCompileError> {
     graphql_name(&definition.name, &format!("{label} type"))?;
     if occupied_types.contains(&definition.name)
@@ -234,37 +234,4 @@ fn validate_codec(
             format!("{label} references unsupported scalar `{scalar}`"),
         )),
     }
-}
-
-pub(super) fn canonical_command_operation(command: &ManifestCommand) -> String {
-    let operation_name = format!("Client_{}", command.mutation_field);
-    let (variables, arguments) = match &command.input {
-        ManifestCommandShape::None => ("($commandId: ID!)".to_string(), "(commandId: $commandId)"),
-        ManifestCommandShape::Object { definition } => (
-            format!("($commandId: ID!, $input: {}!)", definition.name),
-            "(commandId: $commandId, input: $input)",
-        ),
-    };
-    let selection = match &command.output {
-        ManifestCommandShape::Object { definition } => {
-            format!(" {{ {} }}", command_selection(definition))
-        }
-        ManifestCommandShape::None => String::new(),
-    };
-    format!(
-        "mutation {operation_name}{variables} {{ {}{arguments}{selection} }}",
-        command.mutation_field
-    )
-}
-
-fn command_selection(definition: &ManifestTypeDef) -> String {
-    definition
-        .fields
-        .iter()
-        .map(|field| match &field.nested {
-            Some(nested) => format!("{} {{ {} }}", field.name, command_selection(nested)),
-            None => field.name.clone(),
-        })
-        .collect::<Vec<_>>()
-        .join(" ")
 }

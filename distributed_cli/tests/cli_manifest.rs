@@ -124,14 +124,15 @@ fn client_manifest_uses_service_surface_export() {
 fn emitted_client_manifest_is_accepted_by_client_compiler() {
     let json = distributed(&["client-manifest"]);
     let manifest: serde_json::Value = serde_json::from_str(&json).unwrap();
-    let project = distributed_cli::compile_client(distributed_cli::ClientCompileInput::new(
+    let project = distributed_cli::ClientCompileInput::from_manifest_json(
         manifest,
-        distributed_cli::ClientSurfaceSelector::role("user"),
+        distributed_cli::ClientSurfaceIdentity::role("user"),
         vec![distributed_cli::ClientDocument::new(
             "src/routes/orders/+page.graphql",
             "query Orders { orders { order_id status } }",
         )],
-    ))
+    )
+    .and_then(distributed_cli::compile_client)
     .expect("the compiler must consume the exact manifest emitted by the server crate");
 
     assert_eq!(project.operations.len(), 1);

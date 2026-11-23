@@ -4,43 +4,10 @@
 
 use std::collections::BTreeSet;
 
-use serde::{Deserialize, Serialize};
-
 use super::*;
 
 /// The only row type the framework emits for leaderboards.
 pub(crate) const LEADERBOARD_ENTRY_TYPENAME: &str = "LeaderboardEntry";
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct ManifestLeaderboard {
-    pub(crate) name: String,
-    pub(crate) entry_typename: String,
-    pub(crate) order: String,
-    pub(crate) boards: String,
-    pub(crate) default_first: u32,
-    pub(crate) max_first: u32,
-    pub(crate) max_radius: u32,
-    pub(crate) roots: Vec<ManifestLeaderboardRoot>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct ManifestLeaderboardRoot {
-    pub(crate) name: String,
-    pub(crate) operation: String,
-    pub(crate) list: bool,
-    pub(crate) live: bool,
-    pub(crate) arguments: Vec<ManifestLeaderboardArgument>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct ManifestLeaderboardArgument {
-    pub(crate) name: String,
-    pub(crate) type_name: String,
-    pub(crate) nullable: bool,
-}
 
 fn invalid(message: impl Into<String>) -> ClientCompileError {
     ClientCompileError::manifest("client.manifest.leaderboard", message)
@@ -48,8 +15,8 @@ fn invalid(message: impl Into<String>) -> ClientCompileError {
 
 /// Validate the leaderboard section against itself and the read-model roots.
 pub(crate) fn validate_leaderboards(
-    leaderboards: &[ManifestLeaderboard],
-    roots: &std::collections::BTreeMap<(RootOperation, String), ManifestRoot>,
+    leaderboards: &[ClientLeaderboard],
+    roots: &std::collections::BTreeMap<(ClientRootOperation, String), ClientRoot>,
     typenames: &BTreeSet<String>,
 ) -> Result<(), ClientCompileError> {
     if !leaderboards.is_empty() && typenames.contains(LEADERBOARD_ENTRY_TYPENAME) {

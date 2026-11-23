@@ -24,15 +24,15 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 
-use serde::Deserialize;
+use distributed_game::codec::WireType;
+use distributed_game::prediction::ABI_VERSION as PREDICT_ABI_VERSION;
+use distributed_game::schema::Correction;
+use distributed_game::surface::{
+    EventPayload, EventSurface, GameSurface, PayloadField, RecordSurface,
+    GAME_SURFACE_SCHEMA_VERSION,
+};
 
 use crate::client_compiler::GeneratedClientFile;
-
-/// The only surface schema version this generator understands.
-pub const GAME_SURFACE_SCHEMA_VERSION: u32 = 3;
-
-/// The only prediction ABI version this generator (and the SDK) speaks.
-pub const PREDICT_ABI_VERSION: u32 = 1;
 
 const SDK: &str = "@hops-ops/distributed/game";
 
@@ -57,52 +57,6 @@ impl ImportExtension {
     }
 }
 
-// ---- surface mirror (schema v3) -------------------------------------------
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct Surface {
-    schema_version: u32,
-    name: String,
-    protocol_version: u32,
-    kinds: Vec<Kind>,
-    input: Option<Input>,
-    events: Vec<Event>,
-    records: Vec<Record>,
-    #[serde(default)]
-    predict: Option<Predict>,
-    #[serde(default)]
-    pures: Vec<Pure>,
-    #[serde(default)]
-    constants: Vec<Constant>,
-    #[serde(default)]
-    codecs: Vec<String>,
-    #[serde(default)]
-    messages: Vec<Event>,
-}
-
-/// A pure function compiled into the surface's module (`#[game_pure]`).
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub(crate) struct Pure {
-    pub(crate) export: String,
-    pub(crate) package: String,
-    #[serde(default)]
-    arg: Option<Wire>,
-    output: Wire,
-    pub(crate) abi: u32,
-}
-
-/// A constant emitted as TypeScript data.
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct Constant {
-    name: String,
-    #[serde(rename = "type")]
-    ty: Wire,
-    value: serde_json::Value,
-}
-
 /// What `distributed game-wasm` compiles for a surface: one module from one
 /// Cargo package exporting the predicted step and the pure functions.
 #[derive(Debug)]
@@ -113,148 +67,6 @@ pub(crate) struct ModulePlan {
     pub(crate) exports: Vec<String>,
     /// ABI version.
     pub(crate) abi: u32,
-}
-/// The zone's client-predicted step (`#[predict]`).
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub(crate) struct Predict {
-    pub(crate) kind: String,
-    pub(crate) package: String,
-    pub(crate) export: String,
-    pub(crate) state: String,
-    #[serde(default)]
-    pub(crate) context: Option<String>,
-    pub(crate) abi: u32,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct Kind {
-    id: u16,
-    name: String,
-    priority: f32,
-    fields: Vec<EntityField>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct EntityField {
-    name: String,
-    #[serde(rename = "type")]
-    ty: Wire,
-    priority: f32,
-    correction: Option<Correction>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(tag = "mode", rename_all = "snake_case", deny_unknown_fields)]
-enum Correction {
-    Ease {
-        #[serde(rename = "durationMs")]
-        duration_ms: u32,
-        #[serde(rename = "snapAbove", default)]
-        snap_above: Option<f32>,
-    },
-    Snap,
-    Replace,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct Field {
-    name: String,
-    #[serde(rename = "type")]
-    ty: Wire,
-    #[serde(default)]
-    range: Option<[f64; 2]>,
-    #[serde(default)]
-    buttons: Vec<String>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct Input {
-    name: String,
-    fields: Vec<Field>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct Event {
-    id: u32,
-    name: String,
-    payload: Payload,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
-enum Payload {
-    Fields {
-        fields: Vec<Field>,
-    },
-    Value {
-        #[serde(rename = "type")]
-        ty: Wire,
-    },
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct Record {
-    name: String,
-    fields: Vec<Field>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
-enum Wire {
-    Bool,
-    U8,
-    I8,
-    U16,
-    I16,
-    U32,
-    I32,
-    U64,
-    F32,
-    F64,
-    Quant { min: f32, max: f32, bits: u8 },
-    Angle { bits: u8 },
-    ShortStr,
-    Str,
-    Bytes,
-    List { item: Box<Wire> },
-    Optional { item: Box<Wire> },
-    Record { name: String },
-}
-
-impl Wire {
-    fn is_entity_type(&self) -> bool {
-        matches!(
-            self,
-            Self::Bool
-                | Self::U8
-                | Self::U16
-                | Self::U32
-                | Self::I32
-                | Self::F32
-                | Self::Quant { .. }
-                | Self::Angle { .. }
-                | Self::ShortStr
-                | Self::Bytes
-        )
-    }
-
-    fn is_float(&self) -> bool {
-        matches!(self, Self::F32 | Self::F64)
-    }
-
-    fn is_integer(&self) -> bool {
-        matches!(
-            self,
-            Self::U8 | Self::I8 | Self::U16 | Self::I16 | Self::U32 | Self::I32 | Self::U64
-        )
-    }
 }
 
 // ---- naming ---------------------------------------------------------------
@@ -322,6 +134,21 @@ fn constant(name: &str) -> String {
         .join("_")
 }
 
+/// Property names must stay distinct and non-empty in camelCase.
+fn check_field_names(fields: &[PayloadField], owner: &str) -> GenResult<()> {
+    let mut props = BTreeSet::new();
+    for field in fields {
+        if !props.insert(camel(&field.name)) || camel(&field.name).is_empty() {
+            return Err(format!(
+                "{owner}: field `{}` is empty or collides with another as `{}`",
+                field.name,
+                camel(&field.name)
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn is_identifier(name: &str) -> bool {
     let mut chars = name.chars();
     matches!(chars.next(), Some(c) if c.is_ascii_alphabetic() || c == '_' || c == '$')
@@ -378,8 +205,8 @@ fn f64_literal(v: f64) -> String {
 // ---- generation -----------------------------------------------------------
 
 struct Gen<'a> {
-    surface: &'a Surface,
-    records: BTreeMap<&'a str, &'a Record>,
+    surface: &'a GameSurface,
+    records: BTreeMap<&'a str, &'a RecordSurface>,
     ext: ImportExtension,
 }
 
@@ -400,7 +227,7 @@ pub fn generate_game_client(
             "unsupported game surface schemaVersion {version:?}; this CLI generates schema version {GAME_SURFACE_SCHEMA_VERSION}"
         ));
     }
-    let surface: Surface =
+    let surface: GameSurface =
         serde_json::from_value(value.clone()).map_err(|e| format!("invalid game surface: {e}"))?;
     let gen = Gen::new(&surface, ext)?;
     let mut files = vec![
@@ -432,7 +259,7 @@ pub fn generate_game_client(
 /// predicted step and no pure functions).
 pub(crate) fn surface_module(manifest_json: &str) -> GenResult<(String, Option<ModulePlan>)> {
     validate_game_surface(manifest_json)?;
-    let surface: Surface =
+    let surface: GameSurface =
         serde_json::from_str(manifest_json).map_err(|e| format!("invalid game surface: {e}"))?;
     let package = surface
         .predict
@@ -479,55 +306,41 @@ fn file(path: &str, contents: String) -> GeneratedClientFile {
 }
 
 impl<'a> Gen<'a> {
-    fn new(surface: &'a Surface, ext: ImportExtension) -> GenResult<Self> {
-        let _ = (surface.schema_version, surface.protocol_version);
-        if !surface
-            .name
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
-            || surface.name.is_empty()
-        {
-            return Err(format!("invalid surface name {:?}", surface.name));
-        }
-        let mut records = BTreeMap::new();
-        for record in &surface.records {
+    fn new(surface: &'a GameSurface, ext: ImportExtension) -> GenResult<Self> {
+        surface.validate()?;
+        let gen = Self {
+            surface,
+            records: surface
+                .records
+                .iter()
+                .map(|record| (record.name.as_str(), record))
+                .collect(),
+            ext,
+        };
+        gen.check_names()?;
+        Ok(gen)
+    }
+
+    /// TypeScript naming on top of [`GameSurface::validate`]: names that
+    /// are distinct in Rust must stay distinct (and usable) after case
+    /// conversion, and constants must have a literal of their type.
+    fn check_names(&self) -> GenResult<()> {
+        for record in &self.surface.records {
             if !is_identifier(&record.name) {
                 return Err(format!(
                     "record name {:?} is not an identifier",
                     record.name
                 ));
             }
-            if records.insert(record.name.as_str(), record).is_some() {
-                return Err(format!("duplicate record {}", record.name));
-            }
+            check_field_names(&record.fields, &record.name)?;
         }
-        let gen = Self {
-            surface,
-            records,
-            ext,
-        };
-        gen.validate()?;
-        Ok(gen)
-    }
-
-    fn validate(&self) -> GenResult<()> {
-        let mut kind_ids = BTreeSet::new();
         let mut kind_names = BTreeSet::new();
         for kind in &self.surface.kinds {
-            if !kind_ids.insert(kind.id) {
-                return Err(format!("duplicate kind id {}", kind.id));
-            }
             if pascal(&kind.name).is_empty() || !kind_names.insert(pascal(&kind.name)) {
                 return Err(format!("duplicate or empty kind name {:?}", kind.name));
             }
             let mut props = BTreeSet::new();
             for field in &kind.fields {
-                if !field.ty.is_entity_type() {
-                    return Err(format!(
-                        "kind {} field {} has a non-entity wire type",
-                        kind.name, field.name
-                    ));
-                }
                 if !props.insert(camel(&field.name)) {
                     return Err(format!(
                         "kind {} fields collide as `{}`",
@@ -537,65 +350,27 @@ impl<'a> Gen<'a> {
                 }
             }
         }
-        let mut event_ids = BTreeSet::new();
         let mut event_names = BTreeSet::new();
         for event in &self.surface.events {
-            if !event_ids.insert(event.id) || !event_names.insert(camel(&event.name)) {
+            if !event_names.insert(camel(&event.name)) {
                 return Err(format!("duplicate event {} / {}", event.id, event.name));
             }
-            match &event.payload {
-                Payload::Fields { fields } => self.check_fields(fields, &event.name)?,
-                Payload::Value { ty } => self.check_type(ty, &event.name)?,
+            if let EventPayload::Fields { fields } = &event.payload {
+                check_field_names(fields, &event.name)?;
             }
         }
-        for record in &self.surface.records {
-            self.check_fields(&record.fields, &record.name)?;
-        }
         if let Some(input) = &self.surface.input {
-            self.check_fields(&input.fields, &input.name)?;
+            check_field_names(&input.fields, &input.name)?;
             let mut buttons = BTreeSet::new();
-            for field in &input.fields {
-                for b in &field.buttons {
-                    if !buttons.insert(camel(b)) {
-                        return Err(format!("duplicate input button {b}"));
-                    }
+            for b in input.fields.iter().flat_map(|field| &field.buttons) {
+                if !buttons.insert(camel(b)) {
+                    return Err(format!("duplicate input button {b}"));
                 }
             }
         }
-        self.record_order()?;
-        self.check_predict()?;
-        self.check_pures()?;
-        self.check_constants()?;
-        for codec in &self.surface.codecs {
-            if !self.records.contains_key(codec.as_str()) {
-                return Err(format!("codec record {codec} is missing"));
-            }
-        }
-        self.check_exports()
-    }
-
-    /// Pure functions: valid unique exports, one Cargo package (the
-    /// predicted step's, if any), known types, the ABI this generator speaks.
-    fn check_pures(&self) -> GenResult<()> {
-        let mut exports = BTreeSet::new();
         let mut wrappers = BTreeSet::new();
-        let package = self.surface.predict.as_ref().map(|p| p.package.as_str());
         for pure in &self.surface.pures {
-            if pure.abi != PREDICT_ABI_VERSION {
-                return Err(format!(
-                    "pure function {} uses ABI v{}; this CLI generates ABI v{PREDICT_ABI_VERSION}",
-                    pure.export, pure.abi
-                ));
-            }
-            if pure.export.is_empty()
-                || !pure
-                    .export
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || c == '_')
-            {
-                return Err(format!("invalid pure function export {:?}", pure.export));
-            }
-            if !exports.insert(pure.export.as_str()) || !wrappers.insert(camel(&pure.export)) {
+            if !wrappers.insert(camel(&pure.export)) {
                 return Err(format!("duplicate pure function {}", pure.export));
             }
             if matches!(camel(&pure.export).as_str(), "ready" | "loaded" | "module") {
@@ -604,128 +379,12 @@ impl<'a> Gen<'a> {
                     pure.export
                 ));
             }
-            if pure.package.is_empty() {
-                return Err(format!(
-                    "pure function {} names no Cargo package",
-                    pure.export
-                ));
-            }
-            let expected = package.unwrap_or(self.surface.pures[0].package.as_str());
-            if pure.package != expected {
-                return Err(format!(
-                    "pure function {} is declared in Cargo package {}, but the surface's module is built from {expected}",
-                    pure.export, pure.package
-                ));
-            }
-            if let Some(arg) = &pure.arg {
-                self.check_type(arg, &pure.export)?;
-            }
-            self.check_type(&pure.output, &pure.export)?;
         }
-        Ok(())
-    }
-
-    /// Constants: unique `snake_case` names, values that match their type.
-    fn check_constants(&self) -> GenResult<()> {
-        let mut names = BTreeSet::new();
         for constant in &self.surface.constants {
-            let valid = constant.name.starts_with(|c: char| c.is_ascii_lowercase())
-                && constant
-                    .name
-                    .chars()
-                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_');
-            if !valid || !names.insert(constant.name.as_str()) {
-                return Err(format!(
-                    "constant name {:?} is not snake_case or is declared twice",
-                    constant.name
-                ));
-            }
-            self.check_type(&constant.ty, &constant.name)?;
             self.literal(&constant.ty, &constant.value, 0)
                 .map_err(|e| format!("constant {}: {e}", constant.name))?;
         }
-        Ok(())
-    }
-
-    /// The predicted step names a kind of this surface, a state record whose
-    /// fields are fields of that kind (plain scalar types), an optional
-    /// context record, and the ABI this generator speaks.
-    fn check_predict(&self) -> GenResult<()> {
-        let Some(predict) = &self.surface.predict else {
-            return Ok(());
-        };
-        if predict.abi != PREDICT_ABI_VERSION {
-            return Err(format!(
-                "predicted step uses ABI v{}; this CLI generates ABI v{PREDICT_ABI_VERSION}",
-                predict.abi
-            ));
-        }
-        if predict.export.is_empty()
-            || !predict
-                .export
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || c == '_')
-        {
-            return Err(format!(
-                "invalid predicted step export {:?}",
-                predict.export
-            ));
-        }
-        if predict.package.is_empty() {
-            return Err("predicted step names no Cargo package".into());
-        }
-        if self.surface.input.is_none() {
-            return Err("a predicted step needs the zone's input type".into());
-        }
-        let kind = self
-            .surface
-            .kinds
-            .iter()
-            .find(|k| k.name == predict.kind)
-            .ok_or_else(|| format!("predicted kind {:?} is not replicated", predict.kind))?;
-        let state = self
-            .records
-            .get(predict.state.as_str())
-            .ok_or_else(|| format!("predicted state record {} is missing", predict.state))?;
-        if state.fields.is_empty() {
-            return Err(format!("predicted state {} has no fields", state.name));
-        }
-        for field in &state.fields {
-            let entity = kind
-                .fields
-                .iter()
-                .find(|f| f.name == field.name)
-                .ok_or_else(|| {
-                    format!(
-                        "predicted state {} field {} is not a field of kind {}",
-                        state.name, field.name, kind.name
-                    )
-                })?;
-            let matches = match field.ty {
-                Wire::F32 => matches!(
-                    entity.ty,
-                    Wire::F32 | Wire::Quant { .. } | Wire::Angle { .. }
-                ),
-                Wire::Bool => matches!(entity.ty, Wire::Bool),
-                Wire::U8 => matches!(entity.ty, Wire::U8),
-                Wire::U16 => matches!(entity.ty, Wire::U16),
-                Wire::U32 => matches!(entity.ty, Wire::U32),
-                Wire::I32 => matches!(entity.ty, Wire::I32),
-                _ => false,
-            };
-            if !matches {
-                return Err(format!(
-                    "predicted state {} field {} does not match the type of kind {} field {}",
-                    state.name, field.name, kind.name, entity.name
-                ));
-            }
-        }
-        if let Some(context) = &predict.context {
-            if !self.records.contains_key(context.as_str()) {
-                return Err(format!("predicted context record {context} is missing"));
-            }
-        }
-        Ok(())
+        self.check_exports()
     }
 
     /// Every name the generated modules export, so `index.ts` re-exports
@@ -814,77 +473,6 @@ impl<'a> Gen<'a> {
         Ok(())
     }
 
-    fn check_fields(&self, fields: &[Field], owner: &str) -> GenResult<()> {
-        let mut props = BTreeSet::new();
-        for field in fields {
-            if !props.insert(camel(&field.name)) || camel(&field.name).is_empty() {
-                return Err(format!(
-                    "{owner}: field `{}` is empty or collides with another as `{}`",
-                    field.name,
-                    camel(&field.name)
-                ));
-            }
-            self.check_type(&field.ty, owner)?;
-        }
-        Ok(())
-    }
-
-    fn check_type(&self, ty: &Wire, owner: &str) -> GenResult<()> {
-        match ty {
-            Wire::List { item } | Wire::Optional { item } => self.check_type(item, owner),
-            Wire::Record { name } if !self.records.contains_key(name.as_str()) => {
-                Err(format!("{owner}: unknown record {name}"))
-            }
-            _ => Ok(()),
-        }
-    }
-
-    /// Records in dependency order (a record after every record it uses).
-    fn record_order(&self) -> GenResult<Vec<&'a Record>> {
-        fn deps(ty: &Wire, out: &mut Vec<String>) {
-            match ty {
-                Wire::List { item } | Wire::Optional { item } => deps(item, out),
-                Wire::Record { name } => out.push(name.clone()),
-                _ => {}
-            }
-        }
-        let mut order = Vec::new();
-        let mut done = BTreeSet::new();
-        let mut visiting = BTreeSet::new();
-        fn visit<'r>(
-            name: &str,
-            records: &BTreeMap<&'r str, &'r Record>,
-            done: &mut BTreeSet<String>,
-            visiting: &mut BTreeSet<String>,
-            order: &mut Vec<&'r Record>,
-        ) -> GenResult<()> {
-            if done.contains(name) {
-                return Ok(());
-            }
-            if !visiting.insert(name.to_string()) {
-                return Err(format!(
-                    "record {name} is recursive; recursive records are not supported"
-                ));
-            }
-            let record = records[name];
-            let mut needs = Vec::new();
-            for field in &record.fields {
-                deps(&field.ty, &mut needs);
-            }
-            for dep in needs {
-                visit(&dep, records, done, visiting, order)?;
-            }
-            visiting.remove(name);
-            done.insert(name.to_string());
-            order.push(record);
-            Ok(())
-        }
-        for name in self.records.keys() {
-            visit(name, &self.records, &mut done, &mut visiting, &mut order)?;
-        }
-        Ok(order)
-    }
-
     fn header(&self, what: &str) -> String {
         format!(
             "// @generated by `distributed game-client` from game surface `{}` (schema v{}, protocol v{}).\n// {what}\n// Do not edit: change the Rust definitions and regenerate.\n",
@@ -898,12 +486,12 @@ impl<'a> Gen<'a> {
         format!("./{module}{}", self.ext.suffix())
     }
 
-    fn ts_type(&self, ty: &Wire) -> String {
+    fn ts_type(&self, ty: &WireType) -> String {
         match ty {
-            Wire::Bool => "boolean".into(),
-            Wire::ShortStr | Wire::Str => "string".into(),
-            Wire::Bytes => "Uint8Array".into(),
-            Wire::List { item } => {
+            WireType::Bool => "boolean".into(),
+            WireType::ShortStr | WireType::Str => "string".into(),
+            WireType::Bytes => "Uint8Array".into(),
+            WireType::List { item } => {
                 let inner = self.ts_type(item);
                 if inner.contains(' ') {
                     format!("readonly ({inner})[]")
@@ -911,31 +499,33 @@ impl<'a> Gen<'a> {
                     format!("readonly {inner}[]")
                 }
             }
-            Wire::Optional { item } => format!("{} | undefined", self.ts_type(item)),
-            Wire::Record { name } => name.clone(),
+            WireType::Optional { item } => format!("{} | undefined", self.ts_type(item)),
+            WireType::Record { name } => name.clone(),
             _ => "number".into(),
         }
     }
 
     /// A `WireType` literal; records refer to their `*_TYPE` constants.
-    fn wire_literal(&self, ty: &Wire) -> String {
+    fn wire_literal(&self, ty: &WireType) -> String {
         match ty {
-            Wire::Quant { min, max, bits } => format!(
+            WireType::Quant { min, max, bits } => format!(
                 "{{ type: 'quant', min: {}, max: {}, bits: {bits} }}",
                 f32_exact(*min),
                 f32_exact(*max)
             ),
-            Wire::Angle { bits } => format!("{{ type: 'angle', bits: {bits} }}"),
-            Wire::List { item } => format!("{{ type: 'list', item: {} }}", self.wire_literal(item)),
-            Wire::Optional { item } => {
+            WireType::Angle { bits } => format!("{{ type: 'angle', bits: {bits} }}"),
+            WireType::List { item } => {
+                format!("{{ type: 'list', item: {} }}", self.wire_literal(item))
+            }
+            WireType::Optional { item } => {
                 format!("{{ type: 'optional', item: {} }}", self.wire_literal(item))
             }
-            Wire::Record { name } => format!("{}_TYPE", constant(name)),
+            WireType::Record { name } => format!("{}_TYPE", constant(name)),
             other => format!("{{ type: '{}' }}", simple_tag(other)),
         }
     }
 
-    fn layout(&self, fields: &[Field]) -> String {
+    fn layout(&self, fields: &[PayloadField]) -> String {
         if fields.is_empty() {
             return "[]".into();
         }
@@ -952,7 +542,7 @@ impl<'a> Gen<'a> {
         out
     }
 
-    fn interface(&self, name: &str, doc: &str, fields: &[Field]) -> String {
+    fn interface(&self, name: &str, doc: &str, fields: &[PayloadField]) -> String {
         let mut out = format!("/** {doc} */\nexport interface {name} {{\n");
         for field in fields {
             let _ = writeln!(
@@ -1087,7 +677,10 @@ impl<'a> Gen<'a> {
             out.push_str("\n/** This zone takes no typed input. */\nexport type Input = never;\n");
             return Ok(out);
         };
-        let can_reject = input.fields.iter().any(|f| f.ty.is_float());
+        let can_reject = input
+            .fields
+            .iter()
+            .any(|f| matches!(f.ty, WireType::F32 | WireType::F64));
         let _ = writeln!(
             out,
             "import {{ decodePayload, encodePayload, sanitizePayload, type InputRule, type PayloadLayout }} from '{SDK}';\n"
@@ -1098,7 +691,7 @@ impl<'a> Gen<'a> {
             &input.fields,
         ));
         let _ = writeln!(out, "\nexport type Input = {};", input.name);
-        let flag_fields: Vec<&Field> = input
+        let flag_fields: Vec<&PayloadField> = input
             .fields
             .iter()
             .filter(|f| !f.buttons.is_empty())
@@ -1133,7 +726,16 @@ impl<'a> Gen<'a> {
                 let mask: u64 = (1u64 << field.buttons.len()) - 1;
                 format!("{{ buttons: {mask} }}")
             } else if let Some([min, max]) = field.range {
-                let (min, max) = if field.ty.is_integer() {
+                let (min, max) = if matches!(
+                    field.ty,
+                    WireType::U8
+                        | WireType::I8
+                        | WireType::U16
+                        | WireType::I16
+                        | WireType::U32
+                        | WireType::I32
+                        | WireType::U64
+                ) {
                     (min.trunc(), max.trunc())
                 } else {
                     (min, max)
@@ -1172,7 +774,7 @@ impl<'a> Gen<'a> {
         let mut out = self
             .header("Events and records: payload interfaces, ids, codecs, typed subscriptions.");
         let events = &self.surface.events;
-        let records = self.record_order()?;
+        let records = self.surface.records_in_dependency_order()?;
         let mut sdk = vec![
             "decodeGameEvent",
             "onGameEvent",
@@ -1184,11 +786,11 @@ impl<'a> Gen<'a> {
         let uses_fields = events
             .iter()
             .chain(messages)
-            .any(|e| matches!(e.payload, Payload::Fields { .. }));
+            .any(|e| matches!(e.payload, EventPayload::Fields { .. }));
         let uses_value = events
             .iter()
             .chain(messages)
-            .any(|e| matches!(e.payload, Payload::Value { .. }));
+            .any(|e| matches!(e.payload, EventPayload::Value { .. }));
         if uses_fields {
             sdk.extend(["decodePayload", "encodePayload", "type PayloadLayout"]);
         }
@@ -1260,13 +862,13 @@ impl<'a> Gen<'a> {
             let type_name = format!("{}Event", pascal(&event.name));
             let c = constant(&event.name);
             let (encode, decode) = match &event.payload {
-                Payload::Fields { .. } => (
+                EventPayload::Fields { .. } => (
                     format!("(value) => encodePayload({c}_LAYOUT, value)"),
                     format!(
                         "(payload) => decodePayload({c}_LAYOUT, payload) as unknown as {type_name}"
                     ),
                 ),
-                Payload::Value { .. } => (
+                EventPayload::Value { .. } => (
                     format!("(value) => encodeValue({c}_PAYLOAD, value)"),
                     format!("(payload) => decodeValue({c}_PAYLOAD, payload) as {type_name}"),
                 ),
@@ -1291,7 +893,7 @@ impl<'a> Gen<'a> {
 
     /// Zone inbox message ids, codecs and `encodeMessage` (the body of a
     /// `/admin/zone-message` `message`).
-    fn messages_ts(&self, out: &mut String, messages: &[Event]) {
+    fn messages_ts(&self, out: &mut String, messages: &[EventSurface]) {
         out.push_str("\n/** Zone inbox message type ids by name. */\nexport const MESSAGE = {\n");
         for m in messages {
             let _ = writeln!(out, "\t{}: {},", key(&camel(&m.name)), m.id);
@@ -1310,13 +912,13 @@ impl<'a> Gen<'a> {
             let type_name = format!("{}Message", pascal(&m.name));
             let c = format!("MESSAGE_{}", constant(&m.name));
             let (encode, decode) = match &m.payload {
-                Payload::Fields { .. } => (
+                EventPayload::Fields { .. } => (
                     format!("(value) => encodePayload({c}_LAYOUT, value)"),
                     format!(
                         "(payload) => decodePayload({c}_LAYOUT, payload) as unknown as {type_name}"
                     ),
                 ),
-                Payload::Value { .. } => (
+                EventPayload::Value { .. } => (
                     format!("(value) => encodeValue({c}_PAYLOAD, value)"),
                     format!("(payload) => decodeValue({c}_PAYLOAD, payload) as {type_name}"),
                 ),
@@ -1334,12 +936,12 @@ impl<'a> Gen<'a> {
 
     /// Payload interfaces and layouts of events (`suffix` `Event`) or zone
     /// inbox messages (`Message`, constants prefixed `MESSAGE_`).
-    fn payload_types(&self, out: &mut String, items: &[Event], suffix: &str, prefix: &str) {
+    fn payload_types(&self, out: &mut String, items: &[EventSurface], suffix: &str, prefix: &str) {
         for event in items {
             let type_name = format!("{}{suffix}", pascal(&event.name));
             out.push('\n');
             match &event.payload {
-                Payload::Fields { fields } if fields.is_empty() => {
+                EventPayload::Fields { fields } if fields.is_empty() => {
                     let _ = writeln!(
                             out,
                             "/** {suffix} `{}` (id {}): no payload. */\nexport type {type_name} = Readonly<Record<string, never>>;",
@@ -1351,7 +953,7 @@ impl<'a> Gen<'a> {
                         constant(&event.name)
                     );
                 }
-                Payload::Fields { fields } => {
+                EventPayload::Fields { fields } => {
                     out.push_str(&self.interface(
                         &type_name,
                         &format!("{suffix} `{}` (id {}).", event.name, event.id),
@@ -1364,7 +966,7 @@ impl<'a> Gen<'a> {
                         self.layout(fields)
                     );
                 }
-                Payload::Value { ty } => {
+                EventPayload::Value { ty } => {
                     let _ = writeln!(
                         out,
                         "/** {suffix} `{}` (id {}). */\nexport type {type_name} = {};",
@@ -1385,18 +987,20 @@ impl<'a> Gen<'a> {
 
     /// Records an event payload (or the input) encodes, directly or nested.
     fn encoded_records(&self) -> BTreeSet<&'a str> {
-        fn walk<'r>(ty: &'r Wire, out: &mut Vec<&'r str>) {
+        fn walk<'r>(ty: &'r WireType, out: &mut Vec<&'r str>) {
             match ty {
-                Wire::List { item } | Wire::Optional { item } => walk(item, out),
-                Wire::Record { name } => out.push(name),
+                WireType::List { item } | WireType::Optional { item } => walk(item, out),
+                WireType::Record { name } => out.push(name),
                 _ => {}
             }
         }
         let mut pending = Vec::new();
         for event in self.surface.events.iter().chain(&self.surface.messages) {
             match &event.payload {
-                Payload::Fields { fields } => fields.iter().for_each(|f| walk(&f.ty, &mut pending)),
-                Payload::Value { ty } => walk(ty, &mut pending),
+                EventPayload::Fields { fields } => {
+                    fields.iter().for_each(|f| walk(&f.ty, &mut pending))
+                }
+                EventPayload::Value { ty } => walk(ty, &mut pending),
             }
         }
         if let Some(input) = &self.surface.input {
@@ -1616,7 +1220,7 @@ impl<'a> Gen<'a> {
 
 impl Gen<'_> {
     /// Records reachable from `roots` (nested ones included).
-    fn reachable<'t>(&self, roots: impl IntoIterator<Item = &'t Wire>) -> BTreeSet<&str> {
+    fn reachable<'t>(&self, roots: impl IntoIterator<Item = &'t WireType>) -> BTreeSet<&str> {
         let mut pending = Vec::new();
         for root in roots {
             top_records(root, &mut pending);
@@ -1637,7 +1241,7 @@ impl Gen<'_> {
     /// `const <RECORD>_TYPE: WireType` for `names`, dependencies first.
     fn type_consts(&self, names: &BTreeSet<&str>) -> GenResult<String> {
         let mut out = String::new();
-        for record in self.record_order()? {
+        for record in self.surface.records_in_dependency_order()? {
             if names.contains(record.name.as_str()) {
                 let _ = writeln!(
                     out,
@@ -1652,7 +1256,7 @@ impl Gen<'_> {
 
     /// `import type { A, B } from './events'` for the records `types`
     /// mention directly.
-    fn import_records<'t>(&self, types: impl IntoIterator<Item = &'t Wire>) -> String {
+    fn import_records<'t>(&self, types: impl IntoIterator<Item = &'t WireType>) -> String {
         let mut names = Vec::new();
         for ty in types {
             top_records(ty, &mut names);
@@ -1677,7 +1281,7 @@ impl Gen<'_> {
         let mut out = self.header(
             "Pure functions: the Rust `#[game_pure]` fns compiled to WebAssembly (binary ABI).",
         );
-        let types: Vec<&Wire> = pures
+        let types: Vec<&WireType> = pures
             .iter()
             .flat_map(|p| p.arg.iter().chain([&p.output]))
             .collect();
@@ -1685,7 +1289,7 @@ impl Gen<'_> {
         let _ = writeln!(
             out,
             "import {{ createWasmPures, type WasmPures, type WasmSource{} }} from '{SDK}';\n",
-            if records.is_empty() && !types.iter().any(|t| !matches!(t, Wire::Record { .. })) {
+            if records.is_empty() && !types.iter().any(|t| !matches!(t, WireType::Record { .. })) {
                 ""
             } else {
                 ", type WireType"
@@ -1790,7 +1394,7 @@ impl Gen<'_> {
     /// A TypeScript literal of `value` (JSON as `GameSurface::constant`
     /// stores it) of type `ty`: records keyed by camelCase field name, floats
     /// as exact binary32 values, `null` as `undefined`.
-    fn literal(&self, ty: &Wire, value: &serde_json::Value, depth: usize) -> GenResult<String> {
+    fn literal(&self, ty: &WireType, value: &serde_json::Value, depth: usize) -> GenResult<String> {
         use serde_json::Value;
         let pad = "\t".repeat(depth + 1);
         let close = "\t".repeat(depth);
@@ -1807,36 +1411,36 @@ impl Gen<'_> {
             Ok(v.to_string())
         };
         Ok(match ty {
-            Wire::Bool => value.as_bool().ok_or_else(mismatch)?.to_string(),
-            Wire::U8 => int(0, 255)?,
-            Wire::I8 => int(-128, 127)?,
-            Wire::U16 => int(0, 65_535)?,
-            Wire::I16 => int(-32_768, 32_767)?,
-            Wire::U32 => int(0, u32::MAX.into())?,
-            Wire::I32 => int(i32::MIN.into(), i32::MAX.into())?,
-            Wire::U64 => int(0, (1 << 53) - 1)?,
-            Wire::F32 | Wire::Quant { .. } | Wire::Angle { .. } => {
+            WireType::Bool => value.as_bool().ok_or_else(mismatch)?.to_string(),
+            WireType::U8 => int(0, 255)?,
+            WireType::I8 => int(-128, 127)?,
+            WireType::U16 => int(0, 65_535)?,
+            WireType::I16 => int(-32_768, 32_767)?,
+            WireType::U32 => int(0, u32::MAX.into())?,
+            WireType::I32 => int(i32::MIN.into(), i32::MAX.into())?,
+            WireType::U64 => int(0, (1 << 53) - 1)?,
+            WireType::F32 | WireType::Quant { .. } | WireType::Angle { .. } => {
                 let v = value.as_f64().ok_or_else(mismatch)?;
                 if f64::from(v as f32) != v {
                     return Err(format!("{v} is not a binary32 value"));
                 }
                 f32_exact(v as f32)
             }
-            Wire::F64 => f64_literal(value.as_f64().ok_or_else(mismatch)?),
-            Wire::ShortStr | Wire::Str => string(value.as_str().ok_or_else(mismatch)?),
-            Wire::Bytes => {
+            WireType::F64 => f64_literal(value.as_f64().ok_or_else(mismatch)?),
+            WireType::ShortStr | WireType::Str => string(value.as_str().ok_or_else(mismatch)?),
+            WireType::Bytes => {
                 let bytes = value.as_array().ok_or_else(mismatch)?;
                 let mut items = Vec::new();
                 for b in bytes {
-                    items.push(self.literal(&Wire::U8, b, depth)?);
+                    items.push(self.literal(&WireType::U8, b, depth)?);
                 }
                 format!("new Uint8Array([{}])", items.join(", "))
             }
-            Wire::Optional { item } => match value {
+            WireType::Optional { item } => match value {
                 Value::Null => "undefined".into(),
                 other => self.literal(item, other, depth)?,
             },
-            Wire::List { item } => {
+            WireType::List { item } => {
                 let items = value.as_array().ok_or_else(mismatch)?;
                 if items.is_empty() {
                     return Ok("[]".into());
@@ -1852,7 +1456,7 @@ impl Gen<'_> {
                     format!("[\n{pad}{}\n{close}]", parts.join(&format!(",\n{pad}")))
                 }
             }
-            Wire::Record { name } => {
+            WireType::Record { name } => {
                 let record = self.records[name.as_str()];
                 let object = value.as_object().ok_or_else(mismatch)?;
                 if object.len() != record.fields.len() {
@@ -1887,58 +1491,58 @@ impl Gen<'_> {
 
 /// Records a type names directly (through lists and options, not through
 /// other records).
-fn top_records(ty: &Wire, out: &mut Vec<String>) {
+fn top_records(ty: &WireType, out: &mut Vec<String>) {
     match ty {
-        Wire::List { item } | Wire::Optional { item } => top_records(item, out),
-        Wire::Record { name } => out.push(name.clone()),
+        WireType::List { item } | WireType::Optional { item } => top_records(item, out),
+        WireType::Record { name } => out.push(name.clone()),
         _ => {}
     }
 }
 
-fn is_scalar(ty: &Wire) -> bool {
+fn is_scalar(ty: &WireType) -> bool {
     match ty {
-        Wire::List { .. } | Wire::Record { .. } | Wire::Bytes => false,
-        Wire::Optional { item } => is_scalar(item),
+        WireType::List { .. } | WireType::Record { .. } | WireType::Bytes => false,
+        WireType::Optional { item } => is_scalar(item),
         _ => true,
     }
 }
 
-fn simple_tag(ty: &Wire) -> &'static str {
+fn simple_tag(ty: &WireType) -> &'static str {
     match ty {
-        Wire::Bool => "bool",
-        Wire::U8 => "u8",
-        Wire::I8 => "i8",
-        Wire::U16 => "u16",
-        Wire::I16 => "i16",
-        Wire::U32 => "u32",
-        Wire::I32 => "i32",
-        Wire::U64 => "u64",
-        Wire::F32 => "f32",
-        Wire::F64 => "f64",
-        Wire::ShortStr => "short_str",
-        Wire::Str => "str",
-        Wire::Bytes => "bytes",
+        WireType::Bool => "bool",
+        WireType::U8 => "u8",
+        WireType::I8 => "i8",
+        WireType::U16 => "u16",
+        WireType::I16 => "i16",
+        WireType::U32 => "u32",
+        WireType::I32 => "i32",
+        WireType::U64 => "u64",
+        WireType::F32 => "f32",
+        WireType::F64 => "f64",
+        WireType::ShortStr => "short_str",
+        WireType::Str => "str",
+        WireType::Bytes => "bytes",
         _ => unreachable!("composite types have their own literal"),
     }
 }
 
-fn reader(ty: &Wire) -> &'static str {
+fn reader(ty: &WireType) -> &'static str {
     match ty {
-        Wire::Bool => "fieldBool",
-        Wire::ShortStr => "fieldString",
-        Wire::Bytes => "fieldBytes",
+        WireType::Bool => "fieldBool",
+        WireType::ShortStr => "fieldString",
+        WireType::Bytes => "fieldBytes",
         _ => "fieldNumber",
     }
 }
 
-fn field_doc(ty: &Wire, priority: f32) -> String {
+fn field_doc(ty: &WireType, priority: f32) -> String {
     let wire = match ty {
-        Wire::Quant { min, max, bits } => format!(
+        WireType::Quant { min, max, bits } => format!(
             "quant [{}, {}] / {bits} bits",
             f32_literal(*min),
             f32_literal(*max)
         ),
-        Wire::Angle { bits } => format!("angle / {bits} bits"),
+        WireType::Angle { bits } => format!("angle / {bits} bits"),
         other => simple_tag(other).to_string(),
     };
     if priority == 1.0 {

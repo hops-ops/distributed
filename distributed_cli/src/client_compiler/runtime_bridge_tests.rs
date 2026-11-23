@@ -1,8 +1,9 @@
 use super::graphql::{compile_document, CompiledOperation};
 use super::manifest::ClientManifest;
 use super::render::{render_operation_artifact_json, render_operation_module};
-use super::tests::manifest;
-use super::{ClientDocument, ClientSurfaceSelector};
+use super::tests::{manifest, parse_manifest, refresh_schema_fingerprint};
+use super::{ClientDocument, ClientSurfaceIdentity};
+use crate::golden::assert_golden;
 
 #[test]
 fn unique_key_runtime_bridge_artifact_is_byte_exact() {
@@ -39,8 +40,8 @@ fn unique_key_runtime_bridge_artifact_is_byte_exact() {
         "kind": "direct", "local": ["tenantId", "ownerTitle"], "remote": ["tenantId", "title"]
     });
     value["models"][0]["relationships"][0]["maintenance"] = serde_json::json!("local");
-    super::manifest::refresh_schema_fingerprint(&mut value);
-    let manifest = ClientManifest::parse(value, &ClientSurfaceSelector::role("user")).unwrap();
+    refresh_schema_fingerprint(&mut value);
+    let manifest = parse_manifest(value, &ClientSurfaceIdentity::role("user")).unwrap();
     let document = ClientDocument::new(
         "src/routes/unique-key/+page.graphql",
         "query UniqueKeyBridge @load @live { todos(limit: 25) { id title owner { id title } } }",
@@ -50,10 +51,7 @@ fn unique_key_runtime_bridge_artifact_is_byte_exact() {
         "{}\n",
         render_operation_artifact_json(&operation, &manifest).unwrap()
     );
-    assert_eq!(
-        artifact,
-        include_str!("../../tests/fixtures/unique-key-bridge-operation.json")
-    );
+    assert_golden("unique-key-bridge-operation.json", &artifact);
 }
 
 const RUNTIME_BRIDGE_QUERY: &str = r#"
@@ -66,7 +64,7 @@ const RUNTIME_BRIDGE_QUERY: &str = r#"
 "#;
 
 fn compile_runtime_bridge_operation() -> (ClientManifest, CompiledOperation) {
-    let manifest = ClientManifest::parse(manifest(), &ClientSurfaceSelector::role("user"))
+    let manifest = parse_manifest(manifest(), &ClientSurfaceIdentity::role("user"))
         .expect("runtime bridge manifest");
     let document = ClientDocument::new(
         "src/routes/runtime-bridge/+page.graphql",
@@ -86,10 +84,10 @@ fn rust_runtime_bridge_artifact() -> String {
 
 #[test]
 fn rust_emitted_runtime_bridge_artifact_is_byte_exact() {
-    assert_eq!(
-        rust_runtime_bridge_artifact(),
-        include_str!("../../tests/fixtures/runtime-bridge-operation.json"),
-        "the JavaScript runtime bridge fixture must remain exact Rust compiler output"
+    // The JavaScript runtime bridge reads this fixture.
+    assert_golden(
+        "runtime-bridge-operation.json",
+        &rust_runtime_bridge_artifact(),
     );
 }
 
@@ -98,11 +96,8 @@ fn scalar_only_operation_module_is_byte_exact_and_needs_no_replica_value_import(
     let (manifest, operation) = compile_runtime_bridge_operation();
     let module = render_operation_module(&operation, &manifest)
         .expect("render scalar-only operation module");
-    assert_eq!(
-        module,
-        include_str!("../../tests/fixtures/generated-scalar-operation.ts"),
-        "the strict TypeScript scalar-only fixture must remain exact Rust compiler output"
-    );
+    // The strict TypeScript consumer check compiles this fixture.
+    assert_golden("generated-scalar-operation.ts", &module);
     assert!(
         module.contains(
             "import type { ReplicaOperationArtifact } from '@hops-ops/distributed/replica';"

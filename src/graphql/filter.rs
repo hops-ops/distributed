@@ -99,6 +99,7 @@ pub(crate) fn validate_row_policy_operand_literal(
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ClaimRef {
     pub header: String,
 }

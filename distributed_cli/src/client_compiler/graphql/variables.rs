@@ -49,14 +49,14 @@ pub(super) fn compile_variables(
 
 #[derive(Clone, Copy)]
 pub(super) struct FilterInputCandidate<'a> {
-    model: &'a ManifestModel,
-    semantics: &'a ManifestFilterInput,
+    model: &'a ClientModel,
+    semantics: &'a ClientFilterInput,
 }
 
 #[derive(Clone, Copy)]
 pub(super) struct OrderInputCandidate<'a> {
-    model: &'a ManifestModel,
-    semantics: &'a ManifestOrderSemantics,
+    model: &'a ClientModel,
+    semantics: &'a ClientOrderSemantics,
 }
 
 pub(super) fn compile_variable_codec(
@@ -220,15 +220,15 @@ pub(super) fn merge_filter_constraints(
 }
 
 pub(super) fn register_order_input_candidate<'a>(
-    arguments: &[ManifestArgument],
-    order: Option<&'a ManifestOrderSemantics>,
-    model: &'a ManifestModel,
+    arguments: &[ClientArgument],
+    order: Option<&'a ClientOrderSemantics>,
+    model: &'a ClientModel,
     orders: &mut BTreeMap<String, OrderInputCandidate<'a>>,
 ) -> Result<(), ClientCompileError> {
     if let Some(semantics) = order {
         if let Some(argument) = arguments
             .iter()
-            .find(|argument| argument.kind == ManifestArgumentKind::Order)
+            .find(|argument| argument.kind == ClientArgumentKind::Order)
         {
             register_order_input(&argument.type_name, model, semantics, orders)?;
         }
@@ -238,8 +238,8 @@ pub(super) fn register_order_input_candidate<'a>(
 
 pub(super) fn register_filter_input<'a>(
     name: &str,
-    model: &'a ManifestModel,
-    semantics: &'a ManifestFilterInput,
+    model: &'a ClientModel,
+    semantics: &'a ClientFilterInput,
     candidates: &mut BTreeMap<String, FilterInputCandidate<'a>>,
 ) -> Result<(), ClientCompileError> {
     if let Some(existing) = candidates.get(name) {
@@ -257,8 +257,8 @@ pub(super) fn register_filter_input<'a>(
 
 pub(super) fn register_order_input<'a>(
     name: &str,
-    model: &'a ManifestModel,
-    semantics: &'a ManifestOrderSemantics,
+    model: &'a ClientModel,
+    semantics: &'a ClientOrderSemantics,
     candidates: &mut BTreeMap<String, OrderInputCandidate<'a>>,
 ) -> Result<(), ClientCompileError> {
     if let Some(existing) = candidates.get(name) {

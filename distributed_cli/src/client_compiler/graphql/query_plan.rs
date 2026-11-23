@@ -2,7 +2,7 @@ use super::*;
 
 pub(super) fn inject_wire_fields(
     members: &mut Vec<CompiledMember>,
-    model: &ManifestModel,
+    model: &ClientModel,
     document: &ClientDocument,
     position: Pos,
 ) -> Result<(), ClientCompileError> {
@@ -58,21 +58,21 @@ pub(super) fn inject_wire_fields(
 }
 
 pub(super) fn query_plan_field_dependencies(
-    model: &ManifestModel,
-    filter: Option<&ManifestFilterSemantics>,
-    order: Option<&ManifestOrderSemantics>,
-    declared_arguments: &[ManifestArgument],
+    model: &ClientModel,
+    filter: Option<&ClientFilterSemantics>,
+    order: Option<&ClientOrderSemantics>,
+    declared_arguments: &[ClientArgument],
     compiled_arguments: &BTreeMap<String, CompiledArgument>,
 ) -> BTreeSet<String> {
     let mut fields = BTreeSet::new();
     let mut relationships = BTreeSet::new();
     if let Some(filter) = filter {
-        if let ManifestRowPolicy::Predicate { expression } = &filter.row_policy {
+        if let ClientRowPolicy::Predicate { expression } = &filter.row_policy {
             collect_policy_fields(expression, &mut fields, &mut relationships);
         }
         if let Some(argument) = declared_arguments
             .iter()
-            .find(|argument| argument.kind == ManifestArgumentKind::Filter)
+            .find(|argument| argument.kind == ClientArgumentKind::Filter)
             .and_then(|argument| compiled_arguments.get(&argument.name))
         {
             collect_filter_source_fields(argument, filter, &mut fields, &mut relationships);
@@ -81,7 +81,7 @@ pub(super) fn query_plan_field_dependencies(
     if let Some(order) = order {
         if let Some(argument) = declared_arguments
             .iter()
-            .find(|argument| argument.kind == ManifestArgumentKind::Order)
+            .find(|argument| argument.kind == ClientArgumentKind::Order)
             .and_then(|argument| compiled_arguments.get(&argument.name))
         {
             collect_order_source_fields(argument, order, &mut fields);
@@ -98,7 +98,7 @@ pub(super) fn query_plan_field_dependencies(
 
 pub(super) fn collect_filter_source_fields(
     source: &CompiledArgument,
-    semantics: &ManifestFilterSemantics,
+    semantics: &ClientFilterSemantics,
     fields: &mut BTreeSet<String>,
     relationships: &mut BTreeSet<String>,
 ) {
@@ -146,7 +146,7 @@ pub(super) fn collect_filter_source_fields(
 
 pub(super) fn collect_order_source_fields(
     source: &CompiledArgument,
-    semantics: &ManifestOrderSemantics,
+    semantics: &ClientOrderSemantics,
     fields: &mut BTreeSet<String>,
 ) {
     match source {
@@ -170,25 +170,23 @@ pub(super) fn collect_order_source_fields(
 }
 
 pub(super) fn collect_policy_fields(
-    expression: &ManifestFilterExpr,
+    expression: &FilterExpr,
     fields: &mut BTreeSet<String>,
     relationships: &mut BTreeSet<String>,
 ) {
     match expression {
-        ManifestFilterExpr::And(expressions) | ManifestFilterExpr::Or(expressions) => {
+        FilterExpr::And(expressions) | FilterExpr::Or(expressions) => {
             for expression in expressions {
                 collect_policy_fields(expression, fields, relationships);
             }
         }
-        ManifestFilterExpr::Not(expression) => {
-            collect_policy_fields(expression, fields, relationships)
-        }
-        ManifestFilterExpr::Cmp { column, .. }
-        | ManifestFilterExpr::In { column, .. }
-        | ManifestFilterExpr::IsNull { column, .. } => {
+        FilterExpr::Not(expression) => collect_policy_fields(expression, fields, relationships),
+        FilterExpr::Cmp { column, .. }
+        | FilterExpr::In { column, .. }
+        | FilterExpr::IsNull { column, .. } => {
             fields.insert(column.clone());
         }
-        ManifestFilterExpr::Rel { field, .. } => {
+        FilterExpr::Rel { field, .. } => {
             relationships.insert(field.clone());
         }
     }
@@ -196,7 +194,7 @@ pub(super) fn collect_policy_fields(
 
 pub(super) fn collect_client_filter_fields(
     value: &JsonValue,
-    semantics: &ManifestFilterSemantics,
+    semantics: &ClientFilterSemantics,
     fields: &mut BTreeSet<String>,
     relationships: &mut BTreeSet<String>,
 ) {
@@ -236,7 +234,7 @@ pub(super) fn collect_client_filter_fields(
 
 pub(super) fn inject_dependency_fields(
     selection: &mut CompiledObject,
-    model: &ManifestModel,
+    model: &ClientModel,
     dependencies: &BTreeSet<String>,
     document: &ClientDocument,
     position: Pos,
@@ -294,8 +292,8 @@ pub(super) fn allocate_wire_alias(field: &str, used: &mut BTreeSet<String>) -> S
 }
 
 pub(super) fn compile_coverage(
-    pagination: Option<&ManifestPagination>,
-    arguments: &[ManifestArgument],
+    pagination: Option<&ClientPaginationSemantics>,
+    arguments: &[ClientArgument],
     owner: &str,
     document: &ClientDocument,
     position: Pos,
@@ -318,11 +316,11 @@ pub(super) fn compile_coverage(
         kind: "offset".into(),
         offset_argument: arguments
             .iter()
-            .find(|argument| argument.kind == ManifestArgumentKind::Offset)
+            .find(|argument| argument.kind == ClientArgumentKind::Offset)
             .map(|argument| argument.name.clone()),
         limit_argument: arguments
             .iter()
-            .find(|argument| argument.kind == ManifestArgumentKind::Limit)
+            .find(|argument| argument.kind == ClientArgumentKind::Limit)
             .map(|argument| argument.name.clone()),
         default_limit: Some(pagination.default_limit),
         max_limit: Some(pagination.max_limit),
@@ -370,10 +368,10 @@ pub(super) fn compiled_pagination_plan(coverage: &CompiledCoverage) -> CompiledP
 
 #[allow(clippy::too_many_arguments)]
 pub(super) fn compile_query_plans(
-    model: &ManifestModel,
-    filter: Option<&ManifestFilterSemantics>,
-    order: Option<&ManifestOrderSemantics>,
-    declared_arguments: &[ManifestArgument],
+    model: &ClientModel,
+    filter: Option<&ClientFilterSemantics>,
+    order: Option<&ClientOrderSemantics>,
+    declared_arguments: &[ClientArgument],
     compiled_arguments: &BTreeMap<String, CompiledArgument>,
     variables: &[CompiledVariable],
     manifest: &ClientManifest,
@@ -385,10 +383,10 @@ pub(super) fn compile_query_plans(
 ) -> Result<CompiledQueryPlans, ClientCompileError> {
     let filter_argument = declared_arguments
         .iter()
-        .find(|argument| argument.kind == ManifestArgumentKind::Filter);
+        .find(|argument| argument.kind == ClientArgumentKind::Filter);
     let order_argument = declared_arguments
         .iter()
-        .find(|argument| argument.kind == ManifestArgumentKind::Order);
+        .find(|argument| argument.kind == ClientArgumentKind::Order);
 
     let filter_plan = match filter {
         Some(semantics) => {
@@ -398,7 +396,7 @@ pub(super) fn compile_query_plans(
                 .cloned();
             if let Some(input) = &input {
                 let input_type = filter_argument
-                    .map(ManifestArgument::graphql_type)
+                    .map(ClientArgument::graphql_type)
                     .ok_or_else(|| {
                         ClientCompileError::manifest(
                             "client.manifest.filter_argument",
@@ -528,7 +526,7 @@ pub(super) fn compile_query_plans(
 }
 
 pub(super) fn compiled_order_field(
-    model: &ManifestModel,
+    model: &ClientModel,
     name: &str,
 ) -> Result<CompiledOrderField, ClientCompileError> {
     let field = model.field(name).ok_or_else(|| {

@@ -11,12 +11,12 @@ use serde::Serialize;
 use serde_json::{Map as JsonMap, Value as JsonValue};
 
 use super::manifest::{
-    hash_bytes, ClientManifest, ManifestAggregateSemantics, ManifestArgument, ManifestArgumentKind,
-    ManifestComplexityWeights, ManifestExecutionLimits, ManifestField, ManifestFilterExpr,
-    ManifestFilterField, ManifestFilterInput, ManifestFilterSemantics, ManifestModel,
-    ManifestOrderSemantics, ManifestPagination, ManifestRelationship,
-    ManifestRelationshipKeyMapping, ManifestRelationshipKind, ManifestRelationshipMaintenance,
-    ManifestRoot, ManifestRowPolicy, RootKind, RootOperation,
+    hash_bytes, ClientAggregateSemantics, ClientArgument, ClientArgumentKind,
+    ClientComplexityWeights, ClientExecutionLimits, ClientField, ClientFilterField,
+    ClientFilterInput, ClientFilterSemantics, ClientManifest, ClientModel, ClientOrderSemantics,
+    ClientPaginationSemantics, ClientRelationship, ClientRelationshipKind,
+    ClientRelationshipMaintenance, ClientRoot, ClientRootKind, ClientRootOperation,
+    ClientRowPolicy, FilterExpr, RelationshipKeyMapping,
 };
 use super::{ClientCompileError, ClientDocument};
 

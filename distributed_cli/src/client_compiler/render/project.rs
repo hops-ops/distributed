@@ -4,7 +4,7 @@ use serde::Serialize;
 
 use super::super::graphql::CompiledOperation;
 use super::super::islands::{island_plan, GeneratedIslandInventory, ISLAND_PLAN_VERSION};
-use super::super::manifest::{canonical_json_value, ClientManifest, ManifestSurface};
+use super::super::manifest::{canonical_json_value, ClientManifest, ClientSurfaceIdentity};
 use super::super::{
     ClientCompileError, GeneratedClientFile, GeneratedClientProject, GeneratedOperationSummary,
 };
@@ -175,7 +175,7 @@ struct CompilerManifest<'a> {
     distributed_manifest_version: u32,
     protocol_version: u32,
     service_id: &'a str,
-    surface: &'a super::super::manifest::ManifestSurface,
+    surface: &'a super::super::manifest::ClientSurfaceIdentity,
     schema_fingerprint: &'a str,
     protocol_fingerprint: &'a str,
     scalar_codecs: &'a BTreeMap<String, String>,
@@ -329,8 +329,8 @@ fn render_sveltekit(
     // schema fingerprints, and protocol hashes belong to compatibility, not
     // identity.
     let (kind, name) = match &manifest.surface {
-        ManifestSurface::Role { name } => ("role", name),
-        ManifestSurface::Application { name, .. } => ("application", name),
+        ClientSurfaceIdentity::Role { name } => ("role", name),
+        ClientSurfaceIdentity::Application { name, .. } => ("application", name),
     };
     let reload_key = serde_json::to_string(&format!("surface:{kind}:{name}")).map_err(|error| {
         ClientCompileError::manifest(

@@ -1,6 +1,6 @@
 use std::collections::BTreeSet;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::DomainEventOccurrence;
@@ -57,7 +57,7 @@ pub enum ProjectionEnvelopeField {
 /// This deliberately small set has direct JavaScript equivalents. New
 /// transforms require an operation-semantics version change and cross-runtime
 /// golden vectors.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProjectionScalarTransform {
     /// Concatenate one or more strings in declared argument order.
@@ -70,8 +70,13 @@ pub enum ProjectionScalarTransform {
 ///
 /// The type is part of the program digest. In particular, a positive JSON
 /// integer cannot silently collapse an `i64` field into a `u64` field.
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
-#[serde(tag = "type", content = "name", rename_all = "snake_case")]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(
+    tag = "type",
+    content = "name",
+    rename_all = "snake_case",
+    deny_unknown_fields
+)]
 pub enum ProjectionValueType {
     /// Boolean scalar.
     Boolean,

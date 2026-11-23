@@ -1,13 +1,12 @@
-use crate::client_compiler::manifest::{validate_exact_operation_hash, ManifestProtocolOperations};
+use crate::client_compiler::manifest::{
+    command_status_operation, validate_exact_operation_hash, ClientProtocolOperations,
+};
 use crate::client_compiler::ClientCompileError;
 
 use super::support::invalid;
 
-const COMMAND_STATUS_OPERATION: &str =
-    "query Distributed_CommandStatus($commandId: ID!) { commandStatus(commandId: $commandId) { state } }";
-
 pub(super) fn validate_protocol_operations(
-    operations: &ManifestProtocolOperations,
+    operations: &ClientProtocolOperations,
     commands_present: bool,
 ) -> Result<(), ClientCompileError> {
     if operations.version != 1 {
@@ -28,7 +27,7 @@ pub(super) fn validate_protocol_operations(
         (None, false) => Ok(()),
         (Some(status), true) => {
             if status.name != "Distributed_CommandStatus"
-                || status.operation != COMMAND_STATUS_OPERATION
+                || status.operation != command_status_operation()
             {
                 return Err(invalid(
                     "client.manifest.command_status",

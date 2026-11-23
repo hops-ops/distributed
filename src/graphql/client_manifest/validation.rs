@@ -1,16 +1,24 @@
 use super::*;
 
-pub(crate) fn trusted_preset_descriptors(
-    manifest: &DistributedClientManifest,
+/// The scope-wide trusted-preset inventory of a client surface: every
+/// command's declared presets plus every claim a client-visible row policy
+/// compares with a field, each with one wire codec, sorted by name.
+///
+/// # Errors
+///
+/// A preset name that is invalid or used with two codecs, or a row policy
+/// naming an absent field, relationship or model, or a non-local codec.
+pub fn trusted_preset_descriptors<'a>(
+    models: impl IntoIterator<Item = &'a ClientModel>,
+    commands: &[ClientCommand],
 ) -> Result<Vec<ClientTrustedPresetDescriptor>, ClientManifestError> {
-    let models: BTreeMap<&str, &ClientModel> = manifest
-        .models
-        .iter()
+    let models: BTreeMap<&str, &ClientModel> = models
+        .into_iter()
         .map(|model| (model.id.as_str(), model))
         .collect();
     let mut descriptors = BTreeMap::<String, String>::new();
 
-    for command in &manifest.commands {
+    for command in commands {
         for descriptor in &command.extensions.trusted_presets {
             insert_trusted_preset_descriptor(
                 &mut descriptors,
@@ -19,7 +27,7 @@ pub(crate) fn trusted_preset_descriptors(
             )?;
         }
     }
-    for model in &manifest.models {
+    for model in models.values() {
         if let ClientRowPolicy::Predicate { expression } = &model.row_policy {
             collect_row_policy_trusted_presets(expression, model, &models, &mut descriptors)?;
         }

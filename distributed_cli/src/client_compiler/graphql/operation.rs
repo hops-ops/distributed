@@ -68,7 +68,7 @@ pub(crate) fn compile_document(
 
     let root_name = root_field.first.node.name.node.as_str();
     let root_manifest = manifest
-        .root(RootOperation::Query, root_name)
+        .root(ClientRootOperation::Query, root_name)
         .ok_or_else(|| {
             source_error(
                 "client.root.denied_or_unknown",
@@ -99,7 +99,7 @@ pub(crate) fn compile_document(
         document,
     )?;
     let mut selection = match root_manifest.kind {
-        RootKind::List | RootKind::ByPk => compile_model_object(
+        ClientRootKind::List | ClientRootKind::ByPk => compile_model_object(
             &root_field,
             model,
             &ModelCompileContext::new(manifest, &variables, document),
@@ -107,7 +107,7 @@ pub(crate) fn compile_document(
             &mut expander,
             2,
         )?,
-        RootKind::Aggregate => {
+        ClientRootKind::Aggregate => {
             let semantics = root_manifest.aggregate.as_ref().ok_or_else(|| {
                 ClientCompileError::manifest(
                     "client.manifest.aggregate_semantics",
@@ -132,7 +132,7 @@ pub(crate) fn compile_document(
             )?
         }
     };
-    if root_manifest.kind == RootKind::List {
+    if root_manifest.kind == ClientRootKind::List {
         let dependencies = query_plan_field_dependencies(
             model,
             root_manifest.filter.as_ref(),
@@ -152,13 +152,13 @@ pub(crate) fn compile_document(
     expander.reject_unused_fragments()?;
 
     let cardinality = match root_manifest.kind {
-        RootKind::List => Cardinality::Many,
-        RootKind::ByPk => Cardinality::One,
-        RootKind::Aggregate => Cardinality::One,
+        ClientRootKind::List => Cardinality::Many,
+        ClientRootKind::ByPk => Cardinality::One,
+        ClientRootKind::Aggregate => Cardinality::One,
     };
     let coverage = match root_manifest.kind {
-        RootKind::Aggregate => Some(complete_coverage()),
-        RootKind::List | RootKind::ByPk => compile_coverage(
+        ClientRootKind::Aggregate => Some(complete_coverage()),
+        ClientRootKind::List | ClientRootKind::ByPk => compile_coverage(
             root_manifest.pagination.as_ref(),
             &root_manifest.arguments,
             &root_manifest.name,
@@ -178,13 +178,16 @@ pub(crate) fn compile_document(
         &root_field.first.node,
         coverage.as_ref(),
         0,
-        root_manifest.kind == RootKind::List,
+        root_manifest.kind == ClientRootKind::List,
     )?;
     let root = CompiledRoot {
         response_key: root_field.first.node.response_key().node.to_string(),
         field: root_name.to_string(),
         cardinality,
-        nullable: matches!(root_manifest.kind, RootKind::ByPk | RootKind::Aggregate),
+        nullable: matches!(
+            root_manifest.kind,
+            ClientRootKind::ByPk | ClientRootKind::Aggregate
+        ),
         arguments: compiled_arguments,
         dependencies: root_manifest.dependencies.clone(),
         coverage,
@@ -296,7 +299,7 @@ pub(super) fn compile_live(
     query_name: &str,
     variables: &[CompiledVariable],
     root: &CompiledRoot,
-    query_manifest: &ManifestRoot,
+    query_manifest: &ClientRoot,
     manifest: &ClientManifest,
     document: &ClientDocument,
     position: Pos,
@@ -313,7 +316,7 @@ pub(super) fn compile_live(
         ));
     }
     let subscription = manifest
-        .root(RootOperation::Subscription, &query_manifest.name)
+        .root(ClientRootOperation::Subscription, &query_manifest.name)
         .ok_or_else(|| {
             source_error(
                 "client.live.root_missing",
@@ -350,8 +353,8 @@ pub(super) fn compile_live(
     })
 }
 
-pub(super) fn arguments_compatible(left: &[ManifestArgument], right: &[ManifestArgument]) -> bool {
-    let canonical = |arguments: &[ManifestArgument]| {
+pub(super) fn arguments_compatible(left: &[ClientArgument], right: &[ClientArgument]) -> bool {
+    let canonical = |arguments: &[ClientArgument]| {
         arguments
             .iter()
             .map(|argument| {

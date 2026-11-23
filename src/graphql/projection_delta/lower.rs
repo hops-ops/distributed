@@ -158,30 +158,9 @@ impl ProjectionDeltaSource {
             .iter()
             .find(|binding| binding.binding_id == binding_id)
             .ok_or(ProjectionDeltaError::ProjectionIdentityMismatch)?;
-        let manifest_state = match manifest_binding.state {
-            crate::graphql::client_manifest::ClientProjectionBindingState::Active => {
-                ProjectionBindingState::Active
-            }
-            crate::graphql::client_manifest::ClientProjectionBindingState::Draining => {
-                ProjectionBindingState::Draining
-            }
-        };
-        let manifest_placement = match manifest_binding.placement {
-            crate::graphql::client_manifest::ClientProjectionPlacement::Eventual => {
-                ProjectionPlacement::Eventual
-            }
-            crate::graphql::client_manifest::ClientProjectionPlacement::Direct => {
-                ProjectionPlacement::Direct
-            }
-        };
-        let manifest_execution = match manifest_binding.execution_class {
-            crate::graphql::client_manifest::ClientProjectionExecutionClass::Causal => {
-                ProjectionExecutionClass::Causal
-            }
-            crate::graphql::client_manifest::ClientProjectionExecutionClass::Background => {
-                ProjectionExecutionClass::Background
-            }
-        };
+        let manifest_state = manifest_binding.state;
+        let manifest_placement = manifest_binding.placement;
+        let manifest_execution = manifest_binding.execution_class;
         if manifest_binding.program_id != program_id
             || manifest_binding.epoch != projection.epoch().as_str()
             || manifest_program.name != selected.name

@@ -1,6 +1,6 @@
 use std::collections::BTreeSet;
 
-use crate::client_compiler::manifest::ManifestCommand;
+use crate::client_compiler::manifest::ClientCommand;
 use crate::client_compiler::ClientCompileError;
 
 pub(super) fn graphql_name(value: &str, label: &str) -> Result<(), ClientCompileError> {
@@ -40,7 +40,7 @@ pub(super) fn nonempty(value: &str, label: &str) -> Result<(), ClientCompileErro
 }
 
 pub(super) fn command_error(
-    command: &ManifestCommand,
+    command: &ClientCommand,
     code: &'static str,
     message: impl std::fmt::Display,
 ) -> ClientCompileError {

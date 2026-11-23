@@ -22,6 +22,8 @@
 //! It is deliberately separate from the strict GraphQL client manifest: game
 //! clients speak the binary zone protocol (`PROTOCOL.md`), not GraphQL.
 
+use std::collections::{BTreeMap, BTreeSet};
+
 use serde::{Deserialize, Serialize};
 
 use crate::codec::WireType;
@@ -542,6 +544,322 @@ impl GameSurface {
     pub fn to_json(&self) -> String {
         serde_json::to_string_pretty(self).expect("game surface serializes")
     }
+
+    /// Structural validity of a surface, however it was produced (the
+    /// builders above, or JSON read back by `distributed game-client`):
+    /// the versions this crate speaks, unique kinds, events, records,
+    /// fields and buttons, replicable kind field types, known and
+    /// non-recursive records, and a consistent predicted step, pure
+    /// functions, constants and codecs.
+    ///
+    /// Naming rules of one target language (collisions after case
+    /// conversion, reserved words) belong to that generator.
+    ///
+    /// # Errors
+    ///
+    /// The first violated rule, as a message naming the offending item.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.schema_version != GAME_SURFACE_SCHEMA_VERSION {
+            return Err(format!(
+                "unsupported game surface schemaVersion {}; this version is {GAME_SURFACE_SCHEMA_VERSION}",
+                self.schema_version
+            ));
+        }
+        if self.protocol_version != SURFACE_PROTOCOL_VERSION {
+            return Err(format!(
+                "unsupported game surface protocolVersion {}; this version is {SURFACE_PROTOCOL_VERSION}",
+                self.protocol_version
+            ));
+        }
+        if self.name.is_empty()
+            || !self
+                .name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        {
+            return Err(format!("invalid surface name {:?}", self.name));
+        }
+        let mut records = BTreeMap::new();
+        for record in &self.records {
+            if records.insert(record.name.as_str(), record).is_some() {
+                return Err(format!("duplicate record {}", record.name));
+            }
+        }
+        let mut kind_ids = BTreeSet::new();
+        let mut kind_names = BTreeSet::new();
+        for kind in &self.kinds {
+            if !kind_ids.insert(kind.id) {
+                return Err(format!("duplicate kind id {}", kind.id));
+            }
+            if kind.name.is_empty() || !kind_names.insert(kind.name.as_str()) {
+                return Err(format!("duplicate or empty kind name {:?}", kind.name));
+            }
+            let mut names = BTreeSet::new();
+            for field in &kind.fields {
+                if field.ty.field_type().is_none() {
+                    return Err(format!(
+                        "kind {} field {} has a non-entity wire type",
+                        kind.name, field.name
+                    ));
+                }
+                if !names.insert(field.name.as_str()) {
+                    return Err(format!(
+                        "kind {} fields collide as `{}`",
+                        kind.name, field.name
+                    ));
+                }
+            }
+        }
+        let mut event_ids = BTreeSet::new();
+        let mut event_names = BTreeSet::new();
+        for event in &self.events {
+            if !event_ids.insert(event.id) || !event_names.insert(event.name.as_str()) {
+                return Err(format!("duplicate event {} / {}", event.id, event.name));
+            }
+            match &event.payload {
+                EventPayload::Fields { fields } => check_fields(fields, &event.name, &records)?,
+                EventPayload::Value { ty } => check_type(ty, &event.name, &records)?,
+            }
+        }
+        for record in &self.records {
+            check_fields(&record.fields, &record.name, &records)?;
+        }
+        if let Some(input) = &self.input {
+            check_fields(&input.fields, &input.name, &records)?;
+            let mut buttons = BTreeSet::new();
+            for button in input.fields.iter().flat_map(|field| &field.buttons) {
+                if !buttons.insert(button.as_str()) {
+                    return Err(format!("duplicate input button {button}"));
+                }
+            }
+        }
+        self.records_in_dependency_order()?;
+        self.validate_predict(&records)?;
+        self.validate_pures(&records)?;
+        let mut constants = BTreeSet::new();
+        for constant in &self.constants {
+            let snake_case = constant.name.starts_with(|c: char| c.is_ascii_lowercase())
+                && constant
+                    .name
+                    .chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_');
+            if !snake_case || !constants.insert(constant.name.as_str()) {
+                return Err(format!(
+                    "constant name {:?} is not snake_case or is declared twice",
+                    constant.name
+                ));
+            }
+            check_type(&constant.ty, &constant.name, &records)?;
+        }
+        for codec in &self.codecs {
+            if !records.contains_key(codec.as_str()) {
+                return Err(format!("codec record {codec} is missing"));
+            }
+        }
+        Ok(())
+    }
+
+    /// Records with every record a record uses before it.
+    ///
+    /// # Errors
+    ///
+    /// A record that (transitively) contains itself, or names a record the
+    /// surface does not list.
+    pub fn records_in_dependency_order(&self) -> Result<Vec<&RecordSurface>, String> {
+        fn visit<'r>(
+            name: &str,
+            records: &BTreeMap<&'r str, &'r RecordSurface>,
+            done: &mut BTreeSet<&'r str>,
+            visiting: &mut BTreeSet<&'r str>,
+            order: &mut Vec<&'r RecordSurface>,
+        ) -> Result<(), String> {
+            if done.contains(name) {
+                return Ok(());
+            }
+            let record = *records
+                .get(name)
+                .ok_or_else(|| format!("unknown record {name}"))?;
+            if !visiting.insert(record.name.as_str()) {
+                return Err(format!(
+                    "record {name} is recursive; recursive records are not supported"
+                ));
+            }
+            for field in &record.fields {
+                if let Some(used) = record_of(&field.ty) {
+                    visit(used, records, done, visiting, order)?;
+                }
+            }
+            visiting.remove(name);
+            done.insert(record.name.as_str());
+            order.push(record);
+            Ok(())
+        }
+        let records: BTreeMap<&str, &RecordSurface> = self
+            .records
+            .iter()
+            .map(|record| (record.name.as_str(), record))
+            .collect();
+        let mut order = Vec::new();
+        let (mut done, mut visiting) = (BTreeSet::new(), BTreeSet::new());
+        for name in records.keys() {
+            visit(name, &records, &mut done, &mut visiting, &mut order)?;
+        }
+        Ok(order)
+    }
+
+    /// The predicted step names a kind of this surface, a state record whose
+    /// fields are fields of that kind (plain scalar types), an optional
+    /// context record, and this crate's ABI.
+    fn validate_predict(&self, records: &BTreeMap<&str, &RecordSurface>) -> Result<(), String> {
+        let Some(predict) = &self.predict else {
+            return Ok(());
+        };
+        if predict.abi != crate::prediction::ABI_VERSION {
+            return Err(format!(
+                "predicted step uses ABI v{}; this version speaks ABI v{}",
+                predict.abi,
+                crate::prediction::ABI_VERSION
+            ));
+        }
+        if !is_export_name(&predict.export) {
+            return Err(format!(
+                "invalid predicted step export {:?}",
+                predict.export
+            ));
+        }
+        if predict.package.is_empty() {
+            return Err("predicted step names no Cargo package".into());
+        }
+        if self.input.is_none() {
+            return Err("a predicted step needs the zone's input type".into());
+        }
+        let kind = self
+            .kinds
+            .iter()
+            .find(|kind| kind.name == predict.kind)
+            .ok_or_else(|| format!("predicted kind {:?} is not replicated", predict.kind))?;
+        let state = records
+            .get(predict.state.as_str())
+            .ok_or_else(|| format!("predicted state record {} is missing", predict.state))?;
+        if state.fields.is_empty() {
+            return Err(format!("predicted state {} has no fields", state.name));
+        }
+        for field in &state.fields {
+            let entity = kind
+                .fields
+                .iter()
+                .find(|entity| entity.name == field.name)
+                .ok_or_else(|| {
+                    format!(
+                        "predicted state {} field {} is not a field of kind {}",
+                        state.name, field.name, kind.name
+                    )
+                })?;
+            if !state_field_matches(&field.ty, &entity.ty) {
+                return Err(format!(
+                    "predicted state {} field {} does not match the type of kind {} field {}",
+                    state.name, field.name, kind.name, entity.name
+                ));
+            }
+        }
+        if let Some(context) = &predict.context {
+            if !records.contains_key(context.as_str()) {
+                return Err(format!("predicted context record {context} is missing"));
+            }
+        }
+        Ok(())
+    }
+
+    /// Pure functions: valid unique exports, one Cargo package (the
+    /// predicted step's, if any), known types, this crate's ABI.
+    fn validate_pures(&self, records: &BTreeMap<&str, &RecordSurface>) -> Result<(), String> {
+        let mut exports = BTreeSet::new();
+        let package = self
+            .predict
+            .as_ref()
+            .map(|predict| predict.package.as_str())
+            .or_else(|| self.pures.first().map(|pure| pure.package.as_str()));
+        for pure in &self.pures {
+            if pure.abi != crate::prediction::ABI_VERSION {
+                return Err(format!(
+                    "pure function {} uses ABI v{}; this version speaks ABI v{}",
+                    pure.export,
+                    pure.abi,
+                    crate::prediction::ABI_VERSION
+                ));
+            }
+            if !is_export_name(&pure.export) {
+                return Err(format!("invalid pure function export {:?}", pure.export));
+            }
+            if !exports.insert(pure.export.as_str()) {
+                return Err(format!("duplicate pure function {}", pure.export));
+            }
+            if pure.package.is_empty() {
+                return Err(format!(
+                    "pure function {} names no Cargo package",
+                    pure.export
+                ));
+            }
+            let expected = package.expect("a surface with pures has a package");
+            if pure.package != expected {
+                return Err(format!(
+                    "pure function {} is declared in Cargo package {}, but the surface's module is built from {expected}",
+                    pure.export, pure.package
+                ));
+            }
+            if let Some(arg) = &pure.arg {
+                check_type(arg, &pure.export, records)?;
+            }
+            check_type(&pure.output, &pure.export, records)?;
+        }
+        Ok(())
+    }
+}
+
+/// A WebAssembly export suffix (`dg_predict_<export>`, `dg_pure_<export>`).
+fn is_export_name(export: &str) -> bool {
+    !export.is_empty()
+        && export
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// The record a type names, through lists and optionals.
+fn record_of(ty: &WireType) -> Option<&str> {
+    match ty {
+        WireType::List { item } | WireType::Optional { item } => record_of(item),
+        WireType::Record { name } => Some(name),
+        _ => None,
+    }
+}
+
+fn check_type(
+    ty: &WireType,
+    owner: &str,
+    records: &BTreeMap<&str, &RecordSurface>,
+) -> Result<(), String> {
+    match record_of(ty) {
+        Some(name) if !records.contains_key(name) => Err(format!("{owner}: unknown record {name}")),
+        _ => Ok(()),
+    }
+}
+
+fn check_fields(
+    fields: &[PayloadField],
+    owner: &str,
+    records: &BTreeMap<&str, &RecordSurface>,
+) -> Result<(), String> {
+    let mut names = BTreeSet::new();
+    for field in fields {
+        if field.name.is_empty() || !names.insert(field.name.as_str()) {
+            return Err(format!(
+                "{owner}: field `{}` is empty or collides with another as `{}`",
+                field.name, field.name
+            ));
+        }
+        check_type(&field.ty, owner, records)?;
+    }
+    Ok(())
 }
 
 fn record_name(ty: WireType, what: &str, export: &str) -> String {
