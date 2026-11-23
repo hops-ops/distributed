@@ -1489,7 +1489,6 @@ mod tests {
                 ],
                 primary_key: PrimaryKey::new(["id"]),
                 version_column: Some(crate::table::DEFAULT_TABLE_VERSION_COLUMN.into()),
-                foreign_keys: Vec::new(),
                 indexes: Vec::new(),
                 relationships: Vec::new(),
                 kind: TableKind::ReadModel,

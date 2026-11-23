@@ -9,8 +9,7 @@ use super::{
     IncludeSpec, SqlxReadModelBackend,
 };
 use crate::read_model::{
-    ReadModelIncludeRows, ReadModelLoadGraph, ReadModelLoadRequest, ReadModelQueryCapabilities,
-    Versioned,
+    ReadModelIncludeRows, ReadModelLoadGraph, ReadModelLoadRequest, Versioned,
 };
 use crate::sqlx_repo::read_model_storage_error;
 use crate::table::{
@@ -71,7 +70,6 @@ pub(crate) async fn load_read_model_graph<DB>(
     pool: &sqlx::Pool<DB>,
     schemas: &RwLock<TableSchemaRegistry>,
     request: ReadModelLoadRequest,
-    capabilities: ReadModelQueryCapabilities,
 ) -> Result<ReadModelLoadGraph, TableStoreError>
 where
     DB: SqlxReadModelBackend,
@@ -80,8 +78,6 @@ where
     for<'q> i64: Encode<'q, DB> + Type<DB> + sqlx::Decode<'q, DB>,
     for<'r> &'r str: sqlx::ColumnIndex<<DB as Database>::Row>,
 {
-    request.validate_for_query_capabilities(&capabilities)?;
-
     let (root_schema, include_specs) = resolve_registered_read_model_schemas(schemas, &request)?;
     validate_key(&root_schema, &request.key)?;
 

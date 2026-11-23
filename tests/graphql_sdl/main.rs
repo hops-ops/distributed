@@ -23,7 +23,6 @@ fn players() -> TableSchema {
         ],
         primary_key: PrimaryKey::new(["player_id"]),
         version_column: Some("_sourced_version".into()),
-        foreign_keys: Vec::new(),
         indexes: Vec::new(),
         relationships: vec![RelationshipDef {
             references: None,
@@ -53,13 +52,11 @@ fn weapons() -> TableSchema {
                 ..TableColumn::new("weapon_id", "weapon_id", ColumnType::Text)
             },
             TableColumn {
-                jsonb: true,
                 ..TableColumn::new("meta", "meta", ColumnType::Json)
             },
         ],
         primary_key: PrimaryKey::new(["player_id", "weapon_id"]),
         version_column: Some("_sourced_version".into()),
-        foreign_keys: vec![ForeignKey::new("players", "player_id")],
         indexes: Vec::new(),
         relationships: vec![RelationshipDef {
             references: None,
@@ -84,7 +81,6 @@ fn operational_outbox() -> TableSchema {
         }],
         primary_key: PrimaryKey::new(["message_id"]),
         version_column: None,
-        foreign_keys: Vec::new(),
         indexes: Vec::new(),
         relationships: Vec::new(),
         kind: TableKind::Operational,
@@ -149,7 +145,6 @@ fn m2m_requires_through_error() {
         }],
         primary_key: PrimaryKey::new(["id"]),
         version_column: None,
-        foreign_keys: Vec::new(),
         indexes: Vec::new(),
         relationships: vec![RelationshipDef {
             references: None,
@@ -177,7 +172,6 @@ fn invalid_name_errors() {
         }],
         primary_key: PrimaryKey::new(["id"]),
         version_column: None,
-        foreign_keys: Vec::new(),
         indexes: Vec::new(),
         relationships: Vec::new(),
         kind: TableKind::ReadModel,
@@ -197,7 +191,6 @@ fn collision_errors() {
         }],
         primary_key: PrimaryKey::new(["id"]),
         version_column: None,
-        foreign_keys: Vec::new(),
         indexes: Vec::new(),
         relationships: Vec::new(),
         kind: TableKind::ReadModel,
@@ -211,7 +204,6 @@ fn collision_errors() {
         }],
         primary_key: PrimaryKey::new(["id"]),
         version_column: None,
-        foreign_keys: Vec::new(),
         indexes: Vec::new(),
         relationships: Vec::new(),
         kind: TableKind::ReadModel,

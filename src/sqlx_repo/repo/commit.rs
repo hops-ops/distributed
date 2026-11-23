@@ -50,7 +50,7 @@ where
         crate::repository::require_captured_events_are_published(&batch)?;
     }
     for plan in &batch.read_model_plans {
-        validate_sql_write_plan(plan).map_err(RepositoryError::from)?;
+        plan.validate().map_err(RepositoryError::from)?;
     }
     if let Some(direct_projection) = &direct_projection {
         direct_projection.validate().map_err(|error| {

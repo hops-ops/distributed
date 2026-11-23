@@ -402,12 +402,9 @@ pub use read_model::{
 pub use table::{
     ColumnType, DeleteTableRowMutation, ExpectedVersion, ForeignKey, PatchMode,
     PatchTableRowMutation, PrimaryKey, ReadModelCatalog, RelationshipDef, RelationshipKind, RowKey,
-    RowPatch, RowValue, RowValues, RowWriteMode, TableAdapterCapabilities, TableColumn,
-    TableCommitOutcome, TableIndex, TableKind, TableMigrationArtifact, TableModel, TableMutation,
-    TableRowMutation, TableSchema, TableSchemaAdapter, TableSchemaAdapterCapabilities,
-    TableSchemaBootstrap, TableSchemaIssue, TableSchemaIssueKind, TableSchemaRegistry,
-    TableSchemaRegistryExt, TableSchemaVerification, TableStoreError, TableWritePlan,
-    DEFAULT_TABLE_VERSION_COLUMN,
+    RowPatch, RowValue, RowValues, RowWriteMode, TableColumn, TableIndex, TableKind,
+    TableMigrationArtifact, TableMutation, TableRowMutation, TableSchema, TableSchemaBootstrap,
+    TableSchemaRegistry, TableStoreError, TableWritePlan, DEFAULT_TABLE_VERSION_COLUMN,
 };
 pub use trace_context::{
     is_valid_traceparent, TraceContext, CAUSATION_ID, CORRELATION_ID, TRACEPARENT, TRACESTATE,

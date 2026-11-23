@@ -191,7 +191,6 @@ fn derive_describes_columns_indexes_nullability_and_jsonb() {
         .find(|column| column.column_name == "counters_by_game")
         .unwrap();
     assert_eq!(counters.column_type, ColumnType::Json);
-    assert!(counters.jsonb);
 
     assert_eq!(schema.indexes.len(), 1);
     assert_eq!(schema.indexes[0].columns, vec!["owner"]);

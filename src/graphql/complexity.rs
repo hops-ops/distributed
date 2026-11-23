@@ -143,7 +143,6 @@ mod tests {
             ],
             primary_key: PrimaryKey::new(["parent_id"]),
             version_column: None,
-            foreign_keys: Vec::new(),
             indexes: Vec::new(),
             relationships: vec![RelationshipDef {
                 references: None,
@@ -173,7 +172,6 @@ mod tests {
             ],
             primary_key: PrimaryKey::new(["child_id"]),
             version_column: None,
-            foreign_keys: Vec::new(),
             indexes: Vec::new(),
             relationships: vec![RelationshipDef {
                 references: None,
@@ -202,7 +200,6 @@ mod tests {
             ],
             primary_key: PrimaryKey::new(["grand_id"]),
             version_column: None,
-            foreign_keys: Vec::new(),
             indexes: Vec::new(),
             relationships: Vec::new(),
             kind: TableKind::ReadModel,

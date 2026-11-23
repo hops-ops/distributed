@@ -599,7 +599,7 @@ async fn read_model_session_persists_relational_rows() {
     let mut session = ReadModelWritePlanBuilder::new();
     session.upsert(&view).unwrap();
 
-    let outcome = session.commit(&repo).await.unwrap();
+    session.commit(&repo).await.unwrap();
     let row = sqlx::query(
         r#"
         SELECT "value", "_sourced_version"
@@ -612,7 +612,6 @@ async fn read_model_session_persists_relational_rows() {
     .await
     .unwrap();
 
-    assert!(outcome.was_applied());
     assert_eq!(sqlx::Row::try_get::<i64, _>(&row, "value").unwrap(), 42);
     assert_eq!(
         sqlx::Row::try_get::<i64, _>(&row, "_sourced_version").unwrap(),

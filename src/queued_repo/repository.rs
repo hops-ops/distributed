@@ -25,13 +25,13 @@ use crate::projection_protocol::{
     ProjectionProtocolStore, ProjectionQuerySnapshot, ProjectionQuerySnapshotRequest,
     ProjectionRecordMetadata, ProjectionRecordScope, ProjectorTopologyId, TrustedProjectionInput,
 };
-use crate::read_model::{ReadModelLoadGraph, ReadModelLoadRequest, ReadModelQueryCapabilities};
+use crate::read_model::{ReadModelLoadGraph, ReadModelLoadRequest};
 use crate::repository::{
     CommitBatch, GetStream, InboxStore, ReadModelWritePlanStore, RelationalReadModelQueryStore,
     RepositoryError, SnapshotStore, StreamIdentity, StreamWrite, TransactionalCommit,
 };
 use crate::snapshot::SnapshotRecord;
-use crate::table::{TableAdapterCapabilities, TableCommitOutcome, TableStoreError, TableWritePlan};
+use crate::table::{TableStoreError, TableWritePlan};
 
 /// Options for read operations.
 #[derive(Debug, Clone, Copy)]
@@ -575,14 +575,10 @@ where
     R: ReadModelWritePlanStore,
     L: LockManager,
 {
-    fn read_model_capabilities(&self) -> TableAdapterCapabilities {
-        self.inner.read_model_capabilities()
-    }
-
     fn commit_write_plan(
         &self,
         plan: TableWritePlan,
-    ) -> impl Future<Output = Result<TableCommitOutcome, TableStoreError>> + Send + '_ {
+    ) -> impl Future<Output = Result<(), TableStoreError>> + Send + '_ {
         self.inner.commit_write_plan(plan)
     }
 }
@@ -598,10 +594,6 @@ where
     ) -> impl Future<Output = Result<crate::read_model::ReadModelScanPage, TableStoreError>> + Send + '_
     {
         self.inner.scan_read_model(request)
-    }
-
-    fn read_model_query_capabilities(&self) -> ReadModelQueryCapabilities {
-        self.inner.read_model_query_capabilities()
     }
 
     fn load_graph(

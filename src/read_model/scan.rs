@@ -187,7 +187,7 @@ mod tests {
             table_name: "pages".into(),
             columns: vec![TableColumn::new("id", "id", ColumnType::Text)],
             primary_key: PrimaryKey::new(["id"]),
-            relationships: vec![], indexes: vec![], foreign_keys: vec![], version_column: Some("_sourced_version".into()), kind: TableKind::ReadModel,
+            relationships: vec![], indexes: vec![], version_column: Some("_sourced_version".into()), kind: TableKind::ReadModel,
         };
         ReadModelScanRequest {
             schema,

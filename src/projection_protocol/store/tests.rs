@@ -22,7 +22,6 @@ fn schema() -> &'static TableSchema {
         columns: Vec::new(),
         primary_key: PrimaryKey::new(["id"]),
         version_column: None,
-        foreign_keys: Vec::new(),
         indexes: Vec::new(),
         relationships: Vec::new(),
         kind: Default::default(),

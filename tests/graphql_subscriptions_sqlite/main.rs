@@ -34,7 +34,6 @@ fn items_schema() -> TableSchema {
         ],
         primary_key: PrimaryKey::new(["id"]),
         version_column: Some("_sourced_version".into()),
-        foreign_keys: Vec::new(),
         indexes: Vec::new(),
         relationships: Vec::new(),
         kind: TableKind::ReadModel,

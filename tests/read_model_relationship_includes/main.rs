@@ -1,12 +1,7 @@
 use std::future::Future;
 
-use distributed::read_model::{
-    ReadModelLoadGraph, ReadModelLoadRequest, ReadModelQueryCapabilities,
-};
 use distributed::{
-    InMemoryReadModelStore, ReadModel, ReadModelWorkspaceExt, ReadModelWritePlanStore,
-    RelationalReadModelQueryStore, RowKey, RowValue, TableAdapterCapabilities, TableCommitOutcome,
-    TableStoreError, TableWritePlan,
+    InMemoryReadModelStore, ReadModel, ReadModelWorkspaceExt, RowKey, RowValue, TableStoreError,
 };
 use serde::{Deserialize, Serialize};
 
@@ -147,43 +142,6 @@ struct CompositeWeaponLabel {
     player_id: String,
     weapon_id: String,
     label: String,
-}
-
-struct NoIncludeStore {
-    inner: InMemoryReadModelStore,
-}
-
-impl NoIncludeStore {
-    fn new(inner: InMemoryReadModelStore) -> Self {
-        Self { inner }
-    }
-}
-
-impl ReadModelWritePlanStore for NoIncludeStore {
-    fn read_model_capabilities(&self) -> TableAdapterCapabilities {
-        self.inner.read_model_capabilities()
-    }
-
-    fn commit_write_plan(
-        &self,
-        plan: TableWritePlan,
-    ) -> impl Future<Output = Result<TableCommitOutcome, TableStoreError>> + Send + '_ {
-        self.inner.commit_write_plan(plan)
-    }
-}
-
-impl RelationalReadModelQueryStore for NoIncludeStore {
-    fn read_model_query_capabilities(&self) -> ReadModelQueryCapabilities {
-        ReadModelQueryCapabilities::default()
-    }
-
-    async fn load_graph(
-        &self,
-        request: ReadModelLoadRequest,
-    ) -> Result<ReadModelLoadGraph, TableStoreError> {
-        request.validate_for_query_capabilities(&self.read_model_query_capabilities())?;
-        self.inner.load_graph(request).await
-    }
 }
 
 fn player_key(player_id: &str) -> RowKey {
@@ -495,25 +453,6 @@ fn unregistered_root_schema_can_load_primary_key_without_includes() {
         .unwrap();
 
     assert_eq!(loaded.data.display_name, "Ada");
-}
-
-#[test]
-fn adapter_without_include_capability_rejects_includes() {
-    let inner = store_with_player_and_weapons([weapon("player-1", "sword", "2026-05-23")]);
-    let store = NoIncludeStore::new(inner);
-    let mut read_models = store.workspace();
-
-    let err = block_on(
-        read_models
-            .load::<Player>(player_key("player-1"))
-            .include("weapons")
-            .one(),
-    )
-    .unwrap_err();
-
-    assert!(
-        matches!(err, TableStoreError::Metadata(message) if message.contains("relationship includes"))
-    );
 }
 
 #[test]

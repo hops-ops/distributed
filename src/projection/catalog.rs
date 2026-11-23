@@ -1015,7 +1015,6 @@ mod tests {
             ],
             primary_key: PrimaryKey::new(["todo_id"]),
             version_column: Some("_sourced_version".into()),
-            foreign_keys: vec![],
             indexes: vec![],
             relationships: vec![],
             kind: TableKind::ReadModel,

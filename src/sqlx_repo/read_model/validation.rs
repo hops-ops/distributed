@@ -1,19 +1,7 @@
 use crate::table::{
     key_fingerprint, validate_row_values, ExpectedVersion, RowKey, RowValue, RowValues,
-    TableAdapterCapabilities, TableColumn, TableSchema, TableStoreError, TableWritePlan,
+    TableColumn, TableSchema, TableStoreError,
 };
-
-pub(crate) fn sql_read_model_capabilities() -> TableAdapterCapabilities {
-    TableAdapterCapabilities {
-        relational_rows: true,
-        sparse_patches: true,
-        deletes: true,
-    }
-}
-
-pub(crate) fn validate_sql_write_plan(plan: &TableWritePlan) -> Result<(), TableStoreError> {
-    plan.validate_for(&sql_read_model_capabilities())
-}
 
 pub(crate) fn initial_row_version() -> u64 {
     1

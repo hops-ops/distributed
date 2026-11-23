@@ -83,7 +83,6 @@ impl TableSchemaRegistry {
         for schema in self.schemas() {
             schema.validate()?;
             self.validate_column_foreign_keys(schema, &table_names)?;
-            self.validate_schema_foreign_keys(schema, &table_names)?;
             self.validate_relationships(schema, &table_names)?;
         }
 
@@ -103,24 +102,6 @@ impl TableSchemaRegistry {
                 &schema.model_name,
                 &schema.table_name,
                 &column.column_name,
-                &foreign_key.table,
-                &foreign_key.column,
-                table_names,
-            )?;
-        }
-        Ok(())
-    }
-
-    fn validate_schema_foreign_keys(
-        &self,
-        schema: &TableSchema,
-        table_names: &BTreeSet<String>,
-    ) -> Result<(), TableStoreError> {
-        for foreign_key in &schema.foreign_keys {
-            self.validate_foreign_key_target(
-                &schema.model_name,
-                &schema.table_name,
-                "",
                 &foreign_key.table,
                 &foreign_key.column,
                 table_names,
@@ -209,13 +190,8 @@ impl TableSchemaRegistry {
             .iter()
             .any(|column| column.column_name == target_column)
         {
-            let local_column = if column_name.is_empty() {
-                "schema".to_string()
-            } else {
-                format!("column `{column_name}`")
-            };
             return Err(TableStoreError::Metadata(format!(
-                "model `{model_name}` {local_column} references missing foreign-key column `{target_table}.{target_column}`"
+                "model `{model_name}` column `{column_name}` references missing foreign-key column `{target_table}.{target_column}`"
             )));
         }
 
@@ -403,7 +379,7 @@ pub fn resolve_direct_join_keys(
             .ok_or_else(|| {
                 TableStoreError::Metadata(format!("referenced key column `{pk_column}` is missing"))
             })?;
-        if foreign.column_type != referenced.column_type || foreign.jsonb != referenced.jsonb {
+        if foreign.column_type != referenced.column_type {
             return Err(TableStoreError::Metadata(format!(
                 "model `{}` relationship `{}` joins incompatible column types for `{foreign_key_column}` and `{pk_column}`",
                 source.model_name, relationship.field_name,
@@ -594,24 +570,6 @@ fn column_name_on<'a>(schema: &'a TableSchema, name: &str) -> Option<&'a str> {
     })
 }
 
-/// Schema lifecycle operations an adapter can support.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct TableSchemaAdapterCapabilities {
-    pub migration_artifacts: bool,
-    pub schema_verification: bool,
-    pub dev_bootstrap: bool,
-}
-
-impl TableSchemaAdapterCapabilities {
-    pub fn all() -> Self {
-        Self {
-            migration_artifacts: true,
-            schema_verification: true,
-            dev_bootstrap: true,
-        }
-    }
-}
-
 /// Generated or user-consumable migration artifact for registered schemas.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TableMigrationArtifact {
@@ -628,61 +586,6 @@ impl TableMigrationArtifact {
     }
 }
 
-/// Result of verifying registered metadata against an adapter-owned schema.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct TableSchemaVerification {
-    pub issues: Vec<TableSchemaIssue>,
-}
-
-impl TableSchemaVerification {
-    pub fn verified() -> Self {
-        Self::default()
-    }
-
-    pub fn is_verified(&self) -> bool {
-        self.issues.is_empty()
-    }
-}
-
-/// Adapter-facing schema verification issue.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct TableSchemaIssue {
-    pub table_name: String,
-    pub column_name: Option<String>,
-    pub kind: TableSchemaIssueKind,
-    pub message: String,
-}
-
-impl TableSchemaIssue {
-    pub fn new(
-        table_name: impl Into<String>,
-        column_name: Option<impl Into<String>>,
-        kind: TableSchemaIssueKind,
-        message: impl Into<String>,
-    ) -> Self {
-        Self {
-            table_name: table_name.into(),
-            column_name: column_name.map(Into::into),
-            kind,
-            message: message.into(),
-        }
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum TableSchemaIssueKind {
-    MissingTable,
-    MissingColumn,
-    TypeMismatch,
-    PrimaryKeyMismatch,
-    ForeignKeyMismatch,
-    IndexMismatch,
-    NullabilityMismatch,
-    DefaultMismatch,
-    VersionColumnMismatch,
-    Unsupported(String),
-}
-
 /// Result of an explicit dev/test schema bootstrap operation.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct TableSchemaBootstrap {
@@ -694,38 +597,6 @@ impl TableSchemaBootstrap {
         Self {
             bootstrapped_tables: bootstrapped_tables.into_iter().collect(),
         }
-    }
-}
-
-/// Adapter contract for schema generation, verification, and dev/test bootstrap.
-pub trait TableSchemaAdapter {
-    fn schema_capabilities(&self) -> TableSchemaAdapterCapabilities;
-
-    fn generate_migration_artifacts(
-        &self,
-        _registry: &TableSchemaRegistry,
-    ) -> Result<Vec<TableMigrationArtifact>, TableStoreError> {
-        Err(TableStoreError::Metadata(
-            "read-model schema adapter does not support migration artifact generation".into(),
-        ))
-    }
-
-    fn verify_schema(
-        &self,
-        _registry: &TableSchemaRegistry,
-    ) -> Result<TableSchemaVerification, TableStoreError> {
-        Err(TableStoreError::Metadata(
-            "read-model schema adapter does not support startup schema verification".into(),
-        ))
-    }
-
-    fn bootstrap_schema_for_dev(
-        &self,
-        _registry: &TableSchemaRegistry,
-    ) -> Result<TableSchemaBootstrap, TableStoreError> {
-        Err(TableStoreError::Metadata(
-            "read-model schema adapter does not support explicit dev/test bootstrap".into(),
-        ))
     }
 }
 
@@ -761,7 +632,6 @@ mod m2m_join_key_tests {
             columns,
             primary_key: PrimaryKey::new(pk.iter().copied()),
             version_column: None,
-            foreign_keys: Vec::new(),
             indexes: Vec::new(),
             relationships,
             kind: TableKind::ReadModel,

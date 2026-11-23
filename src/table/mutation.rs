@@ -148,16 +148,12 @@ impl TableMutation {
 
     fn depends_on_table(&self, table_name: &str) -> bool {
         let schema = self.schema();
-        schema
-            .foreign_keys
-            .iter()
-            .any(|foreign_key| foreign_key.table == table_name)
-            || schema.columns.iter().any(|column| {
-                column
-                    .foreign_key
-                    .as_ref()
-                    .is_some_and(|foreign_key| foreign_key.table == table_name)
-            })
+        schema.columns.iter().any(|column| {
+            column
+                .foreign_key
+                .as_ref()
+                .is_some_and(|foreign_key| foreign_key.table == table_name)
+        })
     }
 
     pub(crate) fn dependency_order(&self, other: &Self) -> Option<Ordering> {
@@ -491,7 +487,6 @@ mod tests {
             ],
             primary_key: PrimaryKey::new(["id"]),
             version_column: None,
-            foreign_keys: Vec::new(),
             indexes: Vec::new(),
             relationships: Vec::new(),
             kind: TableKind::ReadModel,
@@ -511,7 +506,6 @@ mod tests {
             ],
             primary_key: PrimaryKey::new(["id"]),
             version_column: None,
-            foreign_keys: Vec::new(),
             indexes: Vec::new(),
             relationships: Vec::new(),
             kind: TableKind::ReadModel,

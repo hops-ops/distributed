@@ -208,7 +208,6 @@ mod tests {
             columns: Vec::new(),
             primary_key: crate::table::PrimaryKey::new(["message_id"]),
             version_column: None,
-            foreign_keys: Vec::new(),
             indexes: Vec::new(),
             relationships: Vec::new(),
             kind: crate::table::TableKind::ReadModel,

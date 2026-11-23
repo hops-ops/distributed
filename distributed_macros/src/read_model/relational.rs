@@ -61,7 +61,6 @@ pub(super) fn expand_relational_read_model(
     let mut row_inserts = Vec::new();
     let mut row_fields = Vec::new();
     let mut key_inserts = Vec::new();
-    let mut foreign_keys = Vec::new();
     let mut indexes = Vec::new();
     let mut relationships = Vec::new();
     let mut hydrate_include_arms = Vec::new();
@@ -148,17 +147,14 @@ pub(super) fn expand_relational_read_model(
         let nullable = attrs.nullable || option_inner_type(&field.ty).is_some();
         let column_type = column_type_tokens(&field.ty, attrs.jsonb, attrs.text);
         let default_tokens = option_string_tokens(attrs.default.as_deref());
-        let foreign_key_value = attrs.foreign_key.as_ref().map(foreign_key_tokens);
-        let foreign_key = foreign_key_value
+        let foreign_key = attrs
+            .foreign_key
             .as_ref()
+            .map(foreign_key_tokens)
             .map(|foreign_key| quote! { Some(#foreign_key) })
             .unwrap_or_else(|| quote! { None });
-        if let Some(foreign_key) = &foreign_key_value {
-            foreign_keys.push(foreign_key.clone());
-        }
         let delegated_from = option_string_tokens(attrs.delegated_from.as_deref());
         let has_default = attrs.has_default;
-        let jsonb = attrs.jsonb;
         let projection_metadata = projection_field_metadata(field)?;
         let rust_type = projection_metadata.rust_type;
         let portable_kind = syn::Ident::new(
@@ -194,7 +190,6 @@ pub(super) fn expand_relational_read_model(
                 primary_key: #primary_key,
                 foreign_key: #foreign_key,
                 delegated_from: #delegated_from,
-                jsonb: #jsonb,
                 skipped: false,
             }
         });
@@ -299,7 +294,6 @@ pub(super) fn expand_relational_read_model(
                             columns: vec![#(#primary_key_columns),*],
                         },
                         version_column: Some(#framework::DEFAULT_TABLE_VERSION_COLUMN.to_string()),
-                        foreign_keys: vec![#(#foreign_keys),*],
                         indexes: vec![#(#indexes),*],
                         relationships: vec![#(#relationships),*],
                         kind: #framework::TableKind::ReadModel,

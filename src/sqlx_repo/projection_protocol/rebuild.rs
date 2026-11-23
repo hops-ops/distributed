@@ -101,7 +101,7 @@ where
         let topology = context.compiled.topology();
         let partition = context.partition()?;
         let write_plan = plan.write_plan();
-        validate_sql_write_plan(&write_plan)?;
+        write_plan.validate()?;
         let mut tx = self
             .pool()
             .begin_with(DB::BEGIN_READ_THEN_WRITE)

@@ -36,7 +36,7 @@ use crate::entity::{Entity, EventRecord};
 use crate::outbox::{OutboxMessage, OutboxMessageStatus};
 use crate::outbox_worker::{ClaimOutboxMessages, OutboxBacklogStats, OutboxClaimRef, OutboxStore};
 use crate::projection_protocol::{ProjectionChangeRetention, SameTransactionProjectionBatch};
-use crate::read_model::{ReadModelLoadGraph, ReadModelLoadRequest, ReadModelQueryCapabilities};
+use crate::read_model::{ReadModelLoadGraph, ReadModelLoadRequest};
 use crate::repository::{
     validate_commit_batch, CommitBatch, GetStream, InboxReceipt, InboxStore, PreparedEventAppend,
     ReadModelWritePlanStore, RelationalReadModelQueryStore, RepositoryError, SnapshotStore,
@@ -49,19 +49,13 @@ use crate::sqlx_repo::projection_protocol::{
 };
 use crate::sqlx_repo::read_model::{
     apply_read_model_write_plan_in_tx, commit_read_model_tx, load_read_model_graph,
-    remember_read_model_schemas, sql_read_model_capabilities, validate_sql_write_plan,
-    SqlxReadModelBackend,
+    remember_read_model_schemas, SqlxReadModelBackend,
 };
 use crate::sqlx_repo::{audited_table_schema_sql, repository_u64_from_i64};
 use crate::table::{
     generate_table_migration_artifacts, table_schema_bootstrap_result, table_schema_statements,
     TableMigrationArtifact, TableSchemaBootstrap, TableSchemaRegistry, TableSqlDialect,
-    TableSqlSchemaAdapter, TableStoreError,
-};
-use crate::table::{
-    TableAdapterCapabilities as ReadModelAdapterCapabilities,
-    TableCommitOutcome as ReadModelCommitOutcome, TableStoreError as ReadModelError,
-    TableWritePlan as ReadModelWritePlan,
+    TableStoreError, TableWritePlan,
 };
 
 mod backend;

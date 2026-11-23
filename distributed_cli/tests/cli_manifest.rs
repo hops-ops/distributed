@@ -74,7 +74,7 @@ fn client_manifest_uses_service_surface_export() {
     assert_eq!(manifest["surface"]["name"], "user");
     assert_eq!(
         manifest["schema_fingerprint"],
-        "sha256:f901f7e6a206abf558178255525d907ca14fab95ae4240dba0c35c10a89aaadb"
+        "sha256:c919a2b667e09b9ba82b7631b84580086a7143333a736eaec4641160ebe5707e"
     );
     assert_eq!(
         manifest["protocol_fingerprint"],
@@ -101,7 +101,7 @@ fn client_manifest_uses_service_surface_export() {
     );
     assert_eq!(
         manifest["commands"][0]["extensions"]["direct_projection"]["topology"]["digest"],
-        "sha256:32e51a5f5c3b7a83d27366f8dc889b87045e65f027f7b598421a6db765efe8a4"
+        "sha256:e1a6b71d390f627c5b446daa9b035499f87c03ef24b15df275a807658084b31d"
     );
     assert_eq!(
         manifest["commands"][0]["extensions"]["direct_projection"]["model"],

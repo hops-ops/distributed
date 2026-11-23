@@ -29,37 +29,12 @@ pub use mutation::{
     DeleteTableRowMutation, ExpectedVersion, PatchMode, PatchTableRowMutation, RowPatch,
     RowWriteMode, TableMutation, TableRowMutation,
 };
-pub use plan::{TableAdapterCapabilities, TableCommitOutcome, TableWritePlan};
+pub use plan::TableWritePlan;
 pub use registry::{
     resolve_direct_join_keys, resolve_m2m_join_keys, DirectJoinPair, JoinColumnPair, M2mJoinKeys,
-    TableMigrationArtifact, TableSchemaAdapter, TableSchemaAdapterCapabilities,
-    TableSchemaBootstrap, TableSchemaIssue, TableSchemaIssueKind, TableSchemaRegistry,
-    TableSchemaVerification,
+    TableMigrationArtifact, TableSchemaBootstrap, TableSchemaRegistry,
 };
 pub use sql::{
     bootstrap_result as table_schema_bootstrap_result, generate_table_migration_artifacts,
-    table_schema_statements, TableSqlDialect, TableSqlSchemaAdapter,
+    table_schema_statements, TableSqlDialect,
 };
-
-/// Opt-in trait for non-read-model types that map to a relational table row.
-pub trait TableModel: Clone + Send + Sync + Sized {
-    fn table_schema() -> &'static TableSchema;
-    fn table_key(&self) -> Result<RowKey, TableStoreError>;
-    fn to_table_row(&self) -> Result<RowValues, TableStoreError>;
-}
-
-/// Extension methods for registering neutral table models.
-pub trait TableSchemaRegistryExt {
-    fn register_table<M>(&mut self) -> Result<&mut Self, TableStoreError>
-    where
-        M: TableModel;
-}
-
-impl TableSchemaRegistryExt for TableSchemaRegistry {
-    fn register_table<M>(&mut self) -> Result<&mut Self, TableStoreError>
-    where
-        M: TableModel,
-    {
-        self.register_schema(M::table_schema().clone())
-    }
-}

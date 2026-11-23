@@ -4186,7 +4186,6 @@ fn todos() -> TableSchema {
         ],
         primary_key: PrimaryKey::new(["todo_id"]),
         version_column: Some("_sourced_version".into()),
-        foreign_keys: vec![],
         indexes: vec![],
         relationships: vec![RelationshipDef {
             references: None,
@@ -4208,7 +4207,6 @@ fn users() -> TableSchema {
         columns: vec![primary_column("user_id"), column("display_name")],
         primary_key: PrimaryKey::new(["user_id"]),
         version_column: Some("_sourced_version".into()),
-        foreign_keys: vec![],
         indexes: vec![],
         relationships: vec![],
         kind: TableKind::ReadModel,
@@ -4222,7 +4220,6 @@ fn todo_owner_links() -> TableSchema {
         columns: vec![primary_column("todo_id"), primary_column("owner_id")],
         primary_key: PrimaryKey::new(["todo_id", "owner_id"]),
         version_column: Some("_sourced_version".into()),
-        foreign_keys: vec![],
         indexes: vec![],
         relationships: vec![],
         kind: TableKind::ReadModel,

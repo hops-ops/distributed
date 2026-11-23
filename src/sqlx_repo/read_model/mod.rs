@@ -32,8 +32,7 @@ pub(crate) use schema_registry::{
 pub(crate) use validation::{
     column_by_name, initial_row_version, patch_values_preserving_key, quote_identifier,
     row_concurrency_conflict, row_values_from_key_and_patch, row_write_values,
-    sql_read_model_capabilities, validate_row_expected_version, validate_sql_write_plan,
-    validate_values_match_key, version_column,
+    validate_row_expected_version, validate_values_match_key, version_column,
 };
 pub(crate) use write_plan::{
     apply_read_model_write_plan_in_tx, commit_read_model_tx, row_version_in_tx,
