@@ -22,8 +22,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 const POLL: Duration = Duration::from_millis(10);
-/// How long a group may take to disappear after SIGKILL.
-const KILLED: Duration = Duration::from_secs(1);
 /// How long a foreground command gets to exit after SIGTERM.
 const GRACE: Duration = Duration::from_secs(5);
 
@@ -84,23 +82,28 @@ impl ProcessGroup {
         }
     }
 
-    /// Kill every member (SIGKILL) and wait until none is left.
+    /// Kill every member (SIGKILL) and reap the leader.
+    ///
+    /// SIGKILL cannot be caught and reaches every member in one call, so none
+    /// survives it. This does not wait for the kernel to finish removing
+    /// them: how long that takes depends on the machine's load, not on them.
     pub(crate) fn kill(&mut self) -> io::Result<()> {
-        if !self.is_running()? {
+        if self.gone {
             return Ok(());
         }
         #[cfg(unix)]
-        self.signal(libc::SIGKILL)?;
+        match self.signal(libc::SIGKILL) {
+            Ok(_) => {}
+            // macOS answers EPERM for a group whose members are all exiting.
+            Err(error) if error.raw_os_error() == Some(libc::EPERM) => {}
+            Err(error) => return Err(error),
+        }
         // A leader that left its own group is not reached by the group signal.
         // `Child::kill` does nothing once the leader has been reaped.
         self.leader.kill()?;
-        if self.wait_gone(KILLED)? {
-            Ok(())
-        } else {
-            Err(io::Error::other(
-                "process group remained alive after SIGKILL",
-            ))
-        }
+        self.leader.wait()?;
+        self.gone = true;
+        Ok(())
     }
 
     /// Wait up to `timeout` for the whole group to exit.

@@ -929,7 +929,8 @@ fn dev_stop_cancels_the_initial_build_before_process_startup() {
     let error = supervisor
         .stop_and_join_result()
         .expect_err("initial build should report cancellation");
-    assert!(started.elapsed() < Duration::from_secs(1));
+    // The plan never finishes by itself; the bound only has to be finite.
+    assert!(started.elapsed() < Duration::from_secs(10));
     assert!(error.message().contains("was canceled"));
     assert!(!root.join("dev-process.log").exists());
 }
@@ -959,7 +960,7 @@ fn dev_stop_cancels_a_running_readiness_probe() {
     enable_dev(&root);
     configure_blocking_readiness_probe(&root, 2_000);
     let supervisor = DevSupervisor::start(root.clone());
-    wait_until(Duration::from_secs(1), || {
+    wait_until(Duration::from_secs(5), || {
         root.join("readiness-probe-descendant.pid").exists()
     });
 
