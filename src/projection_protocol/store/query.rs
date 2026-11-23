@@ -155,7 +155,7 @@ pub(crate) struct ProjectionQuerySnapshot {
 
 /// Sanitized live boundary for one exact projector partition, read inside the
 /// same adapter snapshot as a GraphQL query when used by Task 16.
-#[cfg(any(feature = "sqlite", feature = "postgres"))]
+#[cfg(any(feature = "sqlite", feature = "postgres", feature = "graphql"))]
 // Only the GraphQL query path reads this outside tests.
 #[cfg_attr(not(feature = "graphql"), allow(dead_code))]
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -335,7 +335,7 @@ pub(crate) struct ProjectionCausationEvidenceBatch {
 /// store may only return a live record after recovering its exact partition
 /// from durable metadata and proving that identity is unique. Only the SQL
 /// stores answer it, for the GraphQL query path.
-#[cfg(any(feature = "sqlite", feature = "postgres"))]
+#[cfg(any(feature = "sqlite", feature = "postgres", feature = "graphql"))]
 #[cfg_attr(not(feature = "graphql"), allow(dead_code))]
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct ProjectionLiveRecordRequest {
@@ -346,7 +346,7 @@ pub(crate) struct ProjectionLiveRecordRequest {
     pub(crate) canonical_key_hash: [u8; 32],
 }
 
-#[cfg(any(feature = "sqlite", feature = "postgres"))]
+#[cfg(any(feature = "sqlite", feature = "postgres", feature = "graphql"))]
 #[cfg_attr(not(feature = "graphql"), allow(dead_code))]
 impl ProjectionLiveRecordRequest {
     pub(crate) fn new(
@@ -402,7 +402,7 @@ impl ProjectionLiveRecordRequest {
     }
 }
 
-#[cfg(any(feature = "sqlite", feature = "postgres"))]
+#[cfg(any(feature = "sqlite", feature = "postgres", feature = "graphql"))]
 // Only the GraphQL query path reads this outside tests.
 #[cfg_attr(not(feature = "graphql"), allow(dead_code))]
 #[derive(Clone, Debug, PartialEq)]
@@ -410,7 +410,7 @@ pub(crate) struct ProjectionLiveRecordBatchRequest {
     pub(crate) requests: Vec<ProjectionLiveRecordRequest>,
 }
 
-#[cfg(any(feature = "sqlite", feature = "postgres"))]
+#[cfg(any(feature = "sqlite", feature = "postgres", feature = "graphql"))]
 #[cfg_attr(not(feature = "graphql"), allow(dead_code))]
 impl ProjectionLiveRecordBatchRequest {
     pub(crate) fn new(
@@ -447,7 +447,7 @@ impl ProjectionLiveRecordBatchRequest {
 }
 
 /// Results are aligned positionally with the validated request batch.
-#[cfg(any(feature = "sqlite", feature = "postgres"))]
+#[cfg(any(feature = "sqlite", feature = "postgres", feature = "graphql"))]
 // Only the GraphQL query path reads this outside tests.
 #[cfg_attr(not(feature = "graphql"), allow(dead_code))]
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
