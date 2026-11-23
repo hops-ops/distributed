@@ -16,50 +16,12 @@ use crate::table::{
     TableWritePlan,
 };
 
-pub(crate) async fn begin_read_model_tx<DB: SqlxReadModelBackend>(
-    pool: &sqlx::Pool<DB>,
-) -> Result<Transaction<'_, DB>, TableStoreError> {
-    pool.begin()
-        .await
-        .map_err(|err| read_model_storage_error(DB::BACKEND, "begin transaction", err))
-}
-
 pub(crate) async fn commit_read_model_tx<DB: SqlxReadModelBackend>(
     tx: Transaction<'_, DB>,
 ) -> Result<(), TableStoreError> {
     tx.commit()
         .await
         .map_err(|err| read_model_storage_error(DB::BACKEND, "commit transaction", err))
-}
-
-/// Full pool→tx→commit helper kept for adapter authors; production paths use the
-/// split begin/apply/commit helpers above.
-#[allow(dead_code)]
-pub(crate) async fn commit_read_model_write_plan<DB>(
-    pool: &sqlx::Pool<DB>,
-    plan: TableWritePlan,
-    notify_enabled: bool,
-) -> Result<TableCommitOutcome, TableStoreError>
-where
-    DB: SqlxReadModelBackend,
-    for<'c> &'c mut <DB as Database>::Connection: Executor<'c, Database = DB>,
-    <DB as Database>::Arguments: IntoArguments<DB>,
-    for<'q> i64: Encode<'q, DB> + Type<DB> + sqlx::Decode<'q, DB>,
-    for<'r> &'r str: sqlx::ColumnIndex<<DB as Database>::Row>,
-{
-    validate_sql_write_plan(&plan)?;
-    let tables: std::collections::BTreeSet<String> = plan
-        .mutations
-        .iter()
-        .map(|m| m.table_name().to_string())
-        .collect();
-    let mut tx = begin_read_model_tx(pool).await?;
-    let outcome = apply_read_model_write_plan_in_tx(&mut tx, plan).await?;
-    if notify_enabled && !tables.is_empty() {
-        DB::push_change_notify(&mut *tx, &tables).await?;
-    }
-    commit_read_model_tx(tx).await?;
-    Ok(outcome)
 }
 
 pub(crate) async fn apply_read_model_write_plan_in_tx<DB>(

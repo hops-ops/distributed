@@ -73,6 +73,7 @@ pub(crate) use reads::{
     read_projection_changes_in_executor, read_projection_live_record_batch_in_executor,
     read_projection_query_snapshot_in_executor, with_projection_read_snapshot,
 };
+pub(crate) use types::VerifiedRegistrations;
 use types::*;
 use writes::*;
 

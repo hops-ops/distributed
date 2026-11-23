@@ -8,6 +8,8 @@ pub(crate) mod projection_protocol;
 pub(crate) mod read_model;
 #[cfg(any(feature = "postgres", feature = "sqlite"))]
 pub(crate) mod repo;
+#[cfg(all(test, any(feature = "postgres", feature = "sqlite")))]
+pub(crate) mod statement_count_tests;
 
 #[cfg(feature = "postgres")]
 pub(crate) fn repository_i64_from_u64(

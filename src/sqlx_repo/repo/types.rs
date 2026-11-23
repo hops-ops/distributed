@@ -14,6 +14,7 @@ pub struct SqlxRepository<DB: sqlx::Database> {
     pub(super) notify_enabled: bool,
     pub(super) projection_change_retention: ProjectionChangeRetention,
     pub(super) causal_storage_identity: CausalStorageIdentity,
+    pub(super) verified_registrations: VerifiedRegistrations,
     /// A [`ScheduleWorker`](crate::schedule::worker::ScheduleWorker) was
     /// attached (`with_schedule_worker`): routes may require
     /// [`Capability::Scheduling`](crate::schedule::Capability::Scheduling).
@@ -29,6 +30,7 @@ impl<DB: sqlx::Database> Clone for SqlxRepository<DB> {
             notify_enabled: self.notify_enabled,
             projection_change_retention: self.projection_change_retention,
             causal_storage_identity: self.causal_storage_identity,
+            verified_registrations: self.verified_registrations.clone(),
             schedule_dispatch: self.schedule_dispatch,
         }
     }
@@ -67,6 +69,7 @@ where
             notify_enabled: true,
             projection_change_retention: ProjectionChangeRetention::default(),
             causal_storage_identity: CausalStorageIdentity::new(),
+            verified_registrations: VerifiedRegistrations::default(),
             schedule_dispatch: false,
         }
     }
@@ -112,6 +115,10 @@ where
         }
         // Zero receivers is a no-op (broadcast::send returns Err).
         let _ = self.read_model_change_tx.send(change);
+    }
+
+    pub(crate) fn verified_registrations(&self) -> &VerifiedRegistrations {
+        &self.verified_registrations
     }
 
     pub(crate) fn projection_notify_enabled(&self) -> bool {

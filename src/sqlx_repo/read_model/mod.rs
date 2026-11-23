@@ -36,5 +36,5 @@ pub(crate) use validation::{
     validate_values_match_key, version_column,
 };
 pub(crate) use write_plan::{
-    apply_read_model_write_plan_in_tx, begin_read_model_tx, commit_read_model_tx, row_version_in_tx,
+    apply_read_model_write_plan_in_tx, commit_read_model_tx, row_version_in_tx,
 };

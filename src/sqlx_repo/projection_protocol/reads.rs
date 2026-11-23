@@ -150,6 +150,7 @@ where
 /// the caller executes the final ledger fence.
 pub(crate) async fn apply_same_transaction_projection_in_tx<DB>(
     tx: &mut Transaction<'_, DB>,
+    verified: &VerifiedRegistrations,
     batch: &SameTransactionProjectionBatch,
     retention: ProjectionChangeRetention,
 ) -> Result<SameTransactionProjectionEvidence, ProjectionProtocolError>
@@ -173,7 +174,7 @@ where
             .collect(),
     );
     validate_sql_write_plan(&write_plan)?;
-    verify_registered_topology_in_tx(tx, &batch.topology).await?;
+    verify_registered_topology_in_tx(tx, verified, &batch.topology).await?;
     let mut state =
         lock_partition_in_tx(tx, &batch.topology, &batch.partition, &batch.change_epoch).await?;
     if let Some(failure_id) = &state.stopped_failure_id {
@@ -184,8 +185,14 @@ where
     if state.pending_retry_failure_id.is_some() {
         return Err(ProjectionProtocolError::IncomparableInput);
     }
-    ensure_partition_ownership_in_tx(tx, &batch.topology, &batch.partition, &batch.ownership)
-        .await?;
+    ensure_partition_ownership_in_tx(
+        tx,
+        verified,
+        &batch.topology,
+        &batch.partition,
+        &batch.ownership,
+    )
+    .await?;
 
     let staged = batch
         .mutations
@@ -274,9 +281,9 @@ where
     };
 
     apply_read_model_write_plan_in_tx(tx, write_plan).await?;
-    insert_change_in_tx(tx, &change).await?;
-    upsert_record_in_tx(tx, &metadata).await?;
-    insert_observation_in_tx(tx, &observation).await?;
+    insert_changes_in_tx(tx, std::slice::from_ref(&change)).await?;
+    upsert_records_in_tx(tx, std::slice::from_ref(&metadata)).await?;
+    insert_observations_in_tx(tx, std::slice::from_ref(&observation)).await?;
     update_partition_head_in_tx(
         tx,
         &batch.topology,
@@ -319,13 +326,46 @@ where
     for<'r> &'r str: sqlx::ColumnIndex<DB::Row>,
 {
     request.validate()?;
+    let mut builder = QueryBuilder::<DB>::new("");
+    push_query_snapshot_select(&mut builder, request, 0)?;
+    builder.push(QUERY_SNAPSHOT_ORDER);
+    let rows = builder.build().fetch_all(executor).await.map_err(|error| {
+        protocol_storage_error::<DB>("read atomic projection query snapshot", error)
+    })?;
+    decode_query_snapshot::<DB>(request, &rows.iter().collect::<Vec<_>>())
+}
+
+/// Orders a statement of [`push_query_snapshot_select`] selects by request,
+/// then by checkpoint probe.
+const QUERY_SNAPSHOT_ORDER: &str = " ORDER BY ps_request, ps_cursor_source_hash, \
+     ps_cursor_partition_hash, ps_cursor_generation";
+
+/// Push the select answering `request`; every row it returns carries `tag`
+/// as `ps_request`. Selects of one schema combine with `UNION ALL`.
+fn push_query_snapshot_select<DB>(
+    builder: &mut QueryBuilder<DB>,
+    request: &ProjectionQuerySnapshotRequest,
+    tag: usize,
+) -> Result<(), ProjectionProtocolError>
+where
+    DB: SqlxRepoBackend,
+    DB::Arguments: IntoArguments<DB>,
+    for<'q> i64: Encode<'q, DB> + Type<DB> + sqlx::Decode<'q, DB>,
+    for<'q> String: Type<DB> + sqlx::Decode<'q, DB>,
+    for<'q> Vec<u8>: Type<DB> + sqlx::Decode<'q, DB>,
+    for<'q> &'q str: Encode<'q, DB> + Type<DB>,
+    for<'q> &'q [u8]: Encode<'q, DB> + Type<DB>,
+    for<'r> &'r str: sqlx::ColumnIndex<DB::Row>,
+{
     let schema = request.schema.as_ref();
     let physical_version_column = version_column(schema)?;
     let topology_hash = request.scope.topology().digest();
     let partition_hash = request.scope.projection_partition().digest();
     let key_hash = request.scope.key_digest();
 
-    let mut builder = QueryBuilder::<DB>::new("SELECT ");
+    builder.push("SELECT CAST(");
+    builder.push(tag.to_string());
+    builder.push(" AS BIGINT) AS ps_request, ");
     for (index, column) in schema.columns.iter().enumerate() {
         if index > 0 {
             builder.push(", ");
@@ -375,7 +415,7 @@ where
         if index > 0 {
             builder.push(", ");
         }
-        DB::push_select_column(&mut builder, column);
+        DB::push_select_column(builder, column);
     }
     if !schema.columns.is_empty() {
         builder.push(", ");
@@ -383,7 +423,7 @@ where
     builder.push(quote_identifier(physical_version_column));
     builder.push(" FROM ");
     builder.push(quote_identifier(&schema.table_name));
-    push_key_predicates(&mut builder, schema, &request.key)?;
+    push_key_predicates(builder, schema, &request.key)?;
     builder.push(") AS snapshot_row ON 1 = 1 ");
 
     builder.push(
@@ -440,15 +480,26 @@ where
         }
         builder.push(")");
     }
-    builder.push(
-        " ORDER BY checkpoint.source_hash, checkpoint.source_partition_hash, \
-         checkpoint.generation",
-    );
+    Ok(())
+}
 
-    let rows = builder.build().fetch_all(executor).await.map_err(|error| {
-        protocol_storage_error::<DB>("read atomic projection query snapshot", error)
-    })?;
-    let first = rows.first().ok_or_else(|| {
+/// Decode the rows one [`push_query_snapshot_select`] returned for `request`.
+fn decode_query_snapshot<DB>(
+    request: &ProjectionQuerySnapshotRequest,
+    rows: &[&DB::Row],
+) -> Result<ProjectionQuerySnapshot, ProjectionProtocolError>
+where
+    DB: SqlxRepoBackend,
+    DB::Arguments: IntoArguments<DB>,
+    for<'q> i64: Encode<'q, DB> + Type<DB> + sqlx::Decode<'q, DB>,
+    for<'q> String: Type<DB> + sqlx::Decode<'q, DB>,
+    for<'q> Vec<u8>: Type<DB> + sqlx::Decode<'q, DB>,
+    for<'q> &'q str: Encode<'q, DB> + Type<DB>,
+    for<'q> &'q [u8]: Encode<'q, DB> + Type<DB>,
+    for<'r> &'r str: sqlx::ColumnIndex<DB::Row>,
+{
+    let schema = request.schema.as_ref();
+    let first = *rows.first().ok_or_else(|| {
         corrupt_storage("atomic projection query snapshot returned no anchor row")
     })?;
 
@@ -713,7 +764,7 @@ where
     }
 
     let mut checkpoint_values = vec![None; request.checkpoint_probes.len()];
-    for row in &rows {
+    for row in rows {
         let stored_generation: Option<i64> =
             row.try_get("ps_cursor_generation").map_err(|error| {
                 protocol_storage_error::<DB>("decode projection query checkpoint presence", error)
@@ -926,6 +977,10 @@ where
     })
 }
 
+/// Selects per execution-snapshot statement: SQLite compounds at most 500,
+/// and PostgreSQL plans every select.
+const SNAPSHOT_STATEMENT_SELECTS: usize = 100;
+
 pub(crate) async fn read_projection_execution_snapshot_batch_in_executor<DB>(
     connection: &mut DB::Connection,
     request: &ProjectionExecutionSnapshotBatchRequest,
@@ -942,11 +997,68 @@ where
     for<'r> &'r str: sqlx::ColumnIndex<DB::Row>,
 {
     request.validate()?;
+    // One schema's selects have the same columns, so they share a statement.
+    let mut by_schema: Vec<Vec<usize>> = Vec::new();
+    for (index, row_request) in request.requests.iter().enumerate() {
+        match by_schema
+            .iter_mut()
+            .find(|group| request.requests[group[0]].schema == row_request.schema)
+        {
+            Some(group) => group.push(index),
+            None => by_schema.push(vec![index]),
+        }
+    }
+    let mut rows: Vec<Vec<DB::Row>> = request.requests.iter().map(|_| Vec::new()).collect();
+    for group in by_schema {
+        let mut pending = group.as_slice();
+        while !pending.is_empty() {
+            let mut builder = QueryBuilder::<DB>::new("");
+            let mut binds = 0;
+            let mut selects = 0;
+            for index in pending {
+                let row_request = &request.requests[*index];
+                let needed = row_request.schema.primary_key.columns.len()
+                    + 6
+                    + 3 * row_request.checkpoint_probes.len();
+                if selects > 0
+                    && (selects == SNAPSHOT_STATEMENT_SELECTS
+                        || binds + needed > DB::MAX_BIND_PARAMS)
+                {
+                    break;
+                }
+                if selects > 0 {
+                    builder.push(" UNION ALL ");
+                }
+                push_query_snapshot_select(&mut builder, row_request, *index)?;
+                binds += needed;
+                selects += 1;
+            }
+            pending = &pending[selects..];
+            builder.push(QUERY_SNAPSHOT_ORDER);
+            for row in builder
+                .build()
+                .fetch_all(&mut *connection)
+                .await
+                .map_err(|error| {
+                    protocol_storage_error::<DB>("read atomic projection query snapshot", error)
+                })?
+            {
+                let tag: i64 = row.try_get("ps_request").map_err(|error| {
+                    protocol_storage_error::<DB>("decode projection query request", error)
+                })?;
+                usize::try_from(tag)
+                    .ok()
+                    .and_then(|index| rows.get_mut(index))
+                    .ok_or_else(|| {
+                        corrupt_storage("projection query snapshot row names no request")
+                    })?
+                    .push(row);
+            }
+        }
+    }
     let mut snapshots = Vec::with_capacity(request.requests.len());
-    for row_request in &request.requests {
-        let snapshot =
-            read_projection_query_snapshot_in_executor::<DB, _>(&mut *connection, row_request)
-                .await?;
+    for (row_request, rows) in request.requests.iter().zip(&rows) {
+        let snapshot = decode_query_snapshot::<DB>(row_request, &rows.iter().collect::<Vec<_>>())?;
         snapshots.push(ProjectionScopedRowSnapshot {
             scope: row_request.scope.clone(),
             row: snapshot.row,
@@ -1487,10 +1599,9 @@ pub(crate) type ProjectionReadSnapshotFuture<'a, T> =
 /// Run a physical query plan and all of its causal-evidence probes in one
 /// repeatable database snapshot.
 ///
-/// PostgreSQL uses `REPEATABLE READ READ ONLY`; its default READ COMMITTED
-/// isolation would let each metadata statement observe a newer commit than the
-/// physical GraphQL statement. SQLite holds one ordinary read transaction,
-/// whose first read establishes the snapshot for the remaining plan.
+/// Runs `operation` in [`SqlxRepoBackend::BEGIN_READ_SNAPSHOT`], so a
+/// metadata statement never observes a newer commit than the physical GraphQL
+/// statement beside it.
 pub(crate) async fn with_projection_read_snapshot<DB, T, F>(
     pool: &Pool<DB>,
     operation: F,
@@ -1506,17 +1617,9 @@ where
     for<'c> &'c mut DB::Connection: Executor<'c, Database = DB>,
 {
     let mut tx = pool
-        .begin()
+        .begin_with(DB::BEGIN_READ_SNAPSHOT)
         .await
         .map_err(|error| protocol_storage_error::<DB>("begin projection read snapshot", error))?;
-    if DB::BACKEND == "postgres" {
-        sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
-            .execute(&mut *tx)
-            .await
-            .map_err(|error| {
-                protocol_storage_error::<DB>("configure projection read snapshot", error)
-            })?;
-    }
 
     let result = operation(&mut *tx).await;
     match result {

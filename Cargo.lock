@@ -1326,6 +1326,7 @@ dependencies = [
  "js-sys",
  "jsonwebtoken",
  "lapin",
+ "log",
  "opentelemetry",
  "opentelemetry-otlp",
  "opentelemetry_sdk",

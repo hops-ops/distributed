@@ -141,6 +141,7 @@ where
     if let Some(direct_projection) = &direct_projection {
         let evidence = apply_same_transaction_projection_in_tx(
             &mut tx,
+            repository.verified_registrations(),
             direct_projection,
             repository.projection_change_retention,
         )

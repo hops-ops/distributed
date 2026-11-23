@@ -120,6 +120,13 @@ where
     let state = decode_partition_row::<DB>(&row, topology, partition)?;
     ensure_change_epoch(&state.change_epoch, change_epoch)?;
 
+    if generation_exists_in_tx::<DB>(tx, topology, partition, state.active_generation).await? {
+        return Ok(state);
+    }
+    // Only a partition this statement just created has no generation yet.
+    if state.active_generation != ProjectionGeneration::initial() {
+        return Err(missing_generation(state.active_generation));
+    }
     let mut generation = QueryBuilder::<DB>::new(
         "INSERT INTO projection_generations \
          (topology_hash, partition_hash, generation, retry_of_generation, retry_of_failure_id) \
@@ -138,7 +145,6 @@ where
         .map_err(|error| {
             protocol_storage_error::<DB>("ensure initial projection generation", error)
         })?;
-    verify_generation_exists_in_tx::<DB>(tx, topology, partition, state.active_generation).await?;
     Ok(state)
 }
 
@@ -535,6 +541,34 @@ where
     for<'q> &'q str: Encode<'q, DB> + Type<DB>,
     for<'q> &'q [u8]: Encode<'q, DB> + Type<DB>,
 {
+    if generation_exists_in_tx::<DB>(tx, topology, partition, generation).await? {
+        Ok(())
+    } else {
+        Err(missing_generation(generation))
+    }
+}
+
+fn missing_generation(generation: ProjectionGeneration) -> ProjectionProtocolError {
+    corrupt_storage(format!(
+        "active projection generation {} is missing",
+        generation.get()
+    ))
+}
+
+async fn generation_exists_in_tx<DB>(
+    tx: &mut Transaction<'_, DB>,
+    topology: &ProjectorTopologyId,
+    partition: &crate::projection_protocol::PartitionId,
+    generation: ProjectionGeneration,
+) -> Result<bool, ProjectionProtocolError>
+where
+    DB: SqlxRepoBackend,
+    for<'c> &'c mut DB::Connection: Executor<'c, Database = DB>,
+    DB::Arguments: IntoArguments<DB>,
+    for<'q> i64: Encode<'q, DB> + Type<DB>,
+    for<'q> &'q str: Encode<'q, DB> + Type<DB>,
+    for<'q> &'q [u8]: Encode<'q, DB> + Type<DB>,
+{
     let generation_value = to_i64::<DB>(generation.get(), "projection generation")?;
     let topology_hash = topology.digest();
     let partition_hash = partition.digest();
@@ -546,17 +580,10 @@ where
     builder.push(" AND generation = ");
     builder.push_bind(generation_value);
     builder.push(" LIMIT 1");
-    if builder
+    Ok(builder
         .build()
         .fetch_optional(&mut **tx)
         .await
         .map_err(|error| protocol_storage_error::<DB>("verify projection generation", error))?
-        .is_none()
-    {
-        return Err(corrupt_storage(format!(
-            "active projection generation {} is missing",
-            generation.get()
-        )));
-    }
-    Ok(())
+        .is_some())
 }

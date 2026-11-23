@@ -117,6 +117,8 @@ axum = { version = "0.8", features = ["ws"] }
 distributed_cli = { path = "distributed_cli" }
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
+# Names the level SQLx logs statements at (src/sqlx_repo/statement_count_tests.rs).
+log = "0.4"
 # OTLP export e2e (tests/otel_export): a real SDK pipeline pointed at a
 # collector container, exercising the `otel` feature the way a service binary
 # would. Keep versions in lockstep with the optional `otel` feature deps.

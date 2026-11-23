@@ -352,6 +352,129 @@ mod postgres_tests {
         assert_eq!(snapshot.change_head.as_ref(), Some(&record.change));
     }
 
+    /// Raw writers of one table hold its ownership fence together; causal
+    /// registration of that table excludes them, in both orders.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn postgres_raw_writers_share_the_table_fence_registration_excludes() {
+        let Some(url) = crate::test_env::require_service(
+            "DISTRIBUTED_TEST_POSTGRES_URL",
+            "Postgres projection protocol test",
+        ) else {
+            return;
+        };
+        let _test_guard = POSTGRES_PROJECTION_TEST_LOCK.lock().await;
+        let repository = SqlxRepository::<sqlx::Postgres>::connect_and_migrate(&url)
+            .await
+            .unwrap();
+        let id = uuid::Uuid::now_v7();
+        let schema = crate::projection_protocol::scenario_tests::scenario_schema(
+            "FenceView",
+            format!("fence_{}", id.simple()),
+        );
+        let mut registry = TableSchemaRegistry::new();
+        registry.register_schema(schema.clone()).unwrap();
+        repository
+            .bootstrap_table_schema_for_dev(&registry)
+            .await
+            .unwrap();
+        let tables = BTreeSet::from([schema.table_name.clone()]);
+        let row = |id: &str| {
+            let mut values = RowValues::new();
+            values.insert("id", RowValue::String(id.into()));
+            TableWritePlan::new(vec![TableMutation::UpsertRow(TableRowMutation {
+                schema,
+                key: RowKey::new([("id", RowValue::String(id.into()))]),
+                values,
+                expected_version: ExpectedVersion::Any,
+                mode: RowWriteMode::Upsert,
+            })])
+        };
+        let mut digest = [7; 32];
+        digest[..16].copy_from_slice(id.as_bytes());
+        let topology = ProjectorTopologyId::new(1, "fence_projector", digest).unwrap();
+        let owner = ProjectionModelOwnership::new(&schema.model_name, &schema.table_name).unwrap();
+        let register = || {
+            let repository = repository.clone();
+            let (topology, owner) = (topology.clone(), owner.clone());
+            tokio::spawn(async move {
+                repository
+                    .register_projection_models(&topology, &[owner])
+                    .await
+            })
+        };
+        let blocked = Duration::from_millis(300);
+
+        // The table's first writer creates its fence, and until that commits
+        // a second writer waits to learn whether the fence exists.
+        repository.commit_write_plan(row("first")).await.unwrap();
+
+        // From then on an open writer does not make a writer of another row
+        // wait.
+        let mut open_writer = repository.pool().begin().await.unwrap();
+        reject_causal_table_writes_in_tx(&mut open_writer, &tables)
+            .await
+            .unwrap();
+        apply_read_model_write_plan_in_tx(&mut open_writer, row("open"))
+            .await
+            .unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            repository.commit_write_plan(row("concurrent")),
+        )
+        .await
+        .expect("a raw writer waited for another raw writer of the same table")
+        .unwrap();
+
+        // Registration waits for the open writer, then finds its row.
+        let registration = register();
+        tokio::time::sleep(blocked).await;
+        assert!(!registration.is_finished());
+        open_writer.commit().await.unwrap();
+        assert!(matches!(
+            registration.await.unwrap(),
+            Err(ProjectionProtocolError::InvalidBatch(message))
+                if message.contains("unverified legacy rows")
+        ));
+
+        // A writer waits for an open registration, then finds its marker.
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "DELETE FROM {}",
+            quote_identifier(&schema.table_name)
+        )))
+        .execute(repository.pool())
+        .await
+        .unwrap();
+        let mut open_registration = repository.pool().begin().await.unwrap();
+        lock_projection_table_ownership_fences_in_tx(
+            &mut open_registration,
+            &tables,
+            <sqlx::Postgres as SqlxRepoBackend>::OWNERSHIP_FENCE_REGISTRATION_LOCK,
+        )
+        .await
+        .unwrap();
+        let writer = {
+            let repository = repository.clone();
+            let plan = row("late");
+            tokio::spawn(async move { repository.commit_write_plan(plan).await })
+        };
+        tokio::time::sleep(blocked).await;
+        assert!(!writer.is_finished());
+        sqlx::query(
+            "INSERT INTO projection_causal_tables (table_name, model_name) VALUES ($1, $2)",
+        )
+        .bind(&schema.table_name)
+        .bind(&schema.model_name)
+        .execute(&mut *open_registration)
+        .await
+        .unwrap();
+        open_registration.commit().await.unwrap();
+        assert!(matches!(
+            writer.await.unwrap(),
+            Err(TableStoreError::CausalWriteRequired { table }) if table == schema.table_name
+        ));
+        register().await.unwrap().unwrap();
+    }
+
     #[tokio::test]
     async fn postgres_projection_protocol_runtime_conforms() {
         let Some(database_url) = crate::test_env::require_service(
@@ -374,7 +497,7 @@ mod postgres_tests {
 
         let mut raw_first_tx = repository.pool().begin().await.unwrap();
         let ownership_tables = BTreeSet::from(["postgres_projection_views".to_string()]);
-        lock_projection_table_ownership_fences_in_tx(&mut raw_first_tx, &ownership_tables)
+        reject_causal_table_writes_in_tx(&mut raw_first_tx, &ownership_tables)
             .await
             .unwrap();
         let registration_repository = repository.clone();

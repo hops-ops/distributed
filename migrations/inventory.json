@@ -156,6 +156,18 @@
         "path": "migrations/postgres/0013_schedule_claims.sql",
         "sha256": "fb6f15299dad6dde0e98333c11f8cc4f9d13bbee793e856741a5c43fb6d8d48b"
       }
+    },
+    {
+      "version": 14,
+      "description": "hot path indexes",
+      "sqlite": {
+        "path": "migrations/sqlite/0014_hot_path_indexes.sql",
+        "sha256": "79f8aba07265e80a711db60532e8236abf1a04bdcda7982de8e836714bfeb9d5"
+      },
+      "postgres": {
+        "path": "migrations/postgres/0014_hot_path_indexes.sql",
+        "sha256": "519c693c60dea20999b65a666b2010e61caab1ce57340e62776926362a8b4ae7"
+      }
     }
   ]
 }

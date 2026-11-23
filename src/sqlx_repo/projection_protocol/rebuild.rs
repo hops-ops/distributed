@@ -25,7 +25,9 @@ where
         let hash = topology.digest();
         let partition = context.partition()?;
         let mut query = QueryBuilder::<DB>::new(
-            "SELECT model_name, canonical_key_bytes, partition_hash FROM projection_records WHERE topology_hash = "
+            "SELECT model_name, canonical_key_bytes, canonical_key_hash, partition_hash, \
+             incarnation, revision, tombstone, change_epoch, change_position, source_snapshot \
+             FROM projection_records WHERE topology_hash = ",
         );
         query.push_bind(hash.as_slice());
         query.push(" LIMIT ");
@@ -39,7 +41,7 @@ where
             return Err(invalid("snapshot rebuild exceeds 10000 records"));
         }
         let mut records = Vec::with_capacity(keys.len());
-        for key in keys {
+        for key in &keys {
             let model: String = key
                 .try_get("model_name")
                 .map_err(|e| protocol_storage_error::<DB>("decode rebuild model", e))?;
@@ -56,12 +58,7 @@ where
             )?;
             let scope =
                 ProjectionRecordScope::new(topology.clone(), partition.clone(), model, bytes)?;
-            records.push(
-                record_in_tx(tx, &scope, &context.epoch)
-                    .await?
-                    .ok_or_else(|| invalid("snapshot rebuild record disappeared"))?
-                    .metadata,
-            );
+            records.push(decode_record_row::<DB>(&key, &scope, &context.epoch)?.metadata);
         }
         Ok(records)
     }
@@ -75,7 +72,12 @@ where
             .begin_with(DB::BEGIN_READ_THEN_WRITE)
             .await
             .map_err(|e| protocol_storage_error::<DB>("begin rebuild inventory", e))?;
-        verify_registered_topology_in_tx(&mut tx, context.compiled.topology()).await?;
+        verify_registered_topology_in_tx(
+            &mut tx,
+            self.verified_registrations(),
+            context.compiled.topology(),
+        )
+        .await?;
         lock_partition_in_tx(
             &mut tx,
             context.compiled.topology(),
@@ -105,18 +107,28 @@ where
             .begin_with(DB::BEGIN_READ_THEN_WRITE)
             .await
             .map_err(|e| protocol_storage_error::<DB>("begin snapshot rebuild", e))?;
-        verify_registered_topology_in_tx(&mut tx, topology).await?;
+        verify_registered_topology_in_tx(&mut tx, self.verified_registrations(), topology).await?;
         let mut state = lock_partition_in_tx(&mut tx, topology, &partition, &context.epoch).await?;
         plan.verify_inventory(&Self::rebuild_inventory(&mut tx, context).await?)?;
         ensure_partition_ownership_in_tx(
             &mut tx,
+            self.verified_registrations(),
             topology,
             &partition,
             context.compiled.ownership(),
         )
         .await?;
+        let record_rows = record_rows_in_tx(
+            &mut tx,
+            topology,
+            &partition,
+            &plan.rows.iter().map(|row| &row.scope).collect::<Vec<_>>(),
+        )
+        .await?;
+        let mut changes = Vec::with_capacity(plan.rows.len());
+        let mut records = Vec::with_capacity(plan.rows.len());
         for row in &plan.rows {
-            let current = record_in_tx(&mut tx, &row.scope, &context.epoch).await?;
+            let current = stored_record::<DB>(&record_rows, &row.scope, &context.epoch)?;
             let metadata = current.as_ref().map(|r| &r.metadata);
             row.verify_physical(
                 metadata,
@@ -143,9 +155,11 @@ where
                 change: change.cursor.clone(),
                 source_snapshot: Some(row.source.clone()),
             };
-            insert_change_in_tx(&mut tx, &change).await?;
-            upsert_record_in_tx(&mut tx, &record).await?;
+            changes.push(change);
+            records.push(record);
         }
+        insert_changes_in_tx(&mut tx, &changes).await?;
+        upsert_records_in_tx(&mut tx, &records).await?;
         apply_read_model_write_plan_in_tx(&mut tx, write_plan).await?;
         update_partition_head_in_tx(
             &mut tx,

@@ -45,12 +45,12 @@ use crate::repository::{
 use crate::snapshot::SnapshotRecord;
 use crate::sqlx_repo::projection_protocol::{
     apply_same_transaction_projection_in_tx, reject_causal_table_writes_in_tx,
-    PROJECTION_CHANGE_NOTIFY_TABLE,
+    VerifiedRegistrations, PROJECTION_CHANGE_NOTIFY_TABLE,
 };
 use crate::sqlx_repo::read_model::{
-    apply_read_model_write_plan_in_tx, begin_read_model_tx, commit_read_model_tx,
-    load_read_model_graph, remember_read_model_schemas, sql_read_model_capabilities,
-    validate_sql_write_plan, SqlxReadModelBackend,
+    apply_read_model_write_plan_in_tx, commit_read_model_tx, load_read_model_graph,
+    remember_read_model_schemas, sql_read_model_capabilities, validate_sql_write_plan,
+    SqlxReadModelBackend,
 };
 use crate::sqlx_repo::{audited_table_schema_sql, repository_u64_from_i64};
 use crate::table::{

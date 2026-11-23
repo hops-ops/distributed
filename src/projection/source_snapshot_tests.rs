@@ -1041,3 +1041,109 @@ async fn snapshot_rebuild_postgres() {
         .execute(store.pool()).await.unwrap();
     rebuild_rollback(&store).await;
 }
+
+/// Rebuild `records` rows from their complete history on a counted pool and
+/// pin the statements of the inventory read and of the apply.
+#[cfg(any(feature = "sqlite", feature = "postgres"))]
+async fn rebuild_statements<DB>(
+    pool: &sqlx::Pool<DB>,
+    store: &impl ProjectionProtocolStore,
+    records: usize,
+    inventory_bound: usize,
+    apply_bound: usize,
+) where
+    DB: sqlx::Database,
+    for<'c> &'c sqlx::Pool<DB>: sqlx::Executor<'c, Database = DB>,
+{
+    use crate::sqlx_repo::statement_count_tests::{assert_at_most, statements};
+    let projector = rebuild_projector();
+    let history = (0..records)
+        .map(|index| event(&format!("counted-{index}"), 1, "title", false))
+        .collect::<Vec<_>>();
+    let (rebuild, inventory) = statements(pool, projector.begin_snapshot_rebuild(store)).await;
+    assert_at_most(
+        &format!("rebuild inventory before {records} records"),
+        &inventory,
+        inventory_bound,
+    );
+    let plan = rebuild.unwrap().from_complete_history(&history).unwrap();
+    let (applied, apply) = statements(pool, plan.apply(store)).await;
+    assert_eq!(applied.unwrap(), records);
+    assert_at_most(
+        &format!("rebuild of {records} records"),
+        &apply,
+        apply_bound,
+    );
+}
+
+#[cfg(any(feature = "sqlite", feature = "postgres"))]
+async fn register_rebuild_topology(store: &impl ProjectionProtocolStore) {
+    let projector = rebuild_projector();
+    let (_, binding) = projector.modeled[0].raw().unwrap();
+    let physical = binding.physical_topology().unwrap();
+    let compiled = CompiledProjectionTopology::from_modeled_binding(
+        ProjectorTopologyId::new(physical.version(), physical.name(), physical.digest()).unwrap(),
+        binding
+            .outputs()
+            .iter()
+            .map(|o| (o.model(), o.storage(), o.schema())),
+    )
+    .unwrap();
+    store
+        .register_projection_models(compiled.topology(), compiled.ownership())
+        .await
+        .unwrap();
+}
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn sqlite_rebuild_statements_are_pinned() {
+    use crate::sqlx_repo::statement_count_tests::{counted_sqlite_pool, COUNTING};
+    let counting = COUNTING.lock().await;
+    let pool = counted_sqlite_pool(&counting).await;
+    let store = crate::SqliteRepository::new(pool.clone());
+    let mut registry = crate::table::TableSchemaRegistry::new();
+    registry
+        .register_schema(SnapshotRow::schema().clone())
+        .unwrap();
+    store
+        .bootstrap_table_schema_for_dev(&registry)
+        .await
+        .unwrap();
+    register_rebuild_topology(&store).await;
+    // Inventory: partition lock upsert, generation check and one read of
+    // every record; the store's first also reads the registered topology and
+    // inserts the first generation.
+    // Apply: the inventory again, partition ownership, one read of the
+    // records, then per record its row version and row upsert, one change
+    // insert, one record upsert and the partition head update. The first
+    // apply adds the first generation, the registered model and its
+    // ownership. Only the two statements per record grow.
+    rebuild_statements(&pool, &store, 1, 5, 13).await;
+    rebuild_statements(&pool, &store, 10, 3, 28).await;
+}
+
+#[cfg(feature = "postgres")]
+#[tokio::test]
+async fn postgres_rebuild_statements_are_pinned() {
+    use crate::sqlx_repo::statement_count_tests::{counted_postgres_pool, COUNTING};
+    let counting = COUNTING.lock().await;
+    // Its own table in the shared protocol database: a rebuild inventories
+    // the whole topology, and this history is the same on every run.
+    let Some(pool) = counted_postgres_pool(&counting, "DISTRIBUTED_TEST_POSTGRES_URL").await else {
+        return;
+    };
+    let store = crate::PostgresRepository::new(pool.clone());
+    let mut registry = crate::table::TableSchemaRegistry::new();
+    registry
+        .register_schema(SnapshotRow::schema().clone())
+        .unwrap();
+    store
+        .bootstrap_table_schema_for_dev(&registry)
+        .await
+        .unwrap();
+    register_rebuild_topology(&store).await;
+    // As SQLite's first run, plus `pg_notify`; a database that already holds
+    // the partition runs one and two fewer.
+    rebuild_statements(&pool, &store, 10, 5, 32).await;
+}
