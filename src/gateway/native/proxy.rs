@@ -57,9 +57,14 @@ pub(super) fn prepare_headers(
         );
     }
     let authority = &inner.origin[url::Position::BeforeHost..url::Position::AfterPort];
-    let host = HeaderValue::from_str(authority).map_err(|_| ())?;
-    headers.insert(header::HOST, host.clone());
-    headers.insert("x-forwarded-host", host);
+    // Host names the backend, as in the worker adapter: a backend behind
+    // host-based routing is not found under the public name. The client sets
+    // it from the fetched URL.
+    headers.remove(header::HOST);
+    headers.insert(
+        "x-forwarded-host",
+        HeaderValue::from_str(authority).map_err(|_| ())?,
+    );
     headers.insert(
         "x-forwarded-proto",
         HeaderValue::from_str(inner.origin.scheme()).map_err(|_| ())?,
