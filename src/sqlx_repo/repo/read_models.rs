@@ -24,7 +24,18 @@ where
                 .map(|m| m.table_name().to_string())
                 .collect();
             validate_sql_write_plan(&plan)?;
-            let mut tx = begin_read_model_tx(&self.pool).await?;
+            // The ownership fences are read before the rows are written.
+            let mut tx = self
+                .pool
+                .begin_with(DB::BEGIN_READ_THEN_WRITE)
+                .await
+                .map_err(|err| {
+                    crate::sqlx_repo::read_model_storage_error(
+                        DB::BACKEND,
+                        "begin transaction",
+                        err,
+                    )
+                })?;
             reject_causal_table_writes_in_tx(&mut tx, &tables).await?;
             let outcome = apply_read_model_write_plan_in_tx(&mut tx, plan).await?;
             if self.notify_enabled && !tables.is_empty() {
@@ -47,14 +58,24 @@ where
     for<'q> i64: Encode<'q, DB> + Type<DB> + sqlx::Decode<'q, DB>,
     for<'r> &'r str: sqlx::ColumnIndex<DB::Row>,
 {
-    fn scan_read_model(&self, request: crate::read_model::ReadModelScanRequest)
-        -> impl Future<Output = Result<crate::read_model::ReadModelScanPage, TableStoreError>> + Send + '_ {
+    fn scan_read_model(
+        &self,
+        request: crate::read_model::ReadModelScanRequest,
+    ) -> impl Future<Output = Result<crate::read_model::ReadModelScanPage, TableStoreError>> + Send + '_
+    {
         async move {
             request.validate()?;
             {
-                let registry = self.read_model_schemas.read().map_err(|_| TableStoreError::Storage("schema registry lock poisoned".into()))?;
-                if registry.schema_for_model(&request.schema.model_name).is_some_and(|s| s != &request.schema) {
-                    return Err(TableStoreError::Metadata("scan schema differs from registered model".into()));
+                let registry = self.read_model_schemas.read().map_err(|_| {
+                    TableStoreError::Storage("schema registry lock poisoned".into())
+                })?;
+                if registry
+                    .schema_for_model(&request.schema.model_name)
+                    .is_some_and(|s| s != &request.schema)
+                {
+                    return Err(TableStoreError::Metadata(
+                        "scan schema differs from registered model".into(),
+                    ));
                 }
             }
             crate::sqlx_repo::read_model::scan_read_model(&self.pool, request).await

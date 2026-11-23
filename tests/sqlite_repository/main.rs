@@ -202,7 +202,7 @@ async fn projected_command_ledger_rows_upgrade_to_atomic_without_schema_drift() 
         .fetch_one(repo.pool())
         .await
         .unwrap();
-    assert_eq!(latest_version, 13);
+    assert_eq!(latest_version, 14);
 
     let created_at_type: String = sqlx::query_scalar(
         "SELECT typeof(created_at) FROM command_ledger WHERE service_id = 'service'",

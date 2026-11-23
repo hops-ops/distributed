@@ -47,7 +47,12 @@ where
                 .iter()
                 .map(|declaration| declaration.table.clone())
                 .collect::<BTreeSet<_>>();
-            lock_projection_table_ownership_fences_in_tx(&mut tx, &ownership_tables).await?;
+            lock_projection_table_ownership_fences_in_tx(
+                &mut tx,
+                &ownership_tables,
+                DB::OWNERSHIP_FENCE_REGISTRATION_LOCK,
+            )
+            .await?;
             let topology_hash = topology.digest();
             let topology_bytes = topology.canonical_bytes();
             for declaration in ownership {
@@ -353,7 +358,8 @@ where
                 .begin_with(DB::BEGIN_READ_THEN_WRITE)
                 .await
                 .map_err(|error| protocol_storage_error::<DB>("begin projection commit", error))?;
-            verify_registered_topology_in_tx(&mut tx, &topology).await?;
+            verify_registered_topology_in_tx(&mut tx, self.verified_registrations(), &topology)
+                .await?;
             let mut state =
                 lock_partition_in_tx(&mut tx, &topology, &partition, &batch.change_epoch).await?;
             validate_input_identity_in_tx(&mut tx, &batch.input).await?;
@@ -387,8 +393,14 @@ where
             if !redelivery {
                 ensure_inbox_available_in_tx(&mut tx, &batch.input).await?;
             }
-            ensure_partition_ownership_in_tx(&mut tx, &topology, &partition, &batch.ownership)
-                .await?;
+            ensure_partition_ownership_in_tx(
+                &mut tx,
+                self.verified_registrations(),
+                &topology,
+                &partition,
+                &batch.ownership,
+            )
+            .await?;
 
             for mutation in &batch.mutations {
                 if mutation.mutation.table_name()
@@ -411,10 +423,39 @@ where
             let mut records_by_scope = HashMap::with_capacity(batch.mutations.len());
             let mut changes =
                 Vec::with_capacity(batch.mutations.len() + batch.observations.len().max(1));
+            // Every record and observation the batch touches, in one
+            // statement each; nothing below writes either table before the
+            // rows are used.
+            let mut record_scopes = batch
+                .mutations
+                .iter()
+                .map(|mutation| &mutation.scope)
+                .collect::<Vec<_>>();
+            record_scopes.extend(batch.observations.iter().filter_map(|request| {
+                matches!(
+                    request.target,
+                    ProjectionObservationTarget::ExistingRecord(_)
+                )
+                .then(|| request.scope())
+            }));
+            let record_rows =
+                record_rows_in_tx(&mut tx, &topology, &partition, &record_scopes).await?;
+            let observation_rows = observation_rows_in_tx(
+                &mut tx,
+                &topology,
+                &partition,
+                &batch.input.causation_id,
+                &batch
+                    .observations
+                    .iter()
+                    .map(|request| (request.scope(), request.kind))
+                    .collect::<Vec<_>>(),
+            )
+            .await?;
             for mutation in &batch.mutations {
-                let current = record_in_tx(&mut tx, &mutation.scope, &state.change_epoch)
-                    .await?
-                    .map(|record| record.metadata);
+                let current =
+                    stored_record::<DB>(&record_rows, &mutation.scope, &state.change_epoch)?
+                        .map(|record| record.metadata);
                 validate_physical_row(
                     &mutation.scope,
                     current.as_ref(),
@@ -459,8 +500,7 @@ where
                 let scope = request.scope().clone();
                 let stored = match (&request.target, records_by_scope.get(&scope)) {
                     (ProjectionObservationTarget::ExistingRecord(_), None) => {
-                        record_in_tx(&mut tx, &scope, &state.change_epoch)
-                            .await?
+                        stored_record::<DB>(&record_rows, &scope, &state.change_epoch)?
                             .map(|record| record.metadata)
                     }
                     _ => None,
@@ -469,14 +509,13 @@ where
                     &request.target,
                     records_by_scope.get(&scope).or(stored.as_ref()),
                 )?;
-                if observation_in_tx(
-                    &mut tx,
+                if stored_observation::<DB>(
+                    &observation_rows,
                     &batch.input.causation_id,
                     &scope,
                     request.kind,
                     &state.change_epoch,
-                )
-                .await?
+                )?
                 .is_some()
                 {
                     // Causation observations are immutable earliest evidence.
@@ -542,15 +581,9 @@ where
             )?;
 
             apply_read_model_write_plan_in_tx(&mut tx, write_plan).await?;
-            for change in &changes {
-                insert_change_in_tx(&mut tx, change).await?;
-            }
-            for metadata in &records {
-                upsert_record_in_tx(&mut tx, metadata).await?;
-            }
-            for observation in &observations {
-                insert_observation_in_tx(&mut tx, observation).await?;
-            }
+            insert_changes_in_tx(&mut tx, &changes).await?;
+            upsert_records_in_tx(&mut tx, &records).await?;
+            insert_observations_in_tx(&mut tx, &observations).await?;
             store_input_cursor_in_tx(&mut tx, &batch.input, &final_change).await?;
             insert_input_identity_in_tx(&mut tx, &batch.input).await?;
             if !redelivery {
@@ -616,7 +649,8 @@ where
                 .begin_with(DB::BEGIN_READ_THEN_WRITE)
                 .await
                 .map_err(|error| protocol_storage_error::<DB>("begin projection failure", error))?;
-            verify_registered_topology_in_tx(&mut tx, &topology).await?;
+            verify_registered_topology_in_tx(&mut tx, self.verified_registrations(), &topology)
+                .await?;
             let mut state =
                 lock_partition_in_tx(&mut tx, &topology, &partition, &batch.change_epoch).await?;
             validate_input_identity_in_tx(&mut tx, &batch.input).await?;
@@ -677,7 +711,7 @@ where
                 Some(batch.failure_id.clone()),
                 None,
             )?;
-            insert_change_in_tx(&mut tx, &change).await?;
+            insert_changes_in_tx(&mut tx, std::slice::from_ref(&change)).await?;
             insert_failure_in_tx(&mut tx, &batch, &change.cursor).await?;
             insert_input_identity_in_tx(&mut tx, &batch.input).await?;
             insert_input_receipt_in_tx(
@@ -801,23 +835,21 @@ where
     ) -> impl Future<Output = Result<ProjectionInputDisposition, ProjectionProtocolError>> + Send + 'a
     {
         async move {
-            let mut tx = self.pool().begin().await.map_err(|error| {
-                protocol_storage_error::<DB>("begin projection input disposition read", error)
-            })?;
-            if DB::BACKEND == "postgres" {
-                sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
-                    .execute(&mut *tx)
-                    .await
-                    .map_err(|error| {
-                        protocol_storage_error::<DB>(
-                            "configure projection input disposition read",
-                            error,
-                        )
-                    })?;
-            }
+            let mut tx = self
+                .pool()
+                .begin_with(DB::BEGIN_READ_SNAPSHOT)
+                .await
+                .map_err(|error| {
+                    protocol_storage_error::<DB>("begin projection input disposition read", error)
+                })?;
 
             let result = async {
-                verify_registered_topology_in_tx(&mut tx, input.cursor.topology()).await?;
+                verify_registered_topology_in_tx(
+                    &mut tx,
+                    self.verified_registrations(),
+                    input.cursor.topology(),
+                )
+                .await?;
                 // Durable cursor/message/capability corruption wins over a
                 // generation fence, matching commit/failure validation.
                 validate_input_identity_read_only_in_tx(&mut tx, input).await?;

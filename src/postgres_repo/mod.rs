@@ -57,6 +57,9 @@ impl crate::sqlx_repo::repo::SqlxRepoBackend for Postgres {
     const CONFLICT_REREAD_IN_TX: bool = false;
     const NOW: &'static str = "now()";
     const BEGIN_READ_THEN_WRITE: &'static str = "BEGIN";
+    const BEGIN_READ_SNAPSHOT: &'static str = "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY";
+    const OWNERSHIP_FENCE_WRITER_LOCK: &'static str = " FOR SHARE";
+    const OWNERSHIP_FENCE_REGISTRATION_LOCK: &'static str = " FOR UPDATE";
     const COMMAND_LEDGER_SELECT: &'static str = "command_name, command_contract_hash, \
          input_hash, state, causation_id, attempt_token, attempt_number, external_binding, \
          EXTRACT(EPOCH FROM lease_expires_at)::double precision AS lease_expires_at, \

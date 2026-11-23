@@ -47,7 +47,10 @@ mod tests {
             .iter()
             .map(|migration| migration.sql)
             .collect::<Vec<_>>();
-        assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]);
+        assert_eq!(
+            versions,
+            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]
+        );
         assert_eq!(
             descriptions,
             vec![
@@ -63,7 +66,8 @@ mod tests {
                 "coordination leases",
                 "cell alarms",
                 "aggregate schedules",
-                "schedule claims"
+                "schedule claims",
+                "hot path indexes",
             ]
         );
         assert_eq!(
@@ -121,6 +125,10 @@ mod tests {
                     env!("CARGO_MANIFEST_DIR"),
                     "/migrations/sqlite/0013_schedule_claims.sql"
                 )),
+                include_str!(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/migrations/sqlite/0014_hot_path_indexes.sql"
+                )),
             ]
         );
     }
@@ -140,7 +148,10 @@ mod tests {
             .iter()
             .map(|migration| migration.sql)
             .collect::<Vec<_>>();
-        assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]);
+        assert_eq!(
+            versions,
+            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]
+        );
         assert_eq!(
             descriptions,
             vec![
@@ -156,7 +167,8 @@ mod tests {
                 "coordination leases",
                 "cell alarms",
                 "aggregate schedules",
-                "schedule claims"
+                "schedule claims",
+                "hot path indexes",
             ]
         );
         assert_eq!(
@@ -214,6 +226,10 @@ mod tests {
                     env!("CARGO_MANIFEST_DIR"),
                     "/migrations/postgres/0013_schedule_claims.sql"
                 )),
+                include_str!(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/migrations/postgres/0014_hot_path_indexes.sql"
+                )),
             ]
         );
     }
@@ -266,6 +282,19 @@ pub trait SqlxRepoBackend: SqlxReadModelBackend {
     /// committed in between, where waiting for the lock is what
     /// `busy_timeout` is for.
     const BEGIN_READ_THEN_WRITE: &'static str;
+    /// Statement that opens a read-only transaction whose statements all see
+    /// one snapshot. PostgreSQL must ask for it: under its default READ
+    /// COMMITTED each statement sees a newer commit than the last. A SQLite
+    /// read transaction is one snapshot from its first read.
+    const BEGIN_READ_SNAPSHOT: &'static str;
+    /// Row-lock suffix a raw table writer takes on the ownership fences of the
+    /// tables it writes. Writers share it with each other; it excludes
+    /// [`OWNERSHIP_FENCE_REGISTRATION_LOCK`](Self::OWNERSHIP_FENCE_REGISTRATION_LOCK).
+    /// SQLite has one writer at a time and no row locks.
+    const OWNERSHIP_FENCE_WRITER_LOCK: &'static str;
+    /// Row-lock suffix causal registration takes on the fences of the tables
+    /// it claims, excluding every writer and every other registration.
+    const OWNERSHIP_FENCE_REGISTRATION_LOCK: &'static str;
     /// Command-ledger projection with timestamp columns normalized for
     /// [`decode_timestamp`](Self::decode_timestamp) and JSON surfaced as text.
     const COMMAND_LEDGER_SELECT: &'static str;

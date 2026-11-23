@@ -57,6 +57,9 @@ impl crate::sqlx_repo::repo::SqlxRepoBackend for Sqlite {
     const CONFLICT_REREAD_IN_TX: bool = true;
     const NOW: &'static str = "CURRENT_TIMESTAMP";
     const BEGIN_READ_THEN_WRITE: &'static str = "BEGIN IMMEDIATE";
+    const BEGIN_READ_SNAPSHOT: &'static str = "BEGIN";
+    const OWNERSHIP_FENCE_WRITER_LOCK: &'static str = "";
+    const OWNERSHIP_FENCE_REGISTRATION_LOCK: &'static str = "";
     const COMMAND_LEDGER_SELECT: &'static str =
         crate::repository::sqlite_codec::COMMAND_LEDGER_SELECT;
     const COMMAND_LEDGER_LOCK_SUFFIX: &'static str = "";

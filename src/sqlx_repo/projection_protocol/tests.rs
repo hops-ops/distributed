@@ -846,7 +846,7 @@ mod tests {
         let racing = unregistered_repository().await;
         let mut raw_tx = racing.pool().begin().await.unwrap();
         let racing_tables = BTreeSet::from(["sql_todo_views".to_string()]);
-        lock_projection_table_ownership_fences_in_tx(&mut raw_tx, &racing_tables)
+        reject_causal_table_writes_in_tx(&mut raw_tx, &racing_tables)
             .await
             .unwrap();
         let registration_repository = racing.clone();
@@ -981,6 +981,7 @@ mod tests {
         assert!(matches!(
             apply_same_transaction_projection_in_tx(
                 &mut tx,
+                missing_physical.verified_registrations(),
                 &direct("direct-missing-physical"),
                 missing_physical.projection_change_retention(),
             )
@@ -1000,6 +1001,7 @@ mod tests {
         assert!(matches!(
             apply_same_transaction_projection_in_tx(
                 &mut tx,
+                untracked_physical.verified_registrations(),
                 &direct("direct-untracked-physical"),
                 untracked_physical.projection_change_retention(),
             )
@@ -1293,6 +1295,7 @@ mod tests {
         let mut tx = repository.pool().begin().await.unwrap();
         let created = apply_same_transaction_projection_in_tx(
             &mut tx,
+            repository.verified_registrations(),
             &direct("direct-cause-1"),
             repository.projection_change_retention(),
         )
@@ -1311,6 +1314,7 @@ mod tests {
         let mut tx = repository.pool().begin().await.unwrap();
         let updated = apply_same_transaction_projection_in_tx(
             &mut tx,
+            repository.verified_registrations(),
             &direct("direct-cause-2"),
             repository.projection_change_retention(),
         )
