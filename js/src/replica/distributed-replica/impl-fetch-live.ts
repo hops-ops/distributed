@@ -3,6 +3,7 @@ import {
 	type DistributedLiveCursor,
 	type DistributedProtocolEnvelope
 } from '../../protocol.js';
+import { backoffDelay, type Scheduler } from '../../lib/backoff.js';
 import type { ReplicaDiagnosticEventInput } from '../diagnostics.js';
 import type {
 	ReplicaOperationArtifact,
@@ -12,6 +13,7 @@ import type {
 } from '../types.js';
 import {
 	LIVE_FAILURE_RETRY_BASE_MS,
+	LIVE_FAILURE_RETRY_JITTER,
 	LIVE_FAILURE_RETRY_MAX_MS
 } from './constants.js';
 import {
@@ -34,6 +36,8 @@ import type { ReplicaWatchState } from './watch.js';
  */
 export type FetchLiveHost = {
 	readonly transport: ReplicaTransport | undefined;
+	readonly scheduler: Scheduler;
+	readonly random: (() => number) | undefined;
 	readonly inFlight: Map<string, Promise<void>>;
 	readonly inFlightAborts: Map<string, AbortController>;
 	readonly lives: Map<string, LiveEntry>;
@@ -73,7 +77,7 @@ export function closeActiveTransports(host: FetchLiveHost): void {
 	for (const [key, entry] of host.lives) {
 		retireLiveProtocol(host, key);
 		entry.active = false;
-		cancelLiveRetry(entry);
+		cancelLiveRetry(host, entry);
 		try {
 			entry.unsubscribe();
 		} catch {
@@ -346,6 +350,10 @@ export function retainLive<TData, TVariables extends GraphqlVariables>(
 				},
 				error: (error) => {
 					if (!entry.active || host.lives.get(watch.key) !== entry) return;
+					if (liveErrorIsRetryable(error)) {
+						failLive(host, watch, entry, [graphqlError(error)]);
+						return;
+					}
 					retireLiveProtocol(host, watch.key);
 					entry.active = false;
 					host.lives.delete(watch.key);
@@ -449,7 +457,7 @@ export function restartLive(host: FetchLiveHost, key: string): void {
 	const count = previous.count;
 	retireLiveProtocol(host, key);
 	previous.active = false;
-	cancelLiveRetry(previous);
+	cancelLiveRetry(host, previous);
 	host.lives.delete(key);
 	try {
 		previous.unsubscribe();
@@ -490,7 +498,7 @@ export function releaseLive(host: FetchLiveHost, key: string): void {
 	if (entry.count > 0) return;
 	retireLiveProtocol(host, key);
 	entry.active = false;
-	cancelLiveRetry(entry);
+	cancelLiveRetry(host, entry);
 	host.lives.delete(key);
 	entry.unsubscribe();
 	host.queryState(key).live = 'off';
@@ -498,11 +506,33 @@ export function releaseLive(host: FetchLiveHost, key: string): void {
 }
 
 /**
- * Surface a live failure frame and close its terminal stream
- * (`docs/live-query-delivery.md`). The frame was receipt-only: no data,
- * cursor, operation generation or ownership changed. The inactive entry stays
+ * Whether a live stream ended for a reason a later subscription can outlive.
+ * The transport classifies what the server sent (`GraphqlWsError.retryable`);
+ * an error it did not mark (a refused credential, a protocol violation, a
+ * rejected operation) is terminal and never reopened here.
+ */
+function liveErrorIsRetryable(error: unknown): boolean {
+	return (
+		error !== null &&
+		typeof error === 'object' &&
+		(error as { retryable?: unknown }).retryable === true
+	);
+}
+
+/**
+ * Surface a failed live stream and reopen it after a backoff
+ * (`docs/live-query-delivery.md`). Both a failure frame and a retryable
+ * transport error end here: neither admitted anything, so no data, cursor,
+ * operation generation or ownership changed. The inactive entry stays
  * registered, as in fallbackFromLive, so ingestion's resumeLiveWatches cannot
  * bypass the backoff; the timer reopens the operation's current watches.
+ *
+ * Frames may have been missed while the stream was down. The reopen
+ * therefore also reads the operation over HTTP, started before the new
+ * stream so the stream may take the result over. Whichever answers first is
+ * admitted: an admitted live frame fences the HTTP response by operation
+ * generation, and a live frame behind an admitted HTTP result is ordered by
+ * its index and record clocks like any other.
  */
 function failLive<TData, TVariables extends GraphqlVariables>(
 	host: FetchLiveHost,
@@ -511,7 +541,8 @@ function failLive<TData, TVariables extends GraphqlVariables>(
 	errors: readonly GqlError[]
 ): void {
 	if (!entry.active || host.lives.get(watch.key) !== entry) return;
-	retireLiveProtocol(host, watch.key);
+	const key = watch.key;
+	retireLiveProtocol(host, key);
 	entry.active = false;
 	const unsubscribe = entry.unsubscribe;
 	entry.unsubscribe = () => undefined;
@@ -522,34 +553,59 @@ function failLive<TData, TVariables extends GraphqlVariables>(
 	}
 	const failures = (entry.failures ?? 0) + 1;
 	entry.failures = failures;
-	const delay = Math.min(
-		LIVE_FAILURE_RETRY_BASE_MS * 2 ** Math.min(failures - 1, 30),
-		LIVE_FAILURE_RETRY_MAX_MS
-	);
-	entry.retry = setTimeout(() => {
+	const delay = backoffDelay(failures, {
+		baseMs: LIVE_FAILURE_RETRY_BASE_MS,
+		maxMs: LIVE_FAILURE_RETRY_MAX_MS,
+		jitter: LIVE_FAILURE_RETRY_JITTER,
+		...(host.random === undefined ? {} : { random: host.random })
+	});
+	entry.retry = host.scheduler.setTimeout(() => {
 		entry.retry = undefined;
 		if (
-			host.lives.get(watch.key) !== entry ||
+			host.lives.get(key) !== entry ||
 			entry.active ||
 			entry.protocolGeneration !== host.protocolGenerationSequence()
 		) {
 			return;
 		}
-		restartLive(host, watch.key);
-		const replacement = host.lives.get(watch.key);
+		refreshLiveWatch(host, key);
+		restartLive(host, key);
+		const replacement = host.lives.get(key);
 		if (replacement !== undefined && replacement !== entry) {
 			replacement.failures = failures;
 		}
 	}, delay);
-	const state = host.queryState(watch.key);
+	const state = host.queryState(key);
 	state.live = 'error';
 	state.errors = stableErrors(state.errors, errors);
-	host.emitState(watch.key, false);
+	host.emitState(key, false);
 }
 
-function cancelLiveRetry(entry: LiveEntry): void {
+/**
+ * Read a live operation over HTTP for its current watches. A request that is
+ * already running may predate an admitted live frame, which fences its
+ * response, so the authoritative read starts once that request has settled.
+ */
+function refreshLiveWatch(host: FetchLiveHost, key: string): void {
+	const authorizationGeneration = host.protocolGenerationSequence();
+	const refresh = (): void => {
+		if (host.protocolGenerationSequence() !== authorizationGeneration) return;
+		const watch = [...(host.watches.get(key) ?? [])].find(
+			(candidate) => candidate.liveRequested
+		);
+		if (watch !== undefined) void fetchWatch(host, watch, true);
+	};
+	const running = host.inFlight.get(key);
+	if (running === undefined) {
+		refresh();
+	} else {
+		void running.then(refresh, refresh);
+	}
+}
+
+function cancelLiveRetry(host: FetchLiveHost, entry: LiveEntry): void {
 	if (entry.retry === undefined) return;
-	clearTimeout(entry.retry);
+	host.scheduler.clearTimeout(entry.retry);
 	entry.retry = undefined;
 }
 

@@ -129,7 +129,11 @@ export function createDistributedSvelteKitServer<
 				getAuth: () => auth,
 				...(requestFetch === undefined ? {} : { fetch: requestFetch })
 			});
-			const replica = createDistributedReplica({ transport });
+			// One request, discarded whole: nothing to collect.
+			const replica = createDistributedReplica({
+				transport,
+				retentionGraceMs: Infinity
+			});
 			type Scheduled = Readonly<{
 				identity: string;
 				operation: string;
@@ -209,13 +213,8 @@ export function createDistributedSvelteKitServer<
 				const errors = executions.flatMap(({ failure }) =>
 					failure === null ? [] : [failure]
 				);
-				for (const { artifact, variables, watch } of executions) {
-					// Preserve exact rendered-operation reachability after the
-					// temporary watch is released.
-					replica.read(artifact, variables);
-					watch.destroy();
-					activeWatches.delete(watch);
-				}
+				// The watches hold what was rendered until the transfer is taken;
+				// `finally` releases them.
 				const transfer =
 					replica.scope === undefined
 						? undefined

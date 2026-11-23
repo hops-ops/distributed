@@ -37,13 +37,29 @@ works like an HTTP error response: it admits nothing. It writes no data or
 membership, advances no cursor or operation generation, takes no ownership and
 confirms no command. The client shows the original GraphQL errors for that
 operation and keeps any previously admitted data readable. It closes the
-failed stream. After a bounded backoff (1s, doubling to at most 30s), it opens
-a fresh subscription for the operation's current watches. That subscription
-resumes from the last admitted cursors, if there are any. The backoff resets
-when an admitted frame arrives, and that frame also replaces the errors. This is
-how a live query recovers after its storage comes back, without a page reload.
-Disposing the last watch or ending the authorization generation cancels a
-pending reopen.
+failed stream. After a bounded backoff (1s, doubling to at most 30s, each
+delay shortened by a random share of up to half so that clients do not reopen
+in step), it refreshes the operation over HTTP and opens a fresh subscription
+for the operation's current watches. That subscription resumes from the last
+admitted cursors, if there are any. The backoff resets when an admitted frame
+arrives, and that frame also replaces the errors. This is how a live query
+recovers after its storage comes back, without a page reload. Disposing the
+last watch or ending the authorization generation cancels a pending reopen.
+
+A lost connection takes the same path. The client keeps one WebSocket per
+endpoint and credential and runs every live query over it as a separate
+`graphql-transport-ws` subscription. When that socket errors or closes, each
+of its subscriptions ends with a retryable error and is reopened as above; the
+first one to reopen dials the socket again and the others share it. The
+connection keeps its own backoff, so the queries of one page cause one dial
+per attempt. A close that reconnecting cannot fix is not retried: a refused
+`connection_init` (1002) and the 4400-4499 codes, except 4408 and 4401 with
+the reason `token expired`. An `error` message for one subscription is retried
+only when it is `LIVE_RESET_REQUIRED` or `FRESHNESS_SCOPE_CHANGED`.
+
+Whichever of the HTTP refresh and the reopened stream answers first is
+admitted; the other is fenced by the operation generation, so the cache never
+moves back.
 
 Only an error-only frame is a failure frame. A live frame that carries non-null
 `data` (including partial data with errors) without both `snapshot` and `live`

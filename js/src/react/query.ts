@@ -49,6 +49,7 @@ class ReactReplicaExternalStore<
 	#watch: ReplicaWatch<TData> | undefined;
 	#snapshot: ReplicaSnapshot<TData> | undefined;
 	#subscriberCount = 0;
+	#serverHold: (() => void) | undefined;
 
 	constructor(
 		replica: DistributedReplica,
@@ -70,11 +71,24 @@ class ReactReplicaExternalStore<
 		return this.#snapshot;
 	};
 
-	readonly getServerSnapshot = (): ReplicaSnapshot<TData> => this.getSnapshot();
+	/**
+	 * A server render never subscribes, so it holds what it rendered for
+	 * `dehydrate`; the request's replica is discarded with the hold. During
+	 * client hydration the subscription that follows takes the hold over.
+	 */
+	readonly getServerSnapshot = (): ReplicaSnapshot<TData> => {
+		this.#serverHold ??= this.#replica.retainOperation(
+			this.#artifact,
+			this.#variables
+		);
+		return this.getSnapshot();
+	};
 
 	readonly subscribe = (notify: () => void): (() => void) => {
 		const watch = this.#watch ?? this.#createWatch();
 		this.#subscriberCount += 1;
+		this.#serverHold?.();
+		this.#serverHold = undefined;
 		let active = true;
 		const unsubscribe = watch.subscribe((snapshot) => {
 			this.#snapshot = snapshot;

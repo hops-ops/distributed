@@ -285,7 +285,7 @@ test('bound command authority is scope-derived, hydration-safe, and generation-f
 	]);
 	assert.equal(Object.isFrozen(established.trustedPresets), true);
 
-	replica.read(AuthorizedTodos, {});
+	replica.retainOperation(AuthorizedTodos, {});
 	const state = replica.dehydrate();
 	const browser = createDistributedReplica();
 	const browserRegistration = browser[replicaCommandAuthority](contract);
@@ -332,7 +332,7 @@ test('SSR dehydration includes confirmed reachable state and excludes optimistic
 		position: '2',
 		revision: '2'
 	});
-	replica.read(Todos, {});
+	replica.retainOperation(Todos, {});
 	replica.createOptimisticLayer('cmd-1', (writer) => {
 		writer.writeRecord(Todo, 'todo-1', {
 			fields: { title: 'optimistic' }
@@ -376,8 +376,8 @@ test('same-scope re-hydrate retains confirmed indexes omitted from a later route
 	write(warm, HiddenTodos, [{ id: 'hidden-1', title: 'history-page' }], {
 		position: '1'
 	});
-	warm.read(Todos, {});
-	warm.read(HiddenTodos, {});
+	warm.retainOperation(Todos, {});
+	warm.retainOperation(HiddenTodos, {});
 	assert.equal(warm.read(Todos, {}).data.todos[0].title, 'todos-row');
 	assert.equal(
 		warm.read(HiddenTodos, {}).data.hidden_todos[0].title,
@@ -391,7 +391,7 @@ test('same-scope re-hydrate retains confirmed indexes omitted from a later route
 		[{ id: 'todo-1', title: 'todos-row-v2' }],
 		{ position: '2' }
 	);
-	pageSeed.read(Todos, {});
+	pageSeed.retainOperation(Todos, {});
 	// Intentionally omit HiddenTodos from the second seed (route subset).
 	const seed = pageSeed.dehydrate();
 	assert.equal(
@@ -414,11 +414,11 @@ test('same-scope re-hydrate retains confirmed indexes omitted from a later route
 test('older same-scope route seed cannot regress confirmed query membership or record clocks', () => {
 	const old = createDistributedReplica();
 	write(old, Todos, [{ id: 'todo-1', title: 'old' }], { position: '1' });
-	old.read(Todos, {});
+	old.retainOperation(Todos, {});
 	const seed = old.dehydrate();
 	const warm = createDistributedReplica();
 	write(warm, Todos, [{ id: 'todo-1', title: 'current' }, { id: 'todo-2', title: 'new member' }], { position: '3' });
-	warm.read(Todos, {});
+	warm.retainOperation(Todos, {});
 	const before = warm.dehydrate();
 	assert.equal(warm.hydrate(seed, seed.scope), true);
 	assert.deepEqual(warm.read(Todos, {}).data.todos, [{ id: 'todo-1', title: 'current' }, { id: 'todo-2', title: 'new member' }]);
@@ -430,7 +430,7 @@ test('older same-scope route seed cannot regress confirmed query membership or r
 test('hydration rejects malformed, cross-scope, and elevated-schema state atomically', () => {
 	const current = createDistributedReplica();
 	write(current, Todos, [{ id: 'todo-1', title: 'current' }]);
-	current.read(Todos, {});
+	current.retainOperation(Todos, {});
 	const currentState = current.dehydrate();
 	assert.equal(createDistributedReplica().hydrate(currentState, undefined), false);
 
@@ -441,7 +441,7 @@ test('hydration rejects malformed, cross-scope, and elevated-schema state atomic
 		[{ id: 'todo-1', title: 'other tenant' }],
 		{ cacheScope: 'cache:b', recordScope: () => 'record:b' }
 	);
-	otherScope.read(Todos, {});
+	otherScope.retainOperation(Todos, {});
 	assert.equal(
 		current.hydrate(otherScope.dehydrate(), current.scope),
 		false
@@ -456,7 +456,7 @@ test('hydration rejects malformed, cross-scope, and elevated-schema state atomic
 		[{ id: 'todo-1', title: 'other authorization' }],
 		{ authorizationGeneration: 'auth-2' }
 	);
-	otherAuthorization.read(Todos, {});
+	otherAuthorization.retainOperation(Todos, {});
 	assert.equal(
 		current.hydrate(otherAuthorization.dehydrate(), current.scope),
 		false
@@ -473,7 +473,7 @@ test('hydration rejects malformed, cross-scope, and elevated-schema state atomic
 	assert.equal(current.read(Todos, {}).data.todos[0].title, 'current');
 
 	const elevated = createDistributedReplica();
-	elevated.read(ElevatedTodos, {});
+	elevated.retainOperation(ElevatedTodos, {});
 	assert.equal(elevated.hydrate(current.dehydrate(), current.scope), false);
 	assert.equal(elevated.scope, undefined);
 	assert.equal(elevated.read(ElevatedTodos, {}).complete, false);
@@ -578,7 +578,7 @@ test('a malformed response purges the prior scope without publishing its replace
 test('hydrated protocol clocks reject stale rows and tombstone resurrection', () => {
 	const serverReplica = createDistributedReplica();
 	write(serverReplica, Todos, [{ id: 'todo-1', title: 'first' }]);
-	serverReplica.read(Todos, {});
+	serverReplica.retainOperation(Todos, {});
 	write(serverReplica, Todos, [], {
 		position: '9',
 		revision: '9',

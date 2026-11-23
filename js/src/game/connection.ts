@@ -6,6 +6,7 @@
  * clock sync, sequenced inputs and typed server events. The transport and
  * timers are injectable so tests drive it with an in-memory socket.
  */
+import { backoffDelay, defaultScheduler, type Scheduler } from '../lib/backoff.js';
 import { ClockSync, type ClockSyncOptions } from './clock.js';
 import { Emitter } from './emitter.js';
 import {
@@ -48,18 +49,9 @@ export type GameSocketFactory = (url: string) => GameSocket;
 const SOCKET_OPEN = 1;
 
 /** Clock and timers (injectable for deterministic tests). */
-export type GameScheduler = Readonly<{
-	now(): number;
-	setTimeout(callback: () => void, ms: number): unknown;
-	clearTimeout(handle: unknown): void;
-}>;
+export type GameScheduler = Scheduler;
 
-export const defaultScheduler: GameScheduler = Object.freeze({
-	now: () => globalThis.performance?.now() ?? Date.now(),
-	setTimeout: (callback: () => void, ms: number) => globalThis.setTimeout(callback, ms),
-	clearTimeout: (handle: unknown) =>
-		globalThis.clearTimeout(handle as ReturnType<typeof globalThis.setTimeout>)
-});
+export { defaultScheduler };
 
 /** Why the app is being asked for a ticket. */
 export type GameTicketRequest = Readonly<{
@@ -205,7 +197,8 @@ type Attempt = {
 	reload?: GameReloadRequest;
 };
 
-const defaultBackoff = (attempt: number): number => Math.min(5000, 250 * 2 ** (attempt - 1));
+const defaultBackoff = (attempt: number): number =>
+	backoffDelay(attempt, { baseMs: 250, maxMs: 5000 });
 
 /**
  * Hosts (connection URLs) that refused protocol 2 and answered 1: later

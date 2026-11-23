@@ -229,7 +229,7 @@ test(`static @load SSR is isolated and hydration avoids a duplicate fetch (${mod
 		'query-to-live handoff must not fetch through transient cache state'
 	);
 	unsubscribe();
-	assert.equal(socket.closed, true);
+	assert.deepEqual(socket.sent.at(-1), { type: 'complete', id: subscribed.id });
 	client.destroy();
 });
 }

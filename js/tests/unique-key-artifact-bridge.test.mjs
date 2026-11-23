@@ -20,8 +20,8 @@ test('Rust-generated candidate-key relationship survives hydration and live refe
 	assert.deepEqual(server.read(artifact, {}).data.todos[0], {
 		id: 'source-id', title: 'source', owner: { id: 'target-one', title: 'first' }
 	});
-	watch.destroy();
 	const seed = server.dehydrate();
+	watch.destroy();
 	const browserTransport = new ControlledReplicaTransport();
 	const browser = createDistributedReplica({ transport: browserTransport });
 	assert.equal(browser.hydrate(seed, seed.scope), true);
