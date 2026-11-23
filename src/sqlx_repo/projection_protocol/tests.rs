@@ -1037,10 +1037,17 @@ mod tests {
             .bootstrap_table_schema_for_dev(&registry)
             .await
             .unwrap();
-        repository
-            .register_projection_models(&topology(), &[ownership()])
-            .await
-            .unwrap();
+        // A first registration reads the table fences before creating them.
+        let registration = {
+            let repository = repository.clone();
+            async move {
+                repository
+                    .register_projection_models(&topology(), &[ownership()])
+                    .await
+                    .map_err(|error| error.to_string())
+            }
+        };
+        while_another_connection_writes(repository.pool(), registration).await;
 
         let commit = {
             let repository = repository.clone();
