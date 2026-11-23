@@ -530,7 +530,15 @@ mod tests {
                         .execute(&mut *tx)
                         .await
                         .unwrap();
+                    // Hold the lock so every install has to wait for it, then
+                    // free it before taking it again. SQLite's busy handler
+                    // polls instead of queueing: a writer that retakes the
+                    // lock straight after commit (as a slow Linux fsync makes
+                    // it look) starves the installer past busy_timeout, which
+                    // is lock unfairness, not the refusal this test guards.
+                    tokio::time::sleep(std::time::Duration::from_millis(2)).await;
                     tx.commit().await.unwrap();
+                    tokio::time::sleep(std::time::Duration::from_millis(2)).await;
                 }
             }
         });
