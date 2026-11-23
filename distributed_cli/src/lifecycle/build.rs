@@ -86,37 +86,6 @@ pub struct LifecycleBuildConfig {
 }
 
 impl LifecycleBuildConfig {
-    pub fn from_path(path: impl AsRef<Path>) -> Result<Self, LifecycleError> {
-        let metadata = fs::symlink_metadata(path.as_ref()).map_err(|error| {
-            LifecycleError::new(format!(
-                "failed to inspect lifecycle config `{}`: {error}",
-                path.as_ref().display()
-            ))
-        })?;
-        if metadata.file_type().is_symlink() || !metadata.is_file() {
-            return Err(LifecycleError::new(
-                "lifecycle config must be a regular non-symlink file",
-            ));
-        }
-        if metadata.len() > 1024 * 1024 {
-            return Err(LifecycleError::new("lifecycle config exceeds 1 MiB"));
-        }
-        let bytes = fs::read(path.as_ref()).map_err(|error| {
-            LifecycleError::new(format!(
-                "failed to read lifecycle config `{}`: {error}",
-                path.as_ref().display()
-            ))
-        })?;
-        let config: Self = serde_json::from_slice(&bytes).map_err(|error| {
-            LifecycleError::new(format!(
-                "failed to parse lifecycle config `{}`: {error}",
-                path.as_ref().display()
-            ))
-        })?;
-        config.validate()?;
-        Ok(config)
-    }
-
     pub fn lifecycle(&self) -> LifecycleConfig {
         LifecycleConfig {
             schema_version: LIFECYCLE_CONFIG_SCHEMA_VERSION,
@@ -149,24 +118,7 @@ impl LifecycleBuildConfig {
     }
 }
 
-#[derive(Clone, Debug)]
-pub struct LifecycleBuildOptions {
-    pub root: PathBuf,
-    pub catalog: PathBuf,
-    pub config: PathBuf,
-    pub out: PathBuf,
-    pub check: bool,
-    pub lock_timeout: Duration,
-    /// Optional downstream-closed node subset; other receipts are verified and reused.
-    pub nodes: Option<BTreeSet<String>>,
-    /// Optional content snapshot that must still match immediately before activation.
-    pub activation_inputs: Option<BTreeMap<String, String>>,
-    /// Optional cooperative cancellation shared with a supervising watcher.
-    pub cancel: Option<Arc<AtomicBool>>,
-}
-
-/// A lifecycle graph resolved from project metadata rather than user-authored
-/// lifecycle files.
+/// The lifecycle graph of one project: what `build` and `dev` run.
 #[derive(Clone, Debug)]
 pub struct LifecycleProjectPlan {
     /// Canonical lifecycle root shared by every owned application component.
@@ -177,9 +129,9 @@ pub struct LifecycleProjectPlan {
     pub config: LifecycleBuildConfig,
     /// Project-relative or absolute content-addressed lifecycle state directory.
     pub out: PathBuf,
-    /// Canonical executable that initiated discovered lifecycle work. `None`
-    /// is retained for the compatibility file-adapter API.
-    pub(crate) cli_executable: Option<PathBuf>,
+    /// Canonical `distributed` executable that initiated the lifecycle work.
+    /// Executors and UI commands receive it so they call back into the same CLI.
+    pub cli_executable: PathBuf,
 }
 
 /// Per-invocation behavior for an already resolved lifecycle project.
@@ -187,8 +139,6 @@ pub struct LifecycleProjectPlan {
 pub struct LifecycleBuildRequest {
     /// Build in an isolated stage and report drift without activation.
     pub check: bool,
-    /// Existing output set against which check-mode outputs are compared.
-    pub check_baseline: LifecycleCheckBaseline,
     /// Maximum time to wait for a concurrent lifecycle build.
     pub lock_timeout: Duration,
     /// Optional downstream-closed node subset for incremental rebuilds.
@@ -209,29 +159,6 @@ pub enum LifecycleActivation {
     /// Install the immutable generation but leave the current pointer untouched.
     /// The dev supervisor uses this while it proves replacement processes ready.
     Deferred,
-}
-
-/// Output set used as the baseline for a read-only lifecycle check.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum LifecycleCheckBaseline {
-    /// Compare staged outputs with catalog-owned files in the source workspace.
-    Workspace,
-    /// Compare staged outputs with the currently active immutable generation.
-    ActiveGeneration,
-}
-
-impl From<&LifecycleBuildOptions> for LifecycleBuildRequest {
-    fn from(options: &LifecycleBuildOptions) -> Self {
-        Self {
-            check: options.check,
-            check_baseline: LifecycleCheckBaseline::Workspace,
-            lock_timeout: options.lock_timeout,
-            nodes: options.nodes.clone(),
-            activation_inputs: options.activation_inputs.clone(),
-            cancel: options.cancel.clone(),
-            activation: LifecycleActivation::Immediate,
-        }
-    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -257,35 +184,6 @@ pub struct LifecycleBuildReport {
     pub executed: Vec<String>,
     pub drift: Vec<BuildDrift>,
     pub active_generation: Option<String>,
-}
-
-pub fn run_lifecycle_build(
-    options: &LifecycleBuildOptions,
-) -> Result<LifecycleBuildReport, LifecycleError> {
-    let root = options.root.canonicalize().map_err(|error| {
-        LifecycleError::new(format!(
-            "failed to resolve lifecycle root `{}`: {error}",
-            options.root.display()
-        ))
-    })?;
-    if !root.is_dir() {
-        return Err(LifecycleError::new("lifecycle root must be a directory"));
-    }
-    let catalog_path = resolve_under_root(&root, &options.catalog, "contract catalog")?;
-    let config_path = resolve_under_root(&root, &options.config, "lifecycle config")?;
-    let config = LifecycleBuildConfig::from_path(config_path)?;
-    let catalog = ContractCatalog::from_path_at_root(&catalog_path, &root)
-        .map_err(|error| LifecycleError::new(error.to_string()))?;
-    run_lifecycle_project_build(
-        &LifecycleProjectPlan {
-            root,
-            catalog,
-            config,
-            out: options.out.clone(),
-            cli_executable: None,
-        },
-        &LifecycleBuildRequest::from(options),
-    )
 }
 
 /// Build a lifecycle project whose catalog and execution plan were derived by
@@ -399,7 +297,7 @@ pub fn run_lifecycle_project_build(
             &node.outputs,
             executor,
             request.check,
-            project.cli_executable.as_deref(),
+            &project.cli_executable,
             request.cancel.as_deref(),
         )?;
         let output_identities = collect_node_outputs(stage.path(), node_id, &graph)?;
@@ -428,10 +326,7 @@ pub fn run_lifecycle_project_build(
     let compatibility_id = digest_bytes(&compatibility_bytes);
 
     let drift = if request.check {
-        match request.check_baseline {
-            LifecycleCheckBaseline::Workspace => compare_workspace_outputs(&root, &generation)?,
-            LifecycleCheckBaseline::ActiveGeneration => compare_active_outputs(&out, &generation)?,
-        }
+        compare_active_outputs(&out, &generation)?
     } else {
         if request
             .cancel
@@ -648,7 +543,7 @@ fn execute_node(
     declared_outputs: &BTreeSet<String>,
     executor: &LifecycleExecutor,
     check: bool,
-    cli_executable: Option<&Path>,
+    cli_executable: &Path,
     cancel: Option<&AtomicBool>,
 ) -> Result<(), LifecycleError> {
     let root_value = root.to_string_lossy();
@@ -683,11 +578,8 @@ fn execute_node(
         .env("DISTRIBUTED_LIFECYCLE_ROOT", root)
         .env("DISTRIBUTED_LIFECYCLE_STAGE", stage)
         .env("DISTRIBUTED_LIFECYCLE_NODE", node_id)
-        .env("DISTRIBUTED_LIFECYCLE_CHECK", if check { "1" } else { "0" });
-    if let Some(executable) = cli_executable {
-        command.env(LIFECYCLE_CLI_EXECUTABLE_ENV, executable);
-    }
-    command
+        .env("DISTRIBUTED_LIFECYCLE_CHECK", if check { "1" } else { "0" })
+        .env(LIFECYCLE_CLI_EXECUTABLE_ENV, cli_executable)
         .stdin(Stdio::null())
         .stdout(stdout)
         .stderr(Stdio::piped());
@@ -989,31 +881,6 @@ fn collect_regular_files(
     Ok(())
 }
 
-fn compare_workspace_outputs(
-    root: &Path,
-    generation: &GenerationManifest,
-) -> Result<Vec<BuildDrift>, LifecycleError> {
-    let mut drift = Vec::new();
-    for (node_id, receipt) in &generation.receipts {
-        for (output, built_identity) in &receipt.output_identities {
-            let workspace_identity = match fs::symlink_metadata(root.join(output)) {
-                Ok(_) => Some(hash_path(&root.join(output), root)?),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-                Err(error) => return Err(io_error("inspect workspace output")(error)),
-            };
-            if workspace_identity.as_ref() != Some(built_identity) {
-                drift.push(BuildDrift {
-                    node_id: node_id.clone(),
-                    output: output.clone(),
-                    built_identity: built_identity.clone(),
-                    workspace_identity,
-                });
-            }
-        }
-    }
-    Ok(drift)
-}
-
 fn reject_unowned_stage_files(stage: &Path, graph: &LifecycleGraph) -> Result<(), LifecycleError> {
     let outputs = graph
         .nodes
@@ -1300,27 +1167,6 @@ impl Drop for BuildLock {
     }
 }
 
-fn resolve_under_root(root: &Path, path: &Path, label: &str) -> Result<PathBuf, LifecycleError> {
-    let candidate = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        root.join(path)
-    };
-    reject_symlink_components(root, &candidate, label)?;
-    let resolved = candidate.canonicalize().map_err(|error| {
-        LifecycleError::new(format!(
-            "failed to resolve {label} `{}`: {error}",
-            candidate.display()
-        ))
-    })?;
-    if !resolved.starts_with(root) {
-        return Err(LifecycleError::new(format!(
-            "{label} escapes lifecycle root"
-        )));
-    }
-    Ok(resolved)
-}
-
 pub(super) fn resolve_output(root: &Path, path: &Path) -> Result<PathBuf, LifecycleError> {
     if path
         .components()
@@ -1456,7 +1302,7 @@ mod tests {
                 stdout: Some("cli-path.txt".to_string()),
             },
             false,
-            Some(&cli),
+            &cli,
             None,
         )
         .expect("executor should receive the initiating CLI identity");

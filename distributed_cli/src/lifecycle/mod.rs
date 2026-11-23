@@ -21,21 +21,20 @@ pub(crate) const LIFECYCLE_CLI_EXECUTABLE_ENV: &str = "DISTRIBUTED_LIFECYCLE_CLI
 pub(crate) const GENERATED_DIRECTORY_MARKER: &str = ".distributed-generated";
 
 pub use build::{
-    activate_lifecycle_project_generation, run_lifecycle_build, run_lifecycle_project_build,
-    BuildDrift, LifecycleActivation, LifecycleBuildConfig, LifecycleBuildOptions,
-    LifecycleBuildReport, LifecycleBuildRequest, LifecycleCheckBaseline, LifecycleExecutor,
-    LifecycleProjectPlan, LIFECYCLE_BUILD_CONFIG_SCHEMA_VERSION,
+    activate_lifecycle_project_generation, run_lifecycle_project_build, BuildDrift,
+    LifecycleActivation, LifecycleBuildConfig, LifecycleBuildReport, LifecycleBuildRequest,
+    LifecycleExecutor, LifecycleProjectPlan, LIFECYCLE_BUILD_CONFIG_SCHEMA_VERSION,
 };
 pub use dev::{
-    run_lifecycle_dev, run_lifecycle_project_dev, LifecycleDevConfig, LifecycleDevOptions,
-    LifecycleDevProbe, LifecycleDevProcess, LifecycleDevReport, LifecycleProjectDevOptions,
+    run_lifecycle_project_dev, LifecycleDevConfig, LifecycleDevProbe, LifecycleDevProcess,
+    LifecycleDevReport, LifecycleProjectDevOptions,
 };
 pub use graph::{
     DistributedSourceIdentity, LifecycleConfig, LifecycleError, LifecycleGraph, LifecycleNode,
     LIFECYCLE_CONFIG_SCHEMA_VERSION, LIFECYCLE_GRAPH_SCHEMA_VERSION, MAX_LIFECYCLE_NODES,
 };
 pub(crate) use project::discover_ui;
-pub use project::{discover_lifecycle_project, DiscoveredLifecycleProject};
+pub use project::{discover_lifecycle_project, DiscoveredLifecycleProject, UiAdapter};
 pub use receipt::{
     ArtifactNodeReceipt, GenerationManifest, GENERATION_MANIFEST_SCHEMA_VERSION,
     NODE_RECEIPT_SCHEMA_VERSION,

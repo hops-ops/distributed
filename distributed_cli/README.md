@@ -76,9 +76,7 @@ executable appears earlier on `PATH`, regardless of a project-local command
 override. Standalone Vite integrations retain their documented command setting
 and fallback behavior.
 
-Use `--output json` for a machine-readable lifecycle report. The compatibility
-flags `--root`, `--catalog`, and `--config` exist for older low-level lifecycle
-fixtures; normal application builds do not use them.
+Use `--output json` for a machine-readable lifecycle report.
 
 ## `distributed dev` — coherent local supervision
 
@@ -88,9 +86,9 @@ distributed dev
 ```
 
 `distributed dev` first generates and activates the typed application manifest
-and every declared client, then starts the Cargo runtime and `npm run dev` for
-`ui/`, waits for both readiness probes, and prints the usable API and browser
-URLs. No generated client tree or generation preflight exists in application
+and every declared client, then starts the Cargo runtime and the UI dev server
+(`npm run dev` in `ui/` unless the project says otherwise, below), waits for
+both readiness probes, and prints the usable API and browser URLs. No generated client tree or generation preflight exists in application
 source. Vite owns Svelte/CSS HMR; GraphQL or binding-only changes rebuild the
 client node without restarting Rust, while Rust contract changes rebuild the
 application and its downstream clients together. The browser switches
@@ -100,15 +98,48 @@ groups and their descendants.
 
 Shell environment variables win. The CLI then loads `<project-name>.env` and
 `.env` when present, without displaying their values. `BIND` selects the API
-address; `UI_HOST` and `UI_PORT` select the Vite URL. Infrastructure setup is
+address; `UI_HOST` and `UI_PORT` select the UI URL. Infrastructure setup is
 still project-specific—for example, the e2e UI's `make up` creates its local
 Zitadel/Postgres environment—but starting the application no longer needs a
 lifecycle shell script.
 
+### The UI and the addresses, in workspace metadata
+
+A SvelteKit project in `ui/` that uses npm needs no configuration. Anything
+else about the UI, and the addresses `dev` uses, is declared in the Cargo
+workspace's metadata; there is no other configuration file. Every key is
+optional, and an unknown key is an error:
+
+```toml
+[workspace.metadata.distributed.runtime]
+bind = "127.0.0.1:8791"            # API address; `BIND` overrides it
+
+[workspace.metadata.distributed.ui]
+path = "ui"                        # the UI directory, relative to the workspace
+package_manager = "npm"            # the program every command below is given to
+install = ["ci"]                   # default: `ci` beside package-lock.json, else `install`
+check = ["run", "check", "--if-present"]   # `distributed build`; [] skips the step
+build = ["run", "build"]
+dev = ["run", "dev", "--", "--host", "{host}", "--port", "{port}"]
+host = "localhost"                 # `UI_HOST` overrides it
+port = 5180                        # `UI_PORT` overrides it
+
+# Environment of the UI dev server, beyond what the CLI itself provides
+# (`DISTRIBUTED_API_ORIGIN`). `{api_url}` and `{ui_url}` are this session's
+# URLs. A value without a placeholder is the project's development default:
+# the shell or an `.env` file overrides it.
+[workspace.metadata.distributed.ui.env]
+AUTH_URL = "{ui_url}"
+```
+
+The CLI names no application variable and holds no secret: a project that needs
+a local-only secret for its dev server declares it here, as `tests/e2e-ui` does.
+
 The lifecycle CLI contract has black-box Bats coverage. It builds and starts a
-generated Rust application plus conventional SvelteKit project with no lifecycle JSON,
-as well as lower-level coverage for atomic activation, rollback, selective
-restarts, readiness, cancellation, and descendant cleanup:
+generated Rust application plus conventional SvelteKit project with no lifecycle
+configuration, and drives a small Cargo project
+(`tests/fixtures/lifecycle-project`) through atomic activation, drift checks,
+selective restarts, readiness, cancellation, and descendant cleanup:
 
 ```bash
 # Requires Bats; CI installs the pinned version used by the project.

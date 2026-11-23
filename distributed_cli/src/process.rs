@@ -7,7 +7,8 @@
 //!
 //! Only the session's own process creates groups. A helper it runs (`describe`,
 //! `__js-watch`) starts its children in the group it was given: a nested group
-//! would escape the session's kill.
+//! would escape the session's kill. So [`run`] and [`output`] take the session's
+//! stop flag when the session calls them and `None` everywhere else.
 //!
 //! A group is signalled by its leader's process ID. Once the leader has been
 //! reaped and the last member has exited, that ID is free again, so nothing
@@ -16,8 +17,8 @@
 //! Windows has no process groups. There the owner controls the direct child
 //! only, and a grandchild can outlive the session.
 
-use std::io;
-use std::process::{Child, Command, ExitStatus, Stdio};
+use std::io::{self, Read};
+use std::process::{Child, Command, ExitStatus, Output, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
@@ -151,16 +152,65 @@ impl Drop for ProcessGroup {
     }
 }
 
-/// Run `command` in its own process group until it exits or `stop` is set.
+/// Run `command` until it exits or the session stops.
 ///
-/// `None` means it was stopped: its group is gone when this returns. The
-/// command gets no standard input, because a background process group that
-/// reads the terminal is suspended.
-pub(crate) fn run(command: &mut Command, stop: &AtomicBool) -> io::Result<Option<ExitStatus>> {
+/// `stop` is the session's stop flag: the command then leads its own process
+/// group, and `None` is returned when it was stopped, its group gone. It gets
+/// no standard input, because a background process group that reads the
+/// terminal is suspended.
+///
+/// Without `stop` this process is not a session (it is a helper inside a
+/// session's group, or a one-off command) and the command is its ordinary
+/// child.
+pub(crate) fn run(
+    command: &mut Command,
+    stop: Option<&AtomicBool>,
+) -> io::Result<Option<ExitStatus>> {
+    let Some(stop) = stop else {
+        return command.status().map(Some);
+    };
     if stop.load(Ordering::SeqCst) {
         return Ok(None);
     }
     let mut group = ProcessGroup::spawn(command.stdin(Stdio::null()))?;
+    wait(&mut group, stop)
+}
+
+/// [`run`], collecting what the command writes to its output and error streams.
+pub(crate) fn output(
+    command: &mut Command,
+    stop: Option<&AtomicBool>,
+) -> io::Result<Option<Output>> {
+    let Some(stop) = stop else {
+        return command.output().map(Some);
+    };
+    if stop.load(Ordering::SeqCst) {
+        return Ok(None);
+    }
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut group = ProcessGroup::spawn(command)?;
+    let stdout = drain(group.leader().stdout.take());
+    let stderr = drain(group.leader().stderr.take());
+    let status = wait(&mut group, stop)?;
+    // A member that outlived the leader still holds the pipes open.
+    drop(group);
+    let (stdout, stderr) = (stdout.join(), stderr.join());
+    let collected = |stream: std::thread::Result<io::Result<Vec<u8>>>| {
+        stream.unwrap_or_else(|_| Err(io::Error::other("output reader panicked")))
+    };
+    let (stdout, stderr) = (collected(stdout)?, collected(stderr)?);
+    Ok(status.map(|status| Output {
+        status,
+        stdout,
+        stderr,
+    }))
+}
+
+/// Wait for the leader to exit; stop the whole group when `stop` is set first.
+fn wait(group: &mut ProcessGroup, stop: &AtomicBool) -> io::Result<Option<ExitStatus>> {
     loop {
         if let Some(status) = group.leader().try_wait()? {
             return Ok(Some(status));
@@ -171,6 +221,18 @@ pub(crate) fn run(command: &mut Command, stop: &AtomicBool) -> io::Result<Option
         }
         std::thread::sleep(POLL);
     }
+}
+
+/// Read a pipe to its end on another thread, so a full pipe never blocks the
+/// command.
+fn drain(pipe: Option<impl Read + Send + 'static>) -> std::thread::JoinHandle<io::Result<Vec<u8>>> {
+    std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        if let Some(mut pipe) = pipe {
+            pipe.read_to_end(&mut bytes)?;
+        }
+        Ok(bytes)
+    })
 }
 
 #[cfg(all(test, unix))]
@@ -287,7 +349,7 @@ wait"#,
                     r#"sleep 60 & echo "$$ $!" > "$0.tmp" && mv "$0.tmp" "$0"; wait"#,
                     pids.to_str().unwrap(),
                 ]);
-                run(&mut command, &stop)
+                run(&mut command, Some(&stop))
             })
         };
         let started = Instant::now();
@@ -305,8 +367,69 @@ wait"#,
 
         let mut ignored = Command::new("/bin/sh");
         ignored.args(["-c", "exit 0"]);
-        assert!(run(&mut ignored, &stop).unwrap().is_none());
+        assert!(run(&mut ignored, Some(&stop)).unwrap().is_none());
         stop.store(false, Ordering::SeqCst);
-        assert!(run(&mut ignored, &stop).unwrap().unwrap().success());
+        assert!(run(&mut ignored, Some(&stop)).unwrap().unwrap().success());
+    }
+
+    #[test]
+    fn output_is_collected_and_a_stopped_command_takes_its_descendants_with_it() {
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        // More than a pipe holds, on both streams, and a descendant that keeps
+        // them open after the leader exits.
+        let mut noisy = Command::new("/bin/sh");
+        noisy.args([
+            "-c",
+            "head -c 200000 /dev/zero; head -c 200000 /dev/zero >&2; sleep 60 & exit 3",
+        ]);
+        let output = output(&mut noisy, Some(&stop)).unwrap().unwrap();
+        assert_eq!(output.status.code(), Some(3));
+        assert_eq!(
+            (output.stdout.len(), output.stderr.len()),
+            (200_000, 200_000)
+        );
+
+        let directory = tempfile::tempdir().unwrap();
+        let pids = directory.path().join("pids");
+        let runner = {
+            let (stop, pids) = (std::sync::Arc::clone(&stop), pids.clone());
+            std::thread::spawn(move || {
+                let mut command = Command::new("/bin/sh");
+                command.args([
+                    "-c",
+                    r#"sleep 60 & echo "$$ $!" > "$0.tmp" && mv "$0.tmp" "$0"; wait"#,
+                    pids.to_str().unwrap(),
+                ]);
+                super::output(&mut command, Some(&stop))
+            })
+        };
+        let started = Instant::now();
+        let family = loop {
+            if let Ok(line) = std::fs::read_to_string(&pids) {
+                let mut pids = line.split_whitespace().map(|pid| pid.parse().unwrap());
+                break [pids.next().unwrap(), pids.next().unwrap()];
+            }
+            assert!(started.elapsed() < Duration::from_secs(10));
+            std::thread::sleep(POLL);
+        };
+        stop.store(true, Ordering::SeqCst);
+        assert!(runner.join().unwrap().unwrap().is_none());
+        assert_gone(family);
+    }
+
+    #[test]
+    fn outside_a_session_a_command_is_an_ordinary_child() {
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "echo out; echo err >&2; exit 4"]);
+        let output = output(&mut command, None).unwrap().unwrap();
+        assert_eq!(output.status.code(), Some(4));
+        assert_eq!(
+            (output.stdout, output.stderr),
+            (b"out\n".to_vec(), b"err\n".to_vec())
+        );
+        let mut command = Command::new("/bin/sh");
+        // Its own process group would have its own ID.
+        command.args(["-c", r#"test "$(ps -o pgid= -p $$ | tr -d " ")" != "$$""#]);
+        assert!(run(&mut command, None).unwrap().unwrap().success());
     }
 }

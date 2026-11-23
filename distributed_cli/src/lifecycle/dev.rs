@@ -14,9 +14,8 @@ use super::build::{lifecycle_input_snapshot, resolve_output};
 use super::graph::LifecycleErrorReason;
 use super::{
     activate_lifecycle_project_generation, run_lifecycle_project_build, validate_portable_path,
-    validate_stable_value, LifecycleActivation, LifecycleBuildConfig, LifecycleBuildOptions,
-    LifecycleBuildReport, LifecycleBuildRequest, LifecycleError, LifecycleGraph,
-    LifecycleProjectPlan,
+    validate_stable_value, LifecycleActivation, LifecycleBuildReport, LifecycleBuildRequest,
+    LifecycleError, LifecycleGraph, LifecycleProjectPlan,
 };
 
 const MAX_DEV_PROCESSES: usize = 64;
@@ -53,8 +52,8 @@ pub struct LifecycleDevProcess {
     /// Working directory relative to the lifecycle root.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
-    /// Permit an absolute working directory selected by trusted project
-    /// discovery. Ordinary lifecycle files remain root-confined by default.
+    /// Permit an absolute working directory. Project discovery sets it for a
+    /// UI outside the lifecycle root; it cannot be deserialized.
     #[serde(skip)]
     pub external_cwd: bool,
     /// Process-specific environment. Values may use lifecycle placeholders.
@@ -200,14 +199,6 @@ fn readiness_budget_ms(process: &LifecycleDevProcess) -> u64 {
 }
 
 #[derive(Clone, Debug)]
-pub struct LifecycleDevOptions {
-    pub build: LifecycleBuildOptions,
-    pub stop: Arc<AtomicBool>,
-    /// Emit operator-facing readiness and rebuild progress to stderr.
-    pub progress: bool,
-}
-
-#[derive(Clone, Debug)]
 pub struct LifecycleProjectDevOptions {
     /// In-memory lifecycle plan derived from the project.
     pub project: LifecycleProjectPlan,
@@ -226,40 +217,6 @@ pub struct LifecycleDevReport {
     pub final_generation: String,
     pub rebuilds: usize,
     pub restarts: BTreeMap<String, usize>,
-}
-
-pub fn run_lifecycle_dev(
-    options: &LifecycleDevOptions,
-) -> Result<LifecycleDevReport, LifecycleError> {
-    if options.build.check {
-        return Err(LifecycleError::new(
-            "lifecycle dev requires an activating build configuration",
-        ));
-    }
-    let root = options.build.root.canonicalize().map_err(|error| {
-        LifecycleError::new(format!("failed to resolve lifecycle dev root: {error}"))
-    })?;
-    let config_path = resolve_file(&root, &options.build.config)?;
-    let catalog_path = resolve_file(&root, &options.build.catalog)?;
-    let config = LifecycleBuildConfig::from_path(config_path)?;
-    let dev = config.dev.clone().ok_or_else(|| {
-        LifecycleError::new("lifecycle config has no `dev` process configuration")
-    })?;
-    dev.validate()?;
-    let catalog = ContractCatalog::from_path_at_root(&catalog_path, &root)
-        .map_err(|error| LifecycleError::new(error.to_string()))?;
-    run_lifecycle_project_dev(&LifecycleProjectDevOptions {
-        project: LifecycleProjectPlan {
-            root,
-            catalog,
-            config,
-            out: options.build.out.clone(),
-            cli_executable: None,
-        },
-        build: LifecycleBuildRequest::from(&options.build),
-        stop: Arc::clone(&options.stop),
-        progress: options.progress,
-    })
 }
 
 /// Run development processes for a project resolved from Cargo metadata and
@@ -1454,25 +1411,6 @@ fn validate_process_env(
         )));
     }
     Ok(())
-}
-
-fn resolve_file(root: &Path, path: &PathBuf) -> Result<PathBuf, LifecycleError> {
-    let path = if path.is_absolute() {
-        path.clone()
-    } else {
-        root.join(path)
-    };
-    let resolved = path.canonicalize().map_err(|error| {
-        LifecycleError::new(format!("failed to resolve `{}`: {error}", path.display()))
-    })?;
-    if !resolved.starts_with(root)
-        || !fs::metadata(&resolved).is_ok_and(|metadata| metadata.is_file())
-    {
-        return Err(LifecycleError::new(
-            "lifecycle dev input must be a file under the root",
-        ));
-    }
-    Ok(resolved)
 }
 
 #[cfg(test)]
