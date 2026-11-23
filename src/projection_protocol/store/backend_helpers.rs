@@ -1,13 +1,9 @@
 use super::{
-    ProjectionChangeKind, ProjectionFailure, ProjectionFailureBatch,
-    ProjectionGraphSnapshotRequest, ProjectionProtocolError, RecordTransition,
-    MAX_PROJECTION_QUERY_BATCH_ROWS,
+    ProjectionChangeKind, ProjectionFailure, ProjectionFailureBatch, ProjectionProtocolError,
+    RecordTransition,
 };
 use crate::projection_protocol::MAX_PROJECTION_POSITION;
-use crate::table::{
-    resolve_direct_join_keys, RelationshipDef, RelationshipKind, RowValue, RowValues,
-    TableMutation, TableSchema, TableStoreError,
-};
+use crate::table::TableMutation;
 
 pub(crate) fn checked_next(
     value: u64,
@@ -39,7 +35,8 @@ pub(crate) fn failure_matches_batch(
     failure: &ProjectionFailure,
     batch: &ProjectionFailureBatch,
 ) -> bool {
-    failure.input == batch.input.cursor
+    failure.failure_id == batch.failure_id
+        && failure.input == batch.input.cursor
         && failure.input_fingerprint == batch.input.fingerprint
         && failure.message_id == batch.input.message_id
         && failure.causation_id == batch.input.causation_id
@@ -49,109 +46,6 @@ pub(crate) fn failure_matches_batch(
         && failure.failure_bytes == batch.failure_bytes
         && failure.failure_digest == batch.failure_digest
         && failure.change.epoch() == &batch.change_epoch
-}
-
-pub(crate) fn validate_projection_graph_snapshot_request(
-    request: &ProjectionGraphSnapshotRequest,
-) -> Result<(), ProjectionProtocolError> {
-    request.root.validate()?;
-    if request.max_unique_record_scopes == 0
-        || request.max_unique_record_scopes > MAX_PROJECTION_QUERY_BATCH_ROWS
-    {
-        return Err(ProjectionProtocolError::InvalidBatch(format!(
-            "projection graph snapshot record-scope budget is {}; expected 1..={MAX_PROJECTION_QUERY_BATCH_ROWS}",
-            request.max_unique_record_scopes
-        )));
-    }
-    let query_scopes = request.includes.len().checked_add(1).ok_or_else(|| {
-        ProjectionProtocolError::InvalidBatch(
-            "projection graph snapshot query-scope count overflowed".into(),
-        )
-    })?;
-    if query_scopes > MAX_PROJECTION_QUERY_BATCH_ROWS {
-        return Err(ProjectionProtocolError::InvalidBatch(format!(
-            "projection graph snapshot has {query_scopes} query scopes; maximum is {MAX_PROJECTION_QUERY_BATCH_ROWS}"
-        )));
-    }
-    for (name, include) in &request.includes {
-        include.target_schema.validate()?;
-        let relationship = request
-            .root
-            .schema
-            .relationships
-            .iter()
-            .find(|relationship| relationship.field_name == *name)
-            .ok_or_else(|| {
-                ProjectionProtocolError::InvalidBatch(format!(
-                    "projection graph snapshot model `{}` has no relationship `{name}`",
-                    request.root.schema.model_name
-                ))
-            })?;
-        if relationship != &include.relationship
-            || relationship.target_model != include.target_schema.model_name
-            || matches!(
-                relationship.kind,
-                crate::table::RelationshipKind::ManyToMany
-            )
-        {
-            return Err(ProjectionProtocolError::InvalidBatch(format!(
-                "projection graph relationship `{name}` metadata is invalid or divergent"
-            )));
-        }
-    }
-    Ok(())
-}
-
-pub(crate) fn projection_relationship_values(
-    root_schema: &TableSchema,
-    root_row: &RowValues,
-    relationship: &RelationshipDef,
-    target_schema: &TableSchema,
-) -> Result<Vec<(String, RowValue)>, ProjectionProtocolError> {
-    let pairs =
-        resolve_direct_join_keys(root_schema, relationship, target_schema).map_err(|error| {
-            match error {
-                TableStoreError::Metadata(message) => {
-                    ProjectionProtocolError::InvalidBatch(message)
-                }
-                other => ProjectionProtocolError::Table(other),
-            }
-        })?;
-    pairs
-        .into_iter()
-        .map(|pair| {
-            let (source, target) = match relationship.kind {
-                RelationshipKind::HasMany => (pair.primary_key_column, pair.foreign_key_column),
-                RelationshipKind::BelongsTo => (pair.foreign_key_column, pair.primary_key_column),
-                RelationshipKind::ManyToMany => {
-                    unreachable!("direct resolver rejects many-to-many")
-                }
-            };
-            let value = root_row.get(&source).cloned().ok_or_else(|| {
-                ProjectionProtocolError::InvalidBatch(format!(
-                    "projection graph root `{}` is missing relationship key `{source}`",
-                    root_schema.model_name
-                ))
-            })?;
-            Ok((target, value))
-        })
-        .collect()
-}
-
-pub(crate) fn checked_projection_graph_materialization(
-    current: usize,
-) -> Result<usize, ProjectionProtocolError> {
-    let next = current.checked_add(1).ok_or_else(|| {
-        ProjectionProtocolError::InvalidBatch(
-            "projection graph materialized-row count overflowed".into(),
-        )
-    })?;
-    if next > MAX_PROJECTION_QUERY_BATCH_ROWS {
-        return Err(ProjectionProtocolError::InvalidBatch(format!(
-            "projection graph materialized {next} record snapshots; maximum is {MAX_PROJECTION_QUERY_BATCH_ROWS}"
-        )));
-    }
-    Ok(next)
 }
 
 #[cfg(test)]
@@ -225,18 +119,5 @@ mod tests {
 
         failure.gap_free = batch.input.gap_free;
         assert!(failure_matches_batch(&failure, &batch));
-    }
-
-    #[test]
-    fn graph_materialization_budget_bounds_duplicate_include_expansion() {
-        assert_eq!(
-            checked_projection_graph_materialization(MAX_PROJECTION_QUERY_BATCH_ROWS - 1).unwrap(),
-            MAX_PROJECTION_QUERY_BATCH_ROWS
-        );
-        let error =
-            checked_projection_graph_materialization(MAX_PROJECTION_QUERY_BATCH_ROWS).unwrap_err();
-        assert!(error
-            .to_string()
-            .contains("materialized 4097 record snapshots"));
     }
 }

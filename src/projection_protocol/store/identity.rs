@@ -9,7 +9,6 @@ pub(super) const MAX_FAILURE_CODE_BYTES: usize = 255;
 pub(super) const MAX_FAILURE_DETAIL_BYTES: usize = 1024 * 1024;
 pub(crate) const MAX_PROJECTION_QUERY_CHECKPOINT_PROBES: usize = 128;
 pub(crate) const MAX_PROJECTION_QUERY_BATCH_ROWS: usize = 4_096;
-pub(crate) const MAX_PROJECTION_QUERY_BATCH_CHECKPOINT_PROBES: usize = 4_096;
 pub(crate) const MAX_PROJECTION_EVIDENCE_BATCH_ITEMS: usize = 128;
 
 /// Default maximum number of durable changes retained per projector partition.
@@ -110,6 +109,7 @@ impl ProjectionInputFingerprint {
         Self(domain_separated_digest(INPUT_FINGERPRINT_DOMAIN, bytes))
     }
 
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
     pub(crate) fn from_digest(digest: [u8; 32]) -> Self {
         Self(digest)
     }

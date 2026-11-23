@@ -6,12 +6,6 @@
 //! revisions, observations, checkpoints, and change publication inside one
 //! adapter transaction.
 
-// The store trait + query vocabulary is wider than the production call graph:
-// adapters implement the full surface, and many paths are only exercised by
-// adapter tests today. Keep the contract complete without drowning default
-// builds in dead_code noise.
-#![allow(dead_code)]
-
 use std::fmt;
 use std::future::Future;
 use std::num::NonZeroU64;
@@ -35,6 +29,7 @@ use crate::ProjectionProgramId;
 
 mod backend_helpers;
 mod commit;
+mod decisions;
 mod error;
 mod helpers;
 mod identity;
@@ -56,12 +51,18 @@ use identity::{
 };
 
 pub(crate) use backend_helpers::{
-    change_kind_for_mutation, checked_next, checked_projection_graph_materialization,
-    failure_matches_batch, projection_relationship_values, table_model_name,
-    validate_projection_graph_snapshot_request,
+    change_kind_for_mutation, checked_next, failure_matches_batch, table_model_name,
 };
 pub(crate) use commit::{
     ProjectionCommitBatch, ProjectionFailureBatch, SameTransactionProjectionBatch,
+};
+#[cfg(any(feature = "sqlite", feature = "postgres"))]
+pub(crate) use decisions::same_input;
+pub(crate) use decisions::{
+    change_page, change_read_window, classify_input, corrupt_storage, ensure_active_input,
+    ensure_change_epoch, next_record, plan_repair, program_id_for_model, resolve_observation,
+    sort_causation_evidence, validate_input_identity, validate_pending_retry,
+    validate_physical_row,
 };
 pub use error::ProjectionProtocolError;
 pub(super) use helpers::domain_separated_digest;
@@ -73,28 +74,10 @@ pub(crate) use identity::{
     ProjectionInputDisposition, ProjectionModelOwnership, ProjectionObservationRequest,
     ProjectionObservationTarget, ProjectionRecordExpectation, ProjectionRecordMutation,
     RecordTransition, TrustedProjectionInput, MAX_PROJECTION_EVIDENCE_BATCH_ITEMS,
-    MAX_PROJECTION_QUERY_BATCH_CHECKPOINT_PROBES, MAX_PROJECTION_QUERY_BATCH_ROWS,
-    MAX_PROJECTION_QUERY_CHECKPOINT_PROBES,
+    MAX_PROJECTION_QUERY_BATCH_ROWS, MAX_PROJECTION_QUERY_CHECKPOINT_PROBES,
 };
 pub(crate) use ownership::validate_ownership_batch;
-pub use query::{
-    ProjectionChange, ProjectionChangeKind, ProjectionCommitResult, ProjectionFailure,
-    ProjectionObservation, ProjectionRecordMetadata,
-};
-// Several of these are only constructed from adapter unit tests; re-export for the
-// store surface and silence unused_imports on non-test lib builds.
-#[allow(unused_imports)]
-pub(crate) use query::{
-    ProjectionCausationEvidenceBatch, ProjectionCausationEvidenceRequest,
-    ProjectionCheckpointProbe, ProjectionCheckpointSnapshot, ProjectionExecutionSnapshotBatch,
-    ProjectionExecutionSnapshotBatchRequest, ProjectionFailureLocation,
-    ProjectionGraphIncludeRequest, ProjectionGraphIncludeSnapshot, ProjectionGraphSnapshot,
-    ProjectionGraphSnapshotRequest, ProjectionLiveRecordBatch, ProjectionLiveRecordBatchRequest,
-    ProjectionLiveRecordRequest, ProjectionObligationEvidenceRequest,
-    ProjectionPartitionRuntimeState, ProjectionPartitionSnapshot, ProjectionPendingRetry,
-    ProjectionQuerySnapshot, ProjectionQuerySnapshotBatch, ProjectionQuerySnapshotBatchRequest,
-    ProjectionQuerySnapshotRequest, ProjectionScopedRowSnapshot,
-};
+pub use query::*;
 pub use r#trait::ProjectionChangeRead;
 pub(crate) use r#trait::ProjectionProtocolStore;
 pub(crate) use replay::SameTransactionProjectionEvidence;

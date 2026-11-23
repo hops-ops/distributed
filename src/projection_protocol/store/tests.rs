@@ -349,3 +349,95 @@ fn failure_batch_validation_rechecks_all_mutable_identity_and_payload_fields() {
         assert!(batch.validate().is_err(), "{case} must be rejected");
     }
 }
+
+fn change_at(position: u64) -> ProjectionChange {
+    ProjectionChange {
+        cursor: ProjectionChangeCursor::new(
+            topology(),
+            partition(),
+            ProjectionEpoch::new("changes-v1").unwrap(),
+            position,
+        )
+        .unwrap(),
+        kind: ProjectionChangeKind::Checkpoint,
+        causation_id: "cause".into(),
+        observation_kind: None,
+        scope: None,
+        revision: None,
+        failure_id: None,
+        program_id: None,
+    }
+}
+
+#[test]
+fn change_read_window_decides_reset_empty_and_resume() {
+    use std::ops::ControlFlow;
+    let epoch = ProjectionEpoch::new("changes-v1").unwrap();
+    let window = |after: Option<u64>, compacted, limit| {
+        let after = after.map(|position| change_at(position).cursor);
+        change_read_window(
+            &topology(),
+            &partition(),
+            Some((&epoch, 5, compacted)),
+            after.as_ref(),
+            limit,
+        )
+        .unwrap()
+    };
+    let reset = |read| {
+        matches!(
+            read,
+            ControlFlow::Break(ProjectionChangeRead::ResetRequired { .. })
+        )
+    };
+    let empty = |read| {
+        matches!(
+            read,
+            ControlFlow::Break(ProjectionChangeRead::Changes { changes, .. }) if changes.is_empty()
+        )
+    };
+
+    assert_eq!(window(None, 0, 10), ControlFlow::Continue(0));
+    assert_eq!(window(Some(2), 2, 10), ControlFlow::Continue(2));
+    assert!(reset(window(None, 2, 10)));
+    assert!(reset(window(Some(1), 2, 10)));
+    assert!(reset(window(Some(6), 0, 10)));
+    assert!(empty(window(Some(5), 0, 10)));
+    assert!(empty(window(Some(3), 0, 0)));
+    assert!(reset(
+        change_read_window(
+            &topology(),
+            &partition(),
+            None,
+            Some(&change_at(1).cursor),
+            10
+        )
+        .unwrap()
+    ));
+}
+
+#[test]
+fn change_page_rejects_a_log_with_holes() {
+    let epoch = ProjectionEpoch::new("changes-v1").unwrap();
+    let page = |start, positions: &[u64]| {
+        change_page(
+            &topology(),
+            &partition(),
+            (&epoch, 5, 0),
+            start,
+            positions.iter().copied().map(change_at).collect(),
+        )
+    };
+    let corrupt = |result: Result<ProjectionChangeRead, ProjectionProtocolError>| {
+        matches!(result, Err(ProjectionProtocolError::StorageCorruption(_)))
+    };
+
+    assert!(matches!(
+        page(2, &[3, 4]),
+        Ok(ProjectionChangeRead::Changes { changes, .. }) if changes.len() == 2
+    ));
+    assert!(corrupt(page(2, &[])));
+    assert!(corrupt(page(2, &[4, 5])));
+    assert!(corrupt(page(2, &[3, 5])));
+    assert!(corrupt(page(4, &[5, 6])));
+}

@@ -1,128 +1,5 @@
 use super::*;
 
-#[cfg(all(test, feature = "sqlite"))]
-#[tokio::test]
-async fn candidate_key_snapshot_lookup_selects_surrogate_keys_in_sql() {
-    let pool = sqlx::sqlite::SqlitePoolOptions::new()
-        .max_connections(1)
-        .connect("sqlite::memory:")
-        .await
-        .unwrap();
-    let mut connection = pool.acquire().await.unwrap();
-    candidate_key_snapshot_sql_fixture::<sqlx::Sqlite>(&mut connection).await;
-}
-
-#[cfg(all(test, feature = "postgres"))]
-#[tokio::test]
-async fn candidate_key_snapshot_lookup_postgres() {
-    let Some(url) = crate::test_env::require_service(
-        "DISTRIBUTED_UNIQUE_KEY_TEST_POSTGRES_URL",
-        "Postgres unique-key test (dedicated database)",
-    ) else {
-        return;
-    };
-    let options: sqlx::postgres::PgConnectOptions = url.parse().unwrap();
-    assert!(options
-        .get_database()
-        .unwrap_or("")
-        .starts_with("distributed_unique_key_test"));
-    let pool = sqlx::postgres::PgPoolOptions::new()
-        .max_connections(1)
-        .connect_with(options)
-        .await
-        .unwrap();
-    let mut connection = pool.acquire().await.unwrap();
-    candidate_key_snapshot_sql_fixture::<sqlx::Postgres>(&mut connection).await;
-}
-
-#[cfg(test)]
-async fn candidate_key_snapshot_sql_fixture<DB>(connection: &mut DB::Connection)
-where
-    DB: SqlxRepoBackend,
-    DB::Arguments: IntoArguments<DB>,
-    for<'c> &'c mut DB::Connection: Executor<'c, Database = DB>,
-    for<'r> &'r str: sqlx::ColumnIndex<DB::Row>,
-{
-    use crate::table::{
-        ColumnType, PrimaryKey, RelationshipDef, RelationshipKind, RowValue, TableColumn,
-        TableIndex, TableKind,
-    };
-    for statement in [
-        "CREATE TEMP TABLE snapshot_targets (id TEXT PRIMARY KEY, tenant TEXT NOT NULL, candidate TEXT, UNIQUE(tenant,candidate))",
-        "INSERT INTO snapshot_targets VALUES ('opaque-a','a','same'),('opaque-b','b','same'),('null-target','a',NULL)",
-    ] { sqlx::query::<DB>(statement).execute(&mut *connection).await.unwrap(); }
-    let target = TableSchema {
-        model_name: "SnapshotTarget".into(),
-        table_name: "snapshot_targets".into(),
-        columns: vec![
-            TableColumn {
-                primary_key: true,
-                ..TableColumn::new("id", "id", ColumnType::Text)
-            },
-            TableColumn::new("tenant", "tenant", ColumnType::Text),
-            TableColumn {
-                nullable: true,
-                ..TableColumn::new("candidate", "candidate", ColumnType::Text)
-            },
-        ],
-        primary_key: PrimaryKey::new(["id"]),
-        version_column: None,
-        foreign_keys: vec![],
-        indexes: vec![TableIndex {
-            name: None,
-            columns: vec!["tenant".into(), "candidate".into()],
-            unique: true,
-        }],
-        relationships: vec![],
-        kind: TableKind::ReadModel,
-    };
-    let mut source = target.clone();
-    source.model_name = "SnapshotSource".into();
-    source.table_name = "snapshot_sources".into();
-    let relation = RelationshipDef {
-        field_name: "target".into(),
-        kind: RelationshipKind::BelongsTo,
-        target_model: target.model_name.clone(),
-        foreign_key: Some("tenant,candidate".into()),
-        references: Some("tenant,candidate".into()),
-        through: None,
-        target_foreign_key: None,
-    };
-    for (tenant, candidate, expected) in [
-        ("a", Some("same"), Some("opaque-a")),
-        ("b", Some("same"), Some("opaque-b")),
-        ("missing", Some("same"), None),
-        ("a", None, None),
-    ] {
-        let mut values = RowValues::new();
-        values.insert("id", RowValue::String("source-id".into()));
-        values.insert("tenant", RowValue::String(tenant.into()));
-        values.insert(
-            "candidate",
-            candidate
-                .map(|v| RowValue::String(v.into()))
-                .unwrap_or(RowValue::Null),
-        );
-        let keys = read_projection_relationship_keys_in_executor::<DB>(
-            &mut *connection,
-            &source,
-            &values,
-            &relation,
-            &target,
-            2,
-        )
-        .await
-        .unwrap();
-        assert_eq!(
-            keys,
-            expected
-                .into_iter()
-                .map(|id| RowKey::new([("id", RowValue::String(id.into()))]))
-                .collect::<Vec<_>>()
-        );
-    }
-}
-
 pub(super) fn decode_change_row<DB>(
     row: &DB::Row,
     topology: &ProjectorTopologyId,
@@ -327,34 +204,20 @@ where
         )));
     }
 
-    let current = record_in_tx(tx, &staged.scope, &state.change_epoch).await?;
-    crate::projection_protocol::validate_snapshot_write(
-        current.as_ref().map(|record| &record.metadata),
-        None,
+    let current = record_in_tx(tx, &staged.scope, &state.change_epoch)
+        .await?
+        .map(|record| record.metadata);
+    crate::projection_protocol::validate_snapshot_write(current.as_ref(), None)?;
+    validate_physical_row(
+        &staged.scope,
+        current.as_ref(),
+        physical_row_exists_in_tx(tx, &staged.mutation).await?,
     )?;
-    let physical_exists = physical_row_exists_in_tx(tx, &staged.mutation).await?;
-    match current.as_ref().map(|record| &record.metadata) {
-        None if physical_exists => {
-            return Err(ProjectionProtocolError::RecordAlreadyExists {
-                model: staged.scope.model().to_string(),
-            });
-        }
-        Some(metadata) if metadata.tombstone => {
-            return Err(ProjectionProtocolError::RecordTombstoned {
-                model: staged.scope.model().to_string(),
-            });
-        }
-        Some(_) if !physical_exists => {
-            return Err(ProjectionProtocolError::RecordMissing {
-                model: staged.scope.model().to_string(),
-            });
-        }
-        _ => {}
-    }
     let expectation = current
         .as_ref()
-        .map(|record| ProjectionRecordExpectation::Exact(record.metadata.revision.clone()))
-        .unwrap_or(ProjectionRecordExpectation::Missing);
+        .map_or(ProjectionRecordExpectation::Missing, |metadata| {
+            ProjectionRecordExpectation::Exact(metadata.revision.clone())
+        });
     let (revision, tombstone) = next_record(
         &staged.scope,
         &expectation,
@@ -373,11 +236,7 @@ where
         Some(staged.scope.clone()),
         Some(revision.clone()),
         None,
-        batch
-            .ownership
-            .iter()
-            .find(|ownership| ownership.model == staged.scope.model())
-            .and_then(|ownership| ownership.program_id),
+        program_id_for_model(&batch.ownership, staged.scope.model()),
     )?;
     let metadata = ProjectionRecordMetadata {
         source_snapshot: None,
@@ -411,11 +270,7 @@ where
         scope: staged.scope.clone(),
         revision: Some(revision),
         change: change.cursor.clone(),
-        program_id: batch
-            .ownership
-            .iter()
-            .find(|ownership| ownership.model == staged.scope.model())
-            .and_then(|ownership| ownership.program_id),
+        program_id: program_id_for_model(&batch.ownership, staged.scope.model()),
     };
 
     apply_read_model_write_plan_in_tx(tx, write_plan).await?;
@@ -1101,205 +956,6 @@ where
     Ok(ProjectionExecutionSnapshotBatch { snapshots })
 }
 
-pub(crate) async fn read_projection_graph_snapshot_in_executor<DB>(
-    connection: &mut DB::Connection,
-    request: &ProjectionGraphSnapshotRequest,
-) -> Result<ProjectionGraphSnapshot, ProjectionProtocolError>
-where
-    DB: SqlxRepoBackend,
-    DB::Arguments: IntoArguments<DB>,
-    for<'c> &'c mut DB::Connection: Executor<'c, Database = DB>,
-    for<'q> i64: Encode<'q, DB> + Type<DB> + sqlx::Decode<'q, DB>,
-    for<'q> String: Type<DB> + sqlx::Decode<'q, DB>,
-    for<'q> Vec<u8>: Type<DB> + sqlx::Decode<'q, DB>,
-    for<'q> &'q str: Encode<'q, DB> + Type<DB>,
-    for<'q> &'q [u8]: Encode<'q, DB> + Type<DB>,
-    for<'r> &'r str: sqlx::ColumnIndex<DB::Row>,
-{
-    validate_projection_graph_snapshot_request(request)?;
-    let root_snapshot =
-        read_projection_query_snapshot_in_executor::<DB, _>(&mut *connection, &request.root)
-            .await?;
-    let root = ProjectionScopedRowSnapshot {
-        scope: request.root.scope.clone(),
-        row: root_snapshot.row,
-        record: root_snapshot.record,
-    };
-    let mut includes = std::collections::BTreeMap::new();
-    let mut unique_scopes = std::collections::HashSet::from([root.scope.clone()]);
-    let mut materialized_snapshots = 1;
-    for (name, include) in &request.includes {
-        let mut snapshots = Vec::new();
-        if let Some(root_row) = root.row.as_ref() {
-            let keys = read_projection_relationship_keys_in_executor::<DB>(
-                connection,
-                &request.root.schema,
-                root_row,
-                &include.relationship,
-                &include.target_schema,
-                request.max_unique_record_scopes,
-            )
-            .await?;
-            let codec = ProjectionScopeCodec::with_models(
-                request.root.scope.topology().clone(),
-                [(
-                    include.target_schema.model_name.as_str(),
-                    include.target_schema.as_ref(),
-                )],
-            )
-            .map_err(|error| {
-                ProjectionProtocolError::InvalidBatch(format!(
-                    "invalid projection graph target schema: {error}"
-                ))
-            })?;
-            for key in keys {
-                materialized_snapshots =
-                    checked_projection_graph_materialization(materialized_snapshots)?;
-                let scope = codec
-                    .encode_row_scope_in_partition(
-                        &include.target_schema.model_name,
-                        request.root.scope.projection_partition().clone(),
-                        &key,
-                    )
-                    .map_err(|error| {
-                        ProjectionProtocolError::InvalidBatch(format!(
-                            "invalid projection graph included key: {error}"
-                        ))
-                    })?;
-                let is_new_scope = unique_scopes.insert(scope.clone());
-                if is_new_scope && unique_scopes.len() > request.max_unique_record_scopes {
-                    return Err(projection_graph_budget_error(
-                        &request.root.schema,
-                        unique_scopes.len(),
-                        request.max_unique_record_scopes,
-                    ));
-                }
-                let row_request = ProjectionQuerySnapshotRequest {
-                    schema: Arc::clone(&include.target_schema),
-                    key,
-                    scope: scope.clone(),
-                    checkpoint_probes: Vec::new(),
-                };
-                let snapshot = read_projection_query_snapshot_in_executor::<DB, _>(
-                    &mut *connection,
-                    &row_request,
-                )
-                .await?;
-                snapshots.push(ProjectionScopedRowSnapshot {
-                    scope,
-                    row: snapshot.row,
-                    record: snapshot.record,
-                });
-            }
-            snapshots.sort_by(|left, right| {
-                left.scope
-                    .canonical_key_bytes()
-                    .cmp(right.scope.canonical_key_bytes())
-            });
-        }
-        includes.insert(
-            name.clone(),
-            ProjectionGraphIncludeSnapshot {
-                relationship: include.relationship.clone(),
-                target_schema: include.target_schema.as_ref().clone(),
-                rows: snapshots,
-            },
-        );
-    }
-    Ok(ProjectionGraphSnapshot { root, includes })
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn read_projection_relationship_keys_in_executor<DB>(
-    connection: &mut DB::Connection,
-    root_schema: &TableSchema,
-    root_row: &RowValues,
-    relationship: &crate::table::RelationshipDef,
-    target_schema: &TableSchema,
-    max_unique: usize,
-) -> Result<Vec<RowKey>, ProjectionProtocolError>
-where
-    DB: SqlxRepoBackend,
-    DB::Arguments: IntoArguments<DB>,
-    for<'c> &'c mut DB::Connection: Executor<'c, Database = DB>,
-    for<'r> &'r str: sqlx::ColumnIndex<DB::Row>,
-{
-    let values =
-        projection_relationship_values(root_schema, root_row, relationship, target_schema)?;
-    if values
-        .iter()
-        .any(|(_, value)| *value == crate::table::RowValue::Null)
-    {
-        return Ok(Vec::new());
-    }
-
-    let mut builder = QueryBuilder::<DB>::new("SELECT ");
-    for (index, primary_key) in target_schema.primary_key.columns.iter().enumerate() {
-        if index > 0 {
-            builder.push(", ");
-        }
-        DB::push_select_column(&mut builder, column_by_name(target_schema, primary_key)?);
-    }
-    builder.push(" FROM ");
-    builder.push(quote_identifier(&target_schema.table_name));
-    builder.push(" WHERE ");
-    for (index, (target_column, value)) in values.into_iter().enumerate() {
-        if index > 0 {
-            builder.push(" AND ");
-        }
-        builder.push(quote_identifier(&target_column));
-        builder.push(" = ");
-        DB::push_row_value_bind(
-            &mut builder,
-            value,
-            column_by_name(target_schema, &target_column)?,
-        )?;
-    }
-    push_order_by_primary_key(&mut builder, target_schema);
-    builder.push(" LIMIT ");
-    builder.push(max_unique.saturating_add(1).to_string());
-
-    let rows = builder
-        .build()
-        .fetch_all(&mut *connection)
-        .await
-        .map_err(|error| {
-            protocol_storage_error::<DB>("load projection graph relationship keys", error)
-        })?;
-    if rows.len() > max_unique {
-        return Err(projection_graph_budget_error(
-            root_schema,
-            max_unique.saturating_add(1),
-            max_unique,
-        ));
-    }
-    rows.iter()
-        .map(|row| {
-            let values = target_schema
-                .primary_key
-                .columns
-                .iter()
-                .map(|primary_key| {
-                    let column = column_by_name(target_schema, primary_key)?;
-                    Ok((primary_key.clone(), DB::row_value(row, column)?))
-                })
-                .collect::<Result<Vec<_>, TableStoreError>>()?;
-            Ok(RowKey::new(values))
-        })
-        .collect()
-}
-
-fn projection_graph_budget_error(
-    root_schema: &TableSchema,
-    returned: usize,
-    maximum: usize,
-) -> ProjectionProtocolError {
-    ProjectionProtocolError::InvalidBatch(format!(
-        "projection graph model `{}` returned {returned} unique record scopes; request budget is {maximum}",
-        root_schema.model_name
-    ))
-}
-
 /// Discover the bounded durable evidence for one modeled command causation.
 ///
 /// The command ledger stores only opaque scope tokens. This read returns
@@ -1347,11 +1003,7 @@ where
         observation_query.push_bind(topology_hash.as_slice());
     }
     observation_query.push(")");
-    observation_query.push(
-        " ORDER BY observation.topology_hash, observation.partition_hash, \
-         observation.model_name, observation.scope_kind, observation.canonical_key_hash \
-         LIMIT ",
-    );
+    observation_query.push(" LIMIT ");
     observation_query.push(overflow_limit.to_string());
     let rows = observation_query
         .build()
@@ -1480,7 +1132,7 @@ where
         failure_query.push_bind(topology_hash.as_slice());
     }
     failure_query.push(")");
-    failure_query.push(" ORDER BY partition.topology_hash LIMIT ");
+    failure_query.push(" LIMIT ");
     failure_query.push(overflow_limit.to_string());
     let rows = failure_query
         .build()
@@ -1531,14 +1183,18 @@ where
         }
         terminal_failure_topologies.push(topology);
     }
-    Ok(ProjectionCausationEvidenceBatch {
+    let mut evidence = ProjectionCausationEvidenceBatch {
         observations,
         terminal_failure_topologies,
-    })
+    };
+    sort_causation_evidence(&mut evidence);
+    Ok(evidence)
 }
 
 /// Recover exact live record scopes for typed physical-row keys without
 /// requiring the caller to know hidden projection partitions.
+// Only the GraphQL query path reads this outside tests.
+#[cfg_attr(not(feature = "graphql"), allow(dead_code))]
 pub(crate) async fn read_projection_live_record_batch_in_executor<DB>(
     connection: &mut DB::Connection,
     request: &ProjectionLiveRecordBatchRequest,
@@ -1904,58 +1560,18 @@ where
 {
     let state = load_partition_in_connection(connection, topology, partition).await?;
     after_state.await;
-    let Some(state) = state else {
-        return Ok(match after {
-            Some(_) => ProjectionChangeRead::ResetRequired {
-                head: None,
-                compacted_through: 0,
-            },
-            None => ProjectionChangeRead::Changes {
-                head: None,
-                compacted_through: 0,
-                changes: Vec::new(),
-            },
-        });
-    };
-    let head = if state.change_head == 0 {
-        None
-    } else {
-        Some(ProjectionChangeCursor::new(
-            topology.clone(),
-            partition.clone(),
-            state.change_epoch.clone(),
+    let window = state.as_ref().map(|state| {
+        (
+            &state.change_epoch,
             state.change_head,
-        )?)
+            state.compacted_through,
+        )
+    });
+    let start = match change_read_window(topology, partition, window, after, limit)? {
+        std::ops::ControlFlow::Break(read) => return Ok(read),
+        std::ops::ControlFlow::Continue(start) => start,
     };
-    if after.is_none() && state.compacted_through > 0 {
-        return Ok(ProjectionChangeRead::ResetRequired {
-            head,
-            compacted_through: state.compacted_through,
-        });
-    }
-    let start = match after {
-        Some(cursor)
-            if cursor.topology() != topology
-                || cursor.projection_partition() != partition
-                || cursor.epoch() != &state.change_epoch
-                || cursor.position() > state.change_head
-                || cursor.position() < state.compacted_through =>
-        {
-            return Ok(ProjectionChangeRead::ResetRequired {
-                head,
-                compacted_through: state.compacted_through,
-            });
-        }
-        Some(cursor) => cursor.position(),
-        None => state.compacted_through,
-    };
-    if limit == 0 || start == state.change_head {
-        return Ok(ProjectionChangeRead::Changes {
-            head,
-            compacted_through: state.compacted_through,
-            changes: Vec::new(),
-        });
-    }
+    let window = window.expect("a change read past its window decision has a partition");
     let topology_hash = topology.digest();
     let partition_hash = partition.digest();
     let mut builder = QueryBuilder::<DB>::new(
@@ -1967,44 +1583,20 @@ where
     builder.push(" AND partition_hash = ");
     builder.push_bind(partition_hash.as_slice());
     builder.push(" AND change_epoch = ");
-    builder.push_bind(state.change_epoch.as_str());
+    builder.push_bind(window.0.as_str());
     builder.push(" AND change_position > ");
     builder.push_bind(to_i64::<DB>(start, "projection change read position")?);
     builder.push(" ORDER BY change_position ASC LIMIT ");
     builder.push_bind(i64::try_from(limit).unwrap_or(i64::MAX));
-    let rows = builder
+    let changes = builder
         .build()
         .fetch_all(&mut *connection)
         .await
-        .map_err(|error| protocol_storage_error::<DB>("read projection changes", error))?;
-    let mut changes = Vec::with_capacity(rows.len());
-    let mut expected = checked_next(start, "projection change read")?;
-    for row in rows {
-        let change = decode_change_row::<DB>(&row, topology, partition, &state.change_epoch)?;
-        if change.cursor.position() != expected {
-            return Err(corrupt_storage(format!(
-                "projection change log expected position {expected} but found {}",
-                change.cursor.position()
-            )));
-        }
-        expected = if change.cursor.position() == state.change_head {
-            state.change_head
-        } else {
-            checked_next(change.cursor.position(), "projection change read")?
-        };
-        changes.push(change);
-    }
-    if changes.is_empty() {
-        return Err(corrupt_storage(format!(
-            "projection change log is missing retained position {}",
-            checked_next(start, "projection change read")?
-        )));
-    }
-    Ok(ProjectionChangeRead::Changes {
-        head,
-        compacted_through: state.compacted_through,
-        changes,
-    })
+        .map_err(|error| protocol_storage_error::<DB>("read projection changes", error))?
+        .iter()
+        .map(|row| decode_change_row::<DB>(row, topology, partition, window.0))
+        .collect::<Result<Vec<_>, _>>()?;
+    change_page(topology, partition, window, start, changes)
 }
 
 /// Read one durable resumable projection-change page using an existing

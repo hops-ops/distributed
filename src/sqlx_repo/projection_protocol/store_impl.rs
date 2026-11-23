@@ -13,7 +13,6 @@ where
     for<'q> &'q [u8]: Encode<'q, DB> + Type<DB>,
     for<'r> &'r str: sqlx::ColumnIndex<DB::Row>,
 {
-    #[cfg(feature = "graphql")]
     async fn projection_rebuild_records(
         &self,
         context: &crate::projection::rebuild::RebuildContext,
@@ -21,7 +20,6 @@ where
         self.snapshot_rebuild_records(context).await
     }
 
-    #[cfg(feature = "graphql")]
     async fn commit_projection_rebuild(
         &self,
         plan: crate::projection::rebuild::SnapshotProjectionRebuildPlan,
@@ -348,35 +346,38 @@ where
 
             let topology = batch.input.cursor.topology().clone();
             let partition = batch.input.cursor.projection_partition().clone();
-            let mut tx =
-                self.pool().begin().await.map_err(|error| {
-                    protocol_storage_error::<DB>("begin projection commit", error)
-                })?;
+            // The registered topology is read before the partition lock is
+            // written.
+            let mut tx = self
+                .pool()
+                .begin_with(DB::BEGIN_READ_THEN_WRITE)
+                .await
+                .map_err(|error| protocol_storage_error::<DB>("begin projection commit", error))?;
             verify_registered_topology_in_tx(&mut tx, &topology).await?;
             let mut state =
                 lock_partition_in_tx(&mut tx, &topology, &partition, &batch.change_epoch).await?;
             validate_input_identity_in_tx(&mut tx, &batch.input).await?;
-            ensure_active_input(&state, &batch.input)?;
+            ensure_active_input(
+                &batch.input,
+                state.active_generation,
+                state.stopped_failure_id.as_deref(),
+            )?;
             let redelivery =
                 match classify_validated_input_in_tx(&mut tx, &batch.input, &state).await? {
-                    InputDisposition::Duplicate(checkpoint) => {
+                    ProjectionInputDisposition::Duplicate(checkpoint) => {
                         return Ok(ProjectionCommitResult::not_applied(
                             ProjectionCommitOutcome::Duplicate,
                             Some(checkpoint),
                         ));
                     }
-                    InputDisposition::Stale(checkpoint) => {
+                    ProjectionInputDisposition::Stale(checkpoint) => {
                         return Ok(ProjectionCommitResult::not_applied(
                             ProjectionCommitOutcome::StaleInput,
                             Some(checkpoint),
                         ));
                     }
-                    InputDisposition::New => {
-                        ensure_pending_retry_input_in_tx(&mut tx, &state, &batch.input).await?;
-                        false
-                    }
-                    InputDisposition::Redelivery => {
-                        ensure_pending_retry_input_in_tx(&mut tx, &state, &batch.input).await?;
+                    ProjectionInputDisposition::Pending => false,
+                    ProjectionInputDisposition::Redelivery => {
                         batch.mutations.clear();
                         batch.observations.clear();
                         write_plan = TableWritePlan::new(Vec::new());
@@ -411,27 +412,14 @@ where
             let mut changes =
                 Vec::with_capacity(batch.mutations.len() + batch.observations.len().max(1));
             for mutation in &batch.mutations {
-                let current = record_in_tx(&mut tx, &mutation.scope, &state.change_epoch).await?;
-                let physical_exists =
-                    physical_row_exists_in_tx(&mut tx, &mutation.mutation).await?;
-                match current.as_ref().map(|record| &record.metadata) {
-                    None if physical_exists => {
-                        return Err(ProjectionProtocolError::RecordAlreadyExists {
-                            model: mutation.scope.model().to_string(),
-                        });
-                    }
-                    Some(metadata) if metadata.tombstone && physical_exists => {
-                        return Err(ProjectionProtocolError::RecordAlreadyExists {
-                            model: mutation.scope.model().to_string(),
-                        });
-                    }
-                    Some(metadata) if !metadata.tombstone && !physical_exists => {
-                        return Err(ProjectionProtocolError::RecordMissing {
-                            model: mutation.scope.model().to_string(),
-                        });
-                    }
-                    _ => {}
-                }
+                let current = record_in_tx(&mut tx, &mutation.scope, &state.change_epoch)
+                    .await?
+                    .map(|record| record.metadata);
+                validate_physical_row(
+                    &mutation.scope,
+                    current.as_ref(),
+                    physical_row_exists_in_tx(&mut tx, &mutation.mutation).await?,
+                )?;
                 let (revision, tombstone) = next_record(
                     &mutation.scope,
                     &mutation.expectation,
@@ -440,7 +428,7 @@ where
                     mutation.source_snapshot.is_some(),
                 )?;
                 crate::projection_protocol::validate_snapshot_write(
-                    current.as_ref().map(|record| &record.metadata),
+                    current.as_ref(),
                     mutation.source_snapshot.as_ref(),
                 )?;
                 let change = allocate_change(
@@ -468,50 +456,19 @@ where
 
             let mut observations = Vec::with_capacity(batch.observations.len());
             for request in &batch.observations {
-                let (scope, revision, staged_change) = match &request.target {
-                    ProjectionObservationTarget::StagedRecord(scope) => {
-                        let metadata = records_by_scope.get(scope).ok_or_else(|| {
-                            ProjectionProtocolError::InvalidBatch(format!(
-                                "projection observation references unstaged model `{}`",
-                                scope.model()
-                            ))
-                        })?;
-                        (
-                            scope.clone(),
-                            Some(metadata.revision.clone()),
-                            Some(metadata.change.clone()),
-                        )
+                let scope = request.scope().clone();
+                let stored = match (&request.target, records_by_scope.get(&scope)) {
+                    (ProjectionObservationTarget::ExistingRecord(_), None) => {
+                        record_in_tx(&mut tx, &scope, &state.change_epoch)
+                            .await?
+                            .map(|record| record.metadata)
                     }
-                    ProjectionObservationTarget::ExistingRecord(expected) => {
-                        let metadata =
-                            if let Some(metadata) = records_by_scope.get(expected.scope()) {
-                                metadata.clone()
-                            } else {
-                                record_in_tx(&mut tx, expected.scope(), &state.change_epoch)
-                                    .await?
-                                    .map(|record| record.metadata)
-                                    .ok_or_else(|| ProjectionProtocolError::RecordMissing {
-                                        model: expected.scope().model().to_string(),
-                                    })?
-                            };
-                        if metadata.revision != *expected {
-                            return Err(ProjectionProtocolError::RecordRevisionConflict {
-                                model: expected.scope().model().to_string(),
-                                expected_incarnation: expected.incarnation(),
-                                expected_revision: expected.revision(),
-                                actual_incarnation: metadata.revision.incarnation(),
-                                actual_revision: metadata.revision.revision(),
-                            });
-                        }
-                        if metadata.tombstone && metadata.source_snapshot.is_none() {
-                            return Err(ProjectionProtocolError::RecordTombstoned {
-                                model: expected.scope().model().to_string(),
-                            });
-                        }
-                        (expected.scope().clone(), Some(expected.clone()), None)
-                    }
-                    ProjectionObservationTarget::Dependency(scope) => (scope.clone(), None, None),
+                    _ => None,
                 };
+                let (revision, staged_change) = resolve_observation(
+                    &request.target,
+                    records_by_scope.get(&scope).or(stored.as_ref()),
+                )?;
                 if observation_in_tx(
                     &mut tx,
                     &batch.input.causation_id,
@@ -654,55 +611,32 @@ where
             batch.validate()?;
             let topology = batch.input.cursor.topology().clone();
             let partition = batch.input.cursor.projection_partition().clone();
-            let mut tx =
-                self.pool().begin().await.map_err(|error| {
-                    protocol_storage_error::<DB>("begin projection failure", error)
-                })?;
+            let mut tx = self
+                .pool()
+                .begin_with(DB::BEGIN_READ_THEN_WRITE)
+                .await
+                .map_err(|error| protocol_storage_error::<DB>("begin projection failure", error))?;
             verify_registered_topology_in_tx(&mut tx, &topology).await?;
             let mut state =
                 lock_partition_in_tx(&mut tx, &topology, &partition, &batch.change_epoch).await?;
             validate_input_identity_in_tx(&mut tx, &batch.input).await?;
-            if state.active_generation != batch.input.generation {
-                return Err(ProjectionProtocolError::GenerationFenced {
-                    expected: state.active_generation.get(),
-                    actual: batch.input.generation.get(),
-                });
-            }
-            if let Some(stopped_failure_id) = &state.stopped_failure_id {
-                if stopped_failure_id == &batch.failure_id {
-                    let existing = failure_in_tx(
-                        &mut tx,
-                        &topology,
-                        &partition,
-                        stopped_failure_id,
-                        &state.change_epoch,
-                    )
-                    .await?
-                    .ok_or_else(|| {
-                        corrupt_storage(format!(
-                            "stopped projection failure `{stopped_failure_id}` is missing"
-                        ))
-                    })?;
-                    if failure_matches_batch(&existing, &batch) {
-                        return Ok(existing.failure);
-                    }
-                    if existing.failure.input == batch.input.cursor {
-                        if existing.failure.input_fingerprint != batch.input.fingerprint
-                            || existing.failure.message_id != batch.input.message_id
-                            || existing.failure.causation_id != batch.input.causation_id
-                            || existing.failure.gap_free != batch.input.gap_free
-                        {
-                            return Err(ProjectionProtocolError::InputCorruption);
-                        }
-                    } else if existing.failure.message_id == batch.input.message_id {
-                        return Err(ProjectionProtocolError::MessageIdReuse {
-                            message_id: batch.input.message_id.clone(),
-                        });
-                    }
-                }
-                return Err(ProjectionProtocolError::PartitionStopped {
-                    failure_id: stopped_failure_id.clone(),
-                });
+            ensure_active_input(&batch.input, state.active_generation, None)?;
+            if let Some(stopped) = &state.stopped_failure_id {
+                let existing =
+                    failure_in_tx(&mut tx, &topology, &partition, stopped, &state.change_epoch)
+                        .await?
+                        .ok_or_else(|| {
+                            corrupt_storage(format!(
+                                "stopped projection failure `{stopped}` is missing"
+                            ))
+                        })?;
+                return if failure_matches_batch(&existing.failure, &batch) {
+                    Ok(existing.failure)
+                } else {
+                    Err(ProjectionProtocolError::PartitionStopped {
+                        failure_id: stopped.clone(),
+                    })
+                };
             }
             let mut failure_id_query =
                 QueryBuilder::<DB>::new("SELECT 1 FROM projection_failures WHERE failure_id = ");
@@ -723,17 +657,12 @@ where
                 )));
             }
 
-            match classify_validated_input_in_tx(&mut tx, &batch.input, &state).await? {
-                InputDisposition::New => {
-                    ensure_pending_retry_input_in_tx(&mut tx, &state, &batch.input).await?;
-                }
-                InputDisposition::Duplicate(_)
-                | InputDisposition::Stale(_)
-                | InputDisposition::Redelivery => {
-                    return Err(ProjectionProtocolError::InvalidBatch(
-                        "cannot record terminal failure for an already processed input".into(),
-                    ));
-                }
+            if classify_validated_input_in_tx(&mut tx, &batch.input, &state).await?
+                != ProjectionInputDisposition::Pending
+            {
+                return Err(ProjectionProtocolError::InvalidBatch(
+                    "cannot record terminal failure for an already processed input".into(),
+                ));
             }
             ensure_inbox_available_in_tx(&mut tx, &batch.input).await?;
             let change = allocate_change(
@@ -804,15 +733,6 @@ where
     ) -> impl Future<Output = Result<Option<ProjectionCheckpoint>, ProjectionProtocolError>> + Send + 'a
     {
         async move {
-            let Some(state) = load_partition(
-                self.pool(),
-                cursor_scope.topology(),
-                cursor_scope.projection_partition(),
-            )
-            .await?
-            else {
-                return Ok(None);
-            };
             let probe = TrustedProjectionInput {
                 cursor: cursor_scope.clone(),
                 fingerprint: ProjectionInputFingerprint::from_digest([0; 32]),
@@ -826,6 +746,19 @@ where
             })?;
             let Some(stored) = current_input_cursor_in_tx(&mut tx, &probe).await? else {
                 return Ok(None);
+            };
+            // The head is read after the checkpoint it bounds: a commit landing
+            // between the two reads can only move the head forward.
+            let Some(state) = load_partition_in_tx(
+                &mut tx,
+                cursor_scope.topology(),
+                cursor_scope.projection_partition(),
+            )
+            .await?
+            else {
+                return Err(corrupt_storage(
+                    "projection checkpoint exists without partition state",
+                ));
             };
             verify_stored_change(&state, &stored.change)?;
             if stored.source_epoch != *cursor_scope.epoch() {
@@ -895,20 +828,14 @@ where
                 )
                 .await?
                 else {
-                    if input.generation != ProjectionGeneration::initial() {
-                        return Err(ProjectionProtocolError::GenerationFenced {
-                            expected: ProjectionGeneration::initial().get(),
-                            actual: input.generation.get(),
-                        });
-                    }
+                    ensure_active_input(input, ProjectionGeneration::initial(), None)?;
                     return Ok(ProjectionInputDisposition::Pending);
                 };
-                if state.active_generation != input.generation {
-                    return Err(ProjectionProtocolError::GenerationFenced {
-                        expected: state.active_generation.get(),
-                        actual: input.generation.get(),
-                    });
-                }
+                ensure_active_input(
+                    input,
+                    state.active_generation,
+                    state.stopped_failure_id.as_deref(),
+                )?;
                 verify_generation_exists_in_tx(
                     &mut tx,
                     input.cursor.topology(),
@@ -916,27 +843,7 @@ where
                     input.generation,
                 )
                 .await?;
-                if let Some(failure_id) = &state.stopped_failure_id {
-                    return Err(ProjectionProtocolError::PartitionStopped {
-                        failure_id: failure_id.clone(),
-                    });
-                }
-                match classify_validated_input_in_tx(&mut tx, input, &state).await? {
-                    InputDisposition::New => {
-                        ensure_pending_retry_input_in_tx(&mut tx, &state, input).await?;
-                        Ok(ProjectionInputDisposition::Pending)
-                    }
-                    InputDisposition::Redelivery => {
-                        ensure_pending_retry_input_in_tx(&mut tx, &state, input).await?;
-                        Ok(ProjectionInputDisposition::Redelivery)
-                    }
-                    InputDisposition::Duplicate(checkpoint) => {
-                        Ok(ProjectionInputDisposition::Duplicate(checkpoint))
-                    }
-                    InputDisposition::Stale(checkpoint) => {
-                        Ok(ProjectionInputDisposition::Stale(checkpoint))
-                    }
-                }
+                classify_validated_input_in_tx(&mut tx, input, &state).await
             }
             .await;
 
@@ -971,33 +878,6 @@ where
         read_projection_query_snapshot_in_executor(self.pool(), request)
     }
 
-    fn projection_query_snapshot_batch<'a>(
-        &'a self,
-        request: &'a ProjectionQuerySnapshotBatchRequest,
-    ) -> impl Future<Output = Result<ProjectionQuerySnapshotBatch, ProjectionProtocolError>> + Send + 'a
-    {
-        let request = request.clone();
-        async move {
-            request.validate()?;
-            with_projection_read_snapshot(self.pool(), move |connection| {
-                Box::pin(async move {
-                    let mut snapshots = Vec::with_capacity(request.requests.len());
-                    for row_request in &request.requests {
-                        snapshots.push(
-                            read_projection_query_snapshot_in_executor::<DB, _>(
-                                &mut *connection,
-                                row_request,
-                            )
-                            .await?,
-                        );
-                    }
-                    Ok(ProjectionQuerySnapshotBatch { snapshots })
-                })
-            })
-            .await
-        }
-    }
-
     fn projection_execution_snapshot_batch<'a>(
         &'a self,
         request: &'a ProjectionExecutionSnapshotBatchRequest,
@@ -1017,23 +897,6 @@ where
         }
     }
 
-    fn projection_graph_snapshot<'a>(
-        &'a self,
-        request: &'a ProjectionGraphSnapshotRequest,
-    ) -> impl Future<Output = Result<ProjectionGraphSnapshot, ProjectionProtocolError>> + Send + 'a
-    {
-        let request = request.clone();
-        async move {
-            validate_projection_graph_snapshot_request(&request)?;
-            with_projection_read_snapshot(self.pool(), move |connection| {
-                Box::pin(async move {
-                    read_projection_graph_snapshot_in_executor::<DB>(connection, &request).await
-                })
-            })
-            .await
-        }
-    }
-
     fn projection_causation_evidence<'a>(
         &'a self,
         request: &'a ProjectionCausationEvidenceRequest,
@@ -1046,23 +909,6 @@ where
             with_projection_read_snapshot(self.pool(), move |connection| {
                 Box::pin(async move {
                     read_projection_causation_evidence_in_executor::<DB>(connection, &request).await
-                })
-            })
-            .await
-        }
-    }
-
-    fn projection_live_record_batch<'a>(
-        &'a self,
-        request: &'a ProjectionLiveRecordBatchRequest,
-    ) -> impl Future<Output = Result<ProjectionLiveRecordBatch, ProjectionProtocolError>> + Send + 'a
-    {
-        let request = request.clone();
-        async move {
-            request.validate()?;
-            with_projection_read_snapshot(self.pool(), move |connection| {
-                Box::pin(async move {
-                    read_projection_live_record_batch_in_executor::<DB>(connection, &request).await
                 })
             })
             .await
@@ -1141,21 +987,6 @@ where
                     "cannot repair an unknown projection partition".into(),
                 ));
             };
-            match &state.stopped_failure_id {
-                Some(stopped) if stopped == failure_id => {}
-                Some(stopped) => {
-                    return Err(ProjectionProtocolError::PartitionStopped {
-                        failure_id: stopped.clone(),
-                    });
-                }
-                None => {
-                    return Err(ProjectionProtocolError::InvalidBatch(
-                        "projection partition is not stopped".into(),
-                    ));
-                }
-            }
-            verify_generation_exists_in_tx(&mut tx, topology, partition, state.active_generation)
-                .await?;
             let failure = failure_in_tx(
                 &mut tx,
                 topology,
@@ -1163,20 +994,17 @@ where
                 failure_id,
                 &state.change_epoch,
             )
-            .await?
-            .ok_or_else(|| {
-                corrupt_storage(format!(
-                    "stopped projection failure `{failure_id}` is missing"
-                ))
-            })?;
-            if failure.failure.generation != state.active_generation {
-                return Err(corrupt_storage(format!(
-                    "stopped failure generation {} differs from active generation {}",
-                    failure.failure.generation.get(),
-                    state.active_generation.get()
-                )));
-            }
-            let next_generation = state.active_generation.checked_next()?;
+            .await?;
+            let next_generation = plan_repair(
+                topology,
+                partition,
+                state.active_generation,
+                state.stopped_failure_id.as_deref(),
+                failure_id,
+                failure.as_ref().map(|stored| &stored.failure),
+            )?;
+            verify_generation_exists_in_tx(&mut tx, topology, partition, state.active_generation)
+                .await?;
             let topology_hash = topology.digest();
             let partition_hash = partition.digest();
             let old_generation =

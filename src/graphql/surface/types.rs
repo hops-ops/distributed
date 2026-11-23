@@ -318,6 +318,49 @@ impl Deref for SurfaceProjector {
 }
 
 impl SurfaceProjector {
+    /// Begin snapshot rebuild maintenance for this projector's one active,
+    /// locally hosted eventual binding.
+    #[allow(private_bounds)]
+    pub async fn begin_snapshot_rebuild(
+        &self,
+        store: &impl crate::projection_protocol::ProjectionProtocolStore,
+    ) -> Result<
+        crate::projection::rebuild::SnapshotProjectionRebuild,
+        crate::projection_protocol::ProjectionProtocolError,
+    > {
+        use crate::projection::placement::ProjectionExecutorRoute;
+        use crate::projection_protocol::{ProjectionProtocolError, ProjectorTopologyId};
+        let invalid = |message: &str| ProjectionProtocolError::InvalidBatch(message.into());
+        let [projection] = self.modeled.as_slice() else {
+            return Err(invalid(
+                "snapshot rebuild requires exactly one modeled binding",
+            ));
+        };
+        if !projection.is_causally_eligible()
+            || !matches!(projection.route(), ProjectionExecutorRoute::Local { .. })
+        {
+            return Err(invalid(
+                "snapshot rebuild requires an active local eventual binding",
+            ));
+        }
+        let physical = projection
+            .raw()
+            .ok_or_else(|| invalid("snapshot rebuild requires a generated binding"))?
+            .1
+            .physical_topology()
+            .ok_or_else(|| invalid("snapshot rebuild requires a physical topology"))?;
+        let executor = projection
+            .server_executor()
+            .cloned()
+            .ok_or_else(|| invalid("snapshot rebuild requires a generated executor"))?;
+        crate::projection::rebuild::SnapshotProjectionRebuild::begin(
+            store,
+            ProjectorTopologyId::new(physical.version(), physical.name(), physical.digest())?,
+            executor,
+        )
+        .await
+    }
+
     pub fn new(name: impl Into<String>) -> Self {
         Self {
             owner: SurfaceProjectionOwner {

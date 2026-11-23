@@ -72,7 +72,7 @@ where
     ) -> Result<Vec<ProjectionRecordMetadata>, ProjectionProtocolError> {
         let mut tx = self
             .pool()
-            .begin()
+            .begin_with(DB::BEGIN_READ_THEN_WRITE)
             .await
             .map_err(|e| protocol_storage_error::<DB>("begin rebuild inventory", e))?;
         verify_registered_topology_in_tx(&mut tx, context.compiled.topology()).await?;
@@ -102,7 +102,7 @@ where
         validate_sql_write_plan(&write_plan)?;
         let mut tx = self
             .pool()
-            .begin()
+            .begin_with(DB::BEGIN_READ_THEN_WRITE)
             .await
             .map_err(|e| protocol_storage_error::<DB>("begin snapshot rebuild", e))?;
         verify_registered_topology_in_tx(&mut tx, topology).await?;
@@ -124,7 +124,7 @@ where
             )?;
             let (kind, expectation) = row.transition(metadata);
             let (revision, tombstone) =
-                next_record(&row.scope, &expectation, kind, current.as_ref(), true)?;
+                next_record(&row.scope, &expectation, kind, metadata, true)?;
             let change = allocate_change(
                 &mut state,
                 topology,

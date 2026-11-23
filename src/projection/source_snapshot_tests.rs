@@ -570,7 +570,6 @@ fn rebuild_projector() -> crate::graphql::SurfaceProjector {
 }
 
 async fn rebuild_matrix(store: &impl ProjectionProtocolStore) {
-    use crate::projection::rebuild::SnapshotProjectionRebuild;
     let projector = rebuild_projector();
     let (_, binding) = projector.modeled[0].raw().unwrap();
     let physical = binding.physical_topology().unwrap();
@@ -604,7 +603,8 @@ async fn rebuild_matrix(store: &impl ProjectionProtocolStore) {
         vec![second.clone()],
         vec![first.clone(), removed.clone()],
     ] {
-        assert!(SnapshotProjectionRebuild::begin(store, &projector)
+        assert!(projector
+            .begin_snapshot_rebuild(store)
             .await
             .unwrap()
             .from_complete_history(&history)
@@ -612,16 +612,15 @@ async fn rebuild_matrix(store: &impl ProjectionProtocolStore) {
     }
     let mut conflicting = second.clone();
     conflicting.overwrite_causation_id("another-cause");
-    assert!(SnapshotProjectionRebuild::begin(store, &projector)
+    assert!(projector
+        .begin_snapshot_rebuild(store)
         .await
         .unwrap()
         .from_complete_history(&[first.clone(), second.clone(), conflicting])
         .is_err());
     assert_eq!(h.read(store, "a").await.record, original.record);
 
-    let rebuild = SnapshotProjectionRebuild::begin(store, &projector)
-        .await
-        .unwrap();
+    let rebuild = projector.begin_snapshot_rebuild(store).await.unwrap();
     // Reverse delivery and exact duplicate occurrences are deterministic.
     let plan = rebuild
         .from_complete_history(&[second.clone(), first.clone(), second.clone()])
@@ -654,7 +653,8 @@ async fn rebuild_matrix(store: &impl ProjectionProtocolStore) {
     h.apply(store, &removed, 3).await.unwrap();
 
     // Exact inventory CAS rejects modifications made after begin, including inserts.
-    let pending = SnapshotProjectionRebuild::begin(store, &projector)
+    let pending = projector
+        .begin_snapshot_rebuild(store)
         .await
         .unwrap()
         .from_complete_history(&[first.clone(), second.clone(), removed.clone()])
@@ -664,14 +664,16 @@ async fn rebuild_matrix(store: &impl ProjectionProtocolStore) {
     assert!(pending.apply(store).await.is_err());
     assert!(h.read(store, "a").await.row.is_none());
     // Missing the stored tombstone occurrence cannot resurrect it.
-    assert!(SnapshotProjectionRebuild::begin(store, &projector)
+    assert!(projector
+        .begin_snapshot_rebuild(store)
         .await
         .unwrap()
         .from_complete_history(&[first.clone(), second.clone(), other.clone()])
         .is_err());
     let recreated = event("a", 4, "recreated", false);
     let history = [first, second, removed, other, recreated.clone()];
-    SnapshotProjectionRebuild::begin(store, &projector)
+    projector
+        .begin_snapshot_rebuild(store)
         .await
         .unwrap()
         .from_complete_history(&history)
@@ -687,12 +689,10 @@ async fn rebuild_matrix(store: &impl ProjectionProtocolStore) {
     );
 }
 
+#[cfg(any(feature = "sqlite", feature = "postgres"))]
 async fn rebuild_rollback(store: &impl ProjectionProtocolStore) {
-    use crate::projection::rebuild::SnapshotProjectionRebuild;
     let projector = rebuild_projector();
-    let before = SnapshotProjectionRebuild::begin(store, &projector)
-        .await
-        .unwrap();
+    let before = projector.begin_snapshot_rebuild(store).await.unwrap();
     let h = Harness {
         codec: before.context.compiled.codec(),
     };
@@ -729,7 +729,7 @@ async fn snapshot_rebuild_memory() {
 
 #[tokio::test]
 async fn snapshot_rebuild_original_private_log_coverage() {
-    use crate::projection::rebuild::{AggregateRebuildCoverage, SnapshotProjectionRebuild};
+    use crate::projection::rebuild::AggregateRebuildCoverage;
     let identity = crate::repository::StreamIdentity::new("snapshot-item", "a").unwrap();
     let first = event("a", 1, "old", false);
     let third = event("a", 3, "current", false);
@@ -776,18 +776,21 @@ async fn snapshot_rebuild_original_private_log_coverage() {
         .register_projection_models(compiled.topology(), compiled.ownership())
         .await
         .unwrap();
-    assert!(SnapshotProjectionRebuild::begin(&fresh_store, &projector)
+    assert!(projector
+        .begin_snapshot_rebuild(&fresh_store)
         .await
         .unwrap()
         .from_complete_history(&history)
         .is_err());
-    let plan = SnapshotProjectionRebuild::begin(&fresh_store, &projector)
+    let plan = projector
+        .begin_snapshot_rebuild(&fresh_store)
         .await
         .unwrap()
         .from_complete_history_with_coverage(&history, &[witness.clone()])
         .unwrap();
     assert_eq!(plan.apply(&fresh_store).await.unwrap(), 1);
-    let read = SnapshotProjectionRebuild::begin(&fresh_store, &projector)
+    let read = projector
+        .begin_snapshot_rebuild(&fresh_store)
         .await
         .unwrap();
     let harness = Harness {
@@ -812,7 +815,8 @@ async fn snapshot_rebuild_original_private_log_coverage() {
             event("a", 4, "unwitnessed", false),
         ],
     ] {
-        assert!(SnapshotProjectionRebuild::begin(&fresh_store, &projector)
+        assert!(projector
+            .begin_snapshot_rebuild(&fresh_store)
             .await
             .unwrap()
             .from_complete_history_with_coverage(&altered, &[witness.clone()])
@@ -822,7 +826,8 @@ async fn snapshot_rebuild_original_private_log_coverage() {
     let mut mixed = history.to_vec();
     mixed.push(event("other", 2, "missing prefix", false));
     mixed.push(external_row("ledger", "external", 901, "sparse"));
-    assert!(SnapshotProjectionRebuild::begin(&fresh_store, &projector)
+    assert!(projector
+        .begin_snapshot_rebuild(&fresh_store)
         .await
         .unwrap()
         .from_complete_history_with_coverage(&mixed, &[witness])
@@ -880,7 +885,6 @@ async fn snapshot_rebuild_original_private_log_coverage() {
 
 #[tokio::test]
 async fn snapshot_rebuild_external_sparse_members_and_mixed_origins() {
-    use crate::projection::rebuild::SnapshotProjectionRebuild;
     let store = crate::InMemoryRepository::new();
     let mounts = crate::LocalProjectionMountsBuilder::new("external-test", "events")
         .unwrap()
@@ -914,9 +918,7 @@ async fn snapshot_rebuild_external_sparse_members_and_mixed_origins() {
             .unwrap();
     }
     bootstrap(&store, &projector).await;
-    let capture = SnapshotProjectionRebuild::begin(&store, &projector)
-        .await
-        .unwrap();
+    let capture = projector.begin_snapshot_rebuild(&store).await.unwrap();
     let a = external_row("ledger-a", "a", 7, "old");
     let b = external_row("ledger-a", "b", 7, "same transaction, different member");
     let newer = external_row("ledger-a", "a", 42, "new");
@@ -933,7 +935,8 @@ async fn snapshot_rebuild_external_sparse_members_and_mixed_origins() {
         .unwrap();
     // Derived facts which match a snapshot arm remain invalid, not silently
     // converted into source versions.
-    assert!(SnapshotProjectionRebuild::begin(&store, &projector)
+    assert!(projector
+        .begin_snapshot_rebuild(&store)
         .await
         .unwrap()
         .from_complete_history(&[a.clone(), derived.clone()])
@@ -948,9 +951,7 @@ async fn snapshot_rebuild_external_sparse_members_and_mixed_origins() {
     let plan = capture.from_complete_history(&history).unwrap();
     assert_eq!(plan.record_count(), 2);
     assert_eq!(plan.apply(&store).await.unwrap(), 2);
-    let read = SnapshotProjectionRebuild::begin(&store, &projector)
-        .await
-        .unwrap();
+    let read = projector.begin_snapshot_rebuild(&store).await.unwrap();
     assert!(
         read.from_complete_history(&[a.clone(), b.clone()]).is_err(),
         "stored newer source evidence cannot disappear"
@@ -961,7 +962,8 @@ async fn snapshot_rebuild_external_sparse_members_and_mixed_origins() {
     ] {
         let mut changed = history.to_vec();
         changed.push(conflict);
-        assert!(SnapshotProjectionRebuild::begin(&store, &projector)
+        assert!(projector
+            .begin_snapshot_rebuild(&store)
             .await
             .unwrap()
             .from_complete_history(&changed)
@@ -974,7 +976,8 @@ async fn snapshot_rebuild_external_sparse_members_and_mixed_origins() {
     bootstrap(&aggregate_store, &aggregate_projector).await;
     let mixed = [aggregate.clone(), a, b, newer, derived];
     assert_eq!(
-        SnapshotProjectionRebuild::begin(&aggregate_store, &aggregate_projector)
+        aggregate_projector
+            .begin_snapshot_rebuild(&aggregate_store)
             .await
             .unwrap()
             .from_complete_history(&mixed)
@@ -982,16 +985,15 @@ async fn snapshot_rebuild_external_sparse_members_and_mixed_origins() {
             .record_count(),
         1
     );
-    assert!(
-        SnapshotProjectionRebuild::begin(&aggregate_store, &aggregate_projector)
-            .await
-            .unwrap()
-            .from_complete_history(&[
-                event("aggregate", 2, "missing prefix", false),
-                external_row("ledger", "c", 100, "unrelated")
-            ])
-            .is_err()
-    );
+    assert!(aggregate_projector
+        .begin_snapshot_rebuild(&aggregate_store)
+        .await
+        .unwrap()
+        .from_complete_history(&[
+            event("aggregate", 2, "missing prefix", false),
+            external_row("ledger", "c", 100, "unrelated")
+        ])
+        .is_err());
 }
 
 #[cfg(feature = "sqlite")]

@@ -207,6 +207,8 @@ impl ProjectionScopeCodec {
     /// Physical query rows do not carry their hidden causal partition. Query
     /// evidence uses these canonical bytes to find the one live record across
     /// partitions, then returns that record's exact stored scope.
+    // Only the SQL live-record read, for the GraphQL query path, needs it.
+    #[cfg_attr(not(feature = "graphql"), allow(dead_code))]
     pub(crate) fn encode_unpartitioned_row_key(
         &self,
         model: &str,

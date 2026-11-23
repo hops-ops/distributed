@@ -505,7 +505,6 @@ impl SurfaceModeledProjection {
         Some((self.raw_program.as_ref()?, self.raw_binding.as_ref()?))
     }
 
-    #[cfg(feature = "graphql")]
     pub(crate) fn server_executor(
         &self,
     ) -> Option<&crate::projection::lower::ProjectionServerExecutorDescriptor> {

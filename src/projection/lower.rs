@@ -544,6 +544,10 @@ impl ProjectionServerExecutorDescriptor {
             .any(|selector| selector.matches(occurrence))
     }
 
+    pub(crate) fn source_snapshots(&self) -> bool {
+        self.program.source_snapshots()
+    }
+
     #[cfg(feature = "graphql")]
     pub(crate) fn has_unit_partition(&self) -> bool {
         self.unit_partition
