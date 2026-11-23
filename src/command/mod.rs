@@ -33,20 +33,17 @@ pub(crate) use direct_projection::{
     ResolvedDirectProjectionTarget,
 };
 // Public seams used by derives / `command_input_defaults!` only.
-pub(crate) use effect_wire::CommandInputDefault;
-#[cfg(test)]
-pub(crate) use effect_wire::InputDefaultGenerator;
 pub use effect_wire::{
     __command_input_defaults, __input_default_ulid, __input_default_uuid_v7,
-    CombineEffectNullability, CompiledInputDefault, CompiledInputDefaults,
+    CombineEffectNullability, CommandInputDefault, CompiledInputDefault, CompiledInputDefaults,
     EffectInputDescendableKind, EffectInputFieldMarker, EffectInputObjectKind, EffectInputPath,
     EffectInputPathKind, EffectInputTerminalKind, EffectModelFieldMarker, EffectNullable,
     EffectPathNullability, EffectRelationshipMarker, EffectRequired, EffectWireBigInt,
     EffectWireBoolean, EffectWireBytea, EffectWireChecked, EffectWireCompatible, EffectWireFloat,
     EffectWireJson, EffectWireList, EffectWireLiteral, EffectWireObject, EffectWireString,
-    EffectWireTimestamp, EffectWireUnsupported, TypedEffectExpression,
+    EffectWireTimestamp, EffectWireUnsupported, InputDefaultGenerator, TypedEffectExpression,
 };
-pub(crate) use effects::EffectExpression;
+pub use effects::EffectExpression;
 pub use outcomes::{
     Atomic, CommandConsistency, CommandOutcome, Eventual, PrepareCommandError, PreparedCommand,
     Succeeded,

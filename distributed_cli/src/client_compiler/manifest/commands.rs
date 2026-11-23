@@ -1,7 +1,7 @@
 use super::*;
 
 pub(crate) fn canonicalize_commands(
-    commands: &mut [ManifestCommand],
+    commands: &mut [ClientCommand],
 ) -> Result<(), ClientCompileError> {
     for command in commands.iter_mut() {
         canonicalize_string_set(
@@ -46,7 +46,9 @@ pub(crate) fn canonicalize_commands(
                     &format!("command `{}` input default path", command.name),
                 )?;
             }
-            defaults.defaults.sort();
+            defaults
+                .defaults
+                .sort_by(|left, right| left.path.cmp(&right.path));
             if defaults
                 .defaults
                 .windows(2)
@@ -71,8 +73,8 @@ pub(crate) fn canonicalize_commands(
     Ok(())
 }
 
-pub(crate) fn canonicalize_effect_expression(expression: &mut ManifestEffectExpression) {
-    if let ManifestEffectExpression::Constant { value } = expression {
+pub(crate) fn canonicalize_effect_expression(expression: &mut EffectExpression) {
+    if let EffectExpression::Constant { value } = expression {
         *value = canonical_json_value(std::mem::take(value));
     }
 }

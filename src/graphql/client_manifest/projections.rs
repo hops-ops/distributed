@@ -8,20 +8,19 @@ use crate::command::CommandProjectionPreviewSource;
 use crate::graphql::surface::{
     SurfaceProjectionArm, SurfaceProjectionOperation, SurfaceSelectedProjectionProgram,
 };
-use crate::projection::placement::{
-    ProjectionBindingState, ProjectionExecutionClass, ProjectionPlacement,
-};
 use crate::projection::{
     MutationKind, ProjectionAssignmentRef, ProjectionEnvelopeField, ProjectionExpression,
-    ProjectionExpressionRef, ProjectionInvalidation, ProjectionPartition,
-    ProjectionRelationshipEffectKind, ProjectionScalarTransform, ProjectionValue,
+    ProjectionExpressionRef, ProjectionInvalidation, ProjectionPartition, ProjectionValue,
     ProjectionValueRef, ProjectionValueType,
 };
 
-pub(super) const CLIENT_PROJECTION_PROGRAM_VERSION: u32 = 2;
-pub(super) const CLIENT_PROJECTION_BINDING_VERSION: u32 = 1;
+/// Version of the client projection-program shape in the manifest.
+pub const CLIENT_PROJECTION_PROGRAM_VERSION: u32 = 2;
+/// Version of the client projection-binding shape in the manifest.
+pub const CLIENT_PROJECTION_BINDING_VERSION: u32 = 1;
 pub(super) const CLIENT_PROJECTION_OPERATION_SEMANTICS_VERSION: u32 = 1;
-pub(super) const COMMAND_PROJECTION_EXTENSION_VERSION: u32 = 2;
+/// Version of a command's `projection` extension slot.
+pub const COMMAND_PROJECTION_EXTENSION_VERSION: u32 = 2;
 
 #[derive(Clone)]
 struct SlotOrigin {
@@ -50,20 +49,9 @@ pub(super) fn projection_manifest(
                 binding_id: modeled.binding_id().to_string(),
                 program_id: modeled.program_id().to_string(),
                 epoch: modeled.epoch().as_str().to_owned(),
-                state: match modeled.state() {
-                    ProjectionBindingState::Active => ClientProjectionBindingState::Active,
-                    ProjectionBindingState::Draining => ClientProjectionBindingState::Draining,
-                },
-                placement: match modeled.placement() {
-                    ProjectionPlacement::Eventual => ClientProjectionPlacement::Eventual,
-                    ProjectionPlacement::Direct => ClientProjectionPlacement::Direct,
-                },
-                execution_class: match modeled.execution_class() {
-                    ProjectionExecutionClass::Causal => ClientProjectionExecutionClass::Causal,
-                    ProjectionExecutionClass::Background => {
-                        ClientProjectionExecutionClass::Background
-                    }
-                },
+                state: modeled.state(),
+                placement: modeled.placement(),
+                execution_class: modeled.execution_class(),
             });
             let Some(selected) = modeled.selected_program() else {
                 continue;
@@ -792,17 +780,7 @@ fn lower_operation(
                 .collect::<Result<Vec<_>, ClientManifestError>>()?;
             Ok(ClientProjectionRelationshipEffect {
                 ordinal: effect.ordinal(),
-                kind: match effect.kind() {
-                    ProjectionRelationshipEffectKind::Link => {
-                        ClientProjectionRelationshipEffectKind::Link
-                    }
-                    ProjectionRelationshipEffectKind::Unlink => {
-                        ClientProjectionRelationshipEffectKind::Unlink
-                    }
-                    ProjectionRelationshipEffectKind::Invalidate => {
-                        ClientProjectionRelationshipEffectKind::Invalidate
-                    }
-                },
+                kind: effect.kind(),
                 source_model: relationship.source_model().to_owned(),
                 relationship: relationship.relationship().to_owned(),
                 target_model: relationship.target_model().to_owned(),
@@ -878,7 +856,7 @@ fn lower_expression_at(
             });
             ClientProjectionExpression::Slot {
                 slot,
-                value_type: client_value_type(value_type),
+                value_type: value_type.clone(),
             }
         }
         ProjectionExpressionRef::Envelope { field } if intrinsic_envelope(field) => {
@@ -896,10 +874,7 @@ fn lower_expression_at(
                 target,
                 value_type: value_type.clone(),
             });
-            ClientProjectionExpression::Slot {
-                slot,
-                value_type: client_value_type(&value_type),
-            }
+            ClientProjectionExpression::Slot { slot, value_type }
         }
         ProjectionExpressionRef::Constant { value } => ClientProjectionExpression::Constant {
             value: client_value(value),
@@ -946,14 +921,7 @@ fn lower_expression_at(
             transform,
             arguments,
         } => ClientProjectionExpression::Transform {
-            transform: match transform {
-                ProjectionScalarTransform::StringConcat => {
-                    ClientProjectionScalarTransform::StringConcat
-                }
-                ProjectionScalarTransform::FirstPresent => {
-                    ClientProjectionScalarTransform::FirstPresent
-                }
-            },
+            transform,
             arguments: arguments
                 .iter()
                 .enumerate()
@@ -1290,18 +1258,6 @@ fn client_value(value: &ProjectionValue) -> ClientProjectionValue {
                 })
                 .collect(),
         ),
-    }
-}
-
-fn client_value_type(value_type: &ProjectionValueType) -> ClientProjectionValueType {
-    match value_type {
-        ProjectionValueType::Boolean => ClientProjectionValueType::Boolean,
-        ProjectionValueType::I64 => ClientProjectionValueType::I64,
-        ProjectionValueType::U64 => ClientProjectionValueType::U64,
-        ProjectionValueType::F64 => ClientProjectionValueType::F64,
-        ProjectionValueType::String => ClientProjectionValueType::String,
-        ProjectionValueType::Enum(name) => ClientProjectionValueType::Enum(name.clone()),
-        ProjectionValueType::Json => ClientProjectionValueType::Json,
     }
 }
 
@@ -2192,7 +2148,7 @@ mod tests {
         let (programs, bindings) = projection_manifest(&surface).unwrap();
         assert_eq!(programs.len(), 1);
         assert_eq!(bindings.len(), 1);
-        assert_eq!(bindings[0].placement, ClientProjectionPlacement::Direct);
+        assert_eq!(bindings[0].placement, ProjectionPlacement::Direct);
 
         let mut command = command("String");
         command.projections.add_event_set(crate::events![PreviewA]);
@@ -2218,7 +2174,7 @@ mod tests {
         let (programs, bindings) = projection_manifest(&surface).unwrap();
         assert!(programs.is_empty());
         assert_eq!(bindings.len(), 1);
-        assert_eq!(bindings[0].placement, ClientProjectionPlacement::Direct);
+        assert_eq!(bindings[0].placement, ProjectionPlacement::Direct);
     }
 
     #[test]
@@ -2274,14 +2230,14 @@ mod tests {
         assert!(matches!(
             key[0].expression,
             ClientProjectionExpression::Slot {
-                value_type: ClientProjectionValueType::String,
+                value_type: ProjectionValueType::String,
                 ..
             }
         ));
         assert!(matches!(
             key[1].expression,
             ClientProjectionExpression::Slot {
-                value_type: ClientProjectionValueType::String,
+                value_type: ProjectionValueType::String,
                 ..
             }
         ));

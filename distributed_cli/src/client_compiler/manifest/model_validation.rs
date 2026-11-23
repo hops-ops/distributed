@@ -4,48 +4,14 @@ use serde_json::Value as JsonValue;
 
 use super::*;
 
-pub(crate) fn validate_input_default_generators_in_json(
-    value: &JsonValue,
-) -> Result<(), ClientCompileError> {
-    let Some(commands) = value.get("commands").and_then(JsonValue::as_array) else {
-        return Ok(());
-    };
-    for (command_index, command) in commands.iter().enumerate() {
-        let command_name = command
-            .get("name")
-            .and_then(JsonValue::as_str)
-            .unwrap_or("<unknown>");
-        let Some(defaults) = command
-            .pointer("/extensions/input_defaults/defaults")
-            .and_then(JsonValue::as_array)
-        else {
-            continue;
-        };
-        for (default_index, default) in defaults.iter().enumerate() {
-            if !matches!(
-                default.get("generator").and_then(JsonValue::as_str),
-                Some("uuid_v7" | "ulid")
-            ) {
-                return Err(ClientCompileError::manifest(
-                    "client.manifest.input_default_generator",
-                    format!(
-                        "manifest command `{command_name}` input default {default_index} must use uuid_v7 or ulid (commands[{command_index}])"
-                    ),
-                ));
-            }
-        }
-    }
-    Ok(())
-}
-
 pub(crate) fn canonicalize_surface(
-    surface: &mut ManifestSurface,
+    surface: &mut ClientSurfaceIdentity,
 ) -> Result<(), ClientCompileError> {
     match surface {
-        ManifestSurface::Role { name } => {
+        ClientSurfaceIdentity::Role { name } => {
             validate_nonempty(name, "manifest.surface.name")?;
         }
-        ManifestSurface::Application {
+        ClientSurfaceIdentity::Application {
             name,
             eligible_roles,
             schema_roles,
@@ -137,21 +103,21 @@ pub(crate) fn validate_graphql_name(value: &str, label: &str) -> Result<(), Clie
 }
 
 pub(crate) fn validate_surface(
-    actual: &ManifestSurface,
-    expected: &ClientSurfaceSelector,
+    actual: &ClientSurfaceIdentity,
+    expected: &ClientSurfaceIdentity,
 ) -> Result<(), ClientCompileError> {
     let matches = match (actual, expected) {
         (
-            ManifestSurface::Role { name: actual },
-            ClientSurfaceSelector::Role { name: expected },
+            ClientSurfaceIdentity::Role { name: actual },
+            ClientSurfaceIdentity::Role { name: expected },
         ) => !expected.trim().is_empty() && actual == expected,
         (
-            ManifestSurface::Application {
+            ClientSurfaceIdentity::Application {
                 name: actual,
                 eligible_roles,
                 schema_roles,
             },
-            ClientSurfaceSelector::Application {
+            ClientSurfaceIdentity::Application {
                 name: expected,
                 eligible_roles: expected_eligible_roles,
                 schema_roles: expected_schema_roles,
@@ -175,12 +141,12 @@ pub(crate) fn validate_surface(
         return Ok(());
     }
     let actual_label = match actual {
-        ManifestSurface::Role { name } => format!("role `{name}`"),
-        ManifestSurface::Application { name, .. } => format!("application `{name}`"),
+        ClientSurfaceIdentity::Role { name } => format!("role `{name}`"),
+        ClientSurfaceIdentity::Application { name, .. } => format!("application `{name}`"),
     };
     let expected_label = match expected {
-        ClientSurfaceSelector::Role { name } => format!("role `{name}`"),
-        ClientSurfaceSelector::Application {
+        ClientSurfaceIdentity::Role { name } => format!("role `{name}`"),
+        ClientSurfaceIdentity::Application {
             name,
             eligible_roles,
             schema_roles,
@@ -199,7 +165,7 @@ pub(crate) fn validate_surface(
 }
 
 pub(crate) fn validate_capabilities(
-    capabilities: &ManifestCapabilities,
+    capabilities: &ClientCapabilities,
 ) -> Result<(), ClientCompileError> {
     if capabilities.query_fallback != "revalidate" {
         return Err(ClientCompileError::manifest(
@@ -226,7 +192,7 @@ pub(crate) fn validate_capabilities(
 }
 
 pub(crate) fn validate_execution_limits(
-    execution: &ManifestExecutionLimits,
+    execution: &ClientExecutionLimits,
 ) -> Result<(), ClientCompileError> {
     const JS_MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
     for (name, value) in [
@@ -270,15 +236,15 @@ pub(crate) fn validate_execution_limits(
 }
 
 pub(crate) fn validate_derived_capabilities(
-    capabilities: &ManifestCapabilities,
-    roots: &BTreeMap<(RootOperation, String), ManifestRoot>,
-    commands: &[ManifestCommand],
+    capabilities: &ClientCapabilities,
+    roots: &BTreeMap<(ClientRootOperation, String), ClientRoot>,
+    commands: &[ClientCommand],
     live_leaderboards: bool,
 ) -> Result<(), ClientCompileError> {
     let has_live_roots = live_leaderboards
         || roots
             .keys()
-            .any(|(operation, _)| *operation == RootOperation::Subscription);
+            .any(|(operation, _)| *operation == ClientRootOperation::Subscription);
     if capabilities.live_queries != has_live_roots {
         return Err(ClientCompileError::manifest(
             "client.manifest.live_capability",
@@ -302,7 +268,7 @@ pub(crate) fn validate_derived_capabilities(
 }
 
 pub(crate) fn validate_scalar_codecs(
-    codecs: Vec<ManifestScalarCodec>,
+    codecs: Vec<ScalarCodec>,
 ) -> Result<BTreeMap<String, String>, ClientCompileError> {
     if codecs.is_empty() {
         return Err(ClientCompileError::manifest(
@@ -366,7 +332,7 @@ pub(crate) fn validate_scalar_codecs(
     Ok(result)
 }
 
-pub(crate) fn canonicalize_model(model: &mut ManifestModel) -> Result<(), ClientCompileError> {
+pub(crate) fn canonicalize_model(model: &mut ClientModel) -> Result<(), ClientCompileError> {
     canonicalize_string_set(
         &mut model.dependencies,
         &format!("model `{}` dependency", model.id),
@@ -421,41 +387,41 @@ pub(crate) fn canonicalize_model(model: &mut ManifestModel) -> Result<(), Client
     Ok(())
 }
 
-pub(crate) fn canonicalize_row_policy(policy: &mut ManifestRowPolicy) {
-    if let ManifestRowPolicy::Predicate { expression } = policy {
+pub(crate) fn canonicalize_row_policy(policy: &mut ClientRowPolicy) {
+    if let ClientRowPolicy::Predicate { expression } = policy {
         canonicalize_filter_expression(expression);
     }
 }
 
-pub(crate) fn canonicalize_filter_expression(expression: &mut ManifestFilterExpr) {
+pub(crate) fn canonicalize_filter_expression(expression: &mut FilterExpr) {
     match expression {
-        ManifestFilterExpr::And(expressions) | ManifestFilterExpr::Or(expressions) => {
+        FilterExpr::And(expressions) | FilterExpr::Or(expressions) => {
             for expression in expressions {
                 canonicalize_filter_expression(expression);
             }
         }
-        ManifestFilterExpr::Not(expression) => canonicalize_filter_expression(expression),
-        ManifestFilterExpr::Cmp { rhs, .. } => canonicalize_operand(rhs),
-        ManifestFilterExpr::In { values, .. } => {
+        FilterExpr::Not(expression) => canonicalize_filter_expression(expression),
+        FilterExpr::Cmp { rhs, .. } => canonicalize_operand(rhs),
+        FilterExpr::In { values, .. } => {
             for operand in values {
                 canonicalize_operand(operand);
             }
         }
-        ManifestFilterExpr::Rel { predicate, .. } => {
+        FilterExpr::Rel { predicate, .. } => {
             canonicalize_filter_expression(predicate);
         }
-        ManifestFilterExpr::IsNull { .. } => {}
+        FilterExpr::IsNull { .. } => {}
     }
 }
 
-pub(crate) fn canonicalize_operand(operand: &mut ManifestOperand) {
-    if let ManifestOperand::Lit(ManifestLitValue::Json(value)) = operand {
+pub(crate) fn canonicalize_operand(operand: &mut Operand) {
+    if let Operand::Lit(LitValue::Json(value)) = operand {
         *value = canonical_json_value(std::mem::take(value));
     }
 }
 
 pub(crate) fn canonicalize_filter_semantics(
-    semantics: &mut ManifestFilterSemantics,
+    semantics: &mut ClientFilterSemantics,
 ) -> Result<(), ClientCompileError> {
     canonicalize_filter_fields(&mut semantics.fields)?;
     canonicalize_string_set(&mut semantics.relationships, "filter relationship")?;
@@ -464,7 +430,7 @@ pub(crate) fn canonicalize_filter_semantics(
 }
 
 pub(crate) fn canonicalize_filter_input(
-    input: &mut ManifestFilterInput,
+    input: &mut ClientFilterInput,
 ) -> Result<(), ClientCompileError> {
     canonicalize_filter_fields(&mut input.fields)?;
     input
@@ -474,7 +440,7 @@ pub(crate) fn canonicalize_filter_input(
 }
 
 pub(crate) fn canonicalize_filter_fields(
-    fields: &mut [ManifestFilterField],
+    fields: &mut [ClientFilterField],
 ) -> Result<(), ClientCompileError> {
     fields.sort_by(|left, right| left.name.cmp(&right.name));
     for field in fields {
@@ -487,14 +453,14 @@ pub(crate) fn canonicalize_filter_fields(
 }
 
 pub(crate) fn canonicalize_order_semantics(
-    semantics: &mut ManifestOrderSemantics,
+    semantics: &mut ClientOrderSemantics,
 ) -> Result<(), ClientCompileError> {
     canonicalize_string_set(&mut semantics.fields, "order field")?;
     canonicalize_string_set(&mut semantics.values, "order value")
 }
 
 pub(crate) fn canonicalize_aggregate_semantics(
-    semantics: &mut ManifestAggregateSemantics,
+    semantics: &mut ClientAggregateSemantics,
 ) -> Result<(), ClientCompileError> {
     canonicalize_string_set(&mut semantics.sum, "aggregate sum field")?;
     canonicalize_string_set(&mut semantics.avg, "aggregate avg field")?;
@@ -503,7 +469,7 @@ pub(crate) fn canonicalize_aggregate_semantics(
 }
 
 pub(crate) fn canonicalize_arguments(
-    arguments: &mut [ManifestArgument],
+    arguments: &mut [ClientArgument],
     _label: &str,
 ) -> Result<(), ClientCompileError> {
     arguments.sort_by(|left, right| left.name.cmp(&right.name));
@@ -511,7 +477,7 @@ pub(crate) fn canonicalize_arguments(
 }
 
 pub(crate) fn validate_model(
-    model: &ManifestModel,
+    model: &ClientModel,
     scalar_codecs: &BTreeMap<String, String>,
 ) -> Result<(), ClientCompileError> {
     validate_graphql_name(&model.id, "manifest model id")?;
@@ -613,8 +579,8 @@ pub(crate) fn validate_model(
         )?;
     }
     match &model.normalization {
-        ManifestNormalization::Embedded => {}
-        ManifestNormalization::Normalized { fields, encoding } => {
+        ModelNormalization::Embedded => {}
+        ModelNormalization::Normalized { fields, encoding } => {
             if encoding != "canonical_json_tuple_v1" {
                 return Err(ClientCompileError::manifest(
                     "client.manifest.identity_encoding",
@@ -668,7 +634,7 @@ pub(crate) fn validate_model(
 }
 
 pub(crate) fn validate_model_graph(
-    models: &BTreeMap<String, ManifestModel>,
+    models: &BTreeMap<String, ClientModel>,
     scalar_codecs: &BTreeMap<String, String>,
 ) -> Result<(), ClientCompileError> {
     for model in models.values() {
@@ -707,8 +673,7 @@ pub(crate) fn validate_model_graph(
                 &target.source_table,
                 &format!("relationship {}.{}", model.id, relationship.name),
             )?;
-            if let ManifestRelationshipKeyMapping::Through { table, .. } = &relationship.key_mapping
-            {
+            if let RelationshipKeyMapping::Through { table, .. } = &relationship.key_mapping {
                 require_dependency(
                     &relationship.dependencies,
                     table,
@@ -716,7 +681,7 @@ pub(crate) fn validate_model_graph(
                 )?;
             }
             match relationship.kind {
-                ManifestRelationshipKind::BelongsTo if relationship.list => {
+                ClientRelationshipKind::BelongsTo if relationship.list => {
                     return Err(ClientCompileError::manifest(
                         "client.manifest.relationship_cardinality",
                         format!(
@@ -725,7 +690,7 @@ pub(crate) fn validate_model_graph(
                         ),
                     ));
                 }
-                ManifestRelationshipKind::HasMany | ManifestRelationshipKind::ManyToMany
+                ClientRelationshipKind::HasMany | ClientRelationshipKind::ManyToMany
                     if !relationship.list =>
                 {
                     return Err(ClientCompileError::manifest(
@@ -755,9 +720,9 @@ pub(crate) fn validate_model_graph(
 }
 
 pub(crate) fn validate_key_mapping(
-    source: &ManifestModel,
-    target: &ManifestModel,
-    relationship: &ManifestRelationship,
+    source: &ClientModel,
+    target: &ClientModel,
+    relationship: &ClientRelationship,
 ) -> Result<(), ClientCompileError> {
     let validate_fields = |local: &[String], remote: &[String]| {
         if local.is_empty() || local.len() != remote.len() {
@@ -815,13 +780,12 @@ pub(crate) fn validate_key_mapping(
     };
     let local_maintenance = matches!(
         relationship.key_mapping,
-        ManifestRelationshipKeyMapping::Direct { .. }
-            | ManifestRelationshipKeyMapping::Through { .. }
+        RelationshipKeyMapping::Direct { .. } | RelationshipKeyMapping::Through { .. }
     );
     if local_maintenance
         != matches!(
             relationship.maintenance,
-            ManifestRelationshipMaintenance::Local
+            ClientRelationshipMaintenance::Local
         )
     {
         return Err(ClientCompileError::manifest(
@@ -833,8 +797,8 @@ pub(crate) fn validate_key_mapping(
         ));
     }
     match &relationship.key_mapping {
-        ManifestRelationshipKeyMapping::Direct { local, remote } => validate_fields(local, remote),
-        ManifestRelationshipKeyMapping::Through {
+        RelationshipKeyMapping::Direct { local, remote } => validate_fields(local, remote),
+        RelationshipKeyMapping::Through {
             local,
             remote,
             table,
@@ -864,7 +828,7 @@ pub(crate) fn validate_key_mapping(
                 "relationship through target foreign key",
             )
         }
-        ManifestRelationshipKeyMapping::ThroughOpaque {
+        RelationshipKeyMapping::ThroughOpaque {
             local,
             remote,
             dependency,
@@ -886,15 +850,15 @@ pub(crate) fn validate_key_mapping(
             }
             Ok(())
         }
-        ManifestRelationshipKeyMapping::Embedded => Ok(()),
+        RelationshipKeyMapping::Embedded => Ok(()),
     }
 }
 
 pub(crate) fn validate_relationship_semantics(
-    source: &ManifestModel,
-    target: &ManifestModel,
-    relationship: &ManifestRelationship,
-    models: &BTreeMap<String, ManifestModel>,
+    source: &ClientModel,
+    target: &ClientModel,
+    relationship: &ClientRelationship,
+    models: &BTreeMap<String, ClientModel>,
     scalar_codecs: &BTreeMap<String, String>,
 ) -> Result<(), ClientCompileError> {
     validate_filter_argument_type(
@@ -905,19 +869,19 @@ pub(crate) fn validate_relationship_semantics(
     let has_filter_argument = relationship
         .arguments
         .iter()
-        .any(|argument| argument.kind == ManifestArgumentKind::Filter);
+        .any(|argument| argument.kind == ClientArgumentKind::Filter);
     let has_order_argument = relationship
         .arguments
         .iter()
-        .any(|argument| argument.kind == ManifestArgumentKind::Order);
+        .any(|argument| argument.kind == ClientArgumentKind::Order);
     let has_limit_argument = relationship
         .arguments
         .iter()
-        .any(|argument| argument.kind == ManifestArgumentKind::Limit);
+        .any(|argument| argument.kind == ClientArgumentKind::Limit);
     let has_offset_argument = relationship
         .arguments
         .iter()
-        .any(|argument| argument.kind == ManifestArgumentKind::Offset);
+        .any(|argument| argument.kind == ClientArgumentKind::Offset);
     if relationship.filter.is_some() != has_filter_argument
         || relationship.order.is_some() != has_order_argument
         || relationship.pagination.is_some() != (has_limit_argument && has_offset_argument)
@@ -1022,9 +986,9 @@ pub(crate) fn validate_relationship_semantics(
 }
 
 pub(crate) fn validate_filter_input(
-    input: &ManifestFilterInput,
-    model: &ManifestModel,
-    models: &BTreeMap<String, ManifestModel>,
+    input: &ClientFilterInput,
+    model: &ClientModel,
+    models: &BTreeMap<String, ClientModel>,
 ) -> Result<(), ClientCompileError> {
     validate_filter_fields(&input.fields, model)?;
     let expected_relationships = model
@@ -1087,8 +1051,8 @@ pub(crate) fn validate_filter_input(
 }
 
 pub(crate) fn validate_filter_fields(
-    fields: &[ManifestFilterField],
-    model: &ManifestModel,
+    fields: &[ClientFilterField],
+    model: &ClientModel,
 ) -> Result<(), ClientCompileError> {
     let expected_fields = model
         .fields
@@ -1155,9 +1119,9 @@ pub(crate) fn validate_filter_fields(
 }
 
 pub(crate) fn validate_filter_semantics(
-    semantics: &ManifestFilterSemantics,
-    model: &ManifestModel,
-    models: &BTreeMap<String, ManifestModel>,
+    semantics: &ClientFilterSemantics,
+    model: &ClientModel,
+    models: &BTreeMap<String, ClientModel>,
 ) -> Result<(), ClientCompileError> {
     if semantics.fields != model.filter_input.fields {
         return Err(ClientCompileError::manifest(
@@ -1201,13 +1165,13 @@ pub(crate) fn validate_filter_semantics(
 }
 
 pub(crate) fn validate_filter_argument_type(
-    arguments: &[ManifestArgument],
-    model: &ManifestModel,
+    arguments: &[ClientArgument],
+    model: &ClientModel,
     owner: &str,
 ) -> Result<(), ClientCompileError> {
     let Some(argument) = arguments
         .iter()
-        .find(|argument| argument.kind == ManifestArgumentKind::Filter)
+        .find(|argument| argument.kind == ClientArgumentKind::Filter)
     else {
         return Ok(());
     };
@@ -1224,8 +1188,8 @@ pub(crate) fn validate_filter_argument_type(
 }
 
 pub(crate) fn validate_order_semantics(
-    semantics: &ManifestOrderSemantics,
-    model: &ManifestModel,
+    semantics: &ClientOrderSemantics,
+    model: &ClientModel,
 ) -> Result<(), ClientCompileError> {
     let expected_fields = model
         .fields
@@ -1274,7 +1238,7 @@ pub(crate) fn validate_order_semantics(
 }
 
 pub(crate) fn validate_pagination(
-    pagination: &ManifestPagination,
+    pagination: &ClientPaginationSemantics,
     owner: &str,
 ) -> Result<(), ClientCompileError> {
     if pagination.kind != "offset" || pagination.coverage != "window" {
@@ -1293,8 +1257,8 @@ pub(crate) fn validate_pagination(
 }
 
 pub(crate) fn validate_aggregate_semantics(
-    aggregate: &ManifestAggregateSemantics,
-    model: &ManifestModel,
+    aggregate: &ClientAggregateSemantics,
+    model: &ClientModel,
 ) -> Result<(), ClientCompileError> {
     validate_graphql_name(&aggregate.wrapper_typename, "aggregate wrapper typename")?;
     validate_graphql_name(&aggregate.fields_typename, "aggregate fields typename")?;
@@ -1333,157 +1297,16 @@ pub(crate) fn validate_aggregate_semantics(
 }
 
 pub(crate) fn validate_row_policy(
-    policy: &ManifestRowPolicy,
-    model: &ManifestModel,
-    models: &BTreeMap<String, ManifestModel>,
+    policy: &ClientRowPolicy,
+    model: &ClientModel,
+    models: &BTreeMap<String, ClientModel>,
 ) -> Result<(), ClientCompileError> {
     match policy {
-        ManifestRowPolicy::Unrestricted | ManifestRowPolicy::ServerOnly => Ok(()),
-        ManifestRowPolicy::Predicate { expression } => {
+        ClientRowPolicy::Unrestricted | ClientRowPolicy::ServerOnly => Ok(()),
+        ClientRowPolicy::Predicate { expression } => {
             validate_filter_expression(expression, model, models)
         }
     }
-}
-
-pub(crate) fn derive_trusted_preset_descriptors(
-    models: &BTreeMap<String, ManifestModel>,
-    commands: &[ManifestCommand],
-) -> Result<Vec<ManifestTrustedPresetDescriptor>, ClientCompileError> {
-    let mut descriptors = BTreeMap::<String, String>::new();
-    for command in commands {
-        for descriptor in &command.extensions.trusted_presets {
-            insert_trusted_preset_descriptor(
-                &mut descriptors,
-                descriptor,
-                &format!("command `{}`", command.name),
-            )?;
-        }
-    }
-    for model in models.values() {
-        if let ManifestRowPolicy::Predicate { expression } = &model.row_policy {
-            collect_row_policy_trusted_presets(expression, model, models, &mut descriptors)?;
-        }
-    }
-    Ok(descriptors
-        .into_iter()
-        .map(|(name, codec)| ManifestTrustedPresetDescriptor { name, codec })
-        .collect())
-}
-
-pub(crate) fn collect_row_policy_trusted_presets(
-    expression: &ManifestFilterExpr,
-    model: &ManifestModel,
-    models: &BTreeMap<String, ManifestModel>,
-    descriptors: &mut BTreeMap<String, String>,
-) -> Result<(), ClientCompileError> {
-    match expression {
-        ManifestFilterExpr::And(expressions) | ManifestFilterExpr::Or(expressions) => {
-            for expression in expressions {
-                collect_row_policy_trusted_presets(expression, model, models, descriptors)?;
-            }
-        }
-        ManifestFilterExpr::Not(expression) => {
-            collect_row_policy_trusted_presets(expression, model, models, descriptors)?;
-        }
-        ManifestFilterExpr::Cmp {
-            column,
-            rhs: ManifestOperand::Claim(claim),
-            ..
-        } => {
-            insert_row_policy_trusted_preset(model, column, &claim.header, descriptors)?;
-        }
-        ManifestFilterExpr::In { column, values, .. } => {
-            for value in values {
-                if let ManifestOperand::Claim(claim) = value {
-                    insert_row_policy_trusted_preset(model, column, &claim.header, descriptors)?;
-                }
-            }
-        }
-        ManifestFilterExpr::Rel { field, predicate } => {
-            let relationship = model.relationship(field).ok_or_else(|| {
-                ClientCompileError::manifest(
-                    "client.manifest.row_policy_relationship",
-                    format!(
-                        "model `{}` row policy references absent relationship `{field}`",
-                        model.id
-                    ),
-                )
-            })?;
-            let target = models.get(&relationship.target_model).ok_or_else(|| {
-                ClientCompileError::manifest(
-                    "client.manifest.row_policy_relationship",
-                    format!(
-                        "model `{}` row policy relationship `{field}` targets absent model `{}`",
-                        model.id, relationship.target_model
-                    ),
-                )
-            })?;
-            collect_row_policy_trusted_presets(predicate, target, models, descriptors)?;
-        }
-        ManifestFilterExpr::Cmp { .. } | ManifestFilterExpr::IsNull { .. } => {}
-    }
-    Ok(())
-}
-
-pub(crate) fn insert_row_policy_trusted_preset(
-    model: &ManifestModel,
-    column: &str,
-    name: &str,
-    descriptors: &mut BTreeMap<String, String>,
-) -> Result<(), ClientCompileError> {
-    let field = model.field(column).ok_or_else(|| {
-        ClientCompileError::manifest(
-            "client.manifest.row_policy_column",
-            format!(
-                "model `{}` row policy references absent field `{column}`",
-                model.id
-            ),
-        )
-    })?;
-    if matches!(field.codec.as_str(), "base64" | "json") {
-        return Err(ClientCompileError::manifest(
-            "client.manifest.row_policy_portability",
-            format!(
-                "model `{}` row-policy claim `{name}` targets `{column}` with non-local codec `{}`",
-                model.id, field.codec
-            ),
-        ));
-    }
-    insert_trusted_preset_descriptor(
-        descriptors,
-        &ManifestTrustedPresetDescriptor {
-            name: name.into(),
-            codec: field.codec.clone(),
-        },
-        &format!("model `{}` row policy field `{column}`", model.id),
-    )
-}
-
-pub(crate) fn insert_trusted_preset_descriptor(
-    descriptors: &mut BTreeMap<String, String>,
-    descriptor: &ManifestTrustedPresetDescriptor,
-    owner: &str,
-) -> Result<(), ClientCompileError> {
-    validate_trusted_preset_name(&descriptor.name, "trusted preset name")?;
-    match descriptors.entry(descriptor.name.clone()) {
-        std::collections::btree_map::Entry::Vacant(entry) => {
-            entry.insert(descriptor.codec.clone());
-        }
-        std::collections::btree_map::Entry::Occupied(entry) if entry.get() == &descriptor.codec => {
-        }
-        std::collections::btree_map::Entry::Occupied(entry) => {
-            return Err(ClientCompileError::manifest(
-                "client.manifest.trusted_preset_inventory",
-                format!(
-                    "trusted preset `{}` uses incompatible codecs `{}` and `{}` across the selected client surface ({owner})",
-                    descriptor.name,
-                    entry.get(),
-                    descriptor.codec
-                ),
-            ));
-        }
-    }
-    Ok(())
 }
 
 pub(crate) fn validate_trusted_preset_name(
@@ -1501,33 +1324,31 @@ pub(crate) fn validate_trusted_preset_name(
 }
 
 pub(crate) fn validate_filter_expression(
-    expression: &ManifestFilterExpr,
-    model: &ManifestModel,
-    models: &BTreeMap<String, ManifestModel>,
+    expression: &FilterExpr,
+    model: &ClientModel,
+    models: &BTreeMap<String, ClientModel>,
 ) -> Result<(), ClientCompileError> {
     match expression {
-        ManifestFilterExpr::And(expressions) | ManifestFilterExpr::Or(expressions) => {
+        FilterExpr::And(expressions) | FilterExpr::Or(expressions) => {
             for expression in expressions {
                 validate_filter_expression(expression, model, models)?;
             }
             Ok(())
         }
-        ManifestFilterExpr::Not(expression) => {
-            validate_filter_expression(expression, model, models)
-        }
-        ManifestFilterExpr::Cmp { column, rhs, .. } => {
+        FilterExpr::Not(expression) => validate_filter_expression(expression, model, models),
+        FilterExpr::Cmp { column, rhs, .. } => {
             validate_policy_column(model, column)?;
             validate_operand(rhs)
         }
-        ManifestFilterExpr::In { column, values, .. } => {
+        FilterExpr::In { column, values, .. } => {
             validate_policy_column(model, column)?;
             for operand in values {
                 validate_operand(operand)?;
             }
             Ok(())
         }
-        ManifestFilterExpr::IsNull { column, .. } => validate_policy_column(model, column),
-        ManifestFilterExpr::Rel { field, predicate } => {
+        FilterExpr::IsNull { column, .. } => validate_policy_column(model, column),
+        FilterExpr::Rel { field, predicate } => {
             let relationship = model.relationship(field).ok_or_else(|| {
                 ClientCompileError::manifest(
                     "client.manifest.row_policy_relationship",
@@ -1552,7 +1373,7 @@ pub(crate) fn validate_filter_expression(
 }
 
 pub(crate) fn validate_policy_column(
-    model: &ManifestModel,
+    model: &ClientModel,
     column: &str,
 ) -> Result<(), ClientCompileError> {
     if model.field(column).is_none() {
@@ -1567,7 +1388,7 @@ pub(crate) fn validate_policy_column(
     Ok(())
 }
 
-pub(crate) fn validate_operand(operand: &ManifestOperand) -> Result<(), ClientCompileError> {
+pub(crate) fn validate_operand(operand: &Operand) -> Result<(), ClientCompileError> {
     const JS_MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
 
     fn json_is_portable(value: &JsonValue) -> bool {
@@ -1587,17 +1408,15 @@ pub(crate) fn validate_operand(operand: &ManifestOperand) -> Result<(), ClientCo
         }
     }
 
-    if let ManifestOperand::Claim(claim) = operand {
+    if let Operand::Claim(claim) = operand {
         validate_trusted_preset_name(&claim.header, "row policy claim header")?;
         return Ok(());
     }
     let portable = match operand {
-        ManifestOperand::Claim(_) => unreachable!("claim returned above"),
-        ManifestOperand::Lit(ManifestLitValue::I64(value)) => {
-            value.unsigned_abs() <= JS_MAX_SAFE_INTEGER
-        }
-        ManifestOperand::Lit(ManifestLitValue::Json(value)) => json_is_portable(value),
-        ManifestOperand::Lit(_) => true,
+        Operand::Claim(_) => unreachable!("claim returned above"),
+        Operand::Lit(LitValue::I64(value)) => value.unsigned_abs() <= JS_MAX_SAFE_INTEGER,
+        Operand::Lit(LitValue::Json(value)) => json_is_portable(value),
+        Operand::Lit(_) => true,
     };
     if !portable {
         return Err(ClientCompileError::manifest(

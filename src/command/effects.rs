@@ -2,8 +2,8 @@ use serde::{Deserialize, Serialize};
 
 /// Portable value expression resolved from a command's canonical input.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub(crate) enum EffectExpression {
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum EffectExpression {
     Input {
         path: Vec<String>,
     },

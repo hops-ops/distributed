@@ -1,7 +1,7 @@
 use serde::Serialize;
 
 use super::graphql::{Cardinality, CompiledOperation};
-use super::manifest::{hash_bytes, ClientManifest, ManifestSurface};
+use super::manifest::{hash_bytes, ClientManifest, ClientSurfaceIdentity};
 use super::{
     GeneratedIslandDirectives, GeneratedIslandLiveCoverage, GeneratedIslandPlan,
     GeneratedIslandSource, GeneratedIslandVariable, GeneratedIslandVariableSchema,
@@ -15,7 +15,7 @@ pub(crate) struct GeneratedIslandInventory<'a> {
     pub(crate) version: u32,
     pub(crate) schema_fingerprint: &'a str,
     pub(crate) protocol_fingerprint: &'a str,
-    pub(crate) surface: &'a ManifestSurface,
+    pub(crate) surface: &'a ClientSurfaceIdentity,
     pub(crate) islands: &'a [GeneratedIslandPlan],
 }
 

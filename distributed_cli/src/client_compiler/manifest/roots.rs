@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use super::*;
 
-pub(crate) fn canonicalize_root(root: &mut ManifestRoot) -> Result<(), ClientCompileError> {
+pub(crate) fn canonicalize_root(root: &mut ClientRoot) -> Result<(), ClientCompileError> {
     canonicalize_arguments(
         &mut root.arguments,
         &format!("manifest root `{}` argument", root.name),
@@ -24,14 +24,14 @@ pub(crate) fn canonicalize_root(root: &mut ManifestRoot) -> Result<(), ClientCom
 }
 
 pub(crate) fn validate_root_contract(
-    root: &ManifestRoot,
-    models: &BTreeMap<String, ManifestModel>,
+    root: &ClientRoot,
+    models: &BTreeMap<String, ClientModel>,
 ) -> Result<(), ClientCompileError> {
     let expected_id = format!(
         "{}:{}",
         match root.operation {
-            RootOperation::Query => "query",
-            RootOperation::Subscription => "subscription",
+            ClientRootOperation::Query => "query",
+            ClientRootOperation::Subscription => "subscription",
         },
         root.name
     );
@@ -68,7 +68,7 @@ pub(crate) fn validate_root_contract(
         &model.source_table,
         &format!("manifest root {}", root.name),
     )?;
-    if root.operation == RootOperation::Subscription && root.kind != RootKind::List {
+    if root.operation == ClientRootOperation::Subscription && root.kind != ClientRootKind::List {
         return Err(ClientCompileError::manifest(
             "client.manifest.subscription_kind",
             format!(
@@ -77,7 +77,7 @@ pub(crate) fn validate_root_contract(
             ),
         ));
     }
-    if root.operation == RootOperation::Subscription && !root.live {
+    if root.operation == ClientRootOperation::Subscription && !root.live {
         return Err(ClientCompileError::manifest(
             "client.manifest.subscription_live",
             format!("subscription root `{}` must be marked live", root.name),
@@ -87,19 +87,19 @@ pub(crate) fn validate_root_contract(
     let has_filter_argument = root
         .arguments
         .iter()
-        .any(|argument| argument.kind == ManifestArgumentKind::Filter);
+        .any(|argument| argument.kind == ClientArgumentKind::Filter);
     let has_order_argument = root
         .arguments
         .iter()
-        .any(|argument| argument.kind == ManifestArgumentKind::Order);
+        .any(|argument| argument.kind == ClientArgumentKind::Order);
     let has_limit_argument = root
         .arguments
         .iter()
-        .any(|argument| argument.kind == ManifestArgumentKind::Limit);
+        .any(|argument| argument.kind == ClientArgumentKind::Limit);
     let has_offset_argument = root
         .arguments
         .iter()
-        .any(|argument| argument.kind == ManifestArgumentKind::Offset);
+        .any(|argument| argument.kind == ClientArgumentKind::Offset);
     if root.filter.is_some() != has_filter_argument
         || root.order.is_some() != has_order_argument
         || root.pagination.is_some() != (has_limit_argument && has_offset_argument)
@@ -119,7 +119,7 @@ pub(crate) fn validate_root_contract(
         validate_order_semantics(order, model)?;
     }
     match root.kind {
-        RootKind::List => {
+        ClientRootKind::List => {
             root.filter.as_ref().ok_or_else(|| {
                 ClientCompileError::manifest(
                     "client.manifest.root_filter",
@@ -151,7 +151,7 @@ pub(crate) fn validate_root_contract(
                 ));
             }
         }
-        RootKind::ByPk => {
+        ClientRootKind::ByPk => {
             if root.pagination.is_some()
                 || root.aggregate.is_some()
                 || root.filter.is_some()
@@ -166,7 +166,7 @@ pub(crate) fn validate_root_contract(
                 ));
             }
             if root.arguments.iter().any(|argument| {
-                argument.kind != ManifestArgumentKind::PrimaryKey
+                argument.kind != ClientArgumentKind::PrimaryKey
                     || argument.nullable
                     || argument.list
             }) {
@@ -179,7 +179,7 @@ pub(crate) fn validate_root_contract(
                 ));
             }
         }
-        RootKind::Aggregate => {
+        ClientRootKind::Aggregate => {
             if root.pagination.is_some() || root.order.is_some() {
                 return Err(ClientCompileError::manifest(
                     "client.manifest.aggregate_root_semantics",
@@ -207,7 +207,7 @@ pub(crate) fn validate_root_contract(
 }
 
 pub(crate) fn validate_unique_arguments(
-    root: &ManifestRoot,
+    root: &ClientRoot,
     scalar_codecs: &BTreeMap<String, String>,
 ) -> Result<(), ClientCompileError> {
     validate_unique_arguments_for(
@@ -218,7 +218,7 @@ pub(crate) fn validate_unique_arguments(
 }
 
 pub(crate) fn validate_unique_arguments_for(
-    arguments: &[ManifestArgument],
+    arguments: &[ClientArgument],
     scalar_codecs: &BTreeMap<String, String>,
     owner: &str,
 ) -> Result<(), ClientCompileError> {
@@ -233,7 +233,7 @@ pub(crate) fn validate_unique_arguments_for(
                 format!("{owner} repeats argument `{}`", argument.name),
             ));
         }
-        if argument.kind != ManifestArgumentKind::PrimaryKey && !kinds.insert(argument.kind) {
+        if argument.kind != ClientArgumentKind::PrimaryKey && !kinds.insert(argument.kind) {
             return Err(ClientCompileError::manifest(
                 "client.manifest.duplicate_argument_kind",
                 format!("{owner} repeats {:?} argument semantics", argument.kind),
@@ -241,7 +241,7 @@ pub(crate) fn validate_unique_arguments_for(
         }
         if matches!(
             argument.kind,
-            ManifestArgumentKind::Limit | ManifestArgumentKind::Offset
+            ClientArgumentKind::Limit | ClientArgumentKind::Offset
         ) && (argument.list || argument.type_name != "Int")
         {
             return Err(ClientCompileError::manifest(

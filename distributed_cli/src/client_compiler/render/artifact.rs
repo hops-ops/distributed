@@ -10,8 +10,8 @@ use super::super::graphql::{
     CompiledVariableCodec,
 };
 use super::super::manifest::{
-    ClientManifest, ManifestRelationshipKeyMapping, ManifestRelationshipKind,
-    ManifestRelationshipMaintenance, ManifestRowPolicy, ManifestTrustedPresetDescriptor,
+    ClientManifest, ClientRelationshipKind, ClientRelationshipMaintenance, ClientRowPolicy,
+    ClientTrustedPresetDescriptor, RelationshipKeyMapping,
 };
 use super::super::ClientCompileError;
 
@@ -43,10 +43,10 @@ struct ArtifactProtocol<'a> {
     schema_hash: &'a str,
     #[serde(rename = "protocolHash")]
     protocol_hash: &'a str,
-    surface: &'a super::super::manifest::ManifestSurface,
+    surface: &'a super::super::manifest::ClientSurfaceIdentity,
     operation: &'a str,
     #[serde(rename = "trustedPresets")]
-    trusted_presets: &'a [ManifestTrustedPresetDescriptor],
+    trusted_presets: &'a [ClientTrustedPresetDescriptor],
 }
 
 #[derive(Serialize)]
@@ -113,7 +113,7 @@ struct ArtifactFilter<'a> {
     fields: Vec<ArtifactFilterField<'a>>,
     relationships: Vec<ArtifactRelationship<'a>>,
     #[serde(rename = "rowPolicy")]
-    row_policy: &'a ManifestRowPolicy,
+    row_policy: &'a ClientRowPolicy,
 }
 
 #[derive(Serialize)]
@@ -130,10 +130,10 @@ struct ArtifactRelationship<'a> {
     field: &'a str,
     #[serde(rename = "targetModel")]
     target_model: &'a str,
-    kind: ManifestRelationshipKind,
+    kind: ClientRelationshipKind,
     #[serde(rename = "keyMapping")]
     key_mapping: ArtifactRelationshipKeyMapping<'a>,
-    maintenance: ManifestRelationshipMaintenance,
+    maintenance: ClientRelationshipMaintenance,
     dependencies: &'a [String],
 }
 
@@ -371,10 +371,10 @@ fn artifact_relationship(relationship: &CompiledRelationshipPlan) -> ArtifactRel
         target_model: &relationship.target_model,
         kind: relationship.kind,
         key_mapping: match &relationship.key_mapping {
-            ManifestRelationshipKeyMapping::Direct { local, remote } => {
+            RelationshipKeyMapping::Direct { local, remote } => {
                 ArtifactRelationshipKeyMapping::Direct { local, remote }
             }
-            ManifestRelationshipKeyMapping::Through {
+            RelationshipKeyMapping::Through {
                 local,
                 remote,
                 table,
@@ -387,7 +387,7 @@ fn artifact_relationship(relationship: &CompiledRelationshipPlan) -> ArtifactRel
                 source_foreign_key,
                 target_foreign_key,
             },
-            ManifestRelationshipKeyMapping::ThroughOpaque {
+            RelationshipKeyMapping::ThroughOpaque {
                 local,
                 remote,
                 dependency,
@@ -396,7 +396,7 @@ fn artifact_relationship(relationship: &CompiledRelationshipPlan) -> ArtifactRel
                 remote,
                 dependency,
             },
-            ManifestRelationshipKeyMapping::Embedded => ArtifactRelationshipKeyMapping::Embedded,
+            RelationshipKeyMapping::Embedded => ArtifactRelationshipKeyMapping::Embedded,
         },
         maintenance: relationship.maintenance,
         dependencies: &relationship.dependencies,

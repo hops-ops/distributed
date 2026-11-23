@@ -3,9 +3,8 @@ use std::collections::BTreeSet;
 use serde_json::Value as JsonValue;
 
 use super::super::manifest::{
-    canonical_json_value, ClientManifest, ManifestCommand, ManifestCommandShape,
-    ManifestConsistencyKind, ManifestDirectProjection, ManifestEffectExpression, ManifestTypeDef,
-    ManifestTypeField,
+    canonical_json_value, ClientCommand, ClientCommandShape, ClientManifest, ClientTypeDef,
+    ClientTypeField, CommandConsistency, CommandDirectProjectionExtension, EffectExpression,
 };
 use super::super::projection_delta::{compile_command_preview, CompiledCommandProjection};
 use super::super::ClientCompileError;
@@ -24,7 +23,7 @@ pub(super) fn render_lazy_commands(
                 command.name.clone(),
                 serde_json::json!({
                     "operationHash": command.operation_hash,
-                    "hasInput": !matches!(command.input, ManifestCommandShape::None),
+                    "hasInput": !matches!(command.input, ClientCommandShape::None),
                 }),
             )
         })
@@ -257,7 +256,7 @@ pub(super) fn render_pures(
     Ok(Some(format!("{}\n", sections.join("\n\n"))))
 }
 
-fn validate_command_namespaces(commands: &[ManifestCommand]) -> Result<(), ClientCompileError> {
+fn validate_command_namespaces(commands: &[ClientCommand]) -> Result<(), ClientCompileError> {
     const RESERVED_SEGMENTS: [&str; 3] = ["__proto__", "constructor", "prototype"];
 
     let mut paths = Vec::with_capacity(commands.len());
@@ -313,7 +312,7 @@ fn validate_command_namespaces(commands: &[ManifestCommand]) -> Result<(), Clien
 }
 
 fn render_command(
-    command: &ManifestCommand,
+    command: &ClientCommand,
     manifest: &ClientManifest,
 ) -> Result<String, ClientCompileError> {
     // Domain command names deliberately permit dots and other non-GraphQL
@@ -350,7 +349,7 @@ fn render_command(
         )
     })?;
     let prepare = match command.input {
-        ManifestCommandShape::None => format!(
+        ClientCommandShape::None => format!(
             "export function prepareCommand_{}(\n  options?: PrepareReplicaCommandOptions\n): ReplicaPreparedCommand<{}, {}> {{\n  return prepareReplicaCommand(Command_{}, undefined, options);\n}}",
             identifier, input_name, output_name, identifier
         ),
@@ -370,20 +369,20 @@ fn render_command(
 }
 
 fn render_command_shape_type(
-    shape: &ManifestCommandShape,
+    shape: &ClientCommandShape,
     input: bool,
     defaults: &BTreeSet<Vec<String>>,
 ) -> Result<String, ClientCompileError> {
     match shape {
-        ManifestCommandShape::None => Ok("void".into()),
-        ManifestCommandShape::Object { definition } => {
+        ClientCommandShape::None => Ok("void".into()),
+        ClientCommandShape::Object { definition } => {
             render_command_type_definition(definition, input, defaults, &[], 0)
         }
     }
 }
 
 fn render_command_type_definition(
-    definition: &ManifestTypeDef,
+    definition: &ClientTypeDef,
     input: bool,
     defaults: &BTreeSet<Vec<String>>,
     prefix: &[String],
@@ -417,7 +416,7 @@ fn render_command_type_definition(
 }
 
 fn render_command_field_type(
-    field: &ManifestTypeField,
+    field: &ClientTypeField,
     input: bool,
     defaults: &BTreeSet<Vec<String>>,
     path: &[String],
@@ -457,7 +456,7 @@ fn render_command_field_type(
 }
 
 fn command_artifact_json(
-    command: &ManifestCommand,
+    command: &ClientCommand,
     manifest: &ClientManifest,
 ) -> Result<JsonValue, ClientCompileError> {
     let consistency = &command.extensions.consistency;
@@ -530,7 +529,7 @@ fn command_artifact_json(
         .as_ref()
         .map(CompiledCommandProjection::trusted_preset_names)
         .unwrap_or_default();
-    if let Some(ManifestEffectExpression::TrustedPreset { name }) = command
+    if let Some(EffectExpression::TrustedPreset { name }) = command
         .extensions
         .direct_projection
         .as_ref()
@@ -554,24 +553,24 @@ fn command_artifact_json(
     Ok(JsonValue::Object(artifact))
 }
 
-fn command_shape_json(shape: &ManifestCommandShape) -> JsonValue {
+fn command_shape_json(shape: &ClientCommandShape) -> JsonValue {
     match shape {
-        ManifestCommandShape::None => serde_json::json!({"kind": "none"}),
-        ManifestCommandShape::Object { definition } => serde_json::json!({
+        ClientCommandShape::None => serde_json::json!({"kind": "none"}),
+        ClientCommandShape::Object { definition } => serde_json::json!({
             "kind": "object",
             "definition": command_type_definition_json(definition),
         }),
     }
 }
 
-fn command_type_definition_json(definition: &ManifestTypeDef) -> JsonValue {
+fn command_type_definition_json(definition: &ClientTypeDef) -> JsonValue {
     serde_json::json!({
         "name": definition.name,
         "fields": definition.fields.iter().map(command_type_field_json).collect::<Vec<_>>(),
     })
 }
 
-fn command_type_field_json(field: &ManifestTypeField) -> JsonValue {
+fn command_type_field_json(field: &ClientTypeField) -> JsonValue {
     let mut result = serde_json::Map::new();
     result.insert("name".into(), serde_json::json!(field.name));
     result.insert("typeName".into(), serde_json::json!(field.type_name));
@@ -590,31 +589,31 @@ fn command_type_field_json(field: &ManifestTypeField) -> JsonValue {
     JsonValue::Object(result)
 }
 
-fn consistency_label(kind: ManifestConsistencyKind) -> &'static str {
+fn consistency_label(kind: CommandConsistency) -> &'static str {
     match kind {
-        ManifestConsistencyKind::Succeeded => "succeeded",
-        ManifestConsistencyKind::Eventual => "eventual",
-        ManifestConsistencyKind::Atomic => "atomic",
+        CommandConsistency::Succeeded => "succeeded",
+        CommandConsistency::Eventual => "eventual",
+        CommandConsistency::Atomic => "atomic",
     }
 }
 
-fn effect_expression_json(expression: &ManifestEffectExpression) -> JsonValue {
+fn effect_expression_json(expression: &EffectExpression) -> JsonValue {
     match expression {
-        ManifestEffectExpression::Input { path } => {
+        EffectExpression::Input { path } => {
             serde_json::json!({"kind": "input", "path": path})
         }
-        ManifestEffectExpression::TrustedPreset { name } => {
+        EffectExpression::TrustedPreset { name } => {
             serde_json::json!({"kind": "trusted_preset", "name": name})
         }
-        ManifestEffectExpression::Constant { value } => {
+        EffectExpression::Constant { value } => {
             serde_json::json!({"kind": "constant", "value": value})
         }
-        ManifestEffectExpression::Null => serde_json::json!({"kind": "null"}),
+        EffectExpression::Null => serde_json::json!({"kind": "null"}),
     }
 }
 
 fn direct_projection_json(
-    direct: &ManifestDirectProjection,
+    direct: &CommandDirectProjectionExtension,
     manifest: &ClientManifest,
 ) -> Result<JsonValue, ClientCompileError> {
     let identity = manifest
@@ -656,7 +655,7 @@ fn direct_projection_json(
 }
 
 fn command_revalidation_json(
-    command: &ManifestCommand,
+    command: &ClientCommand,
     manifest: &ClientManifest,
     projection: Option<&CompiledCommandProjection>,
 ) -> JsonValue {

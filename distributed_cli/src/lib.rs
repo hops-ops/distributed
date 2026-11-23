@@ -12,6 +12,9 @@ pub mod contracts;
 mod game_client;
 mod game_wasm;
 mod generate;
+#[cfg(test)]
+#[path = "../tests/support/golden.rs"]
+mod golden;
 mod js_framework;
 pub mod lifecycle;
 mod manifest_harness;
@@ -29,9 +32,10 @@ pub use cli::{
 };
 pub use client_compiler::{
     compile_client, ClientCompileError, ClientCompileInput, ClientDocument, ClientSourceLocation,
-    ClientSurfaceSelector, GeneratedClientFile, GeneratedClientProject, GeneratedIslandDirectives,
-    GeneratedIslandLiveCoverage, GeneratedIslandPlan, GeneratedIslandSource,
-    GeneratedIslandVariable, GeneratedIslandVariableSchema, GeneratedOperationSummary,
+    ClientSurfaceIdentity, DistributedClientManifest, GeneratedClientFile, GeneratedClientProject,
+    GeneratedIslandDirectives, GeneratedIslandLiveCoverage, GeneratedIslandPlan,
+    GeneratedIslandSource, GeneratedIslandVariable, GeneratedIslandVariableSchema,
+    GeneratedOperationSummary,
 };
 pub use contracts::{
     check_migration_history, check_migration_inventory, check_predecessor_chain,

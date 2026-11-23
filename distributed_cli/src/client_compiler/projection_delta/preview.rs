@@ -4,7 +4,7 @@ use serde::Serialize;
 
 use super::super::manifest::*;
 use super::super::ClientCompileError;
-use super::PROJECTION_DELTA_WIRE_VERSION;
+use distributed::graphql::projection_delta::PROJECTION_DELTA_WIRE_VERSION;
 
 const PREVIEW_PLAN_VERSION: u16 = 1;
 const MAX_PREVIEW_ITEMS: usize = 128;
@@ -47,7 +47,7 @@ pub(crate) enum PreviewExpression {
         codec: String,
     },
     Constant {
-        value: ManifestProjectionValue,
+        value: ClientProjectionValue,
     },
     Null,
     List {
@@ -57,7 +57,7 @@ pub(crate) enum PreviewExpression {
         fields: Vec<PreviewObjectField>,
     },
     Transform {
-        transform: ManifestProjectionScalarTransform,
+        transform: ProjectionScalarTransform,
         arguments: Vec<PreviewExpression>,
     },
 }
@@ -76,12 +76,12 @@ pub(crate) struct CompiledCommandProjection {
     projection_program_version: u32,
     operation_semantics_version: u16,
     projections: Vec<PreviewProjectionIdentity>,
-    event_set: Vec<ManifestProjectionEventRef>,
+    event_set: Vec<ClientProjectionEventRef>,
     capabilities: ProjectionCapabilities,
     preview: PreviewPlan,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pure_reduces: Vec<CompiledPureReduce>,
-    fallback: ManifestProjectionFallback,
+    fallback: ClientProjectionFallback,
     #[serde(skip)]
     selected_models: BTreeSet<String>,
 }
@@ -204,7 +204,7 @@ struct ProjectionCapabilities {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 struct ProjectionCapabilityArm {
-    event: ManifestProjectionEventRef,
+    event: ClientProjectionEventRef,
     projection_ref: u32,
     arm: String,
     partition: ProjectionCapabilityPartition,
@@ -255,7 +255,7 @@ struct PreviewPlan {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 struct PreviewOccurrence {
     ordinal: u32,
-    event: ManifestProjectionEventRef,
+    event: ClientProjectionEventRef,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -624,7 +624,7 @@ enum PreviewRecoveryTargetKey {
 }
 
 pub(crate) fn compile_command_preview(
-    command: &ManifestCommand,
+    command: &ClientCommand,
     manifest: &ClientManifest,
 ) -> Result<Option<CompiledCommandProjection>, ClientCompileError> {
     let Some(extension) = &command.extensions.projection else {
@@ -650,11 +650,11 @@ pub(crate) fn compile_command_preview(
             .iter()
             .find(|binding| {
                 binding.program_id == program_id
-                    && binding.state == ManifestProjectionBindingState::Active
-                    && binding.execution_class == ManifestProjectionExecutionClass::Causal
+                    && binding.state == ProjectionBindingState::Active
+                    && binding.execution_class == ProjectionExecutionClass::Causal
                     && matches!(
                         binding.placement,
-                        ManifestProjectionPlacement::Eventual | ManifestProjectionPlacement::Direct
+                        ProjectionPlacement::Eventual | ProjectionPlacement::Direct
                     )
             })
             .expect("manifest validation proved one eligible binding");
@@ -779,14 +779,14 @@ pub(crate) fn compile_command_preview(
 }
 
 fn compile_capability_arm(
-    event: ManifestProjectionEventRef,
+    event: ClientProjectionEventRef,
     projection_ref: u32,
-    arm: &ManifestProjectionArm,
+    arm: &ClientProjectionArm,
     manifest: &ClientManifest,
 ) -> Result<ProjectionCapabilityArm, ClientCompileError> {
     let partition = match &arm.partition {
-        ManifestProjectionPartition::Unit => ProjectionCapabilityPartition::Unit,
-        ManifestProjectionPartition::Expression { expression } => {
+        ClientProjectionPartition::Unit => ProjectionCapabilityPartition::Unit,
+        ClientProjectionPartition::Expression { expression } => {
             let encoded = serde_json::to_vec(expression).map_err(|error| {
                 ClientCompileError::manifest(
                     "client.projection_capability.partition",
@@ -806,8 +806,8 @@ fn compile_capability_arm(
             .expect("manifest validation proved operation model");
         if !matches!(
             operation.kind,
-            ManifestProjectionMutationKind::InvalidateModel
-                | ManifestProjectionMutationKind::InvalidateRelationship
+            ClientProjectionMutationKind::InvalidateModel
+                | ClientProjectionMutationKind::InvalidateRelationship
         ) {
             let identity = model
                 .identity()
@@ -834,11 +834,11 @@ fn compile_capability_arm(
             fields.dedup();
             let complete = matches!(
                 operation.kind,
-                ManifestProjectionMutationKind::Insert
-                    | ManifestProjectionMutationKind::Upsert
-                    | ManifestProjectionMutationKind::Recreate
-                    | ManifestProjectionMutationKind::InsertRelated
-                    | ManifestProjectionMutationKind::UpsertRelated
+                ClientProjectionMutationKind::Insert
+                    | ClientProjectionMutationKind::Upsert
+                    | ClientProjectionMutationKind::Recreate
+                    | ClientProjectionMutationKind::InsertRelated
+                    | ClientProjectionMutationKind::UpsertRelated
             );
             mutations.push(ProjectionCapabilityMutation::Record {
                 model: operation.model.clone(),
@@ -851,13 +851,13 @@ fn compile_capability_arm(
                 replace: replace.clone(),
                 upsert: complete,
                 patch: !fields.is_empty(),
-                delete: operation.kind == ManifestProjectionMutationKind::Delete,
+                delete: operation.kind == ClientProjectionMutationKind::Delete,
             });
             mutations.push(ProjectionCapabilityMutation::Model {
                 model: operation.model.clone(),
             });
         }
-        if operation.kind == ManifestProjectionMutationKind::InvalidateModel {
+        if operation.kind == ClientProjectionMutationKind::InvalidateModel {
             mutations.push(ProjectionCapabilityMutation::Model {
                 model: operation.model.clone(),
             });
@@ -877,8 +877,8 @@ fn compile_capability_arm(
                     .iter()
                     .map(|field| field.name.clone())
                     .collect(),
-                link: effect.kind == ManifestProjectionRelationshipEffectKind::Link,
-                unlink: effect.kind == ManifestProjectionRelationshipEffectKind::Unlink,
+                link: effect.kind == ProjectionRelationshipEffectKind::Link,
+                unlink: effect.kind == ProjectionRelationshipEffectKind::Unlink,
             });
             mutations.push(ProjectionCapabilityMutation::Model {
                 model: effect.source_model.clone(),
@@ -886,18 +886,18 @@ fn compile_capability_arm(
         }
         for invalidation in &operation.invalidations {
             match invalidation {
-                ManifestProjectionInvalidation::Model { model } => {
+                ClientProjectionInvalidation::Model { model } => {
                     mutations.push(ProjectionCapabilityMutation::Model {
                         model: model.clone(),
                     });
                 }
-                ManifestProjectionInvalidation::Relationship {
+                ClientProjectionInvalidation::Relationship {
                     source_model,
                     relationship,
                     target_model,
                 } => {
                     let keyed = operation.relationships.iter().any(|effect| {
-                        effect.kind == ManifestProjectionRelationshipEffectKind::Invalidate
+                        effect.kind == ProjectionRelationshipEffectKind::Invalidate
                             && effect.source_model == *source_model
                             && effect.relationship == *relationship
                             && effect.target_model == *target_model
@@ -926,10 +926,10 @@ fn compile_capability_arm(
 fn lower_arm(
     occurrence_ordinal: u32,
     projection_ref: u32,
-    event: &ManifestProjectionEventRef,
-    arm: &ManifestProjectionArm,
+    event: &ClientProjectionEventRef,
+    arm: &ClientProjectionArm,
     slots: &BTreeMap<&str, Knowledge>,
-    command: &ManifestCommand,
+    command: &ClientCommand,
     manifest: &ClientManifest,
     operations: &mut Vec<PreviewOperation>,
     recoveries: &mut Vec<PreviewRecovery>,
@@ -1008,7 +1008,7 @@ fn push_preview_item<T>(items: &mut Vec<T>, item: T) -> Result<(), ClientCompile
     Ok(())
 }
 
-fn collect_selected_models(arm: &ManifestProjectionArm, models: &mut BTreeSet<String>) {
+fn collect_selected_models(arm: &ClientProjectionArm, models: &mut BTreeSet<String>) {
     for operation in &arm.operations {
         models.insert(operation.model.clone());
         for relationship in &operation.relationships {
@@ -1017,10 +1017,10 @@ fn collect_selected_models(arm: &ManifestProjectionArm, models: &mut BTreeSet<St
         }
         for invalidation in &operation.invalidations {
             match invalidation {
-                ManifestProjectionInvalidation::Model { model } => {
+                ClientProjectionInvalidation::Model { model } => {
                     models.insert(model.clone());
                 }
-                ManifestProjectionInvalidation::Relationship {
+                ClientProjectionInvalidation::Relationship {
                     source_model,
                     target_model,
                     ..
@@ -1037,19 +1037,19 @@ fn collect_selected_models(arm: &ManifestProjectionArm, models: &mut BTreeSet<St
 fn lower_record(
     occurrence_ordinal: u32,
     projection_ref: u32,
-    event: &ManifestProjectionEventRef,
-    operation: &ManifestProjectionOperation,
+    event: &ClientProjectionEventRef,
+    operation: &ClientProjectionOperation,
     partition: &Option<PreviewPartition>,
     slots: &BTreeMap<&str, Knowledge>,
-    command: &ManifestCommand,
-    model: &ManifestModel,
+    command: &ClientCommand,
+    model: &ClientModel,
     operations: &mut Vec<PreviewOperation>,
     recoveries: &mut Vec<PreviewRecovery>,
 ) -> Result<(), ClientCompileError> {
     if matches!(
         operation.kind,
-        ManifestProjectionMutationKind::InvalidateModel
-            | ManifestProjectionMutationKind::InvalidateRelationship
+        ClientProjectionMutationKind::InvalidateModel
+            | ClientProjectionMutationKind::InvalidateRelationship
     ) {
         return Ok(());
     }
@@ -1087,11 +1087,11 @@ fn lower_record(
         .collect::<Vec<_>>();
     let (set, unset, uncertain) = evaluate_fields(&operation.fields, slots, event);
     match operation.kind {
-        ManifestProjectionMutationKind::Insert
-        | ManifestProjectionMutationKind::Upsert
-        | ManifestProjectionMutationKind::Recreate
-        | ManifestProjectionMutationKind::InsertRelated
-        | ManifestProjectionMutationKind::UpsertRelated => {
+        ClientProjectionMutationKind::Insert
+        | ClientProjectionMutationKind::Upsert
+        | ClientProjectionMutationKind::Recreate
+        | ClientProjectionMutationKind::InsertRelated
+        | ClientProjectionMutationKind::UpsertRelated => {
             let mapped = set
                 .iter()
                 .map(|field| field.field.as_str())
@@ -1151,7 +1151,7 @@ fn lower_record(
                 )?;
             }
         }
-        ManifestProjectionMutationKind::Patch | ManifestProjectionMutationKind::UpsertPatch => {
+        ClientProjectionMutationKind::Patch | ClientProjectionMutationKind::UpsertPatch => {
             if !set.is_empty() || !unset.is_empty() {
                 push_preview_item(
                     operations,
@@ -1187,7 +1187,7 @@ fn lower_record(
                 )?;
             }
         }
-        ManifestProjectionMutationKind::Delete => push_preview_item(
+        ClientProjectionMutationKind::Delete => push_preview_item(
             operations,
             PreviewOperation {
                 occurrence_ordinal,
@@ -1195,8 +1195,8 @@ fn lower_record(
                 mutation: PreviewMutation::Delete { scope },
             },
         )?,
-        ManifestProjectionMutationKind::InvalidateModel
-        | ManifestProjectionMutationKind::InvalidateRelationship => unreachable!(),
+        ClientProjectionMutationKind::InvalidateModel
+        | ClientProjectionMutationKind::InvalidateRelationship => unreachable!(),
     }
     Ok(())
 }
@@ -1205,11 +1205,11 @@ fn lower_record(
 fn lower_relationships(
     occurrence_ordinal: u32,
     projection_ref: u32,
-    event: &ManifestProjectionEventRef,
-    operation: &ManifestProjectionOperation,
+    event: &ClientProjectionEventRef,
+    operation: &ClientProjectionOperation,
     partition: &Option<PreviewPartition>,
     slots: &BTreeMap<&str, Knowledge>,
-    command: &ManifestCommand,
+    command: &ClientCommand,
     operations: &mut Vec<PreviewOperation>,
     recoveries: &mut Vec<PreviewRecovery>,
 ) -> Result<(), ClientCompileError> {
@@ -1232,7 +1232,7 @@ fn lower_relationships(
                 key,
             });
         match (effect.kind, source, target) {
-            (ManifestProjectionRelationshipEffectKind::Link, Some(source), Some(target)) => {
+            (ProjectionRelationshipEffectKind::Link, Some(source), Some(target)) => {
                 push_preview_item(
                     operations,
                     PreviewOperation {
@@ -1246,7 +1246,7 @@ fn lower_relationships(
                     },
                 )?;
             }
-            (ManifestProjectionRelationshipEffectKind::Unlink, Some(source), Some(target)) => {
+            (ProjectionRelationshipEffectKind::Unlink, Some(source), Some(target)) => {
                 push_preview_item(
                     operations,
                     PreviewOperation {
@@ -1300,13 +1300,13 @@ fn lower_relationships(
 fn lower_invalidations(
     occurrence_ordinal: u32,
     projection_ref: u32,
-    operation: &ManifestProjectionOperation,
+    operation: &ClientProjectionOperation,
     partition: &Option<PreviewPartition>,
     operations: &mut Vec<PreviewOperation>,
     recoveries: &mut Vec<PreviewRecovery>,
 ) -> Result<(), ClientCompileError> {
     let partition = partition.clone();
-    if operation.kind == ManifestProjectionMutationKind::InvalidateModel {
+    if operation.kind == ClientProjectionMutationKind::InvalidateModel {
         push_preview_item(
             operations,
             PreviewOperation {
@@ -1330,7 +1330,7 @@ fn lower_invalidations(
     }
     for invalidation in &operation.invalidations {
         match invalidation {
-            ManifestProjectionInvalidation::Model { model } => {
+            ClientProjectionInvalidation::Model { model } => {
                 push_preview_item(
                     operations,
                     PreviewOperation {
@@ -1352,13 +1352,13 @@ fn lower_invalidations(
                     ),
                 )?;
             }
-            ManifestProjectionInvalidation::Relationship {
+            ClientProjectionInvalidation::Relationship {
                 source_model,
                 relationship,
                 target_model,
             } => {
                 let has_keyed_effect = operation.relationships.iter().any(|effect| {
-                    effect.kind == ManifestProjectionRelationshipEffectKind::Invalidate
+                    effect.kind == ProjectionRelationshipEffectKind::Invalidate
                         && effect.source_model == *source_model
                         && effect.relationship == *relationship
                         && effect.target_model == *target_model
@@ -1396,13 +1396,13 @@ fn lower_invalidations(
 }
 
 fn evaluate_partition(
-    partition: &ManifestProjectionPartition,
+    partition: &ClientProjectionPartition,
     slots: &BTreeMap<&str, Knowledge>,
-    event: &ManifestProjectionEventRef,
+    event: &ClientProjectionEventRef,
 ) -> Option<PreviewPartition> {
     match partition {
-        ManifestProjectionPartition::Unit => Some(PreviewPartition::Unit),
-        ManifestProjectionPartition::Expression { expression } => {
+        ClientProjectionPartition::Unit => Some(PreviewPartition::Unit),
+        ClientProjectionPartition::Expression { expression } => {
             match evaluate_expression(expression, slots, event) {
                 // This is an executable logical expression, never a server
                 // projection-partition token. The runtime must prove it maps
@@ -1423,10 +1423,10 @@ fn evaluate_partition(
 }
 
 fn evaluate_key(
-    key: &[ManifestProjectionKeyField],
+    key: &[ClientProjectionKeyField],
     slots: &BTreeMap<&str, Knowledge>,
-    event: &ManifestProjectionEventRef,
-    command: &ManifestCommand,
+    event: &ClientProjectionEventRef,
+    command: &ClientCommand,
 ) -> Option<Vec<PreviewKeyField>> {
     let mut result = Vec::with_capacity(key.len());
     for field in key {
@@ -1447,7 +1447,7 @@ fn evaluate_key(
 
 fn preview_key_value_is_provably_non_null_scalar(
     value: &PreviewExpression,
-    command: &ManifestCommand,
+    command: &ClientCommand,
 ) -> bool {
     match value {
         PreviewExpression::Input { path } => {
@@ -1471,12 +1471,12 @@ fn preview_key_value_is_provably_non_null_scalar(
         PreviewExpression::TrustedPreset { codec, .. } => codec != "json",
         PreviewExpression::Constant { value } => matches!(
             value,
-            ManifestProjectionValue::Boolean(_)
-                | ManifestProjectionValue::I64(_)
-                | ManifestProjectionValue::U64(_)
-                | ManifestProjectionValue::F64(_)
-                | ManifestProjectionValue::String(_)
-                | ManifestProjectionValue::Enum { .. }
+            ClientProjectionValue::Boolean(_)
+                | ClientProjectionValue::I64(_)
+                | ClientProjectionValue::U64(_)
+                | ClientProjectionValue::F64(_)
+                | ClientProjectionValue::String(_)
+                | ClientProjectionValue::Enum { .. }
         ),
         PreviewExpression::Null
         | PreviewExpression::List { .. }
@@ -1485,23 +1485,21 @@ fn preview_key_value_is_provably_non_null_scalar(
             transform,
             arguments,
         } => match transform {
-            ManifestProjectionScalarTransform::StringConcat => arguments
+            ProjectionScalarTransform::StringConcat => arguments
                 .iter()
                 .all(|argument| preview_key_value_is_provably_non_null_scalar(argument, command)),
-            ManifestProjectionScalarTransform::FirstPresent => {
-                arguments.first().is_some_and(|argument| {
-                    preview_key_value_is_provably_non_null_scalar(argument, command)
-                })
-            }
+            ProjectionScalarTransform::FirstPresent => arguments.first().is_some_and(|argument| {
+                preview_key_value_is_provably_non_null_scalar(argument, command)
+            }),
         },
     }
 }
 
 fn command_input_field<'a>(
-    shape: &'a ManifestCommandShape,
+    shape: &'a ClientCommandShape,
     path: &[String],
-) -> Option<&'a ManifestTypeField> {
-    let ManifestCommandShape::Object { definition } = shape else {
+) -> Option<&'a ClientTypeField> {
+    let ClientCommandShape::Object { definition } = shape else {
         return None;
     };
     let mut current = definition;
@@ -1519,17 +1517,17 @@ fn command_input_field<'a>(
 }
 
 fn evaluate_fields(
-    fields: &[ManifestProjectionField],
+    fields: &[ClientProjectionField],
     slots: &BTreeMap<&str, Knowledge>,
-    event: &ManifestProjectionEventRef,
+    event: &ClientProjectionEventRef,
 ) -> (Vec<PreviewField>, Vec<String>, bool) {
     let mut set = Vec::new();
     let mut unset = Vec::new();
     let mut uncertain = false;
     for field in fields {
         match &field.assignment {
-            ManifestProjectionAssignment::Unset => unset.push(field.name.clone()),
-            ManifestProjectionAssignment::Set { expression } => {
+            ClientProjectionAssignment::Unset => unset.push(field.name.clone()),
+            ClientProjectionAssignment::Set { expression } => {
                 match evaluate_expression(expression, slots, event) {
                     Knowledge::Known(value) => set.push(PreviewField {
                         field: field.name.clone(),
@@ -1549,33 +1547,33 @@ fn evaluate_fields(
     (set, unset, uncertain)
 }
 
-fn source_knowledge(source: &ManifestProjectionPreviewSource) -> Knowledge {
+fn source_knowledge(source: &ClientProjectionPreviewSource) -> Knowledge {
     match source {
-        ManifestProjectionPreviewSource::Input { path } => {
+        ClientProjectionPreviewSource::Input { path } => {
             Knowledge::Known(PreviewExpression::Input { path: path.clone() })
         }
-        ManifestProjectionPreviewSource::GeneratedDefault { path } => {
+        ClientProjectionPreviewSource::GeneratedDefault { path } => {
             Knowledge::Known(PreviewExpression::GeneratedDefault { path: path.clone() })
         }
-        ManifestProjectionPreviewSource::TrustedPreset { name, codec } => {
+        ClientProjectionPreviewSource::TrustedPreset { name, codec } => {
             Knowledge::Known(PreviewExpression::TrustedPreset {
                 name: name.clone(),
                 codec: codec.clone(),
             })
         }
-        ManifestProjectionPreviewSource::Constant { value } => {
+        ClientProjectionPreviewSource::Constant { value } => {
             Knowledge::Known(PreviewExpression::Constant {
                 value: value.clone(),
             })
         }
-        ManifestProjectionPreviewSource::Null => Knowledge::Known(PreviewExpression::Null),
-        ManifestProjectionPreviewSource::Absent => Knowledge::Absent,
-        ManifestProjectionPreviewSource::Unknown => Knowledge::Unknown,
+        ClientProjectionPreviewSource::Null => Knowledge::Known(PreviewExpression::Null),
+        ClientProjectionPreviewSource::Absent => Knowledge::Absent,
+        ClientProjectionPreviewSource::Unknown => Knowledge::Unknown,
     }
 }
 
 fn compile_pure_reduces(
-    extension: &super::super::manifest::ManifestCommandProjection,
+    extension: &super::super::manifest::CommandProjectionExtension,
     projection_refs: &BTreeMap<&str, u32>,
     occurrences: &[PreviewOccurrence],
 ) -> Result<Vec<CompiledPureReduce>, ClientCompileError> {
@@ -1631,7 +1629,7 @@ fn compile_pure_reduces(
 }
 
 fn compile_one_pure_reduce(
-    reduce: &super::super::manifest::ManifestCommandPureReduce,
+    reduce: &super::super::manifest::ClientCommandPureReduce,
     occurrence_ordinal: u32,
     projection_refs: Vec<u32>,
 ) -> Result<CompiledPureReduce, ClientCompileError> {
@@ -1685,43 +1683,43 @@ fn compile_one_pure_reduce(
 }
 
 fn evaluate_expression(
-    expression: &ManifestProjectionExpression,
+    expression: &ClientProjectionExpression,
     slots: &BTreeMap<&str, Knowledge>,
-    event: &ManifestProjectionEventRef,
+    event: &ClientProjectionEventRef,
 ) -> Knowledge {
     match expression {
-        ManifestProjectionExpression::Slot { slot, .. } => slots
+        ClientProjectionExpression::Slot { slot, .. } => slots
             .get(slot.as_str())
             .cloned()
             .unwrap_or(Knowledge::Denied),
-        ManifestProjectionExpression::Envelope { field } => {
+        ClientProjectionExpression::Envelope { field } => {
             let value = match field {
-                ManifestProjectionEnvelopeField::OccurrenceVersion => {
-                    ManifestProjectionValue::U64("1".into())
+                ClientProjectionEnvelopeField::OccurrenceVersion => {
+                    ClientProjectionValue::U64("1".into())
                 }
-                ManifestProjectionEnvelopeField::EventName => {
-                    ManifestProjectionValue::String(event.name.clone())
+                ClientProjectionEnvelopeField::EventName => {
+                    ClientProjectionValue::String(event.name.clone())
                 }
-                ManifestProjectionEnvelopeField::EventVersion => {
-                    ManifestProjectionValue::U64(event.version.to_string())
+                ClientProjectionEnvelopeField::EventVersion => {
+                    ClientProjectionValue::U64(event.version.to_string())
                 }
             };
             Knowledge::Known(PreviewExpression::Constant { value })
         }
-        ManifestProjectionExpression::Constant { value } => {
+        ClientProjectionExpression::Constant { value } => {
             Knowledge::Known(PreviewExpression::Constant {
                 value: value.clone(),
             })
         }
-        ManifestProjectionExpression::Enum { enum_type, variant } => {
+        ClientProjectionExpression::Enum { enum_type, variant } => {
             Knowledge::Known(PreviewExpression::Constant {
-                value: ManifestProjectionValue::Enum {
+                value: ClientProjectionValue::Enum {
                     enum_type: enum_type.clone(),
                     variant: variant.clone(),
                 },
             })
         }
-        ManifestProjectionExpression::List { values } => {
+        ClientProjectionExpression::List { values } => {
             let mut resolved = Vec::with_capacity(values.len());
             for value in values {
                 match evaluate_expression(value, slots, event) {
@@ -1731,7 +1729,7 @@ fn evaluate_expression(
             }
             Knowledge::Known(PreviewExpression::List { values: resolved })
         }
-        ManifestProjectionExpression::Object { fields } => {
+        ClientProjectionExpression::Object { fields } => {
             let mut resolved = Vec::with_capacity(fields.len());
             for field in fields {
                 match evaluate_expression(&field.value, slots, event) {
@@ -1748,7 +1746,7 @@ fn evaluate_expression(
             }
             Knowledge::Known(PreviewExpression::Object { fields: resolved })
         }
-        ManifestProjectionExpression::Transform {
+        ClientProjectionExpression::Transform {
             transform,
             arguments,
         } => {
@@ -1756,11 +1754,8 @@ fn evaluate_expression(
             for argument in arguments {
                 match evaluate_expression(argument, slots, event) {
                     Knowledge::Known(value) => resolved.push(value),
-                    Knowledge::Absent
-                        if *transform == ManifestProjectionScalarTransform::FirstPresent => {}
-                    Knowledge::Unset
-                        if *transform == ManifestProjectionScalarTransform::FirstPresent =>
-                    {
+                    Knowledge::Absent if *transform == ProjectionScalarTransform::FirstPresent => {}
+                    Knowledge::Unset if *transform == ProjectionScalarTransform::FirstPresent => {
                         return Knowledge::Unknown;
                     }
                     other => return other,
@@ -2066,7 +2061,7 @@ mod tests {
                                 preset("label"),
                                 preset("actor"),
                                 PreviewExpression::Constant {
-                                    value: ManifestProjectionValue::String("trusted_preset".into()),
+                                    value: ClientProjectionValue::String("trusted_preset".into()),
                                 },
                             ],
                         },
@@ -2090,33 +2085,33 @@ mod tests {
         assert!(names.is_empty());
     }
 
-    fn event() -> ManifestProjectionEventRef {
-        ManifestProjectionEventRef {
+    fn event() -> ClientProjectionEventRef {
+        ClientProjectionEventRef {
             id: "event:test:v1".into(),
             name: "test.changed".into(),
             version: 1,
         }
     }
 
-    fn slot() -> ManifestProjectionExpression {
-        ManifestProjectionExpression::Slot {
+    fn slot() -> ClientProjectionExpression {
+        ClientProjectionExpression::Slot {
             slot: "value".into(),
-            value_type: ManifestProjectionValueType::String,
+            value_type: ProjectionValueType::String,
         }
     }
 
-    fn key_command() -> ManifestCommand {
-        ManifestCommand {
+    fn key_command() -> ClientCommand {
+        ClientCommand {
             version: 1,
             name: "test".into(),
             mutation_field: "test".into(),
             grants: vec!["user".into()],
-            input: ManifestCommandShape::Object {
-                definition: ManifestTypeDef {
+            input: ClientCommandShape::Object {
+                definition: ClientTypeDef {
                     name: "TestInput".into(),
                     fields: ["source", "target"]
                         .into_iter()
-                        .map(|name| ManifestTypeField {
+                        .map(|name| ClientTypeField {
                             name: name.into(),
                             type_name: "ID".into(),
                             nullable: false,
@@ -2128,15 +2123,15 @@ mod tests {
                         .collect(),
                 },
             },
-            output: ManifestCommandShape::None,
+            output: ClientCommandShape::None,
             operation: "mutation Test { test }".into(),
             operation_hash:
                 "sha256:0000000000000000000000000000000000000000000000000000000000000000".into(),
-            extensions: ManifestCommandExtensions {
+            extensions: ClientCommandExtensionSlots {
                 version: 2,
-                consistency: ManifestCommandConsistency {
+                consistency: CommandConsistencyExtension {
                     version: 1,
-                    kind: ManifestConsistencyKind::Eventual,
+                    kind: CommandConsistency::Eventual,
                 },
                 direct_projection: None,
                 input_defaults: None,
@@ -2146,27 +2141,27 @@ mod tests {
         }
     }
 
-    fn projection_model() -> ManifestModel {
-        ManifestModel {
+    fn projection_model() -> ClientModel {
+        ClientModel {
             id: "Todo".into(),
             typename: "Todo".into(),
             source_table: "todos".into(),
             dependencies: vec!["todos".into()],
-            normalization: ManifestNormalization::Normalized {
-                fields: vec![ManifestKeyField {
+            normalization: ModelNormalization::Normalized {
+                fields: vec![ClientKeyField {
                     name: "id".into(),
                     codec: "string".into(),
                 }],
                 encoding: "tuple_v1".into(),
             },
             fields: vec![
-                ManifestField {
+                ClientField {
                     name: "id".into(),
                     scalar: "ID".into(),
                     codec: "string".into(),
                     nullable: false,
                 },
-                ManifestField {
+                ClientField {
                     name: "metadata".into(),
                     scalar: "JSON".into(),
                     codec: "json".into(),
@@ -2174,12 +2169,12 @@ mod tests {
                 },
             ],
             relationships: Vec::new(),
-            filter_input: ManifestFilterInput {
+            filter_input: ClientFilterInput {
                 type_name: "TodoBoolExp".into(),
                 fields: Vec::new(),
                 relationships: Vec::new(),
             },
-            row_policy: ManifestRowPolicy::Unrestricted,
+            row_policy: ClientRowPolicy::Unrestricted,
             record_revisions: false,
             tombstones: false,
         }
@@ -2216,27 +2211,27 @@ mod tests {
         }
     }
 
-    fn relationship_operation() -> ManifestProjectionOperation {
+    fn relationship_operation() -> ClientProjectionOperation {
         let key = |slot: &str| {
-            vec![ManifestProjectionKeyField {
+            vec![ClientProjectionKeyField {
                 ordinal: 0,
                 name: "id".into(),
-                expression: ManifestProjectionExpression::Slot {
+                expression: ClientProjectionExpression::Slot {
                     slot: slot.into(),
-                    value_type: ManifestProjectionValueType::String,
+                    value_type: ProjectionValueType::String,
                 },
             }]
         };
-        ManifestProjectionOperation {
+        ClientProjectionOperation {
             operation: "link-owner".into(),
             ordinal: 0,
-            kind: ManifestProjectionMutationKind::Patch,
+            kind: ClientProjectionMutationKind::Patch,
             model: "Todo".into(),
             key: key("source"),
             fields: Vec::new(),
-            relationships: vec![ManifestProjectionRelationshipEffect {
+            relationships: vec![ClientProjectionRelationshipEffect {
                 ordinal: 0,
-                kind: ManifestProjectionRelationshipEffectKind::Link,
+                kind: ProjectionRelationshipEffectKind::Link,
                 source_model: "Todo".into(),
                 relationship: "owner".into(),
                 target_model: "User".into(),
@@ -2266,8 +2261,8 @@ mod tests {
 
     #[test]
     fn denied_or_cache_unowned_nested_dependencies_never_become_values() {
-        let expression = ManifestProjectionExpression::Object {
-            fields: vec![ManifestProjectionObjectField {
+        let expression = ClientProjectionExpression::Object {
+            fields: vec![ClientProjectionObjectField {
                 name: "secret".into(),
                 value: slot(),
             }],
@@ -2280,7 +2275,7 @@ mod tests {
 
     #[test]
     fn known_partition_expression_requires_current_cache_proof() {
-        let expression = ManifestProjectionPartition::Expression { expression: slot() };
+        let expression = ClientProjectionPartition::Expression { expression: slot() };
         let known = BTreeMap::from([(
             "value",
             Knowledge::Known(PreviewExpression::Input {
@@ -2300,7 +2295,7 @@ mod tests {
 
     #[test]
     fn uncertain_or_unowned_partition_never_addresses_a_row() {
-        let expression = ManifestProjectionPartition::Expression { expression: slot() };
+        let expression = ClientProjectionPartition::Expression { expression: slot() };
         for knowledge in [
             Knowledge::Unknown,
             Knowledge::Absent,
@@ -2324,17 +2319,17 @@ mod tests {
                 }),
             ),
         ]);
-        let slot = |name: &str| ManifestProjectionExpression::Slot {
+        let slot = |name: &str| ClientProjectionExpression::Slot {
             slot: name.into(),
-            value_type: ManifestProjectionValueType::String,
+            value_type: ProjectionValueType::String,
         };
-        let object = ManifestProjectionExpression::Object {
+        let object = ClientProjectionExpression::Object {
             fields: vec![
-                ManifestProjectionObjectField {
+                ClientProjectionObjectField {
                     name: "missing".into(),
                     value: slot("absent"),
                 },
-                ManifestProjectionObjectField {
+                ClientProjectionObjectField {
                     name: "present".into(),
                     value: slot("known"),
                 },
@@ -2357,12 +2352,12 @@ mod tests {
                 }),
             ),
         ]);
-        let slot = |name: &str| ManifestProjectionExpression::Slot {
+        let slot = |name: &str| ClientProjectionExpression::Slot {
             slot: name.into(),
-            value_type: ManifestProjectionValueType::String,
+            value_type: ProjectionValueType::String,
         };
-        let first_present = ManifestProjectionExpression::Transform {
-            transform: ManifestProjectionScalarTransform::FirstPresent,
+        let first_present = ClientProjectionExpression::Transform {
+            transform: ProjectionScalarTransform::FirstPresent,
             arguments: vec![slot("absent"), slot("known")],
         };
         assert!(matches!(
@@ -2370,8 +2365,8 @@ mod tests {
             Knowledge::Known(PreviewExpression::Transform { arguments, .. })
                 if arguments.len() == 1
         ));
-        let all_absent = ManifestProjectionExpression::Transform {
-            transform: ManifestProjectionScalarTransform::FirstPresent,
+        let all_absent = ClientProjectionExpression::Transform {
+            transform: ProjectionScalarTransform::FirstPresent,
             arguments: vec![slot("absent")],
         };
         assert_eq!(
@@ -2382,16 +2377,16 @@ mod tests {
 
     #[test]
     fn first_present_fails_closed_instead_of_skipping_an_unset_argument() {
-        let expression = ManifestProjectionExpression::Transform {
-            transform: ManifestProjectionScalarTransform::FirstPresent,
+        let expression = ClientProjectionExpression::Transform {
+            transform: ProjectionScalarTransform::FirstPresent,
             arguments: vec![
-                ManifestProjectionExpression::Slot {
+                ClientProjectionExpression::Slot {
                     slot: "unset".into(),
-                    value_type: ManifestProjectionValueType::String,
+                    value_type: ProjectionValueType::String,
                 },
-                ManifestProjectionExpression::Slot {
+                ClientProjectionExpression::Slot {
                     slot: "known".into(),
-                    value_type: ManifestProjectionValueType::String,
+                    value_type: ProjectionValueType::String,
                 },
             ],
         };
@@ -2412,26 +2407,26 @@ mod tests {
 
     #[test]
     fn first_present_unset_lowers_to_record_recovery_without_a_write_or_clear() {
-        let slot = |name: &str| ManifestProjectionExpression::Slot {
+        let slot = |name: &str| ClientProjectionExpression::Slot {
             slot: name.into(),
-            value_type: ManifestProjectionValueType::String,
+            value_type: ProjectionValueType::String,
         };
-        let operation = ManifestProjectionOperation {
+        let operation = ClientProjectionOperation {
             operation: "upsert-todo".into(),
             ordinal: 0,
-            kind: ManifestProjectionMutationKind::Upsert,
+            kind: ClientProjectionMutationKind::Upsert,
             model: "Todo".into(),
-            key: vec![ManifestProjectionKeyField {
+            key: vec![ClientProjectionKeyField {
                 ordinal: 0,
                 name: "id".into(),
                 expression: slot("source"),
             }],
-            fields: vec![ManifestProjectionField {
+            fields: vec![ClientProjectionField {
                 ordinal: 0,
                 name: "metadata".into(),
-                assignment: ManifestProjectionAssignment::Set {
-                    expression: ManifestProjectionExpression::Transform {
-                        transform: ManifestProjectionScalarTransform::FirstPresent,
+                assignment: ClientProjectionAssignment::Set {
+                    expression: ClientProjectionExpression::Transform {
+                        transform: ProjectionScalarTransform::FirstPresent,
                         arguments: vec![slot("unset"), slot("known")],
                     },
                 },
@@ -2489,28 +2484,28 @@ mod tests {
 
     #[test]
     fn json_input_slots_compile_into_their_exact_optimistic_patch_fields() {
-        let slot = |name: &str, value_type| ManifestProjectionExpression::Slot {
+        let slot = |name: &str, value_type| ClientProjectionExpression::Slot {
             slot: name.into(),
             value_type,
         };
-        let operation = ManifestProjectionOperation {
+        let operation = ClientProjectionOperation {
             operation: "patch-json".into(),
             ordinal: 0,
-            kind: ManifestProjectionMutationKind::Patch,
+            kind: ClientProjectionMutationKind::Patch,
             model: "Todo".into(),
-            key: vec![ManifestProjectionKeyField {
+            key: vec![ClientProjectionKeyField {
                 ordinal: 0,
                 name: "id".into(),
-                expression: slot("source", ManifestProjectionValueType::String),
+                expression: slot("source", ProjectionValueType::String),
             }],
             fields: ["details", "tags"]
                 .into_iter()
                 .enumerate()
-                .map(|(ordinal, name)| ManifestProjectionField {
+                .map(|(ordinal, name)| ClientProjectionField {
                     ordinal: ordinal as u32,
                     name: name.into(),
-                    assignment: ManifestProjectionAssignment::Set {
-                        expression: slot(name, ManifestProjectionValueType::Json),
+                    assignment: ClientProjectionAssignment::Set {
+                        expression: slot(name, ProjectionValueType::Json),
                     },
                 })
                 .collect(),
@@ -2540,7 +2535,7 @@ mod tests {
         let mut model = projection_model();
         model
             .fields
-            .extend(["details", "tags"].into_iter().map(|name| ManifestField {
+            .extend(["details", "tags"].into_iter().map(|name| ClientField {
                 name: name.into(),
                 scalar: "JSON".into(),
                 codec: "json".into(),
@@ -2586,8 +2581,8 @@ mod tests {
 
     #[test]
     fn object_expression_fails_closed_when_a_member_is_unset() {
-        let expression = ManifestProjectionExpression::Object {
-            fields: vec![ManifestProjectionObjectField {
+        let expression = ClientProjectionExpression::Object {
+            fields: vec![ClientProjectionObjectField {
                 name: "cleared".into(),
                 value: slot(),
             }],
@@ -2601,17 +2596,17 @@ mod tests {
 
     #[test]
     fn unset_object_member_lowers_to_uncertainty_without_a_write_or_clear() {
-        let expression = ManifestProjectionExpression::Object {
-            fields: vec![ManifestProjectionObjectField {
+        let expression = ClientProjectionExpression::Object {
+            fields: vec![ClientProjectionObjectField {
                 name: "cleared".into(),
                 value: slot(),
             }],
         };
         let slots = BTreeMap::from([("value", Knowledge::Unset)]);
-        let fields = vec![ManifestProjectionField {
+        let fields = vec![ClientProjectionField {
             ordinal: 0,
             name: "metadata".into(),
-            assignment: ManifestProjectionAssignment::Set { expression },
+            assignment: ClientProjectionAssignment::Set { expression },
         }];
         assert_eq!(
             evaluate_fields(&fields, &slots, &event()),
@@ -2623,12 +2618,12 @@ mod tests {
     fn projection_keys_require_provable_non_null_scalars() {
         let command = key_command();
         for value in [
-            ManifestProjectionValue::Boolean(true),
-            ManifestProjectionValue::I64("-1".into()),
-            ManifestProjectionValue::U64("1".into()),
-            ManifestProjectionValue::F64("1.5".into()),
-            ManifestProjectionValue::String("id".into()),
-            ManifestProjectionValue::Enum {
+            ClientProjectionValue::Boolean(true),
+            ClientProjectionValue::I64("-1".into()),
+            ClientProjectionValue::U64("1".into()),
+            ClientProjectionValue::F64("1.5".into()),
+            ClientProjectionValue::String("id".into()),
+            ClientProjectionValue::Enum {
                 enum_type: "Status".into(),
                 variant: "OPEN".into(),
             },
@@ -2639,11 +2634,11 @@ mod tests {
             ));
         }
         for value in [
-            ManifestProjectionValue::Null,
-            ManifestProjectionValue::List(vec![ManifestProjectionValue::String("id".into())]),
-            ManifestProjectionValue::Object(vec![ManifestProjectionValueField {
+            ClientProjectionValue::Null,
+            ClientProjectionValue::List(vec![ClientProjectionValue::String("id".into())]),
+            ClientProjectionValue::Object(vec![ClientProjectionValueField {
                 name: "id".into(),
-                value: ManifestProjectionValue::String("id".into()),
+                value: ClientProjectionValue::String("id".into()),
             }]),
         ] {
             assert!(!preview_key_value_is_provably_non_null_scalar(
@@ -2659,7 +2654,7 @@ mod tests {
             &command,
         ));
         let mut nullable = command;
-        let ManifestCommandShape::Object { definition } = &mut nullable.input else {
+        let ClientCommandShape::Object { definition } = &mut nullable.input else {
             unreachable!();
         };
         definition.fields[0].nullable = true;
@@ -2916,8 +2911,8 @@ mod tests {
         let partition = Some(PreviewPartition::Unit);
         let slots = BTreeMap::from([("source", known("source")), ("target", known("target"))]);
         let mut operation = relationship_operation();
-        operation.relationships[0].kind = ManifestProjectionRelationshipEffectKind::Invalidate;
-        operation.invalidations = vec![ManifestProjectionInvalidation::Relationship {
+        operation.relationships[0].kind = ProjectionRelationshipEffectKind::Invalidate;
+        operation.invalidations = vec![ClientProjectionInvalidation::Relationship {
             source_model: "Todo".into(),
             relationship: "owner".into(),
             target_model: "User".into(),
@@ -2983,9 +2978,9 @@ mod tests {
     #[test]
     fn model_invalidation_and_recovery_compile_without_a_record_key() {
         let mut operation = relationship_operation();
-        operation.kind = ManifestProjectionMutationKind::InvalidateModel;
+        operation.kind = ClientProjectionMutationKind::InvalidateModel;
         operation.relationships.clear();
-        operation.invalidations = vec![ManifestProjectionInvalidation::Model {
+        operation.invalidations = vec![ClientProjectionInvalidation::Model {
             model: "Todo".into(),
         }];
         let mut operations = Vec::new();

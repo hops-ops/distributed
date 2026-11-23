@@ -5,7 +5,7 @@ use distributed::graphql::IdentityConfig;
 use distributed::graphql::{read, GraphqlEngine, ModelPermissions, SurfaceProjector};
 use distributed::microsvc::{CausalProjectorContext, HandlerError, Routes, Service};
 use distributed::{ReadModel, ReadModelCatalog, SqliteRepository};
-use distributed_cli::{compile_client, ClientCompileInput, ClientDocument, ClientSurfaceSelector};
+use distributed_cli::{compile_client, ClientCompileInput, ClientDocument, ClientSurfaceIdentity};
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 
@@ -135,8 +135,8 @@ async fn fixture() -> (
         .build()
         .unwrap();
     let generated = compile_client(ClientCompileInput::new(
-        serde_json::to_value(engine.client_manifest_for_role("user").unwrap()).unwrap(),
-        ClientSurfaceSelector::role("user"),
+        engine.client_manifest_for_role("user").unwrap(),
+        ClientSurfaceIdentity::role("user"),
         vec![ClientDocument::new(
             "src/routes/references/+page.graphql",
             "query References @load @live { reference_views { id target { id body } } }",

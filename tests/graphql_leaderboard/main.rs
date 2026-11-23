@@ -424,7 +424,7 @@ async fn protocol_envelopes_mark_leaderboards_as_snapshot_only() {
 fn the_cli_compiles_a_framework_leaderboard_manifest_into_the_ts_client() {
     use distributed::graphql::read;
     use distributed_cli::{
-        compile_client, ClientCompileInput, ClientDocument, ClientSurfaceSelector,
+        compile_client, ClientCompileInput, ClientDocument, ClientSurfaceIdentity,
     };
 
     let items = distributed::TableSchema {
@@ -462,7 +462,7 @@ fn the_cli_compiles_a_framework_leaderboard_manifest_into_the_ts_client() {
         .unwrap();
     let project = compile_client(ClientCompileInput::new(
         serde_json::from_str(&manifest).unwrap(),
-        ClientSurfaceSelector::role("user"),
+        ClientSurfaceIdentity::role("user"),
         vec![ClientDocument::new(
             "src/routes/items.graphql",
             "query Items { items { name } }",

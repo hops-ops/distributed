@@ -16,20 +16,19 @@ use distributed::command::{
 };
 use distributed::graphql::{
     build_surface, graphql_router_with_service, read, surface_for_role, ClientProjectionAssignment,
-    ClientProjectionExecutionClass, ClientProjectionExpression, ClientProjectionFallback,
-    ClientProjectionInvalidation, ClientProjectionMutationKind, ClientProjectionPartition,
-    ClientProjectionPreviewSource, ClientProjectionValue, ClientProjectionValueType,
-    DistributedClientSurfaceExport, GraphqlEngine, ModelPermissions, SurfaceDirectProjection,
-    SurfaceModeledProjection, SurfaceOptions, SurfaceProjector,
+    ClientProjectionExpression, ClientProjectionFallback, ClientProjectionInvalidation,
+    ClientProjectionMutationKind, ClientProjectionPartition, ClientProjectionPreviewSource,
+    ClientProjectionValue, DistributedClientSurfaceExport, GraphqlEngine, ModelPermissions,
+    SurfaceDirectProjection, SurfaceModeledProjection, SurfaceOptions, SurfaceProjector,
 };
 use distributed::microsvc::Session;
 use distributed::microsvc::{CausalCommandContext, HandlerError, Routes, Service};
 use distributed::projection::catalog::{ProjectionBindingActivation, ProjectionCatalog};
 use distributed::projection::lower::{DirectCandidate, EventualOnly, ProjectionDescriptor};
 use distributed::projection::placement::{
-    ProjectionBinding, ProjectionBindingState, ProjectionEpoch, ProjectionExecutorRoute,
-    ProjectionOutput, ProjectionOwner, ProjectionPhysicalTopology, ProjectionSourceBinding,
-    PROJECTION_PARTITION_CODEC_VERSION,
+    ProjectionBinding, ProjectionBindingState, ProjectionEpoch, ProjectionExecutionClass,
+    ProjectionExecutorRoute, ProjectionOutput, ProjectionOwner, ProjectionPhysicalTopology,
+    ProjectionSourceBinding, PROJECTION_PARTITION_CODEC_VERSION,
 };
 use distributed::projection::ProjectionEventSelector;
 use distributed::projection_protocol::ProjectorTopologyId;
@@ -1401,7 +1400,10 @@ async fn succeeded_command_without_preview_exports_modeled_revalidation_contract
         .find(|command| command.name == "plan.create")
         .unwrap();
 
-    assert_eq!(command.extensions.consistency.kind, "succeeded");
+    assert_eq!(
+        command.extensions.consistency.kind,
+        distributed::command::CommandConsistency::Succeeded
+    );
     let projection = command.extensions.projection.as_ref().unwrap();
     assert_eq!(projection.fallback, ClientProjectionFallback::Revalidate);
     assert_eq!(projection.program_arms.len(), 1);
@@ -1452,15 +1454,18 @@ async fn generated_input_default_is_reused_as_the_effect_key_and_fingerprinted()
     let defaults = command.extensions.input_defaults.as_ref().unwrap();
     assert_eq!(defaults.version, 1);
     assert_eq!(defaults.defaults.len(), 1);
-    assert_eq!(defaults.defaults[0]["path"], serde_json::json!(["id"]));
-    assert_eq!(defaults.defaults[0]["generator"], "uuid_v7");
+    assert_eq!(defaults.defaults[0].path, ["id"]);
+    assert_eq!(
+        defaults.defaults[0].generator,
+        distributed::command::InputDefaultGenerator::UuidV7
+    );
     let projection = command.extensions.projection.as_ref().unwrap();
     let arm = &manifest.projection_programs[0].arms[0];
     let ClientProjectionPartition::Expression {
         expression:
             ClientProjectionExpression::Slot {
                 slot: partition_slot,
-                value_type: ClientProjectionValueType::String,
+                value_type: ProjectionValueType::String,
             },
     } = &arm.partition
     else {
@@ -1473,7 +1478,7 @@ async fn generated_input_default_is_reused_as_the_effect_key_and_fingerprinted()
         .expect("upsert must expose the PlanView identity");
     let ClientProjectionExpression::Slot {
         slot: key_slot,
-        value_type: ClientProjectionValueType::String,
+        value_type: ProjectionValueType::String,
     } = &id_key.expression
     else {
         panic!("upsert id key must lower to a typed state slot");
@@ -1494,7 +1499,7 @@ async fn generated_input_default_is_reused_as_the_effect_key_and_fingerprinted()
     assert_eq!(projection.program_arms[0].event.name, "plan.changed");
     assert_eq!(
         manifest.projection_bindings[0].execution_class,
-        ClientProjectionExecutionClass::Causal
+        ProjectionExecutionClass::Causal
     );
 
     let without_default = Service::new().named("plans").routes(
@@ -1580,7 +1585,7 @@ async fn generated_input_default_uses_the_canonical_renamed_wire_path() {
         .input_defaults
         .as_ref()
         .unwrap();
-    assert_eq!(defaults.defaults[0]["path"], serde_json::json!(["todoId"]));
+    assert_eq!(defaults.defaults[0].path, ["todoId"]);
 }
 
 #[tokio::test]
@@ -1624,7 +1629,7 @@ async fn json_container_leaves_reach_the_manifest() {
             expression:
                 ClientProjectionExpression::Slot {
                     slot,
-                    value_type: ClientProjectionValueType::Json,
+                    value_type: ProjectionValueType::Json,
                 },
         } = &assignment.assignment
         else {
@@ -1763,7 +1768,7 @@ async fn embedded_models_retain_global_revalidation_for_modeled_projections() {
     );
     assert_eq!(
         manifest.projection_bindings[0].execution_class,
-        ClientProjectionExecutionClass::Causal
+        ProjectionExecutionClass::Causal
     );
     let operation = &manifest.projection_programs[0].arms[0].operations[0];
     assert_eq!(
@@ -1818,7 +1823,10 @@ async fn succeeded_emitted_event_exports_a_modeled_causal_projection() {
         .iter()
         .find(|command| command.name == "plan.create")
         .unwrap();
-    assert_eq!(command.extensions.consistency.kind, "succeeded");
+    assert_eq!(
+        command.extensions.consistency.kind,
+        distributed::command::CommandConsistency::Succeeded
+    );
     let projection = command.extensions.projection.as_ref().unwrap();
     assert_eq!(projection.program_arms.len(), 1);
     assert_eq!(projection.program_arms[0].event.name, "plan.changed");
@@ -1828,7 +1836,7 @@ async fn succeeded_emitted_event_exports_a_modeled_causal_projection() {
     );
     assert_eq!(
         manifest.projection_bindings[0].execution_class,
-        ClientProjectionExecutionClass::Causal
+        ProjectionExecutionClass::Causal
     );
 }
 

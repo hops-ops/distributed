@@ -2,7 +2,7 @@ use std::collections::BTreeSet;
 use std::fmt;
 use std::marker::PhantomData;
 
-use serde::{Serialize, Serializer};
+use serde::{Deserialize, Serialize, Serializer};
 
 use crate::projection_protocol::{MAX_PROJECTION_PARTITION_BYTES, MAX_PROJECTION_RECORD_KEY_BYTES};
 use crate::DomainEventOccurrence;
@@ -211,7 +211,7 @@ impl MutationKind {
 }
 
 /// Derived relationship consequence carried by an authoritative row mutation.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProjectionRelationshipEffectKind {
     /// The mutation proves a relationship edge is added.

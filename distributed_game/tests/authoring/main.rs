@@ -564,6 +564,42 @@ fn surface_describes_everything_once() {
 }
 
 #[test]
+fn surface_validation_accepts_the_builders_output_and_names_the_broken_rule() {
+    let surface = sample_surface();
+    surface
+        .validate()
+        .expect("the builders produce a valid surface");
+
+    type Break = fn(&mut GameSurface);
+    let cases: [(&str, Break); 8] = [
+        ("schemaVersion", |s| s.schema_version += 1),
+        ("protocolVersion", |s| s.protocol_version += 1),
+        ("invalid surface name", |s| s.name = "a b".into()),
+        ("duplicate kind id", |s| s.kinds[1].id = s.kinds[0].id),
+        ("non-entity wire type", |s| {
+            s.kinds[0].fields[0].ty = WireType::Str
+        }),
+        ("duplicate event", |s| s.events[1].id = s.events[0].id),
+        ("unknown record Nope", |s| {
+            s.events[1].payload = EventPayload::Value {
+                ty: WireType::Record {
+                    name: "Nope".into(),
+                },
+            }
+        }),
+        ("is not replicated", |s| {
+            s.predict.as_mut().unwrap().kind = "ghost".into()
+        }),
+    ];
+    for (expected, break_it) in cases {
+        let mut broken = surface.clone();
+        break_it(&mut broken);
+        let error = broken.validate().unwrap_err();
+        assert!(error.contains(expected), "{expected}: {error}");
+    }
+}
+
+#[test]
 #[should_panic(expected = "duplicate event id")]
 fn surface_rejects_duplicate_event_ids_across_types() {
     #[derive(GameEvent)]

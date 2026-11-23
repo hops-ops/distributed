@@ -322,27 +322,14 @@ pub(super) fn client_manifest_from_surface_with_execution(
         let operation_hash = hash_bytes(operation.as_bytes());
         let consistency = CommandConsistencyExtension {
             version: 1,
-            kind: match command.consistency {
-                CommandConsistency::Succeeded => "succeeded",
-                CommandConsistency::Eventual => "eventual",
-                CommandConsistency::Atomic => "atomic",
-            }
-            .into(),
+            kind: command.consistency,
         };
         let direct_projection = command_direct_projection_extension(command, surface)?;
-        let input_defaults = (!command.input_defaults.is_empty())
-            .then(|| {
-                command
-                    .input_defaults
-                    .iter()
-                    .map(|default| serde_json::to_value(default).map(canonical_json_value))
-                    .collect::<Result<Vec<_>, _>>()
-                    .map(|defaults| CommandInputDefaultsExtension {
-                        version: 1,
-                        defaults,
-                    })
-            })
-            .transpose()?;
+        let input_defaults =
+            (!command.input_defaults.is_empty()).then(|| CommandInputDefaultsExtension {
+                version: 1,
+                defaults: command.input_defaults.clone(),
+            });
         let mut trusted_presets = command_trusted_preset_descriptors(command, surface)?;
         let projection = command_projection_extension(command, surface, &trusted_presets)?;
         if let Some(projection) = &projection {
@@ -440,52 +427,14 @@ pub(super) fn client_manifest_from_surface_with_execution(
         cache_scope: true,
         confirmed_persistence: false,
     };
-    let protocol_fingerprint = protocol_fingerprint()?;
+    let protocol_fingerprint = client_protocol_fingerprint()?;
 
-    #[derive(Serialize)]
-    struct SchemaMaterial<'a> {
-        manifest_version: u32,
-        protocol_version: u32,
-        service_id: &'a str,
-        surface: &'a ClientSurfaceIdentity,
-        execution: &'a ClientExecutionLimits,
-        capabilities: &'a ClientCapabilities,
-        scalar_codecs: &'a [ScalarCodec],
-        models: &'a [ClientModel],
-        roots: &'a [ClientRoot],
-        commands: &'a [ClientCommand],
-        protocol_operations: &'a ClientProtocolOperations,
-        projectors: &'a [ClientProjector],
-        projection_programs: &'a [ClientProjectionProgram],
-        projection_bindings: &'a [ClientProjectionBinding],
-        #[serde(skip_serializing_if = "<[ClientLeaderboard]>::is_empty")]
-        leaderboards: &'a [ClientLeaderboard],
-    }
-    let schema_material = SchemaMaterial {
-        manifest_version: DISTRIBUTED_CLIENT_MANIFEST_VERSION,
-        protocol_version: DISTRIBUTED_CLIENT_PROTOCOL_VERSION,
-        service_id,
-        surface: &identity,
-        execution: &execution,
-        capabilities: &capabilities,
-        scalar_codecs: &scalar_codecs,
-        models: &models,
-        roots: &roots,
-        commands: &commands,
-        protocol_operations: &protocol_operations,
-        projectors: &projectors,
-        projection_programs: &projection_programs,
-        projection_bindings: &projection_bindings,
-        leaderboards: &leaderboards,
-    };
-    let schema_fingerprint = hash_json(&schema_material)?;
-
-    let manifest = DistributedClientManifest {
+    let mut manifest = DistributedClientManifest {
         manifest_version: DISTRIBUTED_CLIENT_MANIFEST_VERSION,
         protocol_version: DISTRIBUTED_CLIENT_PROTOCOL_VERSION,
         service_id: service_id.into(),
         surface: identity,
-        schema_fingerprint,
+        schema_fingerprint: String::new(),
         protocol_fingerprint,
         execution,
         capabilities,
@@ -499,10 +448,11 @@ pub(super) fn client_manifest_from_surface_with_execution(
         projection_bindings,
         leaderboards,
     };
+    manifest.schema_fingerprint = manifest.computed_schema_fingerprint()?;
     // Validate the one exact scope-wide descriptor union while the complete
     // role-selected manifest is still available. The serialized manifest need
     // not duplicate this deterministic derivation.
-    trusted_preset_descriptors(&manifest)?;
+    trusted_preset_descriptors(&manifest.models, &manifest.commands)?;
     Ok(manifest)
 }
 

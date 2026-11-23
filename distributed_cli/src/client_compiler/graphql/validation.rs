@@ -2,8 +2,8 @@ use super::*;
 
 pub(super) fn validate_execution_limits(
     root: &CompiledRoot,
-    kind: RootKind,
-    execution: &ManifestExecutionLimits,
+    kind: ClientRootKind,
+    execution: &ClientExecutionLimits,
     document: &ClientDocument,
     position: Pos,
 ) -> Result<(), ClientCompileError> {
@@ -21,14 +21,7 @@ pub(super) fn validate_execution_limits(
     }
 
     let weights = &execution.complexity;
-    let child = compiled_object_complexity(&root.selection, weights);
-    let complexity = match kind {
-        RootKind::List => weights
-            .list_root
-            .saturating_add(weights.list_fanout.saturating_mul(child)),
-        RootKind::ByPk => weights.by_pk.saturating_add(child),
-        RootKind::Aggregate => weights.aggregate.saturating_add(child),
-    };
+    let complexity = weights.root(kind, compiled_object_complexity(&root.selection, weights));
     if complexity > execution.max_complexity {
         return Err(source_error(
             "client.operation.complexity_limit",
@@ -60,45 +53,31 @@ pub(super) fn compiled_object_depth(selection: &CompiledObject, parent_depth: u6
         .unwrap_or(parent_depth)
 }
 
+/// The service's own cost formula ([`ClientComplexityWeights`]) over the
+/// compiled selection, with the weights the selected service advertises.
 pub(super) fn compiled_object_complexity(
     selection: &CompiledObject,
-    weights: &ManifestComplexityWeights,
+    weights: &ClientComplexityWeights,
 ) -> u64 {
-    selection.members.iter().fold(0, |total, member| {
-        let cost = match member {
-            CompiledMember::Scalar(_) => weights.scalar,
-            CompiledMember::Branch(branch) => match branch.semantic {
-                CompiledBranchSemantic::Relationship => {
-                    let child = compiled_object_complexity(&branch.selection, weights);
-                    match branch
+    weights.object(selection.members.iter().map(|member| match member {
+        CompiledMember::Scalar(_) => weights.scalar,
+        CompiledMember::Branch(branch) => {
+            let child = compiled_object_complexity(&branch.selection, weights);
+            match branch.semantic {
+                CompiledBranchSemantic::Relationship => weights.relationship(
+                    branch
                         .relationship
                         .as_ref()
                         .expect("relationship branches retain their compiled descriptor")
-                        .kind
-                    {
-                        ManifestRelationshipKind::BelongsTo => {
-                            weights.belongs_to.saturating_add(child)
-                        }
-                        ManifestRelationshipKind::HasMany => weights
-                            .has_many
-                            .saturating_add(weights.list_fanout.saturating_mul(child)),
-                        ManifestRelationshipKind::ManyToMany => weights
-                            .m2m
-                            .saturating_add(weights.list_fanout.saturating_mul(child)),
-                    }
-                }
-                CompiledBranchSemantic::Aggregate => weights
-                    .aggregate
-                    .saturating_add(compiled_object_complexity(&branch.selection, weights)),
+                        .kind,
+                    child,
+                ),
+                CompiledBranchSemantic::Aggregate => weights.aggregate(child),
                 CompiledBranchSemantic::AggregateFields => weights.scalar,
-                CompiledBranchSemantic::AggregateNodes => weights
-                    .list_fanout
-                    .saturating_mul(compiled_object_complexity(&branch.selection, weights))
-                    .max(weights.scalar),
-            },
-        };
-        total.saturating_add(cost)
-    })
+                CompiledBranchSemantic::AggregateNodes => weights.aggregate_nodes(child),
+            }
+        }
+    }))
 }
 
 pub(super) fn filter_depth_from_selection(selection_depth: usize, root_offset: usize) -> u64 {
@@ -109,12 +88,12 @@ pub(super) fn filter_depth_from_selection(selection_depth: usize, root_offset: u
 #[allow(clippy::too_many_arguments)]
 pub(super) fn validate_filter_source(
     source: &CompiledArgument,
-    model: &ManifestModel,
-    input: &ManifestFilterInput,
+    model: &ClientModel,
+    input: &ClientFilterInput,
     expected_type: &str,
     variables: &[CompiledVariable],
     manifest: &ClientManifest,
-    execution: &ManifestExecutionLimits,
+    execution: &ClientExecutionLimits,
     document: &ClientDocument,
     position: Pos,
     depth: u64,
@@ -310,8 +289,8 @@ pub(super) fn validate_filter_source(
 }
 
 pub(super) fn validate_filter_depth(
-    model: &ManifestModel,
-    execution: &ManifestExecutionLimits,
+    model: &ClientModel,
+    execution: &ClientExecutionLimits,
     depth: u64,
     document: &ClientDocument,
     position: Pos,
@@ -376,11 +355,11 @@ pub(super) fn constrain_variable(
 #[allow(clippy::too_many_arguments)]
 pub(super) fn validate_filter_comparison_source(
     source: &CompiledArgument,
-    model: &ManifestModel,
-    field: &ManifestField,
-    semantics: &ManifestFilterField,
+    model: &ClientModel,
+    field: &ClientField,
+    semantics: &ClientFilterField,
     variables: &[CompiledVariable],
-    execution: &ManifestExecutionLimits,
+    execution: &ClientExecutionLimits,
     document: &ClientDocument,
     position: Pos,
     constraints: &mut BTreeMap<String, VariableUseConstraint>,
@@ -583,8 +562,8 @@ pub(super) fn validate_filter_comparison_source(
 
 pub(super) fn validate_compiled_filter_literal(
     source: &CompiledArgument,
-    model: &ManifestModel,
-    field: &ManifestField,
+    model: &ClientModel,
+    field: &ClientField,
     nullable: bool,
     document: &ClientDocument,
     position: Pos,
@@ -604,8 +583,8 @@ pub(super) fn validate_compiled_filter_literal(
 #[allow(clippy::too_many_arguments)]
 pub(super) fn validate_compiled_filter_typed_literal(
     source: &CompiledArgument,
-    model: &ManifestModel,
-    field: &ManifestField,
+    model: &ClientModel,
+    field: &ClientField,
     scalar: &str,
     codec: &str,
     nullable: bool,
@@ -647,8 +626,8 @@ pub(super) fn compiled_literal_json(source: &CompiledArgument) -> Option<JsonVal
 
 pub(super) fn validate_filter_scalar_literal(
     value: &JsonValue,
-    model: &ManifestModel,
-    field: &ManifestField,
+    model: &ClientModel,
+    field: &ClientField,
     nullable: bool,
     document: &ClientDocument,
     position: Pos,
@@ -668,8 +647,8 @@ pub(super) fn validate_filter_scalar_literal(
 #[allow(clippy::too_many_arguments)]
 pub(super) fn validate_filter_typed_literal(
     value: &JsonValue,
-    model: &ManifestModel,
-    field: &ManifestField,
+    model: &ClientModel,
+    field: &ClientField,
     scalar: &str,
     codec: &str,
     nullable: bool,
@@ -805,10 +784,10 @@ pub(super) fn json_singleton(name: &str, value: JsonValue) -> JsonValue {
 #[allow(clippy::too_many_arguments)]
 pub(super) fn validate_filter_literal(
     value: &JsonValue,
-    model: &ManifestModel,
-    input: &ManifestFilterInput,
+    model: &ClientModel,
+    input: &ClientFilterInput,
     manifest: &ClientManifest,
-    execution: &ManifestExecutionLimits,
+    execution: &ClientExecutionLimits,
     document: &ClientDocument,
     position: Pos,
     depth: u64,
@@ -1018,7 +997,7 @@ pub(super) fn validate_filter_literal(
 
 pub(super) fn validate_order_literal(
     value: &JsonValue,
-    semantics: &ManifestOrderSemantics,
+    semantics: &ClientOrderSemantics,
     document: &ClientDocument,
     position: Pos,
 ) -> Result<(), ClientCompileError> {
@@ -1081,8 +1060,8 @@ pub(super) fn validate_order_literal(
 
 pub(super) fn validate_order_source(
     source: &CompiledArgument,
-    semantics: &ManifestOrderSemantics,
-    argument: Option<&ManifestArgument>,
+    semantics: &ClientOrderSemantics,
+    argument: Option<&ClientArgument>,
     variables: &[CompiledVariable],
     document: &ClientDocument,
     position: Pos,
@@ -1092,14 +1071,12 @@ pub(super) fn validate_order_source(
             validate_order_literal(value, semantics, document, position)
         }
         CompiledArgument::Variable(name) => {
-            let expected = argument
-                .map(ManifestArgument::graphql_type)
-                .ok_or_else(|| {
-                    ClientCompileError::manifest(
-                        "client.manifest.order_argument",
-                        "order semantics exist without an order argument",
-                    )
-                })?;
+            let expected = argument.map(ClientArgument::graphql_type).ok_or_else(|| {
+                ClientCompileError::manifest(
+                    "client.manifest.order_argument",
+                    "order semantics exist without an order argument",
+                )
+            })?;
             validate_nested_variable(name, &expected, variables, document, position)
         }
         CompiledArgument::List(entries) => {
@@ -1156,7 +1133,7 @@ pub(super) fn validate_order_source(
 
 pub(super) fn validate_order_entry_source(
     fields: &BTreeMap<String, CompiledArgument>,
-    semantics: &ManifestOrderSemantics,
+    semantics: &ClientOrderSemantics,
     variables: &[CompiledVariable],
     document: &ClientDocument,
     position: Pos,
@@ -1210,5 +1187,27 @@ pub(super) fn validate_order_entry_source(
             document,
             position,
         )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The service charges one scalar for a selection with nothing costed in
+    /// it; a compiler that charged zero would accept an operation the service
+    /// then rejects at its `max_complexity`.
+    #[test]
+    fn an_empty_selection_costs_what_the_service_charges() {
+        let weights = ClientComplexityWeights {
+            scalar: 4,
+            ..ClientComplexityWeights::current()
+        };
+        let empty = CompiledObject {
+            typename: "todo".into(),
+            storage: CompiledStorage::Embedded,
+            members: Vec::new(),
+        };
+        assert_eq!(compiled_object_complexity(&empty, &weights), 4);
     }
 }

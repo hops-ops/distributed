@@ -19,7 +19,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::client_compiler::{
-    compile_client, ClientCompileInput, ClientDocument, ClientSurfaceSelector, GeneratedClientFile,
+    compile_client, ClientCompileInput, ClientDocument, ClientSurfaceIdentity, GeneratedClientFile,
     GeneratedClientProject,
 };
 use crate::contracts::{
@@ -45,7 +45,6 @@ use crate::{
 };
 
 const DISTRIBUTED_MANIFEST_SCHEMA_VERSION: u64 = 2;
-const DISTRIBUTED_CLIENT_MANIFEST_VERSION: u64 = 2;
 
 /// Top-level standalone CLI arguments for the `distributed` binary.
 #[derive(Args, Debug)]
@@ -1778,7 +1777,7 @@ fn run_client(args: &ClientArgs) -> Result<(), Box<dyn Error>> {
             format!("parse client manifest {}: {error}", args.manifest.display()).into()
         })?;
     let selector = match (&args.role, &args.surface) {
-        (Some(role), None) => ClientSurfaceSelector::role(role.clone()),
+        (Some(role), None) => ClientSurfaceIdentity::role(role.clone()),
         (None, Some(surface)) => {
             // Prefer explicit CLI roles when both lists are provided; otherwise
             // take eligible/schema roles from the application surface in the
@@ -1795,14 +1794,16 @@ fn run_client(args: &ClientArgs) -> Result<(), Box<dyn Error>> {
             } else {
                 application_roles_from_manifest(&manifest, surface)?
             };
-            ClientSurfaceSelector::application(surface.clone(), eligible_roles, schema_roles)
+            ClientSurfaceIdentity::application(surface.clone(), eligible_roles, schema_roles)
         }
         _ => {
             return Err("pass exactly one of --role <name> or --surface <application-name>".into());
         }
     };
     let documents = collect_client_documents(&args.documents)?;
-    let project = compile_client(ClientCompileInput::new(manifest, selector, documents))?;
+    let project = compile_client(ClientCompileInput::from_manifest_json(
+        manifest, selector, documents,
+    )?)?;
 
     if args.check {
         check_client_project(&args.out, &project)?;
@@ -2831,54 +2832,11 @@ fn validate_manifest_json(envelope: &serde_json::Value) -> Result<(), Box<dyn Er
     Ok(())
 }
 
+/// The harness printed exactly the client manifest this CLI was built with.
 fn validate_client_manifest_json(manifest: &serde_json::Value) -> Result<(), Box<dyn Error>> {
-    let Some(version) = manifest
-        .get("manifest_version")
-        .and_then(serde_json::Value::as_u64)
-    else {
-        return Err("client manifest JSON is missing numeric manifest_version".into());
-    };
-    if version != DISTRIBUTED_CLIENT_MANIFEST_VERSION {
-        return Err(format!(
-            "unsupported Distributed client manifest version {version}; expected {DISTRIBUTED_CLIENT_MANIFEST_VERSION}"
-        )
-        .into());
-    }
-    if manifest
-        .get("protocol_version")
-        .and_then(serde_json::Value::as_u64)
-        .is_none()
-    {
-        return Err("client manifest JSON is missing numeric protocol_version".into());
-    }
-    for field in ["service_id", "schema_fingerprint", "protocol_fingerprint"] {
-        if manifest
-            .get(field)
-            .and_then(serde_json::Value::as_str)
-            .is_none()
-        {
-            return Err(format!("client manifest JSON is missing string {field}").into());
-        }
-    }
-    for field in ["surface", "capabilities"] {
-        if manifest
-            .get(field)
-            .and_then(serde_json::Value::as_object)
-            .is_none()
-        {
-            return Err(format!("client manifest JSON is missing object {field}").into());
-        }
-    }
-    for field in ["scalar_codecs", "models", "roots", "commands", "projectors"] {
-        if manifest
-            .get(field)
-            .and_then(serde_json::Value::as_array)
-            .is_none()
-        {
-            return Err(format!("client manifest JSON is missing array {field}").into());
-        }
-    }
-    Ok(())
+    serde_json::from_value::<crate::DistributedClientManifest>(manifest.clone())
+        .map(drop)
+        .map_err(|error| format!("invalid Distributed client manifest: {error}").into())
 }
 
 pub(crate) fn resolve_distributed_path(
@@ -3084,32 +3042,13 @@ mod tests {
     }
 
     #[test]
-    fn client_manifest_validator_accepts_only_current_version() {
-        let manifest = serde_json::json!({
-            "manifest_version": DISTRIBUTED_CLIENT_MANIFEST_VERSION,
-            "protocol_version": 1,
-            "service_id": "orders",
-            "schema_fingerprint": "sha256:schema",
-            "protocol_fingerprint": "sha256:protocol",
-            "surface": {},
-            "capabilities": {},
-            "scalar_codecs": [],
-            "models": [],
-            "roots": [],
-            "commands": [],
-            "projectors": [],
-            "projection_programs": [],
-            "projection_bindings": []
-        });
-        validate_client_manifest_json(&manifest).expect("current manifest version");
-
-        let mut stale = manifest;
-        stale["manifest_version"] = serde_json::json!(3);
-        let error = validate_client_manifest_json(&stale)
+    fn client_manifest_validator_rejects_other_versions() {
+        let error = validate_client_manifest_json(&serde_json::json!({"manifest_version": 3}))
             .expect_err("pre-release v3 manifests must be rejected");
-        assert!(error.to_string().contains(&format!(
-            "version 3; expected {DISTRIBUTED_CLIENT_MANIFEST_VERSION}"
-        )));
+        assert!(
+            error.to_string().contains("version 3; expected 2"),
+            "{error}"
+        );
     }
 
     #[test]

@@ -13,6 +13,10 @@ use std::process::Command;
 
 use distributed_cli::{generate_game_client, ImportExtension};
 
+#[path = "support/golden.rs"]
+mod golden;
+use golden::assert_golden;
+
 fn root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).to_path_buf()
 }
@@ -22,10 +26,6 @@ fn sample_surface() -> String {
     let fixture: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(path).expect("authoring fixture")).unwrap();
     serde_json::to_string_pretty(&fixture["surface"]).unwrap()
-}
-
-fn golden_dir() -> PathBuf {
-    root().join("tests/fixtures/game-client/sample")
 }
 
 fn distributed(args: &[&str]) -> std::process::Output {
@@ -53,20 +53,8 @@ fn generated_typescript_matches_the_golden_files() {
             "surface.json"
         ]
     );
-    let dir = golden_dir();
-    if std::env::var_os("UPDATE_GOLDEN").is_some() {
-        fs::create_dir_all(&dir).unwrap();
-        for file in &files {
-            fs::write(dir.join(&file.path), &file.contents).unwrap();
-        }
-    }
     for file in &files {
-        let golden = fs::read_to_string(dir.join(&file.path)).unwrap_or_default();
-        assert_eq!(
-            golden, file.contents,
-            "{} drifted; regenerate with UPDATE_GOLDEN=1",
-            file.path
-        );
+        assert_golden(&format!("game-client/sample/{}", file.path), &file.contents);
     }
     // Deterministic: a second run is byte-identical.
     assert_eq!(

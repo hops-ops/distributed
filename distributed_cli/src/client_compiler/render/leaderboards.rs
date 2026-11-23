@@ -7,7 +7,7 @@
 
 use super::common::json_string;
 use crate::client_compiler::manifest::{
-    ClientManifest, ManifestLeaderboard, ManifestLeaderboardRoot, LEADERBOARD_ENTRY_TYPENAME,
+    ClientLeaderboard, ClientLeaderboardRoot, ClientManifest, LEADERBOARD_ENTRY_TYPENAME,
 };
 use crate::client_compiler::ClientCompileError;
 
@@ -54,8 +54,8 @@ fn pascal(name: &str) -> String {
 
 fn render_root(
     manifest: &ClientManifest,
-    leaderboard: &ManifestLeaderboard,
-    root: &ManifestLeaderboardRoot,
+    leaderboard: &ClientLeaderboard,
+    root: &ClientLeaderboardRoot,
 ) -> Result<(String, String), ClientCompileError> {
     let operation = pascal(&root.name);
     let variables = root

@@ -69,18 +69,18 @@ pub(crate) fn canonical_json_value(value: JsonValue) -> JsonValue {
 
 #[cfg(test)]
 mod canonical_wire_tests {
-    use super::super::{ManifestFilterExpr, ManifestLitValue, ManifestOperand};
+    use super::super::{FilterExpr, LitValue, Operand};
 
     #[test]
     fn filter_expr_serialization_is_canonical_across_map_backends() {
         let mut value = serde_json::Map::new();
         value.insert("z".into(), serde_json::json!(2));
         value.insert("a".into(), serde_json::json!(1));
-        let expression = ManifestFilterExpr::In {
+        let expression = FilterExpr::In {
             column: "metadata".into(),
-            values: vec![ManifestOperand::Lit(ManifestLitValue::Json(
-                serde_json::Value::Object(value),
-            ))],
+            values: vec![Operand::Lit(LitValue::Json(serde_json::Value::Object(
+                value,
+            )))],
             negated: false,
         };
 

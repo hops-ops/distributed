@@ -264,7 +264,8 @@ pub(crate) fn resolve_protocol_preset(
 pub(crate) fn protocol_trusted_presets(
     manifest: &DistributedClientManifest,
 ) -> Result<Vec<ClientTrustedPresetDescriptor>, GraphqlBuildError> {
-    trusted_preset_descriptors(manifest).map_err(|error| GraphqlBuildError(error.to_string()))
+    trusted_preset_descriptors(&manifest.models, &manifest.commands)
+        .map_err(|error| GraphqlBuildError(error.to_string()))
 }
 
 pub(crate) fn operation_fingerprint(document: &str) -> String {
