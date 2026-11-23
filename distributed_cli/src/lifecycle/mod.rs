@@ -15,6 +15,11 @@ mod release;
 /// lifecycle configuration.
 pub(crate) const LIFECYCLE_CLI_EXECUTABLE_ENV: &str = "DISTRIBUTED_LIFECYCLE_CLI_EXECUTABLE";
 
+/// A file the CLI puts in a directory it generates inside the application
+/// source tree. Such a directory is a build product, never a lifecycle input:
+/// hashing and watching skip it, so writing it does not start another build.
+pub(crate) const GENERATED_DIRECTORY_MARKER: &str = ".distributed-generated";
+
 pub use build::{
     activate_lifecycle_project_generation, run_lifecycle_build, run_lifecycle_project_build,
     BuildDrift, LifecycleActivation, LifecycleBuildConfig, LifecycleBuildOptions,

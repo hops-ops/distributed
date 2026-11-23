@@ -1,15 +1,14 @@
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-#[cfg(unix)]
-use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::contracts::ContractCatalog;
+use crate::process::ProcessGroup;
 
 use super::build::{lifecycle_input_snapshot, resolve_output};
 use super::graph::LifecycleErrorReason;
@@ -328,11 +327,20 @@ pub fn run_lifecycle_project_dev(
         .map(|name| (name.clone(), 0))
         .collect::<BTreeMap<_, _>>();
 
+    let mut watch = InputWatch {
+        root: &root,
+        catalog,
+        graph: &graph,
+        progress: options.progress,
+        failure: None,
+    };
     let result = (|| {
         while !options.stop.load(Ordering::SeqCst) {
             children.ensure_running()?;
             std::thread::sleep(Duration::from_millis(dev.poll_ms));
-            let next = lifecycle_input_snapshot(&root, catalog, &graph)?;
+            let Some(next) = watch.observe() else {
+                continue;
+            };
             let mut changed = changed_paths(&snapshot, &next);
             if changed.is_empty() {
                 continue;
@@ -346,7 +354,10 @@ pub fn run_lifecycle_project_dev(
                     return Ok(());
                 }
                 std::thread::sleep(Duration::from_millis(dev.poll_ms.min(dev.debounce_ms)));
-                let observed = lifecycle_input_snapshot(&root, catalog, &graph)?;
+                let Some(observed) = watch.observe() else {
+                    quiet_since = Instant::now();
+                    continue;
+                };
                 let delta = changed_paths(&latest, &observed);
                 if !delta.is_empty() {
                     changed.extend(delta);
@@ -378,16 +389,7 @@ pub fn run_lifecycle_project_dev(
                     return Err(error);
                 }
                 std::thread::sleep(Duration::from_millis(dev.poll_ms));
-                let observed = match lifecycle_input_snapshot(&root, catalog, &graph) {
-                    Ok(observed) => observed,
-                    Err(error) => {
-                        cancel.store(true, Ordering::SeqCst);
-                        let _ = build.join();
-                        return Err(error);
-                    }
-                };
-                if !changed_paths(&latest, &observed).is_empty() {
-                    latest = observed;
+                if watch.observe().is_some_and(|observed| observed != latest) {
                     superseded = true;
                     cancel.store(true, Ordering::SeqCst);
                 }
@@ -403,16 +405,11 @@ pub fn run_lifecycle_project_dev(
                 {
                     return Ok(())
                 }
-                Err(error)
-                    if superseded
-                        && matches!(
-                            error.reason(),
-                            LifecycleErrorReason::Canceled | LifecycleErrorReason::Superseded
-                        ) =>
-                {
-                    continue
-                }
                 Err(error) if error.reason() == LifecycleErrorReason::Superseded => continue,
+                // A build says nothing about inputs that changed, or could not
+                // be read, while it ran. The baseline is unchanged, so the
+                // next poll builds what is there now.
+                Err(_) if superseded || watch.observe().as_ref() != Some(&latest) => continue,
                 Err(error) => return Err(error),
             };
             rebuilds += 1;
@@ -808,6 +805,38 @@ impl DevStateStore {
     }
 }
 
+/// The generations a `dev` session over the lifecycle directory `out` still
+/// reads, from its state file: the active one, a pending one, and the one each
+/// process was started with. Empty when no session is running. `None` when
+/// the state file cannot be understood, and so nothing is known to be unused.
+pub(super) fn generations_in_use(out: &Path) -> Option<BTreeSet<String>> {
+    fn collect(value: &serde_json::Value, found: &mut BTreeSet<String>) {
+        match value {
+            serde_json::Value::Object(object) => {
+                for (key, value) in object {
+                    match value.as_str() {
+                        Some(generation) if key == "generationId" => {
+                            found.insert(generation.to_string());
+                        }
+                        _ => collect(value, found),
+                    }
+                }
+            }
+            serde_json::Value::Array(values) => {
+                values.iter().for_each(|value| collect(value, found))
+            }
+            _ => {}
+        }
+    }
+    let mut found = BTreeSet::new();
+    match fs::read(out.join("dev.json")) {
+        Ok(bytes) => collect(&serde_json::from_slice(&bytes).ok()?, &mut found),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => return None,
+    }
+    Some(found)
+}
+
 struct DevTransition {
     id: String,
     // TempDir removes this attempt's acknowledgement directory after the
@@ -877,6 +906,45 @@ fn validate_restart_nodes(
     Ok(())
 }
 
+/// The watched inputs as the supervisor polls them.
+///
+/// A file can vanish or be half replaced while it is read (an editor's atomic
+/// rename, a checkout), so a failed read is not an observation: the caller
+/// keeps what it last saw and the next poll reads again. A failure that
+/// persists is reported once, and so is the recovery.
+struct InputWatch<'a> {
+    root: &'a Path,
+    catalog: &'a ContractCatalog,
+    graph: &'a LifecycleGraph,
+    progress: bool,
+    failure: Option<String>,
+}
+
+impl InputWatch<'_> {
+    fn observe(&mut self) -> Option<BTreeMap<String, String>> {
+        match lifecycle_input_snapshot(self.root, self.catalog, self.graph) {
+            Ok(snapshot) => {
+                if self.failure.take().is_some() && self.progress {
+                    eprintln!("lifecycle dev: watched inputs are readable again");
+                }
+                Some(snapshot)
+            }
+            Err(error) => {
+                let failure = error.to_string();
+                if self.failure.as_ref() != Some(&failure) {
+                    if self.progress {
+                        eprintln!(
+                            "lifecycle dev: cannot read watched inputs, will keep trying: {failure}"
+                        );
+                    }
+                    self.failure = Some(failure);
+                }
+                None
+            }
+        }
+    }
+}
+
 fn changed_paths(
     before: &BTreeMap<String, String>,
     after: &BTreeMap<String, String>,
@@ -917,7 +985,7 @@ impl DevMemberState {
 }
 
 struct ChildSet {
-    children: BTreeMap<String, Child>,
+    children: BTreeMap<String, ProcessGroup>,
     members: BTreeMap<String, DevMemberState>,
 }
 
@@ -972,7 +1040,7 @@ impl ChildSet {
             ));
         }
         for (name, child) in &mut self.children {
-            if let Some(status) = child.try_wait().map_err(|error| {
+            if let Some(status) = child.leader().try_wait().map_err(|error| {
                 LifecycleError::new(format!("failed to inspect dev process `{name}`: {error}"))
             })? {
                 return Err(LifecycleError::new(format!(
@@ -1098,30 +1166,22 @@ impl ChildSet {
         Ok(())
     }
 
+    /// Stop every process: all are asked at once, and share one grace period.
     fn shutdown(&mut self, timeout: Duration) -> Result<(), LifecycleError> {
         for (name, child) in &mut self.children {
-            terminate_process_group(name, child)?;
+            child.terminate().map_err(group_error(name, "stop"))?;
         }
-        let started = Instant::now();
-        loop {
-            let mut running = Vec::new();
-            for (name, child) in &mut self.children {
-                if process_group_is_running(child)? {
-                    running.push(name.clone());
-                }
+        let deadline = Instant::now() + timeout;
+        for (name, child) in &mut self.children {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if !child
+                .wait_gone(remaining)
+                .map_err(group_error(name, "inspect"))?
+            {
+                child.kill().map_err(group_error(name, "kill"))?;
             }
-            if running.is_empty() {
-                return Ok(());
-            }
-            if started.elapsed() >= timeout {
-                for name in &running {
-                    let child = self.children.get_mut(name).unwrap();
-                    kill_process_group(name, child)?;
-                }
-                return wait_for_stopped_groups(&mut self.children, Duration::from_secs(1));
-            }
-            std::thread::sleep(Duration::from_millis(10));
         }
+        Ok(())
     }
 }
 
@@ -1130,7 +1190,7 @@ fn wait_ready(
     name: &str,
     process: &LifecycleDevProcess,
     generation: &LifecycleBuildReport,
-    child: &mut Child,
+    child: &mut ProcessGroup,
     stop: &AtomicBool,
 ) -> Result<(), LifecycleError> {
     let started = Instant::now();
@@ -1144,7 +1204,7 @@ fn wait_ready(
                 "readiness for lifecycle dev process `{name}` was canceled"
             )));
         }
-        if let Some(status) = child.try_wait().map_err(|error| {
+        if let Some(status) = child.leader().try_wait().map_err(|error| {
             LifecycleError::new(format!("failed to inspect dev process `{name}`: {error}"))
         })? {
             return Err(LifecycleError::new(format!(
@@ -1179,15 +1239,13 @@ fn wait_ready(
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
-        #[cfg(unix)]
-        command.process_group(0);
-        let mut probe_child = command.spawn().map_err(|error| {
+        let mut probe_child = ProcessGroup::spawn(&mut command).map_err(|error| {
             LifecycleError::new(format!(
                 "failed to run readiness probe for lifecycle dev process `{name}` with `{program}`: {error}"
             ))
         })?;
         let status = loop {
-            match probe_child.try_wait() {
+            match probe_child.leader().try_wait() {
                 Ok(Some(status)) => {
                     if started.elapsed() >= timeout.unwrap() {
                         return Err(readiness_timeout(name, probe.timeout_ms));
@@ -1196,20 +1254,23 @@ fn wait_ready(
                 }
                 Ok(None) => {}
                 Err(error) => {
-                    let _ = force_stop_child(name, &mut probe_child);
                     return Err(LifecycleError::new(format!(
                         "failed to inspect readiness probe for lifecycle dev process `{name}`: {error}"
                     )));
                 }
             }
             if stop.load(Ordering::SeqCst) {
-                force_stop_child(name, &mut probe_child)?;
+                probe_child
+                    .kill()
+                    .map_err(group_error(name, "kill the readiness probe of"))?;
                 return Err(LifecycleError::canceled(format!(
                     "readiness for lifecycle dev process `{name}` was canceled"
                 )));
             }
             if started.elapsed() >= timeout.unwrap() {
-                force_stop_child(name, &mut probe_child)?;
+                probe_child
+                    .kill()
+                    .map_err(group_error(name, "kill the readiness probe of"))?;
                 return Err(readiness_timeout(name, probe.timeout_ms));
             }
             std::thread::sleep(
@@ -1259,7 +1320,7 @@ fn spawn_process(
     process: &LifecycleDevProcess,
     generation: &LifecycleBuildReport,
     instance_id: &str,
-) -> Result<Child, LifecycleError> {
+) -> Result<ProcessGroup, LifecycleError> {
     let cwd = resolve_working_dir(root, process.cwd.as_deref(), process.external_cwd)?;
     let args = process
         .args
@@ -1279,27 +1340,29 @@ fn spawn_process(
         .env("DISTRIBUTED_MEMBER_ID", name)
         .env("DISTRIBUTED_PROCESS_INSTANCE_ID", instance_id)
         .stdin(Stdio::null());
-    #[cfg(unix)]
-    command.process_group(0);
-    command.spawn().map_err(|error| {
+    ProcessGroup::spawn(&mut command).map_err(|error| {
         LifecycleError::new(format!(
             "failed to start lifecycle dev process `{name}` with `{program}`: {error}"
         ))
     })
 }
 
-fn stop_child(name: &str, child: &mut Child, timeout: Duration) -> Result<(), LifecycleError> {
-    terminate_process_group(name, child)?;
-    if wait_for_stopped_child(child, timeout)? {
-        return Ok(());
-    }
-    kill_process_group(name, child)?;
-    if wait_for_stopped_child(child, Duration::from_secs(1))? {
-        Ok(())
-    } else {
-        Err(LifecycleError::new(format!(
-            "lifecycle dev process group `{name}` remained alive after SIGKILL"
-        )))
+fn stop_child(
+    name: &str,
+    child: &mut ProcessGroup,
+    timeout: Duration,
+) -> Result<(), LifecycleError> {
+    child.stop(timeout).map_err(group_error(name, "stop"))
+}
+
+fn group_error<'a>(
+    name: &'a str,
+    action: &'a str,
+) -> impl FnOnce(std::io::Error) -> LifecycleError + 'a {
+    move |error| {
+        LifecycleError::new(format!(
+            "failed to {action} lifecycle dev process group `{name}`: {error}"
+        ))
     }
 }
 
@@ -1393,136 +1456,6 @@ fn validate_process_env(
     Ok(())
 }
 
-#[cfg(unix)]
-fn signal_process_group(child: &Child, signal: libc::c_int) -> std::io::Result<()> {
-    let result = unsafe { libc::kill(-(child.id() as libc::pid_t), signal) };
-    if result == 0 {
-        return Ok(());
-    }
-    let error = std::io::Error::last_os_error();
-    if error.raw_os_error() == Some(libc::ESRCH) {
-        Ok(())
-    } else {
-        Err(error)
-    }
-}
-
-fn process_group_is_running(child: &mut Child) -> Result<bool, LifecycleError> {
-    let leader_running = child.try_wait().map_err(io_error)?.is_none();
-    #[cfg(unix)]
-    {
-        let result = unsafe { libc::kill(-(child.id() as libc::pid_t), 0) };
-        if result == 0 {
-            return Ok(true);
-        }
-        let error = std::io::Error::last_os_error();
-        match error.raw_os_error() {
-            Some(libc::ESRCH) => Ok(leader_running),
-            Some(libc::EPERM) => Ok(true),
-            _ => Err(LifecycleError::new(format!(
-                "failed to inspect lifecycle dev process group: {error}"
-            ))),
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        Ok(leader_running)
-    }
-}
-
-fn wait_for_stopped_child(child: &mut Child, timeout: Duration) -> Result<bool, LifecycleError> {
-    let started = Instant::now();
-    loop {
-        if !process_group_is_running(child)? {
-            return Ok(true);
-        }
-        if started.elapsed() >= timeout {
-            return Ok(false);
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    }
-}
-
-fn wait_for_stopped_groups(
-    children: &mut BTreeMap<String, Child>,
-    timeout: Duration,
-) -> Result<(), LifecycleError> {
-    let started = Instant::now();
-    loop {
-        let mut running = Vec::new();
-        for (name, child) in children.iter_mut() {
-            if process_group_is_running(child)? {
-                running.push(name.clone());
-            }
-        }
-        if running.is_empty() {
-            return Ok(());
-        }
-        if started.elapsed() >= timeout {
-            return Err(LifecycleError::new(format!(
-                "lifecycle dev process groups remained alive after SIGKILL: {}",
-                running.join(", ")
-            )));
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    }
-}
-
-fn force_stop_child(name: &str, child: &mut Child) -> Result<(), LifecycleError> {
-    kill_process_group(name, child)?;
-    if wait_for_stopped_child(child, Duration::from_secs(1))? {
-        Ok(())
-    } else {
-        Err(LifecycleError::new(format!(
-            "readiness probe for lifecycle dev process `{name}` remained alive after SIGKILL"
-        )))
-    }
-}
-
-fn terminate_process_group(name: &str, child: &mut Child) -> Result<(), LifecycleError> {
-    #[cfg(unix)]
-    {
-        signal_process_group(child, libc::SIGTERM).map_err(|error| {
-            LifecycleError::new(format!(
-                "failed to stop lifecycle dev process group `{name}`: {error}"
-            ))
-        })
-    }
-    #[cfg(not(unix))]
-    {
-        if child.try_wait().map_err(io_error)?.is_none() {
-            child.kill().map_err(|error| {
-                LifecycleError::new(format!(
-                    "failed to stop lifecycle dev process `{name}`: {error}"
-                ))
-            })?;
-        }
-        Ok(())
-    }
-}
-
-fn kill_process_group(name: &str, child: &mut Child) -> Result<(), LifecycleError> {
-    #[cfg(unix)]
-    {
-        signal_process_group(child, libc::SIGKILL).map_err(|error| {
-            LifecycleError::new(format!(
-                "failed to kill lifecycle dev process group `{name}`: {error}"
-            ))
-        })
-    }
-    #[cfg(not(unix))]
-    {
-        if child.try_wait().map_err(io_error)?.is_none() {
-            child.kill().map_err(|error| {
-                LifecycleError::new(format!(
-                    "failed to kill lifecycle dev process `{name}`: {error}"
-                ))
-            })?;
-        }
-        Ok(())
-    }
-}
-
 fn resolve_file(root: &Path, path: &PathBuf) -> Result<PathBuf, LifecycleError> {
     let path = if path.is_absolute() {
         path.clone()
@@ -1540,10 +1473,6 @@ fn resolve_file(root: &Path, path: &PathBuf) -> Result<PathBuf, LifecycleError> 
         ));
     }
     Ok(resolved)
-}
-
-fn io_error(error: std::io::Error) -> LifecycleError {
-    LifecycleError::new(error.to_string())
 }
 
 #[cfg(test)]

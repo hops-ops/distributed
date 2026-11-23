@@ -1,14 +1,14 @@
-//! The `distributed` command surface: clap types plus the [`run_distributed`]
-//! dispatcher. Generation lives in the crate's `generate`/`atlas` modules and
-//! the `describe`/`schema` harness in `manifest_harness`; this module maps
-//! flags onto those types and owns filesystem / process side effects.
+//! The `distributed` command surface: clap types plus the [`run`] dispatcher.
+//! Generation lives in the crate's `generate`/`atlas` modules and the
+//! `describe`/`schema` harness in `manifest_harness`; this module maps flags
+//! onto those types and owns filesystem / process side effects.
 //!
-//! Host CLIs (for example `hops`) may mount [`ServiceArgs`] under a nested
-//! service command and dispatch with [`run`], re-exporting rather than
-//! reimplementing service-related commands.
+//! A host CLI (for example `hops`) mounts the same [`DistributedArgs`] under
+//! its own command and dispatches with [`run`], naming that command so `build`
+//! and `dev` can call back into the host executable.
 
 use clap::{ArgGroup, Args, Subcommand, ValueEnum};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::error::Error;
 use std::ffi::OsString;
 use std::fs;
@@ -19,8 +19,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::client_compiler::{
-    compile_client, ClientCompileInput, ClientDocument, ClientSurfaceIdentity, GeneratedClientFile,
-    GeneratedClientProject,
+    check_client_project, compile_client, write_client_project, ClientCompileInput, ClientDocument,
+    ClientSurfaceIdentity,
 };
 use crate::contracts::{
     contracts_accept, contracts_check, unknown_scope_diagnostic, ContractAcceptScope,
@@ -46,7 +46,8 @@ use crate::{
 
 const DISTRIBUTED_MANIFEST_SCHEMA_VERSION: u64 = 2;
 
-/// Top-level standalone CLI arguments for the `distributed` binary.
+/// The command tree, for the `distributed` binary and for a host CLI that
+/// mounts it under one of its own commands.
 #[derive(Args, Debug)]
 pub struct DistributedArgs {
     #[command(subcommand)]
@@ -80,7 +81,7 @@ pub enum DistributedCommands {
     Schema(SchemaArgs),
     /// Extract the embedded Distributed agent skills into a project
     Skills(SkillsArgs),
-    /// Internal bounded readiness probe used by `distributed dev`.
+    /// Internal bounded readiness probe used by `dev`.
     #[command(name = "__probe", hide = true)]
     Probe(ProbeArgs),
     /// Internal local Distributed JavaScript source watcher.
@@ -103,48 +104,6 @@ pub struct JavascriptWatchArgs {
     pub package_root: PathBuf,
     #[arg(long)]
     pub project_root: PathBuf,
-}
-
-/// Library adapter for embedding service-related commands under another CLI.
-#[derive(Args, Debug)]
-pub struct ServiceArgs {
-    #[command(subcommand)]
-    pub command: ServiceCommands,
-}
-
-#[derive(Subcommand, Debug)]
-pub enum ServiceCommands {
-    /// Build one coherent application generation
-    Build(BuildArgs),
-    /// Run one coherent local application supervisor
-    Dev(DevArgs),
-    /// Aggregate contract lifecycle check and accept
-    Contracts(ContractsArgs),
-    /// Scaffold a new Distributed microservice crate
-    #[command(alias = "create")]
-    Scaffold(ScaffoldArgs),
-    /// Print a service's explicit ApplicationManifest as JSON
-    Describe(DescribeArgs),
-    /// Compile role/application-scoped GraphQL operations into client artifacts
-    Client(ClientArgs),
-    /// Compile the service's authorized client Surface manifest as JSON
-    ClientManifest(ClientManifestArgs),
-    /// Print a distributed_game zone's GameSurface (kinds, input, events) as JSON
-    GameManifest(GameManifestArgs),
-    /// Generate typed TypeScript for a distributed_game zone from its GameSurface
-    GameClient(GameClientArgs),
-    /// Compile a distributed_game zone's `#[predict]` step and `#[game_pure]` functions to WebAssembly for its generated client
-    GameWasm(GameWasmArgs),
-    /// Render schema artifacts (SQL or an Atlas Operator resource) from a read-model catalog
-    Schema(SchemaArgs),
-    /// Extract the embedded Distributed agent skills into a project
-    Skills(SkillsArgs),
-    /// Internal bounded readiness probe used by `hops service dev`.
-    #[command(name = "__probe", hide = true)]
-    Probe(ProbeArgs),
-    /// Internal local Distributed JavaScript source watcher.
-    #[command(name = "__js-watch", hide = true)]
-    JavascriptWatch(JavascriptWatchArgs),
 }
 
 #[derive(Args, Debug)]
@@ -707,11 +666,16 @@ impl From<GitopsPromote> for GitopsPromoteTarget {
     }
 }
 
-/// Dispatch the standalone `distributed` binary command tree.
-pub fn run_distributed(args: &DistributedArgs) -> Result<(), Box<dyn Error>> {
+/// Dispatch a parsed command.
+///
+/// `command_prefix` is how this command tree is reached from the running
+/// executable: empty for the `distributed` binary, `["service"]` for a host
+/// that mounts it as `hops service`. `build` and `dev` start the executable
+/// again with that prefix for their internal commands.
+pub fn run(args: &DistributedArgs, command_prefix: &[&str]) -> Result<(), Box<dyn Error>> {
     match &args.command {
-        DistributedCommands::Build(build) => run_build(build, &[]),
-        DistributedCommands::Dev(dev) => run_dev(dev, &[]),
+        DistributedCommands::Build(build) => run_build(build, command_prefix),
+        DistributedCommands::Dev(dev) => run_dev(dev, command_prefix),
         DistributedCommands::Contracts(contracts) => run_contracts(contracts),
         DistributedCommands::Scaffold(scaffold) => run_scaffold(scaffold),
         DistributedCommands::Describe(describe) => run_describe(describe),
@@ -755,30 +719,6 @@ fn run_probe(args: &ProbeArgs) -> Result<(), Box<dyn Error>> {
         last_error.expect("at least one resolved probe endpoint")
     )
     .into())
-}
-
-/// Dispatch a parsed service command. Host CLIs (for example `hops service`)
-/// call this without mounting the aggregate contracts surface.
-pub fn run(args: &ServiceArgs) -> Result<(), Box<dyn Error>> {
-    match &args.command {
-        ServiceCommands::Build(build) => run_build(build, &["service"]),
-        ServiceCommands::Dev(dev) => run_dev(dev, &["service"]),
-        ServiceCommands::Contracts(contracts) => run_contracts(contracts),
-        ServiceCommands::Scaffold(scaffold) => run_scaffold(scaffold),
-        ServiceCommands::Describe(describe) => run_describe(describe),
-        ServiceCommands::Client(client) => run_client(client),
-        ServiceCommands::ClientManifest(client) => run_client_manifest(client),
-        ServiceCommands::GameManifest(game) => run_game_manifest(game),
-        ServiceCommands::GameClient(game) => run_game_client(game),
-        ServiceCommands::GameWasm(game) => run_game_wasm(game),
-        ServiceCommands::Schema(schema) => run_schema(schema),
-        ServiceCommands::Skills(skills) => match &skills.command {
-            SkillsCommands::Init(init) => run_skills_init(init),
-            SkillsCommands::List => run_skills_list(),
-        },
-        ServiceCommands::Probe(probe) => run_probe(probe),
-        ServiceCommands::JavascriptWatch(watch) => run_javascript_watch(watch),
-    }
 }
 
 #[derive(Debug)]
@@ -920,6 +860,19 @@ fn load_project_environment(project: &Path) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+/// The flag a `build` or `dev` session polls to stop.
+///
+/// SIGINT, SIGTERM and SIGHUP all set it (on Windows: Ctrl-C, Ctrl-Break and
+/// the console closing), so the session ends the same way for each: it stops
+/// its process groups and returns. The session's children do not share its
+/// process group, so this handler is the only thing that stops them.
+fn stop_on_signals() -> Result<Arc<AtomicBool>, Box<dyn Error>> {
+    let stop = Arc::new(AtomicBool::new(false));
+    let signaled = Arc::clone(&stop);
+    ctrlc::set_handler(move || signaled.store(true, Ordering::SeqCst))?;
+    Ok(stop)
+}
+
 fn run_build(args: &BuildArgs, command_prefix: &[&str]) -> Result<(), Box<dyn Error>> {
     let resolved = resolve_lifecycle_project(
         args.project.as_deref(),
@@ -929,15 +882,16 @@ fn run_build(args: &BuildArgs, command_prefix: &[&str]) -> Result<(), Box<dyn Er
         args.out.as_deref(),
         command_prefix,
     )?;
+    let stop = stop_on_signals()?;
     let (report, detail) = match &resolved {
         ResolvedLifecycleProject::Discovered(project) => {
             if args.check {
                 prepare_project_javascript(project, true)?;
             } else {
-                build_project_runtime(project)?;
+                build_project_runtime(project, &stop)?;
                 prepare_project_javascript(project, false)?;
                 if let Some(ui) = &project.ui {
-                    prepare_ui_dependencies(project, ui)?;
+                    prepare_ui_dependencies(project, ui, &stop)?;
                 }
                 prepare_project_wasm_pures(project).map_err(|error| {
                     contextualize_project_generation_error(
@@ -959,7 +913,7 @@ fn run_build(args: &BuildArgs, command_prefix: &[&str]) -> Result<(), Box<dyn Er
                     lock_timeout: Duration::from_millis(args.lock_timeout_ms),
                     nodes: None,
                     activation_inputs: None,
-                    cancel: None,
+                    cancel: Some(Arc::clone(&stop)),
                     activation: LifecycleActivation::Deferred,
                 },
             )
@@ -971,7 +925,7 @@ fn run_build(args: &BuildArgs, command_prefix: &[&str]) -> Result<(), Box<dyn Er
                 )
             })?;
             if !args.check {
-                build_project_ui(project, &report)?;
+                build_project_ui(project, &report, &stop)?;
                 activate_lifecycle_project_generation(
                     &project.plan,
                     &report,
@@ -996,7 +950,7 @@ fn run_build(args: &BuildArgs, command_prefix: &[&str]) -> Result<(), Box<dyn Er
                 lock_timeout: Duration::from_millis(args.lock_timeout_ms),
                 nodes: None,
                 activation_inputs: None,
-                cancel: None,
+                cancel: Some(Arc::clone(&stop)),
             })?,
             None,
         ),
@@ -1042,7 +996,10 @@ fn run_build(args: &BuildArgs, command_prefix: &[&str]) -> Result<(), Box<dyn Er
     Ok(())
 }
 
-fn build_project_runtime(project: &DiscoveredLifecycleProject) -> Result<(), Box<dyn Error>> {
+fn build_project_runtime(
+    project: &DiscoveredLifecycleProject,
+    stop: &AtomicBool,
+) -> Result<(), Box<dyn Error>> {
     eprintln!(
         "distributed build: compiling Rust runtime {} ({})",
         project.runtime_binary, project.runtime_package
@@ -1058,6 +1015,7 @@ fn build_project_runtime(project: &DiscoveredLifecycleProject) -> Result<(), Box
             OsString::from(&project.runtime_binary),
         ],
         "Rust runtime build",
+        stop,
     )
 }
 
@@ -1130,20 +1088,21 @@ fn prepare_project_wasm_pures(project: &DiscoveredLifecycleProject) -> Result<()
 fn build_project_ui(
     project: &DiscoveredLifecycleProject,
     generation: &crate::lifecycle::LifecycleBuildReport,
+    stop: &AtomicBool,
 ) -> Result<(), Box<dyn Error>> {
     if let Some(ui) = &project.ui {
         let ui_root = ui;
-        prepare_ui_dependencies(project, &ui_root)?;
+        prepare_ui_dependencies(project, ui_root, stop)?;
         eprintln!(
             "distributed build: checking SvelteKit UI {}",
             ui_root.display()
         );
-        run_project_ui_script(project, generation, ui_root, "check", true)?;
+        run_project_ui_script(project, generation, ui_root, "check", true, stop)?;
         eprintln!(
             "distributed build: compiling SvelteKit UI {}",
             ui_root.display()
         );
-        run_project_ui_script(project, generation, ui_root, "build", false)?;
+        run_project_ui_script(project, generation, ui_root, "build", false, stop)?;
     }
     Ok(())
 }
@@ -1154,6 +1113,7 @@ fn run_project_ui_script(
     ui_root: &Path,
     script: &str,
     if_present: bool,
+    stop: &AtomicBool,
 ) -> Result<(), Box<dyn Error>> {
     let lifecycle_dir = if project.plan.out.is_absolute() {
         project.plan.out.clone()
@@ -1177,24 +1137,26 @@ fn run_project_ui_script(
     if let Some(executable) = project.plan.cli_executable.as_deref() {
         command.env(crate::lifecycle::LIFECYCLE_CLI_EXECUTABLE_ENV, executable);
     }
-    let status = command.status()?;
-    if !status.success() {
-        return Err(format!("SvelteKit UI `{script}` failed with {status}").into());
-    }
-    Ok(())
+    finish_project_command(
+        crate::process::run(&mut command, stop)?,
+        &format!("SvelteKit UI `{script}`"),
+    )
 }
 
 fn prepare_ui_dependencies(
     project: &DiscoveredLifecycleProject,
     ui_root: &Path,
+    stop: &AtomicBool,
 ) -> Result<(), Box<dyn Error>> {
-    ensure_ui_dependencies(ui_root)?;
+    if !ui_root.join("node_modules").is_dir() {
+        install_ui_dependencies(ui_root, stop)?;
+    }
     let Some(javascript) = &project.javascript else {
         return Ok(());
     };
     if let Err(error) = javascript.verify_installed(ui_root) {
         eprintln!("distributed: refreshing SvelteKit dependencies because {error}");
-        install_ui_dependencies(ui_root)?;
+        install_ui_dependencies(ui_root, stop)?;
         javascript.verify_installed(ui_root)?;
     }
     Ok(())
@@ -1217,14 +1179,7 @@ fn prepare_project_javascript(
     Ok(())
 }
 
-fn ensure_ui_dependencies(ui_root: &Path) -> Result<(), Box<dyn Error>> {
-    if ui_root.join("node_modules").is_dir() {
-        return Ok(());
-    }
-    install_ui_dependencies(ui_root)
-}
-
-fn install_ui_dependencies(ui_root: &Path) -> Result<(), Box<dyn Error>> {
+fn install_ui_dependencies(ui_root: &Path, stop: &AtomicBool) -> Result<(), Box<dyn Error>> {
     let install = if ui_root.join("package-lock.json").is_file() {
         "ci"
     } else {
@@ -1239,20 +1194,33 @@ fn install_ui_dependencies(ui_root: &Path) -> Result<(), Box<dyn Error>> {
         "npm",
         &[OsString::from(install)],
         "SvelteKit dependency install",
+        stop,
     )
 }
 
+/// Run a build step of the session: in its own process group, until it exits
+/// or the session is stopped.
 fn run_project_command(
     cwd: &Path,
     program: &str,
     args: &[OsString],
     label: &str,
+    stop: &AtomicBool,
 ) -> Result<(), Box<dyn Error>> {
-    let status = Command::new(program).args(args).current_dir(cwd).status()?;
-    if !status.success() {
-        return Err(format!("{label} failed with {status}").into());
+    let mut command = Command::new(program);
+    command.args(args).current_dir(cwd);
+    finish_project_command(crate::process::run(&mut command, stop)?, label)
+}
+
+fn finish_project_command(
+    status: Option<std::process::ExitStatus>,
+    label: &str,
+) -> Result<(), Box<dyn Error>> {
+    match status {
+        Some(status) if status.success() => Ok(()),
+        Some(status) => Err(format!("{label} failed with {status}").into()),
+        None => Err(format!("{label} was stopped").into()),
     }
-    Ok(())
 }
 
 fn run_dev(args: &DevArgs, command_prefix: &[&str]) -> Result<(), Box<dyn Error>> {
@@ -1264,14 +1232,12 @@ fn run_dev(args: &DevArgs, command_prefix: &[&str]) -> Result<(), Box<dyn Error>
         args.out.as_deref(),
         command_prefix,
     )?;
-    let stop = Arc::new(AtomicBool::new(false));
-    let signal_stop = Arc::clone(&stop);
-    ctrlc::set_handler(move || signal_stop.store(true, Ordering::SeqCst))?;
+    let stop = stop_on_signals()?;
     let report = match resolved {
         ResolvedLifecycleProject::Discovered(project) => {
             prepare_project_javascript(&project, false)?;
             if let Some(ui) = &project.ui {
-                prepare_ui_dependencies(&project, ui)?;
+                prepare_ui_dependencies(&project, ui, &stop)?;
             }
             eprintln!(
                 "distributed dev: project={} api={} ui={} (Ctrl-C to stop)",
@@ -1766,8 +1732,6 @@ fn run_describe(args: &DescribeArgs) -> Result<(), Box<dyn Error>> {
 
 const MAX_CLIENT_MANIFEST_BYTES: usize = 16 * 1024 * 1024;
 const MAX_CLIENT_DOCUMENT_BYTES: usize = 1024 * 1024;
-const MAX_GENERATED_CLIENT_ARTIFACT_BYTES: usize = 8 * 1024 * 1024;
-const MAX_GENERATED_CLIENT_FILES: usize = 8_192;
 
 fn run_client(args: &ClientArgs) -> Result<(), Box<dyn Error>> {
     let manifest_source =
@@ -1969,404 +1933,6 @@ fn portable_relative_path(path: &Path) -> Result<String, Box<dyn Error>> {
     Ok(parts.join("/"))
 }
 
-fn generated_client_path(
-    root: &Path,
-    file: &GeneratedClientFile,
-) -> Result<PathBuf, Box<dyn Error>> {
-    let relative = Path::new(&file.path);
-    if relative.is_absolute()
-        || relative
-            .components()
-            .any(|component| !matches!(component, Component::Normal(_)))
-    {
-        return Err(format!("compiler produced unsafe generated path `{}`", file.path).into());
-    }
-    Ok(root.join(relative))
-}
-
-fn write_client_project(
-    root: &Path,
-    project: &GeneratedClientProject,
-) -> Result<(), Box<dyn Error>> {
-    validate_generated_client_files(&project.files)?;
-    validate_client_write_targets(root, &project.files)?;
-    let stale_files = stale_generated_client_files(root, project)?;
-    validate_client_output_convergence(root, project, &stale_files)?;
-    fs::create_dir_all(root)?;
-
-    for path in stale_files {
-        fs::remove_file(&path).map_err(|error| {
-            format!(
-                "remove stale generated client artifact {}: {error}",
-                path.display()
-            )
-        })?;
-    }
-
-    // Provenance is written last so an interrupted run never advertises a new
-    // complete generation before its operation modules exist.
-    let mut files = project.files.iter().collect::<Vec<_>>();
-    files.sort_by_key(|file| (file.path == "manifest.json", file.path.as_str()));
-    for file in files {
-        let path = generated_client_path(root, file)?;
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        fs::write(&path, &file.contents)
-            .map_err(|error| format!("write generated artifact {}: {error}", path.display()))?;
-    }
-    Ok(())
-}
-
-fn validate_client_output_convergence(
-    root: &Path,
-    project: &GeneratedClientProject,
-    stale_files: &[PathBuf],
-) -> Result<(), Box<dyn Error>> {
-    let expected = project
-        .files
-        .iter()
-        .map(|file| file.path.clone())
-        .collect::<BTreeSet<_>>();
-    let stale = stale_files
-        .iter()
-        .map(|path| {
-            path.strip_prefix(root)
-                .map_err(|_| {
-                    format!(
-                        "stale generated client path {} escaped output {}",
-                        path.display(),
-                        root.display()
-                    )
-                })
-                .and_then(|relative| {
-                    portable_relative_path(relative).map_err(|error| error.to_string())
-                })
-        })
-        .collect::<Result<BTreeSet<_>, _>>()?;
-    let unexpected = collect_generated_client_paths(root)?
-        .into_iter()
-        .filter(|path| !expected.contains(path) && !stale.contains(path))
-        .collect::<Vec<_>>();
-    if unexpected.is_empty() {
-        return Ok(());
-    }
-    Err(format!(
-        "generated output contains files without current or previous compiler ownership:\n  {}; refusing to write until they are moved or removed",
-        unexpected.join("\n  ")
-    )
-    .into())
-}
-
-fn validate_client_write_targets(
-    root: &Path,
-    files: &[GeneratedClientFile],
-) -> Result<(), Box<dyn Error>> {
-    match fs::symlink_metadata(root) {
-        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
-            return Err(format!(
-                "generated output {} must be a real directory, not a symlink or other entry",
-                root.display()
-            )
-            .into())
-        }
-        Ok(_) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => {
-            return Err(format!("inspect generated output {}: {error}", root.display()).into())
-        }
-    }
-
-    for file in files {
-        let relative = Path::new(&file.path);
-        let mut current = root.to_path_buf();
-        let component_count = relative.components().count();
-        for (index, component) in relative.components().enumerate() {
-            let Component::Normal(component) = component else {
-                unreachable!("generated paths were validated before write-target inspection")
-            };
-            current.push(component);
-            let metadata = match fs::symlink_metadata(&current) {
-                Ok(metadata) => metadata,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
-                Err(error) => {
-                    return Err(format!(
-                        "inspect generated client path {}: {error}",
-                        current.display()
-                    )
-                    .into())
-                }
-            };
-            let is_target = index + 1 == component_count;
-            let valid = if is_target {
-                metadata.is_file() && !metadata.file_type().is_symlink()
-            } else {
-                metadata.is_dir() && !metadata.file_type().is_symlink()
-            };
-            if !valid {
-                return Err(format!(
-                    "generated client path {} contains a symlink or incompatible entry",
-                    current.display()
-                )
-                .into());
-            }
-        }
-    }
-    Ok(())
-}
-
-fn stale_generated_client_files(
-    root: &Path,
-    project: &GeneratedClientProject,
-) -> Result<Vec<PathBuf>, Box<dyn Error>> {
-    let provenance_path = root.join("manifest.json");
-    let metadata = match fs::symlink_metadata(&provenance_path) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(error) => {
-            return Err(format!(
-                "inspect previous generated client manifest {}: {error}",
-                provenance_path.display()
-            )
-            .into())
-        }
-    };
-    if metadata.file_type().is_symlink() || !metadata.is_file() {
-        return Err(format!(
-            "previous generated client manifest {} must be a regular file",
-            provenance_path.display()
-        )
-        .into());
-    }
-
-    let source = read_utf8_bounded(
-        &provenance_path,
-        MAX_CLIENT_MANIFEST_BYTES,
-        "previous generated client manifest",
-    )?;
-    let provenance: serde_json::Value = serde_json::from_str(&source).map_err(|error| {
-        format!(
-            "parse previous generated client manifest {}: {error}; refusing to guess stale-file ownership",
-            provenance_path.display()
-        )
-    })?;
-    let compiler_manifest_version = provenance
-        .get("compiler_manifest_version")
-        .and_then(serde_json::Value::as_u64);
-    if !matches!(compiler_manifest_version, Some(1 | 2)) {
-        return Err(format!(
-            "previous generated client manifest {} has an unsupported compiler_manifest_version; refusing to guess stale-file ownership",
-            provenance_path.display()
-        )
-        .into());
-    }
-    let operations = provenance
-        .get("operations")
-        .and_then(serde_json::Value::as_array)
-        .ok_or_else(|| {
-            format!(
-                "previous generated client manifest {} is missing operations; refusing to guess stale-file ownership",
-                provenance_path.display()
-            )
-        })?;
-    let expected = project
-        .files
-        .iter()
-        .map(|file| file.path.as_str())
-        .collect::<BTreeSet<_>>();
-    let mut stale = BTreeSet::new();
-    for (index, operation) in operations.iter().enumerate() {
-        let module_path = operation
-            .get("module_path")
-            .and_then(serde_json::Value::as_str)
-            .ok_or_else(|| {
-                format!(
-                    "previous generated client manifest {} operations[{index}] is missing module_path; refusing to guess stale-file ownership",
-                    provenance_path.display()
-                )
-            })?;
-        validate_previous_client_module_path(module_path)?;
-        if !expected.contains(module_path) {
-            stale.insert(module_path.to_string());
-        }
-    }
-
-    if compiler_manifest_version == Some(1) && !expected.contains("routes.ts") {
-        stale.insert("routes.ts".to_string());
-    }
-
-    let mut paths = Vec::with_capacity(stale.len());
-    for relative in stale {
-        let path = root.join(&relative);
-        let metadata = match fs::symlink_metadata(&path) {
-            Ok(metadata) => metadata,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(error) => {
-                return Err(format!(
-                    "inspect stale generated client artifact {}: {error}",
-                    path.display()
-                )
-                .into())
-            }
-        };
-        if metadata.file_type().is_symlink() || !metadata.is_file() {
-            return Err(format!(
-                "stale generated client artifact {} must be a regular file",
-                path.display()
-            )
-            .into());
-        }
-        let contents = read_utf8_bounded(
-            &path,
-            MAX_GENERATED_CLIENT_ARTIFACT_BYTES,
-            "stale generated client artifact",
-        )?;
-        let has_compatible_marker = contents
-            .starts_with("/** GENERATED by distributed client. Do not edit. */")
-            || (compiler_manifest_version == Some(1)
-                && relative == "routes.ts"
-                && contents
-                    .starts_with("/** GENERATED framework-neutral `@load` ownership plan. */"));
-        if !has_compatible_marker {
-            return Err(format!(
-                "refusing to remove {} because its compiler ownership marker is missing",
-                path.display()
-            )
-            .into());
-        }
-        paths.push(path);
-    }
-    Ok(paths)
-}
-
-fn validate_previous_client_module_path(path: &str) -> Result<(), Box<dyn Error>> {
-    let mut components = Path::new(path).components();
-    let valid = matches!(components.next(), Some(Component::Normal(value)) if value == "operations")
-        && matches!(components.next(), Some(Component::Normal(value)) if Path::new(value).extension().is_some_and(|extension| extension == "ts"))
-        && components.next().is_none();
-    if !valid {
-        return Err(format!(
-            "previous compiler provenance contains unsafe operation module path `{path}`; refusing to remove it"
-        )
-        .into());
-    }
-    Ok(())
-}
-
-fn check_client_project(
-    root: &Path,
-    project: &GeneratedClientProject,
-) -> Result<(), Box<dyn Error>> {
-    validate_generated_client_files(&project.files)?;
-    let expected = project
-        .files
-        .iter()
-        .map(|file| (file.path.clone(), file.contents.as_str()))
-        .collect::<BTreeMap<_, _>>();
-    let actual_paths = collect_generated_client_paths(root)?;
-    let mut drift = Vec::new();
-
-    for (path, contents) in &expected {
-        let full_path = root.join(path);
-        match fs::read_to_string(&full_path) {
-            Ok(actual) if actual == *contents => {}
-            Ok(_) => drift.push(format!("changed {path}")),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                drift.push(format!("missing {path}"));
-            }
-            Err(error) => {
-                return Err(
-                    format!("read generated artifact {}: {error}", full_path.display()).into(),
-                )
-            }
-        }
-    }
-    for path in actual_paths {
-        if !expected.contains_key(&path) {
-            drift.push(format!("unexpected {path}"));
-        }
-    }
-    if drift.is_empty() {
-        return Ok(());
-    }
-    drift.sort();
-    Err(format!(
-        "generated Distributed client artifacts are stale:\n  {}\nrun `distributed client` without --check to regenerate",
-        drift.join("\n  ")
-    )
-    .into())
-}
-
-fn validate_generated_client_files(files: &[GeneratedClientFile]) -> Result<(), Box<dyn Error>> {
-    if files.is_empty() || files.len() > MAX_GENERATED_CLIENT_FILES {
-        return Err(format!(
-            "compiler produced {} files; expected 1..={MAX_GENERATED_CLIENT_FILES}",
-            files.len()
-        )
-        .into());
-    }
-    let mut paths = BTreeSet::new();
-    for file in files {
-        let _ = generated_client_path(Path::new("."), file)?;
-        if !paths.insert(file.path.as_str()) {
-            return Err(format!("compiler produced duplicate path `{}`", file.path).into());
-        }
-    }
-    Ok(())
-}
-
-fn collect_generated_client_paths(root: &Path) -> Result<BTreeSet<String>, Box<dyn Error>> {
-    let mut files = BTreeSet::new();
-    match fs::symlink_metadata(root) {
-        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
-            return Err(format!(
-                "generated output {} must be a real directory, not a symlink or other entry",
-                root.display()
-            )
-            .into())
-        }
-        Ok(_) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(files),
-        Err(error) => {
-            return Err(format!("inspect generated output {}: {error}", root.display()).into())
-        }
-    }
-    let mut pending = vec![(root.to_path_buf(), PathBuf::new())];
-    while let Some((directory, relative)) = pending.pop() {
-        for entry in fs::read_dir(&directory)? {
-            let entry = entry?;
-            let file_type = entry.file_type()?;
-            let next_relative = relative.join(entry.file_name());
-            if file_type.is_symlink() {
-                return Err(format!(
-                    "generated output contains unsupported symlink {}",
-                    entry.path().display()
-                )
-                .into());
-            }
-            if file_type.is_dir() {
-                pending.push((entry.path(), next_relative));
-            } else if file_type.is_file() {
-                files.insert(portable_relative_path(&next_relative)?);
-                if files.len() > MAX_GENERATED_CLIENT_FILES {
-                    return Err(format!(
-                        "generated output {} exceeds {MAX_GENERATED_CLIENT_FILES} files",
-                        root.display()
-                    )
-                    .into());
-                }
-            } else {
-                return Err(format!(
-                    "generated output contains unsupported entry {}",
-                    entry.path().display()
-                )
-                .into());
-            }
-        }
-    }
-    Ok(files)
-}
-
 fn run_client_manifest(args: &ClientManifestArgs) -> Result<(), Box<dyn Error>> {
     let json = run_manifest_harness(
         &HarnessOptions {
@@ -2425,14 +1991,14 @@ fn run_game_client(args: &GameClientArgs) -> Result<(), Box<dyn Error>> {
     let files = crate::game_client::generate_game_client(&source, ext)
         .map_err(|error| format!("{}: {error}", args.manifest.display()))?;
     if args.check {
-        check_game_client(&args.out, &files)?;
+        crate::game_client::check_game_client(&args.out, &files)?;
         println!(
             "Game client for {} is current ({} files)",
             args.manifest.display(),
             files.len()
         );
     } else {
-        write_game_client(&args.out, &files)?;
+        crate::game_client::write_game_client(&args.out, &files)?;
         println!(
             "Generated {} game client files at {}",
             files.len(),
@@ -2462,87 +2028,6 @@ fn run_game_wasm(args: &GameWasmArgs) -> Result<(), Box<dyn Error>> {
         crate::game_wasm::GameWasmOutcome::Built(path) => {
             println!("Compiled game module to {}", path.display())
         }
-    }
-    Ok(())
-}
-
-/// Files directly in `root` (the generator owns the directory).
-fn game_client_dir_files(root: &Path) -> Result<BTreeSet<String>, Box<dyn Error>> {
-    let mut out = BTreeSet::new();
-    match fs::read_dir(root) {
-        Ok(entries) => {
-            for entry in entries {
-                let entry = entry?;
-                if entry.file_type()?.is_file() {
-                    out.insert(entry.file_name().to_string_lossy().into_owned());
-                }
-            }
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(format!("read {}: {error}", root.display()).into()),
-    }
-    Ok(out)
-}
-
-fn check_game_client(root: &Path, files: &[GeneratedClientFile]) -> Result<(), Box<dyn Error>> {
-    let mut drift = Vec::new();
-    let existing = game_client_dir_files(root)?;
-    for file in files {
-        match fs::read_to_string(root.join(&file.path)) {
-            Ok(actual) if actual == file.contents => {}
-            Ok(_) => drift.push(format!("changed {}", file.path)),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                drift.push(format!("missing {}", file.path))
-            }
-            Err(error) => return Err(format!("read {}: {error}", file.path).into()),
-        }
-    }
-    for name in existing {
-        if !files.iter().any(|f| f.path == name) {
-            drift.push(format!("unexpected {name}"));
-        }
-    }
-    if drift.is_empty() {
-        return Ok(());
-    }
-    Err(format!(
-        "generated game client at {} is stale:\n  {}\nrun `distributed game-client` without --check to regenerate",
-        root.display(),
-        drift.join("\n  ")
-    )
-    .into())
-}
-
-fn write_game_client(root: &Path, files: &[GeneratedClientFile]) -> Result<(), Box<dyn Error>> {
-    fs::create_dir_all(root)?;
-    for name in game_client_dir_files(root)? {
-        if files.iter().any(|f| f.path == name) {
-            continue;
-        }
-        let path = root.join(&name);
-        let owned = fs::read_to_string(&path)
-            .map(|text| text.starts_with("// @generated by `distributed game-client`"))
-            .unwrap_or(false);
-        if !owned {
-            return Err(format!(
-                "{} is not a generated game client file; refusing to overwrite the directory (move it out of {})",
-                path.display(),
-                root.display()
-            )
-            .into());
-        }
-        fs::remove_file(&path)?;
-    }
-    for file in files {
-        let path = root.join(&file.path);
-        // Leave unchanged files untouched: dev servers watching the
-        // directory (e.g. the Vite plugin's regeneration on Rust changes)
-        // would otherwise reload for nothing.
-        if fs::read(&path).is_ok_and(|current| current == file.contents.as_bytes()) {
-            continue;
-        }
-        fs::write(&path, &file.contents)
-            .map_err(|error| format!("write {}: {error}", path.display()))?;
     }
     Ok(())
 }
@@ -3069,41 +2554,6 @@ mod tests {
     }
 
     #[test]
-    fn client_generation_removes_owned_version_one_routes_artifact() {
-        let fixture = tempfile::tempdir().expect("create generated client fixture");
-        let root = fixture.path();
-        fs::write(
-            root.join("manifest.json"),
-            r#"{"compiler_manifest_version":1,"operations":[]}"#,
-        )
-        .expect("write legacy manifest");
-        fs::write(
-            root.join("routes.ts"),
-            "/** GENERATED framework-neutral `@load` ownership plan. */\nexport const DISTRIBUTED_ROUTES = [];\n",
-        )
-        .expect("write legacy routes");
-        let current_manifest = "{\"compiler_manifest_version\":2,\"operations\":[]}\n".to_string();
-        let project = GeneratedClientProject {
-            files: vec![GeneratedClientFile {
-                path: "manifest.json".to_string(),
-                contents: current_manifest.clone(),
-            }],
-            operations: Vec::new(),
-            islands: Vec::new(),
-            schema_fingerprint: "sha256:schema".to_string(),
-            protocol_fingerprint: "sha256:protocol".to_string(),
-        };
-
-        write_client_project(root, &project).expect("upgrade legacy generated client");
-
-        assert!(!root.join("routes.ts").exists());
-        assert_eq!(
-            fs::read_to_string(root.join("manifest.json")).expect("read current manifest"),
-            current_manifest
-        );
-    }
-
-    #[test]
     fn optional_github_repo_reports_the_flag_on_error() {
         let err = parse_optional_github_repo(Some("missing-repo"), "--github")
             .expect_err("invalid repo should error");
@@ -3167,27 +2617,5 @@ mod tests {
         let mut both = schema_args();
         both.db_url = Some("postgres://localhost/orders".to_string());
         assert!(atlas_spec_from_flags(&both, "sql".into()).is_err());
-    }
-
-    #[test]
-    fn hosted_service_commands_cover_every_public_distributed_command() {
-        use clap::Subcommand as _;
-        let names = |command: clap::Command| -> Vec<String> {
-            command
-                .get_subcommands()
-                .filter(|sub| !sub.is_hide_set())
-                .map(|sub| sub.get_name().to_string())
-                .collect()
-        };
-        let standalone = names(DistributedCommands::augment_subcommands(
-            clap::Command::new("distributed"),
-        ));
-        let hosted = names(ServiceCommands::augment_subcommands(clap::Command::new(
-            "service",
-        )));
-        assert_eq!(
-            standalone, hosted,
-            "`hops service` (ServiceArgs) must expose every public `distributed` command"
-        );
     }
 }

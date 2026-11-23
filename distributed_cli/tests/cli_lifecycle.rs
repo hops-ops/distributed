@@ -68,6 +68,8 @@ if test -f "$root/fail-plan"; then
   exit 17
 fi
 if test -f "$root/slow-plan"; then
+  /bin/sh -c 'trap "" TERM; while :; do sleep 1; done' &
+  printf '%s %s\n' "$$" "$!" >> "$root/build-plan-family.log"
   printf 'started\n' >> "$root/build-plan-starts.log"
   while test -f "$root/slow-plan"; do :; done
 fi
@@ -190,6 +192,7 @@ printf '%s:%s\n' "$name" "$DISTRIBUTED_PROCESS_INSTANCE_ID" >> "$root/dev-instan
 trap 'exit 0' TERM
 /bin/sh -c 'trap "" TERM; while :; do sleep 1; done' &
 descendant=$!
+printf '%s %s\n' "$$" "$descendant" >> "$root/dev-family.log"
 printf '%s\n' "$descendant" >> "$root/dev-descendants.log"
 wait "$descendant"
 "#,
@@ -519,21 +522,25 @@ fn partial_build_reuses_verified_upstream_receipts() {
     assert_eq!(second.executed, ["plan"]);
     assert_ne!(first.generation_id, second.generation_id);
 
-    let manifest = |generation: &str| -> Value {
-        serde_json::from_slice(
-            &fs::read(
-                root.join("dist/distributed/generations")
-                    .join(generation)
-                    .join("generation.json"),
-            )
-            .unwrap(),
+    // Activating the second generation removed the first; its manifest was
+    // read while it was active.
+    let second_manifest: Value = serde_json::from_slice(
+        &fs::read(
+            root.join("dist/distributed/generations")
+                .join(&second.generation_id)
+                .join("generation.json"),
         )
-        .unwrap()
-    };
+        .unwrap(),
+    )
+    .unwrap();
     assert_eq!(
-        manifest(&first.generation_id)["receipts"]["application"],
-        manifest(&second.generation_id)["receipts"]["application"]
+        first_manifest["receipts"]["application"],
+        second_manifest["receipts"]["application"]
     );
+    assert!(!root
+        .join("dist/distributed/generations")
+        .join(&first.generation_id)
+        .exists());
 }
 
 #[test]
@@ -638,6 +645,29 @@ fn dev_waits_for_initial_generation_and_restarts_only_invalidated_processes() {
         replaced["active"]["generationId"]
     );
     assert_eq!(replaced["members"]["ui"], initial_state["members"]["ui"]);
+    // Four generations were activated. The one in between is unused and gone:
+    // what stays is the active one, the one it replaced, and the first, which
+    // the `ui` process was started with and still resolves.
+    let installed = fs::read_dir(root.join("dist/distributed/generations"))
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+        .collect::<std::collections::BTreeSet<_>>();
+    let generation = |state: &Value| {
+        state["active"]["generationId"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    };
+    assert_eq!(
+        installed,
+        [
+            generation(&initial_state),
+            previous_generation.as_str().unwrap().to_string(),
+            generation(&replaced),
+        ]
+        .into_iter()
+        .collect()
+    );
     let report = supervisor.stop_and_join();
     assert_eq!(report.rebuilds, 3);
     assert!(!root.join("dist/distributed/dev.json").exists());
@@ -847,11 +877,14 @@ fn dev_cancels_a_superseded_executor_before_activation() {
     wait_until(Duration::from_secs(5), || {
         root.join("build-plan-starts.log").exists()
     });
+    let canceled = recorded_pids(&root.join("build-plan-family.log"));
+    assert_eq!(canceled.len(), 2, "the executor and its descendant");
     fs::write(root.join("plan/input.txt"), "latest\n").unwrap();
     wait_until(Duration::from_secs(5), || {
         fs::read_to_string(root.join("build-plan-starts.log"))
             .is_ok_and(|log| log.lines().count() >= 2)
     });
+    assert_no_survivors(&canceled);
     assert_eq!(
         initial_active,
         fs::read(root.join("dist/distributed/active.json")).unwrap()
@@ -865,6 +898,9 @@ fn dev_cancels_a_superseded_executor_before_activation() {
     assert_eq!(report.rebuilds, 1);
     assert_eq!(report.restarts["api"], 0);
     assert_eq!(report.restarts["ui"], 0);
+    // The executor that completed left a descendant behind; it is gone too.
+    assert_no_survivors(&recorded_pids(&root.join("build-plan-family.log")));
+    assert_no_survivors(&recorded_pids(&root.join("dev-family.log")));
     let active: Value =
         serde_json::from_slice(&fs::read(root.join("dist/distributed/active.json")).unwrap())
             .unwrap();
@@ -995,4 +1031,220 @@ fn stale_check_names_owner_and_failed_downstream_build_preserves_active_generati
         active_before,
         fs::read(root.join("dist/distributed/active.json")).unwrap()
     );
+}
+
+/// Every process ID a fixture script appended to `path`.
+#[cfg(unix)]
+fn recorded_pids(path: &Path) -> Vec<libc::pid_t> {
+    fs::read_to_string(path)
+        .unwrap_or_default()
+        .split_whitespace()
+        .map(|pid| pid.parse().expect("fixture process ID"))
+        .collect()
+}
+
+/// Polls until none of `pids` can be signalled. None of them is a child of
+/// this test process once its owner has reaped or exited, so a process that
+/// still answers is alive, not a zombie waiting for this test.
+#[cfg(unix)]
+fn assert_no_survivors(pids: &[libc::pid_t]) {
+    let started = std::time::Instant::now();
+    loop {
+        let alive = pids
+            .iter()
+            .copied()
+            .filter(|pid| unsafe { libc::kill(*pid, 0) } == 0)
+            .collect::<Vec<_>>();
+        if alive.is_empty() {
+            return;
+        }
+        if started.elapsed() > Duration::from_secs(10) {
+            for pid in &alive {
+                unsafe { libc::kill(*pid, libc::SIGKILL) };
+            }
+            panic!("processes outlived their session: {alive:?}");
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// `distributed dev` as a real process, with its output in `dev.log`.
+#[cfg(unix)]
+struct DevProcess {
+    child: std::process::Child,
+    log: PathBuf,
+}
+
+#[cfg(unix)]
+impl DevProcess {
+    fn start(root: &Path) -> Self {
+        let log = root.join("dev.log");
+        let output = fs::File::create(&log).expect("create dev log");
+        let child = Command::new(env!("CARGO_BIN_EXE_distributed"))
+            .args(["dev", "--root", root.to_str().expect("UTF-8 fixture root")])
+            .stdin(Stdio::null())
+            .stdout(output.try_clone().expect("share dev log"))
+            .stderr(output)
+            .spawn()
+            .expect("start distributed dev");
+        Self { child, log }
+    }
+
+    fn log(&self) -> String {
+        fs::read_to_string(&self.log).unwrap_or_default()
+    }
+
+    fn signal(&self, signal: libc::c_int) {
+        assert_eq!(
+            unsafe { libc::kill(self.child.id() as libc::pid_t, signal) },
+            0
+        );
+    }
+
+    fn wait(&mut self) -> std::process::ExitStatus {
+        let started = std::time::Instant::now();
+        loop {
+            if let Some(status) = self.child.try_wait().expect("inspect distributed dev") {
+                return status;
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(15),
+                "distributed dev did not exit:\n{}",
+                self.log()
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for DevProcess {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// A session with two processes that each started a descendant ignoring
+/// SIGTERM, and a build executor (with its own descendant) in flight.
+#[cfg(unix)]
+fn signaled_dev_session_leaves_no_descendant(label: &str, signal: libc::c_int) {
+    let fixture = temporary_root(label);
+    let root = fixture.path().to_path_buf();
+    write_fixture(&root);
+    enable_dev(&root);
+    let mut dev = DevProcess::start(&root);
+    wait_until(Duration::from_secs(10), || {
+        dev.log().contains("lifecycle dev: ready")
+    });
+    fs::write(root.join("slow-plan"), "yes\n").unwrap();
+    fs::write(root.join("plan/input.txt"), "changed\n").unwrap();
+    wait_until(Duration::from_secs(10), || {
+        root.join("build-plan-starts.log").exists()
+    });
+    let mut session = recorded_pids(&root.join("dev-family.log"));
+    session.extend(recorded_pids(&root.join("build-plan-family.log")));
+    assert_eq!(
+        session.len(),
+        6,
+        "two processes, one executor, a descendant each"
+    );
+    for pid in &session {
+        assert_eq!(
+            unsafe { libc::kill(*pid, 0) },
+            0,
+            "{pid} runs before the signal"
+        );
+    }
+
+    dev.signal(signal);
+    let status = dev.wait();
+    assert!(status.success(), "{status}:\n{}", dev.log());
+    assert!(
+        dev.log().contains("lifecycle dev: stopped"),
+        "{}",
+        dev.log()
+    );
+    assert_no_survivors(&session);
+}
+
+#[cfg(unix)]
+#[test]
+fn dev_interrupted_leaves_no_descendant() {
+    signaled_dev_session_leaves_no_descendant("dev-sigint", libc::SIGINT);
+}
+
+#[cfg(unix)]
+#[test]
+fn dev_terminated_leaves_no_descendant() {
+    signaled_dev_session_leaves_no_descendant("dev-sigterm", libc::SIGTERM);
+}
+
+#[cfg(unix)]
+#[test]
+fn dev_hung_up_leaves_no_descendant() {
+    signaled_dev_session_leaves_no_descendant("dev-sighup", libc::SIGHUP);
+}
+
+#[cfg(unix)]
+#[test]
+fn dev_that_fails_leaves_no_descendant() {
+    let fixture = temporary_root("dev-failed");
+    let root = fixture.path().to_path_buf();
+    write_fixture(&root);
+    enable_dev(&root);
+    let supervisor = DevSupervisor::start(root.clone());
+    wait_until(Duration::from_secs(5), || {
+        recorded_pids(&root.join("dev-family.log")).len() == 4
+    });
+    let session = recorded_pids(&root.join("dev-family.log"));
+
+    // One process dies under the supervisor; the session ends with an error.
+    assert_eq!(unsafe { libc::kill(session[0], libc::SIGKILL) }, 0);
+    let error = supervisor
+        .join_result()
+        .expect_err("a dead process ends the session");
+    assert!(error.message().contains("exited with"), "{error}");
+    assert_no_survivors(&session);
+}
+
+#[cfg(unix)]
+#[test]
+fn dev_keeps_running_while_a_watched_input_is_missing_and_says_so_once() {
+    let fixture = temporary_root("dev-missing-input");
+    let root = fixture.path().to_path_buf();
+    write_fixture(&root);
+    enable_dev(&root);
+    let mut dev = DevProcess::start(&root);
+    wait_until(Duration::from_secs(10), || {
+        dev.log().contains("lifecycle dev: ready")
+    });
+
+    // An editor or a checkout removes the file before writing its replacement.
+    fs::remove_file(root.join("src/input.txt")).unwrap();
+    wait_until(Duration::from_secs(10), || {
+        dev.log().contains("cannot read watched inputs")
+    });
+    // Many polls (20ms each) see the same failure.
+    thread::sleep(Duration::from_millis(300));
+    fs::write(root.join("src/input.txt"), "replacement\n").unwrap();
+    wait_until(Duration::from_secs(10), || {
+        dev.log().contains("lifecycle dev: activated generation")
+    });
+
+    dev.signal(libc::SIGINT);
+    let status = dev.wait();
+    let log = dev.log();
+    assert!(status.success(), "{status}:\n{log}");
+    assert_eq!(
+        log.matches("cannot read watched inputs").count(),
+        1,
+        "{log}"
+    );
+    assert_eq!(
+        log.matches("watched inputs are readable again").count(),
+        1,
+        "{log}"
+    );
+    assert!(log.contains("rebuilds=1"), "{log}");
 }

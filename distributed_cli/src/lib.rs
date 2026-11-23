@@ -2,8 +2,9 @@
 //!
 //! It bundles pure generation (`generate` / `atlas`), the contract lifecycle
 //! surface (`contracts`), and the clap command surface (`cli`). The standalone
-//! binary parses [`DistributedArgs`] and dispatches with [`run_distributed`].
-//! Host CLIs such as `hops` may mount [`ServiceArgs`] and dispatch with [`run`].
+//! binary parses [`DistributedArgs`] and dispatches with [`run`]. A host CLI
+//! such as `hops` mounts the same arguments under one of its commands and
+//! passes that command to [`run`].
 
 mod atlas;
 mod cli;
@@ -12,23 +13,25 @@ pub mod contracts;
 mod game_client;
 mod game_wasm;
 mod generate;
+mod generated_dir;
 #[cfg(test)]
 #[path = "../tests/support/golden.rs"]
 mod golden;
 mod js_framework;
 pub mod lifecycle;
 mod manifest_harness;
+mod process;
 mod skills;
 mod wasm_pures;
 
 pub use atlas::{render_atlas_schema, AtlasDatabaseUrl, AtlasSchemaSpec};
 pub use cli::{
-    run, run_distributed, AgentHarness, BuildArgs, Bus, ClientArgs, ClientManifestArgs,
-    ContractsAcceptArgs, ContractsArgs, ContractsCheckArgs, ContractsCommands, ContractsOutput,
-    DescribeArgs, DevArgs, DistributedArgs, DistributedCommands, Framework, GameClientArgs,
-    GameManifestArgs, GameWasmArgs, GitopsPromote, JavascriptWatchArgs, LifecycleOutput,
-    ManifestFormat, Metrics, ProbeArgs, ScaffoldArgs, SchemaArgs, SchemaDialect, SchemaFormat,
-    ServiceArgs, ServiceCommands, SkillsArgs, SkillsCommands, SkillsInitArgs, Store, Transport,
+    run, AgentHarness, BuildArgs, Bus, ClientArgs, ClientManifestArgs, ContractsAcceptArgs,
+    ContractsArgs, ContractsCheckArgs, ContractsCommands, ContractsOutput, DescribeArgs, DevArgs,
+    DistributedArgs, DistributedCommands, Framework, GameClientArgs, GameManifestArgs,
+    GameWasmArgs, GitopsPromote, JavascriptWatchArgs, LifecycleOutput, ManifestFormat, Metrics,
+    ProbeArgs, ScaffoldArgs, SchemaArgs, SchemaDialect, SchemaFormat, SkillsArgs, SkillsCommands,
+    SkillsInitArgs, Store, Transport,
 };
 pub use client_compiler::{
     compile_client, ClientCompileError, ClientCompileInput, ClientDocument, ClientSourceLocation,

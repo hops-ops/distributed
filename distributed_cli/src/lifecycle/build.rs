@@ -11,13 +11,14 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::contracts::ContractCatalog;
+use crate::process::ProcessGroup;
 
 use super::graph::source_uses_output;
 use super::{
     digest_bytes, validate_content_identity, validate_portable_path, validate_stable_value,
     ArtifactNodeReceipt, DistributedSourceIdentity, GenerationManifest, LifecycleConfig,
     LifecycleDevConfig, LifecycleError, LifecycleGraph, ReleaseManifest,
-    LIFECYCLE_CLI_EXECUTABLE_ENV, LIFECYCLE_CONFIG_SCHEMA_VERSION,
+    GENERATED_DIRECTORY_MARKER, LIFECYCLE_CLI_EXECUTABLE_ENV, LIFECYCLE_CONFIG_SCHEMA_VERSION,
 };
 
 pub const LIFECYCLE_BUILD_CONFIG_SCHEMA_VERSION: u32 = 1;
@@ -465,6 +466,7 @@ pub fn run_lifecycle_project_build(
         install_generation(stage, &out, &generation.generation_id)?;
         if request.activation == LifecycleActivation::Immediate {
             write_active_generation(&out, &generation.generation_id, &release.release_id)?;
+            prune_generations(&out, &generation.generation_id);
             Some(generation.generation_id.clone())
         } else {
             read_active_generation(&out)?
@@ -685,42 +687,39 @@ fn execute_node(
     if let Some(executable) = cli_executable {
         command.env(LIFECYCLE_CLI_EXECUTABLE_ENV, executable);
     }
-    command.stdout(stdout).stderr(Stdio::piped());
-    let mut child = command.spawn().map_err(|error| {
+    command
+        .stdin(Stdio::null())
+        .stdout(stdout)
+        .stderr(Stdio::piped());
+    // The executor leads its own process group: `describe` blocks in `cargo
+    // run`, so cancelling the leader alone would leave the compiler running.
+    let mut executor_group = ProcessGroup::spawn(&mut command).map_err(|error| {
         LifecycleError::new(format!(
             "lifecycle node `{node_id}` failed to start executor `{}`: {error}",
             executor.program
         ))
     })?;
-    let stderr = child
+    let stderr = executor_group
+        .leader()
         .stderr
         .take()
         .ok_or_else(|| LifecycleError::new("lifecycle executor stderr pipe is unavailable"))?;
-    let stderr_reader = match std::thread::Builder::new()
+    let stderr_reader = std::thread::Builder::new()
         .name(format!("lifecycle-stderr-{node_id}"))
         .spawn(move || forward_executor_stderr(stderr))
-    {
-        Ok(reader) => reader,
-        Err(error) => {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(io_error("start lifecycle executor stderr reader")(error));
-        }
-    };
+        .map_err(io_error("start lifecycle executor stderr reader"))?;
     let status = loop {
         if cancel.is_some_and(|cancel| cancel.load(Ordering::SeqCst)) {
-            child
+            executor_group
                 .kill()
                 .map_err(io_error("cancel lifecycle executor"))?;
-            child
-                .wait()
-                .map_err(io_error("wait for canceled lifecycle executor"))?;
             let _ = finish_executor_stderr(stderr_reader);
             return Err(LifecycleError::canceled(format!(
                 "lifecycle build was canceled while node `{node_id}` was running"
             )));
         }
-        if let Some(status) = child
+        if let Some(status) = executor_group
+            .leader()
             .try_wait()
             .map_err(io_error("inspect lifecycle executor"))?
         {
@@ -728,6 +727,10 @@ fn execute_node(
         }
         std::thread::sleep(Duration::from_millis(10));
     };
+    // Nothing the executor left running may hold its stderr pipe open.
+    executor_group
+        .kill()
+        .map_err(io_error("stop lifecycle executor descendants"))?;
     let stderr_tail = finish_executor_stderr(stderr_reader)?;
     if !status.success() {
         let detail = String::from_utf8_lossy(&stderr_tail);
@@ -935,6 +938,9 @@ fn collect_regular_files(
             "lifecycle directory `{}` exceeds the depth bound",
             path.display()
         )));
+    }
+    if path.join(GENERATED_DIRECTORY_MARKER).is_file() {
+        return Ok(());
     }
     let mut entries = fs::read_dir(path)
         .map_err(io_error("read lifecycle directory"))?
@@ -1145,7 +1151,45 @@ pub fn activate_lifecycle_project_generation(
         report.active_generation.as_deref(),
         &report.generation_id,
     )?;
-    write_active_generation(&out, &report.generation_id, &report.release_id)
+    write_active_generation(&out, &report.generation_id, &report.release_id)?;
+    prune_generations(&out, &report.generation_id);
+    Ok(())
+}
+
+/// Remove the installed generations nothing can read any more.
+///
+/// Kept: the generation that was just activated, and every generation a
+/// running `dev` session names in its state file: the one it serves, the one
+/// it is switching to, and the one each of its processes was started with (a
+/// UI server that is not restarted keeps resolving the generation it started
+/// on). Every other generation is unreachable: nothing serves it, and
+/// activation refuses a generation built before the pointer last moved.
+///
+/// The caller holds the build lock and has moved the pointer. A generation
+/// that cannot be removed is reported and left for the next activation.
+fn prune_generations(out: &Path, active: &str) {
+    let Some(mut keep) = super::dev::generations_in_use(out) else {
+        return;
+    };
+    keep.insert(active.to_string());
+    let Ok(entries) = fs::read_dir(out.join("generations")) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(generation) = name.to_str() else {
+            continue;
+        };
+        if keep.contains(generation)
+            || validate_content_identity(generation, "generation").is_err()
+            || !entry.file_type().is_ok_and(|kind| kind.is_dir())
+        {
+            continue;
+        }
+        if let Err(error) = fs::remove_dir_all(entry.path()) {
+            eprintln!("lifecycle: could not remove unused generation `{generation}`: {error}");
+        }
+    }
 }
 
 fn ensure_activation_predecessor(
@@ -1420,6 +1464,85 @@ mod tests {
             fs::read_to_string(stage.join("cli-path.txt")).unwrap(),
             cli.to_string_lossy()
         );
+    }
+
+    #[test]
+    fn a_generated_directory_is_not_a_lifecycle_input() {
+        let fixture = tempfile::tempdir().expect("create source fixture");
+        let lib = fixture.path().join("lib");
+        fs::create_dir_all(lib.join("pkg")).unwrap();
+        fs::write(lib.join("app.ts"), "export {};\n").unwrap();
+        fs::write(lib.join("pkg/module.wasm"), "first").unwrap();
+        let identity = || hash_path(&lib, fixture.path()).unwrap();
+
+        let unmarked = identity();
+        fs::write(lib.join("pkg/module.wasm"), "second").unwrap();
+        assert_ne!(identity(), unmarked, "an ordinary directory is an input");
+
+        fs::write(lib.join("pkg").join(GENERATED_DIRECTORY_MARKER), "").unwrap();
+        let marked = identity();
+        fs::write(lib.join("pkg/module.wasm"), "third").unwrap();
+        fs::remove_file(lib.join("pkg/module.wasm")).unwrap();
+        assert_eq!(identity(), marked, "a generated directory is not");
+
+        fs::write(lib.join("app.ts"), "export const changed = true;\n").unwrap();
+        assert_ne!(identity(), marked, "its siblings still are");
+    }
+
+    #[test]
+    fn activation_removes_the_generations_nothing_reads() {
+        let generation = |digit: &str| format!("sha256:{}", digit.repeat(64));
+        let installed = |out: &Path| {
+            fs::read_dir(out.join("generations"))
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+                .collect::<BTreeSet<_>>()
+        };
+        let fixture = |state: Option<&str>| {
+            let fixture = tempfile::tempdir().expect("create generation store");
+            for name in ["1", "2", "3", "4"].map(generation) {
+                fs::create_dir_all(fixture.path().join("generations").join(name)).unwrap();
+            }
+            fs::create_dir_all(fixture.path().join("generations/not-a-generation")).unwrap();
+            if let Some(state) = state {
+                fs::write(fixture.path().join("dev.json"), state).unwrap();
+            }
+            fixture
+        };
+
+        // No session: only the active generation is read.
+        let store = fixture(None);
+        prune_generations(store.path(), &generation("4"));
+        assert_eq!(
+            installed(store.path()),
+            BTreeSet::from([generation("4"), "not-a-generation".to_string()])
+        );
+
+        // A session switching from 2 to 4 whose `ui` process started on 1.
+        let state = serde_json::json!({
+            "schemaVersion": 1,
+            "phase": "preparing",
+            "active": { "generationId": generation("2") },
+            "pending": { "generationId": generation("4") },
+            "members": { "ui": { "instanceId": "member-x", "generationId": generation("1") } },
+        })
+        .to_string();
+        let store = fixture(Some(&state));
+        prune_generations(store.path(), &generation("4"));
+        assert_eq!(
+            installed(store.path()),
+            BTreeSet::from([
+                generation("1"),
+                generation("2"),
+                generation("4"),
+                "not-a-generation".to_string()
+            ])
+        );
+
+        // A session whose state cannot be read: nothing is known to be unused.
+        let store = fixture(Some("{"));
+        prune_generations(store.path(), &generation("4"));
+        assert_eq!(installed(store.path()).len(), 5);
     }
 
     #[test]

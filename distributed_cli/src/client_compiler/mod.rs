@@ -1,13 +1,14 @@
 //! Pure, framework-neutral compiler for Distributed client artifacts.
 //!
-//! This module deliberately owns no filesystem or glob behavior. Callers load
-//! one role/application-selected manifest and the colocated GraphQL documents,
-//! then decide how to write or check the returned files.
+//! The compiler deliberately owns no filesystem or glob behavior. Callers load
+//! one role/application-selected manifest and the colocated GraphQL documents;
+//! `output` writes or checks the returned files in a directory.
 
 mod command_manifest;
 mod graphql;
 mod islands;
 mod manifest;
+mod output;
 mod projection_delta;
 mod render;
 
@@ -23,6 +24,7 @@ use serde_json::Value as JsonValue;
 
 use graphql::compile_document;
 use manifest::ClientManifest;
+pub(crate) use output::{check_client_project, write_client_project};
 use render::render_project;
 
 /// Complete input to one deterministic client compilation.
