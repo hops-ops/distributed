@@ -21,8 +21,8 @@ use crate::{
     ProjectionProgramError, ProjectionProgramId, ProjectionRelationship,
     ProjectionRelationshipEffect, ProjectionTarget, ProjectionValue, ProjectionValueRef,
     ProjectionValueType, ResolvedProjectionKey, ResolvedProjectionMutation, ResolvedProjectionPlan,
-    ResolvedProjectionValue, RowKey, RowPatch, RowValue, RowValues, RowWriteMode,
-    TableAdapterCapabilities, TableSchema, TableStoreError, TableWritePlan,
+    ResolvedProjectionValue, RowKey, RowPatch, RowValue, RowValues, RowWriteMode, TableSchema,
+    TableStoreError, TableWritePlan,
 };
 
 /// Flat portable Rust field category emitted by the domain-state/event derives.
@@ -629,20 +629,6 @@ pub struct LoweredProjectionPlan {
     pub write_plan: TableWritePlan,
     /// Resolved logical plan retaining occurrence and relationship provenance.
     pub resolved: ResolvedProjectionPlan,
-}
-
-impl LoweredProjectionPlan {
-    /// Validate adapter support before executing any mutation.
-    ///
-    /// # Errors
-    ///
-    /// Returns an adapter-capability or row-shape error.
-    pub fn validate_for(
-        &self,
-        capabilities: &TableAdapterCapabilities,
-    ) -> Result<(), TableStoreError> {
-        self.write_plan.validate_for(capabilities)
-    }
 }
 
 /// Typed physical lowering failure.

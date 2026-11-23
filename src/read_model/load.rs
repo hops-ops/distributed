@@ -6,9 +6,7 @@ use std::marker::PhantomData;
 use crate::repository::{ReadModelWritePlanStore, RelationalReadModelQueryStore};
 
 use super::workspace::ReadModelWorkspace;
-use super::{
-    ReadModelQueryCapabilities, RelationalReadModel, RelationalReadModelIncludes, Versioned,
-};
+use super::{RelationalReadModel, RelationalReadModelIncludes, Versioned};
 use crate::table::{RelationshipDef, RowKey, RowValues, TableSchema, TableStoreError};
 
 /// A request an adapter can satisfy with a primary-key read plus explicit includes.
@@ -17,21 +15,6 @@ pub struct ReadModelLoadRequest {
     pub schema: TableSchema,
     pub key: RowKey,
     pub includes: Vec<String>,
-}
-
-impl ReadModelLoadRequest {
-    pub fn validate_for_query_capabilities(
-        &self,
-        capabilities: &ReadModelQueryCapabilities,
-    ) -> Result<(), TableStoreError> {
-        if !self.includes.is_empty() && !capabilities.relationship_includes {
-            return Err(TableStoreError::Metadata(
-                "read-model adapter does not support relationship includes".into(),
-            ));
-        }
-
-        Ok(())
-    }
 }
 
 /// Rows loaded for one requested relationship include.

@@ -9,15 +9,13 @@ use std::future::Future;
 use std::sync::{Arc, RwLock};
 
 use super::{
-    ReadModelIncludeRows, ReadModelLoadGraph, ReadModelLoadRequest, ReadModelQueryCapabilities,
-    RelationalReadModel, Versioned,
+    ReadModelIncludeRows, ReadModelLoadGraph, ReadModelLoadRequest, RelationalReadModel, Versioned,
 };
 use crate::repository::{ReadModelWritePlanStore, RelationalReadModelQueryStore};
 use crate::table::{has_many_join_columns, key_fingerprint, validate_key, validate_row_values};
 use crate::table::{
     ExpectedVersion, PatchMode, RelationshipDef, RelationshipKind, RowKey, RowValue, RowValues,
-    RowWriteMode, TableAdapterCapabilities, TableCommitOutcome, TableMutation, TableSchema,
-    TableSchemaRegistry, TableStoreError, TableWritePlan,
+    RowWriteMode, TableMutation, TableSchema, TableSchemaRegistry, TableStoreError, TableWritePlan,
 };
 
 #[derive(Clone)]
@@ -44,15 +42,11 @@ pub(crate) fn next_model_version(
     }
 }
 
-fn relational_capabilities() -> TableAdapterCapabilities {
-    TableAdapterCapabilities::default()
-}
-
 pub(crate) fn apply_read_model_write_plan(
     plan: TableWritePlan,
     staged_rows: &mut HashMap<String, StoredRow>,
-) -> Result<TableCommitOutcome, TableStoreError> {
-    plan.validate_for(&relational_capabilities())?;
+) -> Result<(), TableStoreError> {
+    plan.validate()?;
 
     for mutation in plan.mutations {
         match mutation {
@@ -139,7 +133,7 @@ pub(crate) fn apply_read_model_write_plan(
         }
     }
 
-    Ok(TableCommitOutcome::applied())
+    Ok(())
 }
 
 pub(crate) fn relational_storage_key(table_name: &str, key: &RowKey) -> String {
@@ -283,14 +277,10 @@ impl InMemoryReadModelStore {
 }
 
 impl ReadModelWritePlanStore for InMemoryReadModelStore {
-    fn read_model_capabilities(&self) -> TableAdapterCapabilities {
-        relational_capabilities()
-    }
-
     fn commit_write_plan(
         &self,
         plan: TableWritePlan,
-    ) -> impl Future<Output = Result<TableCommitOutcome, TableStoreError>> + Send + '_ {
+    ) -> impl Future<Output = Result<(), TableStoreError>> + Send + '_ {
         async move {
             let mut relational_rows = self
                 .relational_rows
@@ -311,13 +301,9 @@ impl ReadModelWritePlanStore for InMemoryReadModelStore {
             }
 
             let mut staged_rows = relational_rows.clone();
-            let outcome = apply_read_model_write_plan(plan, &mut staged_rows)?;
-
-            if outcome.was_applied() {
-                *relational_rows = staged_rows;
-            }
-
-            Ok(outcome)
+            apply_read_model_write_plan(plan, &mut staged_rows)?;
+            *relational_rows = staged_rows;
+            Ok(())
         }
     }
 }
@@ -352,16 +338,11 @@ impl RelationalReadModelQueryStore for InMemoryReadModelStore {
         }
     }
 
-    fn read_model_query_capabilities(&self) -> ReadModelQueryCapabilities {
-        ReadModelQueryCapabilities::relationship_includes()
-    }
-
     fn load_graph(
         &self,
         request: ReadModelLoadRequest,
     ) -> impl Future<Output = Result<ReadModelLoadGraph, TableStoreError>> + Send + '_ {
         async move {
-            request.validate_for_query_capabilities(&self.read_model_query_capabilities())?;
 
             let (root_schema, include_specs) = {
                 let registry = self.schema_registry.read().map_err(|_| {
@@ -575,7 +556,6 @@ mod tests {
                 columns: vec![TableColumn::new("id", "id", ColumnType::Text)],
                 primary_key: PrimaryKey::new(["id"]),
                 version_column: None,
-                foreign_keys: Vec::new(),
                 indexes: Vec::new(),
                 relationships: Vec::new(),
                 kind: crate::TableKind::ReadModel,
@@ -591,7 +571,7 @@ mod tests {
         let mut values = RowValues::new();
         values.insert("id", RowValue::String("row-1".into()));
 
-        let outcome = store
+        store
             .commit_write_plan(TableWritePlan::new(vec![TableMutation::UpsertRow(
                 TableRowMutation {
                     schema,
@@ -611,7 +591,6 @@ mod tests {
             .cloned()
             .unwrap();
 
-        assert!(outcome.was_applied());
         assert_eq!(row.version, 1);
         assert_eq!(
             row.values.get("id"),

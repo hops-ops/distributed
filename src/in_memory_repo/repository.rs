@@ -22,16 +22,14 @@ use crate::projection_protocol::{
     ProjectionChangeRetention, ProjectionProtocolError, SameTransactionProjectionBatch,
 };
 use crate::read_model::in_memory::apply_read_model_write_plan;
-use crate::read_model::{
-    InMemoryReadModelStore, ReadModelLoadGraph, ReadModelLoadRequest, ReadModelQueryCapabilities,
-};
+use crate::read_model::{InMemoryReadModelStore, ReadModelLoadGraph, ReadModelLoadRequest};
 use crate::repository::{
     validate_commit_batch, validate_snapshot_identity, CommitBatch, GetStream, InboxStore,
     ReadModelWritePlanStore, RelationalReadModelQueryStore, RepositoryError, SnapshotStore,
     SnapshotWrite, StreamIdentity, TransactionalCommit,
 };
 use crate::snapshot::{InMemorySnapshotStore, SnapshotRecord};
-use crate::table::{TableAdapterCapabilities, TableCommitOutcome, TableStoreError, TableWritePlan};
+use crate::table::{TableStoreError, TableWritePlan};
 
 /// In-memory repository implementation using HashMap.
 ///
@@ -908,14 +906,10 @@ fn stored_stream_version(events: Option<&Vec<EventRecord>>) -> u64 {
 }
 
 impl ReadModelWritePlanStore for InMemoryRepository {
-    fn read_model_capabilities(&self) -> TableAdapterCapabilities {
-        self.model_store.read_model_capabilities()
-    }
-
     fn commit_write_plan(
         &self,
         plan: TableWritePlan,
-    ) -> impl Future<Output = Result<TableCommitOutcome, TableStoreError>> + Send + '_ {
+    ) -> impl Future<Output = Result<(), TableStoreError>> + Send + '_ {
         self.model_store.commit_write_plan(plan)
     }
 }
@@ -927,10 +921,6 @@ impl RelationalReadModelQueryStore for InMemoryRepository {
     ) -> impl Future<Output = Result<crate::read_model::ReadModelScanPage, TableStoreError>> + Send + '_
     {
         self.model_store.scan_read_model(request)
-    }
-
-    fn read_model_query_capabilities(&self) -> ReadModelQueryCapabilities {
-        self.model_store.read_model_query_capabilities()
     }
 
     fn load_graph(

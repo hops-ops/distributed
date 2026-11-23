@@ -536,7 +536,6 @@ mod tests {
                 ],
                 primary_key: PrimaryKey::new(["todo_id"]),
                 version_column: Some("_sourced_version".into()),
-                foreign_keys: Vec::new(),
                 indexes: Vec::new(),
                 relationships: Vec::new(),
                 kind: TableKind::ReadModel,

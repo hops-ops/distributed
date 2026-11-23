@@ -1062,7 +1062,6 @@ mod tests {
                 .collect(),
             primary_key: PrimaryKey::new([fields[0]]),
             version_column: None,
-            foreign_keys: Vec::new(),
             indexes: Vec::new(),
             relationships,
             kind: TableKind::ReadModel,

@@ -22,7 +22,6 @@ fn simple_schema(model: &str, table: &str) -> TableSchema {
         ],
         primary_key: PrimaryKey::new(["id"]),
         version_column: None,
-        foreign_keys: Vec::new(),
         indexes: Vec::new(),
         relationships: Vec::new(),
         kind: TableKind::ReadModel,
@@ -42,7 +41,6 @@ fn bidirectional_parent_schema() -> TableSchema {
         ],
         primary_key: PrimaryKey::new(["id"]),
         version_column: None,
-        foreign_keys: Vec::new(),
         indexes: Vec::new(),
         relationships: vec![RelationshipDef {
             references: None,
@@ -71,7 +69,6 @@ fn bidirectional_child_schema() -> TableSchema {
         ],
         primary_key: PrimaryKey::new(["id"]),
         version_column: None,
-        foreign_keys: Vec::new(),
         indexes: Vec::new(),
         relationships: vec![RelationshipDef {
             references: None,
@@ -110,7 +107,6 @@ async fn isolated_multi_column_primary_key_builds_with_full_by_pk_tuple() {
         ],
         primary_key: PrimaryKey::new(["a", "b"]),
         version_column: None,
-        foreign_keys: Vec::new(),
         indexes: Vec::new(),
         relationships: Vec::new(),
         kind: TableKind::ReadModel,

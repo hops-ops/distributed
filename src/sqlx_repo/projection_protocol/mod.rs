@@ -41,7 +41,7 @@ use crate::projection_protocol::{
 use crate::repository::RepositoryError;
 use crate::sqlx_repo::read_model::{
     apply_read_model_write_plan_in_tx, push_key_predicates, quote_identifier, row_version_in_tx,
-    validate_sql_write_plan, validate_values_match_key, version_column,
+    validate_values_match_key, version_column,
 };
 use crate::sqlx_repo::repo::{repository_storage_error, SqlxRepoBackend, SqlxRepository};
 use crate::table::{

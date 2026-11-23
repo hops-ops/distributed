@@ -1386,7 +1386,6 @@ mod tests {
                 ],
                 primary_key: PrimaryKey::new(["todo_pk"]),
                 version_column: None,
-                foreign_keys: Vec::new(),
                 indexes: Vec::new(),
                 relationships: Vec::new(),
                 kind: TableKind::ReadModel,

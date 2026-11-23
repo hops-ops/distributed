@@ -144,10 +144,9 @@ async fn read_model_write_plan_can_commit_against_store() {
     let mut session = ReadModelWritePlanBuilder::new();
     session.upsert(&view).unwrap();
 
-    let outcome = session.commit(&repo).await.unwrap();
+    session.commit(&repo).await.unwrap();
     let loaded = load_test_view(&repo, "view-1").await.unwrap();
 
-    assert!(outcome.was_applied());
     assert_eq!(loaded.data, view);
 }
 

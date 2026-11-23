@@ -8,8 +8,7 @@ use crate::table::{
     column_name_for, has_many_join_columns, key_fingerprint, key_from_row,
     validate_expected_version, validate_key, DeleteTableRowMutation, ExpectedVersion, PatchMode,
     PatchTableRowMutation, RelationshipDef, RelationshipKind, RowKey, RowPatch, RowValues,
-    RowWriteMode, TableCommitOutcome, TableMutation, TableRowMutation, TableSchema,
-    TableStoreError, TableWritePlan,
+    RowWriteMode, TableMutation, TableRowMutation, TableSchema, TableStoreError, TableWritePlan,
 };
 
 use super::{ReadModelLoadRequest, RelationalReadModel, Versioned};
@@ -255,7 +254,7 @@ impl ReadModelWritePlanBuilder {
         Ok(plan)
     }
 
-    pub async fn commit<S>(self, store: &S) -> Result<TableCommitOutcome, TableStoreError>
+    pub async fn commit<S>(self, store: &S) -> Result<(), TableStoreError>
     where
         S: ReadModelWritePlanStore + ?Sized,
     {

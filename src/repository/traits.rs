@@ -2,9 +2,9 @@ use std::future::Future;
 
 use crate::entity::{Entity, EventRecord};
 use crate::outbox::OutboxMessage;
-use crate::read_model::{ReadModelLoadGraph, ReadModelLoadRequest, ReadModelQueryCapabilities};
+use crate::read_model::{ReadModelLoadGraph, ReadModelLoadRequest};
 use crate::snapshot::SnapshotRecord;
-use crate::table::{TableAdapterCapabilities, TableCommitOutcome, TableStoreError, TableWritePlan};
+use crate::table::{TableStoreError, TableWritePlan};
 
 use super::inbox::InboxReceipt;
 use super::{RepositoryError, StreamIdentity};
@@ -189,18 +189,14 @@ impl<T> Repository for T where T: GetStream + TransactionalCommit {}
 
 /// Adapter contract for committing read-model write plans.
 pub trait ReadModelWritePlanStore: Send + Sync {
-    fn read_model_capabilities(&self) -> TableAdapterCapabilities;
-
     fn commit_write_plan(
         &self,
         plan: TableWritePlan,
-    ) -> impl Future<Output = Result<TableCommitOutcome, TableStoreError>> + Send + '_;
+    ) -> impl Future<Output = Result<(), TableStoreError>> + Send + '_;
 }
 
 /// Primary-key relational read-model query contract.
 pub trait RelationalReadModelQueryStore: Send + Sync {
-    fn read_model_query_capabilities(&self) -> ReadModelQueryCapabilities;
-
     /// Optional bounded normalized-row scan. Unsupported adapters fail closed.
     fn scan_read_model(
         &self,

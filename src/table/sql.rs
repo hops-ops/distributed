@@ -1,8 +1,8 @@
 use std::collections::BTreeMap;
 
 use crate::table::{
-    ColumnType, TableMigrationArtifact, TableSchema, TableSchemaAdapter,
-    TableSchemaAdapterCapabilities, TableSchemaBootstrap, TableSchemaRegistry, TableStoreError,
+    ColumnType, TableMigrationArtifact, TableSchema, TableSchemaBootstrap, TableSchemaRegistry,
+    TableStoreError,
 };
 
 /// SQL dialect used to render table-schema migration artifacts.
@@ -10,47 +10,6 @@ use crate::table::{
 pub enum TableSqlDialect {
     Sqlite,
     Postgres,
-}
-
-/// Stateless adapter for generating SQL artifacts from table schemas.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct TableSqlSchemaAdapter {
-    dialect: TableSqlDialect,
-}
-
-impl TableSqlSchemaAdapter {
-    pub fn sqlite() -> Self {
-        Self {
-            dialect: TableSqlDialect::Sqlite,
-        }
-    }
-
-    pub fn postgres() -> Self {
-        Self {
-            dialect: TableSqlDialect::Postgres,
-        }
-    }
-
-    pub fn dialect(&self) -> TableSqlDialect {
-        self.dialect
-    }
-}
-
-impl TableSchemaAdapter for TableSqlSchemaAdapter {
-    fn schema_capabilities(&self) -> TableSchemaAdapterCapabilities {
-        TableSchemaAdapterCapabilities {
-            migration_artifacts: true,
-            schema_verification: false,
-            dev_bootstrap: false,
-        }
-    }
-
-    fn generate_migration_artifacts(
-        &self,
-        registry: &TableSchemaRegistry,
-    ) -> Result<Vec<TableMigrationArtifact>, TableStoreError> {
-        generate_table_migration_artifacts(registry, self.dialect)
-    }
 }
 
 pub fn generate_table_migration_artifacts(
@@ -117,16 +76,11 @@ fn table_schemas_in_dependency_order(
 }
 
 fn schema_dependency_tables(schema: &TableSchema) -> impl Iterator<Item = &str> {
-    let column_foreign_keys = schema
+    schema
         .columns
         .iter()
         .filter_map(|column| column.foreign_key.as_ref())
-        .map(|foreign_key| foreign_key.table.as_str());
-    let schema_foreign_keys = schema
-        .foreign_keys
-        .iter()
-        .map(|foreign_key| foreign_key.table.as_str());
-    column_foreign_keys.chain(schema_foreign_keys)
+        .map(|foreign_key| foreign_key.table.as_str())
 }
 
 fn create_table_statement(
@@ -140,7 +94,7 @@ fn create_table_statement(
             let mut definition = format!(
                 "{} {}",
                 quote_identifier(&column.column_name),
-                sql_type(&column.column_type, column.jsonb, dialect)?
+                sql_type(&column.column_type, dialect)?
             );
             if !column.nullable || column.primary_key {
                 definition.push_str(" NOT NULL");
@@ -165,7 +119,7 @@ fn create_table_statement(
         definitions.push(format!(
             "{} {} NOT NULL DEFAULT 1",
             quote_identifier(version_column),
-            sql_type(&ColumnType::UnsignedInteger, false, dialect)?
+            sql_type(&ColumnType::UnsignedInteger, dialect)?
         ));
     }
 
@@ -189,22 +143,6 @@ fn create_table_statement(
                 quote_identifier(&foreign_key.column)
             ));
         }
-    }
-
-    for foreign_key in &schema.foreign_keys {
-        let already_declared_on_column = schema.columns.iter().any(|column| {
-            column.column_name == foreign_key.column
-                && column.foreign_key.as_ref() == Some(foreign_key)
-        });
-        if already_declared_on_column {
-            continue;
-        }
-        definitions.push(format!(
-            "FOREIGN KEY ({}) REFERENCES {} ({})",
-            quote_identifier(&foreign_key.column),
-            quote_identifier(&foreign_key.table),
-            quote_identifier(&foreign_key.column)
-        ));
     }
 
     Ok(format!(
@@ -237,7 +175,6 @@ fn index_statements(schema: &TableSchema) -> impl Iterator<Item = String> + '_ {
 
 fn sql_type(
     column_type: &ColumnType,
-    jsonb: bool,
     dialect: TableSqlDialect,
 ) -> Result<&'static str, TableStoreError> {
     let type_name = match (dialect, column_type) {
@@ -253,7 +190,6 @@ fn sql_type(
         (TableSqlDialect::Postgres, ColumnType::Integer | ColumnType::UnsignedInteger) => "bigint",
         (TableSqlDialect::Postgres, ColumnType::Float) => "double precision",
         (TableSqlDialect::Postgres, ColumnType::Bytes) => "bytea",
-        (TableSqlDialect::Postgres, ColumnType::Json) if jsonb => "jsonb",
         (TableSqlDialect::Postgres, ColumnType::Json) => "jsonb",
         (TableSqlDialect::Postgres, ColumnType::Timestamp) => "timestamptz",
         (_, ColumnType::Unsupported(type_name)) => {
@@ -443,7 +379,6 @@ mod tests {
             columns: vec![TableColumn::new("parent_id", "parent_id", ColumnType::Text)],
             primary_key: PrimaryKey::new(["parent_id"]),
             version_column: None,
-            foreign_keys: Vec::new(),
             indexes: Vec::new(),
             relationships: Vec::new(),
             kind: crate::table::TableKind::ReadModel,
@@ -460,7 +395,6 @@ mod tests {
             ],
             primary_key: PrimaryKey::new(["child_id"]),
             version_column: None,
-            foreign_keys: Vec::new(),
             indexes: Vec::new(),
             relationships: Vec::new(),
             kind: crate::table::TableKind::ReadModel,
@@ -543,7 +477,6 @@ mod tests {
             columns: vec![column],
             primary_key: PrimaryKey::new(["note"]),
             version_column: None,
-            foreign_keys: Vec::new(),
             indexes: Vec::new(),
             relationships: Vec::new(),
             kind: crate::table::TableKind::ReadModel,

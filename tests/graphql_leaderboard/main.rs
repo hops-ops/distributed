@@ -439,7 +439,6 @@ fn the_cli_compiles_a_framework_leaderboard_manifest_into_the_ts_client() {
         ],
         primary_key: distributed::PrimaryKey::new(["id"]),
         version_column: Some("_sourced_version".into()),
-        foreign_keys: Vec::new(),
         indexes: Vec::new(),
         relationships: Vec::new(),
         kind: distributed::TableKind::ReadModel,

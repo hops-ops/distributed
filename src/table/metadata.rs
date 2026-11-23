@@ -97,7 +97,6 @@ pub struct TableColumn {
     pub primary_key: bool,
     pub foreign_key: Option<ForeignKey>,
     pub delegated_from: Option<String>,
-    pub jsonb: bool,
     pub skipped: bool,
 }
 
@@ -117,7 +116,6 @@ impl TableColumn {
             primary_key: false,
             foreign_key: None,
             delegated_from: None,
-            jsonb: false,
             skipped: false,
         }
     }
@@ -194,7 +192,6 @@ pub struct TableSchema {
     pub columns: Vec<TableColumn>,
     pub primary_key: PrimaryKey,
     pub version_column: Option<String>,
-    pub foreign_keys: Vec<ForeignKey>,
     pub indexes: Vec<TableIndex>,
     pub relationships: Vec<RelationshipDef>,
     /// Defaults to [`TableKind::ReadModel`]; skipped when serializing the default
@@ -294,10 +291,6 @@ impl TableSchema {
                     self.model_name, column
                 )));
             }
-        }
-
-        for foreign_key in &self.foreign_keys {
-            validate_foreign_key(&self.model_name, foreign_key)?;
         }
 
         let mut index_names = BTreeSet::new();
@@ -549,7 +542,6 @@ mod tests {
             ],
             primary_key: PrimaryKey::new(["player_id", "weapon_id"]),
             version_column: Some(DEFAULT_TABLE_VERSION_COLUMN.into()),
-            foreign_keys: vec![ForeignKey::new("players", "player_id")],
             indexes: vec![TableIndex::new(["player_id"])],
             relationships: Vec::new(),
             kind: TableKind::ReadModel,
@@ -564,7 +556,6 @@ mod tests {
             "columns": [],
             "primary_key": { "columns": [] },
             "version_column": null,
-            "foreign_keys": [],
             "indexes": [],
             "relationships": []
         }"#;

@@ -40,7 +40,6 @@ fn orders_schema() -> TableSchema {
         ],
         primary_key: PrimaryKey::new(["order_id"]),
         version_column: None,
-        foreign_keys: Vec::new(),
         indexes: Vec::new(),
         relationships: Vec::new(),
         kind: TableKind::ReadModel,

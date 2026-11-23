@@ -31,9 +31,7 @@ use crate::sqlx_repo::{
     read_model_u64_from_i64 as sqlx_read_model_u64_from_i64,
 };
 use crate::table::TableSqlDialect;
-use crate::table::{
-    ColumnType, RowValue, TableColumn as ColumnDef, TableStoreError as ReadModelError,
-};
+use crate::table::{ColumnType, RowValue, TableColumn, TableStoreError};
 
 static SQLITE_MIGRATOR: LazyLock<Migrator> = LazyLock::new(|| embedded_migrator(SQLITE_MIGRATIONS));
 const SQLITE_BACKEND: &str = "sqlite";
@@ -240,8 +238,8 @@ impl crate::sqlx_repo::read_model::SqlxReadModelBackend for Sqlite {
     fn push_row_value_bind(
         builder: &mut QueryBuilder<Sqlite>,
         value: RowValue,
-        column: &ColumnDef,
-    ) -> Result<(), ReadModelError> {
+        column: &TableColumn,
+    ) -> Result<(), TableStoreError> {
         match value {
             RowValue::Null => Self::push_null_bind(builder, column)?,
             RowValue::Bool(value) => {
@@ -269,7 +267,7 @@ impl crate::sqlx_repo::read_model::SqlxReadModelBackend for Sqlite {
             }
             RowValue::Json(value) => {
                 let payload = serde_json::to_string(&value)
-                    .map_err(|err| ReadModelError::Serde(err.to_string()))?;
+                    .map_err(|err| TableStoreError::Serde(err.to_string()))?;
                 builder.push_bind(payload);
             }
         }
@@ -278,8 +276,8 @@ impl crate::sqlx_repo::read_model::SqlxReadModelBackend for Sqlite {
 
     fn push_null_bind(
         builder: &mut QueryBuilder<Sqlite>,
-        column: &ColumnDef,
-    ) -> Result<(), ReadModelError> {
+        column: &TableColumn,
+    ) -> Result<(), TableStoreError> {
         match &column.column_type {
             ColumnType::Text | ColumnType::Json | ColumnType::Timestamp => {
                 builder.push_bind(Option::<String>::None);
@@ -294,7 +292,7 @@ impl crate::sqlx_repo::read_model::SqlxReadModelBackend for Sqlite {
                 builder.push_bind(Option::<Vec<u8>>::None);
             }
             ColumnType::Unsupported(type_name) => {
-                return Err(ReadModelError::Metadata(format!(
+                return Err(TableStoreError::Metadata(format!(
                     "read model `{}` column `{}` has unsupported type `{}`",
                     column.field_name, column.column_name, type_name
                 )));
@@ -307,11 +305,11 @@ impl crate::sqlx_repo::read_model::SqlxReadModelBackend for Sqlite {
         result.rows_affected()
     }
 
-    fn push_select_column(builder: &mut QueryBuilder<Sqlite>, column: &ColumnDef) {
+    fn push_select_column(builder: &mut QueryBuilder<Sqlite>, column: &TableColumn) {
         builder.push(quote_identifier(&column.column_name));
     }
 
-    fn row_value(row: &SqliteRow, column: &ColumnDef) -> Result<RowValue, ReadModelError> {
+    fn row_value(row: &SqliteRow, column: &TableColumn) -> Result<RowValue, TableStoreError> {
         Ok(match column.column_type {
             ColumnType::Text | ColumnType::Timestamp => row
                 .try_get::<Option<String>, _>(column.column_name.as_str())
@@ -355,12 +353,12 @@ impl crate::sqlx_repo::read_model::SqlxReadModelBackend for Sqlite {
                 .map(|payload| {
                     serde_json::from_str(&payload)
                         .map(RowValue::Json)
-                        .map_err(|err| ReadModelError::Serde(err.to_string()))
+                        .map_err(|err| TableStoreError::Serde(err.to_string()))
                 })
                 .transpose()?
                 .unwrap_or(RowValue::Null),
             ColumnType::Unsupported(ref type_name) => {
-                return Err(ReadModelError::Metadata(format!(
+                return Err(TableStoreError::Metadata(format!(
                     "read model `{}` column `{}` has unsupported type `{}`",
                     column.field_name, column.column_name, type_name
                 )));
@@ -373,6 +371,6 @@ fn repository_storage_error(operation: &str, err: sqlx::Error) -> RepositoryErro
     sqlx_repo::repository_storage_error(SQLITE_BACKEND, operation, err)
 }
 
-fn read_model_storage_error(operation: &str, err: sqlx::Error) -> ReadModelError {
+fn read_model_storage_error(operation: &str, err: sqlx::Error) -> TableStoreError {
     sqlx_repo::read_model_storage_error(SQLITE_BACKEND, operation, err)
 }

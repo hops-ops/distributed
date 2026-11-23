@@ -64,11 +64,10 @@ where
         .upsert(&view)
         .expect("row mutation should serialize");
 
-    let outcome = read_models
+    read_models
         .commit(&repo)
         .await
         .expect("read model write plan should commit");
-    assert!(outcome.was_applied());
 
     let loaded = load_seat_view(&repo, &view.id)
         .await

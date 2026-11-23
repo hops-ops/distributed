@@ -28,9 +28,7 @@ use crate::sqlx_repo::{
     repository_i64_from_u64 as sqlx_repository_i64_from_u64,
 };
 use crate::table::TableSqlDialect;
-use crate::table::{
-    ColumnType, RowValue, TableColumn as ColumnDef, TableStoreError as ReadModelError,
-};
+use crate::table::{ColumnType, RowValue, TableColumn, TableStoreError};
 
 static POSTGRES_MIGRATOR: LazyLock<Migrator> =
     LazyLock::new(|| embedded_migrator(POSTGRES_MIGRATIONS));
@@ -353,8 +351,8 @@ impl crate::sqlx_repo::read_model::SqlxReadModelBackend for Postgres {
     fn push_row_value_bind(
         builder: &mut QueryBuilder<Postgres>,
         value: RowValue,
-        column: &ColumnDef,
-    ) -> Result<(), ReadModelError> {
+        column: &TableColumn,
+    ) -> Result<(), TableStoreError> {
         match value {
             RowValue::Null => Self::push_null_bind(builder, column)?,
             RowValue::Bool(value) => {
@@ -382,7 +380,7 @@ impl crate::sqlx_repo::read_model::SqlxReadModelBackend for Postgres {
             }
             RowValue::Json(value) => {
                 let payload = serde_json::to_string(&value)
-                    .map_err(|err| ReadModelError::Serde(err.to_string()))?;
+                    .map_err(|err| TableStoreError::Serde(err.to_string()))?;
                 builder.push_bind(payload);
             }
         }
@@ -392,8 +390,8 @@ impl crate::sqlx_repo::read_model::SqlxReadModelBackend for Postgres {
 
     fn push_null_bind(
         builder: &mut QueryBuilder<Postgres>,
-        column: &ColumnDef,
-    ) -> Result<(), ReadModelError> {
+        column: &TableColumn,
+    ) -> Result<(), TableStoreError> {
         match &column.column_type {
             ColumnType::Text | ColumnType::Json | ColumnType::Timestamp => {
                 builder.push_bind(Option::<String>::None);
@@ -411,7 +409,7 @@ impl crate::sqlx_repo::read_model::SqlxReadModelBackend for Postgres {
                 builder.push_bind(Option::<Vec<u8>>::None);
             }
             ColumnType::Unsupported(type_name) => {
-                return Err(ReadModelError::Metadata(format!(
+                return Err(TableStoreError::Metadata(format!(
                     "read model `{}` column `{}` has unsupported type `{}`",
                     column.field_name, column.column_name, type_name
                 )));
@@ -424,7 +422,7 @@ impl crate::sqlx_repo::read_model::SqlxReadModelBackend for Postgres {
         result.rows_affected()
     }
 
-    fn push_select_column(builder: &mut QueryBuilder<Postgres>, column: &ColumnDef) {
+    fn push_select_column(builder: &mut QueryBuilder<Postgres>, column: &TableColumn) {
         builder.push(quote_identifier(&column.column_name));
         if matches!(column.column_type, ColumnType::Json | ColumnType::Timestamp) {
             builder.push("::text");
@@ -435,8 +433,8 @@ impl crate::sqlx_repo::read_model::SqlxReadModelBackend for Postgres {
 
     fn row_value(
         row: &sqlx::postgres::PgRow,
-        column: &ColumnDef,
-    ) -> Result<RowValue, ReadModelError> {
+        column: &TableColumn,
+    ) -> Result<RowValue, TableStoreError> {
         Ok(match column.column_type {
             ColumnType::Text | ColumnType::Timestamp => row
                 .try_get::<Option<String>, _>(column.column_name.as_str())
@@ -484,12 +482,12 @@ impl crate::sqlx_repo::read_model::SqlxReadModelBackend for Postgres {
                 .map(|payload| {
                     serde_json::from_str(&payload)
                         .map(RowValue::Json)
-                        .map_err(|err| ReadModelError::Serde(err.to_string()))
+                        .map_err(|err| TableStoreError::Serde(err.to_string()))
                 })
                 .transpose()?
                 .unwrap_or(RowValue::Null),
             ColumnType::Unsupported(ref type_name) => {
-                return Err(ReadModelError::Metadata(format!(
+                return Err(TableStoreError::Metadata(format!(
                     "read model `{}` column `{}` has unsupported type `{}`",
                     column.field_name, column.column_name, type_name
                 )));
@@ -501,7 +499,7 @@ impl crate::sqlx_repo::read_model::SqlxReadModelBackend for Postgres {
     fn push_change_notify<'e, E>(
         executor: E,
         tables: &std::collections::BTreeSet<String>,
-    ) -> impl std::future::Future<Output = Result<(), ReadModelError>> + Send
+    ) -> impl std::future::Future<Output = Result<(), TableStoreError>> + Send
     where
         E: sqlx::Executor<'e, Database = Postgres> + Send,
     {
@@ -510,7 +508,7 @@ impl crate::sqlx_repo::read_model::SqlxReadModelBackend for Postgres {
                 return Ok(());
             }
             let payload = serde_json::to_string(&tables.iter().collect::<Vec<_>>())
-                .map_err(|err| ReadModelError::Serde(err.to_string()))?;
+                .map_err(|err| TableStoreError::Serde(err.to_string()))?;
             sqlx::query("SELECT pg_notify('distributed_read_model_changes', $1)")
                 .bind(payload)
                 .execute(executor)
@@ -527,7 +525,7 @@ impl crate::sqlx_repo::read_model::SqlxReadModelBackend for Postgres {
     }
 }
 
-fn push_postgres_type_cast(builder: &mut QueryBuilder<Postgres>, column: &ColumnDef) {
+fn push_postgres_type_cast(builder: &mut QueryBuilder<Postgres>, column: &TableColumn) {
     match column.column_type {
         ColumnType::Json => {
             builder.push("::jsonb");
@@ -552,6 +550,6 @@ fn repository_storage_error(operation: &str, err: sqlx::Error) -> RepositoryErro
     sqlx_repo::repository_storage_error(POSTGRES_BACKEND, operation, err)
 }
 
-fn read_model_storage_error(operation: &str, err: sqlx::Error) -> ReadModelError {
+fn read_model_storage_error(operation: &str, err: sqlx::Error) -> TableStoreError {
     sqlx_repo::read_model_storage_error(POSTGRES_BACKEND, operation, err)
 }

@@ -137,7 +137,6 @@ pub async fn json_column_in_a_wide_row_is_json(db: Db) {
         columns,
         primary_key: PrimaryKey::new(["id"]),
         version_column: None,
-        foreign_keys: Vec::new(),
         indexes: Vec::new(),
         relationships: Vec::new(),
         kind: TableKind::ReadModel,

@@ -3,13 +3,17 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::outbox::{OutboxMessage, OutboxMessageStatus};
 use crate::table::{
     ColumnType, ExpectedVersion, PrimaryKey, RowKey, RowValue, RowValues, RowWriteMode,
-    TableColumn, TableIndex, TableKind, TableModel, TableMutation, TableRowMutation, TableSchema,
-    TableStoreError, TableWritePlan,
+    TableColumn, TableKind, TableMutation, TableRowMutation, TableSchema, TableStoreError,
+    TableWritePlan,
 };
 
 pub const OUTBOX_MESSAGES_TABLE: &str = "outbox_messages";
 
-/// Schema for the durable outbox delivery table.
+/// Row contract for the durable outbox delivery table.
+///
+/// The migrations own this table's DDL. Its indexes are not listed here: they
+/// differ per dialect and Postgres uses partial indexes, which `TableIndex`
+/// cannot express, so rendering this schema must not create any.
 pub fn outbox_message_schema() -> &'static TableSchema {
     static SCHEMA: std::sync::LazyLock<TableSchema> = std::sync::LazyLock::new(|| TableSchema {
         model_name: "OutboxMessage".into(),
@@ -40,22 +44,7 @@ pub fn outbox_message_schema() -> &'static TableSchema {
         ],
         primary_key: PrimaryKey::new(["message_id"]),
         version_column: None,
-        foreign_keys: Vec::new(),
-        indexes: vec![
-            named_index(
-                "outbox_messages_claimable_idx",
-                ["status", "next_available_at", "claimed_until", "created_at"],
-            ),
-            named_index(
-                "outbox_messages_source_idx",
-                [
-                    "source_aggregate_type",
-                    "source_aggregate_id",
-                    "source_sequence",
-                ],
-            ),
-            named_index("outbox_messages_destination_idx", ["destination", "status"]),
-        ],
+        indexes: Vec::new(),
         relationships: Vec::new(),
         kind: TableKind::Operational,
     });
@@ -138,20 +127,6 @@ pub fn outbox_message_row_values(message: &OutboxMessage) -> Result<RowValues, T
     Ok(row)
 }
 
-impl TableModel for OutboxMessage {
-    fn table_schema() -> &'static TableSchema {
-        outbox_message_schema()
-    }
-
-    fn table_key(&self) -> Result<RowKey, TableStoreError> {
-        Ok(outbox_message_key(self.id()))
-    }
-
-    fn to_table_row(&self) -> Result<RowValues, TableStoreError> {
-        outbox_message_row_values(self)
-    }
-}
-
 fn table_column(name: &str, column_type: ColumnType, nullable: bool) -> TableColumn {
     let mut column = TableColumn::new(name, name, column_type);
     column.nullable = nullable;
@@ -163,12 +138,6 @@ fn timestamp_column_with_default(name: &str, default: &str) -> TableColumn {
     column.has_default = true;
     column.default = Some(default.into());
     column
-}
-
-fn named_index(name: &str, columns: impl IntoIterator<Item = &'static str>) -> TableIndex {
-    let mut index = TableIndex::new(columns);
-    index.name = Some(name.into());
-    index
 }
 
 fn optional_string(value: &Option<String>) -> RowValue {

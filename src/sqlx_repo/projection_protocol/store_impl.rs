@@ -347,7 +347,7 @@ where
                     .map(|mutation| mutation.mutation.clone())
                     .collect(),
             );
-            validate_sql_write_plan(&write_plan)?;
+            write_plan.validate()?;
 
             let topology = batch.input.cursor.topology().clone();
             let partition = batch.input.cursor.projection_partition().clone();

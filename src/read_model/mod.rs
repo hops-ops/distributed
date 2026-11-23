@@ -22,10 +22,9 @@
 //! ```ignore
 //! let mut read_models = ReadModelWritePlanBuilder::new();
 //! read_models.upsert(&view)?;
-//! let outcome = read_models.commit(&read_store)?;
+//! read_models.commit(&read_store)?;
 //! ```
 
-mod capabilities;
 pub mod change;
 pub(crate) mod in_memory;
 mod load;
@@ -90,7 +89,6 @@ pub trait RelationalReadModelIncludes: RelationalReadModel {
     fn include_target_schema(include: &str) -> Result<&'static TableSchema, TableStoreError>;
 }
 
-pub use capabilities::ReadModelQueryCapabilities;
 pub use scan::{ReadModelScanCursor, ReadModelScanPage, ReadModelScanRequest};
 pub use in_memory::InMemoryReadModelStore;
 pub use load::{

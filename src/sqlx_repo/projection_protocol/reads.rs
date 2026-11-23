@@ -173,7 +173,7 @@ where
             .map(|mutation| mutation.mutation.clone())
             .collect(),
     );
-    validate_sql_write_plan(&write_plan)?;
+    write_plan.validate()?;
     verify_registered_topology_in_tx(tx, verified, &batch.topology).await?;
     let mut state =
         lock_partition_in_tx(tx, &batch.topology, &batch.partition, &batch.change_epoch).await?;

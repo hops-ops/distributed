@@ -181,11 +181,6 @@ where
         &self.pool
     }
 
-    /// SQL artifact adapter for registered table/read-model schemas.
-    pub fn table_schema_adapter(&self) -> TableSqlSchemaAdapter {
-        table_schema_adapter::<DB>()
-    }
-
     /// Generate SQL statements for registered table/read-model schemas.
     pub fn generate_table_migration_artifacts(
         &self,
@@ -224,35 +219,6 @@ where
 
     pub fn pool(&self) -> &Pool<DB> {
         &self.pool
-    }
-
-    /// SQL artifact adapter for registered table/read-model schemas.
-    pub fn table_schema_adapter(&self) -> TableSqlSchemaAdapter {
-        table_schema_adapter::<DB>()
-    }
-
-    /// Generate SQL statements for registered table/read-model schemas.
-    pub fn generate_table_migration_artifacts(
-        &self,
-        registry: &TableSchemaRegistry,
-    ) -> Result<Vec<TableMigrationArtifact>, TableStoreError> {
-        generate_table_migration_artifacts(registry, DB::TABLE_DIALECT)
-    }
-
-    /// Explicit dev/test bootstrap for registered table/read-model schemas.
-    pub async fn bootstrap_table_schema_for_dev(
-        &self,
-        registry: &TableSchemaRegistry,
-    ) -> Result<TableSchemaBootstrap, TableStoreError> {
-        bootstrap_table_schema(&self.pool, registry).await?;
-        Ok(table_schema_bootstrap_result(registry))
-    }
-}
-
-fn table_schema_adapter<DB: SqlxRepoBackend>() -> TableSqlSchemaAdapter {
-    match DB::TABLE_DIALECT {
-        TableSqlDialect::Postgres => TableSqlSchemaAdapter::postgres(),
-        TableSqlDialect::Sqlite => TableSqlSchemaAdapter::sqlite(),
     }
 }
 

@@ -3,8 +3,7 @@ use std::collections::HashMap;
 use distributed::read_model::ReadModelWritePlanBuilder;
 use distributed::{
     ExpectedVersion, InMemoryReadModelStore, PatchMode, ReadModel, ReadModelWorkspaceExt, RowKey,
-    RowPatch, RowValue, RowWriteMode, TableAdapterCapabilities, TableMutation, TableStoreError,
-    Versioned,
+    RowPatch, RowValue, RowWriteMode, TableMutation, TableStoreError, Versioned,
 };
 use serde::{Deserialize, Serialize};
 
@@ -363,24 +362,4 @@ fn validation_failures_happen_before_storage_writes() {
     let err = session.into_write_plan().unwrap_err();
 
     assert!(matches!(err, TableStoreError::Metadata(message) if message.contains("not nullable")));
-}
-
-#[test]
-fn write_plan_validation_reports_unsupported_adapter_capabilities() {
-    let mut session = ReadModelWritePlanBuilder::new();
-    let patch = RowPatch::new().set("owner", RowValue::String("Grace".into()));
-    session
-        .patch::<AccountSummary>(account_key("acct-1"), patch)
-        .unwrap();
-    let plan = session.into_write_plan().unwrap();
-    let capabilities = TableAdapterCapabilities {
-        sparse_patches: false,
-        ..TableAdapterCapabilities::default()
-    };
-
-    let err = plan.validate_for(&capabilities).unwrap_err();
-
-    assert!(
-        matches!(err, TableStoreError::Metadata(message) if message.contains("sparse row patches"))
-    );
 }
