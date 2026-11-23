@@ -19,7 +19,8 @@ async-graphql-parser = "7"
 async-graphql-value = "7"
 base64 = "0.23.0"
 clap = { version = "4", features = ["derive"] }
-ctrlc = "3"
+# `termination` adds SIGTERM and SIGHUP to the SIGINT handler.
+ctrlc = { version = "3", features = ["termination"] }
 distributed = { path = "..", default-features = false }
 distributed_game = { path = "../distributed_game" }
 dotenvy = "0.15"
