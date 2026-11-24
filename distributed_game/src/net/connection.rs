@@ -30,7 +30,23 @@ pub(super) async fn reject(mut socket: WebSocket, code: u32, message: impl Into<
     let _ = socket
         .send(Message::Binary(error_frame(code, message).into()))
         .await;
-    let _ = socket.send(Message::Close(None)).await;
+    close(socket).await;
+}
+
+/// How long a closing connection keeps reading for the client's Close.
+const CLOSE_LINGER: Duration = Duration::from_secs(2);
+
+/// Close so the frames sent before arrive: send Close, then read and
+/// discard until the client answers (or hangs up, or [`CLOSE_LINGER`]
+/// passes). A socket dropped with client frames still unread is reset
+/// (TCP RST), and the client may lose what it had not read yet, such as
+/// the Kick or Error saying why.
+pub(super) async fn close(mut socket: WebSocket) {
+    if socket.send(Message::Close(None)).await.is_err() {
+        return;
+    }
+    let drain = async { while let Some(Ok(_)) = socket.recv().await {} };
+    let _ = tokio::time::timeout(CLOSE_LINGER, drain).await;
 }
 
 pub(super) async fn sleep_until_opt(at: Option<Instant>) {
@@ -85,8 +101,7 @@ where
         .encode(&())
         .expect("redirect encodes");
         let _ = socket.send(Message::Binary(redirect.into())).await;
-        let _ = socket.send(Message::Close(None)).await;
-        return;
+        return close(socket).await;
     }
     // A transfer is single use at its issuer: an arrival reserves it there
     // (settled once the zone answered), a refused one returning to its
@@ -330,7 +345,7 @@ where
     if notify_zone {
         let _ = zone.send(ZoneCmd::Disconnect { client, graceful }).await;
     }
-    let _ = socket.send(Message::Close(None)).await;
+    close(socket).await;
 }
 
 /// Ok(false) when the connection should end.
