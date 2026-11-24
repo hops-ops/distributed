@@ -1,4 +1,5 @@
 import { isPlainRecord } from '../../lib/is-plain-record.js';
+import { oncePerIdentity } from '../../lib/once-per-identity.js';
 import {
 	canonicalCommandProjectionMetadata,
 	canonicalProjectionDelta,
@@ -375,9 +376,26 @@ export function parseCommandProjectionMetadata(
 	return parsed;
 }
 
+/**
+ * A command's projection is an immutable generated constant, validated once.
+ * A caller that names its own error path is validated every time.
+ */
 export function validateCommandProjectionArtifact(
 	value: unknown,
 	path = 'artifact.projection'
+): ReplicaCommandProjection {
+	return path === 'artifact.projection'
+		? oncePerIdentity(validatedProjections, value, (projection) =>
+				parseCommandProjectionArtifact(projection, path)
+			)
+		: parseCommandProjectionArtifact(value, path);
+}
+
+const validatedProjections = new WeakMap<object, ReplicaCommandProjection>();
+
+function parseCommandProjectionArtifact(
+	value: unknown,
+	path: string
 ): ReplicaCommandProjection {
 	preflightProjectionPayload(value, path);
 	const projection = exactRecord(

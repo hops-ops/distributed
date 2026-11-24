@@ -249,9 +249,12 @@ function todoArtifact({
 }
 
 function snapshot(records, indexes) {
+	const recordsByKey = new Map(records.map((record) => [record.key, record]));
+	const indexesByKey = new Map(indexes.map((index) => [index.key, index]));
 	return Object.freeze({
-		records: Object.freeze(records),
-		indexes: Object.freeze(indexes)
+		record: (key) => recordsByKey.get(key),
+		index: (key) => indexesByKey.get(key),
+		indexes: () => indexes
 	});
 }
 

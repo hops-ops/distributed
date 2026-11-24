@@ -36,3 +36,4 @@ export {
 	OptimisticLayerNotFoundError
 } from './errors.js';
 export { cacheIndexKey, createCacheEngine } from './create.js';
+export { cacheEngineWork } from './work.js';

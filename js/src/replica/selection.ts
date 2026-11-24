@@ -7,6 +7,7 @@ import type {
 } from './types.js';
 
 import { assertName } from '../lib/assert-name.js';
+import { oncePerIdentity } from '../lib/once-per-identity.js';
 
 export type RuntimeScalarSelection = ReplicaScalarSelection & {
 	readonly nullable: boolean;
@@ -30,7 +31,14 @@ export type RuntimeRootSelection = Omit<ReplicaRootSelection, 'nullable' | 'sele
 	readonly selection: RuntimeObjectSelection;
 };
 
+/** A root selection is an immutable generated constant, validated once. */
 export function runtimeRoot(selection: ReplicaRootSelection): RuntimeRootSelection {
+	return oncePerIdentity(runtimeRoots, selection, validateRoot);
+}
+
+const runtimeRoots = new WeakMap<object, RuntimeRootSelection>();
+
+function validateRoot(selection: ReplicaRootSelection): RuntimeRootSelection {
 	assertBranchShape(selection, 'root');
 	if (typeof selection.nullable !== 'boolean') {
 		throw new TypeError(

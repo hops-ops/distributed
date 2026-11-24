@@ -1,5 +1,6 @@
 import type { ReplicaClientSurface } from '../types.js';
 import { isPlainRecord } from '../../lib/is-plain-record.js';
+import { oncePerIdentity } from '../../lib/once-per-identity.js';
 import {
 	GRAPHQL_NAME,
 	MAX_TYPE_DEPTH
@@ -33,8 +34,24 @@ import {
 	type ReplicaCommandProjection
 } from '../projection-delta/index.js';
 
+/** A command artifact is an immutable generated constant, validated once. */
 export function validateArtifact<TInput, TOutput>(
 	artifact: ReplicaCommandArtifact<TInput, TOutput>,
+	allowTrustedPresets: boolean
+): readonly ReplicaTrustedPresetDescriptor[] {
+	return oncePerIdentity(
+		allowTrustedPresets ? validatedWithPresets : validatedWithoutPresets,
+		artifact as ReplicaCommandArtifact<unknown, unknown>,
+		(value) => validateCommandArtifact(value, allowTrustedPresets)
+	);
+}
+
+type ValidatedPresets = readonly ReplicaTrustedPresetDescriptor[];
+const validatedWithPresets = new WeakMap<object, ValidatedPresets>();
+const validatedWithoutPresets = new WeakMap<object, ValidatedPresets>();
+
+function validateCommandArtifact(
+	artifact: ReplicaCommandArtifact<unknown, unknown>,
 	allowTrustedPresets: boolean
 ): readonly ReplicaTrustedPresetDescriptor[] {
 	if (artifact.version !== 2) artifactInvalid('artifact.version');

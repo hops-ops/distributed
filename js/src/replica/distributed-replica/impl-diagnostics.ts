@@ -1,4 +1,7 @@
-import type { CacheEngine } from '../../internal/cache-engine.js';
+import type {
+	CacheEngine,
+	CacheEngineSnapshot
+} from '../../internal/cache-engine.js';
 import type {
 	ReplicaDiagnosticEventInput,
 	ReplicaDiagnosticLayerInput,
@@ -31,92 +34,118 @@ export type DiagnosticsHost = {
 	getProtocolGenerationSequence(): number;
 };
 
+/**
+ * Hand the sink the current state. Records and indexes are one pass over the
+ * whole cache, so they are computed when the sink first reads them, from the
+ * cache as it is then; a sink nobody is looking at costs a write nothing.
+ */
 export function syncDiagnostics(host: DiagnosticsHost): void {
 	const diagnostics = host.diagnostics;
 	if (diagnostics === undefined) return;
-	try {
-		const cache = host.engine.extract();
-		const records = cache.records.map((record) => {
-			const model = modelFromRecordKey(record.key);
-			const tombstone = record.tombstoneRevision !== undefined;
-			const values: Record<string, ReplicaValue> = {};
-			if (!tombstone && diagnostics.redactRecordValue !== undefined) {
-				for (const [field, entry] of Object.entries(record.fields)) {
-					const value = diagnostics.redactRecordValue(
-						Object.freeze({
-							recordKey: record.key,
-							...(model === undefined ? {} : { model }),
-							field,
-							kind: 'field' as const
-						}),
-						entry.value as ReplicaValue
-					);
-					if (value !== undefined) values[field] = value;
-				}
-				for (const [field, entry] of Object.entries(record.links)) {
-					const value = diagnostics.redactRecordValue(
-						Object.freeze({
-							recordKey: record.key,
-							...(model === undefined ? {} : { model }),
-							field,
-							kind: 'link' as const
-						}),
-						entry.value as ReplicaValue
-					);
-					if (value !== undefined) values[field] = value;
-				}
+	const whenRead = <T>(compute: () => readonly T[]) => {
+		let value: readonly T[] | undefined;
+		return () => {
+			if (value !== undefined) return value;
+			try {
+				value = Object.freeze(compute());
+			} catch (error) {
+				value = Object.freeze([]);
+				reportSafely(
+					host.reportObserverError,
+					new AggregateError([error], 'replica diagnostics update failed')
+				);
 			}
-			return Object.freeze({
-				key: record.key,
-				...(model === undefined ? {} : { model }),
-				revision: record.revision,
-				incarnation: record.incarnation ?? record.revision,
-				tombstone,
-				...(record.tombstoneRevision === undefined
-					? {}
-					: { tombstoneRevision: record.tombstoneRevision }),
-				presentFields: Object.freeze(
-					tombstone ? [] : Object.keys(record.fields).sort()
-				),
-				presentLinks: Object.freeze(
-					tombstone ? [] : Object.keys(record.links).sort()
-				),
-				...(Object.keys(values).length === 0
-					? {}
-					: { values: Object.freeze(values) })
-			});
-		});
-		const indexes = cache.indexes.map((index) =>
-			Object.freeze({
-				key: index.key,
-				revision: index.revision,
-				...(index.staleRevision === undefined
-					? {}
-					: { staleRevision: index.staleRevision }),
-				records: index.records,
-				complete: index.complete,
-				deleted: index.deleted,
-				...(index.metadata === undefined
-					? {}
-					: {
-							field: index.metadata.field,
-							...(index.metadata.parent === undefined
-								? {}
-								: { parent: index.metadata.parent }),
-							argumentNames: Object.freeze(
-								Object.keys(index.metadata.arguments).sort()
-							),
-							...(diagnostics.includeStructuralIdentities
-								? { arguments: index.metadata.arguments }
-								: {}),
-							coverage: index.metadata.coverage,
-							dependencies: index.metadata.dependencies,
-							...(index.metadata.staleReason === undefined
-								? {}
-								: { staleReason: index.metadata.staleReason }),
-							nullValue: index.metadata.nullValue === true
-						})
+			return value;
+		};
+	};
+	try {
+		let extracted: CacheEngineSnapshot | undefined;
+		const cache = () => (extracted ??= host.engine.extract());
+		const records = whenRead(() =>
+			cache().records.map((record) => {
+				const model = modelFromRecordKey(record.key);
+				const tombstone = record.tombstoneRevision !== undefined;
+				const values: Record<string, ReplicaValue> = {};
+				if (!tombstone && diagnostics.redactRecordValue !== undefined) {
+					for (const [field, entry] of Object.entries(record.fields)) {
+						const value = diagnostics.redactRecordValue(
+							Object.freeze({
+								recordKey: record.key,
+								...(model === undefined ? {} : { model }),
+								field,
+								kind: 'field' as const
+							}),
+							entry.value as ReplicaValue
+						);
+						if (value !== undefined) values[field] = value;
+					}
+					for (const [field, entry] of Object.entries(record.links)) {
+						const value = diagnostics.redactRecordValue(
+							Object.freeze({
+								recordKey: record.key,
+								...(model === undefined ? {} : { model }),
+								field,
+								kind: 'link' as const
+							}),
+							entry.value as ReplicaValue
+						);
+						if (value !== undefined) values[field] = value;
+					}
+				}
+				return Object.freeze({
+					key: record.key,
+					...(model === undefined ? {} : { model }),
+					revision: record.revision,
+					incarnation: record.incarnation ?? record.revision,
+					tombstone,
+					...(record.tombstoneRevision === undefined
+						? {}
+						: { tombstoneRevision: record.tombstoneRevision }),
+					presentFields: Object.freeze(
+						tombstone ? [] : Object.keys(record.fields).sort()
+					),
+					presentLinks: Object.freeze(
+						tombstone ? [] : Object.keys(record.links).sort()
+					),
+					...(Object.keys(values).length === 0
+						? {}
+						: { values: Object.freeze(values) })
+				});
 			})
+		);
+		const indexes = whenRead(() =>
+			cache().indexes.map((index) =>
+				Object.freeze({
+					key: index.key,
+					revision: index.revision,
+					...(index.staleRevision === undefined
+						? {}
+						: { staleRevision: index.staleRevision }),
+					records: index.records,
+					complete: index.complete,
+					deleted: index.deleted,
+					...(index.metadata === undefined
+						? {}
+						: {
+								field: index.metadata.field,
+								...(index.metadata.parent === undefined
+									? {}
+									: { parent: index.metadata.parent }),
+								argumentNames: Object.freeze(
+									Object.keys(index.metadata.arguments).sort()
+								),
+								...(diagnostics.includeStructuralIdentities
+									? { arguments: index.metadata.arguments }
+									: {}),
+								coverage: index.metadata.coverage,
+								dependencies: index.metadata.dependencies,
+								...(index.metadata.staleReason === undefined
+									? {}
+									: { staleReason: index.metadata.staleReason }),
+								nullValue: index.metadata.nullValue === true
+							})
+				})
+			)
 		);
 		const receipts: ReplicaDiagnosticReceiptInput[] = [];
 		for (const layer of host.diagnosticLayers?.values() ?? []) {
@@ -152,8 +181,12 @@ export function syncDiagnostics(host: DiagnosticsHost): void {
 								protocolVersion: 1 as const,
 								schemaHash: scope.schemaHash
 							}),
-				records: Object.freeze(records),
-				indexes: Object.freeze(indexes),
+				get records() {
+					return records();
+				},
+				get indexes() {
+					return indexes();
+				},
 				layers: Object.freeze([
 					...(host.diagnosticLayers?.values() ?? [])
 				]),

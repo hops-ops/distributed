@@ -31,6 +31,7 @@ import type {
 	ReplicaIndexMaintenanceReason,
 	ReplicaIndexMaintenanceReasonCode,
 	ReplicaIndexMaintenanceRecord,
+	ReplicaIndexMaintenanceSnapshot,
 	ReplicaIndexSemanticLayer
 } from './types.js';
 
@@ -60,12 +61,17 @@ export type RegisteredPlan = {
 export type MutableRecord = {
 	readonly key: string;
 	readonly model: string;
-	fields: Record<string, ReplicaValue>;
+	readonly fields: Readonly<Record<string, ReplicaValue>>;
+};
+
+/** Records by key, as `applyLayers` exposes them. */
+export type RecordLookup = {
+	get(key: string): MutableRecord | undefined;
 };
 
 export type AppliedChanges = {
-	readonly baseRecords: ReadonlyMap<string, MutableRecord>;
-	readonly records: Map<string, MutableRecord>;
+	readonly baseRecords: RecordLookup;
+	readonly records: RecordLookup;
 	readonly recordChanges: readonly ReplicaIndexRecordChange[];
 	readonly relationshipChanges: readonly ReplicaIndexRelationshipChange[];
 	readonly invalidatedDependencies: ReadonlySet<string>;
@@ -243,47 +249,125 @@ export function selectionModel(
 		: undefined;
 }
 
+/**
+ * Pair each plan with the confirmed indexes it could maintain for these
+ * changes. A root plan names its one index. A parent-scoped plan has one
+ * index per parent: every one of them when a change may reach them all, and
+ * otherwise only those of the parents the changes name.
+ */
 export function instantiatePlans(
 	plans: readonly RegisteredPlan[],
-	indexes: ReadonlyMap<string, ReplicaIndexMaintenanceIndex>
-): Map<string, RegisteredPlan[]> {
-	const result = new Map<string, RegisteredPlan[]>();
+	snapshot: ReplicaIndexMaintenanceSnapshot,
+	changes: AppliedChanges
+): Map<string, InstantiatedPlans> {
+	const result = new Map<string, InstantiatedPlans>();
+	let byField: Map<string, ReplicaIndexMaintenanceIndex[]> | undefined;
 	for (const value of plans) {
 		if (value.exactIndexKey !== undefined) {
-			if (indexes.has(value.exactIndexKey)) {
-				appendPlan(result, value.exactIndexKey, value);
+			const index = snapshot.index(value.exactIndexKey);
+			if (index !== undefined) appendPlan(result, index, value);
+			continue;
+		}
+		if (planAffectedForEveryParent(value, changes)) {
+			if (byField === undefined) {
+				byField = new Map();
+				for (const index of snapshot.indexes()) {
+					if (index.metadata.parent === undefined) continue;
+					const sameField = byField.get(index.metadata.field);
+					if (sameField === undefined) byField.set(index.metadata.field, [index]);
+					else sameField.push(index);
+				}
+			}
+			for (const index of byField.get(value.field) ?? []) {
+				if (planOwnsParentIndex(value, index)) appendPlan(result, index, value);
 			}
 			continue;
 		}
-		for (const index of indexes.values()) {
-			const parent = index.metadata.parent;
-			if (
-				parent === undefined ||
-				index.metadata.field !== value.field ||
+		for (const parent of changedParents(value, changes)) {
+			const index = snapshot.index(
 				replicaIndexKey({
 					parent,
 					field: value.field,
 					arguments: value.arguments
-				}) !== index.key ||
-				(value.parentModel !== undefined &&
-					!recordKeyMatchesModel(parent, value.parentModel))
-			) {
-				continue;
+				})
+			);
+			if (index !== undefined && planOwnsParentIndex(value, index)) {
+				appendPlan(result, index, value);
 			}
-			appendPlan(result, index.key, value);
 		}
 	}
 	return result;
 }
 
+export type InstantiatedPlans = {
+	readonly index: ReplicaIndexMaintenanceIndex;
+	readonly plans: RegisteredPlan[];
+};
+
+function planOwnsParentIndex(
+	value: RegisteredPlan,
+	index: ReplicaIndexMaintenanceIndex
+): boolean {
+	const parent = index.metadata.parent;
+	return (
+		parent !== undefined &&
+		index.metadata.field === value.field &&
+		replicaIndexKey({
+			parent,
+			field: value.field,
+			arguments: value.arguments
+		}) === index.key &&
+		(value.parentModel === undefined ||
+			recordKeyMatchesModel(parent, value.parentModel))
+	);
+}
+
+/** The cases of `planAffected` that do not depend on which parent an index has. */
+function planAffectedForEveryParent(
+	planValue: RegisteredPlan,
+	changes: AppliedChanges
+): boolean {
+	return (
+		(planValue.kind === 'snapshot' &&
+			intersects(planValue.dependencies, changes.allDependencies)) ||
+		intersects(planValue.dependencies, changes.invalidatedDependencies) ||
+		(planValue.targetModel !== undefined &&
+			changes.recordChanges.some(({ model }) => model === planValue.targetModel))
+	);
+}
+
+/** The parents whose index the remaining cases of `planAffected` can reach. */
+function changedParents(
+	planValue: RegisteredPlan,
+	changes: AppliedChanges
+): ReadonlySet<string> {
+	const parents = new Set<string>();
+	if (planValue.kind !== 'relationship') return parents;
+	for (const change of changes.recordChanges) {
+		if (change.model === planValue.parentModel) parents.add(change.key);
+	}
+	for (const change of changes.relationshipChanges) {
+		if (
+			planValue.parentModel === change.sourceModel &&
+			planValue.field === change.field &&
+			planValue.targetModel === change.targetModel
+		) {
+			parents.add(change.sourceKey);
+		}
+	}
+	return parents;
+}
+
 export function appendPlan(
-	output: Map<string, RegisteredPlan[]>,
-	key: string,
+	output: Map<string, InstantiatedPlans>,
+	index: ReplicaIndexMaintenanceIndex,
 	value: RegisteredPlan
 ): void {
-	const current = output.get(key) ?? [];
+	validateName(index.key, 'index key');
+	let current = output.get(index.key);
+	if (current === undefined) output.set(index.key, (current = { index, plans: [] }));
 	if (
-		current.some(
+		current.plans.some(
 			(candidate) =>
 				candidate.registration === value.registration &&
 				candidate.signature === value.signature
@@ -291,37 +375,27 @@ export function appendPlan(
 	) {
 		return;
 	}
-	current.push(value);
-	output.set(key, current);
+	current.plans.push(value);
 }
 
 export function applyLayers(
-	base: readonly ReplicaIndexMaintenanceRecord[],
+	base: (key: string) => ReplicaIndexMaintenanceRecord | undefined,
 	layers: readonly ReplicaIndexSemanticLayer[]
 ): AppliedChanges {
-	const records = new Map<string, MutableRecord>();
-	for (const input of base) {
-		validateName(input.key, 'record key');
-		validateName(input.model, 'record model');
-		if (records.has(input.key)) {
-			throw new TypeError(`duplicate maintenance record: ${input.key}`);
+	const baseRecords: RecordLookup = {
+		get(key) {
+			const record = base(key);
+			if (record === undefined) return undefined;
+			validateName(record.key, 'record key');
+			validateName(record.model, 'record model');
+			return record;
 		}
-		records.set(input.key, {
-			key: input.key,
-			model: input.model,
-			fields: { ...input.fields }
-		});
-	}
-	const baseRecords = new Map(
-		[...records].map(([key, record]) => [
-			key,
-			{
-				key: record.key,
-				model: record.model,
-				fields: { ...record.fields }
-			}
-		])
-	);
+	};
+	// Only the keys a layer changes are held here; `undefined` is a delete.
+	const changed = new Map<string, MutableRecord | undefined>();
+	const records: RecordLookup = {
+		get: (key) => (changed.has(key) ? changed.get(key) : baseRecords.get(key))
+	};
 	const recordChanges: ReplicaIndexRecordChange[] = [];
 	const relationshipChanges: ReplicaIndexRelationshipChange[] = [];
 	const invalidatedDependencies = new Set<string>();
@@ -360,7 +434,7 @@ export function applyLayers(
 			}
 			recordChanges.push(change);
 			if (change.kind === 'delete') {
-				records.delete(change.key);
+				changed.set(change.key, undefined);
 				continue;
 			}
 			const current = records.get(change.key);
@@ -372,7 +446,7 @@ export function applyLayers(
 			}
 			const fields = { ...(current?.fields ?? {}), ...change.fields };
 			for (const field of change.unset ?? []) delete fields[field];
-			records.set(change.key, {
+			changed.set(change.key, {
 				key: change.key,
 				model: change.model,
 				fields
@@ -387,20 +461,6 @@ export function applyLayers(
 		invalidatedDependencies,
 		allDependencies
 	};
-}
-
-export function validateIndexes(
-	input: readonly ReplicaIndexMaintenanceIndex[]
-): Map<string, ReplicaIndexMaintenanceIndex> {
-	const indexes = new Map<string, ReplicaIndexMaintenanceIndex>();
-	for (const index of input) {
-		validateName(index.key, 'index key');
-		if (indexes.has(index.key)) {
-			throw new TypeError(`duplicate maintenance index: ${index.key}`);
-		}
-		indexes.set(index.key, index);
-	}
-	return indexes;
 }
 
 export function planAffected(
@@ -844,7 +904,7 @@ export function relationshipMembership(
 	planValue: RegisteredPlan,
 	index: ReplicaIndexMaintenanceIndex,
 	target: MutableRecord | undefined,
-	records: ReadonlyMap<string, MutableRecord>
+	records: RecordLookup
 ):
 	| { readonly related: boolean }
 	| { readonly reason: ReplicaIndexMaintenanceReason } {
@@ -933,7 +993,7 @@ export function evaluateMembership(
 export function sortRecords(
 	keys: readonly string[],
 	order: ReplicaOrderArtifact,
-	records: ReadonlyMap<string, MutableRecord>,
+	records: RecordLookup,
 	variables: GraphqlVariables,
 	path: readonly (string | number)[]
 ):

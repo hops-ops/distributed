@@ -4,7 +4,7 @@ import {
 	createCacheEngine,
 	type BaseCacheWriter,
 	type CacheEngine,
-	type CacheEngineSnapshot,
+	type CacheReader,
 	type DerivedIndexMutation,
 	type DerivedIndexReconciler,
 	type OptimisticLayerView
@@ -1699,13 +1699,12 @@ export class DistributedReplicaImpl implements DistributedReplicaApi {
 		this.#emitState(key, false);
 		this.#flushDeferredMembershipConfirms();
 		if (this.#diagnostics !== undefined) {
-			const cache = this.#engine.extract();
 			this.#diagnosticEvent(
 				Object.freeze({
 					kind: 'normalization',
 					operation: artifact.id,
 					source,
-					records: cache.records.length,
+					records: this.#engine.recordCount,
 					indexes: summary.indexKeys.length,
 					partial:
 						summary.partial ||
@@ -1715,10 +1714,9 @@ export class DistributedReplicaImpl implements DistributedReplicaApi {
 				})
 			);
 			for (const indexKey of summary.indexKeys) {
-				const index = cache.indexes.find(
-					(candidate) => candidate.key === indexKey && !candidate.deleted
+				const staleReason = this.#engine.readConfirmed(
+					(confirmed) => confirmed.index(indexKey)?.metadata?.staleReason
 				);
-				const staleReason = index?.metadata?.staleReason;
 				this.#diagnosticEvent(
 					Object.freeze({
 						kind: 'index-decision',
@@ -2334,11 +2332,10 @@ export class DistributedReplicaImpl implements DistributedReplicaApi {
 	}
 
 	#deriveMaintainedIndexes(
-		confirmed: CacheEngineSnapshot,
+		confirmed: CacheReader,
 		layers: readonly OptimisticLayerView[]
 	): readonly DerivedIndexMutation[] {
 		const snapshot = indexMaintenanceSnapshot(confirmed);
-		const indexes = new Map(snapshot.indexes.map((index) => [index.key, index]));
 		const semanticLayers = layers.map(indexSemanticLayer);
 		const mutations: DerivedIndexMutation[] = [];
 			for (const decision of this.#indexMaintenance.evaluate(
@@ -2355,7 +2352,7 @@ export class DistributedReplicaImpl implements DistributedReplicaApi {
 				});
 				continue;
 			}
-			const index = indexes.get(decision.indexKey);
+			const index = confirmed.index(decision.indexKey);
 			if (index === undefined) {
 				throw new Error(
 					`index maintenance returned an unknown index: ${decision.indexKey}`
@@ -2395,7 +2392,9 @@ export class DistributedReplicaImpl implements DistributedReplicaApi {
 				changes: Object.freeze([change])
 			})
 		});
-		return this.#deriveMaintainedIndexes(this.#engine.extract(), [layer]);
+		return this.#engine.readConfirmed((confirmed) =>
+			this.#deriveMaintainedIndexes(confirmed, [layer])
+		);
 	}
 
 	#operationProtocol(
@@ -2550,10 +2549,13 @@ export class DistributedReplicaImpl implements DistributedReplicaApi {
 		const fencedIndexKeys = new Set<string>();
 		let equalRevision: string | undefined;
 		let latestOwnerRevision: string | undefined;
+		// An owner wrote one of the incoming indexes last, at its own revision.
+		const ownerRevisions = new Set(confirmedRevisions.values());
 		for (const [key, group] of this.#operationProtocols) {
 			if (key === currentKey) continue;
 			for (const state of [group.query, group.live]) {
 				if (state?.indexRevision === undefined) continue;
+				if (!ownerRevisions.has(state.indexRevision)) continue;
 				const ownedIncomingKeys: string[] = [];
 				for (const indexKey of state.indexKeys) {
 					if (

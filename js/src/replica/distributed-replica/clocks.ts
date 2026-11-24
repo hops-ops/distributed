@@ -1,3 +1,4 @@
+import { compareCodeUnits } from '../../lib/compare-code-units.js';
 import type { CacheValue } from '../../internal/cache-engine.js';
 import {
 	compareDistributedDecimal,
@@ -199,7 +200,7 @@ export function compareCanonicalDecimalStrings(
 	right: string
 ): number {
 	return left.length === right.length
-		? left.localeCompare(right)
+		? compareCodeUnits(left, right)
 		: left.length < right.length
 			? -1
 			: 1;

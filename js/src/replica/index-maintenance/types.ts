@@ -39,9 +39,15 @@ export type ReplicaIndexSemanticLayer = {
 	readonly changes: readonly ReplicaIndexSemanticChange[];
 };
 
+/**
+ * Confirmed state, read by key. Evaluation looks up the records its layers
+ * and affected indexes name, so its cost does not follow the cache size.
+ */
 export type ReplicaIndexMaintenanceSnapshot = {
-	readonly records: readonly ReplicaIndexMaintenanceRecord[];
-	readonly indexes: readonly ReplicaIndexMaintenanceIndex[];
+	record(key: string): ReplicaIndexMaintenanceRecord | undefined;
+	index(key: string): ReplicaIndexMaintenanceIndex | undefined;
+	/** Listed only when a change may affect every index of one parent field. */
+	indexes(): Iterable<ReplicaIndexMaintenanceIndex>;
 };
 
 export type ReplicaIndexMaintenanceReasonCode =

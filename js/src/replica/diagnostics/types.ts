@@ -131,7 +131,13 @@ export type ReplicaDiagnosticReceiptInput = Readonly<{
 	expectations: readonly ReplicaDiagnosticReceiptExpectationInput[];
 }>;
 
-/** Engine-independent state contract implemented by DistributedReplica. */
+/**
+ * Engine-independent state contract implemented by DistributedReplica.
+ *
+ * DistributedReplica computes `records` and `indexes` when they are first
+ * read, from the cache as it is then: one pass over the whole cache. A sink
+ * reads them when someone asks for its snapshot, not on every update.
+ */
 export type ReplicaDiagnosticStateInput = Readonly<{
 	scope: ReplicaDiagnosticScopeInput;
 	records: readonly ReplicaDiagnosticRecordInput[];
