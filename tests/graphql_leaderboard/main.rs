@@ -580,7 +580,7 @@ async fn live_boards_follow_a_projector_in_another_process_over_the_bus() {
 #[test]
 fn an_application_manifest_carries_and_validates_its_leaderboards() {
     let spec = distributed::SurfaceSpec::from_surface("boards", &surfaces()).unwrap();
-    assert_eq!(spec.leaderboards.len(), 2);
+    assert_eq!(spec.contract.leaderboards.len(), 2);
     let built = distributed::Application::new("boards")
         .surface(spec.clone())
         .build()
@@ -588,9 +588,9 @@ fn an_application_manifest_carries_and_validates_its_leaderboards() {
     let json = serde_json::to_value(built.manifest()).unwrap();
     assert!(json.to_string().contains("\"leaderboards\""));
 
-    // Tampering with the leaderboard section breaks the contract identity.
+    // Tampering with the leaderboard section breaks the surface fingerprint.
     let mut tampered = spec;
-    tampered.leaderboards.pop();
+    tampered.contract.leaderboards.pop();
     assert!(distributed::Application::new("boards")
         .surface(tampered)
         .build()

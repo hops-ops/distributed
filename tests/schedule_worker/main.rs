@@ -1,36 +1,32 @@
 //! The schedule worker on shared repositories: `ctx.schedule` rows stored by
-//! SQLite / Postgres / the in-memory repository are fired through a
-//! `CommandHost`, exactly once per (owner, name, generation), across worker
+//! SQLite / Postgres / the in-memory repository are fired through the
+//! `Service`, exactly once per (owner, name, generation), across worker
 //! crashes, restarts and concurrent workers.
 //!
 //! Postgres runs when `DATABASE_URL` is set (each test in its own schema).
 
-#![cfg(all(feature = "graphql", any(feature = "sqlite", feature = "postgres")))]
+#![cfg(any(feature = "sqlite", feature = "postgres"))]
 
 #[cfg(feature = "postgres")]
 #[path = "../support/postgres.rs"]
 mod postgres;
 
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
-use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::json;
 
 use distributed::command::{typed_command, PreparedCommand, Succeeded};
-use distributed::graphql::identity::VerifiedPrincipal;
-use distributed::graphql::protocol::ProtocolResponseAccumulator;
+use distributed::command_dispatch::VerifiedPrincipal;
+use distributed::microsvc::schedule::{schedule_guard, ScheduleWorker, ScheduleWorkerConfig};
 use distributed::microsvc::{
-    CausalCommandContext, CausalCommandPublicStatus, CausalDispatchError, CausalDispatchResult,
-    HandlerError, PortableCommand, Routes, Service, Session,
+    CausalCommandContext, HandlerError, PortableCommand, Routes, Service, Session,
 };
-use distributed::schedule::worker::ScheduleWorkerConfig;
-use distributed::schedule::{schedule_guard, Capability, Schedule};
+use distributed::schedule::{Capability, Schedule};
 use distributed::{
-    sourced, AggregateRepository, CommandHost, Entity, LocalCommandHost, StreamIdentity, ROLE_KEY,
-    USER_ID_KEY,
+    sourced, AggregateRepository, Entity, ManualClock, StreamIdentity, ROLE_KEY, USER_ID_KEY,
 };
 
 #[derive(Clone, Default, Serialize, Deserialize, distributed::Snapshot)]
@@ -229,20 +225,20 @@ fn command_id() -> String {
     )
 }
 
-async fn start(host: &dyn CommandHost, id: &str, limit: u32, period_ms: u64, command: &str) {
+async fn start(service: &Service, id: &str, limit: u32, period_ms: u64, command: &str) {
     let mut session = Session::new();
     session.set(USER_ID_KEY, "user-1");
     session.set(ROLE_KEY, "user");
-    host.invoke(
-        "ticker.start",
-        &command_id(),
-        json!({ "id": id, "limit": limit, "period_ms": period_ms, "tick_command": command }),
-        session,
-        VerifiedPrincipal::test_oidc("https://issuer.test", "user-1", &["tickers"]),
-        None,
-    )
-    .await
-    .expect("start");
+    service
+        .dispatch_causal(
+            "ticker.start",
+            &command_id(),
+            json!({ "id": id, "limit": limit, "period_ms": period_ms, "tick_command": command }),
+            session,
+            VerifiedPrincipal::internal("user-1").unwrap(),
+        )
+        .await
+        .expect("start");
 }
 
 fn owner(id: &str) -> StreamIdentity {
@@ -253,44 +249,6 @@ fn fast() -> ScheduleWorkerConfig {
     ScheduleWorkerConfig::default()
         .with_poll_interval(Duration::from_millis(20))
         .with_claim_ttl(Duration::from_millis(400))
-}
-
-/// A host that commits the command and then never returns: the process
-/// "crashes" between the command's commit and the schedule's settlement.
-struct CrashAfterCommit {
-    inner: LocalCommandHost,
-    committed: Arc<AtomicUsize>,
-}
-
-#[async_trait]
-impl CommandHost for CrashAfterCommit {
-    async fn invoke(
-        &self,
-        command: &str,
-        command_id: &str,
-        input: Value,
-        session: Session,
-        principal: VerifiedPrincipal,
-        protocol: Option<ProtocolResponseAccumulator>,
-    ) -> Result<CausalDispatchResult, CausalDispatchError> {
-        self.inner
-            .invoke(command, command_id, input, session, principal, protocol)
-            .await?;
-        self.committed.fetch_add(1, Ordering::SeqCst);
-        std::future::pending().await
-    }
-
-    async fn status(
-        &self,
-        command_id: &str,
-        session: &Session,
-        principal: VerifiedPrincipal,
-        protocol: Option<ProtocolResponseAccumulator>,
-    ) -> Result<CausalCommandPublicStatus, CausalDispatchError> {
-        self.inner
-            .status(command_id, session, principal, protocol)
-            .await
-    }
 }
 
 async fn until<F, Fut>(what: &str, timeout: Duration, mut probe: F)
@@ -309,8 +267,12 @@ where
 }
 
 /// The scenarios, written once over any repository with a schedule worker.
+///
+/// `$crash` makes the store refuse to settle (disarm) a schedule, so a
+/// worker pass dies between its committed dispatch and the settlement;
+/// `$heal` lifts that again.
 macro_rules! scenarios {
-    ($repo_ty:ty, $fresh:expr, $reopen:expr) => {
+    ($repo_ty:ty, $fresh:expr, $reopen:expr, $crash:expr, $heal:expr) => {
         async fn ticks(repo: &$repo_ty, id: &str) -> u32 {
             use distributed::GetStream;
             let Some(entity) = repo.get_stream(&owner(id)).await.unwrap() else {
@@ -339,18 +301,18 @@ macro_rules! scenarios {
                 .and_then(|panic| panic.downcast::<String>().ok())
                 .expect("a scheduling route on a repository without a worker must not register");
             assert!(message.contains("scheduling"), "{message}");
-            let (repo, _worker) = repo.with_schedule_worker(fast());
+            let (repo, _worker) = ScheduleWorker::attach(repo, fast());
             let _ = service(repo);
         }
 
         #[tokio::test]
         async fn fires_each_arm_once_and_reports_latency() {
             let Some(ctx) = $fresh.await else { return };
-            let (repo, worker) = ctx.repo().await.with_schedule_worker(fast());
-            let host: Arc<dyn CommandHost> = Arc::new(LocalCommandHost::new(service(repo.clone())));
+            let (repo, worker) = ScheduleWorker::attach(ctx.repo().await, fast());
+            let service = service(repo.clone());
             let started = Instant::now();
-            start(host.as_ref(), "once", 1, 200, TICK).await;
-            let running = worker.spawn(Arc::clone(&host));
+            start(&service, "once", 1, 200, TICK).await;
+            let running = worker.spawn(Arc::clone(&service));
             until("the first tick", Duration::from_secs(10), || async {
                 ticks(&repo, "once").await == 1
             })
@@ -362,7 +324,7 @@ macro_rules! scenarios {
             assert_eq!(armed(&repo, "once").await, 0, "a fired arm is disarmed");
 
             // Periodic: each tick re-arms the next generation until the limit.
-            start(host.as_ref(), "periodic", 3, 50, TICK).await;
+            start(&service, "periodic", 3, 50, TICK).await;
             until("three ticks", Duration::from_secs(10), || async {
                 ticks(&repo, "periodic").await == 3
             })
@@ -376,56 +338,44 @@ macro_rules! scenarios {
         #[tokio::test]
         async fn crash_between_commit_and_settle_does_not_fire_twice() {
             let Some(ctx) = $fresh.await else { return };
-            // A claim long enough to still hold after the restart below
-            // (opening and migrating a Postgres pool takes a while).
-            let claim_ttl = Duration::from_secs(3);
-            let (repo, crashing_worker) = ctx
-                .repo()
-                .await
-                .with_schedule_worker(fast().with_claim_ttl(claim_ttl));
-            let committed = Arc::new(AtomicUsize::new(0));
-            let crashing: Arc<dyn CommandHost> = Arc::new(CrashAfterCommit {
-                inner: LocalCommandHost::new(service(repo.clone())),
-                committed: Arc::clone(&committed),
-            });
-            start(
-                &LocalCommandHost::new(service(repo.clone())),
-                "crash",
-                1,
-                50,
-                TICK,
-            )
-            .await;
-            let running = crashing_worker.spawn(crashing);
-            until("the tick to commit", Duration::from_secs(10), || async {
-                committed.load(Ordering::SeqCst) == 1
-            })
-            .await;
-            // The claim was taken before the commit, so it lapses before
-            // `committed_at + claim_ttl`.
-            let committed_at = Instant::now();
-            running.abort();
-            assert_eq!(ticks(&repo, "crash").await, 1);
-            assert_eq!(
-                armed(&repo, "crash").await,
-                1,
-                "the crash left the arm unsettled"
-            );
+            let claim_ttl = Duration::from_secs(30);
+            let config = fast().with_claim_ttl(claim_ttl);
+            let (repo, crashing) = ScheduleWorker::attach(ctx.repo().await, config);
+            let crashed = service(repo.clone());
+            start(&crashed, "crash", 1, 0, TICK).await;
+            // Both workers measure claims by one manual clock, a second ahead
+            // of the database clock that stamped the due time.
+            let clock = ManualClock::new(SystemTime::now() + Duration::from_secs(1));
+            let crashing = crashing.with_clock(Arc::new(clock.clone()));
 
-            // A new process: a fresh repository on the same database.
-            let (repo, worker) = $reopen(&ctx).await.with_schedule_worker(fast());
-            let host = LocalCommandHost::new(service(repo.clone()));
-            let first = worker.run_once(&host).await.unwrap();
+            // The worker claims the arm and dispatches it (the tick commits),
+            // then dies before settling: the store refuses the settlement.
+            $crash(&repo).await;
+            crashing
+                .run_once(&crashed)
+                .await
+                .expect_err("the settlement fails: the worker crashed");
+            $heal(&repo).await;
+            assert_eq!(ticks(&repo, "crash").await, 1, "the tick committed");
+            assert_eq!(armed(&repo, "crash").await, 1, "the arm is unsettled");
+
+            // A new process on the same database, before the claim lapses:
+            // the arm is neither dispatched nor settled.
+            let (repo, worker) = ScheduleWorker::attach($reopen(&ctx).await, config);
+            let worker = worker.with_clock(Arc::new(clock.clone()));
+            let service = service(repo.clone());
+            clock.advance(claim_ttl - Duration::from_millis(1));
+            let held = worker.run_once(&service).await.unwrap();
             assert!(
-                committed_at.elapsed() >= claim_ttl - Duration::from_millis(500)
-                    || first.is_empty(),
-                "the crashed worker's claim still holds: {first:?}"
+                held.is_empty(),
+                "the crashed worker's claim holds: {held:?}"
             );
-            tokio::time::sleep(
-                (claim_ttl + Duration::from_millis(100)).saturating_sub(committed_at.elapsed()),
-            )
-            .await;
-            let replay = worker.run_once(&host).await.unwrap();
+            assert_eq!(ticks(&repo, "crash").await, 1);
+            assert_eq!(armed(&repo, "crash").await, 1);
+
+            // The claim lapses: the same command id replays and settles once.
+            clock.advance(Duration::from_millis(1));
+            let replay = worker.run_once(&service).await.unwrap();
             assert_eq!(replay.fired.len(), 1, "{replay:?}");
             assert!(
                 replay.fired[0].replayed,
@@ -437,22 +387,20 @@ macro_rules! scenarios {
                 "exactly once across the crash"
             );
             assert_eq!(armed(&repo, "crash").await, 0);
-            assert!(worker.run_once(&host).await.unwrap().is_empty());
+            assert!(worker.run_once(&service).await.unwrap().is_empty());
         }
 
         #[tokio::test]
         async fn concurrent_workers_fire_each_schedule_once() {
             let Some(ctx) = $fresh.await else { return };
-            let (repo, first) = ctx.repo().await.with_schedule_worker(fast());
-            let host: Arc<dyn CommandHost> = Arc::new(LocalCommandHost::new(service(repo.clone())));
+            let (repo, first) = ScheduleWorker::attach(ctx.repo().await, fast());
+            let service_a = service(repo.clone());
             for index in 0..12 {
-                start(host.as_ref(), &format!("many-{index}"), 1, 30, TICK).await;
+                start(&service_a, &format!("many-{index}"), 1, 30, TICK).await;
             }
-            let (other_repo, second) = $reopen(&ctx).await.with_schedule_worker(fast());
-            let other_host: Arc<dyn CommandHost> =
-                Arc::new(LocalCommandHost::new(service(other_repo)));
-            let a = first.spawn(host);
-            let b = second.spawn(other_host);
+            let (other_repo, second) = ScheduleWorker::attach($reopen(&ctx).await, fast());
+            let a = first.spawn(service_a);
+            let b = second.spawn(service(other_repo));
             until("every ticker to tick", Duration::from_secs(20), || async {
                 let mut all = true;
                 for index in 0..12 {
@@ -473,8 +421,8 @@ macro_rules! scenarios {
         #[tokio::test]
         async fn retryable_failures_back_off_then_fire_once() {
             let Some(ctx) = $fresh.await else { return };
-            let (repo, worker) = ctx.repo().await.with_schedule_worker(fast());
-            let host = LocalCommandHost::new(service(repo.clone()));
+            let (repo, worker) = ScheduleWorker::attach(ctx.repo().await, fast());
+            let host = service(repo.clone());
             let flaky = format!("flaky-{}", command_id());
             FLAKY_ONCE.lock().unwrap().insert(flaky.clone());
             start(&host, &flaky, 1, 0, FLAKY).await;
@@ -535,7 +483,24 @@ mod sqlite {
         db.repo().await
     }
 
-    scenarios!(SqliteRepository, fresh(), reopen);
+    async fn crash_before_settle(repo: &SqliteRepository) {
+        sqlx::query(
+            "CREATE TRIGGER crash_before_settle BEFORE UPDATE OF armed ON aggregate_schedules \
+             WHEN NEW.armed = 0 BEGIN SELECT RAISE(ABORT, 'worker crashed before settling'); END",
+        )
+        .execute(repo.pool())
+        .await
+        .unwrap();
+    }
+
+    async fn heal(repo: &SqliteRepository) {
+        sqlx::query("DROP TRIGGER crash_before_settle")
+            .execute(repo.pool())
+            .await
+            .unwrap();
+    }
+
+    scenarios!(SqliteRepository, fresh(), reopen, crash_before_settle, heal);
 }
 
 #[cfg(feature = "postgres")]
@@ -562,13 +527,39 @@ mod postgres_backend {
         db.repo().await
     }
 
-    scenarios!(PostgresRepository, fresh(), reopen);
+    async fn crash_before_settle(repo: &PostgresRepository) {
+        for statement in [
+            "CREATE FUNCTION crash_before_settle() RETURNS trigger LANGUAGE plpgsql AS \
+             $$ BEGIN RAISE EXCEPTION 'worker crashed before settling'; END $$",
+            "CREATE TRIGGER crash_before_settle BEFORE UPDATE OF armed ON aggregate_schedules \
+             FOR EACH ROW WHEN (NEW.armed = 0) EXECUTE FUNCTION crash_before_settle()",
+        ] {
+            sqlx::query(statement).execute(repo.pool()).await.unwrap();
+        }
+    }
+
+    async fn heal(repo: &PostgresRepository) {
+        for statement in [
+            "DROP TRIGGER crash_before_settle ON aggregate_schedules",
+            "DROP FUNCTION crash_before_settle()",
+        ] {
+            sqlx::query(statement).execute(repo.pool()).await.unwrap();
+        }
+    }
+
+    scenarios!(
+        PostgresRepository,
+        fresh(),
+        reopen,
+        crash_before_settle,
+        heal
+    );
 }
 
 /// The in-memory repository fires its schedules by its injected clock.
 mod memory {
     use super::*;
-    use distributed::{GetStream, InMemoryRepository, ManualClock};
+    use distributed::{GetStream, InMemoryRepository};
 
     #[tokio::test]
     async fn in_memory_fires_by_the_store_clock_once_per_arm() {
@@ -579,8 +570,8 @@ mod memory {
                 .is_err(),
             "no worker, no Scheduling capability"
         );
-        let (repo, worker) = unattached.with_schedule_worker(fast());
-        let host = LocalCommandHost::new(service(repo.clone()));
+        let (repo, worker) = ScheduleWorker::attach(unattached, fast());
+        let host = service(repo.clone());
         start(&host, "mem", 2, 1_000, TICK).await;
         assert!(
             worker.run_once(&host).await.unwrap().is_empty(),

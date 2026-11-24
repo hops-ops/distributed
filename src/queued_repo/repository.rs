@@ -773,9 +773,9 @@ mod tests {
     }
 }
 
-impl<R, L> crate::microsvc::BackendHost for QueuedRepository<R, L>
+impl<R, L> crate::schedule::BackendHost for QueuedRepository<R, L>
 where
-    R: crate::microsvc::BackendHost,
+    R: crate::schedule::BackendHost,
     L: LockManager,
 {
     fn capabilities(&self) -> crate::schedule::Capabilities {

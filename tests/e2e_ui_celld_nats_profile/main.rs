@@ -81,8 +81,8 @@ mod live {
         typed_command, CommandInputType, CommandOutputType, CommandTypeDef, CommandTypeField,
         Succeeded,
     };
-    use distributed::command_dispatch::SharedCommandHost;
-    use distributed::graphql::{read, GraphqlEngine, ModelPermissions, VerifiedPrincipal};
+    use distributed::command_dispatch::{SharedCommandHost, VerifiedPrincipal};
+    use distributed::graphql::{read, GraphqlEngine, ModelPermissions};
     use distributed::microsvc::{Session, ROLE_KEY, USER_ID_KEY};
     use distributed::{
         Aggregate, AggregateBuilder, Entity, InMemoryRepository, ReadModel, Snapshot,

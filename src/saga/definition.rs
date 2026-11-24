@@ -132,7 +132,7 @@ impl From<SagaCommand> for SagaAction {
 /// inputs — [`on_step_succeeded`](Self::on_step_succeeded) in particular runs
 /// again on every replay.
 pub trait SagaDefinition: Send + Sync + 'static {
-    /// Durable aggregate type of the saga streams (e.g. `"zone.transfer"`).
+    /// Durable aggregate type of the saga streams (e.g. `"funds.transfer"`).
     const SAGA_TYPE: &'static str;
     /// Destination queue on which this saga receives replies and timers.
     const REPLY_TO: &'static str;

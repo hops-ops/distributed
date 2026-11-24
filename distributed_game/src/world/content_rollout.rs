@@ -28,10 +28,11 @@ use std::time::{Duration, SystemTime};
 
 use distributed::cell_host::AggregateCell;
 use distributed::command::{typed_command, PreparedCommand, Succeeded};
+use distributed::microsvc::schedule::schedule_guard;
 use distributed::microsvc::{
     CausalCommandContext, CausalRouteDependencies, HandlerError, PortableCommand, Routes,
 };
-use distributed::schedule::{schedule_guard, Capability, Schedule};
+use distributed::schedule::{Capability, Schedule};
 use distributed::{sourced, Entity};
 use serde::{Deserialize, Serialize};
 

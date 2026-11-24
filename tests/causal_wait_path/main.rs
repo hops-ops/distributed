@@ -17,8 +17,8 @@ use distributed::command::{
 };
 use distributed::command_dispatch::{
     CellRequestContext, CommandHost, HttpCommandHost, SharedCommandHost, TrustedRequestMetadata,
+    VerifiedPrincipal,
 };
-use distributed::graphql::VerifiedPrincipal;
 use distributed::microsvc::{
     router, CausalCommandContext, HandlerError, PortableCommand, Routes, Service, Session,
     ROLE_KEY, USER_ID_KEY,

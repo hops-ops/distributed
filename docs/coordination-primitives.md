@@ -77,8 +77,9 @@ ctx.schedule(Schedule::at("tick", due, "pool.tick", &input)?)?;
   its `generation`; `cancel_schedule` disarms it.
 - When due, the host dispatches the command **into the owner** through its
   command ledger, with a command id derived from `(name, generation)` and
-  the trusted session from `schedule_session` (role `schedule`, plus claims
-  only the host sets). Guard schedule-only commands with `schedule_guard`
+  the trusted session from `microsvc::schedule::schedule_session` (role
+  `schedule`, plus claims only the host sets). Guard schedule-only commands
+  with `microsvc::schedule::schedule_guard`
   so callers cannot invoke them. A crash after the handler committed but
   before the schedule settled replays the receipt; the handler never runs
   twice for one arm.
@@ -92,8 +93,8 @@ ctx.schedule(Schedule::at("tick", due, "pool.tick", &input)?)?;
 | Backend | Stores schedules | Dispatches them (`Scheduling`) | Clock (`Clock`) |
 |---|---|---|---|
 | Aggregate cell (celld; reference host) | `cell_alarms` | yes: the Durable Object alarm; `fire_due_schedules` on the reference host | DO clock / store clock |
-| In-memory repository | per-stream table | with a schedule worker attached (`with_schedule_worker`) | injected `Clock` (`with_clock`) |
-| SQL (Postgres, SQLite) | `aggregate_schedules` | with a schedule worker attached (`with_schedule_worker`) | database clock |
+| In-memory repository | per-stream table | with a schedule worker attached (`ScheduleWorker::attach`) | injected `Clock` (`with_clock`) |
+| SQL (Postgres, SQLite) | `aggregate_schedules` | with a schedule worker attached (`ScheduleWorker::attach`) | database clock |
 
 A route declares what it needs with `.requires(..)`; registering it on a
 backend without it panics with the missing capabilities while the service is
@@ -102,17 +103,17 @@ declared `Clock` (the dispatcher stamps the host clock into the session and
 removes any caller value); `ctx.schedule` refuses unless the route declared
 `Scheduling`.
 
-**Shared stores: the schedule worker** (`distributed::schedule::worker`,
-`graphql` feature). SQL and in-memory repositories store schedules for
-every aggregate in one table, so a worker process fires them:
+**Shared stores: the schedule worker** (`distributed::microsvc::schedule`,
+any Tokio runtime feature). SQL and in-memory repositories store schedules
+for every aggregate in one table, so a worker process fires them:
 
 ```rust
-let (repo, schedules) = PostgresRepository::connect_and_migrate(url)
-    .await?
-    .with_schedule_worker(ScheduleWorkerConfig::default()); // repo now declares Scheduling
+let (repo, schedules) = ScheduleWorker::attach(
+    PostgresRepository::connect_and_migrate(url).await?,
+    ScheduleWorkerConfig::default(),
+); // repo now declares Scheduling
 let service = Arc::new(build_service(repo.clone()));
-let host: Arc<dyn CommandHost> = Arc::new(LocalCommandHost::new(Arc::clone(&service)));
-let worker = schedules.spawn(host); // worker.stop().await on shutdown
+let worker = schedules.spawn(service); // worker.stop().await on shutdown
 ```
 
 - Each pass claims up to 32 due, unclaimed rows in one statement
@@ -120,7 +121,7 @@ let worker = schedules.spawn(host); // worker.stop().await on shutdown
   SQLite serializes writers instead), marking them `claimed_until_ms`
   (default 30 s ahead). Concurrent workers in several processes get
   disjoint rows.
-- Each claimed arm is dispatched through the `CommandHost` with
+- Each claimed arm is dispatched through the `Service` with
   `schedule_session` and a command id derived from the owning stream, the
   name and the generation (one ledger serves every aggregate here, so the
   owner is part of the id). A worker that crashes after the command

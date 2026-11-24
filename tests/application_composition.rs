@@ -4,7 +4,7 @@ use std::sync::Arc;
 use distributed::application::{
     admit_command_session, command_roles_require_principal, Application, ApplicationExtension,
     CommandDefinition, CommandMount, CommandSpec, CommandTypeField, CommandTypeSpec,
-    ContractCompiler, Module, ProjectionSpec, SurfaceSpec,
+    ContractCompiler, Module, ProjectionSpec, SurfaceSelectionSpec, SurfaceSpec,
 };
 use distributed::command::{typed_command, CommandConsistency, Succeeded};
 use distributed::graphql::{
@@ -230,7 +230,8 @@ fn unsigned_surface_command_contract_round_trips() {
     );
     let surface = full_surface().with_service(&service).unwrap();
     let spec = SurfaceSpec::from_surface("web", &surface).unwrap();
-    for command in spec.contract["commands"].as_array().unwrap() {
+    let contract = serde_json::to_value(&spec.contract).unwrap();
+    for command in contract["commands"].as_array().unwrap() {
         for direction in ["input", "output"] {
             let mut fields = command[direction]["fields"].as_array().unwrap();
             if fields[0]["name"] == "nested" {
@@ -261,8 +262,12 @@ fn unsigned_surface_command_contract_round_trips() {
     assert_eq!(decoded.canonical_bytes().unwrap(), bytes);
 
     let mut tampered = manifest.clone();
-    tampered.surfaces[0].contract["commands"][0]["input"]["fields"][0]["unsigned_integer"] =
-        serde_json::json!("u64");
+    tampered.surfaces[0].contract.commands[0]
+        .input
+        .as_mut()
+        .unwrap()
+        .fields[0]
+        .unsigned_integer = Some(distributed::command::CommandUnsignedInteger::U64);
     tampered.surfaces[0].fingerprint = distributed::application::sha256_fingerprint(
         &tampered.surfaces[0].canonical_bytes().unwrap(),
     );
@@ -270,7 +275,7 @@ fn unsigned_surface_command_contract_round_trips() {
         .refresh_fingerprints()
         .unwrap_err()
         .to_string()
-        .contains("surface contract material"));
+        .contains("not compatible"));
 }
 
 #[test]
@@ -278,13 +283,14 @@ fn ordinary_surface_command_contract_keeps_unrefined_field_shape() {
     let module = command_module();
     let surface = full_surface().with_module(&module).unwrap();
     let spec = SurfaceSpec::from_surface("web", &surface).unwrap();
-    for command in spec.contract["commands"].as_array().unwrap() {
+    let contract = serde_json::to_value(&spec.contract).unwrap();
+    for command in contract["commands"].as_array().unwrap() {
         for (direction, name) in [("input", "title"), ("output", "id")] {
             assert_eq!(
                 command[direction]["fields"],
                 serde_json::json!([{
                     "name": name, "type_name": "String", "nullable": false,
-                    "list": false, "item_nullable": false, "nested": null,
+                    "list": false, "item_nullable": false,
                 }])
             );
         }
@@ -360,12 +366,12 @@ fn explicit_module_commands_filter_allowed_and_forbidden_role_application_invent
     .unwrap();
     assert_eq!(command_names(&application), vec!["todo.allowed"]);
     let spec = SurfaceSpec::from_surface("web", &application).unwrap();
-    assert_eq!(spec.eligible_roles, ["admin", "user"]);
-    assert_eq!(spec.schema_roles, ["user"]);
-    assert_eq!(spec.commands.len(), 1);
-    assert_eq!(spec.commands[0].id, "todo.allowed");
+    assert_eq!(spec.contract.selection.eligible_roles(), ["admin", "user"]);
+    assert_eq!(spec.contract.selection.schema_roles(), ["user"]);
+    assert_eq!(spec.contract.commands.len(), 1);
+    assert_eq!(spec.contract.commands[0].id, "todo.allowed");
     assert_eq!(
-        spec.contract["selection"],
+        serde_json::to_value(&spec.contract.selection).unwrap(),
         serde_json::json!({
             "kind": "application",
             "name": "web",
@@ -408,8 +414,7 @@ fn role_and_application_command_closure_rejects_missing_unauthorized_and_tampere
         .expect("authorized command closure should compile");
 
     let mut missing = valid.clone();
-    missing.commands.clear();
-    missing.contract["commands"] = serde_json::json!([]);
+    missing.contract.commands.clear();
     missing.fingerprint =
         distributed::application::sha256_fingerprint(&missing.canonical_bytes().unwrap());
     let error = Application::try_new("missing-command", [module.clone()], [missing])
@@ -419,8 +424,7 @@ fn role_and_application_command_closure_rejects_missing_unauthorized_and_tampere
         .contains("exact authorized command closure"));
 
     let mut tampered = valid.clone();
-    tampered.commands[0].roles = vec!["admin".into()];
-    tampered.contract["commands"][0]["roles"] = serde_json::json!(["admin"]);
+    tampered.contract.commands[0].roles = vec!["admin".into()];
     tampered.fingerprint =
         distributed::application::sha256_fingerprint(&tampered.canonical_bytes().unwrap());
     let error = Application::try_new("tampered-command", [module.clone()], [tampered])
@@ -436,17 +440,16 @@ fn role_and_application_command_closure_rejects_missing_unauthorized_and_tampere
     )
     .unwrap();
     let admin_spec = SurfaceSpec::from_surface("web", &admin).unwrap();
-    let forbidden_command = admin_spec.commands[0].clone();
-    let forbidden_contract = admin_spec.contract["commands"][0].clone();
+    let forbidden_command = admin_spec.contract.commands[0].clone();
     let mut unauthorized = valid;
-    unauthorized.commands.push(forbidden_command.clone());
     unauthorized
+        .contract
+        .commands
+        .push(forbidden_command.clone());
+    unauthorized
+        .contract
         .commands
         .sort_by(|left, right| left.id.cmp(&right.id));
-    unauthorized.contract["commands"]
-        .as_array_mut()
-        .expect("surface command contract array")
-        .push(forbidden_contract.clone());
     unauthorized.fingerprint =
         distributed::application::sha256_fingerprint(&unauthorized.canonical_bytes().unwrap());
     let error = Application::try_new("unauthorized-command", [module], [unauthorized])
@@ -459,14 +462,11 @@ fn role_and_application_command_closure_rejects_missing_unauthorized_and_tampere
     let role_valid = SurfaceSpec::from_surface("user", &role_surface).unwrap();
 
     let mut role_unauthorized = role_valid.clone();
-    role_unauthorized.commands.push(forbidden_command);
+    role_unauthorized.contract.commands.push(forbidden_command);
     role_unauthorized
+        .contract
         .commands
         .sort_by(|left, right| left.id.cmp(&right.id));
-    role_unauthorized.contract["commands"]
-        .as_array_mut()
-        .expect("surface command contract array")
-        .push(forbidden_contract);
     role_unauthorized.fingerprint =
         distributed::application::sha256_fingerprint(&role_unauthorized.canonical_bytes().unwrap());
     let error = Application::try_new(
@@ -480,8 +480,7 @@ fn role_and_application_command_closure_rejects_missing_unauthorized_and_tampere
         .contains("exact authorized command closure"));
 
     let mut role_tampered = role_valid.clone();
-    role_tampered.commands[0].roles = vec!["admin".into()];
-    role_tampered.contract["commands"][0]["roles"] = serde_json::json!(["admin"]);
+    role_tampered.contract.commands[0].roles = vec!["admin".into()];
     role_tampered.fingerprint =
         distributed::application::sha256_fingerprint(&role_tampered.canonical_bytes().unwrap());
     let error = Application::try_new("tampered-role-command", [command_module()], [role_tampered])
@@ -489,8 +488,7 @@ fn role_and_application_command_closure_rejects_missing_unauthorized_and_tampere
     assert!(error.to_string().contains("not compatible"));
 
     let mut role_missing = role_valid;
-    role_missing.commands.clear();
-    role_missing.contract["commands"] = serde_json::json!([]);
+    role_missing.contract.commands.clear();
     role_missing.fingerprint =
         distributed::application::sha256_fingerprint(&role_missing.canonical_bytes().unwrap());
     let error = Application::try_new("missing-role-command", [command_module()], [role_missing])
@@ -574,7 +572,7 @@ fn manifest_wire_derives_inventories_without_accepting_a_second_authority() {
         ApplicationManifest::try_from_modules("normalized-app", [command_module()], []).unwrap();
     let bytes = manifest.canonical_bytes().unwrap();
     let wire: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-    assert_eq!(wire["schema_version"], 2);
+    assert_eq!(wire["schema_version"], 3);
     for field in ["commands", "events", "models", "projections"] {
         assert!(
             wire.get(field).is_none(),
@@ -741,7 +739,10 @@ fn contract_compiler_pins_manifest_sdl_and_client_to_one_surface() {
 
     assert!(sdl.contains("TodoView"));
     assert_eq!(manifest.surfaces.len(), 1);
-    assert_eq!(manifest.surfaces[0].selection, "application:web");
+    assert!(matches!(
+        &manifest.surfaces[0].contract.selection,
+        SurfaceSelectionSpec::Application { name, .. } if name == "web"
+    ));
     assert!(client
         .models
         .iter()
@@ -758,20 +759,20 @@ fn contract_compiler_pins_manifest_sdl_and_client_to_one_surface() {
 }
 
 #[test]
-fn surface_contract_retains_policy_literals_and_rejects_stale_redundancy() {
+fn surface_contract_retains_policy_literals_and_rejects_stale_model_material() {
     let selected = selected_surface();
     let spec = distributed::application::SurfaceSpec::from_surface("web", &selected).unwrap();
-    let row_policy = &spec.models[0].row_policy;
+    let row_policy = &spec.contract.models[0].row_policy;
     assert_eq!(row_policy["kind"], "predicate");
     assert!(row_policy.get("expression").is_some());
     assert_ne!(row_policy, &serde_json::json!("predicate"));
 
     let mut stale = spec.clone();
-    stale.contract["models"][0]["table_name"] = serde_json::json!("other_table");
+    stale.contract.models[0].table = "other_table".into();
     stale.fingerprint =
         distributed::application::sha256_fingerprint(&stale.canonical_bytes().unwrap());
     let error = Application::try_new("stale", [], [stale]).unwrap_err();
-    assert!(error.to_string().contains("surface contract material"));
+    assert!(error.to_string().contains("model fingerprint"), "{error}");
 }
 
 #[test]
@@ -1102,8 +1103,12 @@ fn attach_todo_and_chat_command_optimism(
 fn application_surface_must_expose_a_schema_role() {
     let mut surface =
         distributed::application::SurfaceSpec::from_surface("web", &selected_surface()).unwrap();
-    surface.schema_roles.clear();
-    surface.contract["selection"]["schema_roles"] = serde_json::json!([]);
+    let distributed::application::SurfaceSelectionSpec::Application { schema_roles, .. } =
+        &mut surface.contract.selection
+    else {
+        panic!("application selection");
+    };
+    schema_roles.clear();
     surface.fingerprint =
         distributed::application::sha256_fingerprint(&surface.canonical_bytes().unwrap());
     let error = Application::try_new("role-owner", [], [surface])

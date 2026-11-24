@@ -108,14 +108,14 @@ async fn stamped_session<R>(
     mut session: Session,
 ) -> Result<Session, crate::RepositoryError>
 where
-    R: crate::microsvc::dependencies::BackendHost,
+    R: crate::schedule::BackendHost,
 {
     let now = if requires_clock {
         Some(repository.host_now().await?)
     } else {
         None
     };
-    crate::schedule::stamp_host_now(&mut session, now);
+    crate::microsvc::schedule::stamp_host_now(&mut session, now);
     Ok(session)
 }
 

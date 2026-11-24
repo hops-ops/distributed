@@ -27,7 +27,7 @@ use super::commands::TypedCommandInventory;
 use super::compile::{SqlDialect, SqlPlan};
 use super::execute;
 use super::filter::FilterExpr;
-use super::identity::{IdentityConfig, IdentityResolver, VerifiedPrincipal};
+use super::identity::{IdentityConfig, IdentityResolver};
 use super::naming::{
     by_pk_field, is_valid_graphql_name, object_type_name, reserved_type_names, root_list_field,
 };
@@ -45,6 +45,7 @@ use super::surface::{
     SurfaceOptions, SurfaceProjectionOwner, SurfaceProjector, SurfaceSelection,
 };
 use crate::command::TypedServiceCommandBinding;
+use crate::command_dispatch::VerifiedPrincipal;
 
 const GRAPHIQL_INTROSPECTION_MAX_DEPTH_FLOOR: usize = 15;
 const GRAPHIQL_INTROSPECTION_MAX_COMPLEXITY_FLOOR: usize = 10_000;

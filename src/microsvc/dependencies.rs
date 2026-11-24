@@ -25,7 +25,7 @@ pub trait HasRepo {
 #[allow(private_bounds)]
 pub trait CausalRepositoryBackend:
     CausalGetStream
-    + BackendHost
+    + crate::schedule::BackendHost
     + CommandLedgerStore
     + CausalTransactionalCommit
     + CausalRepositoryIdentity
@@ -40,7 +40,7 @@ pub trait CausalRepositoryBackend:
 
 impl<T> CausalRepositoryBackend for T where
     T: CausalGetStream
-        + BackendHost
+        + crate::schedule::BackendHost
         + CommandLedgerStore
         + CausalTransactionalCommit
         + CausalRepositoryIdentity
@@ -151,22 +151,6 @@ pub trait CausalRouteDependencies {
     #[doc(hidden)]
     fn __causal_aggregate_repository(&self)
         -> &AggregateRepository<Self::Backend, Self::Aggregate>;
-}
-
-/// What a command backend provides to the commands it hosts
-/// ([`crate::schedule::Capabilities`]) and its clock. Implemented by the
-/// framework's repository adapters; checked when a route is registered.
-pub(crate) trait BackendHost: Send + Sync {
-    /// The backend's capabilities.
-    fn capabilities(&self) -> crate::schedule::Capabilities;
-
-    /// The backend's clock now (store clock, Durable Object clock, database
-    /// clock).
-    fn host_now(
-        &self,
-    ) -> impl std::future::Future<Output = Result<std::time::SystemTime, crate::RepositoryError>>
-           + Send
-           + '_;
 }
 
 /// Dependency capability for services that expose a read-model store.

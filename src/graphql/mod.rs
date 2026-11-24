@@ -82,8 +82,8 @@ pub use http::{
 pub use identity::{
     extract_bearer, map_claims_to_session, public_oidc_identity_from_env,
     public_oidc_identity_from_env_vars, AuthError, ClaimMapConfig, GatewaySecret, IdentityConfig,
-    IdentityConfigError, IdentityResolver, InvalidPrincipal, OidcConfig, OidcValidator,
-    ValidationError, VerifiedPrincipal, UNSET_OIDC_AUDIENCE, UNSET_OIDC_ISSUER,
+    IdentityConfigError, IdentityResolver, OidcConfig, OidcValidator, ValidationError,
+    UNSET_OIDC_AUDIENCE, UNSET_OIDC_ISSUER,
 };
 #[cfg(feature = "graphql")]
 pub use read_store::{CellByKeyGetter, HttpCellByKey, MapCellByKey, ReadStore};

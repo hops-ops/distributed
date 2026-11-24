@@ -15,8 +15,8 @@ pub struct SqlxRepository<DB: sqlx::Database> {
     pub(super) projection_change_retention: ProjectionChangeRetention,
     pub(super) causal_storage_identity: CausalStorageIdentity,
     pub(super) verified_registrations: VerifiedRegistrations,
-    /// A [`ScheduleWorker`](crate::schedule::worker::ScheduleWorker) was
-    /// attached (`with_schedule_worker`): routes may require
+    /// A [`ScheduleWorker`](crate::microsvc::schedule::ScheduleWorker) was
+    /// attached: routes may require
     /// [`Capability::Scheduling`](crate::schedule::Capability::Scheduling).
     pub(super) schedule_dispatch: bool,
 }

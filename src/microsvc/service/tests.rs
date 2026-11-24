@@ -870,7 +870,7 @@ impl CommandLedgerStore for AmbiguousCommitRepository {
     }
 }
 
-impl crate::microsvc::BackendHost for AmbiguousCommitRepository {
+impl crate::schedule::BackendHost for AmbiguousCommitRepository {
     fn capabilities(&self) -> crate::schedule::Capabilities {
         self.inner.capabilities()
     }
@@ -1048,6 +1048,7 @@ fn service_compiles_exact_application_modules_from_command_namespaces() {
 
     let mut missing = surface.clone();
     missing
+        .contract
         .commands
         .retain(|command| command.id != "access.grant");
     assert!(matches!(

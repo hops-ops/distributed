@@ -10,12 +10,12 @@ use async_trait::async_trait;
 use serde_json::Value;
 
 use super::InternalHttpSecret;
+use crate::command_dispatch::VerifiedPrincipal;
 use crate::command_dispatch::{
     validate_principal_session, validate_principal_session_if_present, CellRequestContext,
     CommandHost, HttpCommandHost, LocalCommandHost, TrustedRequestMetadata,
 };
 use crate::command_ledger::ExternalDispatchBinding;
-use crate::graphql::identity::VerifiedPrincipal;
 use crate::graphql::protocol::ProtocolResponseAccumulator;
 use crate::microsvc::{
     CausalCommandPublicStatus, CausalDispatchError, CausalDispatchResult,

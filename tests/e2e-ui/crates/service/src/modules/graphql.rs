@@ -177,6 +177,7 @@ pub fn application_manifest() -> ApplicationManifest {
         .into_iter()
         .map(|command| {
             let exposed = surface
+                .contract
                 .commands
                 .iter()
                 .find(|exposed| exposed.id == command.id)

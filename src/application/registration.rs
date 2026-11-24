@@ -2,7 +2,8 @@ use std::sync::Arc;
 
 use super::error::ApplicationResult;
 use super::manifest::{ApplicationExtension, ApplicationManifest, ManifestProvenance};
-use super::module::{Module, SurfaceSpec};
+use super::module::Module;
+use super::surface::SurfaceSpec;
 use crate::graphql::surface::Surface;
 use crate::graphql::{
     ClientManifestError, DistributedClientManifest, DistributedClientSurfaceExport,

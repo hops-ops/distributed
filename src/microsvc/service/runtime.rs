@@ -627,6 +627,7 @@ impl Service {
                 })?
                 .to_string();
             let exposed = surface
+                .contract
                 .commands
                 .iter()
                 .find(|exposed| exposed.id == command.id)

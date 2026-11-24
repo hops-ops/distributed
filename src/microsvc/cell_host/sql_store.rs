@@ -57,6 +57,17 @@ pub(super) fn finish_sql<T, E: From<RepositoryError>>(
     }
 }
 
+/// The repository migrations a cell runs. Cells host commands, not read-model
+/// projectors: these are the event, snapshot, delivery and command-ledger
+/// migrations of the SQLite inventory. Projection-owned tables are
+/// initialized by their separate query host.
+fn cell_migrations(
+) -> impl Iterator<Item = &'static crate::repository::migrations::EmbeddedMigration> {
+    crate::repository::migrations::SQLITE_MIGRATIONS
+        .iter()
+        .filter(|migration| matches!(migration.version, 1 | 2 | 4 | 8 | 11))
+}
+
 #[derive(Clone)]
 pub(super) struct CellSqlRepository {
     connection: CellSqlConnection,
@@ -87,7 +98,7 @@ impl CellSqlRepository {
             }
             executor.execute(Statement::new("CREATE TABLE IF NOT EXISTS __distributed_cell_migrations (version INTEGER PRIMARY KEY, checksum TEXT NOT NULL)")).await?;
             let applied = executor.query(Statement::new("SELECT version, checksum FROM __distributed_cell_migrations ORDER BY version")).await?;
-            let migrations = crate::repository::migrations::cell_migrations().collect::<Vec<_>>();
+            let migrations = cell_migrations().collect::<Vec<_>>();
             if applied.len() > migrations.len() {
                 return Err(RepositoryError::Model("cell SQL schema is newer than this runtime".into()));
             }

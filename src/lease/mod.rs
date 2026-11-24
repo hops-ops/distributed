@@ -1,7 +1,7 @@
 //! Lease - TTL leases with monotonic fencing tokens.
 //!
-//! A [`Lease`] grants one *holder* exclusive ownership of a *key* (a boss
-//! controller, a play-session item, an encounter settlement, ...) until its
+//! A [`Lease`] grants one *holder* exclusive ownership of a *key* (a job
+//! controller, a partition owner, a settlement in progress, ...) until its
 //! TTL elapses. Holders [`renew`](LeaseStore::renew) to keep it and
 //! [`release`](LeaseStore::release) to hand it back early. A crashed holder's
 //! lease simply expires and becomes acquirable by someone else.
@@ -50,11 +50,11 @@
 //! use std::time::Duration;
 //!
 //! let leases = InMemoryLeaseStore::new();
-//! let lease = leases.acquire("boss:hydra", "zone-7", Duration::from_secs(15)).await?;
+//! let lease = leases.acquire("billing:settlement", "worker-7", Duration::from_secs(15)).await?;
 //! // ... every 5s:
 //! let lease = leases.renew(&lease, Duration::from_secs(15)).await?;
 //! // the protected state rejects writes from a superseded controller:
-//! boss.fence.admit("boss:hydra", lease.token)?;
+//! settlement.fence.admit("billing:settlement", lease.token)?;
 //! ```
 
 mod fence;

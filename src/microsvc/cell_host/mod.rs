@@ -39,8 +39,8 @@ mod wire;
 pub use crate::microsvc::service::{CausalDispatchError, CausalDispatchResult};
 #[allow(unused_imports)]
 pub(crate) use crate::schedule::{
-    schedule_session, ArmedSchedule, FailedSchedule, FiredSchedule, Schedule, ScheduleError,
-    ScheduleFireReport, ScheduleWrite, HOST_NOW_CLAIM, MAX_SCHEDULE_WRITES_PER_COMMAND,
+    ArmedSchedule, FailedSchedule, FiredSchedule, Schedule, ScheduleError, ScheduleFireReport,
+    ScheduleWrite, MAX_SCHEDULE_WRITES_PER_COMMAND,
 };
 pub use causal::{
     CellCommandIdentity, CELL_CAUSATION_ID_HEADER, CELL_PRINCIPAL_PARTITION_HEADER,

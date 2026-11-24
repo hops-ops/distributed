@@ -1,10 +1,10 @@
-//! Portable aggregate schedules, the host clock and backend capabilities.
+//! Portable aggregate schedules, backend capabilities and the schedule store.
 //!
 //! A command handler schedules work for its own aggregate with its events:
 //!
 //! ```rust,ignore
 //! let now = ctx.now()?;
-//! ctx.schedule(Schedule::at("expiry", now + ttl, "zone_lease.expire", &ExpireInput { zone_id })?)?;
+//! ctx.schedule(Schedule::at("expiry", now + ttl, "order.expire", &ExpireInput { order_id })?)?;
 //! ```
 //!
 //! The schedule row commits in the **same transaction** as the command's
@@ -12,8 +12,8 @@
 //! [`TransactionalCommit`](crate::TransactionalCommit) backend, so a failed
 //! command leaves no schedule. The batch must commit exactly one aggregate
 //! stream, which owns the schedule. At `due` the host dispatches `command`
-//! into that aggregate with the trusted [`schedule_session`]; the handler
-//! may schedule the same name again (a periodic tick without a global cron).
+//! into that aggregate with its trusted schedule session; the handler may
+//! schedule the same name again (a periodic tick without a global cron).
 //!
 //! Semantics, identical on every backend that dispatches schedules:
 //!
@@ -29,17 +29,15 @@
 //!   exponentially from one second up to five minutes.
 //!
 //! **Backends declare [`Capabilities`].** Every backend stores schedule rows
-//! (cells in their own `cell_alarms` table, the in-memory repository in a
-//! per-stream table, SQL in `aggregate_schedules`); only some *dispatch*
-//! them ([`Capability::Scheduling`]): aggregate cells (the Durable Object
-//! alarm on celld, `fire_due_schedules` on the reference host), and the SQL
-//! and in-memory repositories once a schedule worker is attached
-//! (`with_schedule_worker`, see `schedule::worker`, `graphql` feature). Every
-//! backend has a clock ([`Capability::Clock`]): the cell store clock (the DO
-//! clock on celld), the in-memory repository's injected
-//! [`Clock`](crate::Clock), the database clock on SQL. Routes declare what
-//! they need (`.requires(Capability::Scheduling)`); registering one on a host
-//! without it fails at service construction, never at the first commit.
+//! (the in-memory repository in a per-stream table, SQL in
+//! `aggregate_schedules`, an aggregate cell in its own table); only some
+//! *dispatch* them ([`Capability::Scheduling`]): a host that fires its own
+//! rows, and a shared store (SQL, in-memory) once a schedule worker is
+//! attached to it. Every backend has a clock ([`Capability::Clock`]): the
+//! in-memory repository's injected [`Clock`](crate::Clock), the database
+//! clock on SQL, the host clock elsewhere. Routes declare what they need
+//! (`.requires(Capability::Scheduling)`); registering one on a host without
+//! it fails at service construction, never at the first commit.
 
 use std::time::{Duration, SystemTime};
 
@@ -47,29 +45,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
-use crate::microsvc::Session;
-
-#[cfg(feature = "graphql")]
-pub mod worker;
 use crate::repository::RepositoryError;
-use crate::{ROLE_KEY, USER_ID_KEY};
+use crate::StreamIdentity;
 
-/// Role carried by the trusted session of a fired schedule. Commands that
-/// only schedules may run are guarded with [`schedule_guard`].
-pub const SCHEDULE_ROLE: &str = "schedule";
-/// User id of the trusted session of a fired schedule.
-pub const SCHEDULE_USER_ID: &str = "system:schedule";
-/// Session claim naming the schedule that fired. Set only by the host.
-pub const SCHEDULE_NAME_CLAIM: &str = "x-distributed-schedule";
-/// Session claim with the fired schedule's due time (epoch ms). Periodic
-/// handlers re-schedule relative to it so ticks do not drift.
-pub const SCHEDULE_DUE_CLAIM: &str = "x-distributed-schedule-due-ms";
-/// Session claim with the fired schedule's generation.
-pub const SCHEDULE_GENERATION_CLAIM: &str = "x-distributed-schedule-generation";
-/// Session claim with the host clock's time at dispatch (epoch ms). The
-/// dispatcher removes any caller value and sets it for routes that declare
-/// [`Capability::Clock`]; read it with `CausalCommandContext::now`.
-pub const HOST_NOW_CLAIM: &str = "x-distributed-now-ms";
 /// Command-ledger service id of fired schedules.
 pub const SCHEDULE_SERVICE_ID: &str = "distributed.schedule";
 /// Longest schedule name.
@@ -121,7 +99,7 @@ impl Capabilities {
         scheduling: false,
         clock: false,
     };
-    /// Everything (aggregate cells).
+    /// Everything (a host that fires its own schedules).
     pub const ALL: Self = Self {
         scheduling: true,
         clock: true,
@@ -242,8 +220,8 @@ impl Schedule {
     }
 
     /// Schedule `name` to fire `delay` after the command commits, measured by
-    /// the backend's clock (the Durable Object clock on celld, the injected
-    /// [`Clock`](crate::Clock) in memory, the database clock on SQL).
+    /// the backend's clock (the injected [`Clock`](crate::Clock) in memory,
+    /// the database clock on SQL, the host clock elsewhere).
     pub fn after(
         name: impl Into<String>,
         delay: Duration,
@@ -308,7 +286,7 @@ impl Schedule {
             let due = now
                 .checked_add(i64::try_from(delay).map_err(|_| ScheduleError::DueOutOfRange)?)
                 .ok_or(ScheduleError::DueOutOfRange)?;
-            if due > MAX_JS_SAFE_MS {
+            if due > MAX_DUE_MS {
                 return Err(ScheduleError::DueOutOfRange);
             }
             self.due = ScheduleDue::At(due);
@@ -348,10 +326,10 @@ impl Schedule {
             return Err(ScheduleError::InvalidInput);
         }
         match self.due {
-            ScheduleDue::At(ms) if !(0..=MAX_JS_SAFE_MS).contains(&ms) => {
+            ScheduleDue::At(ms) if !(0..=MAX_DUE_MS).contains(&ms) => {
                 Err(ScheduleError::DueOutOfRange)
             }
-            ScheduleDue::After(delay) if delay > MAX_JS_SAFE_MS as u64 => {
+            ScheduleDue::After(delay) if delay > MAX_DUE_MS as u64 => {
                 Err(ScheduleError::DueOutOfRange)
             }
             _ => Ok(()),
@@ -372,8 +350,9 @@ pub(crate) fn resolve_schedule_writes(
     Ok(())
 }
 
-/// Durable Object SQL binds integers through JS numbers.
-const MAX_JS_SAFE_MS: i64 = 9_007_199_254_740_991;
+/// Latest due time (epoch ms) a schedule may carry: 2^53 - 1, the largest
+/// integer every backend stores and every JSON reader decodes exactly.
+const MAX_DUE_MS: i64 = 9_007_199_254_740_991;
 
 /// One schedule write staged by a command and committed with its events.
 #[derive(Clone, Debug, PartialEq)]
@@ -411,7 +390,7 @@ pub(crate) fn validate_schedule_writes(writes: &[ScheduleWrite]) -> Result<(), R
 /// batch has none).
 pub(crate) fn schedule_owner(
     batch: &crate::repository::CommitBatch<'_>,
-) -> Result<Option<crate::StreamIdentity>, RepositoryError> {
+) -> Result<Option<StreamIdentity>, RepositoryError> {
     if batch.schedules.is_empty() {
         return Ok(None);
     }
@@ -438,20 +417,6 @@ impl ArmedSchedule {
     pub fn due(&self) -> SystemTime {
         ms_to_system_time(self.due_at_ms)
     }
-
-    /// Stable command-ledger identity of this arm.
-    pub fn command_identity(
-        &self,
-    ) -> Result<
-        crate::microsvc::cell_host::CellCommandIdentity,
-        crate::microsvc::cell_host::CausalDispatchError,
-    > {
-        crate::microsvc::cell_host::CellCommandIdentity::new(
-            SCHEDULE_SERVICE_ID,
-            SCHEDULE_SERVICE_ID,
-            schedule_command_id(&self.name, self.generation),
-        )
-    }
 }
 
 /// How a fired schedule settled.
@@ -461,6 +426,53 @@ pub(crate) enum ScheduleSettlement {
     Done,
     /// Retry this generation at `due_at_ms`.
     Retry { due_at_ms: i64 },
+}
+
+/// What a command backend provides to the commands it hosts
+/// ([`Capabilities`]) and its clock. Implemented by the framework's
+/// repository adapters; checked when a route is registered.
+pub(crate) trait BackendHost: Send + Sync {
+    /// The backend's capabilities.
+    fn capabilities(&self) -> Capabilities;
+
+    /// The backend's clock now (store clock, database clock, host clock).
+    fn host_now(
+        &self,
+    ) -> impl std::future::Future<Output = Result<SystemTime, RepositoryError>> + Send + '_;
+}
+
+/// A store holding the schedule rows of many owners (SQL, in-memory) that
+/// it does not fire itself: a schedule worker claims the due rows, runs
+/// them and settles them here.
+#[cfg(feature = "runtime-tokio")]
+#[async_trait::async_trait]
+pub(crate) trait ScheduleStore: Send + Sync + 'static {
+    /// This store, declaring [`Capability::Scheduling`]: a worker fires its
+    /// rows.
+    fn with_schedule_dispatch(self) -> Self
+    where
+        Self: Sized;
+
+    /// The store clock (the database clock on SQL).
+    async fn schedule_now(&self) -> Result<SystemTime, RepositoryError>;
+
+    /// Claim up to `limit` due, unclaimed armed schedules until
+    /// `claim_until_ms`, earliest first.
+    async fn claim_due_schedules(
+        &self,
+        now_ms: i64,
+        claim_until_ms: i64,
+        limit: usize,
+    ) -> Result<Vec<(StreamIdentity, ArmedSchedule)>, RepositoryError>;
+
+    /// Settle one fired arm (only that generation).
+    async fn settle_schedule(
+        &self,
+        owner: &StreamIdentity,
+        name: &str,
+        generation: u64,
+        settlement: &ScheduleSettlement,
+    ) -> Result<(), RepositoryError>;
 }
 
 /// What one wake did with the due schedules.
@@ -501,92 +513,11 @@ pub struct FailedSchedule {
     pub message: String,
 }
 
-/// The trusted system session a fired schedule dispatches with.
-pub fn schedule_session(schedule: &ArmedSchedule) -> Session {
-    let mut session = Session::new();
-    session.set(USER_ID_KEY, SCHEDULE_USER_ID);
-    session.set(ROLE_KEY, SCHEDULE_ROLE);
-    session.set(SCHEDULE_NAME_CLAIM, schedule.name.clone());
-    session.set(SCHEDULE_DUE_CLAIM, schedule.due_at_ms.to_string());
-    session.set(SCHEDULE_GENERATION_CLAIM, schedule.generation.to_string());
-    session
-}
-
-/// The host clock's time at dispatch, when the dispatcher stamped it.
-pub fn host_now(session: &Session) -> Option<SystemTime> {
-    session
-        .get(HOST_NOW_CLAIM)?
-        .parse::<i64>()
-        .ok()
-        .filter(|ms| *ms >= 0)
-        .map(ms_to_system_time)
-}
-
-/// Overwrite (or clear) the host-clock claim of a session about to run a
-/// command: callers never choose it.
-pub(crate) fn stamp_host_now(session: &mut Session, now: Option<SystemTime>) {
-    session.remove(HOST_NOW_CLAIM);
-    if let Some(now) = now {
-        let ms = system_time_to_ms(now).unwrap_or(0);
-        session.set(HOST_NOW_CLAIM, ms.to_string());
-    }
-}
-
-/// Whether `session` is the trusted session of a fired schedule.
-pub fn is_schedule_session(session: &Session) -> bool {
-    session.user_id() == Some(SCHEDULE_USER_ID)
-        && session.has_role(SCHEDULE_ROLE)
-        && session.get(SCHEDULE_NAME_CLAIM).is_some()
-}
-
-/// Due time of the schedule that fired this command, when it was one.
-pub fn scheduled_due(session: &Session) -> Option<SystemTime> {
-    if !is_schedule_session(session) {
-        return None;
-    }
-    session
-        .get(SCHEDULE_DUE_CLAIM)?
-        .parse::<i64>()
-        .ok()
-        .filter(|ms| *ms >= 0)
-        .map(ms_to_system_time)
-}
-
-/// Route guard admitting only fired schedules.
-pub fn schedule_guard<A>(ctx: &crate::microsvc::CausalCommandContext<'_, A>) -> bool
-where
-    A: crate::Aggregate + Send + Sync + 'static,
-{
-    is_schedule_session(ctx.session())
-}
-
-/// Deterministic UUIDv7-shaped command id of one schedule arm of a cell
-/// (the cell's own ledger scopes it to the owner).
+/// Deterministic UUIDv7-shaped command id of one schedule arm, for an owner
+/// whose command ledger is its own (the ledger scopes it to the owner).
 pub(crate) fn schedule_command_id(name: &str, generation: u64) -> String {
     let mut hasher = Sha256::new();
     hasher.update(SCHEDULE_SERVICE_ID.as_bytes());
-    hasher.update([0u8]);
-    hasher.update(name.as_bytes());
-    hasher.update([0u8]);
-    hasher.update(generation.to_be_bytes());
-    crate::command_ledger::deterministic_command_id(hasher)
-}
-
-/// Command id of one schedule arm held in a shared store (SQL, in-memory):
-/// one command ledger serves every aggregate there, so the owning stream is
-/// part of the identity.
-#[cfg_attr(not(feature = "graphql"), allow(dead_code))]
-pub(crate) fn owned_schedule_command_id(
-    owner: &crate::StreamIdentity,
-    name: &str,
-    generation: u64,
-) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(SCHEDULE_SERVICE_ID.as_bytes());
-    hasher.update([1u8]);
-    hasher.update(owner.aggregate_type().as_bytes());
-    hasher.update([0u8]);
-    hasher.update(owner.aggregate_id().as_bytes());
     hasher.update([0u8]);
     hasher.update(name.as_bytes());
     hasher.update([0u8]);
@@ -609,7 +540,7 @@ pub(crate) fn system_time_to_ms(time: SystemTime) -> Result<i64, ScheduleError> 
         .duration_since(SystemTime::UNIX_EPOCH)
         .map_err(|_| ScheduleError::DueOutOfRange)?
         .as_millis();
-    if millis > MAX_JS_SAFE_MS as u128 {
+    if millis > MAX_DUE_MS as u128 {
         return Err(ScheduleError::DueOutOfRange);
     }
     Ok(millis as i64)
@@ -631,9 +562,9 @@ fn validate_name(name: &str) -> Result<(), ScheduleError> {
     Ok(())
 }
 
-/// One owner's schedule table in memory (the in-memory repository and the
-/// in-process reference cell host), with the same semantics as the SQL
-/// tables.
+/// One owner's schedule table in memory (the in-memory repository, and any
+/// host that keeps its working state in memory), with the same semantics as
+/// the SQL tables.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct MemorySchedules {
     rows: std::collections::BTreeMap<String, MemoryScheduleRow>,
@@ -710,7 +641,7 @@ impl MemorySchedules {
 
     /// Claim up to `limit` due, unclaimed (or claim-expired) rows until
     /// `claim_until_ms`, earliest first (the schedule worker's claim).
-    #[cfg_attr(not(feature = "graphql"), allow(dead_code))]
+    #[cfg_attr(not(feature = "runtime-tokio"), allow(dead_code))]
     pub(crate) fn claim_due(
         &mut self,
         now_ms: i64,
@@ -738,7 +669,7 @@ impl MemorySchedules {
     }
 
     /// Drop a claim taken by [`claim_due`](Self::claim_due) without settling.
-    #[cfg_attr(not(feature = "graphql"), allow(dead_code))]
+    #[cfg_attr(not(feature = "runtime-tokio"), allow(dead_code))]
     pub(crate) fn release_claim(&mut self, name: &str, generation: u64) {
         if let Some(row) = self.rows.get_mut(name) {
             if row.schedule.generation == generation {
@@ -887,15 +818,6 @@ mod tests {
         assert_ne!(first, schedule_command_id("tock", 1));
         let parsed = uuid::Uuid::parse_str(&first).unwrap();
         assert_eq!(parsed.get_version_num(), 7);
-        let armed = ArmedSchedule {
-            name: "tick".into(),
-            command: "c".into(),
-            input: serde_json::json!({}),
-            due_at_ms: 0,
-            generation: 1,
-            attempts: 0,
-        };
-        assert_eq!(armed.command_identity().unwrap().command_id(), first);
     }
 
     #[test]
@@ -903,46 +825,6 @@ mod tests {
         assert_eq!(retry_delay(0), Duration::from_secs(1));
         assert_eq!(retry_delay(3), Duration::from_secs(8));
         assert_eq!(retry_delay(40), SCHEDULE_RETRY_MAX);
-    }
-
-    #[test]
-    fn schedule_session_is_recognized_and_carries_due() {
-        let armed = ArmedSchedule {
-            name: "tick".into(),
-            command: "c".into(),
-            input: serde_json::json!({}),
-            due_at_ms: 1_234,
-            generation: 7,
-            attempts: 0,
-        };
-        let session = schedule_session(&armed);
-        assert!(is_schedule_session(&session));
-        assert_eq!(
-            scheduled_due(&session),
-            Some(SystemTime::UNIX_EPOCH + Duration::from_millis(1_234))
-        );
-        let mut forged = Session::new();
-        forged.set(USER_ID_KEY, "player-1");
-        forged.set(ROLE_KEY, SCHEDULE_ROLE);
-        forged.set(SCHEDULE_NAME_CLAIM, "tick");
-        assert!(!is_schedule_session(&forged));
-        assert_eq!(scheduled_due(&forged), None);
-    }
-
-    #[test]
-    fn host_now_is_overwritten_never_taken_from_the_caller() {
-        let mut session = Session::new();
-        session.set(HOST_NOW_CLAIM, "1");
-        stamp_host_now(&mut session, None);
-        assert_eq!(host_now(&session), None, "an undeclared clock is cleared");
-        stamp_host_now(
-            &mut session,
-            Some(SystemTime::UNIX_EPOCH + Duration::from_millis(1_234)),
-        );
-        assert_eq!(
-            host_now(&session),
-            Some(SystemTime::UNIX_EPOCH + Duration::from_millis(1_234))
-        );
     }
 
     #[test]

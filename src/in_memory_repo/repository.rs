@@ -42,8 +42,8 @@ use crate::table::{TableStoreError, TableWritePlan};
 /// or SQLite repository for a production inbox with retention control.
 #[derive(Clone)]
 pub struct InMemoryRepository {
-    event_store: Arc<RwLock<HashMap<String, Vec<EventRecord>>>>,
-    outbox_store: Arc<RwLock<HashMap<String, OutboxMessage>>>,
+    pub(crate) event_store: Arc<RwLock<HashMap<String, Vec<EventRecord>>>>,
+    pub(crate) outbox_store: Arc<RwLock<HashMap<String, OutboxMessage>>>,
     pub(super) model_store: InMemoryReadModelStore,
     snapshot_store: InMemorySnapshotStore,
     /// Consumer inbox: the set of recorded `(consumer, message_id)` receipts.
@@ -54,7 +54,7 @@ pub struct InMemoryRepository {
     /// deployment with the Postgres or SQLite inbox, which support
     /// [`purge_inbox_older_than`](crate::repository::InboxStore::purge_inbox_older_than).
     pub(super) inbox_store: Arc<RwLock<HashSet<(String, String)>>>,
-    command_ledger: Arc<RwLock<HashMap<CommandLedgerKey, CommandLedgerRecord>>>,
+    pub(crate) command_ledger: Arc<RwLock<HashMap<CommandLedgerKey, CommandLedgerRecord>>>,
     pub(super) projection_protocol: Arc<RwLock<InMemoryProjectionProtocolState>>,
     pub(super) causal_tables: Arc<RwLock<HashSet<String>>>,
     pub(super) projection_change_retention: ProjectionChangeRetention,
@@ -62,7 +62,7 @@ pub struct InMemoryRepository {
     causal_storage_identity: CausalStorageIdentity,
     /// Schedule rows per owning stream (`storage_key`), committed with the
     /// owner's events. Dispatched only once a schedule worker is attached
-    /// (`with_schedule_worker`).
+    /// (`ScheduleWorker::attach`).
     schedules: Arc<RwLock<HashMap<String, (StreamIdentity, crate::schedule::MemorySchedules)>>>,
     /// A schedule worker was attached: [`Capability::Scheduling`](crate::schedule::Capability::Scheduling).
     schedule_dispatch: bool,
@@ -174,104 +174,6 @@ impl InMemoryRepository {
     /// Access the embedded snapshot store directly.
     pub fn snapshot_store(&self) -> &InMemorySnapshotStore {
         &self.snapshot_store
-    }
-
-    /// Clone the event log for Durable Object SQLite persistence.
-    pub fn clone_events(&self) -> Result<HashMap<String, Vec<EventRecord>>, RepositoryError> {
-        Ok(self
-            .event_store
-            .read()
-            .map_err(|_| RepositoryError::LockPoisoned("event log read"))?
-            .clone())
-    }
-
-    /// Replace the event log from Durable Object SQLite restore.
-    pub fn replace_events(
-        &self,
-        events: HashMap<String, Vec<EventRecord>>,
-    ) -> Result<(), RepositoryError> {
-        *self
-            .event_store
-            .write()
-            .map_err(|_| RepositoryError::LockPoisoned("event log write"))? = events;
-        Ok(())
-    }
-
-    /// Clone outbox rows for Durable Object SQLite persistence.
-    pub fn clone_outbox(&self) -> Result<Vec<OutboxMessage>, RepositoryError> {
-        Ok(self
-            .outbox_store
-            .read()
-            .map_err(|_| RepositoryError::LockPoisoned("outbox read"))?
-            .values()
-            .cloned()
-            .collect())
-    }
-
-    /// Replace outbox rows from Durable Object SQLite restore.
-    pub fn replace_outbox(&self, messages: Vec<OutboxMessage>) -> Result<(), RepositoryError> {
-        let mut map = HashMap::new();
-        for message in messages {
-            map.insert(message.id.clone(), message);
-        }
-        *self
-            .outbox_store
-            .write()
-            .map_err(|_| RepositoryError::LockPoisoned("outbox write"))? = map;
-        Ok(())
-    }
-
-    /// Clone snapshot cache records for Durable Object SQLite persistence.
-    pub fn clone_snapshots(&self) -> Result<HashMap<String, SnapshotRecord>, RepositoryError> {
-        Ok(self
-            .snapshot_store
-            .storage
-            .read()
-            .map_err(|_| RepositoryError::LockPoisoned("snapshot log read"))?
-            .clone())
-    }
-
-    /// Replace snapshot cache records from Durable Object SQLite restore.
-    pub fn replace_snapshots(
-        &self,
-        snapshots: HashMap<String, SnapshotRecord>,
-    ) -> Result<(), RepositoryError> {
-        *self
-            .snapshot_store
-            .storage
-            .write()
-            .map_err(|_| RepositoryError::LockPoisoned("snapshot log write"))? = snapshots;
-        Ok(())
-    }
-
-    pub(crate) fn clone_command_ledger(&self) -> Result<Vec<CommandLedgerRecord>, RepositoryError> {
-        Ok(self
-            .command_ledger
-            .read()
-            .map_err(|_| RepositoryError::LockPoisoned("command ledger read"))?
-            .values()
-            .cloned()
-            .collect())
-    }
-
-    pub(crate) fn replace_command_ledger(
-        &self,
-        records: Vec<CommandLedgerRecord>,
-    ) -> Result<(), RepositoryError> {
-        let mut ledger = HashMap::with_capacity(records.len());
-        for record in records {
-            let key = record.key.clone();
-            if ledger.insert(key, record).is_some() {
-                return Err(RepositoryError::Model(
-                    "cell command ledger restore contains a duplicate key".into(),
-                ));
-            }
-        }
-        *self
-            .command_ledger
-            .write()
-            .map_err(|_| RepositoryError::LockPoisoned("command ledger write"))? = ledger;
-        Ok(())
     }
 
     /// Whether a consumer inbox receipt for `(consumer, message_id)` is recorded.
@@ -1157,9 +1059,9 @@ mod tests {
 }
 
 /// Stores schedules; dispatches them once a schedule worker is attached
-/// (`with_schedule_worker`). The store clock is the injected
+/// (`ScheduleWorker::attach`). The store clock is the injected
 /// [`Clock`](crate::Clock).
-impl crate::microsvc::BackendHost for InMemoryRepository {
+impl crate::schedule::BackendHost for InMemoryRepository {
     fn capabilities(&self) -> crate::schedule::Capabilities {
         crate::schedule::Capabilities {
             scheduling: self.schedule_dispatch,
@@ -1174,9 +1076,15 @@ impl crate::microsvc::BackendHost for InMemoryRepository {
     }
 }
 
-#[cfg(feature = "graphql")]
+/// Clones share the schedule table.
+#[cfg(feature = "runtime-tokio")]
 #[async_trait::async_trait]
-impl crate::schedule::worker::ScheduleSource for InMemoryRepository {
+impl crate::schedule::ScheduleStore for InMemoryRepository {
+    fn with_schedule_dispatch(mut self) -> Self {
+        self.schedule_dispatch = true;
+        self
+    }
+
     async fn schedule_now(&self) -> Result<std::time::SystemTime, RepositoryError> {
         Ok(self.clock.now())
     }
@@ -1229,22 +1137,5 @@ impl crate::schedule::worker::ScheduleSource for InMemoryRepository {
             table.settle(name, generation, settlement);
         }
         Ok(())
-    }
-}
-
-#[cfg(feature = "graphql")]
-impl InMemoryRepository {
-    /// Attach a schedule worker: the returned repository declares
-    /// [`Capability::Scheduling`](crate::schedule::Capability::Scheduling),
-    /// and the returned [`ScheduleWorker`](crate::schedule::worker::ScheduleWorker)
-    /// fires due schedules by the store clock once started with the
-    /// service's command host. Clones share the schedule table.
-    pub fn with_schedule_worker(
-        mut self,
-        config: crate::schedule::worker::ScheduleWorkerConfig,
-    ) -> (Self, crate::schedule::worker::ScheduleWorker) {
-        self.schedule_dispatch = true;
-        let worker = crate::schedule::worker::ScheduleWorker::new(self.clone(), config);
-        (self, worker)
     }
 }

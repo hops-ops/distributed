@@ -43,7 +43,7 @@ use crate::{
     MetricsTarget, PostCreateAction, ServiceScaffoldSpec, ServiceTransport, StoreTarget,
 };
 
-const DISTRIBUTED_MANIFEST_SCHEMA_VERSION: u64 = 2;
+const DISTRIBUTED_MANIFEST_SCHEMA_VERSION: u64 = 3;
 
 /// The command tree, for the `distributed` binary and for a host CLI that
 /// mounts it under one of its own commands.

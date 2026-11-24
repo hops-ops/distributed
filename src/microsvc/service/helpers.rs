@@ -171,7 +171,7 @@ mod tests {
         assert_eq!(session.get("saga-id"), Some("s-1"));
         assert_eq!(session.get("traceparent"), Some("00-trace"));
         assert_eq!(session.variables().len(), 5, "{session:?}");
-        assert!(!crate::schedule::is_schedule_session(&session));
+        assert!(!crate::microsvc::schedule::is_schedule_session(&session));
     }
 
     #[test]

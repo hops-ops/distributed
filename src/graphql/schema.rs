@@ -11,7 +11,6 @@ use async_graphql::Value;
 
 use super::compile::{self, QueryPlan, RootKind};
 use super::engine::{EngineInner, ExecutionAuthority};
-use super::identity::VerifiedPrincipal;
 use super::naming::{
     bool_exp_name, causal_protocol_type_names, comparison_exp_name, order_by_name,
     COMMAND_STATUS_ROOT_FIELD, CUSTOM_SCALARS, DISTRIBUTED_COMMAND_STATE_TYPE,
@@ -22,6 +21,7 @@ use super::surface::{
     RootKind as SurfaceRootKind, Surface, SurfaceArgument, SurfaceCommandShape, SurfaceModel,
     SurfaceTypeDef, SurfaceTypeField,
 };
+use crate::command_dispatch::VerifiedPrincipal;
 use crate::microsvc::Session;
 
 pub fn build_role_schema(

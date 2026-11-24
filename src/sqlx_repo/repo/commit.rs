@@ -627,8 +627,8 @@ where
 }
 
 /// SQL stores schedules; it dispatches them once a schedule worker is
-/// attached (`with_schedule_worker`). Its clock is the database clock.
-impl<DB> crate::microsvc::BackendHost for SqlxRepository<DB>
+/// attached (`ScheduleWorker::attach`). Its clock is the database clock.
+impl<DB> crate::schedule::BackendHost for SqlxRepository<DB>
 where
     DB: SqlxRepoBackend,
     for<'c> &'c mut DB::Connection: Executor<'c, Database = DB>,
@@ -694,9 +694,10 @@ where
     }
 }
 
-#[cfg(feature = "graphql")]
+/// Several processes may each attach a worker over one database; claims keep
+/// them off each other's rows.
 #[async_trait::async_trait]
-impl<DB> crate::schedule::worker::ScheduleSource for SqlxRepository<DB>
+impl<DB> crate::schedule::ScheduleStore for SqlxRepository<DB>
 where
     DB: SqlxRepoBackend,
     for<'c> &'c mut DB::Connection: Executor<'c, Database = DB>,
@@ -708,8 +709,13 @@ where
     for<'q> &'q [u8]: Encode<'q, DB> + Type<DB>,
     for<'r> &'r str: sqlx::ColumnIndex<DB::Row>,
 {
+    fn with_schedule_dispatch(mut self) -> Self {
+        self.schedule_dispatch = true;
+        self
+    }
+
     async fn schedule_now(&self) -> Result<SystemTime, RepositoryError> {
-        crate::microsvc::BackendHost::host_now(self).await
+        crate::schedule::BackendHost::host_now(self).await
     }
 
     async fn claim_due_schedules(
@@ -750,34 +756,5 @@ where
             settlement,
         )
         .await
-    }
-}
-
-#[cfg(feature = "graphql")]
-impl<DB> SqlxRepository<DB>
-where
-    DB: SqlxRepoBackend,
-    for<'c> &'c mut DB::Connection: Executor<'c, Database = DB>,
-    DB::Arguments: IntoArguments<DB>,
-    for<'q> i64: Encode<'q, DB> + Type<DB> + sqlx::Decode<'q, DB>,
-    for<'q> String: Type<DB> + sqlx::Decode<'q, DB>,
-    for<'q> Vec<u8>: Type<DB> + sqlx::Decode<'q, DB>,
-    for<'q> &'q str: Encode<'q, DB> + Type<DB>,
-    for<'q> &'q [u8]: Encode<'q, DB> + Type<DB>,
-    for<'r> &'r str: sqlx::ColumnIndex<DB::Row>,
-{
-    /// Attach a schedule worker: the returned repository declares
-    /// [`Capability::Scheduling`](crate::schedule::Capability::Scheduling),
-    /// and the returned [`ScheduleWorker`](crate::schedule::worker::ScheduleWorker)
-    /// fires its due `aggregate_schedules` rows once started with the
-    /// service's command host. Several processes may each run one; claims
-    /// keep them off each other's rows.
-    pub fn with_schedule_worker(
-        mut self,
-        config: crate::schedule::worker::ScheduleWorkerConfig,
-    ) -> (Self, crate::schedule::worker::ScheduleWorker) {
-        self.schedule_dispatch = true;
-        let worker = crate::schedule::worker::ScheduleWorker::new(self.clone(), config);
-        (self, worker)
     }
 }

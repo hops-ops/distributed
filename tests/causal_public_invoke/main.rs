@@ -8,7 +8,7 @@
 use distributed::command::{
     typed_command, CommandInputType, CommandOutputType, CommandTypeDef, CommandTypeField, Succeeded,
 };
-use distributed::graphql::VerifiedPrincipal;
+use distributed::command_dispatch::VerifiedPrincipal;
 use distributed::microsvc::{Routes, Service, Session, USER_ID_KEY};
 use distributed::{Aggregate, AggregateBuilder, Entity, InMemoryRepository, Snapshot};
 use serde::{Deserialize, Serialize};
