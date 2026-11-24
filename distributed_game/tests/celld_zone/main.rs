@@ -185,7 +185,7 @@ impl Player {
             let frame = tokio::time::timeout(left, self.ws.next()).await.ok()?;
             match frame {
                 Some(Ok(Message::Binary(bytes))) => {
-                    match ServerMessage::decode(&bytes, &ClientMirror::speaking(self.protocol)) {
+                    match ServerMessage::decode(&bytes, &ClientMirror::new()) {
                         Ok(message) => return Some(Got::Server(message)),
                         // Deltas need the Welcome's schema; these tests skip them.
                         Err(_) => continue,
@@ -330,29 +330,23 @@ async fn single_node() {
     assert_eq!(ana.total(2).await, 5);
     until(&base, "/tally/ana", long, |v| exactly_once(v, 5)).await;
 
-    // The zone answers in the client's protocol version: v1 Welcome for a
-    // v1 client, v2 (runtime features) for v2; a version it does not speak
-    // is refused before the ticket is used, so the same ticket then joins.
-    let mut old = Player::connect(&base, "room-a").await;
-    old.protocol = 1;
-    old.hello(&ticket_as("old", "room-a", Role::Observer)).await;
-    let w = old.welcome_message().await;
-    assert_eq!((w.protocol_version, w.features, w.origin), (1, 0, None));
+    // A Welcome carries the runtime features; a version the zone does not
+    // speak is refused before the ticket is used, so the same ticket then
+    // joins.
     let mut new = Player::connect(&base, "room-a").await;
     new.hello(&ticket_as("new", "room-a", Role::Observer)).await;
     let w = new.welcome_message().await;
-    assert_eq!(w.protocol_version, 2);
     assert_eq!(w.features & feature::FOCUS, feature::FOCUS);
     new.send(ClientMessage::Focus { x: 1.0, y: 2.0 }).await;
     let mut future = Player::connect(&base, "room-a").await;
-    future.protocol = PROTOCOL_VERSION + 1;
+    future.protocol = PROTOCOL_VERSION - 1;
     let same = ticket_as("future", "room-a", Role::Observer);
     future.hello(&same).await;
     assert_eq!(future.refused().await, error::VERSION_MISMATCH);
     let mut future = Player::connect(&base, "room-a").await;
     future.hello(&same).await;
     future.welcome().await;
-    drop((old, new, future));
+    drop((new, future));
 
     // A used ticket is refused.
     let mut replay = Player::connect(&base, "room-a").await;

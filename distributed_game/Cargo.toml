@@ -152,8 +152,8 @@ path = "tests/lifecycle/main.rs"
 required-features = ["runtime"]
 
 [[test]]
-name = "cell_sink"
-path = "tests/cell_sink/main.rs"
+name = "cell_facts"
+path = "tests/cell_facts/main.rs"
 required-features = ["cell", "runtime"]
 
 [[test]]

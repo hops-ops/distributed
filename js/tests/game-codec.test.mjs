@@ -165,8 +165,7 @@ function messageFromJson(decoded, schema) {
 				reconnectToken: decoded.reconnect_token,
 				contentVersion: decoded.content_version,
 				schema: schemaFromJson(decoded.schema),
-				protocolVersion: decoded.protocol_version,
-				features: decoded.features ?? 0,
+				features: decoded.features,
 				...(decoded.origin ? { origin: decoded.origin } : {})
 			};
 		case 'Delta':
@@ -255,10 +254,8 @@ function messageToJson(message, kinds) {
 				tick_rate: message.tickRate,
 				type: 'Welcome',
 				zone_id: message.zoneId,
-				protocol_version: message.protocolVersion,
-				...(message.protocolVersion >= 2
-					? { features: message.features, origin: message.origin === undefined ? null : message.origin }
-					: {})
+				features: message.features,
+				origin: message.origin === undefined ? null : message.origin
 			};
 		case 'Delta': {
 			const created = new Map(message.creates.map((c) => [c.id, c.kind]));
@@ -387,7 +384,7 @@ test('quantization reproduces the Rust integers and binary32 results exactly', (
 	}
 });
 
-/** Rust message fixtures, including the additive v1 Redirect and Kick RELOAD. */
+/** Rust message fixtures. */
 function allMessages() {
 	return fixture('messages.json').messages;
 }
@@ -395,15 +392,11 @@ function allMessages() {
 test('every message fixture encodes and decodes byte-exactly', () => {
 	const messages = allMessages();
 	const names = messages.map((m) => m.name);
-	for (const required of ['hello', 'hello_v2', 'hello_reconnect', 'input', 'ping', 'leave', 'welcome', 'welcome_v2', 'welcome_v2_unplaced', 'delta', 'delta_empty', 'event', 'pong', 'freeze', 'resume', 'handoff', 'kick', 'error', 'kick_reload', 'redirect', 'hello_near', 'near', 'passive', 'focus']) {
+	for (const required of ['hello', 'hello_reconnect', 'input', 'ping', 'leave', 'welcome', 'welcome_origin', 'delta', 'delta_empty', 'event', 'pong', 'freeze', 'resume', 'handoff', 'kick', 'error', 'kick_reload', 'redirect', 'hello_near', 'near', 'passive', 'focus']) {
 		assert.ok(names.includes(required), `fixture ${required}`);
 	}
 	for (const entry of messages) {
-		// Welcomes decode in the version the client offered.
-		const kinds =
-			entry.schema === undefined
-				? { schema: undefined, kindOf: () => undefined, protocolVersion: entry.decoded.protocol_version }
-				: kindsFor(entry);
+		const kinds = entry.schema === undefined ? { schema: undefined, kindOf: () => undefined } : kindsFor(entry);
 		const message = messageFromJson(entry.decoded);
 		const bytes =
 			entry.direction === 'client_to_server'
@@ -428,7 +421,6 @@ test('client mirror applies the golden delta like Rust ClientMirror', () => {
 	const welcome = messages.find((m) => m.name === 'welcome');
 	const delta = messages.find((m) => m.name === 'delta');
 	const mirror = new GameClientMirror();
-	mirror.protocolVersion = welcome.decoded.protocol_version;
 	const hello = mirror.apply(fromHex(welcome.hex));
 	assert.equal(hello.type, 'Welcome');
 	// Seed the entities the delta fixture assumes are known.
@@ -446,22 +438,17 @@ test('client mirror applies the golden delta like Rust ClientMirror', () => {
 	assert.equal(mirror.entities.get(301).fields[0], 0);
 });
 
-test('a Welcome decodes only in the protocol version the client offered', () => {
+test('a Welcome always carries features and an optional origin', () => {
 	const hex = (name) => fixture('messages.json').messages.find((m) => m.name === name).hex;
-	const v1 = { schema: undefined, kindOf: () => undefined, protocolVersion: 1 };
-	const v2 = { ...v1, protocolVersion: 2 };
-	assert.throws(() => decodeServerMessage(fromHex(hex('welcome_v2')), v1), /TRAILING_BYTES/);
-	assert.throws(() => decodeServerMessage(fromHex(hex('welcome')), v2), /UNEXPECTED_EOF/);
-	const old = new GameClientMirror();
-	old.protocolVersion = 1;
-	const w1 = old.apply(fromHex(hex('welcome')));
-	assert.equal(w1.protocolVersion, 1);
-	assert.equal(w1.features, 0);
-	assert.equal(w1.origin, undefined);
-	const w2 = new GameClientMirror().apply(fromHex(hex('welcome_v2')));
-	assert.equal(w2.features & GameFeature.FOCUS, GameFeature.FOCUS);
-	assert.deepEqual(w2.origin, { x: -48, y: 1_000_000.5 });
-	assert.equal(new GameClientMirror().apply(fromHex(hex('welcome_v2_unplaced'))).origin, undefined);
+	const placed = new GameClientMirror().apply(fromHex(hex('welcome_origin')));
+	assert.equal(placed.features & GameFeature.FOCUS, GameFeature.FOCUS);
+	assert.deepEqual(placed.origin, { x: -48, y: 1_000_000.5 });
+	const unplaced = new GameClientMirror().apply(fromHex(hex('welcome')));
+	assert.equal(unplaced.features & GameFeature.FOCUS, GameFeature.FOCUS);
+	assert.equal(unplaced.origin, undefined);
+	// A Welcome without the trailing features + origin is truncated.
+	const bytes = fromHex(hex('welcome'));
+	assert.throws(() => decodeServerMessage(bytes.subarray(0, bytes.length - 2)), /UNEXPECTED_EOF/);
 });
 
 test('decoders reject malformed input like the Rust reference', () => {

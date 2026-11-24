@@ -7,7 +7,6 @@ import {
 	GameClient,
 	GameConnection,
 	GameErrorCode,
-	GameFeature,
 	GameKickCode
 } from '@hops-ops/distributed/game';
 
@@ -166,83 +165,32 @@ test('an observer sends Focus throttled, and again after a reconnect', async () 
 	player.close();
 });
 
-/**
- * A server built before protocol 2 (what `distributed_game` answered then):
- * any Hello but version 1 gets `Error(VERSION_MISMATCH)` and a close,
- * before the ticket is looked at (`message`: native "protocol 2 != 1",
- * celld "protocol version"). Records the tickets it admitted.
- */
-function v1OnlyServer(network, { message = 'protocol version', closeCode = 1008, role = 'player' } = {}) {
-	const admitted = [];
+test('a protocol VERSION_MISMATCH fails the join like any other refusal', async () => {
+	const network = new FakeNetwork();
+	const scheduler = new FakeScheduler();
 	network.onMessage = (conn, m) => {
-		if (m.type !== 'Hello') {
-			// An old celld zone refuses unknown messages (e.g. Focus) and closes.
-			if (m.type === 'Focus') {
-				conn.send({ type: 'Error', code: GameErrorCode.BAD_MESSAGE, message: 'bad message' });
-				conn.close(1008);
-			}
-			return;
+		if (m.type === 'Hello') {
+			conn.send({ type: 'Error', code: GameErrorCode.VERSION_MISMATCH, message: 'protocol 2 != 3' });
+			conn.close(1008);
 		}
-		if (m.protocolVersion !== 1) {
-			conn.send({ type: 'Error', code: GameErrorCode.VERSION_MISMATCH, message });
-			conn.close(closeCode);
-			return;
-		}
-		admitted.push(m.ticket || m.reconnectToken);
-		conn.send(
-			welcome({ zoneId: conn.zoneId, role, protocolVersion: 1, features: 0, reconnectToken: `rt-${admitted.length}`, serverTime: 10_000 })
-		);
 	};
-	return admitted;
-}
-
-test('offers protocol 2 and falls back once to 1 against a v1-only server', async () => {
-	for (const [message, closeCode] of [
-		['protocol version', 1008],
-		['protocol 2 != 1', 1005]
-	]) {
-		const network = new FakeNetwork();
-		const scheduler = new FakeScheduler();
-		const admitted = v1OnlyServer(network, { message, closeCode, role: 'observer' });
-		const url = `ws://old-${closeCode}.test/zones/z1`;
-		const { conn, tickets } = connection(network, scheduler, { url, role: 'observer' });
-		const errors = [];
-		const disconnects = [];
-		conn.on('error', (e) => errors.push(e));
-		conn.on('disconnect', (d) => disconnects.push(d));
-		const w = await conn.connect();
-		assert.equal(w.protocolVersion, 1);
-		assert.equal(conn.protocolVersion, 1);
-		assert.deepEqual(
-			network.connections.map((c) => c.lastHello.protocolVersion),
-			[2, 1],
-			'the same Hello again with 1'
-		);
-		assert.equal(network.connections[1].lastHello.ticket, network.connections[0].lastHello.ticket, 'same ticket');
-		assert.equal(tickets.length, 1, 'no new ticket fetched');
-		assert.deepEqual(admitted, ['t:z1:1']);
-		assert.deepEqual(errors, [], 'the refusal is not surfaced');
-		assert.deepEqual(disconnects, []);
-		assert.equal(conn.state, 'open');
-		// A v1 server has no FOCUS feature: Focus is never sent (an old
-		// celld zone would close the connection on it).
-		conn.setFocus(3, 4);
-		await scheduler.advance(300);
-		assert.deepEqual(network.last().inbox.filter((m) => m.type === 'Focus'), []);
-		assert.equal(conn.hasFeature(GameFeature.FOCUS), false);
-		// Remembered per host: a reconnect offers 1 at once.
-		network.last().close(1006, 'lost');
-		await scheduler.advance(5_000);
-		assert.equal(conn.state, 'open');
-		assert.deepEqual(
-			network.connections.slice(2).map((c) => c.lastHello.protocolVersion),
-			[1]
-		);
-		conn.close();
-	}
+	const { conn, tickets } = connection(network, scheduler);
+	const errors = [];
+	const reloads = [];
+	conn.on('error', (e) => errors.push(e.code));
+	conn.on('reloadRequired', (r) => reloads.push(r));
+	await assert.rejects(
+		conn.connect(),
+		(error) => error.info.reason === 'rejected' && error.info.code === GameErrorCode.VERSION_MISMATCH
+	);
+	assert.deepEqual(errors, [GameErrorCode.VERSION_MISMATCH]);
+	assert.deepEqual(reloads, [], 'reloading content cannot fix the protocol');
+	assert.equal(tickets.length, 1);
+	assert.deepEqual(network.connections.map((c) => c.lastHello.protocolVersion), [GAME_PROTOCOL_VERSION]);
+	assert.equal(conn.state, 'closed');
 });
 
-test('a content VERSION_MISMATCH still asks for a reload, without a protocol fallback', async () => {
+test('a content VERSION_MISMATCH asks for a reload', async () => {
 	const network = new FakeNetwork();
 	const scheduler = new FakeScheduler();
 	network.onMessage = (conn, m) => {
@@ -257,7 +205,7 @@ test('a content VERSION_MISMATCH still asks for a reload, without a protocol fal
 	void conn.connect().catch(() => undefined);
 	await scheduler.advance(10);
 	assert.deepEqual(reloads, ['version-mismatch']);
-	assert.deepEqual(network.connections.map((c) => c.lastHello.protocolVersion), [2]);
+	assert.equal(network.connections.length, 1);
 	conn.close();
 });
 

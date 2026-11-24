@@ -1,7 +1,7 @@
 /**
  * Browser client SDK for `distributed_game` authoritative zones.
  *
- * - Codec: `PROTOCOL.md` v1 byte-exact (golden-fixture tested).
+ * - Codec: `PROTOCOL.md` byte-exact (golden-fixture tested).
  * - `GameConnection`: one zone WebSocket — handshake, reconnect, clock sync.
  * - `EntityReplica`: schema-driven entity store with interpolation buffers.
  * - `Predictor`: client prediction + per-field reconciliation policies.

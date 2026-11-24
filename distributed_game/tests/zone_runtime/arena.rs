@@ -18,6 +18,9 @@ pub const COIN: u16 = 2;
 #[derive(Debug, Clone, Default)]
 pub struct ArenaConfig {
     pub fact_every_tick: bool,
+    /// Every player queues a `step:{tick}:{player}` fact each tick
+    /// (`Ctx::queue_fact_for`: never refused for backpressure).
+    pub queue_facts: bool,
     pub reject_principal: Option<String>,
     pub background: bool,
     pub spawn_every: Option<Duration>,
@@ -247,6 +250,15 @@ impl Zone for Arena {
                 }
             }
             ctx.set_view(player, View::new(ax, ay, 30.0));
+        }
+        if self.cfg.queue_facts {
+            let players: Vec<_> = ctx.players().map(|p| p.id).collect();
+            for player in players {
+                let key = format!("step:{}:{}", ctx.tick(), player.0);
+                if let Err(e) = ctx.queue_fact_for(player, Fact::new(key, "step", json!(null))) {
+                    self.emit_errors.push(e);
+                }
+            }
         }
         if self.cfg.fact_every_tick {
             let fact = Fact::new(format!("tick:{}", ctx.tick()), "heartbeat", json!(null));
