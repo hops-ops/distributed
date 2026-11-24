@@ -2,7 +2,7 @@
 //! the five transitions, restart-safe keys, per-principal order under
 //! concurrent commits, backpressure backlog and the connection hooks.
 
-#[path = "../zone_runtime/arena.rs"]
+#[path = "../support/arena.rs"]
 mod arena;
 
 use std::collections::BTreeMap;

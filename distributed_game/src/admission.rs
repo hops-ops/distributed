@@ -23,7 +23,7 @@ use std::time::Duration;
 
 use crate::claims::{validate_extensions, ExtensionSchema};
 use crate::handoff::Transfer;
-use crate::protocol::{error, supports_protocol, Hello, MIN_PROTOCOL_VERSION, PROTOCOL_VERSION};
+use crate::protocol::{error, Hello, PROTOCOL_VERSION};
 use crate::ticket::{
     NonceCache, SharedTicketVerifier, TicketError, TicketKey, TicketVerifier, VerifiedTicket,
 };
@@ -157,13 +157,12 @@ pub fn admit(
     zone_id: &str,
     now_unix: u64,
 ) -> Result<Admitted, Refusal> {
-    // Refuse other versions before the ticket is touched, so the client can
-    // retry with an older one (§6.0).
-    if !supports_protocol(hello.protocol_version) {
+    // Refuse other versions before the ticket is touched (§6.0).
+    if hello.protocol_version != PROTOCOL_VERSION {
         return Err(Refusal::new(
             error::VERSION_MISMATCH,
             format!(
-                "protocol {} unsupported ({MIN_PROTOCOL_VERSION}..={PROTOCOL_VERSION})",
+                "protocol {} unsupported (this server speaks {PROTOCOL_VERSION})",
                 hello.protocol_version
             ),
         ));
@@ -377,11 +376,13 @@ mod tests {
             error::UNAUTHORIZED,
             "a transfer for neither end"
         );
-        let old = Hello {
-            protocol_version: PROTOCOL_VERSION + 1,
-            ..hello(c.key.sign(&claims(ZONE, "n1")))
-        };
-        assert_eq!(refused(old), error::VERSION_MISMATCH);
+        for version in [PROTOCOL_VERSION - 1, PROTOCOL_VERSION + 1] {
+            let other = Hello {
+                protocol_version: version,
+                ..hello(c.key.sign(&claims(ZONE, "n1")))
+            };
+            assert_eq!(refused(other), error::VERSION_MISMATCH, "version {version}");
+        }
         let ext = c.key.sign(&TicketClaims {
             extensions: crate::TicketExtensions::from_json(serde_json::json!({"team": 1})).unwrap(),
             ..claims(ZONE, "n1")

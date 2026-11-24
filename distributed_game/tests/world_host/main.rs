@@ -2,7 +2,7 @@
 //! policy, handoff issuance, freeze readiness, tier-up forwarding,
 //! hibernate/restore hooks and version stamping.
 
-#[path = "../world/realm.rs"]
+#[path = "../support/realm.rs"]
 mod realm;
 
 use std::sync::{Arc, Mutex};
@@ -59,7 +59,7 @@ fn transfer(principal: &str, from: &str, to: &str) -> Transfer {
         source_zone: from.into(),
         issuer: "h1".into(),
         generation: 1,
-        carried: b"gold=7".to_vec(),
+        carried: distributed_game::codec::to_bytes(&String::from("gold=7")),
         departed_at_ms: 0,
     }
 }
@@ -207,7 +207,10 @@ fn handoff_issues_ticket_and_removes_player_first() {
         ),
         ("ana", "realm.east", "realm.west")
     );
-    assert_eq!(r.carried, b"ana:gold=0");
+    assert_eq!(
+        r.carried,
+        distributed_game::codec::to_bytes(&String::from("ana:gold=0"))
+    );
 
     // Without an issuer the zone gets an error and the player stays.
     let mut lone = host(
@@ -371,20 +374,19 @@ fn futures_executor(f: impl std::future::Future<Output = ()>) {
 
 #[test]
 fn world_entry_points_record_and_replay_deterministically() {
-    use distributed_game::replay::{replay, Recorder, Recording};
+    use distributed_game::replay::{replay, Recording};
     let clock = ManualClock::new();
     let cfg = RealmConfig {
         neighbour: Some("realm.west".into()),
         ..RealmConfig::new()
     };
-    let mut rec = Recorder::<Realm>::new(
-        "realm.east",
-        safe_room("v1"),
-        Arc::new(clock.clone()),
-        cfg.clone(),
-        Vec::new(),
-    )
-    .with_transfer_issuer(|_| Some("live-ticket".into()));
+    let config = HostConfig {
+        record: true,
+        ..safe_room("v1")
+    };
+    let mut rec =
+        ZoneHost::<Realm>::new("realm.east", config, Arc::new(clock.clone()), cfg.clone())
+            .with_transfer_issuer(|_| Some("live-ticket".into()));
     rec.restore(&5u32.to_le_bytes(), "v0");
     let ana = rec
         .join_transfer(&transfer("ana", "realm.inn", "realm.east"), 0, "v1")
@@ -424,12 +426,12 @@ fn world_entry_points_record_and_replay_deterministically() {
     rec.push_input(bo.client, 2, 0, &[CMD_HANDOFF]);
     clock.advance(Duration::from_millis(40));
     rec.advance();
-    assert_eq!(rec.host().zone().counter, 6);
-    assert_eq!(rec.host().config().config_version, "combat@2");
-    assert_eq!(rec.host().zone().child_events.len(), 1);
-    assert_eq!(rec.host().player_count(), 1, "bo handed off");
+    assert_eq!(rec.zone().counter, 6);
+    assert_eq!(rec.config().config_version, "combat@2");
+    assert_eq!(rec.zone().child_events.len(), 1);
+    assert_eq!(rec.player_count(), 1, "bo handed off");
 
-    let recording = Recording::decode(&rec.finish().encode()).unwrap();
+    let recording = Recording::decode(&rec.recording().unwrap().encode()).unwrap();
     let summary = replay::<Realm>(&recording, cfg).unwrap();
     assert!(summary.ticks >= 2, "{summary:?}");
 }

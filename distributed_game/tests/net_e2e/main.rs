@@ -3,7 +3,7 @@
 
 #[path = "../support/admission.rs"]
 mod admission;
-#[path = "../zone_runtime/arena.rs"]
+#[path = "../support/arena.rs"]
 mod arena;
 
 use std::time::Duration;
@@ -970,33 +970,27 @@ async fn hello_version(ws: &mut Ws, version: u32, ticket: String) {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn negotiates_the_protocol_version_in_hello() {
+async fn refuses_any_other_protocol_version() {
     use distributed_game::protocol::feature;
     let (url, server, handle) = start(None).await;
 
-    // v1 client: v1 Welcome (no features, no origin).
-    let mut ws = connect(&url, "z1").await;
-    hello_version(&mut ws, 1, ticket("ana", "z1", "v-1", Role::Player)).await;
-    let mut v1 = ClientMirror::speaking(1);
-    let Some(ServerMessage::Welcome(w)) = next(&mut ws, &mut v1).await else {
-        panic!("v1 Welcome")
-    };
-    assert_eq!((w.protocol_version, w.features), (1, 0));
-
-    // v2 client: v2 Welcome with the runtime features.
     let mut ws2 = connect(&url, "z1").await;
-    hello_version(&mut ws2, 2, ticket("bo", "z1", "v-2", Role::Observer)).await;
+    hello_version(
+        &mut ws2,
+        PROTOCOL_VERSION,
+        ticket("bo", "z1", "v-2", Role::Observer),
+    )
+    .await;
     let Some(ServerMessage::Welcome(w)) = next(&mut ws2, &mut ClientMirror::new()).await else {
-        panic!("v2 Welcome")
+        panic!("Welcome")
     };
-    assert_eq!(w.protocol_version, 2);
     assert_eq!(w.features & feature::FOCUS, feature::FOCUS);
 
     // A version the server does not speak is refused before the ticket is
     // used (message starting `protocol`): the same ticket then joins.
     let mut ws3 = connect(&url, "z1").await;
     let same = ticket("cy", "z1", "v-3", Role::Player);
-    hello_version(&mut ws3, 3, same.clone()).await;
+    hello_version(&mut ws3, PROTOCOL_VERSION - 1, same.clone()).await;
     match next(&mut ws3, &mut ClientMirror::new()).await {
         Some(ServerMessage::Error { code, message }) => {
             assert_eq!(code, error::VERSION_MISMATCH);
@@ -1005,12 +999,12 @@ async fn negotiates_the_protocol_version_in_hello() {
         other => panic!("expected VERSION_MISMATCH, got {other:?}"),
     }
     let mut ws4 = connect(&url, "z1").await;
-    hello_version(&mut ws4, 2, same).await;
+    hello_version(&mut ws4, PROTOCOL_VERSION, same).await;
     assert!(matches!(
         next(&mut ws4, &mut ClientMirror::new()).await,
         Some(ServerMessage::Welcome(_))
     ));
-    drop((ws, ws2, ws3, ws4));
+    drop((ws2, ws3, ws4));
     stop(server, handle).await;
 }
 
@@ -1235,4 +1229,137 @@ async fn a_command_flood_never_holds_ticks_back() {
     assert!(longest <= 64, "{longest} commands without a tick: {seen:?}");
     assert!(seen.last() > seen.first(), "ticks advanced: {seen:?}");
     server.shutdown();
+}
+
+/// A session on the native driver with recording on: two players join over
+/// WebSockets, move, one drops and reconnects with its token, the other is
+/// kicked through the service inbox; facts (heartbeats and lifecycle) commit
+/// through the real worker. Replaying the recording reproduces every join
+/// and input outcome, every per-tick hash, the final state and the facts
+/// the sink committed, byte for byte.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn native_session_records_and_replays_identically() {
+    use distributed_game::inbox::ZoneInbound;
+    use distributed_game::replay::{replay_with, Recording};
+
+    let arena = || ArenaConfig {
+        fact_every_tick: true,
+        spawn_every: Some(Duration::from_millis(100)),
+        ..ArenaConfig::default()
+    };
+    let mut config = ServerConfig::new(TicketKey::new(SECRET));
+    config.host.record = true;
+    config.host.lifecycle_facts = true;
+    let sink = MemoryFactSink::new();
+    let server = GameServer::<Arena>::new(config, ZoneFactory::sync(move |_| Some(arena())))
+        .with_fact_sink(sink.clone(), 64, RetryPolicy::default());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("ws://{}", listener.local_addr().unwrap());
+    let serving = server.clone();
+    let handle = tokio::spawn(async move {
+        serving
+            .serve(listener, std::future::pending())
+            .await
+            .unwrap();
+    });
+
+    // Inputs until the server acked them all (consumed by ticks).
+    async fn moves(ws: &mut Ws, mirror: &mut ClientMirror, seqs: std::ops::RangeInclusive<u32>) {
+        let last = *seqs.end();
+        for seq in seqs {
+            let payload = vec![(seq % 3) as u8, 1];
+            let input = ClientMessage::Input {
+                seq,
+                client_tick: seq,
+                payload,
+            };
+            send(ws, input).await;
+        }
+        while mirror.ack_seq < last {
+            next(ws, mirror).await.expect("acked");
+        }
+    }
+
+    let mut ana = connect(&url, "zr").await;
+    hello(
+        &mut ana,
+        ticket("ana", "zr", "r1", Role::Player),
+        String::new(),
+    )
+    .await;
+    let mut ana_mirror = ClientMirror::new();
+    let Some(ServerMessage::Welcome(welcome)) = next(&mut ana, &mut ana_mirror).await else {
+        panic!("Welcome")
+    };
+    let mut bo = connect(&url, "zr").await;
+    hello(
+        &mut bo,
+        ticket("bo", "zr", "r2", Role::Player),
+        String::new(),
+    )
+    .await;
+    let mut bo_mirror = ClientMirror::new();
+    let Some(ServerMessage::Welcome(_)) = next(&mut bo, &mut bo_mirror).await else {
+        panic!("Welcome")
+    };
+    moves(&mut ana, &mut ana_mirror, 1..=8).await;
+    moves(&mut bo, &mut bo_mirror, 1..=5).await;
+    drop(ana); // abrupt: reconnect grace
+    let mut ana = connect(&url, "zr").await;
+    hello(&mut ana, String::new(), welcome.reconnect_token.clone()).await;
+    let mut ana_mirror = ClientMirror::new();
+    let Some(ServerMessage::Welcome(_)) = next(&mut ana, &mut ana_mirror).await else {
+        panic!("Welcome on reconnect")
+    };
+    moves(&mut ana, &mut ana_mirror, 9..=14).await;
+    let kicked = server
+        .send(
+            "zr",
+            ZoneInbound::Kick {
+                principal: "bo".into(),
+                reason: "test".into(),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(kicked.players_kicked, 1);
+    moves(&mut ana, &mut ana_mirror, 15..=20).await;
+
+    // Everything applied so far is in the recording: the live state now is
+    // the state after its last entry.
+    let (recording, live_hash) = server
+        .inspect("zr", |h| (h.recording().cloned(), h.state_hash()))
+        .await
+        .expect("zone active");
+    let recording = Recording::decode(&recording.expect("recording on").encode()).unwrap();
+    let mut replayed_hash = None;
+    let summary = replay_with::<Arena>(&recording, arena(), |h| {
+        replayed_hash = Some(h.state_hash())
+    })
+    .unwrap_or_else(|d| panic!("{d}"));
+    assert_eq!(replayed_hash, Some(live_hash), "final state");
+    assert!(summary.ticks > 0);
+
+    // The facts the replay emitted are exactly those the sink committed
+    // (it commits each one, later: wait for the last of them).
+    assert!(summary.facts.iter().any(|f| f.principal() == Some("ana")));
+    assert!(summary.facts.iter().any(|f| f.principal().is_none()));
+    let mut committed = Vec::new();
+    for _ in 0..500 {
+        committed = sink.committed();
+        if summary
+            .facts
+            .iter()
+            .all(|f| committed.iter().any(|c| c.key() == f.key()))
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    for fact in &summary.facts {
+        let live = committed.iter().find(|c| c.key() == fact.key());
+        assert_eq!(live, Some(fact), "fact {}", fact.key());
+    }
+    drop(ana);
+    stop(server, handle).await;
 }

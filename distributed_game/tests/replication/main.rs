@@ -60,7 +60,6 @@ impl Client {
         // Seed the mirror with the schema as a Welcome would.
         let mut mirror = ClientMirror::new();
         mirror.welcome = Some(distributed_game::protocol::Welcome {
-            protocol_version: distributed_game::PROTOCOL_VERSION,
             session_id: "s".into(),
             zone_id: "z".into(),
             role: distributed_game::Role::Player,
@@ -93,13 +92,13 @@ impl Client {
         for e in entities {
             view.push(e);
         }
-        let world = match &self.world {
-            Some(last) => last.next(&schema(), view, &self.interest),
-            None => EncodedWorld::build(&schema(), view, &self.interest),
+        let mut world = match self.world.take() {
+            Some(last) => last.next(&schema(), &view, &self.interest),
+            None => EncodedWorld::build(&schema(), &view, &self.interest),
         };
         let (frame, _) = self.replica.build_delta(
             &schema(),
-            &world,
+            &mut world,
             &self.interest,
             &self.view,
             self.budget,

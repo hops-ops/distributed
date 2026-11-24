@@ -462,6 +462,11 @@ impl FactQueue {
         self.in_flight.len()
     }
 
+    /// Unsettled facts allowed.
+    pub(crate) fn capacity(&self) -> usize {
+        self.capacity
+    }
+
     /// Close the queue dropping the facts its worker has not taken yet
     /// (a plain drop lets the worker commit them first).
     pub fn abandon(self) {

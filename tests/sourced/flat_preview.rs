@@ -90,6 +90,18 @@ impl Review {
         Ok(())
     }
 
+    pub fn archive(&mut self, id: String) -> distributed::SourcedResult {
+        self.record_archived(id, "archived".into())?;
+        Ok(())
+    }
+
+    /// One outcome, one event: its constant body field is declared, not inferred.
+    #[event("review.archived", version = 1, domain = event, known(status: "archived"))]
+    fn record_archived(&mut self, id: String, status: String) {
+        self.entity.set_id(id);
+        self.status = status;
+    }
+
     #[allow(clippy::too_many_arguments)]
     #[event("review.status_recorded", version = 1, domain = event)]
     fn record_status(
@@ -211,7 +223,7 @@ mod client_contract {
         const REVIEWS: ProjectionDescriptor<EventualOnly> = {
             name: "flat_reviews", version: 1, epoch: "flat-reviews-v1",
             model: FlatReviews, source: aggregate_snapshot,
-            on { events: [ReviewStatusRecordedDomainEvent], mutation: SaveFlatReview,
+            on { events: [ReviewStatusRecordedDomainEvent, ReviewArchivedDomainEvent], mutation: SaveFlatReview,
                 input: {review: body}, },
         };
     }
@@ -361,6 +373,52 @@ mod client_contract {
             }
             previous = Some(compiled);
         }
+    }
+
+    #[test]
+    fn an_event_mode_known_constant_reaches_projection_slots_without_applies() {
+        let mounts = LocalProjectionMountsBuilder::new("reviews", "events")
+            .unwrap()
+            .eventual_model::<FlatReviews, _>("flat_reviews", REVIEWS, REVIEWS.epoch())
+            .unwrap()
+            .build()
+            .unwrap();
+        let service = Service::new().named("reviews").routes(
+            Routes::new()
+                .with_repo(AggregateRepository::<_, Review>::new(
+                    InMemoryRepository::new(),
+                ))
+                .typed_command(
+                    typed_command::<Input, Eventual<Output>>("review.archive")
+                        .emits_events::<domain_commands::Archive>(),
+                )
+                .handle(metadata_only),
+        );
+        let surface = build_surface(
+            &[FlatReviews::schema().clone()],
+            &SurfaceOptions::postgres(),
+        )
+        .unwrap()
+        .with_projectors([mounts.projector("flat_reviews").unwrap()])
+        .unwrap()
+        .with_service(&service)
+        .unwrap();
+        let selected = surface_for_role(
+            &surface,
+            "anonymous",
+            &std::collections::BTreeMap::from([("FlatReviews".into(), read().all_columns())]),
+        )
+        .unwrap();
+        let manifest = DistributedClientSurfaceExport::from_selected("reviews", selected)
+            .unwrap()
+            .manifest()
+            .unwrap();
+        let projection = manifest.commands[0].extensions.projection.as_ref().unwrap();
+        assert!(projection.preview_occurrences.iter().any(|occurrence| occurrence
+            .values
+            .iter()
+            .any(|field| matches!(&field.source, ClientProjectionPreviewSource::Constant {
+                value: ClientProjectionValue::String(status) } if status == "archived"))));
     }
 
     #[test]

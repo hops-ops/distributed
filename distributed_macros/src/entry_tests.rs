@@ -177,12 +177,22 @@ mod tests {
             "got: {declared}"
         );
 
-        let error = expand(quote!(
+        let event_mode = expand(quote!(
             #[event("todo.completed", version = 1, domain = event, known(status: "completed"))]
+        ))
+        .unwrap()
+        .to_string();
+        assert!(
+            event_mode.contains("event_preview ! { TodoCompletedDomainEvent => TodoCompletedDomainEvent { status : \"completed\" , } }"),
+            "an event-mode recorder declares constants of its own body: {event_mode}"
+        );
+
+        let error = expand(quote!(
+            #[event("todo.completed", version = 1, known(status: "completed"))]
         ))
         .unwrap_err()
         .to_string();
-        assert!(error.contains("needs `domain` (state mode)"), "{error}");
+        assert!(error.contains("needs one of those"), "{error}");
     }
 
     #[test]

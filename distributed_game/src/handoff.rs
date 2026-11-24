@@ -7,7 +7,21 @@
 //! returns and sends `Handoff(target, ticket)`. The target admits the ticket
 //! with [`ZoneHost::join_transfer`](crate::ZoneHost::join_transfer), which
 //! calls [`Zone::on_handoff_join`](crate::Zone::on_handoff_join) with the
-//! carried bytes.
+//! carried bytes (the encoding of the [`Wire`](crate::Wire) value the
+//! source passed).
+//!
+//! **Custody rule: the client holds the carried state, and it is delivered
+//! at most once.** The source removes the player as soon as the hook
+//! returns; from then on the carried state exists only in the signed
+//! ticket. The issuer's transfer record (reserve / confirm / release) is in
+//! the issuing host's memory. So a client that drops the ticket, or
+//! discards one on purpose and joins afresh, an expired ticket, or an
+//! issuer restart before the target reserves it (`unknown transfer`) loses
+//! the carried state, and the player is in neither zone until it joins
+//! again. What holds is no duplication: the player is never in both zones
+//! and the ticket is single-use. State that must not be lost moves through
+//! a durable record (a fact from the hook driving a saga), never through
+//! `carried`.
 
 use crate::claims::TicketExtensions;
 use crate::zone::TicketClaims;
@@ -29,7 +43,8 @@ pub struct HandoffRequest {
     pub source_zone: String,
     /// Zone the player goes to.
     pub target_zone: String,
-    /// Game state carried along (inventory, buffs, position hint...).
+    /// Game state carried along (a position hint, buffs...): an encoded
+    /// [`Wire`](crate::Wire) value, in the client's custody (module docs).
     pub carried: Vec<u8>,
     /// Source stamp time of the departure (Unix ms): the facts the source
     /// emits while the player leaves carry it, and the target stamps

@@ -1,24 +1,19 @@
-//! [`CellFactSink`]: commit facts as idempotent commands into a
-//! `distributed` [`AggregateCell`].
+//! Helpers for committing facts as idempotent commands into a
+//! `distributed` [`AggregateCell`](distributed::cell_host::AggregateCell)
+//! (the sinks themselves are `CommandFactSink` and `CelldFactSink`):
 //!
-//! For each fact the sink:
-//! 1. takes the principal **only** from [`Fact::principal`] — bound by the
-//!    host from the player's verified ticket — or a configured system
-//!    principal for zone facts; client payloads never supply identity;
-//! 2. builds a trusted server-side [`Session`] (`x-user-id` = principal, plus
-//!    the [`FactStamp`](crate::FactStamp) as `x-game-*` variables so handlers
-//!    can [`stamp_metadata`](crate::stamp_metadata) their events);
-//! 3. derives a deterministic UUIDv7-shaped command id from
-//!    `sha256(service_id ‖ 0x00 ‖ fact key)`, so retries and re-emissions of
-//!    the same key replay through the cell's command ledger instead of
-//!    committing twice;
-//! 4. calls [`AggregateCell::dispatch_idempotent`].
-//!
-//! `InProgress` and `Internal` errors are retryable; everything else is
-//! permanent.
-
-#[cfg(not(target_arch = "wasm32"))]
-use std::sync::Arc;
+//! - the principal comes **only** from [`Fact::principal`] — bound by the
+//!   host from the player's verified ticket — or a system principal for
+//!   zone facts; client payloads never supply identity;
+//! - [`trusted_session`] builds the server-side [`Session`] (`x-user-id` =
+//!   principal, plus the [`FactStamp`](crate::FactStamp) as `x-game-*`
+//!   variables so handlers can [`stamp_metadata`](crate::stamp_metadata)
+//!   their events);
+//! - [`command_id_for`] derives a deterministic UUIDv7-shaped command id
+//!   from `sha256(service_id ‖ 0x00 ‖ fact key)`, so retries and
+//!   re-emissions of the same key replay through the cell's command ledger
+//!   instead of committing twice;
+//! - [`run_fact_batch`] answers a celld object host's fact batch.
 
 use distributed::cell_host::{
     AggregateCell, CausalDispatchError, CellBatchCommand, CellCommandIdentity, CellWaitPathRequest,
@@ -30,41 +25,6 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
 use crate::facts::Fact;
-#[cfg(not(target_arch = "wasm32"))]
-use crate::facts::{BoxFuture, FactError, FactReceipt, FactSink};
-
-/// Fact sink backed by an aggregate cell hosted in the zone server's own
-/// process (native only: on wasm32 a cell is a Durable Object, reached over
-/// the network with [`crate::celld::CelldFactSink`]).
-#[cfg(not(target_arch = "wasm32"))]
-pub struct CellFactSink<A>
-where
-    A: Aggregate + Send + Sync + 'static,
-{
-    cell: Arc<AggregateCell<A>>,
-    service_id: String,
-    system_principal: String,
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-impl<A> CellFactSink<A>
-where
-    A: Aggregate + Send + Sync + 'static,
-{
-    /// Sink dispatching into `cell` under command-ledger `service_id`.
-    /// Zone facts without a player use `system_principal`.
-    pub fn new(
-        cell: Arc<AggregateCell<A>>,
-        service_id: impl Into<String>,
-        system_principal: impl Into<String>,
-    ) -> Self {
-        Self {
-            cell,
-            service_id: service_id.into(),
-            system_principal: system_principal.into(),
-        }
-    }
-}
 
 /// Deterministic UUIDv7-shaped command id for a fact key.
 pub fn command_id_for(service_id: &str, key: &str) -> String {
@@ -225,46 +185,4 @@ fn batch_command(
         input: parsed.input,
         session,
     })
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-fn classify(error: CausalDispatchError) -> FactError {
-    match error {
-        CausalDispatchError::InProgress
-        | CausalDispatchError::ConcurrentWrite
-        | CausalDispatchError::Internal(_) => FactError::Retryable(format!("{error:?}")),
-        other => FactError::Permanent(format!("{}: {other:?}", other.code())),
-    }
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-impl<A> FactSink for CellFactSink<A>
-where
-    A: Aggregate + Send + Sync + 'static,
-{
-    fn commit<'a>(&'a self, fact: &'a Fact) -> BoxFuture<'a, Result<FactReceipt, FactError>> {
-        Box::pin(async move {
-            let principal = fact.principal().unwrap_or(&self.system_principal);
-            let identity = CellCommandIdentity::new(
-                self.service_id.clone(),
-                principal,
-                command_id_for(&self.service_id, fact.key()),
-            )
-            .map_err(|e| FactError::Permanent(format!("{e:?}")))?;
-            let result = self
-                .cell
-                .dispatch_idempotent(
-                    fact.command(),
-                    &identity,
-                    fact.input().clone(),
-                    trusted_session(principal, fact),
-                )
-                .await
-                .map_err(classify)?;
-            Ok(FactReceipt {
-                payload: result.payload().clone(),
-                replayed: result.replayed(),
-            })
-        })
-    }
 }

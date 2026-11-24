@@ -261,6 +261,8 @@ pub struct Rewind {
     config: RewindConfig,
     capacity: usize,
     frames: VecDeque<RewindFrame>,
+    /// The entity buffer of the last frame dropped, for the next one.
+    spare: Vec<Historic>,
 }
 
 impl Rewind {
@@ -273,6 +275,7 @@ impl Rewind {
             capacity: needed.clamp(2, config.max_frames.max(2)),
             config,
             frames: VecDeque::new(),
+            spare: Vec::new(),
         }
     }
 
@@ -289,15 +292,33 @@ impl Rewind {
     /// Store a frame (called by the host after each tick). Entities are
     /// sorted by id; frames must arrive in tick order.
     pub fn record(&mut self, tick: u64, time: Duration, mut entities: Vec<Historic>) {
-        entities.sort_by_key(|e| e.id);
+        // Usually recorded in id order already: then sorting (which may
+        // allocate) is skipped.
+        if !entities.is_sorted_by_key(|e| e.id) {
+            entities.sort_by_key(|e| e.id);
+        }
         if self.frames.len() >= self.capacity {
-            self.frames.pop_front();
+            if let Some(oldest) = self.frames.pop_front() {
+                self.spare = oldest.entities;
+                self.spare.clear();
+            }
         }
         self.frames.push_back(RewindFrame {
             tick,
             time,
             entities,
         });
+    }
+
+    /// An empty frame for the host to fill ([`Zone::record_rewind`]),
+    /// reusing the buffer of the last frame dropped.
+    ///
+    /// [`Zone::record_rewind`]: crate::Zone::record_rewind
+    pub(crate) fn frame(&mut self) -> RewindFrame {
+        RewindFrame {
+            entities: std::mem::take(&mut self.spare),
+            ..RewindFrame::default()
+        }
     }
 
     /// Forget everything (e.g. after a teleport-everything reset).
@@ -411,6 +432,18 @@ impl Rewind {
         })
     }
 
+    /// Entities at `time` by reference, each with its interpolated position
+    /// (as [`at_time`](Self::at_time) places it, without copying it).
+    fn positions_at(&self, time: Duration) -> impl Iterator<Item = (&Historic, Vec3)> {
+        let bracket = self.bracket(time);
+        bracket.into_iter().flat_map(|(a, b, alpha)| {
+            a.entities.iter().map(move |e| match b.get(e.id) {
+                Some(next) if alpha > 0.0 => (e, lerp_pos(e.pos, next.pos, alpha)),
+                _ => (e, e.pos),
+            })
+        })
+    }
+
     fn bracket(&self, time: Duration) -> Option<(&RewindFrame, &RewindFrame, f32)> {
         let first = self.frames.front()?;
         let last = self.frames.back()?;
@@ -438,36 +471,35 @@ impl Rewind {
         query: &HitQuery,
         mut filter: impl FnMut(u32) -> bool,
     ) -> Option<RewindHit> {
-        let entities = self.at_time(time)?;
-        let mut best: Option<RewindHit> = None;
-        for e in entities {
+        let mut best: Option<(u32, f32)> = None;
+        for (e, pos) in self.positions_at(time) {
             if !filter(e.id) {
                 continue;
             }
-            if let Some(distance) = intersect(query, &e) {
-                if best.as_ref().is_none_or(|b| distance < b.distance) {
-                    best = Some(RewindHit {
-                        id: e.id,
-                        distance,
-                        entity: e,
-                    });
+            if let Some(distance) = intersect_at(query, &e.shape, pos) {
+                if best.is_none_or(|(_, d)| distance < d) {
+                    best = Some((e.id, distance));
                 }
             }
         }
-        best
+        let (id, distance) = best?;
+        Some(RewindHit {
+            id,
+            distance,
+            entity: self.entity_at(id, time)?,
+        })
     }
 
     /// Every entity overlapping `query` at `time` (area effects).
     pub fn overlaps(&self, time: Duration, query: &HitQuery) -> Vec<RewindHit> {
         let mut hits: Vec<RewindHit> = self
-            .at_time(time)
-            .unwrap_or_default()
-            .into_iter()
-            .filter_map(|e| {
-                intersect(query, &e).map(|distance| RewindHit {
+            .positions_at(time)
+            .filter_map(|(e, pos)| {
+                let distance = intersect_at(query, &e.shape, pos)?;
+                Some(RewindHit {
                     id: e.id,
                     distance,
-                    entity: e,
+                    entity: self.entity_at(e.id, time)?,
                 })
             })
             .collect();
@@ -497,19 +529,14 @@ impl Rewind {
         colliders: &crate::collide::Colliders,
         accept: impl FnMut(u32) -> bool,
     ) -> Option<crate::collide::RayHit> {
-        let entities = self.at_time(time).unwrap_or_default();
-        crate::collide::raycast(&entities, colliders, ray, accept)
+        crate::collide::raycast(self.positions_at(time), colliders, ray, accept)
     }
 }
 
 fn lerp_entity(a: &Historic, b: &Historic, t: f32) -> Historic {
     Historic {
         id: a.id,
-        pos: [
-            lerp(a.pos[0], b.pos[0], t),
-            lerp(a.pos[1], b.pos[1], t),
-            lerp(a.pos[2], b.pos[2], t),
-        ],
+        pos: lerp_pos(a.pos, b.pos, t),
         shape: a.shape,
         layers: a.layers,
         fields: a
@@ -519,6 +546,10 @@ fn lerp_entity(a: &Historic, b: &Historic, t: f32) -> Historic {
             .map(|(i, v)| b.fields.get(i).map_or(*v, |w| lerp(*v, *w, t)))
             .collect(),
     }
+}
+
+fn lerp_pos(a: Vec3, b: Vec3, t: f32) -> Vec3 {
+    [lerp(a[0], b[0], t), lerp(a[1], b[1], t), lerp(a[2], b[2], t)]
 }
 
 fn lerp(a: f32, b: f32, t: f32) -> f32 {
@@ -607,9 +638,10 @@ fn ray_capsule(ro: Vec3, rd: Vec3, pa: Vec3, pb: Vec3, r: f32) -> Option<f32> {
     best
 }
 
-pub(crate) fn intersect(query: &HitQuery, e: &Historic) -> Option<f32> {
-    let r = e.shape.radius();
-    let (pa, pb) = e.shape.segment(e.pos);
+/// Distance of `query` to a volume of `shape` at `pos` (see [`RewindHit::distance`]).
+pub(crate) fn intersect_at(query: &HitQuery, shape: &Shape, pos: Vec3) -> Option<f32> {
+    let r = shape.radius();
+    let (pa, pb) = shape.segment(pos);
     match *query {
         HitQuery::Segment { from, to } => {
             let d = sub(to, from);

@@ -141,6 +141,23 @@ impl SpatialGrid {
         self.cells.clear();
     }
 
+    /// Empty it for the next patch with cells of `cell_size`: the cells
+    /// occupied since the last reset keep their allocation (the others are
+    /// dropped, so a moving crowd does not grow the map).
+    pub(crate) fn reset(&mut self, cell_size: f32) {
+        let cell = Self::new(cell_size).cell;
+        if cell != self.cell {
+            self.cell = cell;
+            self.cells.clear();
+            return;
+        }
+        self.cells.retain(|_, items| {
+            let occupied = !items.is_empty();
+            items.clear();
+            occupied
+        });
+    }
+
     /// Index an item at (x, y).
     pub fn insert(&mut self, item: u32, x: f32, y: f32) {
         let key = self.key(x, y);

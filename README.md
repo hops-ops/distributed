@@ -845,10 +845,20 @@ recorder (`domain`) lists the values it always sets, in the field grammar of
 fn completed(&mut self) { self.status = TodoStatus::Completed; }
 ```
 
-A command over a flat event declares its preview on the registration, with
+A flat event (`domain = event`) declares the body fields it always carries
+the same way. When each outcome is its own event, the constant belongs to the
+event, and every command that records it gets the preview:
+
+```rust,ignore
+#[event("review.archived", version = 1, domain = event, known(status: "archived"))]
+fn record_archived(&mut self, id: String, status: String) { /* .. */ }
+```
+
+A flat event shared by several outcomes carries no single constant; its
+commands declare their preview on the registration instead, with
 `.applies(event_preview! { ReviewStatusRecorded => ReviewStatusRecorded {
-id: input.id, status: "approved", ..unknown } })`. Both are checked against the
-body's fields when the command is registered. Neither predicts authorization
+id: input.id, status: "approved", ..unknown } })`. All of these are checked
+against the body's fields when the command is registered. Neither predicts authorization
 or guarantees that the event will occur.
 
 Public transitions can delegate to shared decision helpers in the same

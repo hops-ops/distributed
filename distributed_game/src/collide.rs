@@ -863,10 +863,10 @@ impl Colliders {
     }
 }
 
-/// Closest of `entities` (their layers, the ray's ignore, `accept`) and
-/// `colliders`.
-pub(crate) fn raycast(
-    entities: &[Historic],
+/// Closest of `entities`, each at its position (their layers, the ray's
+/// ignore, `accept`), and `colliders`.
+pub(crate) fn raycast<'a>(
+    entities: impl IntoIterator<Item = (&'a Historic, Vec3)>,
     colliders: &Colliders,
     ray: &Ray,
     mut accept: impl FnMut(u32) -> bool,
@@ -876,11 +876,11 @@ pub(crate) fn raycast(
         return best;
     }
     let query = ray.query();
-    for e in entities {
+    for (e, pos) in entities {
         if !ray.meets(e.layers) || ray.ignore == Some(e.id) || !accept(e.id) {
             continue;
         }
-        let Some(distance) = crate::rewind::intersect(&query, e) else {
+        let Some(distance) = crate::rewind::intersect_at(&query, &e.shape, pos) else {
             continue;
         };
         if best.is_none_or(|b| distance < b.distance) {
@@ -889,17 +889,17 @@ pub(crate) fn raycast(
                 target: Target::Entity(e.id),
                 distance,
                 point,
-                normal: entity_normal(e, point, ray.dir),
+                normal: entity_normal(e, pos, point, ray.dir),
             });
         }
     }
     best
 }
 
-/// Outward normal of an entity's volume at `point` (back along `dir` when
-/// the point is on its axis).
-fn entity_normal(e: &Historic, point: Vec3, dir: Vec3) -> Vec3 {
-    let (pa, pb) = e.shape.segment(e.pos);
+/// Outward normal of an entity's volume at `pos` at `point` (back along
+/// `dir` when the point is on its axis).
+fn entity_normal(e: &Historic, pos: Vec3, point: Vec3, dir: Vec3) -> Vec3 {
+    let (pa, pb) = e.shape.segment(pos);
     let axis = crate::rewind::closest_on_segment(point, pa, pb);
     unit_or(sub(point, axis), scale(dir, -1.0))
 }
@@ -1038,6 +1038,16 @@ fn ray_wedge(ro: Vec3, rd: Vec3, lo: Vec3, hi: Vec3, top: (Vec3, f32)) -> Option
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// [`super::raycast`] with each entity at its own position.
+    fn raycast(
+        entities: &[Historic],
+        colliders: &Colliders,
+        ray: &Ray,
+        accept: impl FnMut(u32) -> bool,
+    ) -> Option<RayHit> {
+        super::raycast(entities.iter().map(|e| (e, e.pos)), colliders, ray, accept)
+    }
 
     fn close(a: f32, b: f32) -> bool {
         (a - b).abs() < 1e-4

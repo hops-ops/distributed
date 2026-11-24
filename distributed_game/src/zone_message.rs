@@ -17,8 +17,12 @@
 //! an id it has seen recently (at most once per activation; at-least-once
 //! transports may resend). On celld the object posts envelopes to the
 //! target's object with the internal secret (like a cell's push), never on
-//! a public route. A message for a zone that is not running is refused: it
-//! never wakes a zone. Delivery is best effort; a protocol that must not
+//! a public route. On the native `net` server the zone task hands each to
+//! the target's queue when it runs on the same server, or posts it to the
+//! host the directory places it on (`/admin/zone-envelope`, internal
+//! secret). A message for a zone that is not running is refused: it
+//! never wakes a zone. Delivery is best effort and unordered on both: a
+//! refused or failed message is dropped, never retried. A protocol that must not
 //! lose state (a mob crossing over) needs its own acks and timeouts:
 //! [`lease`](crate::lease) keeps them for an entity lent to another zone.
 //!

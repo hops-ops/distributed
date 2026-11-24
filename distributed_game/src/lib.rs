@@ -6,8 +6,9 @@
 //! - Determinism: injectable [`Clock`] and per-zone seeded [`ZoneRng`].
 //! - Durable outcomes: zones emit [`Fact`]s during a tick; a [`FactSink`]
 //!   commits them asynchronously and settlements come back on later ticks.
-//!   With the `cell` feature, [`cell::CellFactSink`] dispatches them into a
-//!   `distributed` `AggregateCell` idempotently with a server-built Session.
+//!   The `cell` feature has the helpers that dispatch them into a
+//!   `distributed` `AggregateCell` idempotently with a server-built Session
+//!   ([`cell`]).
 //! - Replication: an [`EntitySchema`] shipped in Welcome, per-client deltas
 //!   against last-sent state, spatial interest and a byte budget with
 //!   priority accumulation. Wire format: [`protocol`] / `PROTOCOL.md`.
@@ -110,6 +111,9 @@ pub mod world;
 pub mod zone;
 pub mod zone_message;
 
+#[cfg(test)]
+mod test_zone;
+
 pub use authoring::{GameEvent, GameInput, Pushed, Replicated};
 pub use claims::{ExtensionError, ExtensionSchema, TicketExtension, TicketExtensions};
 pub use clock::{Clock, ManualClock, SystemClock};
@@ -129,14 +133,17 @@ pub use facts::{
 };
 pub use handoff::{HandoffError, HandoffRequest, Transfer};
 pub use lease::{Held, LeaseTimings, Lent, TransferId, TransferIds};
-pub use host::{AdvanceReport, Ctx, FrameStats, HostConfig, JoinError, Joined, Outbound, ZoneHost};
+pub use host::{
+    AdvanceReport, Ctx, FrameStats, HostConfig, JoinError, Joined, Outbound, Outcome, Stimulus,
+    ZoneHost,
+};
 pub use inbox::{Delivered, NoMessages, ZoneInbound};
 pub use input::{ConsumePolicy, InputBuffer, InputCredits, PushOutcome, SequencedInput};
 pub use interest::{InterestConfig, UpdateRates, View};
 pub use prediction::{PredictContext, PredictStep};
 pub use protocol::{ClientMessage, ClientMirror, Origin, Role, ServerMessage, PROTOCOL_VERSION};
 pub use pure::GamePure;
-pub use replay::{replay, Recorder, Recording};
+pub use replay::{replay, Recording};
 pub use replication::{EntityState, WorldView};
 pub use rewind::{Historic, HitQuery, Rewind, RewindConfig, RewindFrame, ShotTiming};
 pub use rng::{Fnv64, ZoneRng};

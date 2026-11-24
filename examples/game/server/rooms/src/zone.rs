@@ -47,16 +47,15 @@
 //! join after the room slept, or after celld restarted, resumes there
 //! instead of at a spawn point. Nothing is written per tick.
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap};
 use std::time::Duration;
 
 use distributed_game::collide::{bounce, Colliders, Ray};
 use distributed_game::rewind::{Historic, RewindFrame, ShotTiming};
 use distributed_game::{
-    schema, ConsumePolicy, Ctx, EmitError, Entities, Entity, EntityId, EntitySchema, Fact,
-    FactOutcome, FactSettlement, GameEvent, GameInput, GameRecord, GameSurface, LeaveReason,
-    ObserverId, Origin, PlayerId, Project, Replicated, TransferIds, VerifiedPrincipal, View, Zone,
-    ZoneSender,
+    schema, ConsumePolicy, Ctx, Entities, Entity, EntityId, EntitySchema, FactOutcome,
+    FactSettlement, GameEvent, GameInput, GameRecord, GameSurface, LeaveReason, ObserverId, Origin,
+    PlayerId, Project, Replicated, TransferIds, VerifiedPrincipal, View, Zone, ZoneSender,
 };
 use game_sim::arena::{self as movement, PLAYER_RADIUS};
 use game_sim::mobpit::PitState as MoveState;
@@ -1001,9 +1000,11 @@ pub struct MobPit {
     players: BTreeMap<PlayerId, Player>,
     mobs: Vec<Mob>,
     pillars: Vec<Pillar>,
+    /// Kills emitted and not settled yet (some may still wait in the
+    /// host's fact backlog).
     pending: HashMap<String, PendingKill>,
-    /// Facts refused by backpressure, retried each tick (oldest first).
-    backlog: VecDeque<(Killer, Fact, f32, f32)>,
+    /// Facts waiting in the host's backlog at the last tick (the HUD).
+    facts_queued: usize,
     last_tick: Option<Duration>,
     tick_ms: f32,
     tick_max_ms: f32,
@@ -1091,41 +1092,6 @@ fn step_toward(x: &mut f32, y: &mut f32, tx: f32, ty: f32, stride: f32) -> f32 {
 
 fn dist(a: (f32, f32), b: (f32, f32)) -> f32 {
     ((a.0 - b.0).powi(2) + (a.1 - b.1).powi(2)).sqrt()
-}
-
-/// Carried through a doorway: the player's [`MoveState`] in the
-/// neighbour's frame (x y vx vy z vz as f32 LE, dash, cd): a jump carries on.
-fn encode_carried(s: &MoveState) -> Vec<u8> {
-    let mut out = Vec::with_capacity(29);
-    for v in [s.x, s.y, s.vx, s.vy, s.z, s.vz] {
-        out.extend_from_slice(&v.to_le_bytes());
-    }
-    out.extend_from_slice(&[s.dash, s.cd, s.air, s.buf, u8::from(s.held)]);
-    out
-}
-
-/// Inverse of [`encode_carried`]; None unless it is a place a player can be.
-fn decode_carried(bytes: &[u8]) -> Option<MoveState> {
-    // 26 bytes: from a room before coyote time and the jump buffer.
-    if bytes.len() != 29 && bytes.len() != 26 {
-        return None;
-    }
-    let tail = |i: usize| bytes.get(i).copied().unwrap_or(0);
-    let f = |i: usize| f32::from_le_bytes(bytes[i * 4..i * 4 + 4].try_into().expect("4 bytes"));
-    let state = MoveState {
-        x: f(0),
-        y: f(1),
-        vx: f(2),
-        vy: f(3),
-        z: f(4),
-        vz: f(5),
-        dash: bytes[24],
-        cd: bytes[25],
-        air: tail(26),
-        buf: tail(27).min(rooms::JUMP_BUFFER),
-        held: tail(28) != 0,
-    };
-    admissible(&state).then(|| rooms::canonicalize(state))
 }
 
 impl MobPit {
@@ -1228,7 +1194,7 @@ impl MobPit {
         };
         let key = fact.key().to_string();
         ctx.broadcast(&PitEvent::Kill {
-            key,
+            key: key.clone(),
             mob: id,
             tier,
             x,
@@ -1236,8 +1202,34 @@ impl MobPit {
             killer: killer_id,
             killer_name: name.clone(),
         });
-        self.backlog.push_back((killer, fact, x, y));
-        self.flush_backlog(ctx);
+        // Through the host's backlog: never refused for backpressure.
+        let (queued, principal) = match &killer {
+            Killer::Here(player) => (
+                ctx.queue_fact_for(*player, fact),
+                self.players
+                    .get(player)
+                    .map(|p| p.principal.clone())
+                    .unwrap_or_default(),
+            ),
+            Killer::Next { principal, .. } => (
+                ctx.queue_fact_as(principal, fact),
+                principal.as_str().to_string(),
+            ),
+        };
+        // Refused only when the killer left first or the room has no sink:
+        // nothing durable to wait for.
+        if queued.is_ok() {
+            let emitted = ctx.now();
+            self.pending.insert(
+                key,
+                PendingKill {
+                    principal,
+                    x,
+                    y,
+                    emitted,
+                },
+            );
+        }
         if tier == BOSS_TIER {
             self.boss_fell(ctx, generation, name);
         }
@@ -1285,47 +1277,6 @@ impl MobPit {
             hood_tier: self.world.hood_tier,
         });
         ctx.broadcast(&PitEvent::World(self.world.clone()));
-    }
-
-    /// Hand queued facts to the host; never blocks. Backpressure keeps the
-    /// rest for the next tick.
-    fn flush_backlog(&mut self, ctx: &mut Ctx<'_, Self>) {
-        while let Some((killer, fact, x, y)) = self.backlog.pop_front() {
-            let key = fact.key().to_string();
-            let (emitted, principal) = match &killer {
-                Killer::Here(player) => (
-                    ctx.emit_fact_for(*player, fact.clone()),
-                    self.players
-                        .get(player)
-                        .map(|p| p.principal.clone())
-                        .unwrap_or_default(),
-                ),
-                Killer::Next { principal, .. } => (
-                    ctx.emit_fact_as(principal, fact.clone()),
-                    principal.as_str().to_string(),
-                ),
-            };
-            match emitted {
-                Ok(()) => {
-                    self.pending.insert(
-                        key,
-                        PendingKill {
-                            principal,
-                            x,
-                            y,
-                            emitted: ctx.now(),
-                        },
-                    );
-                }
-                Err(EmitError::Backpressure) => {
-                    self.backlog.push_front((killer, fact, x, y));
-                    return;
-                }
-                // The killer left before the fact could be queued, or the key
-                // is already in flight: nothing durable to do.
-                Err(_) => {}
-            }
-        }
     }
 
     fn step_players(&mut self, ctx: &mut Ctx<'_, Self>) -> Vec<(PlayerId, f32, f32, f32)> {
@@ -1474,7 +1425,9 @@ impl MobPit {
             // passes into the entrance, which reloads it.
             let held = ctx.is_stale(player) && target != GATE_ROOM;
             let p = self.players.get_mut(&player).expect("player");
-            let carried = encode_carried(&into_neighbour((dx, dy), p.state));
+            // Carried through the doorway: the player's state in the
+            // neighbour's frame (a jump carries on).
+            let carried = into_neighbour((dx, dy), p.state);
             if held && !p.told_stale {
                 p.told_stale = true;
                 ctx.send(
@@ -1487,7 +1440,7 @@ impl MobPit {
             }
             if !held
                 && parse_room(&target).is_some()
-                && ctx.handoff(player, &target, carried).is_ok()
+                && ctx.handoff(player, &target, &carried).is_ok()
             {
                 p.leaving = true;
                 // Mobs chasing it may follow it across.
@@ -2038,7 +1991,7 @@ impl Zone for MobPit {
             transfers: TransferIds::default(),
             open: game_sim::mobpit::open_sides(room.seed, room.room),
             pending: HashMap::new(),
-            backlog: VecDeque::new(),
+            facts_queued: 0,
             last_tick: None,
             tick_ms: 0.0,
             tick_max_ms: 0.0,
@@ -2104,7 +2057,18 @@ impl Zone for MobPit {
         _from_zone: &str,
         carried: Vec<u8>,
     ) {
-        let at = decode_carried(&carried).unwrap_or_else(|| spawn_state(player));
+        // A place a player can be, or a spawn point: the bytes crossed the
+        // client.
+        let at = distributed_game::codec::from_bytes::<MoveState>(&carried)
+            .ok()
+            .filter(admissible)
+            .map(|s| {
+                rooms::canonicalize(MoveState {
+                    buf: s.buf.min(rooms::JUMP_BUFFER),
+                    ..s
+                })
+            })
+            .unwrap_or_else(|| spawn_state(player));
         // Still here inside its reconnect grace (a doorway bounce): replace.
         let hp = self.players.remove(&player).map_or(PLAYER_HP, |p| p.hp);
         if let Some(principal) = ctx.player(player).map(|p| p.principal.clone()) {
@@ -2186,7 +2150,7 @@ impl Zone for MobPit {
         self.step_mobs(ctx);
         self.walk_through_doorways(ctx);
         self.keep_crossings(ctx);
-        self.flush_backlog(ctx);
+        self.facts_queued = ctx.facts_queued();
     }
 
     fn on_zone_message(&mut self, ctx: &mut Ctx<'_, Self>, from: &ZoneSender, message: PitMessage) {
@@ -2389,8 +2353,7 @@ impl Zone for MobPit {
     fn has_pending_work(&self) -> bool {
         // A crossing in flight (a mob following, away or visiting) keeps the
         // room ticking: beats, leases and graces run on its clock.
-        !self.backlog.is_empty()
-            || !self.departed.is_empty()
+        !self.departed.is_empty()
             || self
                 .mobs
                 .iter()
@@ -2545,7 +2508,7 @@ impl Project<PitView> for MobPit {
             PitViewRest {
                 pending: clamp16(self.pending.len()),
                 committed: self.committed,
-                backlog: clamp16(self.backlog.len()),
+                backlog: clamp16(self.facts_queued),
                 tick_ms: self.tick_ms,
                 tick_max_ms: self.tick_max_ms,
                 kills: self.kills,
@@ -2557,7 +2520,7 @@ impl Project<PitView> for MobPit {
 /// Room numbers for tests and tooling.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PitStats {
-    /// Facts emitted and not yet settled (incl. backpressure backlog).
+    /// Facts emitted and not yet settled (incl. the host's backlog).
     pub pending: usize,
     /// Tick interval EMA (ms).
     pub tick_ms: f32,
@@ -2584,7 +2547,7 @@ impl MobPit {
 
     pub fn stats(&self) -> PitStats {
         PitStats {
-            pending: self.pending.len() + self.backlog.len(),
+            pending: self.pending.len(),
             tick_ms: self.tick_ms,
             tick_max_ms: self.tick_max_ms,
             committed: self.committed,
