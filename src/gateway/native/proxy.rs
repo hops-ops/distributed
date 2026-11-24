@@ -2,9 +2,10 @@ use super::{
     response, BackendCredential, Body, Forwarding, HeaderMap, HeaderValue, NativeInner, Request,
     RequestContext, Response, StatusCode, Url,
 };
+use crate::gateway::{append_hop, HOPS_HEADER};
 use axum::http::header;
 use futures_util::{Stream, StreamExt};
-use std::{io, time::Duration};
+use std::io;
 
 pub(super) fn strip_hop_headers(headers: &mut HeaderMap) {
     let named: Vec<_> = headers
@@ -203,17 +204,7 @@ pub(super) async fn forward_with_permit(
         headers.insert(header::CONNECTION, HeaderValue::from_static("upgrade"));
         headers.insert(header::UPGRADE, HeaderValue::from_static("websocket"));
         let lifetime =
-            context
-                .identity()
-                .map_or(inner.options.limits.upgrade_lifetime, |identity| {
-                    inner
-                        .options
-                        .limits
-                        .upgrade_lifetime
-                        .min(Duration::from_secs(
-                            identity.expires_at().saturating_sub(super::now()),
-                        ))
-                });
+            context.connection_lifetime(inner.options.limits.upgrade_lifetime, super::now());
         tokio::spawn(async move {
             let _permit = permit;
             let _ = tokio::time::timeout(lifetime, async move {
@@ -244,20 +235,18 @@ pub(super) async fn forward_with_permit(
     result
 }
 
+/// Write this gateway onto the hop chain; a loop or over-long chain fails.
 pub(super) fn add_hop(headers: &mut HeaderMap, inner: &NativeInner) -> Result<(), ()> {
-    let hops = headers
-        .get("x-distributed-gateway-hops")
-        .and_then(|v| v.to_str().ok())
-        .map_or_else(
-            || inner.hop_id.clone(),
-            |previous| format!("{previous},{}", inner.hop_id),
-        );
-    if hops.len() > 512 {
-        return Err(());
-    }
-    headers.insert(
-        "x-distributed-gateway-hops",
-        HeaderValue::from_str(&hops).map_err(|_| ())?,
-    );
+    let hops = hop_chain(headers, &inner.hop_id)?;
+    headers.insert(HOPS_HEADER, HeaderValue::from_str(&hops).map_err(|_| ())?);
     Ok(())
+}
+/// The chain after this gateway. A non-text incoming chain fails closed.
+pub(super) fn hop_chain(headers: &HeaderMap, hop_id: &str) -> Result<String, ()> {
+    let previous = headers
+        .get(HOPS_HEADER)
+        .map(|value| value.to_str())
+        .transpose()
+        .map_err(|_| ())?;
+    append_hop(previous, hop_id).map_err(|_| ())
 }

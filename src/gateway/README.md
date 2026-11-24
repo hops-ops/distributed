@@ -50,9 +50,17 @@ exhaustion returns 503. Response bytes stream without a whole-body buffer;
 dropping the body releases capacity and cancels its upstream stream. WebSocket
 upgrades require an explicit target opt-in and close on disconnect, identity
 expiry or configured lifetime. Exact public-origin loops fail construction;
-a bounded hop chain also detects loops through aliases at runtime.
+a bounded hop chain also detects loops through aliases at runtime. Both
+adapters apply one rule (`append_hop`): a request whose
+`x-distributed-gateway-hops` chain already names this gateway, already holds
+`MAX_HOPS` (8) entries, or would exceed `MAX_HOPS_BYTES` (1024) returns 508.
 
-`BindingKind::Zones` (`NativeBinding::Zones`) routes a prefix such as
+Credentials fail closed on both adapters (`Credentials::from_fields`): more
+than one Authorization field, or a comma in one (how Fetch runtimes fold
+repeated fields), is unauthorized, as is a credential over
+`MAX_CREDENTIAL_BYTES`. Multiple Cookie fields are joined with `; `.
+
+`BindingKind::Zones` (`NativeBinding::Zones`, `WorkerBinding::Zones`) routes a prefix such as
 `/zones` to a zone host, e.g. celld's public listener. The path is forwarded
 unchanged and WebSocket upgrades are always allowed; zones verify their own
 join tickets, so the gateway forwards no credential. Mount it on the zone

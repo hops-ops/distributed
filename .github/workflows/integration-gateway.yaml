@@ -115,9 +115,11 @@ jobs:
       - name: Verify embedded and remote GraphQL protocols
         run: cargo test -p distributed --no-default-features --features gateway-graphql-native,sqlite --test gateway_graphql --test gateway_graphql_operation --test graphql_causal_transport --test graphql_query_protocol --test graphql_identity --test graphql_sqlite --test sqlite_repository
 
-      - name: Verify shared query cancellation, expiry and deadlines
+      - name: Verify the portable delivery state machines and WS codec
+        run: cargo test -p distributed --no-default-features --features gateway --lib gateway::
+      - name: Verify native query cancellation, expiry and deadlines
         run: cargo test -p distributed --no-default-features --features gateway-graphql-native,sqlite --lib gateway::native::flight::tests
-      - name: Verify shared live replay, expiry, backpressure and teardown
+      - name: Verify native live driver teardown and reset delivery
         run: cargo test -p distributed --no-default-features --features gateway-graphql-native,sqlite --lib gateway::native::live::tests
       - name: Verify transactional cache coverage and Atomic rollback
         run: |

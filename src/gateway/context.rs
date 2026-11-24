@@ -1,5 +1,8 @@
-use super::GatewayError;
-use std::fmt;
+use super::{AuthError, GatewayError};
+use std::{fmt, time::Duration};
+
+/// Most Authorization plus Cookie bytes a request may carry.
+pub const MAX_CREDENTIAL_BYTES: usize = 32 * 1024;
 
 /// Credentials received from a client. Possession is not authentication.
 /// Providers must reject invalid credentials even on otherwise public routes.
@@ -9,6 +12,31 @@ pub struct Credentials {
     pub authorization: Option<String>,
     /// Raw Cookie value, for a configured session provider only.
     pub cookie: Option<String>,
+}
+
+impl Credentials {
+    /// Credentials from a request's Authorization and Cookie field values,
+    /// in order. Fails closed on more than one Authorization field and on a
+    /// comma inside one: a runtime that folds repeated fields into one value
+    /// (the Fetch `Headers` API) cannot otherwise tell a duplicate apart, and
+    /// no bearer token contains a comma. Credential material over
+    /// [`MAX_CREDENTIAL_BYTES`] is refused too.
+    pub fn from_fields(authorization: &[&str], cookies: &[&str]) -> Result<Self, AuthError> {
+        let authorization = match authorization {
+            [] => None,
+            [value] if !value.contains(',') => Some(*value),
+            _ => return Err(AuthError::Unauthorized),
+        };
+        if authorization.map_or(0, str::len) + cookies.iter().map(|v| v.len()).sum::<usize>()
+            > MAX_CREDENTIAL_BYTES
+        {
+            return Err(AuthError::Unauthorized);
+        }
+        Ok(Self {
+            authorization: authorization.map(str::to_owned),
+            cookie: (!cookies.is_empty()).then(|| cookies.join("; ")),
+        })
+    }
 }
 
 impl fmt::Debug for Credentials {
@@ -142,5 +170,66 @@ impl RequestContext {
     /// Explicit downstream credential, never derived from asserted headers.
     pub fn backend_credential(&self) -> &BackendCredential {
         &self.backend
+    }
+    /// How long an upgraded connection admitted under this context may live:
+    /// the configured `limit`, ended earlier by identity expiry (`now` is
+    /// Unix seconds).
+    pub fn connection_lifetime(&self, limit: Duration, now: u64) -> Duration {
+        self.identity.as_ref().map_or(limit, |identity| {
+            limit.min(Duration::from_secs(
+                identity.expires_at().saturating_sub(now),
+            ))
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn one_authorization_field_without_a_comma_is_accepted() {
+        let credentials = Credentials::from_fields(&["Bearer a.b.c"], &["a=1", "b=2"]).unwrap();
+        assert_eq!(credentials.authorization.as_deref(), Some("Bearer a.b.c"));
+        assert_eq!(credentials.cookie.as_deref(), Some("a=1; b=2"));
+        let empty = Credentials::from_fields(&[], &[]).unwrap();
+        assert!(empty.authorization.is_none() && empty.cookie.is_none());
+    }
+
+    #[test]
+    fn duplicate_or_folded_authorization_fails_closed() {
+        // Native sees two fields; a Fetch runtime sees them folded with ", ".
+        assert_eq!(
+            Credentials::from_fields(&["Bearer a", "Bearer b"], &[]).unwrap_err(),
+            AuthError::Unauthorized
+        );
+        assert_eq!(
+            Credentials::from_fields(&["Bearer a, Bearer b"], &[]).unwrap_err(),
+            AuthError::Unauthorized
+        );
+        let oversized = "c".repeat(MAX_CREDENTIAL_BYTES);
+        assert_eq!(
+            Credentials::from_fields(&["Bearer a"], &[&oversized]).unwrap_err(),
+            AuthError::Unauthorized
+        );
+    }
+
+    #[test]
+    fn connections_end_at_the_limit_or_identity_expiry() {
+        let limit = Duration::from_secs(3600);
+        let anonymous = RequestContext::from_provider(None, "r", BackendCredential::None).unwrap();
+        assert_eq!(anonymous.connection_lifetime(limit, 100), limit);
+        let identity = Identity::verified("issuer", "alice", Vec::new(), 160).unwrap();
+        let context =
+            RequestContext::from_provider(Some(identity), "r", BackendCredential::None).unwrap();
+        assert_eq!(
+            context.connection_lifetime(limit, 100),
+            Duration::from_secs(60)
+        );
+        assert_eq!(context.connection_lifetime(limit, 200), Duration::ZERO);
+        assert_eq!(
+            context.connection_lifetime(Duration::from_secs(10), 100),
+            Duration::from_secs(10)
+        );
     }
 }

@@ -3,14 +3,18 @@ use super::{
     live::{LiveSource, LiveSourceFactory},
     proxy, NativeDelivery, NativeInner, RequestContext,
 };
-use crate::gateway::{BindingKind, Forwarding, GraphqlCapabilities, GraphqlExecutor};
+use crate::gateway::{
+    delivery::{mark_connection, FreshnessContext, LiveEnd},
+    graphql::ws::{self, ClientFrame, Operations, ServerFrame, WsProtocol},
+    BindingKind, Forwarding, GraphqlCapabilities, GraphqlExecutor,
+};
 use axum::{
     body::Bytes,
     extract::ws::{Message, WebSocket},
     http::{header, request::Parts, HeaderMap, HeaderValue, Method},
 };
 use futures_util::{FutureExt, SinkExt, StreamExt};
-use std::{collections::BTreeMap, sync::Arc, time::Duration};
+use std::{sync::Arc, time::Duration};
 use tokio::sync::{mpsc, watch};
 use tokio_tungstenite::{
     tungstenite::{protocol::Role, Message as Upstream},
@@ -51,22 +55,57 @@ impl Execution {
             let headers = headers.clone();
             let init = init.clone();
             async move {
-            match &execution.binding {
-                GraphqlBinding::Embedded(embedded)=>{
-                    let engine=embedded.engine.as_ref().ok_or_else(||"custom embedded live source is not eligible".to_owned())?;
-                    let (session,principal)=crate::graphql::http::resolve_ws_identity(engine,&headers,&init).await.map_err(|_|"unauthorized".to_owned())?.into_parts();
-                    let mut request:async_graphql::Request=serde_json::from_value(request).map_err(|_|"invalid live request".to_owned())?;
-                    if let Some(principal)=principal {request=request.data(principal);}
-                    Ok(engine.execute_stream(&session,request).map(|response|serde_json::to_value(response).map_err(|_|"invalid origin envelope".into())).boxed())
-                }
-                GraphqlBinding::Remote(remote)=>{
-                    let GraphqlExecutor::Remote{origin}=execution.executor() else {return Err("invalid origin binding".into())};
-                    let mut socket=connect(&execution.inner,origin,remote,&execution.context,headers,&init).await?;
-                    socket.send(Upstream::Text(serde_json::json!({"id":"upstream","type":"subscribe","payload":request}).to_string().into())).await.map_err(|_|"upstream subscribe failed")?;
-                    Ok(origin_stream(socket))
+                match &execution.binding {
+                    GraphqlBinding::Embedded(embedded) => {
+                        let engine = embedded.engine.as_ref().ok_or_else(|| {
+                            "custom embedded live source is not eligible".to_owned()
+                        })?;
+                        let (session, principal) =
+                            crate::graphql::http::resolve_ws_identity(engine, &headers, &init)
+                                .await
+                                .map_err(|_| "unauthorized".to_owned())?
+                                .into_parts();
+                        let mut request: async_graphql::Request =
+                            serde_json::from_value(request)
+                                .map_err(|_| "invalid live request".to_owned())?;
+                        if let Some(principal) = principal {
+                            request = request.data(principal);
+                        }
+                        Ok(engine
+                            .execute_stream(&session, request)
+                            .map(|response| {
+                                serde_json::to_value(response)
+                                    .map_err(|_| "invalid origin envelope".into())
+                            })
+                            .boxed())
+                    }
+                    GraphqlBinding::Remote(remote) => {
+                        let GraphqlExecutor::Remote { origin } = execution.executor() else {
+                            return Err("invalid origin binding".into());
+                        };
+                        let mut socket = connect(
+                            &execution.inner,
+                            origin,
+                            remote,
+                            &execution.context,
+                            headers,
+                            &init,
+                        )
+                        .await?;
+                        let subscribe =
+                            WsProtocol::TransportWs.encode_client(&ClientFrame::Subscribe {
+                                id: UPSTREAM.into(),
+                                payload: request,
+                            });
+                        socket
+                            .send(Upstream::Text(subscribe.to_string().into()))
+                            .await
+                            .map_err(|_| "upstream subscribe failed")?;
+                        Ok(origin_stream(socket))
+                    }
                 }
             }
-        }.boxed()
+            .boxed()
         })
     }
 }
@@ -106,7 +145,7 @@ async fn connect(
     .map_err(|_| "upstream handshake timed out")?
     .map_err(|_| "upstream handshake failed")?;
     if response.status() == axum::http::StatusCode::UNAUTHORIZED {
-        return Err("AUTH_EXPIRED".into());
+        return Err(LiveEnd::AuthExpired.code().into());
     }
     if response.status() != axum::http::StatusCode::SWITCHING_PROTOCOLS
         || response
@@ -138,25 +177,20 @@ async fn connect(
         ),
     )
     .await;
+    let init = WsProtocol::TransportWs.encode_client(&ClientFrame::Init(init.clone()));
     socket
-        .send(Upstream::Text(
-            serde_json::json!({"type":"connection_init","payload":init})
-                .to_string()
-                .into(),
-        ))
+        .send(Upstream::Text(init.to_string().into()))
         .await
         .map_err(|_| "upstream init failed")?;
     tokio::time::timeout(inner.options.limits.response_header_timeout, async {
         loop {
             match socket.next().await {
                 Some(Ok(Upstream::Text(text))) => {
-                    let value: serde_json::Value =
-                        serde_json::from_str(&text).map_err(|_| "invalid upstream init")?;
-                    if value["type"] == "connection_ack" {
-                        return Ok(());
-                    }
-                    if value["type"] == "connection_error" {
-                        return Err("AUTH_EXPIRED");
+                    let value = serde_json::from_str(&text).map_err(|_| "invalid upstream init")?;
+                    match ws::decode_server(value) {
+                        ServerFrame::Ack => return Ok(()),
+                        ServerFrame::ConnectionError => return Err(LiveEnd::AuthExpired.code()),
+                        _ => {}
                     }
                 }
                 Some(Ok(Upstream::Ping(data))) => {
@@ -165,7 +199,7 @@ async fn connect(
                         .await
                         .map_err(|_| "upstream ping failed")?;
                 }
-                _ => return Err("AUTH_EXPIRED"),
+                _ => return Err(LiveEnd::AuthExpired.code()),
             }
         }
     })
@@ -178,26 +212,20 @@ fn origin_stream(socket: OriginSocket) -> LiveSource {
         loop {
             match socket.next().await {
                 Some(Ok(Upstream::Text(text))) => {
-                    let value = match serde_json::from_str::<serde_json::Value>(&text) {
-                        Ok(value) => value,
-                        Err(_) => return Some((Err("invalid upstream frame".into()), socket)),
+                    let Ok(value) = serde_json::from_str(&text) else {
+                        return Some((Err("invalid upstream frame".into()), socket));
                     };
-                    match value["type"].as_str() {
-                        Some("next") if value["id"] == "upstream" => {
-                            return Some((Ok(value["payload"].clone()), socket))
+                    match ws::decode_server(value) {
+                        ServerFrame::Next { id, payload } if id == UPSTREAM => {
+                            return Some((Ok(payload), socket))
                         }
-                        Some("complete") if value["id"] == "upstream" => return None,
-                        Some("error") => {
+                        ServerFrame::Complete { id } if id == UPSTREAM => return None,
+                        ServerFrame::Error { .. } => {
                             return Some((Err("upstream operation failed".into()), socket))
                         }
-                        Some("ping") => {
-                            let _ = socket
-                                .send(Upstream::Text(
-                                    serde_json::json!({"type":"pong","payload":value["payload"]})
-                                        .to_string()
-                                        .into(),
-                                ))
-                                .await;
+                        ServerFrame::Ping(payload) => {
+                            let pong = ws::pong(payload).to_string();
+                            let _ = socket.send(Upstream::Text(pong.into())).await;
                         }
                         _ => {}
                     }
@@ -218,6 +246,8 @@ fn origin_stream(socket: OriginSocket) -> LiveSource {
     })
     .boxed()
 }
+/// Operation id of the gateway's own single upstream subscription.
+const UPSTREAM: &str = "upstream";
 
 pub(super) async fn remote(
     mut client: WebSocket,
@@ -225,10 +255,11 @@ pub(super) async fn remote(
     execution: Execution,
     parts: Parts,
     coordinator: Arc<NativeDelivery>,
-    protocol: &'static str,
+    protocol: WsProtocol,
 ) {
     let init = match initial_message(
         &mut client,
+        protocol,
         execution.inner.options.limits.response_header_timeout,
     )
     .await
@@ -236,12 +267,9 @@ pub(super) async fn remote(
         Some(init) => init,
         None => return,
     };
+    let frame = protocol.encode_client(&ClientFrame::Init(init.clone()));
     if origin
-        .send(Upstream::Text(
-            serde_json::json!({"type":"connection_init","payload":init})
-                .to_string()
-                .into(),
-        ))
+        .send(Upstream::Text(frame.to_string().into()))
         .await
         .is_err()
     {
@@ -253,13 +281,13 @@ pub(super) async fn remote(
             loop {
                 match origin.next().await {
                     Some(Ok(Upstream::Text(text))) => {
-                        let value: serde_json::Value = serde_json::from_str(&text).ok()?;
-                        if value["type"] == "connection_ack" {
-                            return Some(text.to_string());
-                        }
-                        if value["type"] == "connection_error" {
-                            let _ = client.send(Message::Text(text.to_string().into())).await;
-                            return None;
+                        match ws::decode_server(serde_json::from_str(&text).ok()?) {
+                            ServerFrame::Ack => return Some(text.to_string()),
+                            ServerFrame::ConnectionError => {
+                                let _ = client.send(Message::Text(text.to_string().into())).await;
+                                return None;
+                            }
+                            _ => {}
                         }
                     }
                     Some(Ok(Upstream::Ping(data))) => {
@@ -302,10 +330,11 @@ pub(super) async fn embedded(
     execution: Execution,
     parts: Parts,
     coordinator: Arc<NativeDelivery>,
-    protocol: &'static str,
+    protocol: WsProtocol,
 ) {
     let init = match initial_message(
         &mut client,
+        protocol,
         execution.inner.options.limits.response_header_timeout,
     )
     .await
@@ -329,11 +358,7 @@ pub(super) async fn embedded(
         return;
     }
     if client
-        .send(Message::Text(
-            serde_json::json!({"type":"connection_ack"})
-                .to_string()
-                .into(),
-        ))
+        .send(Message::Text(ws::connection_ack().to_string().into()))
         .await
         .is_err()
     {
@@ -341,7 +366,11 @@ pub(super) async fn embedded(
     }
     client_loop(client, execution, parts, coordinator, protocol, init).await;
 }
-async fn initial_message(client: &mut WebSocket, timeout: Duration) -> Option<serde_json::Value> {
+async fn initial_message(
+    client: &mut WebSocket,
+    protocol: WsProtocol,
+    timeout: Duration,
+) -> Option<serde_json::Value> {
     let message = tokio::time::timeout(timeout, client.recv())
         .await
         .ok()??
@@ -349,16 +378,13 @@ async fn initial_message(client: &mut WebSocket, timeout: Duration) -> Option<se
     let Message::Text(text) = message else {
         return None;
     };
-    if text.len() > 65536 {
+    if text.len() > ws::MAX_INIT_BYTES {
         return None;
     }
-    let value: serde_json::Value = serde_json::from_str(&text).ok()?;
-    (value["type"] == "connection_init").then(|| {
-        value
-            .get("payload")
-            .cloned()
-            .unwrap_or_else(|| serde_json::json!({}))
-    })
+    match protocol.decode_client_text(&text) {
+        Ok(ClientFrame::Init(payload)) => Some(payload),
+        _ => None,
+    }
 }
 struct Operation(tokio::task::JoinHandle<()>);
 impl Drop for Operation {
@@ -366,69 +392,90 @@ impl Drop for Operation {
         self.0.abort();
     }
 }
-fn packet(id: &str, kind: &str, payload: serde_json::Value) -> serde_json::Value {
-    serde_json::json!({"id":id,"type":kind,"payload":payload})
-}
-fn failure(id: &str, code: &str) -> serde_json::Value {
-    packet(
-        id,
-        "error",
-        serde_json::json!([{"message":code,"extensions":{"code":code}}]),
-    )
-}
 async fn client_loop(
     client: WebSocket,
     execution: Execution,
     mut parts: Parts,
     coordinator: Arc<NativeDelivery>,
-    protocol: &'static str,
+    protocol: WsProtocol,
     init: serde_json::Value,
 ) {
     let source = execution.source(parts.headers.clone(), init.clone());
     parts.method = Method::POST;
     proxy::strip_hop_headers(&mut parts.headers);
     let parts = Arc::new(parts);
+    let write_timeout = execution.inner.options.limits.read_timeout;
     let (mut sink, mut stream) = client.split();
     let (out, mut output) = mpsc::channel::<serde_json::Value>(32);
     let (close, mut closed) = watch::channel(false);
-    let mut operations = BTreeMap::<String, Operation>::new();
+    let mut operations = Operations::<Operation>::default();
     let mut close_frame = Some(axum::extract::ws::CloseFrame {
         code: 1013,
-        reason: "LIVE_RESET_REQUIRED".into(),
+        reason: LiveEnd::ResetRequired.code().into(),
     });
     loop {
         tokio::select! {biased;
-            _=closed.changed()=>break,
-            next=output.recv()=>{
-                let Some(value)=next else {break;};
-                let id=value["id"].as_str().map(str::to_owned);
-                let terminal=matches!(value["type"].as_str(),Some("complete"|"error"));
-                let sending=sink.send(Message::Text(value.to_string().into()));
-                tokio::select! { _=closed.changed()=>break, sent=tokio::time::timeout(execution.inner.options.limits.read_timeout,sending)=>{if !matches!(sent,Ok(Ok(()))){break;}} }
-                if terminal {if let Some(id)=id {operations.remove(&id);}}
+            _ = closed.changed() => break,
+            next = output.recv() => {
+                let Some(value) = next else { break };
+                let terminal = ws::ended_operation(&value).map(str::to_owned);
+                let sending = sink.send(Message::Text(value.to_string().into()));
+                tokio::select! {
+                    _ = closed.changed() => break,
+                    sent = tokio::time::timeout(write_timeout, sending) => if !matches!(sent, Ok(Ok(()))) { break },
+                }
+                if let Some(id) = terminal {
+                    operations.close(&id);
+                }
             }
-            next=stream.next()=>{
-                let Some(Ok(message))=next else {break;};
-                match message {
-                    Message::Text(text)=>{
-                        let Ok(value)=serde_json::from_str::<serde_json::Value>(&text) else {break;};
-                        match value["type"].as_str() {
-                            Some(kind @ ("subscribe"|"start")) if kind == if protocol == "graphql-ws" {"start"} else {"subscribe"}=>{
-                                let Some(id)=value["id"].as_str() else {break;};
-                                if id.is_empty()||id.len()>256||operations.len()>=128||operations.contains_key(id){break;}
-                                if let Err(error)=crate::gateway::graphql::admit_request(&value["payload"],execution.capabilities()) {let _=out.try_send(packet(id,if protocol=="graphql-ws"{"data"}else{"next"},error.envelope()));let _=out.try_send(serde_json::json!({"id":id,"type":"complete"}));continue;}
-                                let id=id.to_owned();let payload=value["payload"].clone();let execution=execution.clone();let parts=parts.clone();let coordinator=coordinator.clone();let source=source.clone();let out=out.clone();let close=close.clone();let init=init.clone();let task_id=id.clone();
-                                operations.insert(id,Operation(tokio::spawn(async move {operation(task_id,payload,execution,parts,coordinator,source,out,close,protocol,init).await;})));
+            next = stream.next() => {
+                let Some(Ok(message)) = next else { break };
+                let reply = match message {
+                    Message::Text(text) => match protocol.decode_client_text(&text) {
+                        Ok(ClientFrame::Subscribe { id, payload }) => {
+                            if operations.admit(&id).is_err() {
+                                break;
                             }
-                            Some(kind @ ("complete"|"stop")) if kind == if protocol == "graphql-ws" {"stop"} else {"complete"}=>{if let Some(id)=value["id"].as_str(){operations.remove(id);}}
-                            Some("ping")=>{if !matches!(tokio::time::timeout(execution.inner.options.limits.read_timeout,sink.send(Message::Text(serde_json::json!({"type":"pong","payload":value["payload"]}).to_string().into()))).await,Ok(Ok(()))){break;}}
-                            Some("pong")=>{},
-                            Some("connection_terminate") if protocol == "graphql-ws"=>{close_frame=Some(axum::extract::ws::CloseFrame{code:1000,reason:"".into()});break;},
-                            _=>break,
+                            if let Err(error) = crate::gateway::graphql::admit_request(&payload, execution.capabilities()) {
+                                let _ = out.try_send(protocol.next(&id, error.envelope()));
+                                let _ = out.try_send(ws::complete(&id));
+                                continue;
+                            }
+                            let task = tokio::spawn(operation(
+                                id.clone(),
+                                payload,
+                                execution.clone(),
+                                parts.clone(),
+                                coordinator.clone(),
+                                source.clone(),
+                                Output { out: out.clone(), close: close.clone(), protocol },
+                                init.clone(),
+                            ));
+                            let _ = operations.open(id, Operation(task));
+                            continue;
                         }
+                        Ok(ClientFrame::Complete { id }) => {
+                            operations.close(&id);
+                            continue;
+                        }
+                        Ok(ClientFrame::Ping(payload)) => Message::Text(ws::pong(payload).to_string().into()),
+                        Ok(ClientFrame::Pong(_)) => continue,
+                        Ok(ClientFrame::Terminate) => {
+                            close_frame = Some(axum::extract::ws::CloseFrame { code: 1000, reason: "".into() });
+                            break;
+                        }
+                        Ok(ClientFrame::Init(_)) | Err(_) => break,
+                    },
+                    Message::Ping(data) => Message::Pong(data),
+                    Message::Pong(_) => continue,
+                    Message::Close(frame) => {
+                        close_frame = frame;
+                        break;
                     }
-                    Message::Ping(data)=>{if !matches!(tokio::time::timeout(execution.inner.options.limits.read_timeout,sink.send(Message::Pong(data))).await,Ok(Ok(()))){break;}},
-                    Message::Pong(_)=>{},Message::Close(frame)=>{close_frame=frame;break;},_=>break,
+                    Message::Binary(_) => break,
+                };
+                if !matches!(tokio::time::timeout(write_timeout, sink.send(reply)).await, Ok(Ok(()))) {
+                    break;
                 }
             }
         }
@@ -440,6 +487,32 @@ async fn client_loop(
     )
     .await;
 }
+
+/// Where one operation writes its frames.
+#[derive(Clone)]
+struct Output {
+    out: mpsc::Sender<serde_json::Value>,
+    close: watch::Sender<bool>,
+    protocol: WsProtocol,
+}
+impl Output {
+    async fn next(&self, id: &str, payload: serde_json::Value) -> bool {
+        self.out.send(self.protocol.next(id, payload)).await.is_ok()
+    }
+    async fn complete(&self, id: &str) {
+        let _ = self.out.send(ws::complete(id)).await;
+    }
+    async fn fail(&self, id: &str, end: LiveEnd) {
+        let _ = self.out.send(ws::error(id, end.code())).await;
+    }
+    /// Answer once, then complete.
+    async fn answer(&self, id: &str, payload: serde_json::Value) {
+        if self.next(id, payload).await {
+            self.complete(id).await;
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn operation(
     id: String,
@@ -448,21 +521,10 @@ async fn operation(
     parts: Arc<Parts>,
     coordinator: Arc<NativeDelivery>,
     source: LiveSourceFactory,
-    out: mpsc::Sender<serde_json::Value>,
-    close: watch::Sender<bool>,
-    protocol: &str,
+    output: Output,
     init: serde_json::Value,
 ) {
-    let next = if protocol == "graphql-ws" {
-        "data"
-    } else {
-        "next"
-    };
-    if !payload["extensions"].is_object() {
-        payload["extensions"] = serde_json::json!({});
-    }
-    payload["extensions"]["gatewayDelivery"] =
-        serde_json::json!({"action":"execute","connectionInit":init});
+    mark_connection(&mut payload, init);
     let kind = crate::gateway::graphql::operation_kind(
         payload["query"].as_str().unwrap_or(""),
         payload["operationName"].as_str(),
@@ -484,29 +546,25 @@ async fn operation(
             }
             Err(_) => super::response(axum::http::StatusCode::SERVICE_UNAVAILABLE),
         };
-        let value = match axum::body::to_bytes(
+        let value = axum::body::to_bytes(
             result.into_body(),
             execution.inner.options.limits.request_body_bytes,
         )
         .await
-        {
-            Ok(body) => serde_json::from_slice(&body).unwrap_or_else(
-                |_| serde_json::json!({"errors":[{"message":"origin unavailable"}]}),
-            ),
-            Err(_) => serde_json::json!({"errors":[{"message":"origin unavailable"}]}),
-        };
-        if out.send(packet(&id, next, value)).await.is_ok() {
-            let _ = out
-                .send(serde_json::json!({"id":id,"type":"complete"}))
-                .await;
-        }
+        .ok()
+        .and_then(|body| serde_json::from_slice(&body).ok())
+        .unwrap_or_else(origin_unavailable);
+        output.answer(&id, value).await;
         return;
     }
     let freshness = match payload["extensions"].get("gatewayFreshness") {
-        Some(value) => match crate::gateway::delivery::FreshnessContext::parse(value) {
+        Some(value) => match FreshnessContext::parse(value) {
             Ok(value) => Some(value),
             Err(_) => {
-                let _ = out.send(failure(&id, "FRESHNESS_SCOPE_CHANGED")).await;
+                let _ = output
+                    .out
+                    .send(ws::error(&id, "FRESHNESS_SCOPE_CHANGED"))
+                    .await;
                 return;
             }
         },
@@ -530,26 +588,28 @@ async fn operation(
                 Ok(lease) => lease,
                 // Sharing is an optimization. A full registry, or a group this
                 // consumer cannot join, means this consumer runs alone.
-                Err(_) => return independent(&id, next, payload, source, &out).await,
+                Err(_) => return independent(&id, payload, source, &output).await,
             };
             loop {
                 match lease.next().await {
                     Ok(Some(frame)) => {
-                        let message = packet(&id, next, frame.payload().clone());
+                        let message = output.protocol.next(&id, frame.payload().clone());
                         tokio::select! {
-                            sent=out.send(message)=>{if sent.is_err(){break;}},
-                            reason=lease.interrupted()=>{let _=out.try_send(failure(&id,reason));let _=close.send(true);break;}
+                            sent = output.out.send(message) => if sent.is_err() { break },
+                            end = lease.interrupted() => {
+                                let _ = output.out.try_send(ws::error(&id, end.code()));
+                                let _ = output.close.send(true);
+                                break;
+                            }
                         }
                     }
                     Ok(None) => {
-                        let _ = out
-                            .send(serde_json::json!({"id":id,"type":"complete"}))
-                            .await;
+                        output.complete(&id).await;
                         break;
                     }
-                    Err(reason) => {
-                        if out.try_send(failure(&id, reason)).is_err() {
-                            let _ = close.send(true);
+                    Err(end) => {
+                        if output.out.try_send(ws::error(&id, end.code())).is_err() {
+                            let _ = output.close.send(true);
                         }
                         break;
                     }
@@ -557,54 +617,47 @@ async fn operation(
             }
         }
         super::delivery::AdmissionResult::Bypass => {
-            independent(&id, next, payload, source, &out).await
+            independent(&id, payload, source, &output).await
         }
         super::delivery::AdmissionResult::Error(response) => {
-            let bytes = axum::body::to_bytes(response.into_body(), 65536)
-                .await
-                .unwrap_or_else(|_| Bytes::new());
-            let value = serde_json::from_slice(&bytes).unwrap_or_else(
-                |_| serde_json::json!({"errors":[{"message":"origin unavailable"}]}),
-            );
-            let _ = out.send(packet(&id, next, value)).await;
-            let _ = out
-                .send(serde_json::json!({"id":id,"type":"complete"}))
+            let bytes = axum::body::to_bytes(
+                response.into_body(),
+                crate::gateway::delivery::MAX_VALIDATION_BYTES,
+            )
+            .await
+            .unwrap_or_else(|_| Bytes::new());
+            output
+                .answer(
+                    &id,
+                    serde_json::from_slice(&bytes).unwrap_or_else(|_| origin_unavailable()),
+                )
                 .await;
         }
     }
+}
+fn origin_unavailable() -> serde_json::Value {
+    serde_json::json!({"errors":[{"message":"origin unavailable"}]})
 }
 
 /// One consumer's own upstream execution, shared with nobody.
 async fn independent(
     id: &str,
-    next: &str,
     payload: serde_json::Value,
     source: LiveSourceFactory,
-    out: &mpsc::Sender<serde_json::Value>,
+    output: &Output,
 ) {
-    match source(payload).await {
-        Ok(mut stream) => {
-            while let Some(result) = stream.next().await {
-                match result {
-                    Ok(payload) => {
-                        if out.send(packet(id, next, payload)).await.is_err() {
-                            return;
-                        }
-                    }
-                    Err(_) => {
-                        let _ = out.send(failure(id, "LIVE_RESET_REQUIRED")).await;
-                        return;
-                    }
-                }
-            }
-            let _ = out
-                .send(serde_json::json!({"id":id,"type":"complete"}))
-                .await;
-        }
-        Err(_) => {
-            let _ = out.send(failure(id, "LIVE_RESET_REQUIRED")).await;
+    let Ok(mut stream) = source(payload).await else {
+        return output.fail(id, LiveEnd::ResetRequired).await;
+    };
+    while let Some(result) = stream.next().await {
+        let Ok(payload) = result else {
+            return output.fail(id, LiveEnd::ResetRequired).await;
+        };
+        if !output.next(id, payload).await {
+            return;
         }
     }
+    output.complete(id).await;
 }
 
 pub(super) async fn upgrade_embedded(
@@ -627,14 +680,7 @@ pub(super) async fn upgrade_embedded(
         .get(header::SEC_WEBSOCKET_PROTOCOL)
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
-    let protocol = if offered
-        .split(',')
-        .any(|p| p.trim() == "graphql-transport-ws")
-    {
-        "graphql-transport-ws"
-    } else if offered.split(',').any(|p| p.trim() == "graphql-ws") {
-        "graphql-ws"
-    } else {
+    let Some(protocol) = WsProtocol::negotiate(offered) else {
         return super::response(axum::http::StatusCode::BAD_REQUEST);
     };
     let upgrade = match WebSocketUpgrade::from_request_parts(&mut parts, &()).await {
@@ -652,21 +698,12 @@ pub(super) async fn upgrade_embedded(
     {
         return super::response(axum::http::StatusCode::BAD_REQUEST);
     }
-    let lifetime = execution.context.identity().map_or(
+    let lifetime = execution.context.connection_lifetime(
         execution.inner.options.limits.upgrade_lifetime,
-        |id| {
-            execution
-                .inner
-                .options
-                .limits
-                .upgrade_lifetime
-                .min(Duration::from_secs(
-                    id.expires_at().saturating_sub(super::now()),
-                ))
-        },
+        super::now(),
     );
     upgrade
-        .protocols([protocol])
+        .protocols([protocol.name()])
         .max_message_size(execution.inner.options.limits.request_body_bytes)
         .on_upgrade(move |socket| async move {
             let _permit = permit;

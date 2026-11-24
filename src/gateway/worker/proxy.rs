@@ -1,5 +1,5 @@
 use super::{RequestContext, WorkerOptions};
-use crate::gateway::{BackendCredential, Forwarding};
+use crate::gateway::{append_hop, BackendCredential, Forwarding, HOPS_HEADER};
 use futures_util::{
     future::{select, Either},
     StreamExt,
@@ -73,24 +73,13 @@ pub(super) fn prepare_headers(
     if upgrade {
         headers.set("upgrade", "websocket")?;
     }
-    let hops = headers
-        .get("x-distributed-gateway-hops")?
-        .unwrap_or_default();
-    if hops.len() > 1024
-        || hops.split(',').count() > 8
-        || hops.split(',').any(|s| s.trim() == options.hop_id)
-    {
-        return Err(worker::Error::RustError("gateway loop".into()));
-    }
-    headers.set(
-        "x-distributed-gateway-hops",
-        &if hops.is_empty() {
-            options.hop_id.clone()
-        } else {
-            format!("{hops},{}", options.hop_id)
-        },
-    )?;
+    headers.set(HOPS_HEADER, &hop_chain(headers, options)?)?;
     Ok(())
+}
+/// The chain after this gateway; a loop or over-long chain fails.
+pub(super) fn hop_chain(headers: &Headers, options: &WorkerOptions) -> Result<String> {
+    append_hop(headers.get(HOPS_HEADER)?.as_deref(), &options.hop_id)
+        .map_err(|error| worker::Error::RustError(error.0.into()))
 }
 pub(super) async fn read_request(request: &mut Request, max: usize) -> Result<Vec<u8>> {
     if request
@@ -241,15 +230,12 @@ pub(super) async fn forward(
         };
         let pair = WebSocketPair::new()?;
         let client = pair.client;
-        let lifetime =
-            context
-                .identity()
-                .map_or(options.limits.websocket_lifetime_ms, |identity| {
-                    options
-                        .limits
-                        .websocket_lifetime_ms
-                        .min(identity.expires_at().saturating_sub(super::now()) * 1000)
-                });
+        let lifetime = context
+            .connection_lifetime(
+                std::time::Duration::from_millis(options.limits.websocket_lifetime_ms),
+                super::now(),
+            )
+            .as_millis() as u64;
         let max = options.limits.websocket_buffer_bytes;
         worker::wasm_bindgen_futures::spawn_local(async move {
             let _guard = guard;
