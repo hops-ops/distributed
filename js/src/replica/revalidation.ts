@@ -1,4 +1,5 @@
 import type { GraphqlVariables } from '../types.js';
+import { intersects } from '../lib/intersects.js';
 import type {
 	ReplicaObjectSelection,
 	ReplicaOperationArtifact,
@@ -120,13 +121,6 @@ function stringSet(values: readonly string[], path: string): ReadonlySet<string>
 
 function validName(value: unknown): value is string {
 	return typeof value === 'string' && value.length > 0;
-}
-
-function intersects(
-	left: readonly string[],
-	right: ReadonlySet<string>
-): boolean {
-	return left.some((value) => right.has(value));
 }
 
 function relationshipKey(

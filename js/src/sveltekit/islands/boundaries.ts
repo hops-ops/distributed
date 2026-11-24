@@ -11,8 +11,8 @@ import {
 	sep
 } from 'node:path';
 import { pathToFileURL } from 'node:url';
-
-import { parse } from 'svelte/compiler';
+import { fnv1a64 } from '../../lib/fnv1a64.js';
+import { isMissing, isWithin } from '../../lib/node-fs.js';
 
 import {
 	DISTRIBUTED_BOUNDARY_BINDING_VERSION,
@@ -830,6 +830,10 @@ async function loadComponents(
 		);
 	}
 	const components = new Map<string, ComponentModule>();
+	if (paths.size === 0) return components;
+	// Loaded only when there is a component to parse: this module is also behind
+	// the games-only Vite plugin, whose apps need not have `svelte` installed.
+	const { parse } = await import('svelte/compiler');
 	for (const path of [...paths].sort()) {
 		const metadata = await lstat(path);
 		if (!metadata.isFile() || metadata.isSymbolicLink()) continue;
@@ -843,7 +847,7 @@ async function loadComponents(
 			);
 		}
 		const source = await readFile(path, 'utf8');
-		components.set(path, parseComponent(path, source, cwd));
+		components.set(path, parseComponent(parse, path, source, cwd));
 	}
 	return components;
 }
@@ -868,7 +872,12 @@ async function collectSvelteFiles(
 	}
 }
 
-function parseComponent(path: string, source: string, cwd: string): ComponentModule {
+function parseComponent(
+	parse: typeof import('svelte/compiler').parse,
+	path: string,
+	source: string,
+	cwd: string
+): ComponentModule {
 	let ast: AstNode;
 	try {
 		ast = parse(source, { filename: projectPath(cwd, path), modern: true }) as unknown as AstNode;
@@ -1113,11 +1122,6 @@ function contained(root: string, value: string, label: string): string {
 	return path;
 }
 
-function isWithin(root: string, target: string): boolean {
-	const path = relative(root, target);
-	return path === '' || (!path.startsWith(`..${sep}`) && path !== '..' && !isAbsolute(path));
-}
-
 function projectPath(cwd: string, path: string): string {
 	return portable(relative(cwd, path));
 }
@@ -1202,15 +1206,3 @@ function freezeStable(value: unknown): unknown {
 	return Object.freeze(value);
 }
 
-function fnv1a64(value: string): string {
-	let hash = 0xcbf29ce484222325n;
-	for (const byte of new TextEncoder().encode(value)) {
-		hash ^= BigInt(byte);
-		hash = BigInt.asUintN(64, hash * 0x100000001b3n);
-	}
-	return hash.toString(16).padStart(16, '0');
-}
-
-function isMissing(error: unknown): boolean {
-	return error !== null && typeof error === 'object' && 'code' in error && error.code === 'ENOENT';
-}

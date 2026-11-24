@@ -1,6 +1,7 @@
 import type { GraphqlVariables } from '../../types.js';
 import type { DistributedTrustedPreset } from '../../protocol.js';
 import {
+	recordKeyMatchesModel,
 	replicaIndexKey,
 	resolveArguments
 } from '../identity.js';
@@ -25,6 +26,7 @@ import type {
 	ReplicaValue
 } from '../types.js';
 import { compareCodeUnits } from '../../lib/compare-code-units.js';
+import { intersects } from '../../lib/intersects.js';
 import type {
 	ReplicaIndexMaintenanceDecision,
 	ReplicaIndexMaintenanceIndex,
@@ -1068,17 +1070,6 @@ export function validateDependencies(value: readonly string[]): readonly string[
 		seen.add(dependency);
 	}
 	return value;
-}
-
-export function intersects(
-	left: readonly string[],
-	right: ReadonlySet<string>
-): boolean {
-	return left.some((value) => right.has(value));
-}
-
-export function recordKeyMatchesModel(key: string, model: string): boolean {
-	return key.startsWith(`record:${encodeURIComponent(model)}:`);
 }
 
 export function firstDuplicate(values: readonly string[]): string | undefined {

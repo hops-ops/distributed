@@ -419,7 +419,9 @@ fn collect_source_files(
 fn compiler_identity(launcher: &Path) -> Result<String, Box<dyn Error>> {
     let launcher = launcher.canonicalize().map_err(|error| {
         format!(
-            "failed to resolve browser WASM compiler `{}`: {error}",
+            "failed to resolve browser WASM compiler `{}`: {error}; browser WASM pures need the \
+             `wasm-pack` npm package installed there (an optional peer of \
+             @hops-ops/distributed: add it to the application UI's devDependencies)",
             launcher.display()
         )
     })?;

@@ -6,6 +6,8 @@
 //! never client-decodable identities and never bearer credentials.
 
 mod accumulator;
+#[cfg(test)]
+mod envelope_fixture;
 mod projection_metadata;
 #[cfg(test)]
 mod tests;

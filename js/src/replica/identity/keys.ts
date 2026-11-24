@@ -11,7 +11,8 @@ import type {
 } from '../types.js';
 import { assertName } from '../../lib/assert-name.js';
 import { freezeRecord } from '../../lib/freeze-record.js';
-import { canonicalCacheValue, cloneJsonValue } from './clone.js';
+import { canonicalJson } from '../../lib/canonical-json.js';
+import { cloneJsonValue } from './clone.js';
 
 export function replicaRecordKey(
 	model: ReplicaModelArtifact,
@@ -27,7 +28,7 @@ export function replicaRecordKey(
 			`model ${model.id} identity expected ${model.identityFields.length} part(s), received ${parts.length}`
 		);
 	}
-	return `record:${encodeURIComponent(model.id)}:${canonicalCacheValue(
+	return `record:${encodeURIComponent(model.id)}:${canonicalJson(
 		parts.map((part) => cloneJsonValue(part))
 	)}`;
 }
@@ -248,3 +249,7 @@ export function numericArgument(
 	return value as number;
 }
 
+/** True when `recordKey` is a key {@link replicaRecordKey} builds for `model`. */
+export function recordKeyMatchesModel(recordKey: string, model: string): boolean {
+	return recordKey.startsWith(`record:${encodeURIComponent(model)}:`);
+}

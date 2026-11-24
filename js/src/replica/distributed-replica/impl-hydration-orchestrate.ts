@@ -1,6 +1,5 @@
 import { compareCodeUnits } from '../../lib/compare-code-units.js';
 import {
-	createCacheEngine,
 	type CacheEngine,
 	type CacheEngineSnapshot
 } from '../../internal/cache-engine.js';
@@ -32,15 +31,16 @@ import {
 } from './clocks.js';
 import { trustedPresetInventoryFingerprint } from './helpers.js';
 import {
-	hydrationMetadataConsistent,
+	hydrationTables,
 	parseAuthoritativeScope,
-	parseReplicaHydration,
+	parseDehydratedState,
 	serializeOperationProtocolGroup
 } from './hydration.js';
 import type {
 	AnonymousRecordProtocolClock,
 	OperationProtocolGroup,
 	OptimisticReceiptState,
+	ParsedReplicaHydration,
 	ProtocolGeneration,
 	QueryState,
 	RecordProtocolClock,
@@ -309,7 +309,6 @@ export function hydrateReplica(
 			| 'scope-mismatch'
 			| 'artifact-mismatch'
 			| 'active-scope-mismatch'
-			| 'metadata-mismatch'
 	): false => {
 		if (host.diagnostics.enabled) {
 			host.diagnosticEvent(
@@ -318,9 +317,14 @@ export function hydrateReplica(
 		}
 		return false;
 	};
-	const parsed = parseReplicaHydration(state);
-	const expectedScope = parseAuthoritativeScope(authoritativeScope);
-	if (parsed === undefined || expectedScope === undefined) {
+	let parsed: ParsedReplicaHydration;
+	let expectedScope: ProtocolGeneration;
+	try {
+		// Parsed whole, cache included, before any transport closes or any live
+		// state changes.
+		parsed = hydrationTables(parseDehydratedState(state));
+		expectedScope = parseAuthoritativeScope(authoritativeScope);
+	} catch {
 		return rejected('invalid');
 	}
 	if (
@@ -357,10 +361,7 @@ export function hydrateReplica(
 	}
 	const preserveLocalCommandState = current !== undefined;
 
-	// Validate the private engine payload before closing transports or changing
-	// any live state. `restore` parses fully before its own transaction.
 	try {
-		createCacheEngine().restore(parsed.cache);
 		const expectedTrustedPresets =
 			binding?.trustedPresets !== undefined
 				? binding.trustedPresets
@@ -382,9 +383,6 @@ export function hydrateReplica(
 		}
 	} catch {
 		return rejected('invalid');
-	}
-	if (!hydrationMetadataConsistent(parsed)) {
-		return rejected('metadata-mismatch');
 	}
 
 	if (mode === 'reauthorize') {

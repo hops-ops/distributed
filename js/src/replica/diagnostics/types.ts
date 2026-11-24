@@ -206,8 +206,7 @@ export type ReplicaDiagnosticEventInput =
 				| 'invalid'
 				| 'scope-mismatch'
 				| 'artifact-mismatch'
-				| 'active-scope-mismatch'
-				| 'metadata-mismatch';
+				| 'active-scope-mismatch';
 	  }>
 	| Readonly<{
 			kind: 'scope';

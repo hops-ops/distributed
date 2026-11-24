@@ -1,4 +1,5 @@
 import { spawn, type ChildProcess } from 'node:child_process';
+import { isMissing, isWithin } from '../lib/node-fs.js';
 import { randomUUID } from 'node:crypto';
 import {
 	existsSync,
@@ -1375,14 +1376,6 @@ function containedPath(root: string, value: string, label: string): string {
 	return target;
 }
 
-function isWithin(root: string, target: string): boolean {
-	const rel = relative(root, target);
-	return (
-		rel === '' ||
-		(!rel.startsWith(`..${sep}`) && rel !== '..' && !isAbsolute(rel))
-	);
-}
-
 function documentWatchRoots(
 	cwd: string,
 	documents: readonly string[],
@@ -2457,15 +2450,6 @@ function throwIfAborted(signal: AbortSignal): void {
 	const error = new Error('Distributed SvelteKit compiler was cancelled');
 	error.name = 'AbortError';
 	throw error;
-}
-
-function isMissing(error: unknown): boolean {
-	return (
-		error !== null &&
-		typeof error === 'object' &&
-		'code' in error &&
-		error.code === 'ENOENT'
-	);
 }
 
 function isAlreadyExists(error: unknown): boolean {

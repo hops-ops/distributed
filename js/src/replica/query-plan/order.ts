@@ -6,7 +6,7 @@ import type {
 } from '../types.js';
 import { ORDER_EQUAL } from './constants.js';
 import { recordField, resolveInput } from './resolve.js';
-import { compareUtf8 } from './util.js';
+import { compareUtf8 } from '../../lib/compare-utf8.js';
 import type {
 	OrderDirection,
 	ReplicaOrderComparison,

@@ -1,5 +1,6 @@
 export {
 	replicaRecordKey,
+	recordKeyMatchesModel,
 	replicaIndexKey,
 	resolveArguments,
 	resolveReplicaArgumentValue,
@@ -11,6 +12,5 @@ export {
 export {
 	canonicalVariables,
 	cloneJsonObject,
-	cloneJsonValue,
-	canonicalCacheValue
+	cloneJsonValue
 } from './clone.js';

@@ -1,5 +1,8 @@
 import { compareCodeUnits } from '../../lib/compare-code-units.js';
-import type { CacheEngineSnapshot } from '../../internal/cache-engine.js';
+import {
+	createCacheEngine,
+	type CacheEngineSnapshot
+} from '../../internal/cache-engine.js';
 import {
 	compareDistributedDecimal,
 	parseDistributedTrustedPresetInventory,
@@ -9,16 +12,18 @@ import {
 
 import { modelFromRecordKey } from './clocks.js';
 
+import type { ReplicaAuthoritativeScope } from '../types.js';
+import { isPlainRecord } from '../../lib/is-plain-record.js';
 import { canonicalTrustedPresets } from './helpers.js';
 import type {
 	AnonymousRecordProtocolClock,
-	IndexProtocolClock,
 	OperationProtocolGroup,
 	OperationProtocolSource,
 	OperationProtocolState,
 	ParsedReplicaHydration,
 	ProtocolGeneration,
 	RecordProtocolClock,
+	ReplicaDehydratedPayloadV1,
 	SerializedOperationProtocolGroup,
 	SerializedOperationProtocolState
 } from './types.js';
@@ -86,331 +91,367 @@ export function serializeOperationProtocolState(
 	});
 }
 
+/** A dehydrated state that passed {@link parseDehydratedState}. */
+export type ParsedDehydratedState = {
+	readonly scope: ProtocolGeneration;
+	readonly payload: ReplicaDehydratedPayloadV1;
+};
+
+const SCOPE_FIELDS = [
+	'protocolVersion',
+	'schemaHash',
+	'authorizationGeneration',
+	'cacheScope'
+] as const;
+
+/** Parse the scope a caller independently established. Throws `TypeError`. */
 export function parseAuthoritativeScope(
-	value: unknown
-): ProtocolGeneration | undefined {
-	try {
-		const scope = hydrationRecord(
-			value,
-			'authoritativeScope',
-			[
-				'protocolVersion',
-				'schemaHash',
-				'authorizationGeneration',
-				'cacheScope'
-			]
-		);
-		if (scope.protocolVersion !== 1) {
-			hydrationInvalid('authoritativeScope.protocolVersion');
-		}
-		return Object.freeze({
-			protocolVersion: 1,
-			schemaHash: hydrationString(
-				scope.schemaHash,
-				'authoritativeScope.schemaHash'
-			),
-			authorizationGeneration: hydrationString(
-				scope.authorizationGeneration,
-				'authoritativeScope.authorizationGeneration'
-			),
-			cacheScope: hydrationOpaque(
-				scope.cacheScope,
-				'authoritativeScope.cacheScope'
-			)
-		});
-	} catch {
-		return undefined;
-	}
+	value: unknown,
+	path = 'authoritativeScope'
+): ProtocolGeneration {
+	const scope = exactRecord(value, path, SCOPE_FIELDS);
+	if (scope.protocolVersion !== 1) invalid(`${path}.protocolVersion`);
+	return Object.freeze({
+		protocolVersion: 1,
+		schemaHash: nonEmptyString(scope.schemaHash, `${path}.schemaHash`),
+		authorizationGeneration: nonEmptyString(
+			scope.authorizationGeneration,
+			`${path}.authorizationGeneration`
+		),
+		cacheScope: opaque(scope.cacheScope, `${path}.cacheScope`)
+	});
 }
 
-export function hydrationMetadataConsistent(
-	parsed: ParsedReplicaHydration
+export function sameScope(
+	left: ReplicaAuthoritativeScope,
+	right: ReplicaAuthoritativeScope
 ): boolean {
-	try {
-		const recordByKey = new Map(
-			parsed.cache.records.map((record) => [record.key, record])
-		);
-		for (const record of parsed.cache.records) {
-			if (modelFromRecordKey(record.key) === undefined) continue;
-			const clock = parsed.recordClocks.get(record.key);
-			if (
-				clock === undefined ||
-				record.incarnation === undefined ||
-				clock.incarnation !== record.incarnation ||
-				clock.revision !== record.revision
-			) {
-				return false;
-			}
-			if (clock.tombstone) {
-				if (record.tombstoneRevision !== clock.revision) return false;
-			} else if (record.tombstoneRevision !== undefined) {
-				return false;
-			}
-		}
-		for (const [recordKey, clock] of parsed.recordClocks) {
-			const record = recordByKey.get(recordKey);
-			if (
-				record?.tombstoneRevision !== undefined &&
-				(
-					!clock.tombstone ||
-					record.tombstoneRevision !== clock.revision
-				)
-			) {
-				return false;
-			}
-		}
+	return (
+		left.protocolVersion === right.protocolVersion &&
+		left.schemaHash === right.schemaHash &&
+		left.authorizationGeneration === right.authorizationGeneration &&
+		left.cacheScope === right.cacheScope
+	);
+}
 
-		const revisionsByIndex = new Map<string, Set<string>>();
-		for (const group of parsed.operationProtocols.values()) {
-			for (const state of [group.query, group.live]) {
-				if (state === undefined) continue;
-				for (const recordKey of state.pathRecords.values()) {
-					if (
-						modelFromRecordKey(recordKey) !== undefined &&
-						!parsed.recordClocks.has(recordKey)
-					) {
-						return false;
-					}
+/**
+ * The one parser of the format `dehydrate()` writes: SSR hydration and
+ * IndexedDB persistence both read a state through it and nothing else.
+ *
+ * It admits exactly what `dehydrate()` can emit. Every object is plain and has
+ * no unknown member, every revision is a canonical decimal string, the cache
+ * restores into an engine, and the record clocks, operation states and indexes
+ * agree with one another. Anything else throws `TypeError` naming the path.
+ *
+ * Protocol metadata is returned as fresh frozen values; the validated cache is
+ * returned as given.
+ */
+export function parseDehydratedState(value: unknown): ParsedDehydratedState {
+	const state = exactRecord(value, 'state', ['version', 'scope', 'payload']);
+	if (state.version !== 1) invalid('state.version');
+	const scope = parseAuthoritativeScope(state.scope, 'state.scope');
+	const raw = exactRecord(state.payload, 'state.payload', [
+		'cache',
+		'operations',
+		'recordClocks',
+		'anonymousRecordClocks',
+		'trustedPresets',
+		'nextIndexRevision'
+	]);
+	const cache = parseCacheSnapshot(raw.cache);
+	const operations = parseOperations(raw.operations);
+	const recordClocks = parseUniquePairs(
+		raw.recordClocks,
+		'state.payload.recordClocks',
+		parseRecordClock
+	);
+	const anonymousRecordClocks = parseUniquePairs(
+		raw.anonymousRecordClocks,
+		'state.payload.anonymousRecordClocks',
+		(entry, path): AnonymousRecordProtocolClock => {
+			const anonymous = exactRecord(entry, path, ['model', 'clock']);
+			return Object.freeze({
+				model: nonEmptyString(anonymous.model, `${path}.model`),
+				clock: parseRecordClock(anonymous.clock, `${path}.clock`)
+			});
+		}
+	);
+	const payload: ReplicaDehydratedPayloadV1 = Object.freeze({
+		cache,
+		operations,
+		recordClocks,
+		anonymousRecordClocks,
+		trustedPresets: canonicalTrustedPresets(
+			parseDistributedTrustedPresetInventory(
+				raw.trustedPresets,
+				'state.payload.trustedPresets'
+			)
+		),
+		nextIndexRevision: decimal(
+			raw.nextIndexRevision,
+			'state.payload.nextIndexRevision'
+		)
+	});
+	assertMetadataConsistent(payload);
+	return Object.freeze({ scope, payload });
+}
+
+/** The mutable protocol tables a replica keeps for a parsed state. */
+export function hydrationTables(
+	parsed: ParsedDehydratedState
+): ParsedReplicaHydration {
+	const { payload } = parsed;
+	const operationProtocols = new Map<string, OperationProtocolGroup>();
+	const operationGenerations = new Map<string, number>();
+	for (const group of payload.operations) {
+		operationProtocols.set(group.key, {
+			...(group.query === undefined
+				? {}
+				: { query: operationProtocolState(group.query) }),
+			...(group.live === undefined
+				? {}
+				: { live: operationProtocolState(group.live) }),
+			...(group.active === undefined ? {} : { active: group.active })
+		});
+		operationGenerations.set(group.key, group.generation);
+	}
+	return {
+		scope: parsed.scope,
+		cache: payload.cache,
+		operationProtocols,
+		operationGenerations,
+		recordClocks: new Map(payload.recordClocks),
+		recordKeysByScope: new Map(
+			payload.recordClocks.map(([key, clock]) => [clock.scopeToken, key])
+		),
+		anonymousRecordClocks: new Map(
+			payload.anonymousRecordClocks as readonly (readonly [
+				DistributedOpaqueString,
+				AnonymousRecordProtocolClock
+			])[]
+		),
+		trustedPresets: payload.trustedPresets,
+		nextIndexRevision: payload.nextIndexRevision
+	};
+}
+
+function operationProtocolState(
+	state: SerializedOperationProtocolState
+): OperationProtocolState {
+	return {
+		operation: state.operation,
+		...(state.snapshotScope === undefined
+			? {}
+			: { snapshotScope: state.snapshotScope as DistributedOpaqueString }),
+		indexClocks: new Map(
+			state.indexClocks.map(([projection, clock]) => [
+				projection,
+				clock as {
+					scopeToken: DistributedOpaqueString;
+					position: DistributedDecimalString;
 				}
-				if (state.indexRevision === undefined) {
-					if (state.indexKeys.size > 0) return false;
-					continue;
-				}
-				for (const indexKey of state.indexKeys) {
-					let revisions = revisionsByIndex.get(indexKey);
-					if (revisions === undefined) {
-						revisions = new Set();
-						revisionsByIndex.set(indexKey, revisions);
-					}
-					revisions.add(state.indexRevision);
-				}
+			])
+		),
+		...(state.indexRevision === undefined
+			? {}
+			: { indexRevision: state.indexRevision }),
+		...(state.retiredAtRevision === undefined
+			? {}
+			: { retiredAtRevision: state.retiredAtRevision }),
+		indexKeys: new Set(state.indexKeys),
+		pathRecords: new Map(state.pathRecords),
+		cursors: state.cursors
+	};
+}
+
+/**
+ * Structure first, so that the engine only ever sees the shape it is typed
+ * for; then the engine itself, which owns the cache's own invariants (key
+ * shapes, field revisions within their record, tombstones without fields).
+ */
+function parseCacheSnapshot(value: unknown): CacheEngineSnapshot {
+	const root = 'state.payload.cache';
+	const cache = exactRecord(value, root, ['version', 'records', 'indexes']);
+	if (cache.version !== 1) invalid(`${root}.version`);
+	for (const [index, entry] of array(cache.records, `${root}.records`).entries()) {
+		const path = `${root}.records[${index}]`;
+		const record = exactRecord(
+			entry,
+			path,
+			['key', 'revision', 'incarnation', 'tombstoneRevision', 'fields', 'links'],
+			['key', 'revision', 'fields', 'links']
+		);
+		nonEmptyString(record.key, `${path}.key`);
+		decimal(record.revision, `${path}.revision`);
+		optional(record.incarnation, `${path}.incarnation`, decimal);
+		optional(record.tombstoneRevision, `${path}.tombstoneRevision`, decimal);
+		for (const member of ['fields', 'links'] as const) {
+			for (const [name, stored] of Object.entries(
+				plainRecord(record[member], `${path}.${member}`)
+			)) {
+				const storedPath = `${path}.${member}.${name}`;
+				const cell = exactRecord(stored, storedPath, ['revision', 'value']);
+				decimal(cell.revision, `${storedPath}.revision`);
+				(member === 'fields' ? assertJsonValue : assertRecordLink)(
+					cell.value,
+					`${storedPath}.value`
+				);
 			}
 		}
-		const nextIndexRevision =
-			parsed.nextIndexRevision as DistributedDecimalString;
-		for (const index of parsed.cache.indexes) {
-			const revision = hydrationDecimal(
-				index.revision,
-				'state.payload.cache.indexes.revision'
+	}
+	for (const [index, value] of array(cache.indexes, `${root}.indexes`).entries()) {
+		const path = `${root}.indexes[${index}]`;
+		const entry = exactRecord(
+			value,
+			path,
+			[
+				'key',
+				'revision',
+				'staleRevision',
+				'records',
+				'complete',
+				'deleted',
+				'metadata'
+			],
+			['key', 'revision', 'records', 'complete', 'deleted']
+		);
+		nonEmptyString(entry.key, `${path}.key`);
+		decimal(entry.revision, `${path}.revision`);
+		optional(entry.staleRevision, `${path}.staleRevision`, decimal);
+		uniqueStrings(entry.records, `${path}.records`);
+		boolean(entry.complete, `${path}.complete`);
+		boolean(entry.deleted, `${path}.deleted`);
+		optional(entry.metadata, `${path}.metadata`, assertIndexMetadata);
+	}
+	const snapshot = cache as unknown as CacheEngineSnapshot;
+	try {
+		createCacheEngine().restore(snapshot);
+	} catch (error) {
+		throw new TypeError(
+			`invalid replica state at ${root}: ${(error as Error).message}`
+		);
+	}
+	return snapshot;
+}
+
+function assertIndexMetadata(value: unknown, path: string): void {
+	const metadata = exactRecord(
+		value,
+		path,
+		[
+			'parent',
+			'parentRevision',
+			'parentIncarnation',
+			'field',
+			'arguments',
+			'coverage',
+			'dependencies',
+			'staleReason',
+			'nullValue'
+		],
+		['field', 'arguments', 'coverage', 'dependencies']
+	);
+	optional(metadata.parent, `${path}.parent`, nonEmptyString);
+	optional(metadata.parentRevision, `${path}.parentRevision`, decimal);
+	optional(metadata.parentIncarnation, `${path}.parentIncarnation`, decimal);
+	nonEmptyString(metadata.field, `${path}.field`);
+	assertJsonValue(
+		plainRecord(metadata.arguments, `${path}.arguments`),
+		`${path}.arguments`
+	);
+	assertCoverage(metadata.coverage, `${path}.coverage`);
+	uniqueStrings(metadata.dependencies, `${path}.dependencies`);
+	optional(metadata.staleReason, `${path}.staleReason`, nonEmptyString);
+	optional(metadata.nullValue, `${path}.nullValue`, boolean);
+}
+
+function assertCoverage(value: unknown, path: string): void {
+	const coverage = plainRecord(value, path);
+	const members = (
+		kinds: Readonly<Record<string, (value: unknown, path: string) => unknown>>,
+		required: readonly string[] = []
+	): void => {
+		exactRecord(coverage, path, ['kind', ...Object.keys(kinds)], [
+			'kind',
+			...required
+		]);
+		for (const [key, check] of Object.entries(kinds)) {
+			optional(coverage[key], `${path}.${key}`, check);
+		}
+	};
+	switch (coverage.kind) {
+		case 'complete':
+		case 'unknown':
+			return members({});
+		case 'offset':
+			return members(
+				{
+					offset: nonNegativeInteger,
+					limit: nonNegativeInteger,
+					returned: nonNegativeInteger,
+					hasNext: boolean
+				},
+				['offset']
 			);
-			if (
-				compareDistributedDecimal(revision, nextIndexRevision) > 0 ||
-				!revisionsByIndex.get(index.key)?.has(index.revision)
-			) {
-				return false;
-			}
-		}
-		return true;
-	} catch {
-		return false;
+		case 'cursor':
+			return members({
+				after: assertJsonValue,
+				before: assertJsonValue,
+				first: nonNegativeInteger,
+				last: nonNegativeInteger,
+				start: assertJsonValue,
+				end: assertJsonValue,
+				hasNext: boolean,
+				hasPrevious: boolean
+			});
+		default:
+			invalid(`${path}.kind`);
 	}
 }
 
-export function parseReplicaHydration(
+function parseOperations(
 	value: unknown
-): ParsedReplicaHydration | undefined {
-	try {
-		const state = hydrationRecord(
-			value,
-			'state',
-			['version', 'scope', 'payload']
-		);
-		if (state.version !== 1) hydrationInvalid('state.version');
-		const scopeValue = hydrationRecord(
-			state.scope,
-			'state.scope',
-			[
-				'protocolVersion',
-				'schemaHash',
-				'authorizationGeneration',
-				'cacheScope'
-			]
-		);
-		if (scopeValue.protocolVersion !== 1) {
-			hydrationInvalid('state.scope.protocolVersion');
-		}
-		const scope: ProtocolGeneration = Object.freeze({
-			protocolVersion: 1,
-			schemaHash: hydrationString(
-				scopeValue.schemaHash,
-				'state.scope.schemaHash'
-			),
-			authorizationGeneration: hydrationString(
-				scopeValue.authorizationGeneration,
-				'state.scope.authorizationGeneration'
-			),
-			cacheScope: hydrationOpaque(
-				scopeValue.cacheScope,
-				'state.scope.cacheScope'
-			)
-		});
-		const payload = hydrationRecord(
-			state.payload,
-			'state.payload',
-			[
-				'cache',
-					'operations',
-					'recordClocks',
-					'anonymousRecordClocks',
-					'trustedPresets',
-					'nextIndexRevision'
-				]
-			);
-		const cache = payload.cache as CacheEngineSnapshot;
-		if (!isHydrationRecord(cache)) hydrationInvalid('state.payload.cache');
-		const operationsValue = hydrationArray(
-			payload.operations,
-			'state.payload.operations'
-		);
-		const operationProtocols = new Map<string, OperationProtocolGroup>();
-		const operationGenerations = new Map<string, number>();
-		for (const [index, entry] of operationsValue.entries()) {
-			const path = `state.payload.operations[${index}]`;
-			const raw = hydrationRecord(
+): readonly SerializedOperationProtocolGroup[] {
+	const root = 'state.payload.operations';
+	const keys = new Set<string>();
+	return Object.freeze(
+		array(value, root).map((entry, index) => {
+			const path = `${root}[${index}]`;
+			const raw = exactRecord(
 				entry,
 				path,
 				['key', 'query', 'live', 'active', 'generation'],
 				['key', 'generation']
 			);
-			const key = hydrationString(raw.key, `${path}.key`);
-			if (!key.startsWith('protocol:') || operationProtocols.has(key)) {
-				hydrationInvalid(`${path}.key`);
-			}
-			const query =
-				raw.query === undefined
-					? undefined
-					: parseOperationProtocolState(raw.query, `${path}.query`);
-			const live =
-				raw.live === undefined
-					? undefined
-					: parseOperationProtocolState(raw.live, `${path}.live`);
-			if (query === undefined && live === undefined) hydrationInvalid(path);
-			const active =
-				raw.active === undefined
-					? undefined
-					: hydrationOperationSource(raw.active, `${path}.active`);
+			const key = nonEmptyString(raw.key, `${path}.key`);
+			if (!key.startsWith('protocol:') || keys.has(key)) invalid(`${path}.key`);
+			keys.add(key);
+			const query = optional(raw.query, `${path}.query`, parseOperationState);
+			const live = optional(raw.live, `${path}.live`, parseOperationState);
+			if (query === undefined && live === undefined) invalid(path);
+			const active = optional(raw.active, `${path}.active`, operationSource);
 			if (
 				(active === 'query' && query === undefined) ||
 				(active === 'live' && live === undefined)
 			) {
-				hydrationInvalid(`${path}.active`);
+				invalid(`${path}.active`);
 			}
-			operationProtocols.set(key, {
+			return Object.freeze({
+				key,
 				...(query === undefined ? {} : { query }),
 				...(live === undefined ? {} : { live }),
-				...(active === undefined ? {} : { active })
+				...(active === undefined ? {} : { active }),
+				generation: nonNegativeInteger(raw.generation, `${path}.generation`)
 			});
-			operationGenerations.set(
-				key,
-				hydrationGeneration(raw.generation, `${path}.generation`)
-			);
-		}
-
-		const recordClocks = new Map<string, RecordProtocolClock>();
-		const recordKeysByScope = new Map<DistributedOpaqueString, string>();
-		for (const [index, entry] of hydrationArray(
-			payload.recordClocks,
-			'state.payload.recordClocks'
-		).entries()) {
-			const path = `state.payload.recordClocks[${index}]`;
-			const pair = hydrationPair(entry, path);
-			const key = hydrationString(pair[0], `${path}[0]`);
-			if (recordClocks.has(key)) hydrationInvalid(`${path}[0]`);
-			const clock = parseRecordClock(pair[1], `${path}[1]`);
-			if (recordKeysByScope.has(clock.scopeToken)) {
-				hydrationInvalid(`${path}[1].scopeToken`);
-			}
-			recordClocks.set(key, clock);
-			recordKeysByScope.set(clock.scopeToken, key);
-		}
-
-		const anonymousRecordClocks = new Map<
-			DistributedOpaqueString,
-			AnonymousRecordProtocolClock
-		>();
-		for (const [index, entry] of hydrationArray(
-			payload.anonymousRecordClocks,
-			'state.payload.anonymousRecordClocks'
-		).entries()) {
-			const path = `state.payload.anonymousRecordClocks[${index}]`;
-			const pair = hydrationPair(entry, path);
-			const scopeToken = hydrationOpaque(pair[0], `${path}[0]`);
-			if (
-				anonymousRecordClocks.has(scopeToken) ||
-				recordKeysByScope.has(scopeToken)
-			) {
-				hydrationInvalid(`${path}[0]`);
-			}
-			const raw = hydrationRecord(
-				pair[1],
-				`${path}[1]`,
-				['model', 'clock']
-			);
-			const clock = parseRecordClock(raw.clock, `${path}[1].clock`);
-			if (clock.scopeToken !== scopeToken) {
-				hydrationInvalid(`${path}[1].clock.scopeToken`);
-			}
-			anonymousRecordClocks.set(
-				scopeToken,
-				Object.freeze({
-					model: hydrationString(raw.model, `${path}[1].model`),
-					clock
-					})
-				);
-			}
-			const trustedPresets = canonicalTrustedPresets(
-				parseDistributedTrustedPresetInventory(
-					payload.trustedPresets,
-					'state.payload.trustedPresets'
-				)
-			);
-			const nextIndexRevision = hydrationDecimal(
-				payload.nextIndexRevision,
-			'state.payload.nextIndexRevision'
-		);
-		for (const group of operationProtocols.values()) {
-			for (const operation of [group.query, group.live]) {
-				if (
-					operation?.indexRevision !== undefined &&
-					compareDistributedDecimal(
-						operation.indexRevision as DistributedDecimalString,
-						nextIndexRevision
-					) > 0
-				) {
-					hydrationInvalid('state.payload.nextIndexRevision');
-				}
-				if (
-					operation?.retiredAtRevision !== undefined &&
-					compareDistributedDecimal(
-						operation.retiredAtRevision as DistributedDecimalString,
-						nextIndexRevision
-					) > 0
-				) {
-					hydrationInvalid('state.payload.nextIndexRevision');
-				}
-			}
-		}
-		return {
-			scope,
-			cache,
-			operationProtocols,
-			operationGenerations,
-				recordClocks,
-				recordKeysByScope,
-				anonymousRecordClocks,
-				trustedPresets,
-				nextIndexRevision
-			};
-	} catch {
-		return undefined;
-	}
+		})
+	);
 }
 
-export function parseOperationProtocolState(
+function parseOperationState(
 	value: unknown,
 	path: string
-): OperationProtocolState {
-	const raw = hydrationRecord(
+): SerializedOperationProtocolState {
+	const raw = exactRecord(
 		value,
 		path,
 		[
@@ -425,195 +466,282 @@ export function parseOperationProtocolState(
 		],
 		['operation', 'indexClocks', 'indexKeys', 'pathRecords', 'cursors']
 	);
-	const indexClocks = new Map<string, IndexProtocolClock>();
-	for (const [index, entry] of hydrationArray(
-		raw.indexClocks,
-		`${path}.indexClocks`
-	).entries()) {
-		const entryPath = `${path}.indexClocks[${index}]`;
-		const pair = hydrationPair(entry, entryPath);
-		const projection = hydrationString(pair[0], `${entryPath}[0]`);
-		if (indexClocks.has(projection)) hydrationInvalid(`${entryPath}[0]`);
-		const clock = hydrationRecord(
-			pair[1],
-			`${entryPath}[1]`,
-			['scopeToken', 'position']
-		);
-		indexClocks.set(
-			projection,
-			Object.freeze({
-					scopeToken: hydrationOpaque(
-						clock.scopeToken,
-						`${entryPath}[1].scopeToken`
-					),
-				position: hydrationDecimal(
-					clock.position,
-					`${entryPath}[1].position`
-				)
-			})
-		);
-	}
-	const indexKeys = new Set<string>();
-	for (const [index, entry] of hydrationArray(
-		raw.indexKeys,
-		`${path}.indexKeys`
-	).entries()) {
-		const key = hydrationString(entry, `${path}.indexKeys[${index}]`);
-		if (indexKeys.has(key)) hydrationInvalid(`${path}.indexKeys[${index}]`);
-		indexKeys.add(key);
-	}
-	const pathRecords = new Map<string, string>();
-	for (const [index, entry] of hydrationArray(
-		raw.pathRecords,
-		`${path}.pathRecords`
-	).entries()) {
-		const entryPath = `${path}.pathRecords[${index}]`;
-		const pair = hydrationPair(entry, entryPath);
-		const responsePath = hydrationString(pair[0], `${entryPath}[0]`);
-		if (pathRecords.has(responsePath)) hydrationInvalid(`${entryPath}[0]`);
-		pathRecords.set(
-			responsePath,
-			hydrationString(pair[1], `${entryPath}[1]`)
-		);
-	}
-	const cursors = hydrationArray(raw.cursors, `${path}.cursors`).map(
-		(entry, index) => {
-			const entryPath = `${path}.cursors[${index}]`;
-			const cursor = hydrationRecord(
-				entry,
-				entryPath,
-				['projection', 'position', 'token']
-			);
-			return Object.freeze({
-				projection: hydrationString(
-					cursor.projection,
-					`${entryPath}.projection`
-				),
-				position: hydrationDecimal(
-					cursor.position,
-					`${entryPath}.position`
-				),
-				token: hydrationOpaque(cursor.token, `${entryPath}.token`)
-			});
-		}
+	const snapshotScope = optional(raw.snapshotScope, `${path}.snapshotScope`, opaque);
+	const indexRevision = optional(raw.indexRevision, `${path}.indexRevision`, decimal);
+	const retiredAtRevision = optional(
+		raw.retiredAtRevision,
+		`${path}.retiredAtRevision`,
+		decimal
 	);
-	return {
-		operation: hydrationString(raw.operation, `${path}.operation`),
-		...(raw.snapshotScope === undefined
-			? {}
-			: {
-					snapshotScope: hydrationOpaque(
-						raw.snapshotScope,
-						`${path}.snapshotScope`
-					)
-				}),
-		indexClocks,
-		...(raw.indexRevision === undefined
-			? {}
-			: {
-					indexRevision: hydrationDecimal(
-						raw.indexRevision,
-						`${path}.indexRevision`
-					)
-				}),
-		...(raw.retiredAtRevision === undefined
-			? {}
-			: {
-					retiredAtRevision: hydrationDecimal(
-						raw.retiredAtRevision,
-						`${path}.retiredAtRevision`
-					)
-				}),
-		indexKeys,
-		pathRecords,
-		cursors: Object.freeze(cursors)
-	};
-}
-
-export function parseRecordClock(value: unknown, path: string): RecordProtocolClock {
-	const raw = hydrationRecord(
-		value,
-		path,
-		['scopeToken', 'incarnation', 'revision', 'tombstone']
-	);
-	if (typeof raw.tombstone !== 'boolean') hydrationInvalid(`${path}.tombstone`);
 	return Object.freeze({
-		scopeToken: hydrationOpaque(raw.scopeToken, `${path}.scopeToken`),
-		incarnation: hydrationDecimal(raw.incarnation, `${path}.incarnation`),
-		revision: hydrationDecimal(raw.revision, `${path}.revision`),
-		tombstone: raw.tombstone
+		operation: nonEmptyString(raw.operation, `${path}.operation`),
+		...(snapshotScope === undefined ? {} : { snapshotScope }),
+		indexClocks: parseUniquePairs(
+			raw.indexClocks,
+			`${path}.indexClocks`,
+			(entry, entryPath) => {
+				const clock = exactRecord(entry, entryPath, ['scopeToken', 'position']);
+				return Object.freeze({
+					scopeToken: opaque(clock.scopeToken, `${entryPath}.scopeToken`),
+					position: decimal(clock.position, `${entryPath}.position`)
+				});
+			}
+		),
+		...(indexRevision === undefined ? {} : { indexRevision }),
+		...(retiredAtRevision === undefined ? {} : { retiredAtRevision }),
+		indexKeys: uniqueStrings(raw.indexKeys, `${path}.indexKeys`),
+		pathRecords: parseUniquePairs(raw.pathRecords, `${path}.pathRecords`, nonEmptyString),
+		cursors: Object.freeze(
+			array(raw.cursors, `${path}.cursors`).map((entry, index) => {
+				const entryPath = `${path}.cursors[${index}]`;
+				const cursor = exactRecord(entry, entryPath, [
+					'projection',
+					'position',
+					'token'
+				]);
+				return Object.freeze({
+					projection: nonEmptyString(cursor.projection, `${entryPath}.projection`),
+					position: decimal(cursor.position, `${entryPath}.position`),
+					token: opaque(cursor.token, `${entryPath}.token`)
+				});
+			})
+		)
 	});
 }
 
-export function hydrationRecord(
+function parseRecordClock(value: unknown, path: string): RecordProtocolClock {
+	const raw = exactRecord(value, path, [
+		'scopeToken',
+		'incarnation',
+		'revision',
+		'tombstone'
+	]);
+	return Object.freeze({
+		scopeToken: opaque(raw.scopeToken, `${path}.scopeToken`),
+		incarnation: decimal(raw.incarnation, `${path}.incarnation`),
+		revision: decimal(raw.revision, `${path}.revision`),
+		tombstone: boolean(raw.tombstone, `${path}.tombstone`)
+	});
+}
+
+/** What the separately valid parts of a payload must agree on. */
+function assertMetadataConsistent(payload: ReplicaDehydratedPayloadV1): void {
+	const clocks = new Map(payload.recordClocks);
+	const scopes = new Set<string>();
+	for (const [key, clock] of payload.recordClocks) {
+		if (scopes.has(clock.scopeToken)) {
+			throw new TypeError(`replica state repeats the record scope of ${key}`);
+		}
+		scopes.add(clock.scopeToken);
+	}
+	for (const [scopeToken, anonymous] of payload.anonymousRecordClocks) {
+		if (anonymous.clock.scopeToken !== scopeToken || scopes.has(scopeToken)) {
+			throw new TypeError(
+				'replica state has an anonymous record clock under the wrong scope'
+			);
+		}
+	}
+	for (const record of payload.cache.records) {
+		const disagrees = (): never => {
+			throw new TypeError(`replica state record clock disagrees with ${record.key}`);
+		};
+		const clock = clocks.get(record.key);
+		// Only records of a model carry a server clock.
+		const modeled = modelFromRecordKey(record.key) !== undefined;
+		const tombstoned = record.tombstoneRevision !== undefined;
+		if (clock === undefined) {
+			if (modeled) disagrees();
+			continue;
+		}
+		if (
+			tombstoned &&
+			!(clock.tombstone && clock.revision === record.tombstoneRevision)
+		) {
+			disagrees();
+		}
+		if (
+			modeled &&
+			(clock.incarnation !== record.incarnation ||
+				clock.revision !== record.revision ||
+				clock.tombstone !== tombstoned)
+		) {
+			disagrees();
+		}
+	}
+	const next = payload.nextIndexRevision as DistributedDecimalString;
+	const beyondCheckpoint = (revision: string | undefined): boolean =>
+		revision !== undefined &&
+		compareDistributedDecimal(revision as DistributedDecimalString, next) > 0;
+	const revisionsByIndex = new Map<string, Set<string>>();
+	for (const group of payload.operations) {
+		for (const state of [group.query, group.live]) {
+			if (state === undefined) continue;
+			if (
+				beyondCheckpoint(state.indexRevision) ||
+				beyondCheckpoint(state.retiredAtRevision)
+			) {
+				throw new TypeError('replica state operation revision exceeds its checkpoint');
+			}
+			if (state.indexRevision === undefined && state.indexKeys.length > 0) {
+				throw new TypeError('replica state operation index keys lack a revision');
+			}
+			for (const [, recordKey] of state.pathRecords) {
+				if (modelFromRecordKey(recordKey) !== undefined && !clocks.has(recordKey)) {
+					throw new TypeError('replica state operation path lacks a record clock');
+				}
+			}
+			if (state.indexRevision === undefined) continue;
+			for (const key of state.indexKeys) {
+				let revisions = revisionsByIndex.get(key);
+				if (revisions === undefined) {
+					revisions = new Set();
+					revisionsByIndex.set(key, revisions);
+				}
+				revisions.add(state.indexRevision);
+			}
+		}
+	}
+	for (const index of payload.cache.indexes) {
+		if (
+			beyondCheckpoint(index.revision) ||
+			!revisionsByIndex.get(index.key)?.has(index.revision)
+		) {
+			throw new TypeError(
+				`replica state index lacks a matching operation checkpoint: ${index.key}`
+			);
+		}
+	}
+}
+
+function parseUniquePairs<T>(
+	value: unknown,
+	path: string,
+	parseValue: (value: unknown, path: string) => T
+): readonly (readonly [string, T])[] {
+	const keys = new Set<string>();
+	return Object.freeze(
+		array(value, path).map((entry, index) => {
+			const entryPath = `${path}[${index}]`;
+			if (!Array.isArray(entry) || entry.length !== 2) invalid(entryPath);
+			const key = nonEmptyString(entry[0], `${entryPath}[0]`);
+			if (keys.has(key)) invalid(`${entryPath}[0]`);
+			keys.add(key);
+			return Object.freeze([key, parseValue(entry[1], `${entryPath}[1]`)] as const);
+		})
+	);
+}
+
+function uniqueStrings(value: unknown, path: string): readonly string[] {
+	const seen = new Set<string>();
+	return Object.freeze(
+		array(value, path).map((entry, index) => {
+			const string = nonEmptyString(entry, `${path}[${index}]`);
+			if (seen.has(string)) invalid(`${path}[${index}]`);
+			seen.add(string);
+			return string;
+		})
+	);
+}
+
+function assertRecordLink(value: unknown, path: string): void {
+	if (value === null) return;
+	if (typeof value === 'string') return void nonEmptyString(value, path);
+	uniqueStrings(value, path);
+}
+
+function assertJsonValue(
+	value: unknown,
+	path: string,
+	ancestors = new Set<object>()
+): void {
+	if (value === null || typeof value === 'string' || typeof value === 'boolean') {
+		return;
+	}
+	if (typeof value === 'number') {
+		if (!Number.isFinite(value)) invalid(path);
+		return;
+	}
+	if (typeof value !== 'object' || ancestors.has(value)) invalid(path);
+	ancestors.add(value);
+	if (Array.isArray(value)) {
+		for (const [index, entry] of value.entries()) {
+			assertJsonValue(entry, `${path}[${index}]`, ancestors);
+		}
+	} else {
+		for (const [key, entry] of Object.entries(plainRecord(value, path))) {
+			assertJsonValue(entry, `${path}.${key}`, ancestors);
+		}
+	}
+	ancestors.delete(value);
+}
+
+function optional<T>(
+	value: unknown,
+	path: string,
+	parse: (value: unknown, path: string) => T
+): T | undefined {
+	return value === undefined ? undefined : parse(value, path);
+}
+
+/** A plain object with only `allowed` members and every `required` one. */
+export function exactRecord(
 	value: unknown,
 	path: string,
 	allowed: readonly string[],
 	required: readonly string[] = allowed
 ): Record<string, unknown> {
-	if (!isHydrationRecord(value)) hydrationInvalid(path);
-	const allowedKeys = new Set(allowed);
-	for (const key of Object.keys(value)) {
-		if (!allowedKeys.has(key)) hydrationInvalid(`${path}.${key}`);
+	const record = plainRecord(value, path);
+	for (const key of Object.keys(record)) {
+		if (!allowed.includes(key)) invalid(`${path}.${key}`);
 	}
 	for (const key of required) {
-		if (!Object.prototype.hasOwnProperty.call(value, key)) {
-			hydrationInvalid(`${path}.${key}`);
+		if (!Object.prototype.hasOwnProperty.call(record, key)) {
+			invalid(`${path}.${key}`);
 		}
 	}
+	return record;
+}
+
+export function plainRecord(value: unknown, path: string): Record<string, unknown> {
+	if (!isPlainRecord(value)) invalid(path);
 	return value;
 }
 
-export function isHydrationRecord(value: unknown): value is Record<string, unknown> {
-	return typeof value === 'object' && value !== null && !Array.isArray(value);
-}
-
-export function hydrationArray(value: unknown, path: string): unknown[] {
-	if (!Array.isArray(value)) hydrationInvalid(path);
+function array(value: unknown, path: string): unknown[] {
+	if (!Array.isArray(value)) invalid(path);
 	return value;
 }
 
-export function hydrationPair(value: unknown, path: string): readonly [unknown, unknown] {
-	if (!Array.isArray(value) || value.length !== 2) hydrationInvalid(path);
-	return value as unknown as readonly [unknown, unknown];
-}
-
-export function hydrationString(value: unknown, path: string): string {
-	if (typeof value !== 'string' || value.length === 0) hydrationInvalid(path);
+export function nonEmptyString(value: unknown, path: string): string {
+	if (typeof value !== 'string' || value.length === 0) invalid(path);
 	return value;
 }
 
-export function hydrationOpaque(
-	value: unknown,
-	path: string
-): DistributedOpaqueString {
-	return hydrationString(value, path) as DistributedOpaqueString;
+function opaque(value: unknown, path: string): DistributedOpaqueString {
+	return nonEmptyString(value, path) as DistributedOpaqueString;
 }
 
-export function hydrationDecimal(
-	value: unknown,
-	path: string
-): DistributedDecimalString {
-	const string = hydrationString(value, path);
-	if (!/^(0|[1-9][0-9]*)$/.test(string)) hydrationInvalid(path);
+function decimal(value: unknown, path: string): DistributedDecimalString {
+	const string = nonEmptyString(value, path);
+	if (!/^(0|[1-9][0-9]*)$/.test(string)) invalid(path);
 	return string as DistributedDecimalString;
 }
 
-export function hydrationGeneration(value: unknown, path: string): number {
-	if (!Number.isSafeInteger(value) || (value as number) < 0) {
-		hydrationInvalid(path);
-	}
-	return value as number;
-}
-
-export function hydrationOperationSource(
-	value: unknown,
-	path: string
-): OperationProtocolSource {
-	if (value !== 'query' && value !== 'live') hydrationInvalid(path);
+function boolean(value: unknown, path: string): boolean {
+	if (typeof value !== 'boolean') invalid(path);
 	return value;
 }
 
-export function hydrationInvalid(path: string): never {
-	throw new TypeError(`invalid replica hydration state at ${path}`);
+export function nonNegativeInteger(value: unknown, path: string): number {
+	if (!Number.isSafeInteger(value) || (value as number) < 0) invalid(path);
+	return value as number;
+}
+
+function operationSource(value: unknown, path: string): OperationProtocolSource {
+	if (value !== 'query' && value !== 'live') invalid(path);
+	return value;
+}
+
+function invalid(path: string): never {
+	throw new TypeError(`invalid replica state at ${path}`);
 }

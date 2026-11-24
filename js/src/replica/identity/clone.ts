@@ -1,9 +1,10 @@
 import type { GraphqlVariables } from '../../types.js';
 import type { ReplicaValue } from '../types.js';
+import { canonicalJson } from '../../lib/canonical-json.js';
 import { freezeRecord } from '../../lib/freeze-record.js';
 
 export function canonicalVariables(variables: GraphqlVariables): string {
-	return canonicalCacheValue(cloneJsonObject(variables));
+	return canonicalJson(cloneJsonObject(variables));
 }
 
 export function cloneJsonObject(
@@ -51,14 +52,3 @@ export function cloneJsonValue(value: unknown, ancestors = new Set<object>()): R
 	ancestors.delete(value);
 	return cloned;
 }
-
-export function canonicalCacheValue(value: ReplicaValue): string {
-	if (value === null || typeof value !== 'object') return JSON.stringify(value);
-	if (Array.isArray(value)) return `[${value.map(canonicalCacheValue).join(',')}]`;
-	const record = value as Readonly<Record<string, ReplicaValue>>;
-	return `{${Object.keys(record)
-		.sort()
-		.map((key) => `${JSON.stringify(key)}:${canonicalCacheValue(record[key]!)}`)
-		.join(',')}}`;
-}
-

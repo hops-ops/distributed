@@ -10,4 +10,3 @@ export const ORDER_EQUAL = Object.freeze({ result: 'equal' as const }) satisfies
 export const PAGINATION_LOCAL = Object.freeze({
 	decision: 'local' as const
 }) satisfies ReplicaPaginationMaintenanceDecision;
-export const UTF8_ENCODER = new TextEncoder();

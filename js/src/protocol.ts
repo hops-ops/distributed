@@ -1016,10 +1016,11 @@ function canonicalDecimal(
  * Compare two already-validated protocol decimals without converting either
  * through JavaScript's numeric types.
  */
-export function compareDistributedDecimal(
-	left: DistributedDecimalString,
-	right: DistributedDecimalString
-): -1 | 0 | 1 {
+/**
+ * Order two canonical decimal strings as the unsigned integers they spell.
+ * The one decimal comparison in the client; the server compares the integers.
+ */
+export function compareDistributedDecimal(left: string, right: string): -1 | 0 | 1 {
 	if (left.length !== right.length) return left.length < right.length ? -1 : 1;
 	return left === right ? 0 : left < right ? -1 : 1;
 }

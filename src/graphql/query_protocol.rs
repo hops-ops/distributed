@@ -556,7 +556,9 @@ struct PreparedQueryEvidence {
     indexes: QueryIndexPlan,
 }
 
-const MAX_PROTOCOL_EVIDENCE_ITEMS: usize = 4_096;
+/// Records, indexes or observations one envelope may carry; pinned for the
+/// client in `tests/fixtures/protocol-envelope-v1.json`.
+pub(crate) const MAX_PROTOCOL_EVIDENCE_ITEMS: usize = 4_096;
 
 struct PreparedLiveChange {
     /// Physical owner used for change-log routing and opaque scope tokens.

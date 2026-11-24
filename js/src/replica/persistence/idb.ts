@@ -20,14 +20,16 @@ import {
 	STORE_NAME,
 	filterReplicaState,
 	normalizePolicy,
-	parseAuthoritativeScope,
-	parseReplicaState,
 	parseStoredEntry,
 	persistenceIdentity,
-	sameScope,
 	type NormalizedPolicy,
 	type StoredReplicaEntry
 } from './state.js';
+import {
+	parseAuthoritativeScope,
+	parseDehydratedState,
+	sameScope
+} from '../distributed-replica/hydration.js';
 
 export class IndexedDbConfirmedStatePersistence
 	implements ReplicaIndexedDbPersistence
@@ -51,7 +53,7 @@ export class IndexedDbConfirmedStatePersistence
 
 	async save(state: ReplicaDehydratedState): Promise<boolean> {
 		this.#assertOpen();
-		const parsed = parseReplicaState(state);
+		const parsed = parseDehydratedState(state);
 		const filtered = filterReplicaState(parsed, this.#policy);
 		const identity = persistenceIdentity(parsed.scope);
 		if (filtered === undefined) {
@@ -80,7 +82,7 @@ export class IndexedDbConfirmedStatePersistence
 
 		try {
 			const entry = parseStoredEntry(raw);
-			const parsed = parseReplicaState(entry.state);
+			const parsed = parseDehydratedState(entry.state);
 			if (
 				entry.identity !== identity ||
 				!sameScope(parsed.scope, scope)
