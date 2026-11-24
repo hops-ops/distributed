@@ -270,8 +270,10 @@ pub(crate) struct EngineInner {
     pub(crate) read_stores: BTreeMap<String, crate::graphql::read_store::ReadStoreKind>,
     pub(crate) cell_getters:
         BTreeMap<String, std::sync::Arc<dyn crate::graphql::read_store::CellByKeyGetter>>,
-    /// Leaderboard stores by surface name ([`GraphqlEngineBuilder::leaderboard`]).
-    pub(crate) leaderboard_stores: BTreeMap<String, Arc<dyn crate::leaderboard::LeaderboardStore>>,
+    /// External read executors by (section, source name)
+    /// ([`GraphqlEngineBuilder::external_read_source`]).
+    pub(crate) external_executors:
+        BTreeMap<(String, String), Arc<dyn crate::graphql::surface::ExternalReadExecutor>>,
 }
 
 /// Bounds on one origin GraphQL WebSocket connection.
@@ -349,8 +351,5 @@ pub struct GraphqlEngineBuilder {
     pub(crate) identity: Option<IdentityConfig>,
     pub(crate) websocket: WebsocketLimits,
     pub(crate) read_stores: BTreeMap<String, crate::graphql::read_store::ReadStore>,
-    pub(crate) leaderboards: Vec<(
-        crate::graphql::surface::LeaderboardSurface,
-        Arc<dyn crate::leaderboard::LeaderboardStore>,
-    )>,
+    pub(crate) external: Vec<Arc<dyn crate::graphql::surface::ExternalReadExecutor>>,
 }

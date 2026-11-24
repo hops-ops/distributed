@@ -2,14 +2,14 @@
 //!
 //! - Store: `InMemoryLeaderboard`, or `RedisLeaderboard` when `REDIS_URL`
 //!   is set (sorted sets; every idempotent write is one Lua script).
-//! - Live path (fire-and-forget): kills commit in the Crawler cells, next to
-//!   the rooms on celld; their `crawler.mob_killed` events reach this server
-//!   through the outbox Queue relay and the crawler directory
-//!   (`super::directory`). Every change of a crawler's totals there becomes
-//!   one [`CrawlerTotals`] occurrence ([`Leaderboards::submit_totals`]) on a
-//!   `BackgroundLeaderboard`: `Max` of kills and XP, so repeats, replays and
-//!   reordering are no-ops. A full queue or a Redis outage drops the update
-//!   (counted); the next change or a rebuild heals it.
+//! - Live path: kills commit in the Crawler cells, next to the rooms on
+//!   celld; their `crawler.mob_killed` events reach this server through the
+//!   outbox Queue relay and the crawler directory (`super::directory`).
+//!   Every change of a crawler's totals there becomes one [`CrawlerTotals`]
+//!   occurrence ([`Leaderboards::apply_totals`]) applied by the projector:
+//!   `Max` of kills and XP, so repeats, replays and reordering are no-ops. A
+//!   Redis outage fails the apply and the directory poller offers the same
+//!   totals again on its next pass.
 //! - Idempotency of the rebuild: every kill in a cell's history becomes a
 //!   `DomainEventOccurrence` whose id is derived from `(producer,
 //!   "Crawler:{principal}", event sequence, "mob_killed")`; the projector's
@@ -28,14 +28,13 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
-use distributed::leaderboard::{
-    BackgroundLeaderboard, BackgroundLeaderboardOptions, Board, InMemoryLeaderboard,
-    LeaderboardChange, LeaderboardChangeListener, LeaderboardEntry, LeaderboardError,
-    LeaderboardProjection, LeaderboardProjector, LeaderboardStore, RedisLeaderboard, ScorePolicy,
-    ScoreSubmission,
-};
 use distributed::{DomainEventOccurrence, ExternalEventSource};
 use distributed_game::GameRecord;
+use distributed_leaderboard::{
+    Board, InMemoryLeaderboard, LeaderboardChange, LeaderboardChangeListener, LeaderboardEntry,
+    LeaderboardError, LeaderboardProjection, LeaderboardProjector, LeaderboardStore,
+    RedisLeaderboard, ScorePolicy, ScoreSubmission,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
@@ -60,20 +59,6 @@ pub struct BoardRow {
     pub name: String,
     /// Score (kills or XP).
     pub score: f64,
-}
-
-/// Live-update counters of the background applier.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, GameRecord)]
-#[serde(rename_all = "camelCase")]
-pub struct BackgroundStats {
-    /// Occurrences enqueued.
-    pub enqueued: u64,
-    /// Applied to the store.
-    pub applied: u64,
-    /// Dropped (queue full / store outage).
-    pub dropped: u64,
-    /// Failed to apply.
-    pub failed: u64,
 }
 
 /// Kills and XP of one principal.
@@ -136,8 +121,6 @@ pub struct BoardSnapshot {
     pub kills: Vec<BoardRow>,
     /// Top XP.
     pub xp: Vec<BoardRow>,
-    /// Background applier counters.
-    pub background: BackgroundStats,
     /// Last rebuild, if any.
     pub last_rebuild: Option<RebuildReport>,
 }
@@ -274,7 +257,6 @@ type Projector = LeaderboardProjector<dyn LeaderboardStore, KillProjection>;
 pub struct Leaderboards {
     store: Arc<dyn LeaderboardStore>,
     projector: Projector,
-    background: BackgroundLeaderboard,
     backend: &'static str,
     kills: Board,
     xp: Board,
@@ -288,7 +270,7 @@ pub struct Leaderboards {
 
 impl Leaderboards {
     /// Redis when `redis_url` is given, else in memory. Must run inside a
-    /// Tokio runtime (spawns the background applier and the refresher).
+    /// Tokio runtime (spawns the refresher).
     /// `on_change` is told every board whose scores changed (applied kills
     /// and rebuild promotions): the zone server publishes it on the
     /// projection bus as `distributed.leaderboard.changed`, which drives
@@ -314,14 +296,9 @@ impl Leaderboards {
         if let Some(listener) = on_change {
             projector = projector.with_change_listener(listener);
         }
-        let background = BackgroundLeaderboard::spawn(
-            projector.clone(),
-            BackgroundLeaderboardOptions::default(),
-        );
         let boards = Arc::new(Self {
             store,
             projector,
-            background,
             backend,
             kills: Board::high_first(KILLS_BOARD).expect("board name"),
             xp: Board::high_first(XP_BOARD).expect("board name"),
@@ -332,7 +309,6 @@ impl Leaderboards {
                 members: 0,
                 kills: Vec::new(),
                 xp: Vec::new(),
-                background: BackgroundStats::default(),
                 last_rebuild: None,
             })),
             version: AtomicU64::new(0),
@@ -364,20 +340,27 @@ impl Leaderboards {
         (&self.kills, &self.xp)
     }
 
-    /// Fire-and-forget live update: `principal` (shown as `name`) now has
-    /// these totals.
-    pub fn submit_totals(&self, principal: &str, name: &str, kills: u32, xp: u64) {
+    /// Live update: `principal` (shown as `name`) now has these totals.
+    /// Idempotent; on an error the caller offers the totals again later.
+    pub async fn apply_totals(
+        &self,
+        principal: &str,
+        name: &str,
+        kills: u32,
+        xp: u64,
+    ) -> Result<(), String> {
         self.remember_name(principal, name);
-        match totals_occurrence(&CrawlerTotals {
+        let occurrence = totals_occurrence(&CrawlerTotals {
             crawler: principal.to_string(),
             kills,
             xp,
-        }) {
-            Ok(occurrence) => {
-                self.background.submit(occurrence);
-            }
-            Err(error) => eprintln!("mobpit: leaderboard update skipped: {error}"),
-        }
+        })?;
+        self.projector
+            .apply_event(&occurrence)
+            .await
+            .map_err(|error| error.to_string())?;
+        self.mark_dirty();
+        Ok(())
     }
 
     fn remember_name(&self, principal: &str, name: &str) {
@@ -434,19 +417,12 @@ impl Leaderboards {
 
     async fn refresh(&self) -> Result<(), LeaderboardError> {
         let (kills, xp, members) = self.top_rows().await?;
-        let stats = self.background.stats();
         let mut body = BoardSnapshot {
             version: 0,
             backend: self.backend.into(),
             members,
             kills,
             xp,
-            background: BackgroundStats {
-                enqueued: stats.enqueued,
-                applied: stats.applied,
-                dropped: stats.dropped,
-                failed: stats.failed,
-            },
             last_rebuild: self.last_rebuild.lock().expect("rebuild").clone(),
         };
         let mut snapshot = self.snapshot.lock().expect("snapshot");
@@ -558,19 +534,13 @@ impl Leaderboards {
 }
 
 async fn refresh_loop(boards: std::sync::Weak<Leaderboards>) {
-    let mut last_applied = u64::MAX;
     loop {
         tokio::time::sleep(Duration::from_millis(150)).await;
         let Some(boards) = boards.upgrade() else {
             return;
         };
-        let applied = boards.background.stats().applied;
-        if applied != last_applied || boards.dirty.swap(false, Ordering::AcqRel) {
-            if boards.refresh().await.is_ok() {
-                last_applied = applied;
-            } else {
-                boards.mark_dirty();
-            }
+        if boards.dirty.swap(false, Ordering::AcqRel) && boards.refresh().await.is_err() {
+            boards.mark_dirty();
         }
     }
 }

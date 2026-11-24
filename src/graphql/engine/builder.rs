@@ -40,7 +40,7 @@ impl GraphqlEngineBuilder {
             identity: None,
             websocket: WebsocketLimits::default(),
             read_stores: BTreeMap::new(),
-            leaderboards: Vec::new(),
+            external: Vec::new(),
         }
     }
 
@@ -624,18 +624,16 @@ impl GraphqlEngineBuilder {
         self.websocket = limits;
         self
     }
-    /// Expose a sorted-set leaderboard through GraphQL (roots, `@live`
-    /// subscriptions, the client manifest and the generated TS client); see
-    /// [`LeaderboardSurface`](crate::graphql::surface::LeaderboardSurface).
-    /// Feed `@live` by registering
-    /// [`GraphqlEngine::leaderboard_change_listener`] on the projector that
-    /// writes `store`.
-    pub fn leaderboard(
+    /// Serve an external read source's roots (queries, `@live`
+    /// subscriptions, the client manifest); see
+    /// [`ExternalReadSource`](crate::graphql::surface::ExternalReadSource).
+    /// `@live` roots refresh when the change keys of their reads are
+    /// published on [`GraphqlEngine::change_hub`].
+    pub fn external_read_source(
         mut self,
-        surface: crate::graphql::surface::LeaderboardSurface,
-        store: Arc<dyn crate::leaderboard::LeaderboardStore>,
+        executor: Arc<dyn crate::graphql::surface::ExternalReadExecutor>,
     ) -> Self {
-        self.leaderboards.push((surface, store));
+        self.external.push(executor);
         self
     }
 
@@ -708,13 +706,19 @@ impl GraphqlEngineBuilder {
 
         // Validate permissions.
         let declared_roles = self.roles.clone();
-        for (leaderboard, _) in &self.leaderboards {
-            for role in leaderboard.grants().keys() {
+        let external_sources = self
+            .external
+            .iter()
+            .map(|executor| executor.source())
+            .collect::<Vec<_>>();
+        for source in &external_sources {
+            for role in source.roles() {
                 if let Some(roles) = &declared_roles {
-                    if !roles.contains(role) && role != &self.anonymous_role {
+                    if !roles.contains(&role) && role != self.anonymous_role {
                         return Err(GraphqlBuildError(format!(
-                            "leaderboard `{}` grants undeclared role `{role}`",
-                            leaderboard.name()
+                            "{} `{}` grants undeclared role `{role}`",
+                            source.section(),
+                            source.name()
                         )));
                     }
                 }
@@ -825,7 +829,7 @@ impl GraphqlEngineBuilder {
                 .with_service_binding(self.command_binding.clone())
                 .with_projection_owners(self.projectors.clone())
                 .map_err(GraphqlBuildError)?
-                .with_leaderboards(self.leaderboards.iter().map(|(surface, _)| surface.clone()))
+                .with_external_sources(external_sources.iter().cloned())
                 .map_err(GraphqlBuildError)?,
         );
         let query_protocol = if self.protocol_token_key.is_some() {
@@ -846,11 +850,7 @@ impl GraphqlEngineBuilder {
             .transpose()?;
 
         let mut roles: BTreeSet<String> = self.permissions.keys().cloned().collect();
-        roles.extend(
-            self.leaderboards
-                .iter()
-                .flat_map(|(leaderboard, _)| leaderboard.grants().keys().cloned()),
-        );
+        roles.extend(external_sources.iter().flat_map(|source| source.roles()));
         if let Some(declared) = &declared_roles {
             roles.extend(declared.iter().cloned());
         }
@@ -890,7 +890,7 @@ impl GraphqlEngineBuilder {
                     .as_deref()
                     .expect("protocol configuration validated a service ID");
                 let (authorization_fingerprint, claim_keys) =
-                    role_authorization_info(role, &self.permissions, &full_surface.leaderboards)?;
+                    role_authorization_info(role, &self.permissions, &full_surface.external)?;
                 let export = DistributedClientSurfaceExport::from_selected_with_execution(
                     service_id,
                     Arc::clone(&role_surface),
@@ -999,7 +999,7 @@ impl GraphqlEngineBuilder {
                         role_authorization_info(
                             &registration.schema_roles[0],
                             &self.permissions,
-                            &full_surface.leaderboards,
+                            &full_surface.external,
                         )?
                     } else {
                         // Multi-privilege: fingerprint the application surface grant
@@ -1008,7 +1008,7 @@ impl GraphqlEngineBuilder {
                             &privilege_key,
                             &registration.schema_roles,
                             &self.permissions,
-                            &full_surface.leaderboards,
+                            &full_surface.external,
                         )?
                     };
                 // Ensure the privilege key has a role surface for projection
@@ -1122,10 +1122,16 @@ impl GraphqlEngineBuilder {
             query_protocol,
             read_stores: read_store_kinds,
             cell_getters,
-            leaderboard_stores: self
-                .leaderboards
+            external_executors: self
+                .external
                 .into_iter()
-                .map(|(surface, store)| (surface.name().to_string(), store))
+                .zip(external_sources)
+                .map(|(executor, source)| {
+                    (
+                        (source.section().to_string(), source.name().to_string()),
+                        executor,
+                    )
+                })
                 .collect(),
         });
 

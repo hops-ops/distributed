@@ -1,10 +1,12 @@
-//! Leaderboard surfaces: sorted-set boards ([`crate::leaderboard`]) exposed
-//! through the generated GraphQL surface, client manifest and TS client.
+//! Leaderboard surfaces: sorted-set boards exposed through the generated
+//! GraphQL surface, client manifest and TS client as an
+//! [`ExternalReadSource`].
 //!
 //! A [`LeaderboardSurface`] declares one board (or one board *family*, keyed
-//! by a `board` argument) and per-role grants. It is feature-free so the
-//! pool-free client manifest export and the runtime engine share one
-//! declaration. For a surface named `xp` the roots are:
+//! by a `board` argument) and per-role grants. The pool-free client manifest
+//! export (`Surface::with_external_sources`) and the runtime engine
+//! ([`LeaderboardRoots`](crate::LeaderboardRoots)) share one declaration.
+//! For a surface named `xp` the roots are:
 //!
 //! | Root | Grant | Arguments | Result |
 //! |---|---|---|---|
@@ -19,12 +21,19 @@
 //! separate `rank_any_member` grant, which adds `xpRank(member:)`.
 //! `xpLeaderboard`, `xpLeaderboardAround` and `xpMyRank` also exist as
 //! subscription roots for `@live`; they refresh when the board's change key
-//! ([`leaderboard_change_key`]) is published.
+//! ([`leaderboard_change_key`]) or [`ALL_BOARDS_CHANGE_KEY`](crate::ALL_BOARDS_CHANGE_KEY)
+//! is published.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
-use crate::leaderboard::{Board, ScoreOrder};
-use crate::microsvc::USER_ID_KEY;
+use distributed::graphql::surface::{
+    ExternalField, ExternalReadSource, ExternalRoot, ExternalType,
+};
+use distributed::microsvc::USER_ID_KEY;
+
+use crate::manifest::{ClientLeaderboard, ClientLeaderboardArgument, ClientLeaderboardRoot};
+use crate::{Board, ScoreOrder, LEADERBOARDS_SECTION};
 
 /// GraphQL object type of one ranked row.
 pub const LEADERBOARD_ENTRY_TYPE: &str = "LeaderboardEntry";
@@ -37,7 +46,8 @@ pub const LEADERBOARD_MAX_RADIUS: u32 = 25;
 /// Longest board family key.
 pub const MAX_LEADERBOARD_KEY_LEN: usize = 64;
 
-/// The live-invalidation key of a board: `leaderboard:{board name}`.
+/// The live-invalidation key of a board: `leaderboard:{board name}`. Reads
+/// also listen on [`ALL_BOARDS_CHANGE_KEY`](crate::ALL_BOARDS_CHANGE_KEY).
 pub fn leaderboard_change_key(board: &str) -> String {
     format!("leaderboard:{board}")
 }
@@ -133,23 +143,6 @@ impl LeaderboardOperation {
     pub fn ranks_viewer(self) -> bool {
         matches!(self, Self::AroundMe | Self::MyRank)
     }
-}
-
-/// One argument of a leaderboard root.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct LeaderboardArgument {
-    pub name: &'static str,
-    /// GraphQL scalar (`String` or `Int`).
-    pub type_name: &'static str,
-    pub nullable: bool,
-}
-
-/// One generated leaderboard root.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct LeaderboardRoot {
-    pub name: String,
-    pub operation: LeaderboardOperation,
-    pub arguments: Vec<LeaderboardArgument>,
 }
 
 /// A leaderboard (or board family) exposed through GraphQL.
@@ -301,47 +294,41 @@ impl LeaderboardSurface {
         Board::new(name, self.order).map_err(|error| error.message().to_string())
     }
 
-    /// Roots for `grant` (query roots; [`LeaderboardOperation::is_live`]
-    /// ones also have a subscription twin).
-    pub fn roots(&self, grant: LeaderboardGrant) -> Vec<LeaderboardRoot> {
+    /// Roots for `grant`, with their operations ([`LeaderboardOperation::is_live`]
+    /// ones are `live`).
+    pub fn roots_for(&self, grant: LeaderboardGrant) -> Vec<(LeaderboardOperation, ExternalRoot)> {
         let family = matches!(self.boards, LeaderboardBoards::Family { .. });
-        let board = || {
-            family.then_some(LeaderboardArgument {
-                name: "board",
-                type_name: "String",
-                nullable: false,
-            })
-        };
         let mut roots = Vec::new();
-        let mut push = |suffix: &str, operation, extra: Option<LeaderboardArgument>| {
-            let mut arguments = board().into_iter().collect::<Vec<_>>();
-            arguments.extend(extra);
-            roots.push(LeaderboardRoot {
-                name: format!("{}{suffix}", self.name),
-                operation,
-                arguments,
-            });
-        };
+        let mut push =
+            |suffix: &str, operation: LeaderboardOperation, extra: Option<ExternalField>| {
+                let mut arguments = Vec::new();
+                if family {
+                    arguments.push(ExternalField::new("board", "String", false));
+                }
+                arguments.extend(extra);
+                roots.push((
+                    operation,
+                    ExternalRoot {
+                        name: format!("{}{suffix}", self.name),
+                        arguments,
+                        type_name: LEADERBOARD_ENTRY_TYPE.to_string(),
+                        list: operation.is_list(),
+                        live: operation.is_live(),
+                    },
+                ));
+            };
         if grant.top {
             push(
                 "Leaderboard",
                 LeaderboardOperation::Top,
-                Some(LeaderboardArgument {
-                    name: "first",
-                    type_name: "Int",
-                    nullable: true,
-                }),
+                Some(ExternalField::new("first", "Int", true)),
             );
         }
         if grant.around_me {
             push(
                 "LeaderboardAround",
                 LeaderboardOperation::AroundMe,
-                Some(LeaderboardArgument {
-                    name: "radius",
-                    type_name: "Int",
-                    nullable: true,
-                }),
+                Some(ExternalField::new("radius", "Int", true)),
             );
         }
         if grant.my_rank {
@@ -351,18 +338,14 @@ impl LeaderboardSurface {
             push(
                 "Rank",
                 LeaderboardOperation::Rank,
-                Some(LeaderboardArgument {
-                    name: "member",
-                    type_name: "String",
-                    nullable: false,
-                }),
+                Some(ExternalField::new("member", "String", false)),
             );
         }
         roots
     }
 
     /// Validate the declaration (names, limits, board, roles).
-    pub(crate) fn validate(&self) -> Result<(), String> {
+    fn check(&self) -> Result<(), String> {
         let mut chars = self.name.chars();
         if !chars.next().is_some_and(|c| c.is_ascii_lowercase())
             || !chars.all(|c| c.is_ascii_alphanumeric())
@@ -406,18 +389,9 @@ impl LeaderboardSurface {
         Ok(())
     }
 
-    /// The declaration as seen by `role` (`None` when not granted).
-    pub(crate) fn for_role(&self, role: &str) -> Option<Self> {
-        let grant = *self.grants.get(role)?;
-        Some(Self {
-            grants: BTreeMap::from([(role.to_string(), grant)]),
-            ..self.clone()
-        })
-    }
-
-    /// The declaration every schema role of an application may use, granted
-    /// under the application's name (`None` when nothing is common).
-    pub(crate) fn for_roles(&self, application: &str, roles: &[String]) -> Option<Self> {
+    /// The declaration as `roles` jointly see it (the intersection of their
+    /// grants), granted to `grantee`; `None` when nothing is common.
+    fn selected(&self, grantee: &str, roles: &[String]) -> Option<Self> {
         let mut common: Option<LeaderboardGrant> = None;
         for role in roles {
             let grant = *self.grants.get(role)?;
@@ -425,12 +399,12 @@ impl LeaderboardSurface {
         }
         let common = common.filter(|grant| !grant.is_empty())?;
         Some(Self {
-            grants: BTreeMap::from([(application.to_string(), common)]),
+            grants: BTreeMap::from([(grantee.to_string(), common)]),
             ..self.clone()
         })
     }
 
-    pub(crate) fn canonical_value(&self) -> serde_json::Value {
+    fn canonical_value(&self) -> serde_json::Value {
         let grants = self
             .grants
             .iter()
@@ -463,52 +437,96 @@ impl LeaderboardSurface {
 }
 
 /// `high_first` / `low_first`.
-pub fn order_str(order: ScoreOrder) -> &'static str {
+fn order_str(order: ScoreOrder) -> &'static str {
     match order {
         ScoreOrder::HighFirst => "high_first",
         ScoreOrder::LowFirst => "low_first",
     }
 }
 
-/// Validate a set of declarations against each other and the existing roots.
-pub(crate) fn validate_leaderboards(
-    leaderboards: &[LeaderboardSurface],
-    existing_roots: &[&str],
-    existing_types: &[&str],
-) -> Result<(), String> {
-    if existing_types.contains(&LEADERBOARD_ENTRY_TYPE) && !leaderboards.is_empty() {
-        return Err(format!(
-            "GraphQL type `{LEADERBOARD_ENTRY_TYPE}` is reserved for leaderboards"
-        ));
+impl ExternalReadSource for LeaderboardSurface {
+    fn section(&self) -> &str {
+        LEADERBOARDS_SECTION
     }
-    let mut names = std::collections::BTreeSet::new();
-    let mut roots = existing_roots
-        .iter()
-        .map(|root| root.to_string())
-        .collect::<std::collections::BTreeSet<_>>();
-    for leaderboard in leaderboards {
-        leaderboard.validate()?;
-        if !names.insert(leaderboard.name.clone()) {
-            return Err(format!(
-                "duplicate leaderboard surface `{}`",
-                leaderboard.name
-            ));
-        }
-        for root in leaderboard.roots(LeaderboardGrant {
-            top: true,
-            around_me: true,
-            my_rank: true,
-            rank_any_member: true,
-        }) {
-            if !roots.insert(root.name.clone()) {
-                return Err(format!(
-                    "leaderboard root `{}` collides with another root",
-                    root.name
-                ));
+
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn roles(&self) -> Vec<String> {
+        self.grants.keys().cloned().collect()
+    }
+
+    fn select(&self, grantee: &str, roles: &[String]) -> Option<Arc<dyn ExternalReadSource>> {
+        self.selected(grantee, roles)
+            .map(|selected| Arc::new(selected) as Arc<dyn ExternalReadSource>)
+    }
+
+    fn types(&self) -> Vec<ExternalType> {
+        vec![ExternalType {
+            name: LEADERBOARD_ENTRY_TYPE.to_string(),
+            fields: vec![
+                ExternalField::new("rank", "Int", false),
+                ExternalField::new("member", "String", false),
+                ExternalField::new("score", "Float", false),
+            ],
+        }]
+    }
+
+    fn roots(&self) -> Vec<ExternalRoot> {
+        self.roots_for(self.selected_grant())
+            .into_iter()
+            .map(|(_, root)| root)
+            .collect()
+    }
+
+    fn claims(&self) -> Vec<String> {
+        vec![self.member_claim.clone()]
+    }
+
+    fn contract(&self) -> serde_json::Value {
+        self.canonical_value()
+    }
+
+    fn client_manifest(&self, subscriptions: bool) -> serde_json::Value {
+        let manifest = ClientLeaderboard {
+            name: self.name.clone(),
+            entry_typename: LEADERBOARD_ENTRY_TYPE.to_string(),
+            order: order_str(self.order).to_string(),
+            boards: match self.boards {
+                LeaderboardBoards::Single { .. } => "single",
+                LeaderboardBoards::Family { .. } => "family",
             }
-        }
+            .to_string(),
+            default_first: self.default_first,
+            max_first: self.max_first,
+            max_radius: self.max_radius,
+            roots: self
+                .roots_for(self.selected_grant())
+                .into_iter()
+                .map(|(operation, root)| ClientLeaderboardRoot {
+                    live: subscriptions && root.live,
+                    list: root.list,
+                    operation: operation.as_str().to_string(),
+                    arguments: root
+                        .arguments
+                        .into_iter()
+                        .map(|argument| ClientLeaderboardArgument {
+                            name: argument.name,
+                            type_name: argument.type_name,
+                            nullable: argument.nullable,
+                        })
+                        .collect(),
+                    name: root.name,
+                })
+                .collect(),
+        };
+        serde_json::to_value(manifest).expect("a client leaderboard serializes")
     }
-    Ok(())
+
+    fn validate(&self) -> Result<(), String> {
+        self.check()
+    }
 }
 
 #[cfg(test)]
@@ -523,27 +541,30 @@ mod tests {
 
     #[test]
     fn roots_follow_the_grant() {
-        let user = xp().roots(LeaderboardGrant::read());
+        let user = xp().roots_for(LeaderboardGrant::read());
         assert_eq!(
             user.iter()
-                .map(|root| root.name.as_str())
+                .map(|(_, root)| root.name.as_str())
                 .collect::<Vec<_>>(),
             ["xpLeaderboard", "xpLeaderboardAround", "xpMyRank"]
         );
         assert!(user
             .iter()
-            .all(|root| root.arguments.iter().all(|arg| arg.name != "member")));
-        let moderator = xp().roots(LeaderboardGrant::read().rank_any_member());
-        assert_eq!(moderator.last().unwrap().name, "xpRank");
-        assert_eq!(moderator.last().unwrap().arguments[0].name, "member");
+            .all(|(_, root)| root.arguments.iter().all(|arg| arg.name != "member")));
+        let moderator = xp().roots_for(LeaderboardGrant::read().rank_any_member());
+        let (operation, rank) = moderator.last().unwrap();
+        assert_eq!(*operation, LeaderboardOperation::Rank);
+        assert_eq!(rank.name, "xpRank");
+        assert!(!rank.live);
+        assert_eq!(rank.arguments[0].name, "member");
     }
 
     #[test]
     fn families_take_a_validated_board_key() {
         let season = LeaderboardSurface::family("season", "season.xp", ScoreOrder::HighFirst)
             .grant("user", LeaderboardGrant::top_only());
-        let roots = season.roots(LeaderboardGrant::top_only());
-        assert_eq!(roots[0].arguments[0].name, "board");
+        let roots = season.roots_for(LeaderboardGrant::top_only());
+        assert_eq!(roots[0].1.arguments[0].name, "board");
         assert_eq!(season.board(Some("s3")).unwrap().name(), "season.xp:s3");
         assert!(season.board(None).is_err());
         assert!(season.board(Some("bad key")).is_err());
@@ -554,32 +575,30 @@ mod tests {
 
     #[test]
     fn role_and_application_selection_narrow_the_grant() {
-        assert!(xp().for_role("guest").is_none());
-        let user = xp().for_role("user").unwrap();
+        assert!(xp().selected("guest", &["guest".into()]).is_none());
+        let user = xp().selected("user", &["user".into()]).unwrap();
         assert_eq!(user.selected_grant(), LeaderboardGrant::read());
         let app = xp()
-            .for_roles("app", &["user".into(), "moderator".into()])
+            .selected("app", &["user".into(), "moderator".into()])
             .unwrap();
+        assert_eq!(app.grants().keys().collect::<Vec<_>>(), ["app"]);
         assert_eq!(app.selected_grant(), LeaderboardGrant::read());
-        assert!(xp().for_roles("app", &["guest".into()]).is_none());
+        assert!(xp().selected("app", &["guest".into()]).is_none());
     }
 
     #[test]
-    fn rejects_bad_declarations_and_collisions() {
+    fn rejects_bad_declarations() {
         assert!(
             LeaderboardSurface::single("Xp", &Board::high_first("b").unwrap())
-                .validate()
+                .check()
                 .is_err()
         );
-        assert!(xp().limits(0, 10, 5).validate().is_err());
-        assert!(xp().limits(20, 10, 5).validate().is_err());
+        assert!(xp().limits(0, 10, 5).check().is_err());
+        assert!(xp().limits(20, 10, 5).check().is_err());
         assert!(xp()
             .grant("nobody", LeaderboardGrant::default())
-            .validate()
+            .check()
             .is_err());
-        assert!(validate_leaderboards(&[xp(), xp()], &[], &[]).is_err());
-        assert!(validate_leaderboards(&[xp()], &["xpMyRank"], &[]).is_err());
-        assert!(validate_leaderboards(&[xp()], &[], &[LEADERBOARD_ENTRY_TYPE]).is_err());
-        assert!(validate_leaderboards(&[xp()], &["players"], &["Player"]).is_ok());
+        assert!(xp().check().is_ok());
     }
 }

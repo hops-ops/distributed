@@ -35,8 +35,8 @@ mod application;
 mod build;
 mod commands;
 mod effects;
+pub(crate) mod external;
 mod identity;
-mod leaderboard;
 mod projections;
 mod roots;
 mod types;
@@ -49,11 +49,9 @@ pub use application::{
     surface_for_application, surface_for_application_contract, surface_for_role,
 };
 pub use build::build_surface;
-pub use leaderboard::{
-    leaderboard_change_key, order_str as leaderboard_order_str, LeaderboardArgument,
-    LeaderboardBoards, LeaderboardGrant, LeaderboardOperation, LeaderboardRoot, LeaderboardSurface,
-    LEADERBOARD_DEFAULT_FIRST, LEADERBOARD_ENTRY_TYPE, LEADERBOARD_MAX_FIRST,
-    LEADERBOARD_MAX_RADIUS, MAX_LEADERBOARD_KEY_LEN,
+pub use external::{
+    ExternalField, ExternalReadError, ExternalReadErrorKind, ExternalReadExecutor,
+    ExternalReadResult, ExternalReadSource, ExternalRoot, ExternalType,
 };
 pub use projections::SurfaceModeledProjection;
 pub(crate) use projections::{

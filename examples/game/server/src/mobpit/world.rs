@@ -17,7 +17,7 @@ use super::store::{CelldOptions, CrawlerCells};
 use crate::common::random_hex;
 use crate::common::relay::{ProjectionBus, ProjectionPublisher};
 use crate::common::zone_status::ZoneStatusView;
-use distributed::leaderboard::LeaderboardChangePublisher;
+use distributed_leaderboard::LeaderboardChangePublisher;
 
 /// Bus consumer group of the rooms' zone status projection here.
 pub const ZONE_STATUS_CONSUMER: &str = "mobpit-rooms";
@@ -113,7 +113,9 @@ impl MobPitWorld {
         // Board changes go out on the projection bus (once attached) so the
         // GraphQL service's `@live` boards follow them.
         let projection: Arc<OnceLock<ProjectionBus>> = Arc::default();
-        let notices = LeaderboardChangePublisher::spawn(ProjectionPublisher(projection.clone()));
+        // At most a few distinct boards pend; beyond that, one every-board notice.
+        let notices =
+            LeaderboardChangePublisher::spawn(ProjectionPublisher(projection.clone()), 64);
         let board = Leaderboards::open(
             options.redis_url.as_deref(),
             &options.redis_prefix,
@@ -272,7 +274,8 @@ impl MobPitWorld {
 }
 
 /// Keep the boards in step with the crawler directory: every change of a
-/// crawler's totals becomes one idempotent `Max` update.
+/// crawler's totals becomes one idempotent `Max` update, retried on the next
+/// pass until it applies.
 async fn feed_board(world: std::sync::Weak<MobPitWorld>) {
     let mut seen: HashMap<String, (i64, i64)> = HashMap::new();
     loop {
@@ -291,13 +294,22 @@ async fn feed_board(world: std::sync::Weak<MobPitWorld>) {
             if seen.get(&row.player_id) == Some(&totals) {
                 continue;
             }
-            world.board.submit_totals(
-                &row.player_id,
-                &row.name,
-                u32::try_from(row.kills).unwrap_or(0),
-                u64::try_from(row.xp).unwrap_or(0),
-            );
-            seen.insert(row.player_id, totals);
+            let applied = world
+                .board
+                .apply_totals(
+                    &row.player_id,
+                    &row.name,
+                    u32::try_from(row.kills).unwrap_or(0),
+                    u64::try_from(row.xp).unwrap_or(0),
+                )
+                .await;
+            match applied {
+                Ok(()) => {
+                    seen.insert(row.player_id, totals);
+                }
+                // Not marked seen: the next pass offers these totals again.
+                Err(error) => eprintln!("mobpit: leaderboard update deferred: {error}"),
+            }
         }
     }
 }

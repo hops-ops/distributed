@@ -15,7 +15,7 @@
 #   NATS_URL=nats://localhost:4222 \
 #     cargo test --test nats_transport --features nats
 #   REDIS_URL=redis://127.0.0.1:6379 \
-#     cargo test --test redis_leaderboard --features redis
+#     cargo test -p distributed_leaderboard --features redis,graphql --test redis
 services:
   postgres:
     image: postgres:18

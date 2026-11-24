@@ -658,8 +658,8 @@ pub(super) fn validate_surface(
             require_nested_fingerprints,
         )?;
     }
-    for leaderboard in &contract.leaderboards {
-        validate_json_contract("surface leaderboard", leaderboard)?;
+    for source in contract.external.values().flatten() {
+        validate_json_contract("surface external read source", source)?;
     }
     Ok(())
 }

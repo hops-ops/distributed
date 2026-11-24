@@ -104,7 +104,7 @@ mod publisher;
 mod rabbitmq;
 #[cfg(feature = "rabbitmq")]
 mod rabbitmq_bus;
-#[cfg(feature = "redis")]
+#[cfg(feature = "redis-streams")]
 mod redis_streams;
 mod router;
 mod run_options;
@@ -161,7 +161,7 @@ pub use ordered_delivery::OrderedDelivery;
 #[cfg(feature = "postgres")]
 pub use postgres_bus::{LogReceived, PostgresBus, QueueReceived};
 pub use publisher::MessagePublisher;
-#[cfg(feature = "redis")]
+#[cfg(feature = "redis-streams")]
 pub use redis_streams::{
     RedisStreamPublisher, DEFAULT_REDIS_DEDUPE_TTL, DEFAULT_REDIS_STREAM_PREFIX,
 };

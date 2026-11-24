@@ -13,6 +13,30 @@ fn invalid(message: impl Into<String>) -> ClientCompileError {
     ClientCompileError::manifest("client.manifest.leaderboard", message)
 }
 
+/// The typed `leaderboards` section of the manifest's external read sources.
+/// Any other section is refused: this compiler cannot generate a client for
+/// it.
+pub(crate) fn external_leaderboards(
+    external: &std::collections::BTreeMap<String, Vec<serde_json::Value>>,
+) -> Result<Vec<ClientLeaderboard>, ClientCompileError> {
+    let mut leaderboards = Vec::new();
+    for (section, values) in external {
+        if section != LEADERBOARDS_SECTION {
+            return Err(ClientCompileError::manifest(
+                "client.manifest.external",
+                format!("unknown external read source section `{section}`"),
+            ));
+        }
+        for value in values {
+            leaderboards.push(
+                serde_json::from_value(value.clone())
+                    .map_err(|error| invalid(format!("malformed leaderboard: {error}")))?,
+            );
+        }
+    }
+    Ok(leaderboards)
+}
+
 /// Validate the leaderboard section against itself and the read-model roots.
 pub(crate) fn validate_leaderboards(
     leaderboards: &[ClientLeaderboard],

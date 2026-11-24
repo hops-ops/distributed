@@ -22,9 +22,10 @@ path = "src/main.rs"
 [dependencies]
 mobpit_crawler = { path = "../crawler" }
 mobpit_tiers = { path = "../tiers" }
-# `redis`: the Redis leaderboards the zone server writes, served as GraphQL
-# board roots (`xpLeaderboard`, `killsMyRank`, … with `@live`).
-distributed = { path = "../../../..", features = ["sqlite", "http", "graphql", "redis"] }
+distributed = { path = "../../../..", features = ["sqlite", "http", "graphql"] }
+# The Redis leaderboards the zone server writes, served as GraphQL board
+# roots (`xpLeaderboard`, `killsMyRank`, … with `@live`).
+distributed_leaderboard = { path = "../../../../distributed_leaderboard", features = ["redis", "graphql"] }
 # The rooms' zone status read model (`zone_activities`, the minimap).
 distributed_game = { path = "../../../../distributed_game", features = ["cell"] }
 axum = { version = "0.8", default-features = false, features = ["json", "tokio", "http1", "ws"] }

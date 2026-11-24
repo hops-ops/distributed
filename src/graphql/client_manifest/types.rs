@@ -151,11 +151,15 @@ pub struct DistributedClientManifest {
     pub projectors: Vec<ClientProjector>,
     pub projection_programs: Vec<ClientProjectionProgram>,
     pub projection_bindings: Vec<ClientProjectionBinding>,
-    /// Leaderboard queries. Omitted when empty, so a manifest without
-    /// leaderboards (and its fingerprint) is unchanged; a compiler that does
-    /// not know this field refuses a manifest that has one.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub leaderboards: Vec<ClientLeaderboard>,
+    /// External read sources by section ([`ExternalReadSource::section`]),
+    /// each entry its source's client-manifest value, sorted by source name.
+    /// Omitted when empty, so a manifest without external sources (and its
+    /// fingerprint) is unchanged; a compiler refuses a section it does not
+    /// know.
+    ///
+    /// [`ExternalReadSource::section`]: crate::graphql::surface::ExternalReadSource::section
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub external: BTreeMap<String, Vec<serde_json::Value>>,
 }
 
 impl DistributedClientManifest {
@@ -185,8 +189,8 @@ impl DistributedClientManifest {
             projectors: &'a [ClientProjector],
             projection_programs: &'a [ClientProjectionProgram],
             projection_bindings: &'a [ClientProjectionBinding],
-            #[serde(skip_serializing_if = "<[ClientLeaderboard]>::is_empty")]
-            leaderboards: &'a [ClientLeaderboard],
+            #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+            external: &'a BTreeMap<String, Vec<serde_json::Value>>,
         }
         hash_json(&SchemaMaterial {
             manifest_version: self.manifest_version,
@@ -203,7 +207,7 @@ impl DistributedClientManifest {
             projectors: &self.projectors,
             projection_programs: &self.projection_programs,
             projection_bindings: &self.projection_bindings,
-            leaderboards: &self.leaderboards,
+            external: &self.external,
         })
     }
 }
@@ -242,46 +246,6 @@ impl ClientArgument {
             format!("{base}!")
         }
     }
-}
-
-/// One leaderboard surface on the client contract.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ClientLeaderboard {
-    /// GraphQL base name (`xp` → `xpLeaderboard`, …).
-    pub name: String,
-    /// Object type of each row (`LeaderboardEntry`: `rank`, `member`, `score`).
-    pub entry_typename: String,
-    /// `high_first` or `low_first`.
-    pub order: String,
-    /// `single` (no `board` argument) or `family` (`board: String!`).
-    pub boards: String,
-    pub default_first: u32,
-    pub max_first: u32,
-    pub max_radius: u32,
-    pub roots: Vec<ClientLeaderboardRoot>,
-}
-
-/// One leaderboard root the selected roles may run.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ClientLeaderboardRoot {
-    pub name: String,
-    /// `top`, `around_me`, `my_rank` or `rank`.
-    pub operation: String,
-    /// `true`: `[LeaderboardEntry!]!`; `false`: nullable `LeaderboardEntry`.
-    pub list: bool,
-    /// Whether a same-named subscription root exists (`@live`).
-    pub live: bool,
-    pub arguments: Vec<ClientLeaderboardArgument>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ClientLeaderboardArgument {
-    pub name: String,
-    pub type_name: String,
-    pub nullable: bool,
 }
 
 /// Framework-owned operations generated alongside application operations.

@@ -53,11 +53,11 @@ mod engine;
 #[cfg(feature = "graphql")]
 mod execute;
 #[cfg(feature = "graphql")]
+mod external_roots;
+#[cfg(feature = "graphql")]
 pub mod http;
 #[cfg(feature = "graphql")]
 pub mod identity;
-#[cfg(feature = "graphql")]
-mod leaderboard_roots;
 #[cfg(feature = "graphql")]
 pub mod protocol;
 #[cfg(feature = "graphql")]

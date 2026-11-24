@@ -25,10 +25,10 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use distributed::leaderboard::LeaderboardStore;
 use distributed_game::bots::{run_bots, Behaviour, BotConfig};
 use distributed_game::net::TicketKey;
 use distributed_game::{Fact, FactError, FactSink, FactStamp, ZoneRng};
+use distributed_leaderboard::LeaderboardStore;
 use game_demos::common::random_hex;
 use game_demos::devcelld::DevCelld;
 use game_demos::mobpit::board::{kill_occurrence, MobKilled};

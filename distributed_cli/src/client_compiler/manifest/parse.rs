@@ -194,9 +194,9 @@ impl ClientManifest {
                     error.to_string(),
                 )
             })?;
-        validate_leaderboards(&wire.leaderboards, &roots, &typenames)?;
-        let live_leaderboards = wire
-            .leaderboards
+        let leaderboards = external_leaderboards(&wire.external)?;
+        validate_leaderboards(&leaderboards, &roots, &typenames)?;
+        let live_leaderboards = leaderboards
             .iter()
             .any(|leaderboard| leaderboard.roots.iter().any(|root| root.live));
         validate_derived_capabilities(&wire.capabilities, &roots, &commands, live_leaderboards)?;
@@ -227,7 +227,7 @@ impl ClientManifest {
             projectors,
             projection_programs,
             projection_bindings,
-            leaderboards: wire.leaderboards,
+            leaderboards,
         })
     }
 

@@ -3,10 +3,10 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use crate::bus::{Message, TransportError};
-use crate::DomainEventOccurrence;
+use distributed::bus::{Message, TransportError};
+use distributed::DomainEventOccurrence;
 
-use super::{ApplyKey, ApplyOutcome, Board, LeaderboardError, LeaderboardStore, ScoreSubmission};
+use crate::{ApplyKey, ApplyOutcome, Board, LeaderboardError, LeaderboardStore, ScoreSubmission};
 
 /// One score change a projection derives from an occurrence.
 #[derive(Debug, Clone, PartialEq)]
@@ -80,7 +80,7 @@ impl ProjectionReport {
 /// Called with each live board whose scores changed: after an applied (not
 /// duplicate) change, and after a rebuild promotes a board. A GraphQL engine
 /// turns this into `@live` invalidation
-/// (`GraphqlEngine::leaderboard_change_listener`).
+/// (`change_listener`, feature `graphql`).
 pub type LeaderboardChangeListener = Arc<dyn Fn(&Board) + Send + Sync>;
 
 /// Applies a [`LeaderboardProjection`] to a [`LeaderboardStore`].
@@ -304,18 +304,18 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bus::MessageKind;
-    use crate::leaderboard::{InMemoryLeaderboard, LeaderboardErrorKind, ScorePolicy};
+    use crate::{InMemoryLeaderboard, LeaderboardErrorKind, ScorePolicy};
+    use distributed::bus::MessageKind;
     use std::time::{Duration, UNIX_EPOCH};
 
-    #[derive(serde::Serialize, serde::Deserialize, crate::DomainEvent)]
+    #[derive(serde::Serialize, serde::Deserialize, distributed::DomainEvent)]
     #[domain_event(name = "test.monster_slain", version = 1)]
     struct MonsterSlain {
         player: String,
         xp: u32,
     }
 
-    #[derive(serde::Serialize, serde::Deserialize, crate::DomainEvent)]
+    #[derive(serde::Serialize, serde::Deserialize, distributed::DomainEvent)]
     #[domain_event(name = "test.chat_sent", version = 1)]
     struct ChatSent {
         text: String,
@@ -323,7 +323,7 @@ mod tests {
 
     fn slain(position: u64, player: &str, xp: u32) -> DomainEventOccurrence {
         DomainEventOccurrence::capture_external(
-            crate::ExternalEventSource {
+            distributed::ExternalEventSource {
                 producer: "zone.sim".into(),
                 stream: "zone-1".into(),
                 position,
@@ -341,7 +341,7 @@ mod tests {
 
     fn chat(position: u64) -> DomainEventOccurrence {
         DomainEventOccurrence::capture_external(
-            crate::ExternalEventSource {
+            distributed::ExternalEventSource {
                 producer: "zone.sim".into(),
                 stream: "zone-1".into(),
                 position,

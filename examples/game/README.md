@@ -268,7 +268,7 @@ and `vite dev` on `SVELTEKIT_PORT` (default 5573). What each piece replaces:
   cross processes on the bus: the zone server's `LeaderboardProjector`
   publishes `distributed.leaderboard.changed` for each changed board
   (`LeaderboardChangePublisher`), and `mobpit-service` subscribes with
-  `GraphqlEngine::leaderboard_change_handlers` (`spawn_board_notices`).
+  `distributed_leaderboard::change_handlers` (`spawn_board_notices`).
   Both processes use `REDIS_URL` and the same key prefix
   (`MOBPIT_REDIS_PREFIX`, default `mobpit`).
   The rows come from the cells (see *Mob Pit*, step 5).
@@ -734,10 +734,10 @@ are available.
   `REDIS_URL=redis://127.0.0.1:6379 examples/game/run.sh leaderboard`).
 - **Live**: the services' crawler list (the `player_stats` projection of
   the cells' events) feeds the boards: every change of a crawler's totals
-  becomes one `CrawlerTotals` occurrence applied with `max` on both boards,
-  fire-and-forget through `BackgroundLeaderboard` (a full queue or a Redis
-  outage drops and counts the update; the next change heals it). Repeats,
-  replays and reordering are no-ops.
+  becomes one `CrawlerTotals` occurrence applied by the projector with
+  `max` on both boards (a Redis outage defers it: the directory poller
+  offers the same totals again on its next pass). Repeats, replays and
+  reordering are no-ops.
 - **Rebuild** (button, `POST /dev/mobpit/leaderboard/rebuild`, and at every
   server start): read every cell's durable event stream, project each kill
   (`capture_external`, source `mobpit.crawler-cell` /

@@ -5,7 +5,7 @@ use std::sync::Mutex;
 
 use async_trait::async_trait;
 
-use super::{
+use crate::{
     validate_member, ApplyKey, ApplyOutcome, Board, LeaderboardEntry, LeaderboardError,
     LeaderboardStore, ScoreOrder, ScorePolicy, ScoreSubmission,
 };
@@ -205,7 +205,7 @@ mod tests {
     #[tokio::test]
     async fn in_memory_store_satisfies_the_leaderboard_contract() {
         let store = InMemoryLeaderboard::new();
-        crate::leaderboard::conformance::run_store_contract(&store, "contract").await;
+        crate::conformance::run_store_contract(&store, "contract").await;
     }
 
     #[tokio::test]

@@ -1,11 +1,11 @@
 //! Sorted-set leaderboards as a rebuildable projection target.
 //!
 //! Leaderboards are a poor fit for the relational read-model traits
-//! ([`ReadModelWritePlanStore`](crate::ReadModelWritePlanStore) and friends):
-//! the hot queries are *rank of member*, *top N* and *members around a member*,
-//! which a sorted set answers in `O(log n)` while a SQL table needs a window
-//! function or a full index scan per request. This module is therefore a
-//! dedicated, typed seam rather than another relational backend.
+//! (`ReadModelWritePlanStore` and friends): the hot queries are *rank of
+//! member*, *top N* and *members around a member*, which a sorted set answers
+//! in `O(log n)` while a SQL table needs a window function or a full index
+//! scan per request. This crate is therefore a dedicated, typed seam rather
+//! than another relational backend.
 //!
 //! # Pieces
 //!
@@ -18,45 +18,33 @@
 //!   ordering and tie-break semantics as Redis, for tests and demos.
 //! - `RedisLeaderboard` (feature `redis`) — Redis sorted sets, with every
 //!   idempotent write executed by one Lua script.
-//! - [`LeaderboardProjector`] — maps [`DomainEventOccurrence`](crate::DomainEventOccurrence)s (directly, or
-//!   decoded from an outbox [`Message`](crate::bus::Message)) to score changes
-//!   through a [`LeaderboardProjection`], applies them idempotently and
-//!   rebuilds boards from an event history.
-//! - `BackgroundLeaderboard` (feature `redis`) — a bounded, fire-and-forget
-//!   in-process queue in front of a projector, so a Redis outage never blocks
-//!   gameplay.
-//!
-//! # GraphQL
-//!
-//! With the `graphql` feature, `GraphqlEngineBuilder::leaderboard` exposes a
-//! store through the generated surface (top-N, around-me and my-rank roots,
-//! `@live` subscriptions, the client manifest and `leaderboards.ts`), and
-//! [`LeaderboardProjector::with_change_listener`] +
-//! `GraphqlEngine::leaderboard_change_listener` refresh live queries after an
-//! applied change. Across processes, `LeaderboardChangePublisher` publishes
-//! [`LEADERBOARD_CHANGED_EVENT`] notices on the bus and
-//! `GraphqlEngine::leaderboard_change_handlers` consumes them. See
-//! `docs/live-query-delivery.md`.
+//! - [`LeaderboardProjector`] — maps [`DomainEventOccurrence`](distributed::DomainEventOccurrence)s
+//!   (directly, or decoded from an outbox [`Message`](distributed::bus::Message))
+//!   to score changes through a [`LeaderboardProjection`], applies them
+//!   idempotently and rebuilds boards from an event history.
+//! - [`LeaderboardSurface`] + [`LeaderboardRoots`] — boards as GraphQL roots
+//!   through the engine's external read source extension point
+//!   (`GraphqlEngineBuilder::external_read_source`): top-N, around-me and
+//!   my-rank roots, `@live` subscriptions, the application contract and the
+//!   client manifest's `leaderboards` section (`leaderboards.ts`).
+//! - [`LeaderboardChangePublisher`] / [`LeaderboardChanged`] — board change
+//!   notices on the bus, for `@live` boards served by another process; with
+//!   the `graphql` feature, `change_listener` and `change_handlers` feed a
+//!   `GraphqlEngine`. See `docs/live-query-delivery.md`.
 //!
 //! # How it plugs into projections
 //!
 //! A leaderboard is an *eventual* projection: the source of truth stays the
 //! aggregate event stream, and the board can be thrown away and rebuilt at any
-//! time. There are two ways to feed it:
-//!
-//! 1. **Outbox / bus (durable, recommended for production).** Publish domain
-//!    events through the outbox as usual and subscribe a consumer whose handler
-//!    calls [`LeaderboardProjector::apply_message`]. The handler returns a
-//!    classified [`TransportError`](crate::bus::TransportError): a Redis outage
-//!    is retryable (the message is redelivered), an undecodable payload is
-//!    permanent. Because gameplay commands only commit to the event store and
-//!    outbox, a Redis blip delays the board but never blocks a command.
-//! 2. **In-process (best effort).** Hand committed occurrences to a
-//!    `BackgroundLeaderboard` (feature `leaderboard-background`, implied by
-//!    `redis`; needs Tokio, works over any store, e.g. the in-memory one),
-//!    which applies them on a background task and drops (and counts)
-//!    updates when its queue is full or the store stays down. Dropped
-//!    updates are healed by the next rebuild.
+//! time. Feed it from the outbox / bus: publish domain events through the
+//! outbox as usual and subscribe a consumer whose handler calls
+//! [`LeaderboardProjector::apply_message`]. The handler returns a classified
+//! [`TransportError`](distributed::bus::TransportError): a Redis outage is
+//! retryable (the message is redelivered), an undecodable payload is
+//! permanent. Because gameplay commands only commit to the event store and
+//! outbox, a Redis blip delays the board but never blocks a command. A
+//! process that already holds committed occurrences (a poller, a relay) calls
+//! [`LeaderboardProjector::apply_event`] itself and retries what failed.
 //!
 //! # Idempotency
 //!
@@ -87,31 +75,42 @@
 //! makes overlapping replay safe.
 
 mod in_memory;
+#[cfg(feature = "graphql")]
+mod live;
+mod manifest;
 mod notify;
 mod projector;
-
-#[cfg(feature = "leaderboard-background")]
-mod background;
 #[cfg(feature = "redis")]
 mod redis;
+mod roots;
+mod surface;
 
 use std::fmt;
 
 use async_trait::async_trait;
 
 pub use in_memory::InMemoryLeaderboard;
-#[cfg(feature = "leaderboard-background")]
-pub use notify::LeaderboardChangePublisher;
-pub use notify::{LeaderboardChanged, LEADERBOARD_CHANGED_EVENT};
+#[cfg(feature = "graphql")]
+pub use live::{change_handlers, change_listener};
+pub use manifest::{
+    ClientLeaderboard, ClientLeaderboardArgument, ClientLeaderboardRoot, LEADERBOARDS_SECTION,
+};
+pub use notify::{
+    LeaderboardChangePublisher, LeaderboardChanged, ALL_BOARDS_CHANGE_KEY,
+    LEADERBOARD_CHANGED_EVENT,
+};
 pub use projector::{
     LeaderboardChange, LeaderboardChangeListener, LeaderboardProjection, LeaderboardProjector,
     LeaderboardRebuild, ProjectionReport,
 };
-
-#[cfg(feature = "leaderboard-background")]
-pub use background::{BackgroundLeaderboard, BackgroundLeaderboardOptions, BackgroundStats};
 #[cfg(feature = "redis")]
 pub use redis::{RedisLeaderboard, DEFAULT_REDIS_LEADERBOARD_PREFIX};
+pub use roots::LeaderboardRoots;
+pub use surface::{
+    leaderboard_change_key, LeaderboardBoards, LeaderboardGrant, LeaderboardOperation,
+    LeaderboardSurface, LEADERBOARD_DEFAULT_FIRST, LEADERBOARD_ENTRY_TYPE, LEADERBOARD_MAX_FIRST,
+    LEADERBOARD_MAX_RADIUS, MAX_LEADERBOARD_KEY_LEN,
+};
 
 /// Maximum board name length in bytes.
 pub const MAX_BOARD_NAME_LEN: usize = 200;
@@ -374,13 +373,13 @@ impl LeaderboardError {
     }
 
     /// Map to a transport error: unavailable is retryable, invalid permanent.
-    pub fn into_transport_error(self) -> crate::bus::TransportError {
+    pub fn into_transport_error(self) -> distributed::bus::TransportError {
         match self.kind {
             LeaderboardErrorKind::Unavailable => {
-                crate::bus::TransportError::retryable(self.to_string())
+                distributed::bus::TransportError::retryable(self.to_string())
             }
             LeaderboardErrorKind::Invalid => {
-                crate::bus::TransportError::permanent(self.to_string())
+                distributed::bus::TransportError::permanent(self.to_string())
             }
         }
     }
@@ -398,7 +397,7 @@ impl fmt::Display for LeaderboardError {
 
 impl std::error::Error for LeaderboardError {}
 
-impl From<LeaderboardError> for crate::bus::TransportError {
+impl From<LeaderboardError> for distributed::bus::TransportError {
     fn from(err: LeaderboardError) -> Self {
         err.into_transport_error()
     }
