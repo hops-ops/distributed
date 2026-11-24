@@ -15,7 +15,7 @@ pub mod surface;
 // pool/server independent. `distributed` and the runtime engine must compile the same
 // surface without pulling in async-graphql or a database adapter.
 mod commands;
-mod complexity_contract;
+mod cost;
 mod filter;
 mod permissions;
 
@@ -31,12 +31,11 @@ pub use sdl::{
     graphql_sdl_from_surface, SdlOptions,
 };
 pub use surface::{
-    build_surface, surface_for_application, surface_for_application_contract, surface_for_role,
-    RootField, RootKind, Surface, SurfaceArgument, SurfaceArgumentKind, SurfaceCommand,
-    SurfaceCommandShape, SurfaceDialect, SurfaceDirectProjection, SurfaceModel,
-    SurfaceModeledProjection, SurfaceOptions, SurfaceProjectionOwner, SurfaceProjector,
-    SurfaceRelationshipAggregate, SurfaceRelationshipKeys, SurfaceRowPolicy, SurfaceTypeDef,
-    SurfaceTypeField,
+    build_surface, surface_for_application, surface_for_role, RootField, RootKind, Surface,
+    SurfaceArgument, SurfaceArgumentKind, SurfaceCommand, SurfaceCommandShape, SurfaceDialect,
+    SurfaceDirectProjection, SurfaceModel, SurfaceModeledProjection, SurfaceOptions,
+    SurfaceProjectionOwner, SurfaceProjector, SurfaceRelationshipAggregate,
+    SurfaceRelationshipKeys, SurfaceRowPolicy, SurfaceTypeDef, SurfaceTypeField,
 };
 
 pub use filter::{
@@ -46,8 +45,6 @@ pub use permissions::{read, ModelPermissions, ReadPermission};
 
 #[cfg(feature = "graphql")]
 mod compile;
-#[cfg(feature = "graphql")]
-mod complexity;
 #[cfg(feature = "graphql")]
 mod engine;
 #[cfg(feature = "graphql")]

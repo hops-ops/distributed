@@ -8,15 +8,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
-use async_graphql::Value;
 #[cfg(any(feature = "sqlite", feature = "postgres"))]
 use sqlx::{Encode, Executor, IntoArguments, Type};
 
 use super::compile::{ExtractedQueryEvidence, QueryResponsePathSegment, SqlPlan};
-use super::engine::EngineInner;
-use super::engine::GraphqlPool;
-#[cfg(any(feature = "sqlite", feature = "postgres"))]
-use super::execute;
 use super::protocol::{
     DistributedIndexRevision, DistributedLiveMetadata, DistributedLiveMode,
     DistributedQuerySnapshot, DistributedRecordRevision, ProtocolResponseAccumulator,
@@ -33,7 +28,7 @@ use crate::projection_protocol::{
 #[cfg(any(feature = "sqlite", feature = "postgres"))]
 use crate::sqlx_repo::projection_protocol::{
     read_projection_changes_in_executor, read_projection_live_record_batch_in_executor,
-    read_projection_partition_snapshot_in_executor, with_projection_read_snapshot,
+    read_projection_partition_snapshot_in_executor,
 };
 #[cfg(any(feature = "sqlite", feature = "postgres"))]
 use crate::sqlx_repo::repo::SqlxRepoBackend;
@@ -237,11 +232,6 @@ impl QueryProtocolRuntime {
             comparable: true,
             projectors: selected.into_values().collect(),
         }
-    }
-
-    #[allow(dead_code)]
-    pub(crate) fn is_empty(&self) -> bool {
-        self.projectors.is_empty()
     }
 
     #[cfg(test)]
@@ -539,12 +529,6 @@ fn validate_modeled_partition_binding(
     Ok(())
 }
 
-pub(crate) struct ProtocolQueryExecution {
-    pub(crate) value: Value,
-    pub(crate) snapshot: DistributedQuerySnapshot,
-    pub(crate) live: Option<DistributedLiveMetadata>,
-}
-
 struct PreparedRecordProbe {
     request: ProjectionLiveRecordRequest,
     paths: Vec<Vec<String>>,
@@ -573,198 +557,18 @@ struct PreparedLiveMetadata {
     changes: Vec<PreparedLiveChange>,
 }
 
-/// Execute the physical query and all record/index evidence reads inside one
-/// adapter snapshot. The returned GraphQL value has already had every hidden
-/// compiler key removed.
+/// Read every record/index evidence row a query result needs, inside the
+/// result's own snapshot (`connection`), and assemble the wire metadata.
 #[cfg(any(feature = "sqlite", feature = "postgres"))]
-pub(crate) async fn execute_query_with_protocol(
-    inner: &EngineInner,
-    pool: &GraphqlPool,
-    primary: bool,
-    role_surface: Arc<Surface>,
-    accumulator: ProtocolResponseAccumulator,
-    plan: &SqlPlan,
-    live_resume: Option<RequestedLiveResume>,
-) -> Result<ProtocolQueryExecution, String> {
-    #[derive(serde::Serialize)]
-    struct QueryPlanInstance<'a> {
-        domain: &'static str,
-        version: u32,
-        sql: &'a str,
-        binds: &'a [super::compile::BindValue],
-        tables: &'a [String],
-    }
-
-    // Query and subscription documents retain distinct public operation
-    // hashes, but matching compiler plans share one comparable snapshot scope.
-    // This prevents a lagging refresh from being treated as authoritative over
-    // a newer live frame merely because the transport operation differs.
-    accumulator
-        .bind_query_snapshot_scope(&QueryPlanInstance {
-            domain: "distributed.graphql.query-plan-instance",
-            version: 1,
-            sql: &plan.sql,
-            binds: &plan.binds,
-            tables: &plan.tables_touched,
-        })
-        .map_err(|error| format!("query snapshot scope failed: {error}"))?;
-
-    // The snapshot helper accepts an HRTB closure whose returned future may
-    // borrow only its connection. Keep every other input owned by the closure
-    // so plan/runtime references cannot escape into that future.
-    let _ = primary;
-    let plan = plan.clone();
-    let runtime = inner.query_protocol.clone();
-    let statement_timeout = inner.statement_timeout;
-    #[cfg(feature = "gateway")]
-    let gateway_versions = inner.gateway_versions.clone();
-    match pool {
-        #[cfg(feature = "sqlite")]
-        GraphqlPool::Sqlite(pool) => {
-            let run = with_projection_read_snapshot(pool, move |connection| {
-                let role_surface = Arc::clone(&role_surface);
-                let accumulator = accumulator.clone();
-                let plan = plan.clone();
-                let runtime = runtime.clone();
-                let live_resume = live_resume.clone();
-                #[cfg(feature = "gateway")]
-                let gateway_versions = gateway_versions.clone();
-                Box::pin(async move {
-                    #[cfg(feature = "gateway")]
-                    if let Some(store) = &gateway_versions {
-                        store.record_result();
-                    }
-                    let executed = execute::execute_sqlite_in_connection(connection, &plan)
-                        .await
-                        .map_err(query_execution_error)?;
-                    let result = finish_protocol_query::<sqlx::Sqlite>(
-                        connection,
-                        &runtime,
-                        &role_surface,
-                        &accumulator,
-                        &plan,
-                        executed,
-                        live_resume,
-                    )
-                    .await?;
-                    #[cfg(feature = "gateway")]
-                    if accumulator.gateway_enabled() {
-                        if let Some(store) = &gateway_versions {
-                            if store.covers(&plan.tables_touched) {
-                                let versions = store
-                                    .sqlite(connection, &plan.tables_touched)
-                                    .await
-                                    .map_err(query_execution_error)?;
-                                accumulator
-                                    .record_gateway_versions(&versions)
-                                    .map_err(query_execution_error)?;
-                            }
-                        }
-                    }
-                    Ok(result)
-                })
-            });
-            execute::apply_statement_timeout(statement_timeout, async {
-                run.await.map_err(|error| error.to_string())
-            })
-            .await
-        }
-        #[cfg(feature = "postgres")]
-        GraphqlPool::Postgres(pool) => {
-            let run = with_projection_read_snapshot(pool, move |connection| {
-                let role_surface = Arc::clone(&role_surface);
-                let accumulator = accumulator.clone();
-                let plan = plan.clone();
-                let runtime = runtime.clone();
-                let live_resume = live_resume.clone();
-                #[cfg(feature = "gateway")]
-                let gateway_versions = gateway_versions.clone();
-                Box::pin(async move {
-                    let timeout_ms =
-                        i64::try_from(statement_timeout.as_millis()).unwrap_or(i64::MAX);
-                    sqlx::query(sqlx::AssertSqlSafe(format!(
-                        "SET LOCAL statement_timeout = '{timeout_ms}ms'"
-                    )))
-                    .execute(&mut *connection)
-                    .await
-                    .map_err(|error| {
-                        query_execution_error(format!("statement_timeout: {error}"))
-                    })?;
-                    execute::ensure_primary_backend(connection, primary)
-                        .await
-                        .map_err(query_execution_error)?;
-                    #[cfg(feature = "gateway")]
-                    if let Some(store) = &gateway_versions {
-                        store.record_result();
-                    }
-                    let executed = execute::execute_postgres_in_connection(connection, &plan)
-                        .await
-                        .map_err(query_execution_error)?;
-                    let result = finish_protocol_query::<sqlx::Postgres>(
-                        connection,
-                        &runtime,
-                        &role_surface,
-                        &accumulator,
-                        &plan,
-                        executed,
-                        live_resume,
-                    )
-                    .await?;
-                    #[cfg(feature = "gateway")]
-                    if accumulator.gateway_enabled() {
-                        if let Some(store) = &gateway_versions {
-                            if store.covers(&plan.tables_touched) {
-                                let versions = store
-                                    .postgres(connection, &plan.tables_touched)
-                                    .await
-                                    .map_err(query_execution_error)?;
-                                accumulator
-                                    .record_gateway_versions(&versions)
-                                    .map_err(query_execution_error)?;
-                            }
-                        }
-                    }
-                    Ok(result)
-                })
-            });
-            execute::apply_statement_timeout(statement_timeout, async {
-                run.await.map_err(|error| error.to_string())
-            })
-            .await
-        }
-        #[allow(unreachable_patterns)]
-        _ => Err("no database pool available for GraphQL execution".into()),
-    }
-}
-
-#[cfg(not(any(feature = "sqlite", feature = "postgres")))]
-pub(crate) async fn execute_query_with_protocol(
-    _inner: &EngineInner,
-    _pool: &GraphqlPool,
-    _primary: bool,
-    _role_surface: Arc<Surface>,
-    _accumulator: ProtocolResponseAccumulator,
-    _plan: &SqlPlan,
-    _live_resume: Option<RequestedLiveResume>,
-) -> Result<ProtocolQueryExecution, String> {
-    Err("no database pool available for GraphQL execution".into())
-}
-
-#[cfg(any(feature = "sqlite", feature = "postgres"))]
-fn query_execution_error(error: String) -> ProjectionProtocolError {
-    ProjectionProtocolError::InvalidBatch(format!("GraphQL query snapshot failed: {error}"))
-}
-
-#[cfg(any(feature = "sqlite", feature = "postgres"))]
-async fn finish_protocol_query<DB>(
+pub(crate) async fn finish_protocol_query<DB>(
     connection: &mut DB::Connection,
     runtime: &QueryProtocolRuntime,
     role_surface: &Surface,
     accumulator: &ProtocolResponseAccumulator,
     plan: &SqlPlan,
-    executed: execute::ExecutedSql,
+    evidence: ExtractedQueryEvidence,
     live_resume: Option<RequestedLiveResume>,
-) -> Result<ProtocolQueryExecution, ProjectionProtocolError>
+) -> Result<(DistributedQuerySnapshot, Option<DistributedLiveMetadata>), ProjectionProtocolError>
 where
     DB: SqlxRepoBackend,
     for<'c> &'c mut DB::Connection: Executor<'c, Database = DB>,
@@ -776,7 +580,7 @@ where
     for<'q> &'q [u8]: Encode<'q, DB> + Type<DB>,
     for<'r> &'r str: sqlx::ColumnIndex<DB::Row>,
 {
-    let prepared = prepare_query_evidence(runtime, role_surface, plan, executed.evidence)?;
+    let prepared = prepare_query_evidence(runtime, role_surface, plan, evidence)?;
     // Store evidence batches are deliberately capped at 128 to bound one SQL
     // statement. A query snapshot may carry up to 4,096 records, so read it in
     // bounded chunks inside this same database snapshot and preserve positional
@@ -849,11 +653,7 @@ where
         snapshot.indexes.clear();
         snapshot.observations.clear();
     }
-    Ok(ProtocolQueryExecution {
-        value: executed.value,
-        snapshot,
-        live,
-    })
+    Ok((snapshot, live))
 }
 
 fn prepare_query_evidence(

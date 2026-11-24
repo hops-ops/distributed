@@ -235,21 +235,20 @@ pub(crate) struct EngineInner {
     pub gateway_versions: Option<crate::graphql::delivery::GatewayVersionStore>,
     pub catalog: BTreeMap<String, CatalogEntry>,
     pub by_table: BTreeMap<String, String>,
-    pub roles: BTreeSet<String>,
     pub anonymous_role: String,
     pub default_limit: u64,
     pub max_limit: u64,
     pub max_depth: usize,
-    #[allow(dead_code)]
-    pub max_complexity: usize,
+    /// Rows one root field may produce (`crate::graphql::cost`).
+    pub max_rows: u64,
     pub max_in_list: usize,
     /// Max length of a single `_and` / `_or` list in client `where` (breadth DoS).
     pub max_bool_width: usize,
+    /// The cost limits above as client manifests export them.
+    pub client_execution: ClientExecutionLimits,
     /// When true (default), unknown/ungranted client `where` and `order_by`
     /// keys fail the request instead of soft-skipping.
     pub strict_where: bool,
-    #[allow(dead_code)]
-    pub introspection_for_anonymous: bool,
     pub statement_timeout: Duration,
     pub graphiql: bool,
     pub(crate) typed_commands: TypedCommandInventory,
@@ -336,7 +335,8 @@ pub struct GraphqlEngineBuilder {
     pub(crate) default_limit: u64,
     pub(crate) max_limit: u64,
     pub(crate) max_depth: usize,
-    pub(crate) max_complexity: usize,
+    pub(crate) max_fields: usize,
+    pub(crate) max_rows: u64,
     pub(crate) max_in_list: usize,
     pub(crate) max_bool_width: usize,
     pub(crate) strict_where: bool,

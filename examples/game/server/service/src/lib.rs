@@ -37,9 +37,8 @@ use std::time::Duration;
 use distributed::bus::{BusConsumer, RunOptions, SqliteBus};
 use distributed::graphql::surface::ExternalReadSource;
 use distributed::graphql::{
-    build_surface, read, surface_for_application_contract, DistributedClientSurfaceExport,
-    GraphqlEngine, IdentityConfig, ModelPermissions, OidcConfig, ReadPermission, Surface,
-    SurfaceOptions,
+    build_surface, read, surface_for_application, DistributedClientSurfaceExport, GraphqlEngine,
+    IdentityConfig, ModelPermissions, OidcConfig, ReadPermission, Surface, SurfaceOptions,
 };
 use distributed::microsvc::{
     spawn_service_consumer_loop, CausalProjectorContext, HandlerError, LifecycleGate,
@@ -226,9 +225,8 @@ pub fn application_manifest() -> ApplicationManifest {
 /// Pool-free client export consumed by `distributed client-manifest`.
 pub fn distributed_client_surface() -> DistributedClientSurfaceExport {
     let roles = [ROLE.to_string()];
-    let selected =
-        surface_for_application_contract(&full_surface(), APPLICATION, &roles, &roles, &grants())
-            .expect("mobpit application Surface should select");
+    let selected = surface_for_application(&full_surface(), APPLICATION, &roles, &roles, &grants())
+        .expect("mobpit application Surface should select");
     DistributedClientSurfaceExport::from_selected(APPLICATION, selected)
         .expect("mobpit application Surface should export")
 }

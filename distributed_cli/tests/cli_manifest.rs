@@ -72,9 +72,13 @@ fn client_manifest_uses_service_surface_export() {
     assert_eq!(manifest["service_id"], "orders");
     assert_eq!(manifest["surface"]["kind"], "role");
     assert_eq!(manifest["surface"]["name"], "user");
+    // The fingerprint commits to the exported schema contract: it is the one
+    // a client recomputes from the manifest itself.
+    let decoded: distributed::graphql::DistributedClientManifest =
+        serde_json::from_value(manifest.clone()).unwrap();
     assert_eq!(
         manifest["schema_fingerprint"],
-        "sha256:c919a2b667e09b9ba82b7631b84580086a7143333a736eaec4641160ebe5707e"
+        decoded.computed_schema_fingerprint().unwrap()
     );
     assert_eq!(
         manifest["protocol_fingerprint"],

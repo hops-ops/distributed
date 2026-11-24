@@ -16,24 +16,14 @@ const ROLE_MANIFEST: &str = r#"{
     "kind": "role",
     "name": "user"
   },
-  "schema_fingerprint": "sha256:758a97e4f7e1e538e8be86d24abd3d50a8da2d5813d29abd7a04bfa092d05189",
+  "schema_fingerprint": "sha256:eb28c89f691ba3b5500f63a610f427dfa6a2a2a46e8874330411a98199e21d15",
   "protocol_fingerprint": "sha256:0dfa8a3f49e17d8d99c5c095c1ed14f528cae3e55fbc2f2b852975a50936ec5b",
   "execution": {
     "max_depth": 8,
-    "max_complexity": 500,
+    "max_fields": 500,
+    "max_rows": 200000,
     "max_bool_width": 256,
-    "max_in_list": 1000,
-    "complexity": {
-      "version": 1,
-      "scalar": 1,
-      "belongs_to": 2,
-      "has_many": 10,
-      "m2m": 12,
-      "aggregate": 8,
-      "list_root": 3,
-      "by_pk": 1,
-      "list_fanout": 5
-    }
+    "max_in_list": 1000
   },
   "capabilities": {
     "live_queries": false,
@@ -391,8 +381,8 @@ fn literal_text_search_generates_a_typed_load_island() {
             .replace("\"_ilike\"", "\"_ilike\", \"_icontains\"")
             // Adding a filter changes the selected schema contract.
             .replace(
-                "sha256:758a97e4f7e1e538e8be86d24abd3d50a8da2d5813d29abd7a04bfa092d05189",
-                "sha256:9143345e62737d38ed28e997fd76f434b18ae6b9c794b2c06477d1879fcfc136",
+                "sha256:eb28c89f691ba3b5500f63a610f427dfa6a2a2a46e8874330411a98199e21d15",
+                "sha256:ef5eca766105f3447552a5662d8553ef6b4c9a0a9ae20b70257152208aca88ca",
             ),
     )
     .unwrap();

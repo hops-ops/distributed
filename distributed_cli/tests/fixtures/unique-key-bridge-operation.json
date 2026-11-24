@@ -317,7 +317,7 @@
   ],
   "protocol": {
     "version": 1,
-    "schemaHash": "sha256:d43d65b233d9839f28271b4bdee7326f03b660cac3002013d8f058204e188415",
+    "schemaHash": "sha256:e54b9612f0c48fffb597337e3246b43203cb33e6487319986d47920b772d4c1b",
     "protocolHash": "sha256:0dfa8a3f49e17d8d99c5c095c1ed14f528cae3e55fbc2f2b852975a50936ec5b",
     "surface": {
       "kind": "role",

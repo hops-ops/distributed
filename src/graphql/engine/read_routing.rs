@@ -3,6 +3,7 @@ use crate::gateway::{
     delivery::*,
     graphql::{operation_kind, OperationKind},
 };
+use crate::graphql::compile::SqlPlan;
 
 /// Explicit stale-tolerant allowlist. No timeout/stickiness is treated as replay
 /// proof. With any retained floor the initial router always uses primary.

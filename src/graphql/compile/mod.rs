@@ -18,6 +18,7 @@
 
 mod binds;
 mod dialect;
+mod error;
 mod evidence;
 mod filter;
 mod projection;
@@ -25,15 +26,11 @@ mod relationship;
 mod scan;
 
 pub use binds::BindValue;
-#[allow(unused_imports)]
-pub use dialect::{DialectOps, SqlDialect};
-#[allow(unused_imports)]
+pub use dialect::SqlDialect;
+pub use error::CompileError;
 pub use projection::{
-    compile_query, compile_root, selection_from_field, QueryPlan, RootKind, SelectionNode, SqlPlan,
+    compile_query, selection_from_field, QueryPlan, RootKind, SelectionNode, SqlPlan,
 };
 
-#[allow(unused_imports)]
-pub(crate) use dialect::{join_predicate_direct, join_predicate_m2m_pairs};
-#[allow(unused_imports)]
-pub(crate) use evidence::{ExtractedQueryEvidence, QueryRecordEvidence, QueryResponsePathSegment};
+pub(crate) use evidence::{ExtractedQueryEvidence, QueryResponsePathSegment};
 pub(crate) use projection::cell_row_matches;

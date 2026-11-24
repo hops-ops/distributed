@@ -533,11 +533,11 @@ impl ProtocolProjectionRequestSeed {
         .with_trusted_presets(self.trusted_presets.clone());
         let manifest = self
             .export
-            .manifest()
+            .manifest_ref()
             .map_err(|_| ProjectionRuntimeAuthorityError::InvalidAuthority)?;
         metadata
             .delta
-            .validate_replay_scope(&manifest, &authority)
+            .validate_replay_scope(manifest, &authority)
             .map_err(ProjectionRuntimeAuthorityError::Delta)
     }
 
@@ -585,7 +585,7 @@ impl ProtocolProjectionRequestSeed {
         .with_trusted_presets(self.trusted_presets.clone());
         let manifest = self
             .export
-            .manifest()
+            .manifest_ref()
             .map_err(|_| ProjectionRuntimeAuthorityError::InvalidAuthority)?;
         let identity = &metadata.delta.identity;
         // Lifecycle authority may be exercised against an unchanged outer
@@ -768,7 +768,7 @@ impl ProtocolProjectionRequestSeed {
         .with_trusted_presets(self.trusted_presets.clone());
         let manifest = self
             .export
-            .manifest()
+            .manifest_ref()
             .map_err(|_| ProjectionRuntimeAuthorityError::InvalidAuthority)?;
         let identity = &metadata.delta.identity;
         if identity.manifest_version != manifest.manifest_version
@@ -1542,7 +1542,7 @@ impl ProtocolProjectionDeltaRequestAuthority {
             return Err(ProjectionRuntimeAuthorityError::InvalidAuthority);
         }
         export
-            .manifest()
+            .manifest_ref()
             .map_err(|_| ProjectionRuntimeAuthorityError::InvalidAuthority)?;
         let surface = export.surface().clone();
         SelectedSurfacePolicyVisibility::try_new(&surface)
@@ -1630,9 +1630,8 @@ impl ProtocolProjectionDeltaRequestAuthority {
     ) -> Result<CommandProjectionMetadataV1, ProjectionRuntimeAuthorityError> {
         delta
             .validate_replay_scope(
-                &self
-                    .export
-                    .manifest()
+                self.export
+                    .manifest_ref()
                     .map_err(|_| ProjectionRuntimeAuthorityError::InvalidAuthority)?,
                 self,
             )
@@ -1645,7 +1644,7 @@ impl ProtocolProjectionDeltaRequestAuthority {
         let mut obligations = Vec::with_capacity(observations.len());
         let manifest = self
             .export
-            .manifest()
+            .manifest_ref()
             .map_err(|_| ProjectionRuntimeAuthorityError::InvalidAuthority)?;
         for observation in observations {
             let projection = delta
@@ -1734,7 +1733,7 @@ impl ProtocolProjectionDeltaRequestAuthority {
         }
         let manifest = self
             .export
-            .manifest()
+            .manifest_ref()
             .map_err(|_| ProjectionRuntimeAuthorityError::InvalidAuthority)?;
         if surface != &ProjectionDeltaSurfaceIdentity::from(&manifest.surface) {
             return Err(ProjectionRuntimeAuthorityError::InvalidAuthority);

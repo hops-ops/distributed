@@ -45,9 +45,7 @@ mod validation;
 #[cfg(test)]
 mod tests;
 
-pub use application::{
-    surface_for_application, surface_for_application_contract, surface_for_role,
-};
+pub use application::{surface_for_application, surface_for_role};
 pub use build::build_surface;
 pub use external::{
     ExternalField, ExternalReadError, ExternalReadErrorKind, ExternalReadExecutor,

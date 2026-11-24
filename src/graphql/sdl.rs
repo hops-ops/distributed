@@ -6,7 +6,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::table::{TableKind, TableSchema};
+use crate::table::TableSchema;
 
 use super::naming::{
     causal_protocol_type_names, comparison_exp_name, include_postgres_json_comparison_ops,
@@ -621,17 +621,6 @@ fn surface_arguments_sdl(arguments: &[super::surface::SurfaceArgument]) -> Strin
         .collect::<Vec<_>>()
         .join(", ");
     format!("({arguments})")
-}
-
-/// Filter operational tables and render SDL for a read-model schema catalog.
-pub fn graphql_sdl_from_schemas(
-    schemas: impl IntoIterator<Item = TableSchema>,
-) -> Result<String, String> {
-    let tables: Vec<TableSchema> = schemas
-        .into_iter()
-        .filter(|t| matches!(t.kind, TableKind::ReadModel))
-        .collect();
-    graphql_sdl_for_tables(&tables)
 }
 
 #[cfg(test)]

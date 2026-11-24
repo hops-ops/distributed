@@ -16,7 +16,7 @@ export const XpLeaderboardLeaderboard = {
 	limits: { defaultFirst: 3, maxFirst: 5, maxRadius: 2 },
 	document: "query XpLeaderboard($first: Int) { xpLeaderboard(first: $first) { rank member score } }",
 	liveDocument: "subscription XpLeaderboard_Live($first: Int) { xpLeaderboard(first: $first) { rank member score } }",
-	schemaHash: "sha256:a90a3d1493cd22d995e2a32c28ef7b6f87d7c56780fc181e5d91ff172c1d4338",
+	schemaHash: "sha256:1e530895b54f8e80d0d2162cfdf5e2b5eb67a8956735bdc82b6c8f10df870743",
 } as const;
 
 export type XpMyRankVariables = {};
@@ -28,7 +28,7 @@ export const XpMyRankLeaderboard = {
 	limits: { defaultFirst: 3, maxFirst: 5, maxRadius: 2 },
 	document: "query XpMyRank { xpMyRank { rank member score } }",
 	liveDocument: "subscription XpMyRank_Live { xpMyRank { rank member score } }",
-	schemaHash: "sha256:a90a3d1493cd22d995e2a32c28ef7b6f87d7c56780fc181e5d91ff172c1d4338",
+	schemaHash: "sha256:1e530895b54f8e80d0d2162cfdf5e2b5eb67a8956735bdc82b6c8f10df870743",
 } as const;
 
 export type SeasonRankVariables = { readonly board: string; readonly member: string; };
@@ -40,7 +40,7 @@ export const SeasonRankLeaderboard = {
 	limits: { defaultFirst: 10, maxFirst: 100, maxRadius: 25 },
 	document: "query SeasonRank($board: String!, $member: String!) { seasonRank(board: $board, member: $member) { rank member score } }",
 	liveDocument: null,
-	schemaHash: "sha256:a90a3d1493cd22d995e2a32c28ef7b6f87d7c56780fc181e5d91ff172c1d4338",
+	schemaHash: "sha256:1e530895b54f8e80d0d2162cfdf5e2b5eb67a8956735bdc82b6c8f10df870743",
 } as const;
 
 export const LEADERBOARD_OPERATIONS = {

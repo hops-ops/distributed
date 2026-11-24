@@ -1113,7 +1113,7 @@ pub struct Todos {
 				{
 					file: 'modules/graphql.rs · build_engine surfaces',
 					caption: 'One engine opens three surfaces: user, admin, and public. Each surface names its eligible roles and its privilege pack.',
-					code: `.client_application_surface_with_schema_roles(
+					code: `.client_application_surface(
   DISTRIBUTED_CLIENT_SURFACE,         // "e2e-ui"
   ["admin", "user"],                  // eligible
   ["user"],                           // portable privilege pack
@@ -1314,7 +1314,7 @@ mutation DeleteTodo {
 				{
 					file: 'modules/graphql.rs · dual surfaces',
 					caption: 'The service crate opens the user, admin, and public surfaces.',
-					code: `.client_application_surface_with_schema_roles(
+					code: `.client_application_surface(
   "e2e-ui",
   ["admin", "user"],
   ["user"],

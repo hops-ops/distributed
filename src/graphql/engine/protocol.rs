@@ -299,23 +299,10 @@ pub(crate) fn has_multiple_protocol_query_roots(
     let Ok(document) = request.parsed_query() else {
         return false;
     };
-    let mut operations = document.operations.iter();
-    let operation = if let Some(requested) = operation_name.as_deref() {
-        operations
-            .find(|(name, _)| name.map(|name| name.as_str()) == Some(requested))
-            .map(|(_, operation)| operation)
-    } else {
-        let first = operations.next().map(|(_, operation)| operation);
-        if operations.next().is_some() {
-            None
-        } else {
-            first
-        }
-    };
-    let Some(operation) = operation else {
+    let Some(operation) = selected_operation(document, operation_name.as_deref()) else {
         return false;
     };
-    if operation.node.ty != async_graphql::parser::types::OperationType::Query {
+    if operation.ty != async_graphql::parser::types::OperationType::Query {
         return false;
     }
 
@@ -396,7 +383,7 @@ pub(crate) fn has_multiple_protocol_query_roots(
     let mut response_keys = BTreeSet::new();
     let mut remaining_selections = REQUEST_ANALYSIS_MAX_SELECTIONS;
     let analysis = collect_root_keys(
-        &operation.node.selection_set.node,
+        &operation.selection_set.node,
         document,
         &query_roots,
         &mut BTreeSet::new(),

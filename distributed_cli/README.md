@@ -282,7 +282,9 @@ from that selected surface. The runtime applies GraphQL singleton-list coercion,
 canonical scalar encoding, unknown-field rejection, and deterministic deep
 freezing before variables can identify a cache entry or reach the network.
 Manifest v7 and variable codec v2 carry the selected service's exact
-`max_depth`, `max_bool_width`, and `max_in_list` contract. Static literal and
+`max_depth`, `max_bool_width`, and `max_in_list` contract, and its `max_rows`
+budget ([query cost](../docs/graphql-query-cost.md)): an operation whose
+literal or default page sizes already exceed it fails to compile. Static literal and
 mixed-variable filters are rejected during generation when their known shape
 exceeds those limits; runtime variables carry per-use `filterBaseDepth` and
 `maxItems` constraints. Reused variables receive the most restrictive

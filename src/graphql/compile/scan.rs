@@ -16,6 +16,7 @@ use crate::table::{
 
 use super::super::engine::EngineInner;
 use super::dialect::{join_predicate_direct, join_predicate_m2m_pairs, SqlDialect};
+use super::CompileError;
 
 /// Ties a scan to what encloses it: an optional `JOIN` (many-to-many through
 /// table) and the predicate selecting the enclosing row's related rows, or one
@@ -43,7 +44,7 @@ impl<'a> ModelScan<'a> {
         session: &'a Session,
         role: &'a str,
         model_name: &str,
-    ) -> Result<Self, String> {
+    ) -> Result<Self, CompileError> {
         let entry = inner
             .catalog
             .get(model_name)
@@ -79,12 +80,12 @@ impl<'a> ModelScan<'a> {
         target_alias: &str,
         join_alias: &str,
         tables: &mut Vec<String>,
-    ) -> Result<(ModelScan<'a>, ScanLink), String> {
+    ) -> Result<(ModelScan<'a>, ScanLink), CompileError> {
         let target = self.target(rel).ok_or_else(|| {
-            format!(
-                "internal: relationship `{}` reached ungranted model `{}`",
+            CompileError::internal(format!(
+                "relationship `{}` reached ungranted model `{}`",
                 rel.field_name, rel.target_model
-            )
+            ))
         })?;
         let link = relationship_link(
             self.inner,
@@ -126,7 +127,7 @@ impl<'a> ModelScan<'a> {
         &self,
         order_arg: Option<&Value>,
         alias: &str,
-    ) -> Result<String, String> {
+    ) -> Result<String, CompileError> {
         compile_order_by(
             self.schema,
             order_arg,
@@ -149,35 +150,40 @@ pub(super) fn relationship_link(
     target_alias: &str,
     join_alias: &str,
     tables: &mut Vec<String>,
-) -> Result<ScanLink, String> {
+) -> Result<ScanLink, CompileError> {
     tables.push(target.table_name.clone());
     match rel.kind {
         RelationshipKind::HasMany | RelationshipKind::BelongsTo => {
-            let pairs =
-                resolve_direct_join_keys(source, rel, target).map_err(|error| error.to_string())?;
+            let pairs = resolve_direct_join_keys(source, rel, target)
+                .map_err(|error| CompileError::internal(error.to_string()))?;
             Ok(ScanLink {
                 join: String::new(),
-                on: join_predicate_direct(rel.kind.clone(), source_alias, target_alias, &pairs)?,
+                on: join_predicate_direct(rel.kind.clone(), source_alias, target_alias, &pairs)
+                    .map_err(CompileError::Internal)?,
             })
         }
         RelationshipKind::ManyToMany => {
             let through = rel
                 .through
                 .as_deref()
-                .ok_or_else(|| "m2m missing through".to_string())?;
+                .ok_or_else(|| CompileError::internal("m2m missing through"))?;
             let through_schema = inner
                 .by_table
                 .get(through)
                 .and_then(|model| inner.catalog.get(model))
                 .map(|entry| &entry.schema)
-                .ok_or_else(|| format!("through table `{through}` not in catalog"))?;
+                .ok_or_else(|| {
+                    CompileError::internal(format!("through table `{through}` not in catalog"))
+                })?;
             let keys = resolve_m2m_join_keys(source, rel, through_schema, target)
-                .map_err(|error| error.to_string())?;
+                .map_err(|error| CompileError::internal(error.to_string()))?;
             tables.push(through.to_string());
-            let on_target = join_predicate_m2m_pairs(join_alias, target_alias, &keys.target)?;
+            let on_target = join_predicate_m2m_pairs(join_alias, target_alias, &keys.target)
+                .map_err(CompileError::Internal)?;
             Ok(ScanLink {
                 join: format!(" JOIN \"{through}\" {join_alias} ON {on_target}"),
-                on: join_predicate_m2m_pairs(join_alias, source_alias, &keys.parent)?,
+                on: join_predicate_m2m_pairs(join_alias, source_alias, &keys.parent)
+                    .map_err(CompileError::Internal)?,
             })
         }
     }
@@ -210,27 +216,31 @@ pub(super) fn compile_order_by(
     allows_column: impl Fn(&str) -> bool,
     strict: bool,
     dialect: SqlDialect,
-) -> Result<String, String> {
+) -> Result<String, CompileError> {
     let mut parts = Vec::new();
     if let Some(Value::List(items)) = order_arg {
         for item in items {
             if let Value::Object(map) = item {
                 if map.len() > 1 {
-                    return Err(
+                    return Err(CompileError::InvalidFilter(
                         "ambiguous order_by entry: use one field per list entry to declare priority"
                             .into(),
-                    );
+                    ));
                 }
                 for (col, dir) in map {
                     if !schema.columns.iter().any(|c| c.column_name == *col) {
                         if strict {
-                            return Err(format!("unknown order_by column `{col}`"));
+                            return Err(CompileError::InvalidFilter(format!(
+                                "unknown order_by column `{col}`"
+                            )));
                         }
                         continue;
                     }
                     if !allows_column(col) {
                         if strict {
-                            return Err(format!("ungranted order_by column `{col}`"));
+                            return Err(CompileError::InvalidFilter(format!(
+                                "ungranted order_by column `{col}`"
+                            )));
                         }
                         continue;
                     }
@@ -325,7 +335,7 @@ mod strict_order_by_tests {
         let arg = order_list(vec![("nope", "asc")]);
         let err = compile_order_by(&schema, Some(&arg), "t0", perm, true, SqlDialect::Sqlite)
             .unwrap_err();
-        assert!(err.contains("unknown order_by"), "{err}");
+        assert!(err.to_string().contains("unknown order_by"), "{err}");
     }
 
     #[test]
@@ -335,7 +345,7 @@ mod strict_order_by_tests {
         let arg = order_list(vec![("secret", "asc")]);
         let err = compile_order_by(&schema, Some(&arg), "t0", perm, true, SqlDialect::Sqlite)
             .unwrap_err();
-        assert!(err.contains("ungranted order_by"), "{err}");
+        assert!(err.to_string().contains("ungranted order_by"), "{err}");
     }
 
     #[test]
@@ -382,8 +392,11 @@ mod strict_order_by_tests {
 
         let error = compile_order_by(&schema, Some(&arg), "t0", perm, false, SqlDialect::Sqlite)
             .unwrap_err();
-        assert!(error.contains("ambiguous order_by"), "{error}");
-        assert!(error.contains("one field per list entry"), "{error}");
+        assert!(
+            matches!(&error, CompileError::InvalidFilter(detail)
+                if detail.contains("ambiguous order_by") && detail.contains("one field per list entry")),
+            "{error}"
+        );
     }
 
     #[test]

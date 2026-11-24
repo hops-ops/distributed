@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use distributed::application::CommandDefinition;
 use distributed::graphql::{
-    build_surface, surface_for_application_contract, DistributedClientSurfaceExport, GraphqlEngine,
+    build_surface, surface_for_application, DistributedClientSurfaceExport, GraphqlEngine,
     GraphqlPoolSource, IdentityConfig, OidcConfig, Surface, SurfaceOptions,
 };
 use distributed::microsvc::Service;
@@ -54,11 +54,7 @@ pub(crate) fn build_graphql_engine_with_graphiql(
     let mut b = GraphqlEngine::builder(pool)
         .protocol_token_key(E2E_PROTOCOL_TOKEN_KEY)
         .roles(&["user", "admin", "anonymous"])
-        .client_application_surface_with_schema_roles(
-            DISTRIBUTED_CLIENT_SURFACE,
-            ["admin", "user"],
-            ["user"],
-        )
+        .client_application_surface(DISTRIBUTED_CLIENT_SURFACE, ["admin", "user"], ["user"])
         .client_application_surface(DISTRIBUTED_ADMIN_CLIENT_SURFACE, ["admin"], ["admin"])
         .client_application_surface(
             DISTRIBUTED_PUBLIC_CLIENT_SURFACE,
@@ -102,9 +98,8 @@ fn pool_free_client_surface_contract(
         .map(|role| (*role).to_string())
         .collect::<Vec<_>>();
     let grants = e2e_readmodels::application_grants();
-    let selected =
-        surface_for_application_contract(&full, application, &eligible, &schema, &grants)
-            .expect("e2e-ui application Surface should select");
+    let selected = surface_for_application(&full, application, &eligible, &schema, &grants)
+        .expect("e2e-ui application Surface should select");
     DistributedClientSurfaceExport::from_selected("e2e-ui", selected)
         .expect("e2e-ui application Surface should export")
 }

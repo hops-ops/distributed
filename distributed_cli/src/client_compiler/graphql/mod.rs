@@ -11,9 +11,9 @@ use serde::Serialize;
 use serde_json::{Map as JsonMap, Value as JsonValue};
 
 use super::manifest::{
-    hash_bytes, ClientAggregateSemantics, ClientArgument, ClientArgumentKind,
-    ClientComplexityWeights, ClientExecutionLimits, ClientField, ClientFilterField,
-    ClientFilterInput, ClientFilterSemantics, ClientManifest, ClientModel, ClientOrderSemantics,
+    hash_bytes, row_cost, ClientAggregateSemantics, ClientArgument, ClientArgumentKind,
+    ClientExecutionLimits, ClientField, ClientFilterField, ClientFilterInput,
+    ClientFilterSemantics, ClientManifest, ClientModel, ClientOrderSemantics,
     ClientPaginationSemantics, ClientRelationship, ClientRelationshipKind,
     ClientRelationshipMaintenance, ClientRoot, ClientRootKind, ClientRootOperation,
     ClientRowPolicy, FilterExpr, RelationshipKeyMapping,

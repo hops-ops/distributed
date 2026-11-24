@@ -63,9 +63,10 @@ on_each_dialect! {
         d5_wide_and_list_rejected_by_max_bool_width,
         d7_concurrent_queries_complete,
         d7_concurrent_with_timeout_bound_terminates,
-        d8_nested_has_many_exceeds_complexity_budget,
+        d8_two_level_default_nest_exceeds_row_budget,
         d8_shallow_nested_has_many_within_budget,
-        d8_low_max_complexity_rejects_single_nest,
+        d8_low_max_rows_rejects_single_nest,
+        d8_explicit_limits_multiply_into_the_row_budget,
     }
     errors::{
         compile_errors_do_not_leak_sql,

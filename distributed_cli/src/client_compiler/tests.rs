@@ -301,20 +301,10 @@ pub(super) fn manifest() -> JsonValue {
         "protocol_fingerprint": "sha256:0dfa8a3f49e17d8d99c5c095c1ed14f528cae3e55fbc2f2b852975a50936ec5b",
         "execution": {
             "max_depth": 8,
-            "max_complexity": 500,
+            "max_fields": 500,
+            "max_rows": 200000,
             "max_bool_width": 256,
-            "max_in_list": 1000,
-            "complexity": {
-                "version": 1,
-                "scalar": 1,
-                "belongs_to": 2,
-                "has_many": 10,
-                "m2m": 12,
-                "aggregate": 8,
-                "list_root": 3,
-                "by_pk": 1,
-                "list_fanout": 5
-            }
+            "max_in_list": 1000
         },
         "capabilities": {
             "live_queries": true,
@@ -1509,7 +1499,7 @@ fn multiple_load_islands_may_share_one_future_boundary() {
 }
 
 #[test]
-fn enforces_the_selected_services_exact_depth_and_complexity_limits() {
+fn enforces_the_selected_services_exact_depth_and_row_limits() {
     let shallow_source = "query ExactDepth { todos { id } }";
     let mut exact_depth_manifest = manifest();
     exact_depth_manifest["execution"]["max_depth"] = json!(2);
@@ -1548,23 +1538,42 @@ fn enforces_the_selected_services_exact_depth_and_complexity_limits() {
     ))
     .expect("the exact recursive service depth boundary must compile");
 
-    let source = "query ExactCost { todos { id } }";
+    // A literal limit counts as given; nested lists multiply.
+    let source = "query ExactRows { todos(limit: 40) { id } }";
     let mut accepted_manifest = manifest();
-    accepted_manifest["execution"]["max_complexity"] = json!(18);
+    accepted_manifest["execution"]["max_rows"] = json!(40);
     refresh_schema_fingerprint(&mut accepted_manifest);
     compile(input_with_manifest(accepted_manifest, source))
-        .expect("the exact service complexity boundary must compile");
+        .expect("the exact service row boundary must compile");
 
     let mut rejected_manifest = manifest();
-    rejected_manifest["execution"]["max_complexity"] = json!(17);
+    rejected_manifest["execution"]["max_rows"] = json!(39);
     refresh_schema_fingerprint(&mut rejected_manifest);
     let error = compile(input_with_manifest(rejected_manifest, source))
-        .expect_err("complexity must fail at build time");
-    assert_eq!(error.code, "client.operation.complexity_limit");
-    assert!(
-        error.message.contains("operation complexity 18"),
-        "{error:?}"
-    );
+        .expect_err("rows over budget must fail at build time");
+    assert_eq!(error.code, "client.operation.row_limit");
+    assert!(error.message.contains("may return 40 rows"), "{error:?}");
+
+    // An absent limit counts as the field's default (25); a literal above
+    // `max_limit` (100) counts as the cap.
+    let mut default_manifest = manifest();
+    default_manifest["execution"]["max_rows"] = json!(24);
+    refresh_schema_fingerprint(&mut default_manifest);
+    let error = compile(input_with_manifest(
+        default_manifest,
+        "query DefaultRows { todos { id } }",
+    ))
+    .expect_err("the default page counts");
+    assert!(error.message.contains("may return 25 rows"), "{error:?}");
+
+    let mut capped_manifest = manifest();
+    capped_manifest["execution"]["max_rows"] = json!(100);
+    refresh_schema_fingerprint(&mut capped_manifest);
+    compile(input_with_manifest(
+        capped_manifest,
+        "query CappedRows { todos(limit: 5000) { id } }",
+    ))
+    .expect("a limit above max_limit costs max_limit");
 }
 
 #[test]

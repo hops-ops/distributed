@@ -23,12 +23,13 @@ use async_graphql::Value;
 use futures_util::Stream;
 use tokio::sync::{broadcast, mpsc};
 
-use crate::microsvc::Session;
 use crate::read_model::ReadModelChange;
 
-use super::compile::{self, RootKind, SelectionNode, SqlPlan};
-use super::engine::{execute_plan, EngineInner};
+use super::compile::{QueryPlan, SqlPlan};
+use super::engine::EngineInner;
+use super::execute::{execute_plan, ProtocolRead};
 use super::protocol::{ProtocolResponseAccumulator, RequestedLiveResume};
+use super::schema::client_error;
 
 /// Fan-out hub for read-model change notifications.
 #[derive(Clone, Debug)]
@@ -103,26 +104,17 @@ impl Stream for LiveQueryStream {
     }
 }
 
-/// Build a live-query stream for a subscription root field.
+/// Build a live-query stream for a subscription root field's compiled plan.
 pub(crate) async fn live_query_stream(
     inner: Arc<EngineInner>,
-    session: Session,
     role: String,
-    model: String,
-    selection: SelectionNode,
+    plan: QueryPlan,
     protocol: Option<ProtocolResponseAccumulator>,
-) -> Result<LiveQueryStream, String> {
-    let plan: SqlPlan = match compile::compile_query(
-        &inner,
-        &session,
-        &role,
-        &model,
-        RootKind::List,
-        &selection,
-    )? {
-        compile::QueryPlan::Sql(plan) => plan,
-        compile::QueryPlan::CellByKey { .. } => {
-            return Err("cell-by-key store does not support @live".into());
+) -> Result<LiveQueryStream, async_graphql::Error> {
+    let plan: Arc<SqlPlan> = match plan {
+        QueryPlan::Sql(plan) => plan,
+        QueryPlan::CellByKey { .. } => {
+            return Err(client_error("BAD_REQUEST", "unsupported on cell store"));
         }
     };
     let footprint = footprint_from_tables(&plan.tables_touched);
@@ -133,7 +125,7 @@ pub(crate) async fn live_query_stream(
         .as_ref()
         .map(ProtocolResponseAccumulator::requested_live_resume)
         .transpose()
-        .map_err(|error| error.to_string())?
+        .map_err(|_| client_error("BAD_REQUEST", "invalid live resume"))?
         .unwrap_or(RequestedLiveResume::Absent);
 
     tokio::spawn(async move {
@@ -144,13 +136,13 @@ pub(crate) async fn live_query_stream(
         };
         let mut initial = match initial_result {
             Ok(executed) => executed,
-            Err(e) => {
-                let _ = tx.send(Err(async_graphql::Error::new(e))).await;
+            Err(error) => {
+                let _ = tx.send(Err(error)).await;
                 return;
             }
         };
-        if let Err(error) = initial.record_protocol_metadata(protocol.as_ref()) {
-            let _ = tx.send(Err(async_graphql::Error::new(error))).await;
+        if initial.record_protocol_metadata(protocol.as_ref()).is_err() {
+            let _ = tx.send(Err(evidence_failed())).await;
             return;
         }
         let mut last_hash = Some(initial.hash);
@@ -207,8 +199,11 @@ pub(crate) async fn live_query_stream(
                     if last_hash == Some(executed.hash) {
                         continue; // hash gate: no push on no-change
                     }
-                    if let Err(error) = executed.record_protocol_metadata(protocol.as_ref()) {
-                        let _ = tx.send(Err(async_graphql::Error::new(error))).await;
+                    if executed
+                        .record_protocol_metadata(protocol.as_ref())
+                        .is_err()
+                    {
+                        let _ = tx.send(Err(evidence_failed())).await;
                         return;
                     }
                     last_hash = Some(executed.hash);
@@ -216,8 +211,8 @@ pub(crate) async fn live_query_stream(
                         return;
                     }
                 }
-                Err(e) => {
-                    let _ = tx.send(Err(async_graphql::Error::new(e))).await;
+                Err(error) => {
+                    let _ = tx.send(Err(error)).await;
                     return;
                 }
             }
@@ -225,6 +220,10 @@ pub(crate) async fn live_query_stream(
     });
 
     Ok(LiveQueryStream { rx })
+}
+
+fn evidence_failed() -> async_graphql::Error {
+    client_error("INTERNAL", "query evidence encoding failed")
 }
 
 struct ExecutedLiveQuery {
@@ -259,35 +258,31 @@ async fn execute_list(
     plan: &SqlPlan,
     protocol: Option<&ProtocolResponseAccumulator>,
     requested_live_resume: RequestedLiveResume,
-) -> Result<ExecutedLiveQuery, String> {
-    let Some(protocol) = protocol else {
-        let value = execute_plan(inner, plan).await?;
+) -> Result<ExecutedLiveQuery, async_graphql::Error> {
+    let read = match protocol {
+        None => None,
+        Some(accumulator) => Some(ProtocolRead {
+            role_surface: inner.role_surfaces.get(role).cloned().ok_or_else(|| {
+                client_error("INTERNAL", "authorized GraphQL role surface is unavailable")
+            })?,
+            accumulator: accumulator.clone(),
+            live_resume: Some(requested_live_resume),
+        }),
+    };
+    let executed = execute_plan(inner, &inner.pool, true, plan, read)
+        .await
+        .map_err(|error| error.client_error())?;
+    let Some(evidence) = executed.protocol else {
         return Ok(ExecutedLiveQuery {
-            hash: response_hash(&value),
-            value,
+            hash: response_hash(&executed.value),
+            value: executed.value,
             snapshot: None,
             live: None,
             next_live_resume: RequestedLiveResume::Absent,
         });
     };
-
-    let role_surface = inner
-        .role_surfaces
-        .get(role)
-        .cloned()
-        .ok_or_else(|| "authorized GraphQL role surface is unavailable".to_string())?;
-    let executed = super::query_protocol::execute_query_with_protocol(
-        inner,
-        &inner.pool,
-        true,
-        role_surface,
-        protocol.clone(),
-        plan,
-        Some(requested_live_resume),
-    )
-    .await?;
-    let hash = protocol_response_hash(&executed.value, &executed.snapshot, &executed.live);
-    let next_live_resume = executed
+    let hash = hash_json(&(&executed.value, &evidence.snapshot, &evidence.live));
+    let next_live_resume = evidence
         .live
         .as_ref()
         .filter(|live| live.mode == super::protocol::DistributedLiveMode::Resumable)
@@ -296,8 +291,8 @@ async fn execute_list(
     Ok(ExecutedLiveQuery {
         value: executed.value,
         hash,
-        snapshot: Some(executed.snapshot),
-        live: executed.live,
+        snapshot: Some(evidence.snapshot),
+        live: evidence.live,
         next_live_resume,
     })
 }
@@ -317,30 +312,30 @@ pub fn footprint_from_tables(tables: &[String]) -> BTreeSet<String> {
 
 /// Hash a GraphQL JSON payload for hash-gated push (no push on no-change).
 pub fn response_hash(value: &Value) -> u64 {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    let mut h = DefaultHasher::new();
-    if let Ok(json) = serde_json::to_string(value) {
-        json.hash(&mut h);
-    } else {
-        format!("{value:?}").hash(&mut h);
-    }
-    h.finish()
+    hash_json(value)
 }
 
-fn protocol_response_hash(
-    value: &Value,
-    snapshot: &super::protocol::DistributedQuerySnapshot,
-    live: &Option<super::protocol::DistributedLiveMetadata>,
-) -> u64 {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    let mut hash = DefaultHasher::new();
-    match serde_json::to_string(&(value, snapshot, live)) {
-        Ok(encoded) => encoded.hash(&mut hash),
-        Err(_) => format!("{value:?}:{snapshot:?}:{live:?}").hash(&mut hash),
+/// Hash the JSON encoding of `value` as it is produced, without building the
+/// string.
+fn hash_json(value: &impl serde::Serialize) -> u64 {
+    use std::hash::Hasher;
+
+    struct HashWriter(std::collections::hash_map::DefaultHasher);
+    impl std::io::Write for HashWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.write(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
     }
-    hash.finish()
+
+    let mut writer = HashWriter(Default::default());
+    // Encoding a GraphQL value cannot fail; if it ever did, the partial
+    // encoding still hashes deterministically.
+    let _ = serde_json::to_writer(&mut writer, value);
+    writer.0.finish()
 }
 
 /// Forward an external change receiver into the engine hub.
