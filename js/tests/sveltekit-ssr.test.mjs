@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import {createLazyReplicaCommandRuntime} from '../dist/replica/command-runtime/lazy.js';
+import {createLazyReplicaCommandRuntime} from '../dist/replica/lazy.js';
 import test from 'node:test';
 
 import {

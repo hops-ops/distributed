@@ -1,9 +1,7 @@
 import {
 	type DistributedCommandMetadata
 } from '../../../protocol.js';
-import {
-	type ReplicaCommandArtifact
-} from '../../commands.js';
+import type { ReplicaCommandArtifact } from '../../commands/types.js';
 import type {
 	ReplicaValue
 } from '../../types.js';

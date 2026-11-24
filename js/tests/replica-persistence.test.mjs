@@ -1,16 +1,13 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import {
-	createReplicaIndexedDbPersistence,
-	REPLICA_OFFLINE_COMMAND_OUTBOX_SUPPORTED
-} from '../dist/replica/persistence.js';
+import { createReplicaIndexedDbPersistence, REPLICA_OFFLINE_COMMAND_OUTBOX_SUPPORTED } from '../dist/replica/index.js';
 import {
 	createDistributedReplica,
 	replicaIndexKey,
 	replicaRecordKey
 } from '../dist/replica/index.js';
-import { replicaCommandAuthority } from '../dist/replica/command-runtime.js';
+import { replicaCommandAuthority } from '../dist/replica/command-runtime/symbols.js';
 
 const DATABASE = 'replica-persistence-test';
 const Todo = Object.freeze({

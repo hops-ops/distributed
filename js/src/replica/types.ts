@@ -6,7 +6,7 @@ import type {
 	GraphqlResponseExtensions
 } from '../protocol.js';
 import type { Scheduler } from '../lib/backoff.js';
-import type { ReplicaDiagnosticsSink } from './diagnostics.js';
+import type { ReplicaDiagnosticsSink } from './diagnostics/types.js';
 
 export type ReplicaRevision = number | string | bigint;
 export type ReplicaValue =

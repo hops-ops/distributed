@@ -5,48 +5,53 @@ import {
 } from '../../protocol.js';
 import { sameScope } from '../distributed-replica/hydration.js';
 import { compareCodeUnits } from '../../lib/compare-code-units.js';
-import {
-	matchReplicaTrustedPresetInventory,
-	prepareReplicaCommandWithTrustedPresets,
-	verifyReplicaCommandReceipt,
-	type ReplicaCommandArtifact,
-	type ReplicaCommandRevalidationPlan,
-	type ReplicaPreparedCommand
-} from '../commands.js';
+import { matchReplicaTrustedPresetInventory } from '../commands/presets.js';
+import { prepareReplicaCommandWithTrustedPresets } from '../commands/prepare.js';
+import { verifyReplicaCommandReceipt } from '../commands/receipt.js';
+import type {
+	ReplicaCommandArtifact,
+	ReplicaCommandRevalidationPlan,
+	ReplicaPreparedCommand
+} from '../commands/types.js';
 import type { ReplicaResultEnvelope } from '../types.js';
 import {
 	applyOptimisticEffects,
+	preparedDispatchKeys,
+	preparedSemanticChanges
+} from './lib/effects.js';
+import {
 	attachAuthorityAbort,
 	callerProjectedPromise,
-	cloneScope,
-	commandOutput,
-	commandStatusArtifact,
-	commandStatusRequest,
-	commandSurfaceContract,
-	commandTransportRequest,
 	confirmDirectProjection,
-	defineBoundCommand,
-	dispatchPrepared,
 	failTrackedProjection,
-	freezeCommandTree,
-	graphqlCommandRejection,
-	linkAbortSignals,
 	monitorPendingProjection,
-	normalizeInventory,
-	normalizeRetries,
 	pendingProjection,
-	preparedDispatchKeys,
-	preparedSemanticChanges,
-	projectionExpectationFingerprint,
-	requireCommandEnvelope,
-	requireCommandRejectionEnvelope,
-	requireStatusEnvelope,
 	settleProjectionFailure,
 	settleProjectionSuccess,
-	settleTrackedProjection,
-	validateStatusProgression,
+	settleTrackedProjection
+} from './lib/projection.js';
+import {
+	cloneScope,
+	linkAbortSignals,
+	normalizeRetries,
 	waitForCommandOperation
-} from './lib/index.js';
+} from './lib/util.js';
+import { commandOutput, projectionExpectationFingerprint } from './lib/output.js';
+import {
+	commandStatusArtifact,
+	commandSurfaceContract,
+	normalizeInventory
+} from './lib/inventory.js';
+import {
+	commandStatusRequest,
+	commandTransportRequest,
+	dispatchPrepared,
+	graphqlCommandRejection,
+	requireCommandEnvelope,
+	requireCommandRejectionEnvelope
+} from './lib/transport.js';
+import { defineBoundCommand, freezeCommandTree } from './lib/binding.js';
+import { requireStatusEnvelope, validateStatusProgression } from './lib/status.js';
 import { ReplicaCommandRuntimeError } from './errors.js';
 import {
 	replicaCommandAuthority,
@@ -75,18 +80,18 @@ import type {
 	ReplicaCommandTransportResult,
 	SemanticReplica
 } from './types.js';
-import {
-	operationsFromProjectionDelta,
-	validateProjectionMetadataAuthority,
-	type ProjectionCapabilityArm,
-	type ProjectionCapabilityMutation,
-	type ProjectionDelta,
-	type ProjectionDeltaMutation,
-	type ProjectionDeltaRecoveryTarget,
-	type ProjectionDeltaScope,
-	type PreparedProjectionOperation,
-	type ReplicaCommandProjection
-} from '../projection-delta/index.js';
+import { operationsFromProjectionDelta } from '../projection-delta/resolve.js';
+import { validateProjectionMetadataAuthority } from '../projection-delta/validate.js';
+import type {
+	ProjectionCapabilityArm,
+	ProjectionCapabilityMutation,
+	ProjectionDelta,
+	ProjectionDeltaMutation,
+	ProjectionDeltaRecoveryTarget,
+	ProjectionDeltaScope,
+	PreparedProjectionOperation,
+	ReplicaCommandProjection
+} from '../projection-delta/types.js';
 
 function hasCompleteProjectionObservations(
 	metadata: DistributedCommandMetadata

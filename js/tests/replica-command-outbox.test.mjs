@@ -1,10 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import {
-	createReplicaIndexedDbPersistence,
-	REPLICA_OFFLINE_COMMAND_OUTBOX_SUPPORTED
-} from '../dist/replica/persistence.js';
+import { createReplicaIndexedDbPersistence, REPLICA_OFFLINE_COMMAND_OUTBOX_SUPPORTED } from '../dist/replica/index.js';
 import { classifyOutboxResult } from '../dist/replica/persistence/outbox.js';
 import { FakeIndexedDb } from './fixtures/fake-indexeddb.mjs';
 import { COMMAND_CONSISTENCY, commandReceipt } from './fixtures/command-protocol.mjs';

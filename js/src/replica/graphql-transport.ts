@@ -11,7 +11,7 @@ import type {
 	ReplicaCommandTransport,
 	ReplicaCommandTransportRequest,
 	ReplicaCommandTransportResult
-} from './command-runtime.js';
+} from './command-runtime/types.js';
 import type {
 	ReplicaLiveObserver,
 	ReplicaResultEnvelope,

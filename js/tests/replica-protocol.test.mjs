@@ -10,10 +10,7 @@ import {
 	createDistributedReplica,
 	replicaRecordKey
 } from '../dist/replica/index.js';
-import {
-	replicaCommandDirectProjection,
-	replicaCommandProjectionDelta
-} from '../dist/replica/command-runtime.js';
+import { replicaCommandDirectProjection, replicaCommandProjectionDelta } from '../dist/replica/command-runtime/symbols.js';
 import {
 	COMMAND_CONSISTENCY,
 	COMMAND_STATE,

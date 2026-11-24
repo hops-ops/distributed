@@ -1,6 +1,6 @@
 import type { GraphqlVariables } from '../../types.js';
-import type { ReplicaCommandArtifact } from '../commands.js';
-import type { ProjectionPreviewValue } from '../projection-delta/index.js';
+import type { ReplicaCommandArtifact } from '../commands/types.js';
+import type { ProjectionPreviewValue } from '../projection-delta/types.js';
 import type {
 	ReplicaObjectSelection,
 	ReplicaOperationArtifact,

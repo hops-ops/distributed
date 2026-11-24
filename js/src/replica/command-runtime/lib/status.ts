@@ -3,11 +3,9 @@ import {
 	type DistributedCommandMetadata,
 	type DistributedCommandState
 } from '../../../protocol.js';
-import {
-	matchReplicaTrustedPresetInventory,
-	verifyReplicaCommandReceipt,
-	type ReplicaPreparedCommand
-} from '../../commands.js';
+import { matchReplicaTrustedPresetInventory } from '../../commands/presets.js';
+import { verifyReplicaCommandReceipt } from '../../commands/receipt.js';
+import type { ReplicaPreparedCommand } from '../../commands/types.js';
 import type {
 	CapturedAuthority,
 	ReplicaCommandStatus,

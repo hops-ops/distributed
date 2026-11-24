@@ -13,10 +13,8 @@ import {
 	materializeInput,
 	resolveDirectProjection
 } from './resolve.js';
-import {
-	prepareCommandProjection,
-	validateCommandProjectionArtifact
-} from '../projection-delta/index.js';
+import { prepareCommandProjection } from '../projection-delta/resolve.js';
+import { validateCommandProjectionArtifact } from '../projection-delta/validate.js';
 import {
 	cloneClientSurface,
 	cloneRevalidation,

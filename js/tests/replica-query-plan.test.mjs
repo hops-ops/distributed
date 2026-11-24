@@ -6,7 +6,7 @@ import {
 	decideReplicaPaginationMaintenance,
 	evaluateReplicaFilter
 } from '../dist/replica/index.js';
-import { resolveArguments } from '../dist/replica/identity.js';
+import { resolveArguments } from '../dist/replica/identity/keys.js';
 
 const FILTER_FIELDS = Object.freeze([
 	Object.freeze({

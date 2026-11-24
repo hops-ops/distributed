@@ -1,4 +1,4 @@
-import { matchReplicaTrustedPresetInventory } from '../commands.js';
+import { matchReplicaTrustedPresetInventory } from '../commands/presets.js';
 import { sameScope } from '../distributed-replica/hydration.js';
 import { SHA256 } from './constants.js';
 import { ReplicaCommandRuntimeError } from './errors.js';

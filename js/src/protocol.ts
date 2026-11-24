@@ -6,10 +6,8 @@
  * positions remain opaque strings: the JavaScript client compares or returns
  * them, but never parses them as numbers or reconstructs server scopes.
  */
-import {
-	parseCommandProjectionMetadata,
-	type CommandProjectionMetadata
-} from './replica/projection-delta/index.js';
+import { parseCommandProjectionMetadata } from './replica/projection-delta/validate.js';
+import type { CommandProjectionMetadata } from './replica/projection-delta/types.js';
 import {
 	parseDistributedGenerationEnvelope,
 	type DistributedGenerationEnvelope

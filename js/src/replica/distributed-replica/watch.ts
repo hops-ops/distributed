@@ -1,5 +1,5 @@
 import type { GraphqlVariables } from '../../types.js';
-import { canonicalizeOperationVariables } from '../identity.js';
+import { canonicalizeOperationVariables } from '../identity/codec.js';
 import type { MaterializedReplicaResult } from '../materialize.js';
 import type {
 	ReplicaOperationArtifact,

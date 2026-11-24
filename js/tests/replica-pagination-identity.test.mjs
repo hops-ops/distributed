@@ -1,11 +1,8 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import {
-	coverageFromArtifact,
-	replicaIndexKey,
-	resolveArguments
-} from '../dist/replica/identity.js';
+import { coverageFromArtifact, resolveArguments } from '../dist/replica/identity/keys.js';
+import { replicaIndexKey } from '../dist/replica/index.js';
 
 const OFFSET_COVERAGE = Object.freeze({
 	kind: 'offset',
