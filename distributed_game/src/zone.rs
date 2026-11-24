@@ -411,10 +411,13 @@ pub trait Zone: Sized + Send + 'static {
     fn on_restore(&mut self, _ctx: &mut Ctx<'_, Self>, _state: &[u8], _saved_version: &str) {}
 
     /// A player arrived through a handoff from `from_zone` with `carried`
-    /// state (instead of `on_join`). Also called when the principal was
-    /// still present (reconnect grace), and for a handoff that failed and
-    /// returned to its source (`from_zone` is then the zone it never
-    /// reached). Defaults to `on_join`.
+    /// state (instead of `on_join`): the encoding of the [`Wire`](crate::Wire)
+    /// value the source passed to [`Ctx::handoff`](crate::Ctx::handoff);
+    /// decode it with [`codec::from_bytes`](crate::codec::from_bytes) (and
+    /// treat a failure as no state: the bytes crossed the client). Also
+    /// called when the principal was still present (reconnect grace), and
+    /// for a handoff that failed and returned to its source (`from_zone` is
+    /// then the zone it never reached). Defaults to `on_join`.
     fn on_handoff_join(
         &mut self,
         ctx: &mut Ctx<'_, Self>,

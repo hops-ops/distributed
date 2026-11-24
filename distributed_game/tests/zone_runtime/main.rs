@@ -609,7 +609,7 @@ fn focus_gives_an_observer_the_zones_view_radius() {
 }
 
 #[test]
-fn welcome_is_encoded_in_the_clients_protocol_version() {
+fn welcome_carries_features_and_origin() {
     use distributed_game::protocol::feature;
     use distributed_game::Origin;
     let clock = ManualClock::new();
@@ -618,31 +618,13 @@ fn welcome_is_encoded_in_the_clients_protocol_version() {
         ..ArenaConfig::default()
     };
     let mut h = host(HostConfig::default(), &clock, cfg);
-    let welcome = |h: &mut ZoneHost<Arena>, version: Option<u32>, who: &str| {
-        let joined = match version {
-            Some(v) => h.speaking(v).join(&claims(who, "z1"), 0, ""),
-            None => h.join(&claims(who, "z1"), 0, ""),
-        }
-        .unwrap();
-        let frame = frames_for(&h.drain_outbound(), joined.client).remove(0);
-        let mut mirror = ClientMirror::speaking(version.unwrap_or(2));
-        match mirror.apply(&frame).unwrap() {
-            ServerMessage::Welcome(w) => w,
-            other => panic!("{other:?}"),
-        }
+    let joined = h.join(&claims("ana", "z1"), 0, "").unwrap();
+    let frame = frames_for(&h.drain_outbound(), joined.client).remove(0);
+    let Ok(ServerMessage::Welcome(w)) = ClientMirror::new().apply(&frame) else {
+        panic!("Welcome")
     };
-    let v1 = welcome(&mut h, Some(1), "ana");
-    assert_eq!((v1.protocol_version, v1.features, v1.origin), (1, 0, None));
-    let v2 = welcome(&mut h, None, "bo");
-    assert_eq!(v2.protocol_version, 2);
-    assert_eq!(v2.features & feature::FOCUS, feature::FOCUS);
-    assert_eq!(v2.origin, Some(Origin::new(120.0, -40.0)));
-    // `speaking` applies to one admission: a failed one consumes it too.
-    assert!(h
-        .speaking(1)
-        .join(&claims("cy", "elsewhere"), 0, "")
-        .is_err());
-    assert_eq!(welcome(&mut h, None, "cy").protocol_version, 2);
+    assert_eq!(w.features & feature::FOCUS, feature::FOCUS);
+    assert_eq!(w.origin, Some(Origin::new(120.0, -40.0)));
 }
 
 #[test]
@@ -845,4 +827,58 @@ fn input_credits_cap_inputs_per_tick_and_absorb_bursts() {
     }
     // Full bank of 3 spent on the burst, then one input per tick.
     assert_eq!(h.zone().consumed[..5], [3, 1, 1, 1, 1]);
+}
+
+/// Queued facts wait in the host's backlog behind a full queue, in order,
+/// count as in flight, and go out one by one as settlements free capacity.
+#[test]
+fn queued_facts_wait_in_the_host_backlog_in_order() {
+    let clock = ManualClock::new();
+    let cfg = ArenaConfig {
+        queue_facts: true,
+        ..ArenaConfig::default()
+    };
+    let (queue, script) = distributed_game::FactQueue::scripted(1);
+    let mut h = host(HostConfig::default(), &clock, cfg).with_facts(queue.with_journal());
+    let joined = h.join(&claims("ana", "z1"), 0, "").unwrap();
+    let distributed_game::Viewer::Player(ana) = joined.viewer else {
+        panic!("a player")
+    };
+    let key = |tick: u64| format!("step:{tick}:{}", ana.0);
+    let step = |h: &mut ZoneHost<Arena>| {
+        clock.advance(MS(34));
+        assert_eq!(h.advance().ticks, 1);
+    };
+    for _ in 0..3 {
+        step(&mut h);
+    }
+    // Capacity 1: the first is sent, two wait; nothing refused.
+    let sent: Vec<String> = h
+        .take_emitted_facts()
+        .iter()
+        .map(|f| f.key().into())
+        .collect();
+    assert_eq!(sent, [key(1)]);
+    assert_eq!(h.facts_in_flight(), 3);
+    assert!(h.zone().emit_errors.is_empty());
+    // Each settlement frees the slot for the oldest waiting fact.
+    let settle = |key: &str| distributed_game::FactSettlement {
+        key: key.into(),
+        command: "step".into(),
+        outcome: FactOutcome::Committed(FactReceipt {
+            payload: serde_json::Value::Null,
+            replayed: false,
+        }),
+    };
+    let mut order = sent;
+    for _ in 0..3 {
+        let key = order.last().unwrap().clone();
+        script.push(h.tick() + 1, settle(&key));
+        step(&mut h);
+        step(&mut h);
+        order.extend(h.take_emitted_facts().iter().map(|f| f.key().to_string()));
+    }
+    assert_eq!(order, [key(1), key(2), key(3), key(4)]);
+    assert!(h.zone().emit_errors.is_empty());
+    assert_eq!(h.zone().settled.len(), 3, "settlements reach the zone");
 }

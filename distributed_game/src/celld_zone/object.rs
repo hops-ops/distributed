@@ -1899,8 +1899,7 @@ impl<Z: CelldZone> ZoneObject<Z> {
                     reject(ws, error::RECONNECT_FAILED, "zone restarted; rejoin");
                     return Ok(());
                 };
-                host.speaking(hello.protocol_version)
-                    .reconnect_with_version(&token, hello.capabilities, &hello.content_version)
+                host.reconnect_with_version(&token, hello.capabilities, &hello.content_version)
             }
             // A transfer's single use is recorded by the target object
             // alone: a return to the source would make it usable twice.
@@ -1977,7 +1976,6 @@ impl<Z: CelldZone> ZoneObject<Z> {
                     reject(ws, error::ZONE_UNAVAILABLE, "zone asleep");
                     return Ok(());
                 };
-                let host = host.speaking(hello.protocol_version);
                 match &admitted {
                     Admitted::Arrival(transfer) => {
                         host.join_transfer(transfer, hello.capabilities, &hello.content_version)

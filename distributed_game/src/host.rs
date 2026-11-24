@@ -1,16 +1,23 @@
 //! [`ZoneHost`]: drives one [`Zone`] — lifecycle, fixed timestep, activity
 //! tiers, inputs, timers, facts and replication.
 //!
-//! The host is synchronous and transport-agnostic. A driver (the `net`
-//! server, a test, a custom loop) calls:
+//! The host is synchronous and transport-agnostic. Everything from outside
+//! that changes the zone is one [`Stimulus`] applied with
+//! [`apply`](ZoneHost::apply), which reads the injected [`Clock`] once (the
+//! zone sees that time throughout) and, with [`HostConfig::record`], appends
+//! it to the host's [`Recording`](crate::replay::Recording). A driver (the
+//! `net` server, a celld zone object, a test, a custom loop) calls, as
+//! shorthand for `apply`:
 //!
 //! - [`join`](ZoneHost::join) / [`reconnect`](ZoneHost::reconnect) /
 //!   [`disconnect`](ZoneHost::disconnect) for membership,
 //! - [`push_input`](ZoneHost::push_input) for wire inputs,
-//! - [`advance`](ZoneHost::advance) whenever time may have passed (it reads
-//!   the injected [`Clock`], runs due fixed steps and patches, and reports
-//!   when it next wants to be called),
-//! - [`drain_outbound`](ZoneHost::drain_outbound) to collect encoded frames.
+//! - [`advance`](ZoneHost::advance) whenever time may have passed (it runs
+//!   due fixed steps and patches, and reports when it next wants to be
+//!   called),
+//!
+//! and [`drain_outbound`](ZoneHost::drain_outbound) to collect encoded
+//! frames (outputs are never stimuli).
 //!
 //! **Cadence.** Ticks run at `tick_rate` with an accumulator and catch-up cap
 //! ([`FixedTimestep`]). Patches (Deltas) run at `patch_rate` on the clock,
@@ -32,6 +39,7 @@ use std::time::Duration;
 
 use crate::authoring::GameEvent;
 use crate::clock::Clock;
+use crate::codec::Wire;
 use crate::collide::{Colliders, Ray, RayHit};
 use crate::facts::{EmitError, Fact, FactCommand, FactQueue, FactSettlement};
 use crate::handoff::{HandoffError, HandoffRequest, Transfer, TransferIssuer, MAX_CARRIED_BYTES};
@@ -42,9 +50,8 @@ use crate::lifecycle::{
     ConnectionLost, JoinVia, LeftReason, LostCause, PlayerDisconnected, PlayerJoined, PlayerLeft,
     PlayerReconnected,
 };
-use crate::protocol::{
-    error, feature, kick, Notice, Role, ServerMessage, Welcome, PROTOCOL_VERSION,
-};
+use crate::protocol::{error, feature, kick, Notice, Role, ServerMessage, Welcome};
+use crate::replay::{Entry, Observed, Recording};
 use crate::replication::{ClientReplica, DeltaStats, EncodedWorld, WorldView};
 use crate::rewind::{Rewind, RewindConfig, RewindFrame, ShotTiming};
 use crate::rng::ZoneRng;
@@ -110,6 +117,11 @@ pub struct HostConfig {
     /// connection lost, reconnected, disconnected, left) on the zone's fact
     /// queue, bound to each player's verified principal. Off by default.
     pub lifecycle_facts: bool,
+    /// Keep a [`Recording`](crate::replay::Recording) of every
+    /// [`Stimulus`] from creation on ([`ZoneHost::recording`]), for
+    /// [`replay`](crate::replay::replay). Costs a state hash per tick and
+    /// memory for every stimulus. Off by default.
+    pub record: bool,
 }
 
 impl Default for HostConfig {
@@ -134,6 +146,7 @@ impl Default for HostConfig {
             boot_epoch: 0,
             config_version: String::new(),
             lifecycle_facts: false,
+            record: false,
         }
     }
 }
@@ -226,6 +239,198 @@ pub struct Joined {
     pub viewer: Viewer,
 }
 
+/// Something from outside the zone that changes it: the one way anything
+/// does. [`ZoneHost::apply`] runs it with the clock read once on arrival;
+/// the typed methods ([`join`](ZoneHost::join),
+/// [`push_input`](ZoneHost::push_input), [`advance`](ZoneHost::advance), …)
+/// are shorthand for it. A host with [`HostConfig::record`] keeps every
+/// stimulus, with that clock reading and what it observed, in its
+/// [`Recording`](crate::replay::Recording).
+///
+/// Game messages travel encoded (`type_id` + payload, as on the wire), so
+/// a stimulus is independent of the zone type.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Stimulus {
+    /// Admit a verified ticket holder.
+    Join {
+        /// Verified claims.
+        claims: TicketClaims,
+        /// Hello capabilities.
+        capabilities: u32,
+        /// The client's content version.
+        content_version: String,
+    },
+    /// Admit a player arriving with a verified transfer ticket: the zone
+    /// sees [`Zone::on_handoff_join`] with the carried state (also when the
+    /// principal is still present, e.g. inside its reconnect grace).
+    JoinTransfer {
+        /// Verified transfer.
+        transfer: Transfer,
+        /// Hello capabilities.
+        capabilities: u32,
+        /// The client's content version.
+        content_version: String,
+    },
+    /// Resume a player's session with the token from its last Welcome.
+    /// With `content_version` (the client's, possibly reloaded) a stale
+    /// version is refused under [`StalePolicy::Strict`]; under `SafeRoom`
+    /// it is admitted to this zone and told `Kick(RELOAD)` again if this
+    /// zone is a gate.
+    Reconnect {
+        /// Reconnect token (in a recording: its place in the host's token
+        /// sequence, `token#N`).
+        token: String,
+        /// Hello capabilities.
+        capabilities: u32,
+        /// The client's content version, when it presented one.
+        content_version: Option<String>,
+    },
+    /// A connection ended. Graceful (Leave) removes the player now;
+    /// otherwise the player stays (disconnected) for `reconnect_grace`.
+    Disconnect {
+        /// Connection.
+        client: ClientId,
+        /// Leave vs drop.
+        graceful: bool,
+    },
+    /// A wire input from `client`, decoded and sanitized by the zone.
+    Input {
+        /// Connection.
+        client: ClientId,
+        /// Sequence.
+        seq: u32,
+        /// Client tick.
+        client_tick: u32,
+        /// Encoded input.
+        payload: Vec<u8>,
+    },
+    /// A client patched its content live and now runs `version`
+    /// (`ClientMessage::Content`): kept for its player only when it is the
+    /// zone's current version (a client can catch up, never get ahead).
+    Content {
+        /// Connection.
+        client: ClientId,
+        /// Version it runs.
+        version: String,
+    },
+    /// An observer's `Focus` ([`Zone::on_observer_focus`]); ignored for
+    /// players and unknown clients.
+    Focus {
+        /// Connection.
+        client: ClientId,
+        /// Focus x.
+        x: f32,
+        /// Focus y.
+        y: f32,
+    },
+    /// Service inbox ([`crate::inbox`]): remove every connection of
+    /// `principal` (players leave with [`LeaveReason::Kicked`]).
+    Kick {
+        /// Principal kicked.
+        principal: String,
+        /// Reason sent to its clients.
+        reason: String,
+    },
+    /// Service inbox: an encoded `Z::Message` for [`Zone::on_message`].
+    Message {
+        /// Message type id.
+        type_id: u32,
+        /// Encoded payload.
+        payload: Vec<u8>,
+    },
+    /// A message from another zone ([`Zone::on_zone_message`]), unless its
+    /// id was seen lately.
+    ZoneMessage(ZoneEnvelope),
+    /// A tier-up event from a child zone: delivered to
+    /// [`Zone::on_child_event`] on a later tick (or the next advance when
+    /// the zone is not ticking), never while frozen.
+    ChildEvent(ChildEvent),
+    /// Barrier phase 1: freeze as soon as [`Zone::freeze_ready`] allows
+    /// (now, or at the end of a later advance; the zone keeps ticking until
+    /// then).
+    RequestFreeze(Notice),
+    /// Abort a barrier: drop a pending freeze request, and resume with the
+    /// notice if already frozen.
+    CancelFreeze(Notice),
+    /// Resume after a freeze; the frozen backlog is not simulated.
+    Resume(Notice),
+    /// Switch to a new content version
+    /// ([`Zone::on_content_version_changed`]); facts and stamps produced
+    /// afterwards carry it.
+    ContentVersion(String),
+    /// Switch the remote config version ([`HostConfig::config_version`]);
+    /// facts and stamps produced afterwards carry it.
+    ConfigVersion(String),
+    /// Tell a connected player to reload its content (`Kick(RELOAD)`) and
+    /// keep it in the reconnect grace window so it can reconnect with its
+    /// last Welcome's token after reloading.
+    Reload(PlayerId),
+    /// [`Reload`](Self::Reload) every connected player whose content
+    /// version differs from the zone's (hard rollout).
+    ReloadStale,
+    /// Kick a player now.
+    KickPlayer {
+        /// Player.
+        player: PlayerId,
+        /// Reason sent to its client.
+        message: String,
+    },
+    /// Tell a player to move to `target_zone`, then remove it
+    /// (`LeaveReason::Handoff`); the transfer is the caller's concern.
+    Handoff {
+        /// Player.
+        player: PlayerId,
+        /// Zone it moves to.
+        target_zone: String,
+        /// Transfer ticket it presents there.
+        ticket: String,
+    },
+    /// Hand a hibernated snapshot to the zone ([`Zone::on_restore`]),
+    /// right after construction.
+    Restore {
+        /// Snapshot bytes.
+        state: Vec<u8>,
+        /// Content version it was written under.
+        saved_version: String,
+    },
+    /// Kick everyone (`on_leave(Disposed)` / `on_unobserve`), call
+    /// `on_dispose`, clear timers. The host stops ticking afterwards.
+    Dispose,
+    /// Run due ticks and patches for the time elapsed on the clock.
+    Advance,
+}
+
+/// What a [`Stimulus`] answered.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Outcome {
+    /// Nothing to report.
+    Done,
+    /// A join or reconnect.
+    Joined(Result<Joined, JoinError>),
+    /// An input.
+    Input(PushOutcome),
+    /// A kick or message from the service inbox.
+    Delivered(Delivered),
+    /// A zone message.
+    ZoneMessage(Result<(), ZoneMessageError>),
+    /// A freeze request.
+    Freeze(FreezeState),
+    /// Players told to reload.
+    Reloaded(usize),
+    /// Whether a client's content patch was kept.
+    Patched(bool),
+    /// An advance.
+    Advanced(AdvanceReport),
+}
+
+/// Recording kept by a host with [`HostConfig::record`].
+struct Tape {
+    recording: Recording,
+    /// Tokens issued so far: a reconnect is recorded by its token's place
+    /// in this sequence, never the secret.
+    tokens: Vec<String>,
+}
+
 struct PlayerSlot<I> {
     info: PlayerInfo,
     inputs: InputBuffer<I>,
@@ -255,6 +460,12 @@ pub(crate) struct Core<Z: Zone> {
     zone_id: String,
     config: HostConfig,
     clock: Arc<dyn Clock>,
+    /// The clock read when the current stimulus arrived
+    /// ([`ZoneHost::apply`]): every time the host and the zone see while it
+    /// runs, so a recording that keeps it replays exactly.
+    now: Duration,
+    /// Wall time (Unix ms) read with [`now`](Self::now).
+    unix_ms: u64,
     rng: ZoneRng,
     timers: Timers<Z::Timer>,
     tick: u64,
@@ -292,8 +503,9 @@ pub(crate) struct Core<Z: Zone> {
     /// Stamp time forced while a handoff departure runs `on_leave`, so the
     /// source's departure facts carry exactly the time in the ticket.
     pinned_stamp_ms: Option<u64>,
-    /// Lifecycle facts waiting for queue capacity, in emission order.
-    lifecycle_backlog: VecDeque<Fact>,
+    /// Bound facts waiting for queue capacity, in emission order: the
+    /// lifecycle facts and [`Ctx::emit_queued`]'s.
+    backlog: VecDeque<Fact>,
     /// Zone messages sent since the driver last took them.
     zone_out: Vec<ZoneEnvelope>,
     /// Zone messages sent this activation (their ids).
@@ -325,11 +537,11 @@ impl<Z: Zone> Core<Z> {
     }
 
     fn server_time_ms(&self) -> f64 {
-        self.clock.now().as_secs_f64() * 1000.0
+        self.now.as_secs_f64() * 1000.0
     }
 
     fn in_flight(&self) -> usize {
-        self.facts.as_ref().map_or(0, FactQueue::in_flight) + self.lifecycle_backlog.len()
+        self.facts.as_ref().map_or(0, FactQueue::in_flight) + self.backlog.len()
     }
 
     /// Queue a lifecycle fact for `principal`'s slot `player` (transition
@@ -348,22 +560,27 @@ impl<Z: Zone> Core<Z> {
             return;
         };
         let fact = fact.bind(Some(principal.to_string()), self.stamp_fact());
-        self.lifecycle_backlog.push_back(fact);
-        self.flush_lifecycle();
+        self.queue(fact);
     }
 
-    /// Send backlogged lifecycle facts while the queue has room.
-    fn flush_lifecycle(&mut self) {
+    /// Queue a bound fact behind the backlog and send what fits.
+    fn queue(&mut self, fact: Fact) {
+        self.backlog.push_back(fact);
+        self.flush_backlog();
+    }
+
+    /// Send backlogged facts while the queue has room.
+    fn flush_backlog(&mut self) {
         let Some(queue) = self.facts.as_mut() else {
-            self.lifecycle_backlog.clear();
+            self.backlog.clear();
             return;
         };
-        while let Some(fact) = self.lifecycle_backlog.front() {
+        while let Some(fact) = self.backlog.front() {
             match queue.try_send(fact.clone()) {
                 Err(EmitError::Backpressure) => return,
                 // Sent, or a duplicate already in flight: done either way.
                 _ => {
-                    self.lifecycle_backlog.pop_front();
+                    self.backlog.pop_front();
                 }
             }
         }
@@ -388,7 +605,7 @@ impl<Z: Zone> Core<Z> {
     /// Wall time stamped on anything produced now (Unix ms).
     fn stamp_ms(&self) -> u64 {
         self.pinned_stamp_ms
-            .unwrap_or_else(|| self.clock.unix_ms().max(self.stamp_floor_ms))
+            .unwrap_or_else(|| self.unix_ms.max(self.stamp_floor_ms))
     }
 
     fn stamp(&self) -> FactStamp {
@@ -450,9 +667,10 @@ impl<Z: Zone> Ctx<'_, Z> {
         self.core.sim_time
     }
 
-    /// Host clock (not deterministic across runs with a real clock).
+    /// Host clock when the current stimulus arrived (the same throughout
+    /// one [`ZoneHost::apply`]; recorded, so it replays).
     pub fn now(&self) -> Duration {
-        self.core.clock.now()
+        self.core.now
     }
 
     /// Current activity tier.
@@ -744,9 +962,66 @@ impl<Z: Zone> Ctx<'_, Z> {
             .try_send(fact.bind(principal, stamp))
     }
 
-    /// Unsettled facts.
+    /// [`emit`](Self::emit) that never answers [`EmitError::Backpressure`]:
+    /// when the fact queue is full the fact waits in the host's backlog,
+    /// in order behind facts queued earlier (the lifecycle facts use the
+    /// same backlog), and is sent as capacity frees, at the start of each
+    /// advance. It is stamped now and counts in
+    /// [`facts_in_flight`](Self::facts_in_flight) from now on, so the zone
+    /// does not go Dormant with it waiting; its settlement arrives in
+    /// [`Zone::on_fact_settled`] as any other. A key already in flight is
+    /// not sent twice (the waiting copy is dropped). A fact still waiting
+    /// when the queue is abandoned is lost with the queue. Returns the key.
+    pub fn emit_queued<C: FactCommand>(
+        &mut self,
+        player: PlayerId,
+        input: C,
+    ) -> Result<String, EmitError> {
+        let fact = self.fact(&input)?;
+        let key = fact.key().to_string();
+        self.queue_fact_for(player, fact).map(|()| key)
+    }
+
+    /// [`emit_fact_for`](Self::emit_fact_for) through the backlog, as
+    /// [`emit_queued`](Self::emit_queued).
+    pub fn queue_fact_for(&mut self, player: PlayerId, fact: Fact) -> Result<(), EmitError> {
+        let principal = self
+            .core
+            .players
+            .get(&player)
+            .map(|slot| slot.info.principal.clone())
+            .ok_or(EmitError::UnknownPlayer)?;
+        self.queue_bound(fact, Some(principal))
+    }
+
+    /// [`emit_fact_as`](Self::emit_fact_as) through the backlog, as
+    /// [`emit_queued`](Self::emit_queued).
+    pub fn queue_fact_as(
+        &mut self,
+        principal: &VerifiedPrincipal,
+        fact: Fact,
+    ) -> Result<(), EmitError> {
+        self.queue_bound(fact, Some(principal.as_str().to_string()))
+    }
+
+    fn queue_bound(&mut self, fact: Fact, principal: Option<String>) -> Result<(), EmitError> {
+        if self.core.facts.is_none() {
+            return Err(EmitError::NoSink);
+        }
+        let stamp = self.core.stamp_fact();
+        self.core.queue(fact.bind(principal, stamp));
+        Ok(())
+    }
+
+    /// Unsettled facts (the backlog included).
     pub fn facts_in_flight(&self) -> usize {
         self.core.in_flight()
+    }
+
+    /// Facts waiting in the backlog for queue capacity
+    /// ([`emit_queued`](Self::emit_queued)).
+    pub fn facts_queued(&self) -> usize {
+        self.core.backlog.len()
     }
 
     /// Lag-compensation history (filled by [`Zone::record_rewind`]).
@@ -872,21 +1147,35 @@ impl<Z: Zone> Ctx<'_, Z> {
         self.core.stamp()
     }
 
-    /// Move `player` to `target_zone` with `carried` state. A signed
-    /// transfer ticket is issued now; after the current hook returns the
-    /// player is removed (`LeaveReason::Handoff`) and its client is told
+    /// Move `player` to `target_zone` with `carried` state (any [`Wire`]
+    /// value, e.g. a `#[derive(GameRecord)]` struct; the target decodes it
+    /// in [`Zone::on_handoff_join`] with
+    /// [`codec::from_bytes`](crate::codec::from_bytes)). A signed transfer
+    /// ticket is issued now; after the current hook returns the player is
+    /// removed (`LeaveReason::Handoff`) and its client is told
     /// `Handoff(target, ticket)`. The player can never be in both zones: it
     /// leaves this one before the ticket is usable, and the ticket is
     /// single-use.
-    pub fn handoff(
+    ///
+    /// **Custody.** From then on the carried state exists only inside the
+    /// ticket, which the client holds: it is delivered at most once. A
+    /// client that drops the ticket (or deliberately discards one carrying
+    /// state it dislikes and joins afresh), a ticket that expires, or an
+    /// issuing host that restarts before the target reserves it
+    /// (`unknown transfer`) loses the carried state, and the player is in
+    /// neither zone until it joins again. Anything that must survive that
+    /// belongs in a durable record, moved by a fact from the hook (see the
+    /// handoff section of the README), not in `carried`.
+    pub fn handoff<C: Wire>(
         &mut self,
         player: PlayerId,
         target_zone: &str,
-        carried: Vec<u8>,
+        carried: &C,
     ) -> Result<(), HandoffError> {
         if target_zone == self.core.zone_id {
             return Err(HandoffError::SameZone);
         }
+        let carried = crate::codec::to_bytes(carried);
         if carried.len() > MAX_CARRIED_BYTES {
             return Err(HandoffError::TooLarge);
         }
@@ -971,13 +1260,12 @@ pub struct ZoneHost<Z: Zone> {
     freeze_request: Option<Notice>,
     disposed: bool,
     token_source: Box<dyn FnMut() -> String + Send>,
+    tape: Option<Tape>,
     pending: AdvanceReport,
     hash_ticks: bool,
     /// The last patch's world: the next one shares its unchanged entities
     /// and encodes each change once for every client.
     last_world: Option<EncodedWorld>,
-    /// Protocol version of the next admission's client ([`ZoneHost::speaking`]).
-    next_protocol: Option<u32>,
 }
 
 macro_rules! hook {
@@ -1003,6 +1291,8 @@ impl<Z: Zone> ZoneHost<Z> {
         let mut core = Core {
             rng: ZoneRng::for_zone(config.world_seed, &zone_id),
             zone_id,
+            now,
+            unix_ms: clock.unix_ms(),
             clock,
             timers: Timers::default(),
             tick: 0,
@@ -1029,7 +1319,7 @@ impl<Z: Zone> ZoneHost<Z> {
             stamped: 0,
             stamp_floor_ms: 0,
             pinned_stamp_ms: None,
-            lifecycle_backlog: VecDeque::new(),
+            backlog: VecDeque::new(),
             zone_out: Vec::new(),
             zone_seq: 0,
             zone_seen: SeenIds::default(),
@@ -1056,17 +1346,38 @@ impl<Z: Zone> ZoneHost<Z> {
             freeze_request: None,
             disposed: false,
             token_source: Box::new(default_token),
+            tape: None,
             pending: AdvanceReport::default(),
             hash_ticks: false,
             last_world: None,
-            next_protocol: None,
         };
+        if host.core.config.record {
+            host.hash_ticks = true;
+            host.tape = Some(Tape {
+                recording: Recording {
+                    zone_id: host.core.zone_id.clone(),
+                    // As resolved (the boot epoch), and replayed unrecorded.
+                    config: HostConfig {
+                        record: false,
+                        ..host.core.config.clone()
+                    },
+                    created_at: now,
+                    created_unix_ms: host.core.unix_ms,
+                    fact_capacity: None,
+                    entries: Vec::new(),
+                },
+                tokens: Vec::new(),
+            });
+        }
         host.process_kicks();
         host
     }
 
     /// Attach the zone side of a fact channel.
     pub fn with_facts(mut self, facts: FactQueue) -> Self {
+        if let Some(tape) = &mut self.tape {
+            tape.recording.fact_capacity = Some(facts.capacity());
+        }
         self.core.facts = Some(facts);
         self
     }
@@ -1086,9 +1397,8 @@ impl<Z: Zone> ZoneHost<Z> {
         self
     }
 
-    /// Hand a hibernated snapshot to the zone ([`Zone::on_restore`]); call
-    /// right after construction.
-    pub fn restore(&mut self, state: &[u8], saved_version: &str) {
+    /// [`Stimulus::Restore`].
+    fn restore_snapshot(&mut self, state: &[u8], saved_version: &str) {
         hook!(self.on_restore(state, saved_version));
         self.process_kicks();
     }
@@ -1108,7 +1418,8 @@ impl<Z: Zone> ZoneHost<Z> {
         &self.zone
     }
 
-    /// Mutable game state (operator tooling; bypasses determinism).
+    /// Mutable game state (operator tooling): not a [`Stimulus`], so a
+    /// recording does not see it and its replay diverges.
     pub fn zone_mut(&mut self) -> &mut Z {
         &mut self.zone
     }
@@ -1202,7 +1513,7 @@ impl<Z: Zone> ZoneHost<Z> {
     /// left unsettled.
     pub fn abandon_facts(&mut self) -> usize {
         let unsettled = self.core.in_flight();
-        self.core.lifecycle_backlog.clear();
+        self.core.backlog.clear();
         if let Some(queue) = self.core.facts.take() {
             queue.abandon();
         }
@@ -1229,9 +1540,9 @@ impl<Z: Zone> ZoneHost<Z> {
         self.frozen
     }
 
-    /// Server clock in ms (for Pong).
+    /// Server clock in ms (for Pong): read now, not frozen.
     pub fn server_time_ms(&self) -> f64 {
-        self.core.server_time_ms()
+        self.core.clock.now().as_secs_f64() * 1000.0
     }
 
     /// Send every client the current state now, without ticking (a host
@@ -1248,40 +1559,10 @@ impl<Z: Zone> ZoneHost<Z> {
         std::mem::take(&mut self.core.outbound)
     }
 
-    /// The protocol version of the client the next
-    /// [`join`](Self::join) / [`join_transfer`](Self::join_transfer) /
-    /// [`reconnect`](Self::reconnect) admits (its Hello's
-    /// `protocol_version`, already checked with
-    /// [`supports_protocol`](crate::protocol::supports_protocol)): its
-    /// Welcome is encoded in it. Applies to that one call; without it the
-    /// client speaks [`PROTOCOL_VERSION`].
-    ///
-    /// ```ignore
-    /// host.speaking(hello.protocol_version).join(&claims, hello.capabilities, &hello.content_version)
-    /// ```
-    pub fn speaking(&mut self, protocol_version: u32) -> &mut Self {
-        self.next_protocol = Some(protocol_version);
-        self
-    }
-
-    /// Admit a verified ticket holder.
-    pub fn join(
-        &mut self,
-        claims: &TicketClaims,
-        capabilities: u32,
-        content_version: &str,
-    ) -> Result<Joined, JoinError> {
-        self.admit(claims, capabilities, content_version, None)
-    }
-
-    /// Admit a player arriving with a verified transfer ticket; the zone
-    /// sees [`Zone::on_handoff_join`] with the carried state (also when the
-    /// principal is still present, e.g. inside its reconnect grace).
-    ///
-    /// From now on this zone stamps facts later than the source stamped the
-    /// departure ([`Transfer::departed_at_ms`]), whatever the two hosts'
-    /// clocks say.
-    pub fn join_transfer(
+    /// [`Stimulus::JoinTransfer`]: from now on this zone stamps facts later
+    /// than the source stamped the departure ([`Transfer::departed_at_ms`]),
+    /// whatever the two hosts' clocks say.
+    fn admit_transfer(
         &mut self,
         transfer: &Transfer,
         capabilities: u32,
@@ -1312,7 +1593,6 @@ impl<Z: Zone> ZoneHost<Z> {
         content_version: &str,
         handoff: Option<(&str, Vec<u8>)>,
     ) -> Result<Joined, JoinError> {
-        let protocol = self.next_protocol.take().unwrap_or(PROTOCOL_VERSION);
         if self.disposed {
             return Err(JoinError::new(error::NOT_FOUND, "zone disposed"));
         }
@@ -1375,7 +1655,7 @@ impl<Z: Zone> ZoneHost<Z> {
                     }
                     slot.info.extensions = claims.extensions.clone();
                 }
-                self.bind_player(player, client, capabilities, protocol);
+                self.bind_player(player, client, capabilities);
                 let zone = self.core.zone_id.clone();
                 if let Some((from, carried)) = handoff.take() {
                     self.core.emit_lifecycle(
@@ -1407,6 +1687,7 @@ impl<Z: Zone> ZoneHost<Z> {
                 let player = PlayerId(self.core.next_id());
                 let radius = self.core.config.default_view_radius;
                 let capacity = self.core.config.input_capacity;
+                let session_id = self.next_token();
                 self.core.players.insert(
                     player,
                     PlayerSlot {
@@ -1423,12 +1704,12 @@ impl<Z: Zone> ZoneHost<Z> {
                         view: View::new(0.0, 0.0, radius),
                         grace_until: None,
                         reconnect_token: String::new(),
-                        session_id: (self.token_source)(),
+                        session_id,
                         content_version: content_version.to_string(),
                         transitions: 0,
                     },
                 );
-                self.bind_player(player, client, capabilities, protocol);
+                self.bind_player(player, client, capabilities);
                 let zone = self.core.zone_id.clone();
                 match handoff.take() {
                     Some((from, carried)) => {
@@ -1461,7 +1742,7 @@ impl<Z: Zone> ZoneHost<Z> {
             }
             (Role::Observer, _) => {
                 let observer = ObserverId(self.core.next_id());
-                let session_id = (self.token_source)();
+                let session_id = self.next_token();
                 self.core.observers.insert(
                     observer,
                     ObserverSlot {
@@ -1477,7 +1758,7 @@ impl<Z: Zone> ZoneHost<Z> {
                     },
                 );
                 self.attach_client(client, Viewer::Observer(observer));
-                self.welcome(client, session_id, String::new(), Role::Observer, protocol);
+                self.welcome(client, session_id, String::new(), Role::Observer);
                 hook!(self.on_observe(observer));
                 Joined {
                     client,
@@ -1490,30 +1771,11 @@ impl<Z: Zone> ZoneHost<Z> {
                 slot.content_version = content_version.to_string();
             }
             if reload {
-                self.reload_player(player);
+                self.reload(player);
             }
         }
         self.process_kicks();
         Ok(joined)
-    }
-
-    /// Resume a player's session with the token from its last Welcome.
-    pub fn reconnect(&mut self, token: &str, capabilities: u32) -> Result<Joined, JoinError> {
-        self.reconnect_as(token, capabilities, None)
-    }
-
-    /// [`reconnect`](Self::reconnect) presenting the client's (possibly
-    /// reloaded) content version. Under [`StalePolicy::Strict`] a stale
-    /// version is refused; under `SafeRoom` it is admitted to this zone
-    /// (the one the player is in), and told `Kick(RELOAD)` again if this
-    /// zone is a gate.
-    pub fn reconnect_with_version(
-        &mut self,
-        token: &str,
-        capabilities: u32,
-        content_version: &str,
-    ) -> Result<Joined, JoinError> {
-        self.reconnect_as(token, capabilities, Some(content_version))
     }
 
     fn reconnect_as(
@@ -1522,7 +1784,6 @@ impl<Z: Zone> ZoneHost<Z> {
         capabilities: u32,
         content_version: Option<&str>,
     ) -> Result<Joined, JoinError> {
-        let protocol = self.next_protocol.take().unwrap_or(PROTOCOL_VERSION);
         let player = (!token.is_empty() && !self.disposed)
             .then(|| {
                 self.core
@@ -1548,7 +1809,7 @@ impl<Z: Zone> ZoneHost<Z> {
         }
         self.wake();
         let client = ClientId(self.core.next_id());
-        self.bind_player(player, client, capabilities, protocol);
+        self.bind_player(player, client, capabilities);
         if let Some(version) = content_version {
             if let Some(slot) = self.core.players.get_mut(&player) {
                 slot.content_version = version.to_string();
@@ -1558,7 +1819,7 @@ impl<Z: Zone> ZoneHost<Z> {
         self.core.emit_lifecycle(player, PlayerReconnected { zone });
         hook!(self.on_reconnected(player));
         if reload {
-            self.reload_player(player);
+            self.reload(player);
         }
         self.process_kicks();
         Ok(Joined {
@@ -1567,11 +1828,9 @@ impl<Z: Zone> ZoneHost<Z> {
         })
     }
 
-    /// Tell a connected player to reload its content (`Kick(RELOAD)`) and
-    /// keep it in the reconnect grace window so it can reconnect with its
-    /// last Welcome's token after reloading.
-    pub fn reload_player(&mut self, player: PlayerId) {
-        let now = self.core.clock.now();
+    /// [`Stimulus::Reload`].
+    fn reload(&mut self, player: PlayerId) {
+        let now = self.core.now;
         let grace = self.core.config.reconnect_grace;
         let message = ServerMessage::Kick {
             code: kick::RELOAD,
@@ -1603,10 +1862,8 @@ impl<Z: Zone> ZoneHost<Z> {
         hook!(self.on_connection_lost(player));
     }
 
-    /// [`reload_player`](Self::reload_player) every connected player whose
-    /// content version differs from the zone's (hard rollout). Returns the
-    /// number reloaded.
-    pub fn reload_stale_players(&mut self) -> usize {
+    /// [`Stimulus::ReloadStale`].
+    fn reload_stale(&mut self) -> usize {
         let expected = self.core.config.content_version.clone();
         if expected.is_empty() {
             return 0;
@@ -1619,16 +1876,13 @@ impl<Z: Zone> ZoneHost<Z> {
             .map(|slot| slot.info.id)
             .collect();
         for player in &stale {
-            self.reload_player(*player);
+            self.reload(*player);
         }
         stale.len()
     }
 
-    /// A client patched its content live and now runs `version`
-    /// (`ClientMessage::Content`): recorded for its player only when it is
-    /// the zone's current version (a client can catch up, never get
-    /// ahead). Returns whether it was recorded.
-    pub fn content_patched(&mut self, client: ClientId, version: &str) -> bool {
+    /// [`Stimulus::Content`].
+    fn patch_content(&mut self, client: ClientId, version: &str) -> bool {
         if version != self.core.config.content_version {
             return false;
         }
@@ -1644,9 +1898,8 @@ impl<Z: Zone> ZoneHost<Z> {
         }
     }
 
-    /// An observer's `Focus` (zone-local): [`Zone::on_observer_focus`].
-    /// Ignored for players and unknown clients.
-    pub fn observer_focus(&mut self, client: ClientId, x: f32, y: f32) {
+    /// [`Stimulus::Focus`].
+    fn focus_observer(&mut self, client: ClientId, x: f32, y: f32) {
         if let Some(Viewer::Observer(observer)) = self.viewer_of(client) {
             hook!(self.on_observer_focus(observer, x, y));
         }
@@ -1660,30 +1913,14 @@ impl<Z: Zone> ZoneHost<Z> {
             .map(|slot| slot.content_version.as_str())
     }
 
-    /// Switch the remote config version ([`HostConfig::config_version`]);
-    /// facts and stamps produced afterwards carry it.
-    pub fn set_config_version(&mut self, version: impl Into<String>) {
-        self.core.config.config_version = version.into();
-    }
-
-    /// Switch the zone to a new content version
-    /// ([`Zone::on_content_version_changed`]); facts and stamps produced
-    /// afterwards carry it.
-    pub fn set_content_version(&mut self, version: impl Into<String>) {
-        let version = version.into();
+    /// [`Stimulus::ContentVersion`].
+    fn switch_content(&mut self, version: String) {
         if version == self.core.config.content_version {
             return;
         }
         let previous = std::mem::replace(&mut self.core.config.content_version, version.clone());
         hook!(self.on_content_version_changed(&previous, &version));
         self.process_kicks();
-    }
-
-    /// Queue a tier-up event from a child zone; delivered to
-    /// [`Zone::on_child_event`] on a later tick (or the next `advance` when
-    /// the zone is not ticking), never while frozen.
-    pub fn deliver_child_event(&mut self, event: ChildEvent) {
-        self.core.child_inbox.push(event);
     }
 
     /// Zone messages sent since the last call ([`crate::zone_message`]);
@@ -1693,10 +1930,8 @@ impl<Z: Zone> ZoneHost<Z> {
         std::mem::take(&mut self.core.zone_out)
     }
 
-    /// Deliver a message from another zone: runs
-    /// [`Zone::on_zone_message`] unless the id was seen lately. Call
-    /// between ticks.
-    pub fn deliver_zone(&mut self, envelope: ZoneEnvelope) -> Result<(), ZoneMessageError> {
+    /// [`Stimulus::ZoneMessage`].
+    fn deliver_envelope(&mut self, envelope: ZoneEnvelope) -> Result<(), ZoneMessageError> {
         if envelope.to != self.core.zone_id {
             return Err(ZoneMessageError::WrongZone);
         }
@@ -1736,14 +1971,8 @@ impl<Z: Zone> ZoneHost<Z> {
         );
     }
 
-    fn bind_player(
-        &mut self,
-        player: PlayerId,
-        client: ClientId,
-        capabilities: u32,
-        protocol: u32,
-    ) {
-        let token = (self.token_source)();
+    fn bind_player(&mut self, player: PlayerId, client: ClientId, capabilities: u32) {
+        let token = self.next_token();
         let slot = self.core.players.get_mut(&player).expect("player exists");
         let previous = slot.client.replace(client);
         slot.grace_until = None;
@@ -1766,19 +1995,11 @@ impl<Z: Zone> ZoneHost<Z> {
             self.core.outbound.push(Outbound::Close { client: old });
         }
         self.attach_client(client, Viewer::Player(player));
-        self.welcome(client, session_id, token, Role::Player, protocol);
+        self.welcome(client, session_id, token, Role::Player);
     }
 
-    fn welcome(
-        &mut self,
-        client: ClientId,
-        session_id: String,
-        token: String,
-        role: Role,
-        protocol_version: u32,
-    ) {
+    fn welcome(&mut self, client: ClientId, session_id: String, token: String, role: Role) {
         let welcome = ServerMessage::Welcome(Welcome {
-            protocol_version,
             session_id,
             zone_id: self.core.zone_id.clone(),
             role,
@@ -1795,9 +2016,8 @@ impl<Z: Zone> ZoneHost<Z> {
         self.core.server_message(client, &welcome);
     }
 
-    /// A connection ended. Graceful (Leave) removes the player now; otherwise
-    /// the player stays (disconnected) for `reconnect_grace`.
-    pub fn disconnect(&mut self, client: ClientId, graceful: bool) {
+    /// [`Stimulus::Disconnect`].
+    fn drop_client(&mut self, client: ClientId, graceful: bool) {
         let Some(slot) = self.core.clients.remove(&client) else {
             return;
         };
@@ -1809,7 +2029,7 @@ impl<Z: Zone> ZoneHost<Z> {
                     p.client = None;
                     p.info.connected = false;
                     p.inputs.clear();
-                    p.grace_until = Some(self.core.clock.now() + self.core.config.reconnect_grace);
+                    p.grace_until = Some(self.core.now + self.core.config.reconnect_grace);
                     self.connection_lost(player, LostCause::Dropped);
                 }
             }
@@ -1818,8 +2038,8 @@ impl<Z: Zone> ZoneHost<Z> {
         self.process_kicks();
     }
 
-    /// Offer a wire input from `client`. Decodes and sanitizes via the zone.
-    pub fn push_input(
+    /// [`Stimulus::Input`]: decoded and sanitized by the zone.
+    fn offer_input(
         &mut self,
         client: ClientId,
         seq: u32,
@@ -1868,65 +2088,49 @@ impl<Z: Zone> ZoneHost<Z> {
         self.send_event(to, event.event_id(), event.to_payload());
     }
 
-    /// Deliver a service message ([`crate::inbox`]): a kick removes every
-    /// connection of the principal (players leave with
-    /// [`LeaveReason::Kicked`]), a game message runs
-    /// [`Zone::on_message`]. Call between ticks (the host is not ticking
-    /// while the caller holds `&mut self`).
-    pub fn deliver(&mut self, inbound: ZoneInbound<Z::Message>) -> Delivered {
+    /// [`Stimulus::Kick`]: every connection of `principal` goes (players
+    /// leave with [`LeaveReason::Kicked`]).
+    fn kick_principal(&mut self, principal: &str, reason: String) -> Delivered {
         let mut delivered = Delivered::default();
-        match inbound {
-            ZoneInbound::Kick { principal, reason } => {
-                let players: Vec<_> = self
-                    .core
-                    .players
-                    .values()
-                    .filter(|slot| slot.info.principal == principal)
-                    .map(|slot| slot.info.id)
-                    .collect();
-                delivered.players_kicked = players.len();
-                for player in players {
-                    self.core.pending_kicks.push((player, reason.clone()));
-                }
-                let observers: Vec<_> = self
-                    .core
-                    .observers
-                    .values()
-                    .filter(|slot| slot.info.principal == principal)
-                    .map(|slot| slot.info.id)
-                    .collect();
-                delivered.observers_kicked = observers.len();
-                let bye = ServerMessage::Kick {
-                    code: kick::BY_ZONE,
-                    message: reason,
-                };
-                for observer in observers {
-                    self.remove_observer(observer, Some(&bye));
-                }
-            }
-            ZoneInbound::Message(message) => hook!(self.on_message(message)),
+        let players: Vec<_> = self
+            .core
+            .players
+            .values()
+            .filter(|slot| slot.info.principal == principal)
+            .map(|slot| slot.info.id)
+            .collect();
+        delivered.players_kicked = players.len();
+        for player in players {
+            self.core.pending_kicks.push((player, reason.clone()));
+        }
+        let observers: Vec<_> = self
+            .core
+            .observers
+            .values()
+            .filter(|slot| slot.info.principal == principal)
+            .map(|slot| slot.info.id)
+            .collect();
+        delivered.observers_kicked = observers.len();
+        let bye = ServerMessage::Kick {
+            code: kick::BY_ZONE,
+            message: reason,
+        };
+        for observer in observers {
+            self.remove_observer(observer, Some(&bye));
         }
         self.process_kicks();
         delivered
     }
 
-    /// Kick a player now.
-    pub fn kick(&mut self, player: PlayerId, message: impl Into<String>) {
-        self.core.pending_kicks.push((player, message.into()));
-        self.process_kicks();
-    }
-
     /// Freeze: ticks stop and inputs are rejected; clients get Freeze.
-    pub fn freeze(&mut self, notice: Notice) {
+    fn freeze(&mut self, notice: Notice) {
         self.freeze_request = None;
         self.frozen = true;
         self.broadcast(&ServerMessage::Freeze(notice));
     }
 
-    /// Barrier phase 1: freeze as soon as [`Zone::freeze_ready`] allows (now,
-    /// or at the end of a later `advance`; the zone keeps ticking until
-    /// then). Returns the resulting state.
-    pub fn request_freeze(&mut self, notice: Notice) -> FreezeState {
+    /// [`Stimulus::RequestFreeze`].
+    fn ask_freeze(&mut self, notice: Notice) -> FreezeState {
         if !self.frozen {
             self.freeze_request = Some(notice);
             self.try_freeze();
@@ -1934,12 +2138,11 @@ impl<Z: Zone> ZoneHost<Z> {
         self.freeze_state()
     }
 
-    /// Abort a barrier: drop a pending freeze request, and resume with
-    /// `notice` if already frozen.
-    pub fn cancel_freeze(&mut self, notice: Notice) {
+    /// [`Stimulus::CancelFreeze`].
+    fn abort_freeze(&mut self, notice: Notice) {
         self.freeze_request = None;
         if self.frozen {
-            self.resume(notice);
+            self.thaw(notice);
         }
     }
 
@@ -1961,8 +2164,8 @@ impl<Z: Zone> ZoneHost<Z> {
         }
     }
 
-    /// Resume after [`freeze`](Self::freeze); the frozen backlog is not simulated.
-    pub fn resume(&mut self, notice: Notice) {
+    /// [`Stimulus::Resume`]: the frozen backlog is not simulated.
+    fn thaw(&mut self, notice: Notice) {
         self.freeze_request = None;
         self.frozen = false;
         self.hot.reset();
@@ -1972,9 +2175,8 @@ impl<Z: Zone> ZoneHost<Z> {
         self.broadcast(&ServerMessage::Resume(notice));
     }
 
-    /// Tell a player to move to `target_zone`, then remove it
-    /// (`LeaveReason::Handoff`). The transfer saga is the caller's concern.
-    pub fn handoff(&mut self, player: PlayerId, target_zone: &str, transfer_ticket: &str) {
+    /// [`Stimulus::Handoff`].
+    fn hand_off(&mut self, player: PlayerId, target_zone: &str, transfer_ticket: &str) {
         let message = ServerMessage::Handoff {
             target_zone: target_zone.into(),
             transfer_ticket: transfer_ticket.into(),
@@ -1983,9 +2185,8 @@ impl<Z: Zone> ZoneHost<Z> {
         self.process_kicks();
     }
 
-    /// Kick everyone (`on_leave(Disposed)` / `on_unobserve`), call
-    /// `on_dispose`, clear timers. The host stops ticking afterwards.
-    pub fn dispose(&mut self) {
+    /// [`Stimulus::Dispose`].
+    fn dispose_zone(&mut self) {
         if self.disposed {
             return;
         }
@@ -2078,7 +2279,7 @@ impl<Z: Zone> ZoneHost<Z> {
     }
 
     fn wake(&mut self) {
-        let now = self.core.clock.now();
+        let now = self.core.now;
         self.set_tier(Tier::Hot, now);
     }
 
@@ -2246,16 +2447,16 @@ impl<Z: Zone> ZoneHost<Z> {
         self.last_world = Some(world);
     }
 
-    /// Run due ticks and patches for the time elapsed on the clock.
-    pub fn advance(&mut self) -> AdvanceReport {
+    /// [`Stimulus::Advance`].
+    fn step(&mut self) -> AdvanceReport {
         let mut report = std::mem::take(&mut self.pending);
         if self.disposed {
             return report;
         }
-        let now = self.core.clock.now();
+        let now = self.core.now;
         let elapsed = now.saturating_sub(self.last_advance);
         self.last_advance = now;
-        self.core.flush_lifecycle();
+        self.core.flush_backlog();
 
         let expired: Vec<_> = self
             .core
@@ -2336,6 +2537,384 @@ impl<Z: Zone> ZoneHost<Z> {
         report.settled.extend(pending.settled);
         report.tick_hashes.extend(pending.tick_hashes);
         report
+    }
+}
+
+impl<Z: Zone> ZoneHost<Z> {
+    /// Run one [`Stimulus`]: the single way the zone changes from outside.
+    /// The clock is read once here; the host and the zone see that time
+    /// throughout ([`Ctx::now`], fact stamps, grace deadlines). With
+    /// [`HostConfig::record`] the stimulus, that time and what it observed
+    /// (join and input outcomes, settlements and per-tick state hashes) are
+    /// appended to the [`recording`](Self::recording).
+    pub fn apply(&mut self, stimulus: Stimulus) -> Outcome {
+        // Never backwards, whatever the clock does.
+        self.core.now = self.core.clock.now().max(self.core.now);
+        self.core.unix_ms = self.core.clock.unix_ms().max(self.core.unix_ms);
+        let recorded = self.tape.as_ref().map(|tape| tape.redact(&stimulus));
+        let outcome = self.dispatch(stimulus);
+        if let (Some(stimulus), Some(tape)) = (recorded, &mut self.tape) {
+            tape.recording.entries.push(Entry {
+                at: self.core.now,
+                unix_ms: self.core.unix_ms,
+                stimulus,
+                observed: Observed::of(&outcome),
+            });
+        }
+        outcome
+    }
+
+    fn dispatch(&mut self, stimulus: Stimulus) -> Outcome {
+        match stimulus {
+            Stimulus::Join {
+                claims,
+                capabilities,
+                content_version,
+            } => Outcome::Joined(self.admit(&claims, capabilities, &content_version, None)),
+            Stimulus::JoinTransfer {
+                transfer,
+                capabilities,
+                content_version,
+            } => Outcome::Joined(self.admit_transfer(&transfer, capabilities, &content_version)),
+            Stimulus::Reconnect {
+                token,
+                capabilities,
+                content_version,
+            } => {
+                Outcome::Joined(self.reconnect_as(&token, capabilities, content_version.as_deref()))
+            }
+            Stimulus::Disconnect { client, graceful } => {
+                self.drop_client(client, graceful);
+                Outcome::Done
+            }
+            Stimulus::Input {
+                client,
+                seq,
+                client_tick,
+                payload,
+            } => Outcome::Input(self.offer_input(client, seq, client_tick, &payload)),
+            Stimulus::Content { client, version } => {
+                Outcome::Patched(self.patch_content(client, &version))
+            }
+            Stimulus::Focus { client, x, y } => {
+                self.focus_observer(client, x, y);
+                Outcome::Done
+            }
+            Stimulus::Kick { principal, reason } => {
+                Outcome::Delivered(self.kick_principal(&principal, reason))
+            }
+            Stimulus::Message { type_id, payload } => {
+                if let Ok(Some(message)) = Z::Message::decode_event(type_id, &payload) {
+                    hook!(self.on_message(message));
+                    self.process_kicks();
+                }
+                Outcome::Delivered(Delivered::default())
+            }
+            Stimulus::ZoneMessage(envelope) => {
+                Outcome::ZoneMessage(self.deliver_envelope(envelope))
+            }
+            Stimulus::ChildEvent(event) => {
+                self.core.child_inbox.push(event);
+                Outcome::Done
+            }
+            Stimulus::RequestFreeze(notice) => Outcome::Freeze(self.ask_freeze(notice)),
+            Stimulus::CancelFreeze(notice) => {
+                self.abort_freeze(notice);
+                Outcome::Done
+            }
+            Stimulus::Resume(notice) => {
+                self.thaw(notice);
+                Outcome::Done
+            }
+            Stimulus::ContentVersion(version) => {
+                self.switch_content(version);
+                Outcome::Done
+            }
+            Stimulus::ConfigVersion(version) => {
+                self.core.config.config_version = version;
+                Outcome::Done
+            }
+            Stimulus::Reload(player) => {
+                self.reload(player);
+                Outcome::Done
+            }
+            Stimulus::ReloadStale => Outcome::Reloaded(self.reload_stale()),
+            Stimulus::KickPlayer { player, message } => {
+                self.core.pending_kicks.push((player, message));
+                self.process_kicks();
+                Outcome::Done
+            }
+            Stimulus::Handoff {
+                player,
+                target_zone,
+                ticket,
+            } => {
+                self.hand_off(player, &target_zone, &ticket);
+                Outcome::Done
+            }
+            Stimulus::Restore {
+                state,
+                saved_version,
+            } => {
+                self.restore_snapshot(&state, &saved_version);
+                Outcome::Done
+            }
+            Stimulus::Dispose => {
+                self.dispose_zone();
+                Outcome::Done
+            }
+            Stimulus::Advance => Outcome::Advanced(self.step()),
+        }
+    }
+
+    /// The recording so far ([`HostConfig::record`]; `None` when off).
+    pub fn recording(&self) -> Option<&Recording> {
+        self.tape.as_ref().map(|tape| &tape.recording)
+    }
+
+    fn next_token(&mut self) -> String {
+        let token = (self.token_source)();
+        if let Some(tape) = &mut self.tape {
+            tape.tokens.push(token.clone());
+        }
+        token
+    }
+
+    // ---- Shorthand for `apply` ----
+
+    /// [`Stimulus::Join`].
+    pub fn join(
+        &mut self,
+        claims: &TicketClaims,
+        capabilities: u32,
+        content_version: &str,
+    ) -> Result<Joined, JoinError> {
+        self.apply(Stimulus::Join {
+            claims: claims.clone(),
+            capabilities,
+            content_version: content_version.into(),
+        })
+        .joined()
+    }
+
+    /// [`Stimulus::JoinTransfer`].
+    pub fn join_transfer(
+        &mut self,
+        transfer: &Transfer,
+        capabilities: u32,
+        content_version: &str,
+    ) -> Result<Joined, JoinError> {
+        self.apply(Stimulus::JoinTransfer {
+            transfer: transfer.clone(),
+            capabilities,
+            content_version: content_version.into(),
+        })
+        .joined()
+    }
+
+    /// [`Stimulus::Reconnect`] without a content version.
+    pub fn reconnect(&mut self, token: &str, capabilities: u32) -> Result<Joined, JoinError> {
+        self.apply(Stimulus::Reconnect {
+            token: token.into(),
+            capabilities,
+            content_version: None,
+        })
+        .joined()
+    }
+
+    /// [`Stimulus::Reconnect`] presenting the client's content version.
+    pub fn reconnect_with_version(
+        &mut self,
+        token: &str,
+        capabilities: u32,
+        content_version: &str,
+    ) -> Result<Joined, JoinError> {
+        self.apply(Stimulus::Reconnect {
+            token: token.into(),
+            capabilities,
+            content_version: Some(content_version.into()),
+        })
+        .joined()
+    }
+
+    /// [`Stimulus::Disconnect`].
+    pub fn disconnect(&mut self, client: ClientId, graceful: bool) {
+        self.apply(Stimulus::Disconnect { client, graceful });
+    }
+
+    /// [`Stimulus::Input`].
+    pub fn push_input(
+        &mut self,
+        client: ClientId,
+        seq: u32,
+        client_tick: u32,
+        payload: &[u8],
+    ) -> PushOutcome {
+        match self.apply(Stimulus::Input {
+            client,
+            seq,
+            client_tick,
+            payload: payload.to_vec(),
+        }) {
+            Outcome::Input(outcome) => outcome,
+            other => unreachable!("input answered {other:?}"),
+        }
+    }
+
+    /// [`Stimulus::Content`]: whether it was kept.
+    pub fn content_patched(&mut self, client: ClientId, version: &str) -> bool {
+        matches!(
+            self.apply(Stimulus::Content {
+                client,
+                version: version.into(),
+            }),
+            Outcome::Patched(true)
+        )
+    }
+
+    /// [`Stimulus::Focus`].
+    pub fn observer_focus(&mut self, client: ClientId, x: f32, y: f32) {
+        self.apply(Stimulus::Focus { client, x, y });
+    }
+
+    /// Deliver a service message ([`crate::inbox`]): [`Stimulus::Kick`] or
+    /// [`Stimulus::Message`].
+    pub fn deliver(&mut self, inbound: ZoneInbound<Z::Message>) -> Delivered {
+        let stimulus = match inbound {
+            ZoneInbound::Kick { principal, reason } => Stimulus::Kick { principal, reason },
+            ZoneInbound::Message(message) => Stimulus::Message {
+                type_id: message.event_id(),
+                payload: message.to_payload(),
+            },
+        };
+        match self.apply(stimulus) {
+            Outcome::Delivered(delivered) => delivered,
+            other => unreachable!("delivery answered {other:?}"),
+        }
+    }
+
+    /// [`Stimulus::ZoneMessage`].
+    pub fn deliver_zone(&mut self, envelope: ZoneEnvelope) -> Result<(), ZoneMessageError> {
+        match self.apply(Stimulus::ZoneMessage(envelope)) {
+            Outcome::ZoneMessage(result) => result,
+            other => unreachable!("zone message answered {other:?}"),
+        }
+    }
+
+    /// [`Stimulus::ChildEvent`].
+    pub fn deliver_child_event(&mut self, event: ChildEvent) {
+        self.apply(Stimulus::ChildEvent(event));
+    }
+
+    /// [`Stimulus::RequestFreeze`]: the resulting state.
+    pub fn request_freeze(&mut self, notice: Notice) -> FreezeState {
+        match self.apply(Stimulus::RequestFreeze(notice)) {
+            Outcome::Freeze(state) => state,
+            other => unreachable!("freeze request answered {other:?}"),
+        }
+    }
+
+    /// [`Stimulus::CancelFreeze`].
+    pub fn cancel_freeze(&mut self, notice: Notice) {
+        self.apply(Stimulus::CancelFreeze(notice));
+    }
+
+    /// [`Stimulus::Resume`].
+    pub fn resume(&mut self, notice: Notice) {
+        self.apply(Stimulus::Resume(notice));
+    }
+
+    /// [`Stimulus::ContentVersion`].
+    pub fn set_content_version(&mut self, version: impl Into<String>) {
+        self.apply(Stimulus::ContentVersion(version.into()));
+    }
+
+    /// [`Stimulus::ConfigVersion`].
+    pub fn set_config_version(&mut self, version: impl Into<String>) {
+        self.apply(Stimulus::ConfigVersion(version.into()));
+    }
+
+    /// [`Stimulus::Reload`].
+    pub fn reload_player(&mut self, player: PlayerId) {
+        self.apply(Stimulus::Reload(player));
+    }
+
+    /// [`Stimulus::ReloadStale`]: the number reloaded.
+    pub fn reload_stale_players(&mut self) -> usize {
+        match self.apply(Stimulus::ReloadStale) {
+            Outcome::Reloaded(n) => n,
+            other => unreachable!("reload answered {other:?}"),
+        }
+    }
+
+    /// [`Stimulus::KickPlayer`].
+    pub fn kick(&mut self, player: PlayerId, message: impl Into<String>) {
+        self.apply(Stimulus::KickPlayer {
+            player,
+            message: message.into(),
+        });
+    }
+
+    /// [`Stimulus::Handoff`].
+    pub fn handoff(&mut self, player: PlayerId, target_zone: &str, transfer_ticket: &str) {
+        self.apply(Stimulus::Handoff {
+            player,
+            target_zone: target_zone.into(),
+            ticket: transfer_ticket.into(),
+        });
+    }
+
+    /// [`Stimulus::Restore`].
+    pub fn restore(&mut self, state: &[u8], saved_version: &str) {
+        self.apply(Stimulus::Restore {
+            state: state.to_vec(),
+            saved_version: saved_version.into(),
+        });
+    }
+
+    /// [`Stimulus::Dispose`].
+    pub fn dispose(&mut self) {
+        self.apply(Stimulus::Dispose);
+    }
+
+    /// [`Stimulus::Advance`].
+    pub fn advance(&mut self) -> AdvanceReport {
+        match self.apply(Stimulus::Advance) {
+            Outcome::Advanced(report) => report,
+            other => unreachable!("advance answered {other:?}"),
+        }
+    }
+}
+
+impl Outcome {
+    fn joined(self) -> Result<Joined, JoinError> {
+        match self {
+            Self::Joined(result) => result,
+            other => unreachable!("join answered {other:?}"),
+        }
+    }
+}
+
+impl Tape {
+    /// `stimulus` as recorded: a reconnect token becomes its place in the
+    /// token sequence (`token#N`; empty when this host never issued it).
+    fn redact(&self, stimulus: &Stimulus) -> Stimulus {
+        match stimulus {
+            Stimulus::Reconnect {
+                token,
+                capabilities,
+                content_version,
+            } => Stimulus::Reconnect {
+                token: self
+                    .tokens
+                    .iter()
+                    .position(|issued| issued == token)
+                    .map_or_else(String::new, crate::replay::token_label),
+                capabilities: *capabilities,
+                content_version: content_version.clone(),
+            },
+            other => other.clone(),
+        }
     }
 }
 

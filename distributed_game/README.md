@@ -778,8 +778,7 @@ ctx.emit_keyed(killer, RecordKillInput { mob, tier }, &[&format_args!("m{id}"), 
   (that player's cell, a match cell, ...) over the internal path, or a
   `LocalCommandHost` to a service over any repository — with a command id
   derived from the fact key. A retry or a duplicate is
-  therefore a harmless replay, never a double reward. (`cell::CellFactSink`
-  does the same into an in-process reference cell, for unit tests.)
+  therefore a harmless replay, never a double reward.
 - `on_fact_settled` reports the outcome on a later tick.
 - Keys must be unique across restarts; `ctx.fact_key` includes the
   activation's boot epoch for you (see [Durable facts](#durable-facts)).
@@ -1078,8 +1077,9 @@ stopped at a wall on the room's edge) as leaving.
 
 - **Deterministic tests**: drive `ZoneHost` with `ManualClock`; the RNG
   is seeded.
-- **Record and replay**: `Recorder` captures a session; `replay` re-runs
-  it and pinpoints the first tick that differs.
+- **Record and replay**: `HostConfig::record` keeps every stimulus a host
+  is applied, on any driver; `replay` re-runs it and pinpoints the first
+  tick that differs.
 - **Metrics**: `GET /metrics` (Prometheus): tick time, players, entities,
   inputs by outcome, bytes per Delta, facts pending and settled.
 - **Load bots**: `game-bots` connects N WebSocket clients and reports
@@ -1134,10 +1134,9 @@ stopped at a wall on the room's edge) as leaving.
   every float bit and costs about a microsecond per step.
 - **Binary protocol with the schema sent on connect.** Small,
   diff-friendly frames, and any client can decode them without generated
-  code. The version is negotiated in the handshake (`PROTOCOL.md` §6.0):
-  servers answer v1 and v2 clients, the JS SDK falls back to v1 against
-  an old server and sends feature-gated messages (`Focus`) only to
-  servers that announce them, so servers and clients deploy in any order.
+  code. One protocol version, checked in the handshake (`PROTOCOL.md`
+  §6.0): a server refuses any other, so servers and clients deploy
+  together (pre-release; no negotiation to maintain).
 - **Reliable, ordered WebSockets.** Deltas are computed against what each
   client last received, which only works because nothing is lost or
   reordered. Loss shows up as delay, which the adaptive interpolation
@@ -1196,7 +1195,7 @@ trait and its ABI (`run_abi`, `call_bytes`).
 |---|---|---|
 | *(default)* | Zone/host runtime, facts queue, protocol, schema, replication, authoring derives, game surface, predicted steps (compiles to `wasm32-unknown-unknown`, where `#[predict]` exports its steps) | `serde`, `serde_json`, `distributed_game_macros` |
 | `runtime` | `spawn_fact_worker` on Tokio | `tokio` (rt, time, sync) |
-| `cell` | `cell::CellFactSink` → in-process `AggregateCell::dispatch_idempotent` (native, unit tests); `cell::fact_session_from_headers` / `session_stamp` for cells (also wasm32); `stamp_event_record`; the `world::zone_lease` and `world::zone_state` cell aggregates | `distributed`, `sha2`, `base64` |
+| `cell` | `cell::command_id_for` / `trusted_session` / `run_fact_batch`; `cell::fact_session_from_headers` / `session_stamp` for cells (also wasm32); `stamp_event_record`; the `world::zone_lease` and `world::zone_state` cell aggregates | `distributed`, `sha2`, `base64` |
 | `cell` (also) | `command_sink::CommandFactSink<H: FactHost>`: facts → commands through any fact host, routed by command (`FactRoute`); `world::zone_activity` | |
 | `command-host` | `FactHost` for `CelldCommandHost` / `LocalCommandHost` (`CelldFactSink`) | `cell` + `distributed/graphql` |
 | `celld-zone` | `celld_zone`: any `Zone` as a celld Durable Object (`ZoneObject`, `celld_zone_object!`, `forward_to_zone`), facts object to object (`CelldObjectHost`), `serve_cell` / `ZoneActivityCell` for the worker's cells (wasm32) | `cell`, `ticket`, `workers-rs` + `js-sys`, `wasm-bindgen(-futures)` |
@@ -1224,6 +1223,23 @@ ctx.emit_fact_for(player, Fact::new(key, "hero.slay", json!({"enemy": enemy_id})
 Settlements: `settlement.is::<SlayInput>()`, and
 `receipt.payload_as::<SlayReceipt>()` for the command's typed output.
 
+`ctx.emit*` answers `EmitError::Backpressure` when the zone's fact queue
+is full. `ctx.emit_queued(player, input)` (and `queue_fact_for` /
+`queue_fact_as` for a fact built by hand) never does: the fact is stamped
+now and waits in the host's backlog — the one the lifecycle facts use —
+in order, and goes out as settlements free capacity. It counts as in
+flight, so the zone does not go Dormant with it waiting.
+
+**Durability differs by driver, and is named here on purpose:**
+
+| Driver | Guarantee | Why |
+|---|---|---|
+| native (`GameServer`, `ZoneHost` + `spawn_fact_worker`) | **at most once** across a crash; exactly once (idempotent key) while the process lives | the queue and the backlog are process memory: a crash, a kill, a disposal that outlives `settle_timeout`, or lost ownership (`abandon_facts`) drops what is unsettled |
+| celld zone object | **at least once** to the cell, exactly once in effect | each call's emitted facts are spooled to the object's storage (its outbox) and deleted on settlement; the next activation (or the outbox alarm) resends what is left, and the cell's command ledger turns a resend into a replay |
+
+A native game that cannot lose a fact keeps its own durable record (or
+emits from a cell, not a zone).
+
 > **Warning — restart-safe keys.** Ticks, entity ids and generations all
 > restart from zero when a process restarts (or a zone is re-activated from
 > a snapshot). A key derived only from them — `format!("kill:{zone}:{tick}")`
@@ -1238,9 +1254,9 @@ Settlements: `settlement.is::<SlayInput>()`, and
 The host binds the principal from the player's **verified ticket** and
 stamps zone, activation, tick, wall time, content and config version and emission sequence. A `FactSink` commits facts on a worker
 with bounded retries/backoff; `Zone::on_fact_settled` receives the outcome
-on a later tick. `cell::CellFactSink` dispatches into an `AggregateCell`
-with a deterministic command id per fact key, so retries replay instead of
-double-crediting. A custom sink needs only crate-root imports:
+on a later tick. `command_sink::CommandFactSink` dispatches each fact as a
+command with a deterministic command id per fact key, so retries replay
+instead of double-crediting. A custom sink needs only crate-root imports:
 `impl FactSink for MySink { fn commit<'a>(&'a self, fact: &'a Fact) -> BoxFuture<'a, Result<FactReceipt, FactError>> { Box::pin(async move { … }) } }`
 (`BoxFuture` is also re-exported from `world` and `net` for
 `ZoneOwnership` / `BarrierParticipant` impls).
@@ -1375,17 +1391,21 @@ ledger reservation and commit.
   among the recorded rewind entities and the colliders. A `Ray` has
   `max_dist`, a layer `mask` and an `ignoring(id)`; it is not a
   client-side query, and the predicted movement in `sim` does not use it.
-- **Record/replay** (`replay`): drive a host through `Recorder` (same
-  methods as `ZoneHost`), save the compact `Recording` (`DGR3`), and
-  `replay::<Z>(&recording, config)` re-runs it on a `ManualClock`,
-  checking a per-tick state hash (`Zone::state_hash`, or the replicated
-  `WorldView`). A mismatch returns a `Divergence` naming the tick and the
-  stimuli applied since the last matching tick. Fact settlements are
-  replayed on the tick they were delivered. World entry points (`join_transfer`,
-  `reconnect_with_version`, `set_content_version`, `request_freeze` /
-  `cancel_freeze`, `reload_stale_players`, `deliver_child_event`,
-  `restore`) are recorded too; zone-issued handoffs replay against a stub
-  issuer that always signs.
+- **Record/replay** (`replay`): everything outside a zone reaches it as
+  one `Stimulus` through `ZoneHost::apply` (the typed methods `join`,
+  `push_input`, `advance`, … are shorthand for it), with the clock read
+  once per stimulus. A host created with `HostConfig::record` keeps each
+  stimulus with that clock reading and what it observed — on the native
+  server, a celld zone object or a test alike (`ZoneHost::recording`;
+  `GameServer::inspect` reads it from a live zone). Save the compact
+  `Recording` (`DGR4`), and `replay::<Z>(&recording, config)` re-runs it
+  on the recorded clock readings, checking join and input outcomes and a
+  per-tick state hash (`Zone::state_hash`, or the replicated `WorldView`).
+  A mismatch returns a `Divergence` naming the tick and the stimuli
+  applied since the last matching tick. Fact settlements are replayed on
+  the tick they were delivered, and `ReplaySummary::facts` returns the
+  facts the replay emitted (same keys and stamps as the live run's).
+  Zone-issued handoffs replay against a stub issuer that always signs.
 - **Metrics** (`metrics`, served by `GameServer` at `GET /metrics`):
   tick duration histogram, ticks/dropped ticks, tier, players, observers,
   entities, inputs by outcome (incl. `rate_limited` and `frozen` barrier drops),
@@ -1463,7 +1483,7 @@ wrong_owner` answers. The built-in `ZoneInbound::Kick { principal, reason
 refused (`404 inactive` / `InboxError::Inactive`) and never activates it.
 Messages appear in the game surface under `messages`; the generated
 TypeScript has `MESSAGE`, `MESSAGES` and `encodeMessage` for TS services.
-Recorded and replayed like the other entry points (`Recorder::deliver`).
+Recorded and replayed like every other stimulus.
 
 **Zone factory and allocation.** `ZoneFactory::new(|activation| async move
 { … })` may await storage: it runs on the activation task after the
@@ -1495,12 +1515,14 @@ calls `Zone::on_restore`.
 facts, so hibernation never strands a settlement. Facts emitted during
 disposal (e.g. in `on_dispose`) are still committed: the fact worker
 drains its queue after the zone drops it, and the zone task waits up to
-`settle_timeout` for it. We chose "settle, then dispose" over a durable
-fact outbox because the zone-side queue is already bounded and
-idempotent; a crash-durable outbox belongs to the sink (e.g. the cell
-adapter commits the fact atomically with its own outbox row).
+`settle_timeout` for it; what is still unsettled after that is dropped.
+Native facts are at most once across a crash (see
+[Durable facts](#durable-facts)): "settle, then dispose" keeps them in
+memory only; the celld zone object spools them instead.
 
-**Handoff.** In a hook: `ctx.handoff(player, "realm.west", carried_bytes)?`.
+**Handoff.** In a hook: `ctx.handoff(player, "realm.west", &carried)?`,
+`carried` any `Wire` value (a `#[derive(GameRecord)]` struct); the target
+decodes it in `on_handoff_join` with `codec::from_bytes`.
 The host signs a transfer ticket (principal, source, target, issuer host,
 ownership generation, carried state, nonce, 30 s expiry), removes the
 player (`LeaveReason::Handoff`) and sends `Handoff(target, ticket)`. The
@@ -1508,7 +1530,11 @@ target reserves the ticket with the issuing host (locally or via
 `/admin/transfer`), admits it with `Zone::on_handoff_join(player, from,
 carried)` and confirms; a refused transfer is released and the client may
 present the same ticket back to the source (PROTOCOL.md §8.1). The
-realtime path never waits on storage. When the player's **durable**
+realtime path never waits on storage. **Custody:** the carried state then
+lives only in the ticket the client holds, so it is delivered at most
+once: a dropped or discarded ticket, an expired one, or an issuer restart
+before the target reserves it loses it (the player is in neither zone
+until it joins again; it is never in both). When the player's **durable**
 record must move too (home zone, inventory cell), emit a fact from the
 handoff hook and let a `distributed::saga` drive it, off the tick:
 

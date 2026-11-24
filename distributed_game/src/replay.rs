@@ -1,44 +1,49 @@
 //! Deterministic record/replay.
 //!
-//! A [`Recorder`] wraps a [`ZoneHost`] and logs every external stimulus with
-//! the clock reading it happened at: joins, reconnects, disconnects, inputs
-//! (sequence, client tick, payload, outcome), kicks, freeze/resume, dispose,
-//! and each `advance` together with the fact settlements delivered during it
-//! (tagged with the tick they were delivered on) and a state hash after every
-//! tick. World-structure entry points are recorded too: transfer joins,
-//! versioned reconnects, content-version switches, freeze requests/cancels,
-//! stale-client reloads, delivered child events and snapshot restores.
-//! Handoffs issued by the zone replay against a stub issuer that always
-//! signs (the ticket text is output, not state); a recording made with an
-//! issuer that *refused* a handoff will diverge. Timers, RNG draws and tier changes are *not* logged: they are
-//! derived from those inputs and the clock, so replay reproduces them.
+//! A host created with [`HostConfig::record`] keeps every [`Stimulus`] it
+//! is [applied](ZoneHost::apply) — joins, reconnects, disconnects, inputs,
+//! content patches, focus, inbox kicks and messages, zone messages, child
+//! events, freeze/resume, version switches, reloads, kicks, handoffs,
+//! restores, dispose and each advance — whichever driver applies it (the
+//! native server, a celld zone object, a test). Each [`Entry`] carries the
+//! clock reading the stimulus ran at (monotonic and wall: the host freezes
+//! both for the whole stimulus, so every time the zone and its fact stamps
+//! see is in the recording) and what it observed: join and input outcomes,
+//! and for an advance the fact settlements delivered (tagged with their
+//! tick) and a state hash after every tick. Timers, RNG draws and tier
+//! changes are *not* logged: they are derived from those inputs and the
+//! clock, so replay reproduces them. Handoffs issued by the zone replay
+//! against a stub issuer that always signs (the ticket text is output, not
+//! state); a recording made with an issuer that *refused* a handoff will
+//! diverge.
 //!
-//! [`replay`] rebuilds a fresh host on a [`ManualClock`], feeds the log back
-//! (settlements through a [`FactQueue::scripted`] queue so they land on the
-//! same tick) and compares the per-tick hashes. The first mismatch is
-//! returned as a [`Divergence`] whose `Display` shows the tick, the hashes
-//! and the stimuli applied since the last matching advance.
+//! [`replay`] rebuilds a fresh host on the recorded clock readings, applies
+//! the entries back (settlements through a [`FactQueue::scripted`] queue so
+//! they land on the same tick) and compares join and input outcomes and the
+//! per-tick hashes. The first mismatch is returned as a [`Divergence`]
+//! whose `Display` shows the tick, the hashes and the stimuli applied since
+//! the last matching advance. A successful replay returns the facts the
+//! zone emitted ([`ReplaySummary::facts`]): the same keys, inputs,
+//! principals and stamps as the live run's.
 //!
 //! Requirements for a zone to replay: all randomness from
-//! [`Ctx::rng`](crate::Ctx::rng), all time from `ctx.dt()` / `ctx.sim_time()`
-//! (never `ctx.now()` or wall time), no iteration over `HashMap`s that feeds
+//! [`Ctx::rng`](crate::Ctx::rng), all time from the [`Ctx`](crate::Ctx)
+//! (never wall time read directly), no iteration over `HashMap`s that feeds
 //! state. Override [`Zone::state_hash`] to cover unreplicated state.
 //!
-//! The file is compact binary (`DGR1`, varints; see [`Recording::encode`]).
-//! Reconnect tokens are stored as indices into the host's token sequence,
-//! never as secrets. Zone construction parameters are opaque bytes chosen by
-//! the caller ([`Recording::zone_config`]); [`replay`] takes the decoded
-//! `Z::Config`.
+//! The file is compact binary (`DGR4`, varints; see [`Recording::encode`]).
+//! Reconnect tokens are stored as their place in the host's token sequence
+//! (`token#N`), never as secrets. [`replay`] takes the zone's `Z::Config`.
 
 use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use crate::clock::{Clock, ManualClock};
-use crate::facts::{FactError, FactOutcome, FactQueue, FactReceipt, FactSettlement};
+use crate::clock::Clock;
+use crate::facts::{Fact, FactError, FactOutcome, FactQueue, FactReceipt, FactSettlement};
 use crate::handoff::{HandoffRequest, Transfer};
-use crate::host::{AdvanceReport, HostConfig, JoinError, Joined, Outbound, ZoneHost};
+use crate::host::{HostConfig, JoinError, Joined, Outcome, Stimulus, ZoneHost};
 use crate::input::PushOutcome;
 use crate::interest::InterestConfig;
 use crate::protocol::wire::{DecodeError, Reader, Writer};
@@ -49,8 +54,9 @@ use crate::rng::Fnv64;
 use crate::schema::FieldValue;
 use crate::world::{ChildEvent, StalePolicy};
 use crate::zone::{ClientId, PlayerId, TicketClaims, Zone};
+use crate::zone_message::ZoneEnvelope;
 
-const MAGIC: &[u8; 4] = b"DGR3";
+const MAGIC: &[u8; 4] = b"DGR4";
 
 /// FNV digest of a replicated world (entity order, ids, kinds, positions,
 /// priorities and field values).
@@ -95,298 +101,131 @@ impl From<&Result<Joined, JoinError>> for JoinResult {
     }
 }
 
-/// One recorded stimulus. `at` is the host clock when it happened.
+/// What a recorded stimulus observed that replay must reproduce.
 #[derive(Debug, Clone, PartialEq)]
-pub enum Event {
-    /// [`ZoneHost::join`].
-    Join {
-        /// Clock.
-        at: Duration,
-        /// Verified claims.
-        claims: TicketClaims,
-        /// Hello capabilities.
-        capabilities: u32,
-        /// Client content version.
-        content_version: String,
-        /// Outcome.
-        result: JoinResult,
-    },
-    /// [`ZoneHost::reconnect`].
-    Reconnect {
-        /// Clock.
-        at: Duration,
-        /// Index of the token in the host's token sequence (`u32::MAX` = unknown).
-        token: u32,
-        /// Hello capabilities.
-        capabilities: u32,
-        /// Outcome.
-        result: JoinResult,
-    },
-    /// [`ZoneHost::disconnect`].
-    Disconnect {
-        /// Clock.
-        at: Duration,
-        /// Connection.
-        client: u32,
-        /// Leave vs drop.
-        graceful: bool,
-    },
-    /// [`ZoneHost::push_input`].
-    Input {
-        /// Clock.
-        at: Duration,
-        /// Connection.
-        client: u32,
-        /// Sequence.
-        seq: u32,
-        /// Client tick.
-        client_tick: u32,
-        /// Raw payload.
-        payload: Vec<u8>,
-        /// Outcome.
-        outcome: PushOutcome,
-    },
-    /// [`ZoneHost::kick`].
-    Kick {
-        /// Clock.
-        at: Duration,
-        /// Player.
-        player: u32,
-        /// Message.
-        message: String,
-    },
-    /// [`ZoneHost::freeze`].
-    Freeze {
-        /// Clock.
-        at: Duration,
-        /// Notice.
-        notice: Notice,
-    },
-    /// [`ZoneHost::resume`].
-    Resume {
-        /// Clock.
-        at: Duration,
-        /// Notice.
-        notice: Notice,
-    },
-    /// [`ZoneHost::dispose`].
-    Dispose {
-        /// Clock.
-        at: Duration,
-    },
-    /// [`ZoneHost::advance`].
+pub enum Observed {
+    /// Nothing checked.
+    Nothing,
+    /// A join or reconnect.
+    Join(JoinResult),
+    /// An input.
+    Input(PushOutcome),
+    /// An advance.
     Advance {
-        /// Clock.
-        at: Duration,
-        /// Settlements delivered, with their delivery tick.
+        /// Settlements delivered, with their delivery tick (the fact
+        /// sink's answers: replayed, not recomputed).
         settled: Vec<(u64, FactSettlement)>,
         /// `(tick, hash)` after each tick simulated.
         hashes: Vec<(u64, u64)>,
     },
-    /// [`ZoneHost::join_transfer`].
-    JoinTransfer {
-        /// Clock.
-        at: Duration,
-        /// Verified transfer.
-        transfer: Transfer,
-        /// Hello capabilities.
-        capabilities: u32,
-        /// Client content version.
-        content_version: String,
-        /// Outcome.
-        result: JoinResult,
-    },
-    /// [`ZoneHost::reconnect_with_version`].
-    ReconnectVersion {
-        /// Clock.
-        at: Duration,
-        /// Token index (see [`Event::Reconnect`]).
-        token: u32,
-        /// Hello capabilities.
-        capabilities: u32,
-        /// Client content version.
-        content_version: String,
-        /// Outcome.
-        result: JoinResult,
-    },
-    /// [`ZoneHost::set_content_version`].
-    SetContentVersion {
-        /// Clock.
-        at: Duration,
-        /// New version.
-        version: String,
-    },
-    /// [`ZoneHost::set_config_version`].
-    SetConfigVersion {
-        /// Clock.
-        at: Duration,
-        /// New version.
-        version: String,
-    },
-    /// [`ZoneHost::deliver`]: a kick of `principal`.
-    DeliverKick {
-        /// Clock.
-        at: Duration,
-        /// Principal kicked.
-        principal: String,
-        /// Reason.
-        reason: String,
-    },
-    /// [`ZoneHost::deliver`]: a game message (encoded `Z::Message`).
-    DeliverMessage {
-        /// Clock.
-        at: Duration,
-        /// Message type id.
-        type_id: u32,
-        /// Encoded payload.
-        payload: Vec<u8>,
-    },
-    /// [`ZoneHost::request_freeze`].
-    RequestFreeze {
-        /// Clock.
-        at: Duration,
-        /// Notice.
-        notice: Notice,
-    },
-    /// [`ZoneHost::cancel_freeze`].
-    CancelFreeze {
-        /// Clock.
-        at: Duration,
-        /// Notice.
-        notice: Notice,
-    },
-    /// [`ZoneHost::reload_stale_players`].
-    ReloadStale {
-        /// Clock.
-        at: Duration,
-    },
-    /// [`ZoneHost::deliver_child_event`].
-    ChildEvent {
-        /// Clock.
-        at: Duration,
-        /// Event.
-        event: ChildEvent,
-    },
-    /// [`ZoneHost::restore`].
-    Restore {
-        /// Clock.
-        at: Duration,
-        /// Snapshot bytes.
-        state: Vec<u8>,
-        /// Version it was saved under.
-        saved_version: String,
-    },
 }
 
-impl Event {
-    /// Clock reading.
-    pub fn at(&self) -> Duration {
-        match self {
-            Self::Join { at, .. }
-            | Self::Reconnect { at, .. }
-            | Self::Disconnect { at, .. }
-            | Self::Input { at, .. }
-            | Self::Kick { at, .. }
-            | Self::Freeze { at, .. }
-            | Self::Resume { at, .. }
-            | Self::Dispose { at }
-            | Self::Advance { at, .. }
-            | Self::JoinTransfer { at, .. }
-            | Self::ReconnectVersion { at, .. }
-            | Self::SetContentVersion { at, .. }
-            | Self::SetConfigVersion { at, .. }
-            | Self::DeliverKick { at, .. }
-            | Self::DeliverMessage { at, .. }
-            | Self::RequestFreeze { at, .. }
-            | Self::CancelFreeze { at, .. }
-            | Self::ReloadStale { at }
-            | Self::ChildEvent { at, .. }
-            | Self::Restore { at, .. } => *at,
+impl Observed {
+    pub(crate) fn of(outcome: &Outcome) -> Self {
+        match outcome {
+            Outcome::Joined(result) => Self::Join(result.into()),
+            Outcome::Input(outcome) => Self::Input(*outcome),
+            Outcome::Advanced(report) => Self::Advance {
+                settled: report.settled.clone(),
+                hashes: report.tick_hashes.clone(),
+            },
+            _ => Self::Nothing,
         }
     }
 }
 
-impl fmt::Display for Event {
+/// One recorded stimulus.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Entry {
+    /// Host clock when it ran.
+    pub at: Duration,
+    /// Wall time (Unix ms) when it ran.
+    pub unix_ms: u64,
+    /// The stimulus (a reconnect's token as `token#N`).
+    pub stimulus: Stimulus,
+    /// What it observed.
+    pub observed: Observed,
+}
+
+/// The recorded name of the `n`-th token a host issued.
+pub(crate) fn token_label(n: usize) -> String {
+    format!("token#{n}")
+}
+
+impl fmt::Display for Entry {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let ms = self.at().as_secs_f64() * 1000.0;
-        match self {
-            Self::Join {
-                claims, result, ..
-            } => write!(f, "@{ms:.1}ms join {} -> {result:?}", claims.principal),
-            Self::Reconnect { token, result, .. } => {
-                write!(f, "@{ms:.1}ms reconnect token#{token} -> {result:?}")
+        write!(f, "@{:.1}ms ", self.at.as_secs_f64() * 1000.0)?;
+        match &self.stimulus {
+            Stimulus::Join { claims, .. } => write!(f, "join {}", claims.principal)?,
+            Stimulus::JoinTransfer { transfer, .. } => write!(
+                f,
+                "join transfer {} from {}",
+                transfer.claims.principal, transfer.source_zone
+            )?,
+            Stimulus::Reconnect {
+                token,
+                content_version,
+                ..
+            } => match content_version {
+                Some(version) => write!(f, "reconnect {token} version {version}")?,
+                None => write!(f, "reconnect {token}")?,
+            },
+            Stimulus::Disconnect { client, graceful } => {
+                write!(f, "disconnect client {} graceful={graceful}", client.0)?
             }
-            Self::Disconnect {
-                client, graceful, ..
-            } => write!(f, "@{ms:.1}ms disconnect client {client} graceful={graceful}"),
-            Self::Input {
+            Stimulus::Input {
                 client,
                 seq,
                 client_tick,
                 payload,
-                outcome,
+            } => write!(
+                f,
+                "input client {} seq {seq} client_tick {client_tick} payload {payload:02x?}",
+                client.0
+            )?,
+            Stimulus::Content { client, version } => {
+                write!(f, "content client {} {version}", client.0)?
+            }
+            Stimulus::Focus { client, x, y } => write!(f, "focus client {} {x},{y}", client.0)?,
+            Stimulus::Kick { principal, .. } => write!(f, "inbox kick {principal}")?,
+            Stimulus::Message { type_id, .. } => write!(f, "inbox message {type_id}")?,
+            Stimulus::ZoneMessage(envelope) => write!(
+                f,
+                "zone message {} from {} type {}",
+                envelope.id, envelope.from, envelope.type_id
+            )?,
+            Stimulus::ChildEvent(event) => {
+                write!(f, "child event {} from {}", event.kind, event.origin_zone)?
+            }
+            Stimulus::RequestFreeze(notice) => write!(f, "request freeze {}", notice.reason)?,
+            Stimulus::CancelFreeze(notice) => write!(f, "cancel freeze {}", notice.reason)?,
+            Stimulus::Resume(notice) => write!(f, "resume {}", notice.reason)?,
+            Stimulus::ContentVersion(version) => write!(f, "content version {version}")?,
+            Stimulus::ConfigVersion(version) => write!(f, "config version {version}")?,
+            Stimulus::Reload(player) => write!(f, "reload player {}", player.0)?,
+            Stimulus::ReloadStale => write!(f, "reload stale players")?,
+            Stimulus::KickPlayer { player, message } => {
+                write!(f, "kick player {}: {message}", player.0)?
+            }
+            Stimulus::Handoff {
+                player,
+                target_zone,
                 ..
-            } => write!(
-                f,
-                "@{ms:.1}ms input client {client} seq {seq} client_tick {client_tick} payload {payload:02x?} -> {outcome:?}"
-            ),
-            Self::Kick {
-                player, message, ..
-            } => write!(f, "@{ms:.1}ms kick player {player}: {message}"),
-            Self::Freeze { notice, .. } => write!(f, "@{ms:.1}ms freeze {}", notice.reason),
-            Self::Resume { notice, .. } => write!(f, "@{ms:.1}ms resume {}", notice.reason),
-            Self::Dispose { .. } => write!(f, "@{ms:.1}ms dispose"),
-            Self::Advance {
-                settled, hashes, ..
-            } => {
-                let ticks = match (hashes.first(), hashes.last()) {
-                    (Some(a), Some(b)) => format!("ticks {}..={}", a.0, b.0),
-                    _ => "no ticks".into(),
-                };
-                write!(f, "@{ms:.1}ms advance {ticks}, {} settled", settled.len())
-            }
-            Self::JoinTransfer {
-                transfer, result, ..
-            } => write!(
-                f,
-                "@{ms:.1}ms join transfer {} from {} -> {result:?}",
-                transfer.claims.principal, transfer.source_zone
-            ),
-            Self::ReconnectVersion {
-                token,
-                content_version,
-                result,
-                ..
-            } => write!(
-                f,
-                "@{ms:.1}ms reconnect token#{token} version {content_version} -> {result:?}"
-            ),
-            Self::SetContentVersion { version, .. } => {
-                write!(f, "@{ms:.1}ms content version {version}")
-            }
-            Self::SetConfigVersion { version, .. } => {
-                write!(f, "@{ms:.1}ms config version {version}")
-            }
-            Self::DeliverKick { principal, .. } => {
-                write!(f, "@{ms:.1}ms inbox kick {principal}")
-            }
-            Self::DeliverMessage { type_id, .. } => {
-                write!(f, "@{ms:.1}ms inbox message {type_id}")
-            }
-            Self::RequestFreeze { notice, .. } => {
-                write!(f, "@{ms:.1}ms request freeze {}", notice.reason)
-            }
-            Self::CancelFreeze { notice, .. } => {
-                write!(f, "@{ms:.1}ms cancel freeze {}", notice.reason)
-            }
-            Self::ReloadStale { .. } => write!(f, "@{ms:.1}ms reload stale players"),
-            Self::ChildEvent { event, .. } => write!(
-                f,
-                "@{ms:.1}ms child event {} from {}",
-                event.kind, event.origin_zone
-            ),
-            Self::Restore { state, .. } => {
-                write!(f, "@{ms:.1}ms restore {} bytes", state.len())
+            } => write!(f, "handoff player {} to {target_zone}", player.0)?,
+            Stimulus::Restore { state, .. } => write!(f, "restore {} bytes", state.len())?,
+            Stimulus::Dispose => write!(f, "dispose")?,
+            Stimulus::Advance => write!(f, "advance")?,
+        }
+        match &self.observed {
+            Observed::Nothing => Ok(()),
+            Observed::Join(result) => write!(f, " -> {result:?}"),
+            Observed::Input(outcome) => write!(f, " -> {outcome:?}"),
+            Observed::Advance { settled, hashes } => {
+                match (hashes.first(), hashes.last()) {
+                    (Some(a), Some(b)) => write!(f, " ticks {}..={}", a.0, b.0)?,
+                    _ => write!(f, " no ticks")?,
+                }
+                write!(f, ", {} settled", settled.len())
             }
         }
     }
@@ -397,22 +236,22 @@ impl fmt::Display for Event {
 pub struct Recording {
     /// Zone id (seeds the RNG).
     pub zone_id: String,
-    /// Host configuration.
+    /// Host configuration, as resolved at creation (the boot epoch).
     pub config: HostConfig,
     /// Clock when the host was created.
     pub created_at: Duration,
+    /// Wall time (Unix ms) when the host was created.
+    pub created_unix_ms: u64,
     /// Fact queue capacity, when a queue was attached.
     pub fact_capacity: Option<usize>,
-    /// Caller-encoded zone construction parameters (opaque).
-    pub zone_config: Vec<u8>,
     /// Stimuli in order.
-    pub events: Vec<Event>,
+    pub entries: Vec<Entry>,
 }
 
 /// File decode failure.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RecordingError {
-    /// Not a `DGR3` file.
+    /// Not a `DGR4` file.
     BadMagic,
     /// Malformed content.
     Decode(String),
@@ -674,20 +513,326 @@ fn get_config(r: &mut Reader<'_>) -> Result<HostConfig, RecordingError> {
         boot_epoch: get_u64(r)?,
         config_version: r.string()?,
         lifecycle_facts: r.bool()?,
+        record: false,
+    })
+}
+
+fn put_opt_string(w: &mut Writer, v: Option<&str>) {
+    match v {
+        Some(v) => w.u8(1).string(v),
+        None => w.u8(0),
+    };
+}
+
+fn get_opt_string(r: &mut Reader<'_>) -> Result<Option<String>, RecordingError> {
+    Ok(match r.u8()? {
+        0 => None,
+        _ => Some(r.string()?),
+    })
+}
+
+fn put_stimulus(w: &mut Writer, stimulus: &Stimulus) {
+    match stimulus {
+        Stimulus::Join {
+            claims,
+            capabilities,
+            content_version,
+        } => {
+            w.u8(0);
+            put_claims(w, claims);
+            w.varuint(*capabilities).string(content_version);
+        }
+        Stimulus::JoinTransfer {
+            transfer,
+            capabilities,
+            content_version,
+        } => {
+            w.u8(1);
+            put_claims(w, &transfer.claims);
+            w.string(&transfer.source_zone).string(&transfer.issuer);
+            put_u64(w, transfer.generation);
+            put_u64(w, transfer.departed_at_ms);
+            w.bytes(&transfer.carried)
+                .varuint(*capabilities)
+                .string(content_version);
+        }
+        Stimulus::Reconnect {
+            token,
+            capabilities,
+            content_version,
+        } => {
+            w.u8(2).string(token).varuint(*capabilities);
+            put_opt_string(w, content_version.as_deref());
+        }
+        Stimulus::Disconnect { client, graceful } => {
+            w.u8(3).varuint(client.0).bool(*graceful);
+        }
+        Stimulus::Input {
+            client,
+            seq,
+            client_tick,
+            payload,
+        } => {
+            w.u8(4)
+                .varuint(client.0)
+                .varuint(*seq)
+                .varuint(*client_tick)
+                .bytes(payload);
+        }
+        Stimulus::Content { client, version } => {
+            w.u8(5).varuint(client.0).string(version);
+        }
+        Stimulus::Focus { client, x, y } => {
+            w.u8(6).varuint(client.0).f32(*x).f32(*y);
+        }
+        Stimulus::Kick { principal, reason } => {
+            w.u8(7).string(principal).string(reason);
+        }
+        Stimulus::Message { type_id, payload } => {
+            w.u8(8).varuint(*type_id).bytes(payload);
+        }
+        Stimulus::ZoneMessage(envelope) => {
+            w.u8(9)
+                .string(&envelope.id)
+                .string(&envelope.from)
+                .string(&envelope.to);
+            put_opt_string(w, envelope.principal.as_deref());
+            w.varuint(envelope.type_id).bytes(&envelope.payload);
+        }
+        Stimulus::ChildEvent(event) => {
+            w.u8(10)
+                .string(&event.origin_zone)
+                .string(&event.from_zone)
+                .string(&event.kind)
+                .bytes(&event.payload);
+            put_u64(w, event.origin_tick);
+            w.string(&event.content_version).u8(event.levels);
+        }
+        Stimulus::RequestFreeze(notice) => {
+            w.u8(11);
+            put_notice(w, notice);
+        }
+        Stimulus::CancelFreeze(notice) => {
+            w.u8(12);
+            put_notice(w, notice);
+        }
+        Stimulus::Resume(notice) => {
+            w.u8(13);
+            put_notice(w, notice);
+        }
+        Stimulus::ContentVersion(version) => {
+            w.u8(14).string(version);
+        }
+        Stimulus::ConfigVersion(version) => {
+            w.u8(15).string(version);
+        }
+        Stimulus::Reload(player) => {
+            w.u8(16).varuint(player.0);
+        }
+        Stimulus::ReloadStale => {
+            w.u8(17);
+        }
+        Stimulus::KickPlayer { player, message } => {
+            w.u8(18).varuint(player.0).string(message);
+        }
+        Stimulus::Handoff {
+            player,
+            target_zone,
+            ticket,
+        } => {
+            w.u8(19)
+                .varuint(player.0)
+                .string(target_zone)
+                .string(ticket);
+        }
+        Stimulus::Restore {
+            state,
+            saved_version,
+        } => {
+            w.u8(20).bytes(state).string(saved_version);
+        }
+        Stimulus::Dispose => {
+            w.u8(21);
+        }
+        Stimulus::Advance => {
+            w.u8(22);
+        }
+    }
+}
+
+fn get_stimulus(r: &mut Reader<'_>) -> Result<Stimulus, RecordingError> {
+    Ok(match r.u8()? {
+        0 => Stimulus::Join {
+            claims: get_claims(r)?,
+            capabilities: r.varuint()?,
+            content_version: r.string()?,
+        },
+        1 => {
+            let claims = get_claims(r)?;
+            let source_zone = r.string()?;
+            let issuer = r.string()?;
+            let generation = get_u64(r)?;
+            let departed_at_ms = get_u64(r)?;
+            let carried = r.bytes()?.to_vec();
+            Stimulus::JoinTransfer {
+                transfer: Transfer {
+                    claims,
+                    source_zone,
+                    issuer,
+                    generation,
+                    carried,
+                    departed_at_ms,
+                },
+                capabilities: r.varuint()?,
+                content_version: r.string()?,
+            }
+        }
+        2 => Stimulus::Reconnect {
+            token: r.string()?,
+            capabilities: r.varuint()?,
+            content_version: get_opt_string(r)?,
+        },
+        3 => Stimulus::Disconnect {
+            client: ClientId(r.varuint()?),
+            graceful: r.bool()?,
+        },
+        4 => Stimulus::Input {
+            client: ClientId(r.varuint()?),
+            seq: r.varuint()?,
+            client_tick: r.varuint()?,
+            payload: r.bytes()?.to_vec(),
+        },
+        5 => Stimulus::Content {
+            client: ClientId(r.varuint()?),
+            version: r.string()?,
+        },
+        6 => Stimulus::Focus {
+            client: ClientId(r.varuint()?),
+            x: r.f32()?,
+            y: r.f32()?,
+        },
+        7 => Stimulus::Kick {
+            principal: r.string()?,
+            reason: r.string()?,
+        },
+        8 => Stimulus::Message {
+            type_id: r.varuint()?,
+            payload: r.bytes()?.to_vec(),
+        },
+        9 => Stimulus::ZoneMessage(ZoneEnvelope {
+            id: r.string()?,
+            from: r.string()?,
+            to: r.string()?,
+            principal: get_opt_string(r)?,
+            type_id: r.varuint()?,
+            payload: r.bytes()?.to_vec(),
+        }),
+        10 => Stimulus::ChildEvent(ChildEvent {
+            origin_zone: r.string()?,
+            from_zone: r.string()?,
+            kind: r.string()?,
+            payload: r.bytes()?.to_vec(),
+            origin_tick: get_u64(r)?,
+            content_version: r.string()?,
+            levels: r.u8()?,
+        }),
+        11 => Stimulus::RequestFreeze(get_notice(r)?),
+        12 => Stimulus::CancelFreeze(get_notice(r)?),
+        13 => Stimulus::Resume(get_notice(r)?),
+        14 => Stimulus::ContentVersion(r.string()?),
+        15 => Stimulus::ConfigVersion(r.string()?),
+        16 => Stimulus::Reload(PlayerId(r.varuint()?)),
+        17 => Stimulus::ReloadStale,
+        18 => Stimulus::KickPlayer {
+            player: PlayerId(r.varuint()?),
+            message: r.string()?,
+        },
+        19 => Stimulus::Handoff {
+            player: PlayerId(r.varuint()?),
+            target_zone: r.string()?,
+            ticket: r.string()?,
+        },
+        20 => Stimulus::Restore {
+            state: r.bytes()?.to_vec(),
+            saved_version: r.string()?,
+        },
+        21 => Stimulus::Dispose,
+        22 => Stimulus::Advance,
+        _ => return Err(bad("stimulus tag")),
+    })
+}
+
+fn put_observed(w: &mut Writer, observed: &Observed) {
+    match observed {
+        Observed::Nothing => {
+            w.u8(0);
+        }
+        Observed::Join(result) => {
+            w.u8(1);
+            put_join_result(w, result);
+        }
+        Observed::Input(outcome) => {
+            let code = OUTCOMES.iter().position(|o| o == outcome).unwrap_or(0) as u8;
+            w.u8(2).u8(code);
+        }
+        Observed::Advance { settled, hashes } => {
+            w.u8(3);
+            put_u64(w, settled.len() as u64);
+            for (tick, s) in settled {
+                put_settlement(w, *tick, s);
+            }
+            put_u64(w, hashes.len() as u64);
+            if let Some((first, _)) = hashes.first() {
+                put_u64(w, *first);
+            }
+            for (_, hash) in hashes {
+                w.raw(&hash.to_le_bytes());
+            }
+        }
+    }
+}
+
+fn get_observed(r: &mut Reader<'_>) -> Result<Observed, RecordingError> {
+    Ok(match r.u8()? {
+        0 => Observed::Nothing,
+        1 => Observed::Join(get_join_result(r)?),
+        2 => Observed::Input(*OUTCOMES.get(r.u8()? as usize).ok_or(bad("input outcome"))?),
+        3 => {
+            let n = get_u64(r)? as usize;
+            let mut settled = Vec::with_capacity(n.min(1 << 16));
+            for _ in 0..n {
+                settled.push(get_settlement(r)?);
+            }
+            let n = get_u64(r)?;
+            let mut hashes = Vec::with_capacity((n as usize).min(1 << 16));
+            if n > 0 {
+                let first = get_u64(r)?;
+                for i in 0..n {
+                    let mut b = [0u8; 8];
+                    b.copy_from_slice(r.raw(8)?);
+                    hashes.push((first + i, u64::from_le_bytes(b)));
+                }
+            }
+            Observed::Advance { settled, hashes }
+        }
+        _ => return Err(bad("observed tag")),
     })
 }
 
 impl Recording {
     /// Compact binary encoding:
-    /// `"DGR3" ‖ zone_id ‖ config ‖ created_at ‖ fact_capacity? ‖ zone_config ‖
-    /// varuint(event count) ‖ events`. Integers are LEB128 varints,
+    /// `"DGR4" ‖ zone_id ‖ config ‖ created_at ‖ created_unix_ms ‖
+    /// fact_capacity? ‖ varuint(entry count) ‖ entries`, each entry
+    /// `at ‖ unix_ms ‖ stimulus ‖ observed`. Integers are LEB128 varints,
     /// durations are nanosecond varints, clock readings are delta-coded
-    /// against the previous event, hashes are 8 raw bytes.
+    /// against the previous entry (both clocks never go backwards in a
+    /// recording: the host clamps them), hashes are 8 raw bytes.
     pub fn encode(&self) -> Vec<u8> {
         let mut w = Writer::new();
         w.raw(MAGIC).string(&self.zone_id);
         put_config(&mut w, &self.config);
         put_dur(&mut w, self.created_at);
+        put_u64(&mut w, self.created_unix_ms);
         match self.fact_capacity {
             Some(c) => {
                 w.u8(1);
@@ -697,163 +842,14 @@ impl Recording {
                 w.u8(0);
             }
         }
-        put_u64(&mut w, self.zone_config.len() as u64);
-        w.raw(&self.zone_config);
-        put_u64(&mut w, self.events.len() as u64);
-        let mut last = self.created_at;
-        for event in &self.events {
-            let at = event.at();
-            put_dur(&mut w, at.saturating_sub(last));
-            last = at;
-            match event {
-                Event::Join {
-                    claims,
-                    capabilities,
-                    content_version,
-                    result,
-                    ..
-                } => {
-                    w.u8(0);
-                    put_claims(&mut w, claims);
-                    w.varuint(*capabilities).string(content_version);
-                    put_join_result(&mut w, result);
-                }
-                Event::Reconnect {
-                    token,
-                    capabilities,
-                    result,
-                    ..
-                } => {
-                    w.u8(1).varuint(*token).varuint(*capabilities);
-                    put_join_result(&mut w, result);
-                }
-                Event::Disconnect {
-                    client, graceful, ..
-                } => {
-                    w.u8(2).varuint(*client).bool(*graceful);
-                }
-                Event::Input {
-                    client,
-                    seq,
-                    client_tick,
-                    payload,
-                    outcome,
-                    ..
-                } => {
-                    let code = OUTCOMES.iter().position(|o| o == outcome).unwrap_or(0) as u8;
-                    w.u8(3)
-                        .varuint(*client)
-                        .varuint(*seq)
-                        .varuint(*client_tick)
-                        .bytes(payload)
-                        .u8(code);
-                }
-                Event::Kick {
-                    player, message, ..
-                } => {
-                    w.u8(4).varuint(*player).string(message);
-                }
-                Event::Freeze { notice, .. } => {
-                    w.u8(5);
-                    put_notice(&mut w, notice);
-                }
-                Event::Resume { notice, .. } => {
-                    w.u8(6);
-                    put_notice(&mut w, notice);
-                }
-                Event::Dispose { .. } => {
-                    w.u8(7);
-                }
-                Event::Advance {
-                    settled, hashes, ..
-                } => {
-                    w.u8(8);
-                    put_u64(&mut w, settled.len() as u64);
-                    for (tick, s) in settled {
-                        put_settlement(&mut w, *tick, s);
-                    }
-                    put_u64(&mut w, hashes.len() as u64);
-                    if let Some((first, _)) = hashes.first() {
-                        put_u64(&mut w, *first);
-                    }
-                    for (_, hash) in hashes {
-                        w.raw(&hash.to_le_bytes());
-                    }
-                }
-                Event::JoinTransfer {
-                    transfer,
-                    capabilities,
-                    content_version,
-                    result,
-                    ..
-                } => {
-                    w.u8(9);
-                    put_claims(&mut w, &transfer.claims);
-                    w.string(&transfer.source_zone).string(&transfer.issuer);
-                    put_u64(&mut w, transfer.generation);
-                    put_u64(&mut w, transfer.departed_at_ms);
-                    w.bytes(&transfer.carried)
-                        .varuint(*capabilities)
-                        .string(content_version);
-                    put_join_result(&mut w, result);
-                }
-                Event::ReconnectVersion {
-                    token,
-                    capabilities,
-                    content_version,
-                    result,
-                    ..
-                } => {
-                    w.u8(10)
-                        .varuint(*token)
-                        .varuint(*capabilities)
-                        .string(content_version);
-                    put_join_result(&mut w, result);
-                }
-                Event::SetContentVersion { version, .. } => {
-                    w.u8(11).string(version);
-                }
-                Event::RequestFreeze { notice, .. } => {
-                    w.u8(12);
-                    put_notice(&mut w, notice);
-                }
-                Event::CancelFreeze { notice, .. } => {
-                    w.u8(13);
-                    put_notice(&mut w, notice);
-                }
-                Event::ReloadStale { .. } => {
-                    w.u8(14);
-                }
-                Event::ChildEvent { event, .. } => {
-                    w.u8(15)
-                        .string(&event.origin_zone)
-                        .string(&event.from_zone)
-                        .string(&event.kind)
-                        .bytes(&event.payload);
-                    put_u64(&mut w, event.origin_tick);
-                    w.string(&event.content_version).u8(event.levels);
-                }
-                Event::Restore {
-                    state,
-                    saved_version,
-                    ..
-                } => {
-                    w.u8(16).bytes(state).string(saved_version);
-                }
-                Event::DeliverKick {
-                    principal, reason, ..
-                } => {
-                    w.u8(18).string(principal).string(reason);
-                }
-                Event::DeliverMessage {
-                    type_id, payload, ..
-                } => {
-                    w.u8(19).varuint(*type_id).bytes(payload);
-                }
-                Event::SetConfigVersion { version, .. } => {
-                    w.u8(17).string(version);
-                }
-            }
+        put_u64(&mut w, self.entries.len() as u64);
+        let (mut at, mut unix_ms) = (self.created_at, self.created_unix_ms);
+        for entry in &self.entries {
+            put_dur(&mut w, entry.at.saturating_sub(at));
+            put_u64(&mut w, entry.unix_ms.saturating_sub(unix_ms));
+            (at, unix_ms) = (entry.at, entry.unix_ms);
+            put_stimulus(&mut w, &entry.stimulus);
+            put_observed(&mut w, &entry.observed);
         }
         w.into_bytes()
     }
@@ -867,168 +863,34 @@ impl Recording {
         let zone_id = r.string()?;
         let config = get_config(&mut r)?;
         let created_at = get_dur(&mut r)?;
+        let created_unix_ms = get_u64(&mut r)?;
         let fact_capacity = match r.u8()? {
             0 => None,
             _ => Some(get_u64(&mut r)? as usize),
         };
-        let len = get_u64(&mut r)? as usize;
-        let zone_config = r.raw(len)?.to_vec();
         let count = get_u64(&mut r)? as usize;
-        let mut events = Vec::with_capacity(count.min(1 << 20));
-        let mut at = created_at;
+        let mut entries = Vec::with_capacity(count.min(1 << 20));
+        let (mut at, mut unix_ms) = (created_at, created_unix_ms);
         for _ in 0..count {
             at += get_dur(&mut r)?;
-            let event = match r.u8()? {
-                0 => {
-                    let claims = get_claims(&mut r)?;
-                    Event::Join {
-                        at,
-                        claims,
-                        capabilities: r.varuint()?,
-                        content_version: r.string()?,
-                        result: get_join_result(&mut r)?,
-                    }
-                }
-                1 => Event::Reconnect {
-                    at,
-                    token: r.varuint()?,
-                    capabilities: r.varuint()?,
-                    result: get_join_result(&mut r)?,
-                },
-                2 => Event::Disconnect {
-                    at,
-                    client: r.varuint()?,
-                    graceful: r.bool()?,
-                },
-                3 => Event::Input {
-                    at,
-                    client: r.varuint()?,
-                    seq: r.varuint()?,
-                    client_tick: r.varuint()?,
-                    payload: r.bytes()?.to_vec(),
-                    outcome: *OUTCOMES.get(r.u8()? as usize).ok_or(bad("input outcome"))?,
-                },
-                4 => Event::Kick {
-                    at,
-                    player: r.varuint()?,
-                    message: r.string()?,
-                },
-                5 => Event::Freeze {
-                    at,
-                    notice: get_notice(&mut r)?,
-                },
-                6 => Event::Resume {
-                    at,
-                    notice: get_notice(&mut r)?,
-                },
-                7 => Event::Dispose { at },
-                8 => {
-                    let n = get_u64(&mut r)? as usize;
-                    let mut settled = Vec::with_capacity(n.min(1 << 16));
-                    for _ in 0..n {
-                        settled.push(get_settlement(&mut r)?);
-                    }
-                    let n = get_u64(&mut r)?;
-                    let mut hashes = Vec::with_capacity((n as usize).min(1 << 16));
-                    if n > 0 {
-                        let first = get_u64(&mut r)?;
-                        for i in 0..n {
-                            let mut b = [0u8; 8];
-                            b.copy_from_slice(r.raw(8)?);
-                            hashes.push((first + i, u64::from_le_bytes(b)));
-                        }
-                    }
-                    Event::Advance {
-                        at,
-                        settled,
-                        hashes,
-                    }
-                }
-                9 => {
-                    let claims = get_claims(&mut r)?;
-                    let source_zone = r.string()?;
-                    let issuer = r.string()?;
-                    let generation = get_u64(&mut r)?;
-                    let departed_at_ms = get_u64(&mut r)?;
-                    let carried = r.bytes()?.to_vec();
-                    Event::JoinTransfer {
-                        at,
-                        transfer: Transfer {
-                            claims,
-                            source_zone,
-                            issuer,
-                            generation,
-                            carried,
-                            departed_at_ms,
-                        },
-                        capabilities: r.varuint()?,
-                        content_version: r.string()?,
-                        result: get_join_result(&mut r)?,
-                    }
-                }
-                10 => Event::ReconnectVersion {
-                    at,
-                    token: r.varuint()?,
-                    capabilities: r.varuint()?,
-                    content_version: r.string()?,
-                    result: get_join_result(&mut r)?,
-                },
-                11 => Event::SetContentVersion {
-                    at,
-                    version: r.string()?,
-                },
-                12 => Event::RequestFreeze {
-                    at,
-                    notice: get_notice(&mut r)?,
-                },
-                13 => Event::CancelFreeze {
-                    at,
-                    notice: get_notice(&mut r)?,
-                },
-                14 => Event::ReloadStale { at },
-                15 => Event::ChildEvent {
-                    at,
-                    event: ChildEvent {
-                        origin_zone: r.string()?,
-                        from_zone: r.string()?,
-                        kind: r.string()?,
-                        payload: r.bytes()?.to_vec(),
-                        origin_tick: get_u64(&mut r)?,
-                        content_version: r.string()?,
-                        levels: r.u8()?,
-                    },
-                },
-                16 => Event::Restore {
-                    at,
-                    state: r.bytes()?.to_vec(),
-                    saved_version: r.string()?,
-                },
-                17 => Event::SetConfigVersion {
-                    at,
-                    version: r.string()?,
-                },
-                18 => Event::DeliverKick {
-                    at,
-                    principal: r.string()?,
-                    reason: r.string()?,
-                },
-                19 => Event::DeliverMessage {
-                    at,
-                    type_id: r.varuint()?,
-                    payload: r.bytes()?.to_vec(),
-                },
-                _ => return Err(bad("event tag")),
-            };
-            events.push(event);
+            unix_ms = unix_ms
+                .checked_add(get_u64(&mut r)?)
+                .ok_or(bad("wall clock overflow"))?;
+            entries.push(Entry {
+                at,
+                unix_ms,
+                stimulus: get_stimulus(&mut r)?,
+                observed: get_observed(&mut r)?,
+            });
         }
         r.finish()?;
         Ok(Self {
             zone_id,
             config,
             created_at,
+            created_unix_ms,
             fact_capacity,
-            zone_config,
-            events,
+            entries,
         })
     }
 
@@ -1045,363 +907,13 @@ impl Recording {
 
     /// Simulated ticks in the recording.
     pub fn tick_count(&self) -> usize {
-        self.events
+        self.entries
             .iter()
-            .map(|e| match e {
-                Event::Advance { hashes, .. } => hashes.len(),
+            .map(|e| match &e.observed {
+                Observed::Advance { hashes, .. } => hashes.len(),
                 _ => 0,
             })
             .sum()
-    }
-}
-
-/// Records a session while driving a [`ZoneHost`]. Use its methods instead
-/// of the host's so every stimulus is logged.
-pub struct Recorder<Z: Zone> {
-    host: ZoneHost<Z>,
-    clock: Arc<dyn Clock>,
-    recording: Recording,
-    tokens: Arc<Mutex<Vec<String>>>,
-}
-
-impl<Z: Zone> Recorder<Z> {
-    /// Create the host (as [`ZoneHost::new`]) and start recording.
-    /// `zone_config_bytes` is stored verbatim for whoever replays.
-    pub fn new(
-        zone_id: impl Into<String>,
-        config: HostConfig,
-        clock: Arc<dyn Clock>,
-        zone_config: Z::Config,
-        zone_config_bytes: Vec<u8>,
-    ) -> Self {
-        let zone_id = zone_id.into();
-        let created_at = clock.now();
-        let tokens = Arc::new(Mutex::new(Vec::new()));
-        let sink = tokens.clone();
-        let mut host = ZoneHost::new(zone_id.clone(), config.clone(), clock.clone(), zone_config)
-            .with_token_source(move || {
-                let token = crate::host::default_token();
-                sink.lock().expect("tokens").push(token.clone());
-                token
-            });
-        host.set_tick_hashing(true);
-        // The resolved boot epoch, so replayed fact keys match.
-        let config = host.config().clone();
-        Self {
-            host,
-            clock,
-            recording: Recording {
-                zone_id,
-                config,
-                created_at,
-                fact_capacity: None,
-                zone_config: zone_config_bytes,
-                events: Vec::new(),
-            },
-            tokens,
-        }
-    }
-
-    /// Attach a live fact queue (as [`ZoneHost::with_facts`]); `capacity`
-    /// must be the capacity it was created with.
-    pub fn with_facts(mut self, facts: FactQueue, capacity: usize) -> Self {
-        self.host = self.host.with_facts(facts);
-        self.recording.fact_capacity = Some(capacity);
-        self
-    }
-
-    /// The host (read-only: mutations bypassing the recorder break replay).
-    pub fn host(&self) -> &ZoneHost<Z> {
-        &self.host
-    }
-
-    /// The recording so far.
-    pub fn recording(&self) -> &Recording {
-        &self.recording
-    }
-
-    /// Stop and return the recording.
-    pub fn finish(self) -> Recording {
-        self.recording
-    }
-
-    fn now(&self) -> Duration {
-        self.clock.now()
-    }
-
-    /// [`ZoneHost::join`].
-    pub fn join(
-        &mut self,
-        claims: &TicketClaims,
-        capabilities: u32,
-        content_version: &str,
-    ) -> Result<Joined, JoinError> {
-        let at = self.now();
-        let result = self.host.join(claims, capabilities, content_version);
-        self.recording.events.push(Event::Join {
-            at,
-            claims: claims.clone(),
-            capabilities,
-            content_version: content_version.into(),
-            result: (&result).into(),
-        });
-        result
-    }
-
-    /// [`ZoneHost::reconnect`].
-    pub fn reconnect(&mut self, token: &str, capabilities: u32) -> Result<Joined, JoinError> {
-        let at = self.now();
-        let index = self
-            .tokens
-            .lock()
-            .expect("tokens")
-            .iter()
-            .position(|t| t == token)
-            .map_or(u32::MAX, |i| i as u32);
-        let result = self.host.reconnect(token, capabilities);
-        self.recording.events.push(Event::Reconnect {
-            at,
-            token: index,
-            capabilities,
-            result: (&result).into(),
-        });
-        result
-    }
-
-    /// [`ZoneHost::disconnect`].
-    pub fn disconnect(&mut self, client: ClientId, graceful: bool) {
-        let at = self.now();
-        self.host.disconnect(client, graceful);
-        self.recording.events.push(Event::Disconnect {
-            at,
-            client: client.0,
-            graceful,
-        });
-    }
-
-    /// [`ZoneHost::push_input`].
-    pub fn push_input(
-        &mut self,
-        client: ClientId,
-        seq: u32,
-        client_tick: u32,
-        payload: &[u8],
-    ) -> PushOutcome {
-        let at = self.now();
-        let outcome = self.host.push_input(client, seq, client_tick, payload);
-        self.recording.events.push(Event::Input {
-            at,
-            client: client.0,
-            seq,
-            client_tick,
-            payload: payload.to_vec(),
-            outcome,
-        });
-        outcome
-    }
-
-    /// [`ZoneHost::kick`].
-    pub fn kick(&mut self, player: PlayerId, message: &str) {
-        let at = self.now();
-        self.host.kick(player, message);
-        self.recording.events.push(Event::Kick {
-            at,
-            player: player.0,
-            message: message.into(),
-        });
-    }
-
-    /// [`ZoneHost::freeze`].
-    pub fn freeze(&mut self, notice: Notice) {
-        let at = self.now();
-        self.host.freeze(notice.clone());
-        self.recording.events.push(Event::Freeze { at, notice });
-    }
-
-    /// [`ZoneHost::resume`].
-    pub fn resume(&mut self, notice: Notice) {
-        let at = self.now();
-        self.host.resume(notice.clone());
-        self.recording.events.push(Event::Resume { at, notice });
-    }
-
-    /// [`ZoneHost::dispose`].
-    pub fn dispose(&mut self) {
-        let at = self.now();
-        self.host.dispose();
-        self.recording.events.push(Event::Dispose { at });
-    }
-
-    /// [`ZoneHost::advance`].
-    pub fn advance(&mut self) -> AdvanceReport {
-        let at = self.now();
-        let report = self.host.advance();
-        self.recording.events.push(Event::Advance {
-            at,
-            settled: report.settled.clone(),
-            hashes: report.tick_hashes.clone(),
-        });
-        report
-    }
-
-    /// [`ZoneHost::drain_outbound`].
-    pub fn drain_outbound(&mut self) -> Vec<Outbound> {
-        self.host.drain_outbound()
-    }
-
-    /// [`ZoneHost::with_transfer_issuer`] (the issuer itself is not
-    /// recorded; replay uses a stub that always signs).
-    pub fn with_transfer_issuer(
-        mut self,
-        issuer: impl FnMut(&HandoffRequest) -> Option<String> + Send + 'static,
-    ) -> Self {
-        self.host = self.host.with_transfer_issuer(issuer);
-        self
-    }
-
-    fn token_index(&self, token: &str) -> u32 {
-        self.tokens
-            .lock()
-            .expect("tokens")
-            .iter()
-            .position(|t| t == token)
-            .map_or(u32::MAX, |i| i as u32)
-    }
-
-    /// [`ZoneHost::join_transfer`].
-    pub fn join_transfer(
-        &mut self,
-        transfer: &Transfer,
-        capabilities: u32,
-        content_version: &str,
-    ) -> Result<Joined, JoinError> {
-        let at = self.now();
-        let result = self
-            .host
-            .join_transfer(transfer, capabilities, content_version);
-        self.recording.events.push(Event::JoinTransfer {
-            at,
-            transfer: transfer.clone(),
-            capabilities,
-            content_version: content_version.into(),
-            result: (&result).into(),
-        });
-        result
-    }
-
-    /// [`ZoneHost::reconnect_with_version`].
-    pub fn reconnect_with_version(
-        &mut self,
-        token: &str,
-        capabilities: u32,
-        content_version: &str,
-    ) -> Result<Joined, JoinError> {
-        let at = self.now();
-        let index = self.token_index(token);
-        let result = self
-            .host
-            .reconnect_with_version(token, capabilities, content_version);
-        self.recording.events.push(Event::ReconnectVersion {
-            at,
-            token: index,
-            capabilities,
-            content_version: content_version.into(),
-            result: (&result).into(),
-        });
-        result
-    }
-
-    /// [`ZoneHost::set_content_version`].
-    pub fn set_content_version(&mut self, version: &str) {
-        let at = self.now();
-        self.host.set_content_version(version);
-        self.recording.events.push(Event::SetContentVersion {
-            at,
-            version: version.into(),
-        });
-    }
-
-    /// [`ZoneHost::set_config_version`].
-    pub fn set_config_version(&mut self, version: &str) {
-        let at = self.now();
-        self.host.set_config_version(version);
-        self.recording.events.push(Event::SetConfigVersion {
-            at,
-            version: version.into(),
-        });
-    }
-
-    /// [`ZoneHost::deliver`].
-    pub fn deliver(
-        &mut self,
-        inbound: crate::inbox::ZoneInbound<Z::Message>,
-    ) -> crate::inbox::Delivered {
-        let at = self.now();
-        let event = match &inbound {
-            crate::inbox::ZoneInbound::Kick { principal, reason } => Event::DeliverKick {
-                at,
-                principal: principal.clone(),
-                reason: reason.clone(),
-            },
-            crate::inbox::ZoneInbound::Message(message) => Event::DeliverMessage {
-                at,
-                type_id: crate::GameEvent::event_id(message),
-                payload: crate::GameEvent::to_payload(message),
-            },
-        };
-        let delivered = self.host.deliver(inbound);
-        self.recording.events.push(event);
-        delivered
-    }
-
-    /// [`ZoneHost::request_freeze`].
-    pub fn request_freeze(&mut self, notice: Notice) -> crate::world::FreezeState {
-        let at = self.now();
-        let state = self.host.request_freeze(notice.clone());
-        self.recording
-            .events
-            .push(Event::RequestFreeze { at, notice });
-        state
-    }
-
-    /// [`ZoneHost::cancel_freeze`].
-    pub fn cancel_freeze(&mut self, notice: Notice) {
-        let at = self.now();
-        self.host.cancel_freeze(notice.clone());
-        self.recording
-            .events
-            .push(Event::CancelFreeze { at, notice });
-    }
-
-    /// [`ZoneHost::reload_stale_players`].
-    pub fn reload_stale_players(&mut self) -> usize {
-        let at = self.now();
-        let n = self.host.reload_stale_players();
-        self.recording.events.push(Event::ReloadStale { at });
-        n
-    }
-
-    /// [`ZoneHost::deliver_child_event`].
-    pub fn deliver_child_event(&mut self, event: ChildEvent) {
-        let at = self.now();
-        self.host.deliver_child_event(event.clone());
-        self.recording.events.push(Event::ChildEvent { at, event });
-    }
-
-    /// [`ZoneHost::restore`].
-    pub fn restore(&mut self, state: &[u8], saved_version: &str) {
-        let at = self.now();
-        self.host.restore(state, saved_version);
-        self.recording.events.push(Event::Restore {
-            at,
-            state: state.to_vec(),
-            saved_version: saved_version.into(),
-        });
-    }
-
-    /// [`ZoneHost::drain_upward`] (output only, not recorded).
-    pub fn drain_upward(&mut self) -> Vec<ChildEvent> {
-        self.host.drain_upward()
     }
 }
 
@@ -1441,8 +953,8 @@ pub enum DivergenceKind {
 /// First point where a replay departed from its recording.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Divergence {
-    /// Index into [`Recording::events`].
-    pub event_index: usize,
+    /// Index into [`Recording::entries`].
+    pub entry_index: usize,
     /// Tick at which it was detected (the diverging tick for hashes).
     pub tick: u64,
     /// What differed.
@@ -1458,23 +970,23 @@ impl fmt::Display for Divergence {
         match &self.kind {
             DivergenceKind::StateHash { expected, actual } => write!(
                 f,
-                "replay diverged at tick {} (event #{}): state hash {actual:016x} != recorded {expected:016x}",
-                self.tick, self.event_index
+                "replay diverged at tick {} (entry #{}): state hash {actual:016x} != recorded {expected:016x}",
+                self.tick, self.entry_index
             )?,
             DivergenceKind::Ticks { expected, actual } => write!(
                 f,
-                "replay diverged at tick {} (event #{}): simulated ticks {actual:?} != recorded {expected:?}",
-                self.tick, self.event_index
+                "replay diverged at tick {} (entry #{}): simulated ticks {actual:?} != recorded {expected:?}",
+                self.tick, self.entry_index
             )?,
             DivergenceKind::InputOutcome { expected, actual } => write!(
                 f,
-                "replay diverged at tick {} (event #{}): input outcome {actual:?} != recorded {expected:?}",
-                self.tick, self.event_index
+                "replay diverged at tick {} (entry #{}): input outcome {actual:?} != recorded {expected:?}",
+                self.tick, self.entry_index
             )?,
             DivergenceKind::Join { expected, actual } => write!(
                 f,
-                "replay diverged at tick {} (event #{}): join {actual:?} != recorded {expected:?}",
-                self.tick, self.event_index
+                "replay diverged at tick {} (entry #{}): join {actual:?} != recorded {expected:?}",
+                self.tick, self.entry_index
             )?,
         }
         write!(f, "\n  last matching tick: {}", self.last_good_tick)?;
@@ -1491,18 +1003,40 @@ impl fmt::Display for Divergence {
 impl std::error::Error for Divergence {}
 
 /// Successful replay summary.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ReplaySummary {
-    /// Events applied.
-    pub events: usize,
+    /// Entries applied.
+    pub entries: usize,
     /// Ticks simulated and verified.
     pub ticks: u64,
     /// Hash after the last tick.
     pub final_hash: u64,
+    /// Facts the zone emitted, in order (a recording without a fact queue
+    /// emits none).
+    pub facts: Vec<Fact>,
 }
 
-/// Replay `recording` through a fresh host on a [`ManualClock`] and verify
-/// every per-tick state hash.
+/// The clock a replay runs on: exactly the recorded readings.
+struct ReplayClock(Mutex<(Duration, u64)>);
+
+impl ReplayClock {
+    fn set(&self, at: Duration, unix_ms: u64) {
+        *self.0.lock().expect("replay clock") = (at, unix_ms);
+    }
+}
+
+impl Clock for ReplayClock {
+    fn now(&self) -> Duration {
+        self.0.lock().expect("replay clock").0
+    }
+
+    fn unix_ms(&self) -> u64 {
+        self.0.lock().expect("replay clock").1
+    }
+}
+
+/// Replay `recording` through a fresh host on its recorded clock readings
+/// and verify every join and input outcome and per-tick state hash.
 pub fn replay<Z: Zone>(
     recording: &Recording,
     zone_config: Z::Config,
@@ -1510,282 +1044,128 @@ pub fn replay<Z: Zone>(
     replay_with::<Z>(recording, zone_config, |_| {})
 }
 
-/// [`replay`] with a callback after each event (inspection, tooling).
+/// [`replay`] with a callback after each entry (inspection, tooling).
 pub fn replay_with<Z: Zone>(
     recording: &Recording,
     zone_config: Z::Config,
     mut inspect: impl FnMut(&ZoneHost<Z>),
 ) -> Result<ReplaySummary, Divergence> {
-    let clock = ManualClock::new();
-    clock.set(recording.created_at);
-    let counter = Arc::new(Mutex::new(0u32));
-    let source = counter.clone();
+    let clock = Arc::new(ReplayClock(Mutex::new((
+        recording.created_at,
+        recording.created_unix_ms,
+    ))));
+    let mut issued = 0usize;
     let mut host = ZoneHost::<Z>::new(
         recording.zone_id.clone(),
         recording.config.clone(),
-        Arc::new(clock.clone()),
+        clock.clone(),
         zone_config,
     )
     .with_token_source(move || {
-        let mut n = source.lock().expect("counter");
-        *n += 1;
-        format!("replay-token-{}", *n - 1)
+        issued += 1;
+        token_label(issued - 1)
     })
     .with_transfer_issuer(|_: &HandoffRequest| Some("replay-transfer".into()));
     host.set_tick_hashing(true);
     let mut script = None;
     if let Some(capacity) = recording.fact_capacity {
         let (queue, s) = FactQueue::scripted(capacity);
-        host = host.with_facts(queue);
+        host = host.with_facts(queue.with_journal());
         script = Some(s);
     }
     let mut last_good_tick = 0u64;
     let mut suspects: Vec<String> = Vec::new();
     let mut last_hash = 0u64;
     let mut ticks = 0u64;
-    let diverge = |event_index: usize,
-                   tick: u64,
-                   kind: DivergenceKind,
-                   last_good_tick: u64,
-                   suspects: &[String]| Divergence {
-        event_index,
-        tick,
-        kind,
-        last_good_tick,
-        suspects: suspects.to_vec(),
-    };
-    for (index, event) in recording.events.iter().enumerate() {
-        clock.set(event.at());
-        match event {
-            Event::Join {
-                claims,
-                capabilities,
-                content_version,
-                result,
-                ..
-            } => {
-                let actual = JoinResult::from(&host.join(claims, *capabilities, content_version));
-                if &actual != result {
-                    return Err(diverge(
-                        index,
-                        host.tick(),
-                        DivergenceKind::Join {
-                            expected: result.clone(),
-                            actual,
-                        },
-                        last_good_tick,
-                        &suspects,
-                    ));
-                }
+    let mut facts = Vec::new();
+    for (index, entry) in recording.entries.iter().enumerate() {
+        clock.set(entry.at, entry.unix_ms);
+        if let (Some(script), Observed::Advance { settled, .. }) = (&script, &entry.observed) {
+            for (tick, s) in settled {
+                script.push(*tick, s.clone());
             }
-            Event::Reconnect {
-                token,
-                capabilities,
-                result,
-                ..
-            } => {
-                let token = if *token == u32::MAX {
-                    String::new()
-                } else {
-                    format!("replay-token-{token}")
+        }
+        let outcome = host.apply(entry.stimulus.clone());
+        host.drain_outbound();
+        facts.extend(host.take_emitted_facts());
+        let diverged =
+            |tick: u64, kind: DivergenceKind, last_good_tick: u64, suspects: &[String]| {
+                let mut suspects = suspects.to_vec();
+                suspects.push(entry.to_string());
+                Divergence {
+                    entry_index: index,
+                    tick,
+                    kind,
+                    last_good_tick,
+                    suspects,
+                }
+            };
+        match (&entry.observed, Observed::of(&outcome)) {
+            (Observed::Join(expected), Observed::Join(actual)) if *expected != actual => {
+                let kind = DivergenceKind::Join {
+                    expected: expected.clone(),
+                    actual,
                 };
-                let actual = JoinResult::from(&host.reconnect(&token, *capabilities));
-                if &actual != result {
-                    return Err(diverge(
-                        index,
-                        host.tick(),
-                        DivergenceKind::Join {
-                            expected: result.clone(),
-                            actual,
-                        },
-                        last_good_tick,
-                        &suspects,
-                    ));
-                }
+                return Err(diverged(host.tick(), kind, last_good_tick, &suspects));
             }
-            Event::Disconnect {
-                client, graceful, ..
-            } => host.disconnect(ClientId(*client), *graceful),
-            Event::Input {
-                client,
-                seq,
-                client_tick,
-                payload,
-                outcome,
-                ..
-            } => {
-                let actual = host.push_input(ClientId(*client), *seq, *client_tick, payload);
-                if actual != *outcome {
-                    return Err(diverge(
-                        index,
-                        host.tick(),
-                        DivergenceKind::InputOutcome {
-                            expected: *outcome,
-                            actual,
-                        },
-                        last_good_tick,
-                        &suspects,
-                    ));
-                }
-            }
-            Event::Kick {
-                player, message, ..
-            } => host.kick(PlayerId(*player), message.clone()),
-            Event::JoinTransfer {
-                transfer,
-                capabilities,
-                content_version,
-                result,
-                ..
-            } => {
-                let actual =
-                    JoinResult::from(&host.join_transfer(transfer, *capabilities, content_version));
-                if &actual != result {
-                    return Err(diverge(
-                        index,
-                        host.tick(),
-                        DivergenceKind::Join {
-                            expected: result.clone(),
-                            actual,
-                        },
-                        last_good_tick,
-                        &suspects,
-                    ));
-                }
-            }
-            Event::ReconnectVersion {
-                token,
-                capabilities,
-                content_version,
-                result,
-                ..
-            } => {
-                let token = if *token == u32::MAX {
-                    String::new()
-                } else {
-                    format!("replay-token-{token}")
+            (Observed::Input(expected), Observed::Input(actual)) if *expected != actual => {
+                let kind = DivergenceKind::InputOutcome {
+                    expected: *expected,
+                    actual,
                 };
-                let actual = JoinResult::from(&host.reconnect_with_version(
-                    &token,
-                    *capabilities,
-                    content_version,
-                ));
-                if &actual != result {
-                    return Err(diverge(
-                        index,
-                        host.tick(),
-                        DivergenceKind::Join {
-                            expected: result.clone(),
-                            actual,
-                        },
-                        last_good_tick,
-                        &suspects,
-                    ));
-                }
+                return Err(diverged(host.tick(), kind, last_good_tick, &suspects));
             }
-            Event::SetContentVersion { version, .. } => host.set_content_version(version.clone()),
-            Event::SetConfigVersion { version, .. } => host.set_config_version(version.clone()),
-            Event::DeliverKick {
-                principal, reason, ..
-            } => {
-                host.deliver(crate::inbox::ZoneInbound::Kick {
-                    principal: principal.clone(),
-                    reason: reason.clone(),
-                });
-            }
-            Event::DeliverMessage {
-                type_id, payload, ..
-            } => {
-                if let Ok(Some(message)) =
-                    <Z::Message as crate::GameEvent>::decode_event(*type_id, payload)
-                {
-                    host.deliver(crate::inbox::ZoneInbound::Message(message));
-                }
-            }
-            Event::RequestFreeze { notice, .. } => {
-                host.request_freeze(notice.clone());
-            }
-            Event::CancelFreeze { notice, .. } => host.cancel_freeze(notice.clone()),
-            Event::ReloadStale { .. } => {
-                host.reload_stale_players();
-            }
-            Event::ChildEvent { event, .. } => host.deliver_child_event(event.clone()),
-            Event::Restore {
-                state,
-                saved_version,
-                ..
-            } => host.restore(state, saved_version),
-            Event::Freeze { notice, .. } => host.freeze(notice.clone()),
-            Event::Resume { notice, .. } => host.resume(notice.clone()),
-            Event::Dispose { .. } => host.dispose(),
-            Event::Advance {
-                settled, hashes, ..
-            } => {
-                if let Some(script) = &script {
-                    for (tick, s) in settled {
-                        script.push(*tick, s.clone());
-                    }
-                }
-                let report = host.advance();
-                host.drain_outbound();
-                let expected_ticks: Vec<u64> = hashes.iter().map(|(t, _)| *t).collect();
-                let actual_ticks: Vec<u64> = report.tick_hashes.iter().map(|(t, _)| *t).collect();
-                for ((tick, expected), (_, actual)) in hashes.iter().zip(&report.tick_hashes) {
+            (
+                Observed::Advance { hashes, .. },
+                Observed::Advance {
+                    hashes: actual_hashes,
+                    ..
+                },
+            ) => {
+                for ((tick, expected), (_, actual)) in hashes.iter().zip(&actual_hashes) {
                     if expected != actual {
-                        suspects.push(event.to_string());
-                        return Err(diverge(
-                            index,
-                            *tick,
-                            DivergenceKind::StateHash {
-                                expected: *expected,
-                                actual: *actual,
-                            },
-                            last_good_tick,
-                            &suspects,
-                        ));
+                        let kind = DivergenceKind::StateHash {
+                            expected: *expected,
+                            actual: *actual,
+                        };
+                        return Err(diverged(*tick, kind, last_good_tick, &suspects));
                     }
                     last_good_tick = *tick;
                 }
-                if expected_ticks != actual_ticks {
-                    suspects.push(event.to_string());
-                    return Err(diverge(
-                        index,
-                        host.tick(),
-                        DivergenceKind::Ticks {
-                            expected: expected_ticks,
-                            actual: actual_ticks,
-                        },
-                        last_good_tick,
-                        &suspects,
-                    ));
+                let expected: Vec<u64> = hashes.iter().map(|(t, _)| *t).collect();
+                let actual: Vec<u64> = actual_hashes.iter().map(|(t, _)| *t).collect();
+                if expected != actual {
+                    let kind = DivergenceKind::Ticks { expected, actual };
+                    return Err(diverged(host.tick(), kind, last_good_tick, &suspects));
                 }
-                if let Some((_, h)) = report.tick_hashes.last() {
+                if let Some((_, h)) = actual_hashes.last() {
                     last_hash = *h;
-                    ticks += report.tick_hashes.len() as u64;
+                    ticks += actual_hashes.len() as u64;
                     suspects.clear();
                 }
                 inspect(&host);
                 continue;
             }
+            _ => {}
         }
-        suspects.push(event.to_string());
-        host.drain_outbound();
+        suspects.push(entry.to_string());
         inspect(&host);
     }
     Ok(ReplaySummary {
-        events: recording.events.len(),
+        entries: recording.entries.len(),
         ticks,
         final_hash: last_hash,
+        facts,
     })
 }
 
 /// Per-tick hashes of a recording (for diffing two recordings).
 pub fn tick_hashes(recording: &Recording) -> BTreeMap<u64, u64> {
     recording
-        .events
+        .entries
         .iter()
-        .flat_map(|e| match e {
-            Event::Advance { hashes, .. } => hashes.clone(),
+        .flat_map(|e| match &e.observed {
+            Observed::Advance { hashes, .. } => hashes.clone(),
             _ => Vec::new(),
         })
         .collect()

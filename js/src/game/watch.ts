@@ -22,7 +22,7 @@
  * off like a sleeping zone.
  *
  * **Focus** (interest across borders): zones that declare their world
- * origin (Welcome v2) are focused by the client itself from
+ * origin (Welcome) are focused by the client itself from
  * `client.setPosition(x, y, zoneId)`, so each neighbour applies the
  * player's own view around it instead of sending everything. For zones
  * without an origin, `setFocus(at)` tells every watched zone where the

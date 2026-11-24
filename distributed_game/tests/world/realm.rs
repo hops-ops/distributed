@@ -106,6 +106,9 @@ impl Zone for Realm {
             );
             let _ = ctx.emit_fact_for(player, fact);
         }
+        let carried = distributed_game::codec::from_bytes::<String>(&carried)
+            .unwrap_or_default()
+            .into_bytes();
         let mut payload = carried.clone();
         payload.extend_from_slice(b"|");
         payload.extend_from_slice(from_zone.as_bytes());
@@ -138,8 +141,8 @@ impl Zone for Realm {
                         let Some(target) = self.cfg.neighbour.clone() else {
                             continue;
                         };
-                        let carried = format!("{principal}:gold={}", self.counter).into_bytes();
-                        if let Err(e) = ctx.handoff(player, &target, carried) {
+                        let carried = format!("{principal}:gold={}", self.counter);
+                        if let Err(e) = ctx.handoff(player, &target, &carried) {
                             self.handoff_errors.push(e);
                         }
                     }

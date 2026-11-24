@@ -59,7 +59,7 @@ pub mod transfer;
 pub mod world;
 
 use std::any::Any;
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::future::Future;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -96,7 +96,6 @@ use crate::host::{HostConfig, JoinError, Joined, Outbound, ZoneHost};
 use crate::metrics::GameMetrics;
 use crate::protocol::Role;
 use crate::protocol::{error, kick, ClientMessage, Notice, ServerMessage};
-use crate::rng::ZoneRng;
 use crate::world::{
     BarrierMode, ChildEvent, DottedTopology, FreezeState, HostAddr, LocalOwnership, OwnershipError,
     StalePolicy, StateError, StoredZoneState, ZoneActivation, ZoneAllocationStore, ZoneClaim,
@@ -104,6 +103,7 @@ use crate::world::{
 };
 use crate::zone::{ClientId, TicketClaims, Tier, Zone};
 
+use crate::netsim::DelayLine;
 pub use crate::netsim::NetSim;
 
 /// Server settings.
@@ -147,7 +147,9 @@ pub struct ServerConfig {
     /// Transfer ticket lifetime (and target reservation bound).
     pub transfer_ttl: Duration,
     /// After a zone is disposed, how long to wait for its fact worker to
-    /// commit the facts still queued.
+    /// commit the facts still queued; whatever is unsettled after that is
+    /// dropped (native facts are at most once, see
+    /// [`GameServer::with_fact_sink`]).
     pub settle_timeout: Duration,
     /// The hosts' shared internal secret: enables the `/admin/*` routes
     /// (which require it in [`CELL_INTERNAL_SECRET_HEADER`]) and peer calls.
@@ -225,7 +227,6 @@ enum ZoneCmd {
     Join {
         claims: TicketClaims,
         transfer: Option<Transfer>,
-        protocol: u32,
         capabilities: u32,
         content_version: String,
         out: mpsc::Sender<ConnOut>,
@@ -233,7 +234,6 @@ enum ZoneCmd {
     },
     Reconnect {
         token: String,
-        protocol: u32,
         capabilities: u32,
         content_version: String,
         out: mpsc::Sender<ConnOut>,
@@ -702,6 +702,13 @@ where
 
     /// Commit every zone's facts through `sink` (one worker per zone).
     /// Must be called before the server is cloned or served.
+    ///
+    /// **At most once across a crash.** Each zone's queue and backlog live
+    /// in this process: while it runs, every fact is committed exactly once
+    /// (retried per `policy` under its idempotent key), but a crash, a
+    /// kill, a disposal that outlives [`ServerConfig::settle_timeout`] or a
+    /// lost ownership drops the facts not yet settled. The celld zone
+    /// object spools its facts to storage instead (at least once).
     pub fn with_fact_sink<S: FactSink>(
         mut self,
         sink: S,
@@ -1508,13 +1515,11 @@ fn handle_cmd<Z: Zone>(
         ZoneCmd::Join {
             claims,
             transfer,
-            protocol,
             capabilities,
             content_version,
             out,
             reply,
         } => {
-            let host = host.speaking(protocol);
             let result = match &transfer {
                 Some(transfer) => host.join_transfer(transfer, capabilities, &content_version),
                 None => host.join(&claims, capabilities, &content_version),
@@ -1526,17 +1531,12 @@ fn handle_cmd<Z: Zone>(
         }
         ZoneCmd::Reconnect {
             token,
-            protocol,
             capabilities,
             content_version,
             out,
             reply,
         } => {
-            let result = host.speaking(protocol).reconnect_with_version(
-                &token,
-                capabilities,
-                &content_version,
-            );
+            let result = host.reconnect_with_version(&token, capabilities, &content_version);
             if let Ok(joined) = &result {
                 conns.insert(joined.client, out);
             }
@@ -1658,53 +1658,6 @@ async fn reject(mut socket: WebSocket, code: u32, message: impl Into<String>) {
     let _ = socket.send(Message::Close(None)).await;
 }
 
-/// Order-preserving delay line for [`NetSim`].
-struct DelayLine<T> {
-    sim: watch::Receiver<Option<NetSim>>,
-    rng: ZoneRng,
-    queue: VecDeque<(Instant, T)>,
-    last: Instant,
-}
-
-impl<T> DelayLine<T> {
-    fn new(sim: watch::Receiver<Option<NetSim>>, seed: u64) -> Self {
-        Self {
-            sim,
-            rng: ZoneRng::from_seed(seed),
-            queue: VecDeque::new(),
-            last: Instant::now(),
-        }
-    }
-
-    /// Returns the item immediately when no simulation is in effect and
-    /// nothing is still queued (order is preserved when the simulation is
-    /// switched off while messages are in flight).
-    fn push(&mut self, item: T) -> Option<T> {
-        let sim = *self.sim.borrow();
-        let delay = match sim {
-            Some(sim) => sim.delay(&mut self.rng),
-            None if self.queue.is_empty() => return Some(item),
-            None => Duration::ZERO,
-        };
-        let at = (Instant::now() + delay).max(self.last);
-        self.last = at;
-        self.queue.push_back((at, item));
-        None
-    }
-
-    fn next_due(&self) -> Option<Instant> {
-        self.queue.front().map(|(at, _)| *at)
-    }
-
-    fn pop_due(&mut self) -> Option<T> {
-        if self.queue.front()?.0 <= Instant::now() {
-            self.queue.pop_front().map(|(_, item)| item)
-        } else {
-            None
-        }
-    }
-}
-
 async fn sleep_until_opt(at: Option<Instant>) {
     match at {
         Some(at) => tokio::time::sleep_until(at).await,
@@ -1808,7 +1761,6 @@ where
         Admitted::Join(claims) => ZoneCmd::Join {
             claims,
             transfer: None,
-            protocol: hello.protocol_version,
             capabilities: hello.capabilities,
             content_version: hello.content_version,
             out: out_tx,
@@ -1817,7 +1769,6 @@ where
         Admitted::Arrival(transfer) | Admitted::Return(transfer) => ZoneCmd::Join {
             claims: transfer.claims.clone(),
             transfer: Some(transfer),
-            protocol: hello.protocol_version,
             capabilities: hello.capabilities,
             content_version: hello.content_version,
             out: out_tx,
@@ -1825,7 +1776,6 @@ where
         },
         Admitted::Reconnect(token) => ZoneCmd::Reconnect {
             token,
-            protocol: hello.protocol_version,
             capabilities: hello.capabilities,
             content_version: hello.content_version,
             out: out_tx,
@@ -1878,15 +1828,23 @@ where
 
     // 2. Session loop.
     let seed = u64::from(client.0) ^ unix_now();
-    let mut outbound: DelayLine<ConnOut> = DelayLine::new(inner.net_sim.subscribe(), seed);
-    let mut inbound: DelayLine<Inbound> = DelayLine::new(inner.net_sim.subscribe(), !seed);
+    // Both directions' delay lines run on milliseconds since `origin`; the
+    // simulation is read live, so a change applies to the next message.
+    let sim = inner.net_sim.subscribe();
+    let mut outbound: DelayLine<ConnOut> = DelayLine::new(seed);
+    let mut inbound: DelayLine<Inbound> = DelayLine::new(!seed);
     let origin = Instant::now();
+    let ms = || origin.elapsed().as_secs_f64() * 1000.0;
+    let link = || Link {
+        sim: *sim.borrow(),
+        now_ms: ms(),
+    };
     let mut gate = InputGate::new(&cfg.admission, Duration::ZERO);
     let mut graceful = false;
     let mut notify_zone = true;
     'session: loop {
         // Flush due delayed items.
-        while let Some(item) = outbound.pop_due() {
+        while let Some(item) = outbound.pop_due(ms()) {
             match send_out(&mut socket, item).await {
                 Ok(true) => {}
                 // The zone closed this connection and already forgot the client.
@@ -1899,19 +1857,31 @@ where
                 Err(_) => break 'session,
             }
         }
-        while let Some(item) = inbound.pop_due() {
-            if !forward_in(&inner, &zone, &mut socket, &mut outbound, client, item).await {
+        while let Some(item) = inbound.pop_due(ms()) {
+            if !forward_in(
+                &inner,
+                &zone,
+                &mut socket,
+                &mut outbound,
+                link(),
+                client,
+                item,
+            )
+            .await
+            {
                 break 'session;
             }
         }
         let next = match (outbound.next_due(), inbound.next_due()) {
             (Some(a), Some(b)) => Some(a.min(b)),
             (a, b) => a.or(b),
-        };
+        }
+        .map(|due| origin + Duration::from_secs_f64(due.max(0.0) / 1000.0));
         tokio::select! {
             out = out_rx.recv() => {
                 let Some(out) = out else { notify_zone = false; break };
-                if let Some(out) = outbound.push(out) {
+                let now = link();
+                if let Some(out) = outbound.push(now.sim, now.now_ms, out) {
                     match send_out(&mut socket, out).await {
                         Ok(true) => {}
                         Ok(false) => {
@@ -1972,8 +1942,9 @@ where
                         continue;
                     }
                 };
-                if let Some(item) = inbound.push(item) {
-                    if !forward_in(&inner, &zone, &mut socket, &mut outbound, client, item).await {
+                let now = link();
+                if let Some(item) = inbound.push(now.sim, now.now_ms, item) {
+                    if !forward_in(&inner, &zone, &mut socket, &mut outbound, link(), client, item).await {
                         break;
                     }
                 }
@@ -1998,11 +1969,19 @@ async fn send_out(socket: &mut WebSocket, out: ConnOut) -> Result<bool, axum::Er
     }
 }
 
+/// The simulated link at the moment an item is forwarded.
+#[derive(Clone, Copy)]
+struct Link {
+    sim: Option<NetSim>,
+    now_ms: f64,
+}
+
 async fn forward_in<Z: Zone>(
     inner: &Arc<Inner<Z>>,
     zone: &mpsc::Sender<ZoneCmd>,
     socket: &mut WebSocket,
     outbound: &mut DelayLine<ConnOut>,
+    link: Link,
     client: ClientId,
     item: Inbound,
 ) -> bool {
@@ -2032,35 +2011,10 @@ async fn forward_in<Z: Zone>(
             }
             .encode(&())
             .expect("pong encodes");
-            match outbound.push(ConnOut::Frame(pong)) {
+            match outbound.push(link.sim, link.now_ms, ConnOut::Frame(pong)) {
                 Some(out) => send_out(socket, out).await.unwrap_or(false),
                 None => true,
             }
         }
-    }
-}
-
-#[cfg(test)]
-mod netsim_tests {
-    use super::*;
-
-    #[test]
-    fn live_net_sim_changes_preserve_order() {
-        let (tx, rx) = watch::channel(None);
-        let mut line = DelayLine::new(rx, 1);
-        assert_eq!(line.push(1), Some(1), "no simulation: immediate");
-        tx.send_replace(Some(NetSim::new(
-            Duration::from_millis(200),
-            Duration::ZERO,
-        )));
-        assert_eq!(line.push(2), None, "simulation switched on: delayed");
-        let due = line.next_due().expect("queued");
-        tx.send_replace(None);
-        assert_eq!(line.push(3), None, "switched off: queues behind 2");
-        assert_eq!(line.pop_due(), None);
-        assert_eq!(line.queue.len(), 2);
-        assert!(line.queue.back().unwrap().0 >= due);
-        line.queue.clear();
-        assert_eq!(line.push(4), Some(4), "queue drained: immediate again");
     }
 }

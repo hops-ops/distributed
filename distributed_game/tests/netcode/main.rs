@@ -8,12 +8,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use arena::{Arena, ArenaConfig};
-use distributed_game::replay::{replay, DivergenceKind, Event, JoinResult, Recorder, Recording};
+use distributed_game::replay::{replay, DivergenceKind, JoinResult, Observed, Recording};
 use distributed_game::rewind::{Historic, HitQuery, RewindConfig, RewindFrame, ShotTiming};
 use distributed_game::{
     fact_channel, spawn_fact_worker, ClientMirror, ConsumePolicy, Ctx, EntitySchema, EntityState,
     FieldType, FieldValue, HostConfig, KindDef, ManualClock, MemoryFactSink, Outbound, PlayerId,
-    RetryPolicy, Role, ServerMessage, TicketClaims, WorldView, Zone, ZoneHost, ZoneRng,
+    RetryPolicy, Role, ServerMessage, Stimulus, TicketClaims, WorldView, Zone, ZoneHost, ZoneRng,
 };
 
 fn claims(principal: &str, zone: &str) -> TicketClaims {
@@ -198,6 +198,7 @@ async fn record_session() -> Session {
     let clock = ManualClock::new();
     let config = HostConfig {
         world_seed: 0xdead_beef,
+        record: true,
         ..HostConfig::default()
     };
     let cfg = ArenaConfig {
@@ -207,8 +208,8 @@ async fn record_session() -> Session {
     };
     let (queue, feed) = fact_channel(64, RetryPolicy::default());
     spawn_fact_worker(feed, MemoryFactSink::new());
-    let mut rec = Recorder::<Arena>::new("arena-1", config, Arc::new(clock.clone()), cfg, vec![])
-        .with_facts(queue, 64);
+    let mut rec =
+        ZoneHost::<Arena>::new("arena-1", config, Arc::new(clock.clone()), cfg).with_facts(queue);
     let mut rng = ZoneRng::from_seed(42);
     let mut clients = Vec::new();
     let mut seqs = [0u32; 4];
@@ -257,10 +258,9 @@ async fn record_session() -> Session {
     tokio::time::sleep(Duration::from_millis(20)).await;
     clock.advance(Duration::from_millis(40));
     rec.advance();
-    let final_hash = rec.host().state_hash();
     Session {
-        recording: rec.finish(),
-        final_hash,
+        recording: rec.recording().expect("recording on").clone(),
+        final_hash: rec.state_hash(),
     }
 }
 
@@ -269,20 +269,20 @@ async fn recorded_session_replays_identically() {
     let session = record_session().await;
     let rec = &session.recording;
     let settled: usize = rec
-        .events
+        .entries
         .iter()
-        .map(|e| match e {
-            Event::Advance { settled, .. } => settled.len(),
+        .map(|e| match &e.observed {
+            Observed::Advance { settled, .. } => settled.len(),
             _ => 0,
         })
         .sum();
     assert!(settled > 0, "facts settled during the recording");
-    assert!(rec.events.iter().any(|e| matches!(
-        e,
-        Event::Reconnect {
-            result: JoinResult::Joined(_),
-            ..
-        }
+    assert!(rec.entries.iter().any(|e| matches!(
+        (&e.stimulus, &e.observed),
+        (
+            Stimulus::Reconnect { .. },
+            Observed::Join(JoinResult::Joined(_))
+        )
     )));
     assert!(rec.tick_count() > 120, "{}", rec.tick_count());
 
@@ -311,35 +311,32 @@ async fn recorded_session_replays_identically() {
 async fn mutated_input_diverges_at_the_consuming_tick() {
     let mut rec = record_session().await.recording;
     // Flip the x direction of a mid-session input from p0 (never drops).
-    let p0 = match &rec.events[0] {
-        Event::Join {
-            result: JoinResult::Joined(c),
-            ..
-        } => *c,
+    let p0 = match &rec.entries[0].observed {
+        Observed::Join(JoinResult::Joined(c)) => *c,
         other => panic!("{other:?}"),
     };
     let (index, seq) = rec
-        .events
+        .entries
         .iter()
         .enumerate()
-        .skip(rec.events.len() / 2)
-        .find_map(|(i, e)| match e {
-            Event::Input {
+        .skip(rec.entries.len() / 2)
+        .find_map(|(i, e)| match &e.stimulus {
+            Stimulus::Input {
                 client,
                 payload,
                 seq,
                 ..
-            } if *client == p0 && payload[0] != 0 => Some((i, *seq)),
+            } if client.0 == p0 && payload[0] != 0 => Some((i, *seq)),
             _ => None,
         })
         .expect("an input to mutate");
-    if let Event::Input { payload, .. } = &mut rec.events[index] {
+    if let Stimulus::Input { payload, .. } = &mut rec.entries[index].stimulus {
         payload[0] = (-(payload[0] as i8)) as u8;
     }
-    let consuming_tick = rec.events[index..]
+    let consuming_tick = rec.entries[index..]
         .iter()
-        .find_map(|e| match e {
-            Event::Advance { hashes, .. } => hashes.first().map(|(t, _)| *t),
+        .find_map(|e| match &e.observed {
+            Observed::Advance { hashes, .. } => hashes.first().map(|(t, _)| *t),
             _ => None,
         })
         .unwrap();

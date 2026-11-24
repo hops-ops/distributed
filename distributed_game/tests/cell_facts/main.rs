@@ -1,8 +1,5 @@
-//! Facts committed into a real `distributed` AggregateCell through
-//! `dispatch_idempotent` with a server-built trusted Session.
-
-use std::sync::Arc;
-use std::time::Duration;
+//! Fact batches committed into a real `distributed` AggregateCell with a
+//! server-built trusted Session.
 
 use distributed::cell_host::AggregateCell;
 use distributed::command::{typed_command, PreparedCommand, Succeeded};
@@ -13,11 +10,9 @@ use distributed::{sourced, Entity};
 use std::collections::HashMap;
 
 use distributed_game::cell::{
-    command_id_for, fact_session_from_headers, run_fact_batch, session_stamp, CellFactSink,
+    command_id_for, fact_session_from_headers, run_fact_batch, session_stamp,
 };
-use distributed_game::{
-    fact_channel, spawn_fact_worker, stamp_metadata, Fact, FactOutcome, FactStamp, RetryPolicy,
-};
+use distributed_game::{stamp_metadata, FactStamp};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
@@ -110,76 +105,6 @@ fn command_ids_are_deterministic_uuidv7_shaped() {
     assert!(matches!(&a[19..20], "8" | "9" | "a" | "b"));
 }
 
-#[tokio::test]
-async fn facts_dispatch_idempotently_with_trusted_principal() {
-    let cell = Arc::new(AggregateCell::<Hero>::new("alice").unwrap().mount(CreditXp));
-    let sink = CellFactSink::new(cell.clone(), "game-svc", "zone-system");
-    let (mut queue, feed) = fact_channel(16, RetryPolicy::default());
-    let worker = spawn_fact_worker(feed, sink);
-
-    let stamp = FactStamp {
-        zone_id: "z1".into(),
-        tick: 99,
-        content_version: "c1".into(),
-        emitted_at_ms: 1_700_000_000_456,
-        activation: 77,
-        config_version: "combat@12".into(),
-        seq: 12,
-    };
-    let fact = Fact::trusted(
-        "coin:z1:7",
-        "hero.credit_xp",
-        json!({ "amount": 10 }),
-        Some("alice".into()),
-        stamp.clone(),
-    );
-    queue.try_send(fact.clone()).unwrap();
-    let first = wait_one(&mut queue).await;
-    queue.try_send(fact).unwrap();
-    let replay = wait_one(&mut queue).await;
-
-    let FactOutcome::Committed(first) = first.outcome else {
-        panic!("first commit failed: {first:?}")
-    };
-    let FactOutcome::Committed(replay) = replay.outcome else {
-        panic!("replay failed: {replay:?}")
-    };
-    assert!(!first.replayed);
-    assert!(
-        replay.replayed,
-        "same key replays through the command ledger"
-    );
-    assert_eq!(first.payload["hero"], "alice");
-    assert_eq!(first.payload["xp"], 10);
-    assert_eq!(first.payload["tick"], "99");
-    assert_eq!(first.payload["emitted_at_ms"], 1_700_000_000_456u64);
-    assert_eq!(first.payload["activation"], 77);
-    assert_eq!(first.payload["config_version"], "combat@12");
-    assert_eq!(cell.load().await.unwrap().unwrap().xp, 10, "credited once");
-
-    // Payload-supplied identity is not a declared input: permanent failure.
-    let forged = Fact::trusted(
-        "coin:z1:8",
-        "hero.credit_xp",
-        json!({ "amount": 10, "principal": "mallory" }),
-        Some("alice".into()),
-        stamp,
-    );
-    queue.try_send(forged).unwrap();
-    let forged = wait_one(&mut queue).await;
-    assert!(matches!(
-        forged.outcome,
-        FactOutcome::Failed {
-            error: distributed_game::FactError::Permanent(_),
-            ..
-        }
-    ));
-    assert_eq!(cell.load().await.unwrap().unwrap().xp, 10);
-
-    drop(queue);
-    worker.await.unwrap();
-}
-
 /// A `__batch` body of `amounts` for alice, one entry per amount; `None`
 /// is an entry without a partition.
 fn batch_body(amounts: &[Option<u32>]) -> serde_json::Value {
@@ -253,14 +178,4 @@ async fn a_replayed_batch_answers_only_replays() {
     }
     assert_eq!(cell.load().await.unwrap().unwrap().xp, 60, "credited once");
     assert_eq!(cell.history().await.unwrap().len(), 3);
-}
-
-async fn wait_one(queue: &mut distributed_game::FactQueue) -> distributed_game::FactSettlement {
-    for _ in 0..500 {
-        if let Some(s) = queue.drain().pop() {
-            return s;
-        }
-        tokio::time::sleep(Duration::from_millis(2)).await;
-    }
-    panic!("no settlement")
 }
