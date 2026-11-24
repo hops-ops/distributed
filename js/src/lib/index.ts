@@ -4,3 +4,10 @@ export { deepEqual } from './deep-equal.js';
 export { freezeRecord } from './freeze-record.js';
 export { isPlainRecord } from './is-plain-record.js';
 export { reportSafely, reportUnhandledError } from './report.js';
+export {
+	backoffDelay,
+	defaultScheduler,
+	unrefTimer,
+	type BackoffOptions,
+	type Scheduler
+} from './backoff.js';

@@ -52,7 +52,7 @@ test('framework-neutral island performs SSR, hydration, reactive selection, and 
 	);
 	await refreshed;
 	assert.equal(serverWatch.get().data.todos[0].title, 'server island');
-	server.read(VanillaIsland.artifact, {});
+	server.retainOperation(VanillaIsland.artifact, {});
 	serverWatch.destroy();
 	const seed = server.dehydrate();
 

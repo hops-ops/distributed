@@ -479,10 +479,20 @@ export function createReplicaCommandRuntime<
 	}
 	const registration = replica[replicaCommandAuthority]?.(contract);
 	const pending = new Map<string, PendingProjection>();
-	const projectionReplays = new Map<string, string>();
-	const projectionRevalidations = new Map<
-		string,
-		ReplicaCommandRevalidationPlan
+	/*
+	 * The applied projection delta of each command, kept so that a replayed
+	 * status or live envelope is recognised instead of applied twice. Keyed by
+	 * the prepared command itself: the entry lives exactly as long as
+	 * something (the pending projection, a recovery receipt) can still
+	 * replay that command, and no retirement path has to remember to delete
+	 * it.
+	 */
+	const appliedProjections = new WeakMap<
+		object,
+		Readonly<{
+			canonical: string;
+			revalidation: ReplicaCommandRevalidationPlan | undefined;
+		}>
 	>();
 	const dispatchTails = new Map<string, Promise<void>>();
 	const unmanagedLayers = new Set<string>();
@@ -577,9 +587,9 @@ export function createReplicaCommandRuntime<
 		) {
 			throw new Error('projection obligations do not match command expectations');
 		}
-		const previous = projectionReplays.get(prepared.commandId);
+		const previous = appliedProjections.get(prepared);
 		if (previous !== undefined) {
-			if (previous !== canonical) {
+			if (previous.canonical !== canonical) {
 				throw new Error('projection delta changed during command replay');
 			}
 			return Object.freeze({
@@ -635,13 +645,13 @@ export function createReplicaCommandRuntime<
 			(writer) => applyOptimisticEffects(writer, validated.operations!),
 			preparedSemanticChanges(actualPrepared)
 		);
-		projectionReplays.set(prepared.commandId, validated.canonical);
-		if (validated.revalidation !== undefined) {
-			projectionRevalidations.set(
-				prepared.commandId,
-				validated.revalidation
-			);
-		}
+		appliedProjections.set(
+			prepared,
+			Object.freeze({
+				canonical: validated.canonical,
+				revalidation: validated.revalidation
+			})
+		);
 		return validated.requiresRevalidation;
 	};
 
@@ -755,7 +765,7 @@ export function createReplicaCommandRuntime<
 		try {
 			await waitForCommandOperation(
 				replicaRevalidate(
-					projectionRevalidations.get(prepared.commandId) ??
+					appliedProjections.get(prepared)?.revalidation ??
 						prepared.revalidation
 				),
 				revalidationSignals.signal

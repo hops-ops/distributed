@@ -1,3 +1,14 @@
+import {
+	backoffDelay,
+	defaultScheduler,
+	unrefTimer,
+	type Scheduler
+} from '../lib/backoff.js';
+import {
+	LIVE_FAILURE_RETRY_BASE_MS,
+	LIVE_FAILURE_RETRY_JITTER,
+	LIVE_FAILURE_RETRY_MAX_MS
+} from '../replica/distributed-replica/constants.js';
 import { requestGraphql, type FetchLike } from '../request.js';
 import type { GqlAuth, GqlError, GraphqlVariables } from '../types.js';
 import type { ReplicaDocumentTransport } from '../replica/graphql-transport.js';
@@ -64,6 +75,10 @@ export type UseDistributedLeaderboardOptions<TData> = Readonly<{
 	live?: boolean;
 	/** Whether this runs in a browser (default: `typeof window !== 'undefined'`). */
 	browser?: boolean;
+	/** Timer source of the live reopen backoff (tests). */
+	scheduler?: Scheduler;
+	/** Jitter source of the live reopen backoff (tests). */
+	random?: () => number;
 }>;
 
 function message(errors: readonly GqlError[] | undefined): string | null {
@@ -107,7 +122,9 @@ export async function loadDistributedLeaderboard<
  * client (call during component initialization). It starts from `initial`
  * (or runs the query in the browser), then follows the operation's `@live`
  * subscription over the client's WebSocket; every push replaces the whole
- * result (server-ranked rows are never merged into the replica).
+ * result (server-ranked rows are never merged into the replica). A stream
+ * that loses its connection is reopened after a jittered backoff (1 s,
+ * doubling to 30 s); its first frame is the current board.
  */
 export function useDistributedLeaderboard<
 	TData,
@@ -149,14 +166,18 @@ export function createDistributedLeaderboardStore<
 			set(current);
 		};
 		const controller = new AbortController();
+		const scheduler = options.scheduler ?? defaultScheduler;
 		let close = (): void => undefined;
+		let retry: unknown;
+		let failures = 0;
+		// Results carry no version. A live frame is always newer than the
+		// initial query, which was sent before the first stream opened.
+		let liveDelivered = false;
 		if (options.initial === undefined) {
 			transport
 				.query<TData, TVariables>(operation.document, variables, controller.signal)
 				.then((result) => {
-					if (controller.signal.aborted) return;
-					// A live result that arrived first is newer: keep it.
-					if (current.data !== undefined && current.live === 'active') return;
+					if (controller.signal.aborted || liveDelivered) return;
 					update({
 						...(result.data === undefined || result.data === null
 							? {}
@@ -168,27 +189,61 @@ export function createDistributedLeaderboardStore<
 					if (!controller.signal.aborted) update({ error: String(error) });
 				});
 		}
-		if (options.live !== false && operation.liveDocument !== null) {
+		const liveDocument = operation.liveDocument;
+		/*
+		 * The server answers a subscription with the current board and then
+		 * every change, so a reopened stream needs no HTTP refresh and no
+		 * ordering against one: only the open stream writes.
+		 */
+		const open = (): void => {
+			if (liveDocument === null) return;
+			let streaming = true;
 			update({ live: 'connecting' });
-			close = transport.live<TData, TVariables>(operation.liveDocument, variables, {
+			const unsubscribe = transport.live<TData, TVariables>(liveDocument, variables, {
 				next(result) {
+					if (!streaming) return;
 					const error = message(result.errors);
 					if (result.data === undefined || result.data === null) {
 						update({ error, live: error === null ? current.live : 'error' });
 						return;
 					}
+					failures = 0;
+					liveDelivered = true;
 					update({ data: result.data, error, live: 'active' });
 				},
 				error(error) {
+					if (!streaming) return;
 					update({ error: String(error), live: 'error' });
+					if ((error as { retryable?: unknown } | null)?.retryable !== true) return;
+					close();
+					failures += 1;
+					retry = scheduler.setTimeout(
+						() => {
+							retry = undefined;
+							open();
+						},
+						backoffDelay(failures, {
+							baseMs: LIVE_FAILURE_RETRY_BASE_MS,
+							maxMs: LIVE_FAILURE_RETRY_MAX_MS,
+							jitter: LIVE_FAILURE_RETRY_JITTER,
+							...(options.random === undefined ? {} : { random: options.random })
+						})
+					);
+					unrefTimer(retry);
 				},
 				complete() {
-					update({ live: 'off' });
+					if (streaming) update({ live: 'off' });
 				}
 			});
-		}
+			close = () => {
+				streaming = false;
+				unsubscribe();
+			};
+		};
+		if (options.live !== false) open();
 		return () => {
 			controller.abort();
+			if (retry !== undefined) scheduler.clearTimeout(retry);
 			close();
 		};
 	});

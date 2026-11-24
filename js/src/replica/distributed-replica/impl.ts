@@ -9,6 +9,11 @@ import {
 	type DerivedIndexReconciler,
 	type OptimisticLayerView
 } from '../../internal/cache-engine.js';
+import {
+	defaultScheduler,
+	unrefTimer,
+	type Scheduler
+} from '../../lib/backoff.js';
 import type { GraphqlVariables } from '../../types.js';
 import {
 	compareDistributedDecimal,
@@ -94,6 +99,8 @@ import type {
 } from '../types.js';
 import {
 	EMPTY_ERRORS,
+	IDLE_QUERY_STATE,
+	OPERATION_RETENTION_GRACE_MS,
 	EMPTY_TRUSTED_PRESETS,
 	MAX_ANONYMOUS_RECORD_CLOCKS
 } from './constants.js';
@@ -111,6 +118,7 @@ import type {
 	RecordProtocolClock,
 	RegisteredCommandAuthorityContract,
 	RenderedOperation,
+	RetiredOperation,
 	ReplicaArtifactBinding,
 	SharedIndexDisposition,
 	ValidatedArtifactBinding
@@ -185,7 +193,6 @@ import {
 } from './impl-optimistic.js';
 import {
 	dehydrateReplica,
-	finishDehydration as finishDehydrationOn,
 	hydrateReplica,
 	type HydrationHost
 } from './impl-hydration-orchestrate.js';
@@ -201,6 +208,9 @@ import {
 export class DistributedReplicaImpl implements DistributedReplicaApi {
 	readonly #engine: CacheEngine;
 	readonly #transport: ReplicaTransport | undefined;
+	readonly #scheduler: Scheduler;
+	readonly #random: (() => number) | undefined;
+	readonly #retentionGraceMs: number;
 	readonly #reportObserverError: (error: AggregateError) => void;
 	readonly #onAuthorizationGenerationDispose: (() => void) | undefined;
 	readonly #diagnostics: ReplicaDiagnosticsSink | undefined;
@@ -235,8 +245,11 @@ export class DistributedReplicaImpl implements DistributedReplicaApi {
 	readonly #freshnessPlans = new Map<string, { generation: number; plan: ReplicaRevalidationPlan }>();
 	readonly #optimisticReceipts = new Map<string, OptimisticReceiptState>();
 	readonly #renderedOperations = new Map<string, RenderedOperation>();
-	readonly #readOperationKeys = new Set<string>();
-	readonly #watchRenderCounts = new Map<string, number>();
+	/** Watches and retained operations holding each rendered operation. */
+	readonly #renderCounts = new Map<string, number>();
+	/** Operations whose last holder left, awaiting collection. */
+	readonly #retired = new Map<string, RetiredOperation>();
+	#retentionTimer: unknown;
 	readonly #resultObservers = new Set<
 		(envelope: ReplicaResultEnvelope<unknown>) => void
 	>();
@@ -267,6 +280,10 @@ export class DistributedReplicaImpl implements DistributedReplicaApi {
 
 	constructor(options: DistributedReplicaOptions = {}) {
 		this.#transport = options.transport;
+		this.#scheduler = options.scheduler ?? defaultScheduler;
+		this.#random = options.random;
+		this.#retentionGraceMs =
+			options.retentionGraceMs ?? OPERATION_RETENTION_GRACE_MS;
 		this.#reportObserverError = options.onObserverError ?? reportUnhandledObserverError;
 		this.#onAuthorizationGenerationDispose =
 			options.onAuthorizationGenerationDispose;
@@ -314,6 +331,8 @@ export class DistributedReplicaImpl implements DistributedReplicaApi {
 			get transport() {
 				return self.#transport;
 			},
+			scheduler: self.#scheduler,
+			random: self.#random,
 			get inFlight() {
 				return self.#inFlight;
 			},
@@ -398,15 +417,6 @@ export class DistributedReplicaImpl implements DistributedReplicaApi {
 			get indexPlanRegistrations() {
 				return self.#indexPlanRegistrations;
 			},
-			get renderedOperations() {
-				return self.#renderedOperations;
-			},
-			get readOperationKeys() {
-				return self.#readOperationKeys;
-			},
-			get watchRenderCounts() {
-				return self.#watchRenderCounts;
-			},
 			get watches() {
 				return self.#watches;
 			},
@@ -453,8 +463,7 @@ export class DistributedReplicaImpl implements DistributedReplicaApi {
 			syncDiagnostics: () => self.#syncDiagnostics(),
 			emitState: (key, allowFetch) => self.#emitState(key, allowFetch),
 			diagnosticEvent: (event) => self.#diagnosticEvent(event),
-			rememberRenderedOperation: (key, artifact, variables, source) =>
-				self.#rememberRenderedOperation(key, artifact, variables, source)
+			restoreIndexPlans: () => self.#restoreIndexPlans()
 		};
 		return this.#protocolHostCache;
 	}
@@ -518,12 +527,6 @@ export class DistributedReplicaImpl implements DistributedReplicaApi {
 			get renderedOperations() {
 				return self.#renderedOperations;
 			},
-			get readOperationKeys() {
-				return self.#readOperationKeys;
-			},
-			get watchRenderCounts() {
-				return self.#watchRenderCounts;
-			},
 			get indexPlanRegistrations() {
 				return self.#indexPlanRegistrations;
 			},
@@ -563,8 +566,7 @@ export class DistributedReplicaImpl implements DistributedReplicaApi {
 			},
 			syncDiagnostics: () => self.#syncDiagnostics(),
 			diagnosticEvent: (event) => self.#diagnosticEvent(event),
-			refreshIndexMaintenance: () => self.#refreshIndexMaintenance(),
-			finishDehydration: () => self.#finishDehydration()
+			refreshIndexMaintenance: () => self.#refreshIndexMaintenance()
 		};
 		return this.#hydrationHostCache;
 	}
@@ -876,11 +878,30 @@ export class DistributedReplicaImpl implements DistributedReplicaApi {
 		this.#bindArtifact(artifact);
 		const stableVariables = canonicalizeOperationVariables(artifact, variables);
 		const key = operationKey(artifact, stableVariables);
-		this.#rememberRenderedOperation(key, artifact, stableVariables, 'read');
 		const materialized = this.#engine.read((reader) =>
 			materializeReplicaOperation(reader, artifact, stableVariables)
 		);
-		return snapshotFrom(materialized, this.#queryState(key));
+		// A read registers nothing, so it must not create query state either.
+		return snapshotFrom(
+			materialized,
+			this.#queryStates.get(key) ?? IDLE_QUERY_STATE
+		);
+	}
+
+	retainOperation<TData, TVariables extends GraphqlVariables>(
+		artifact: ReplicaOperationArtifact<TData, TVariables>,
+		variables: TVariables
+	): () => void {
+		this.#bindArtifact(artifact);
+		const stableVariables = canonicalizeOperationVariables(artifact, variables);
+		const key = operationKey(artifact, stableVariables);
+		this.#rememberRenderedOperation(key, artifact, stableVariables);
+		let retained = true;
+		return () => {
+			if (!retained) return;
+			retained = false;
+			this.#forgetRenderedOperation(key);
+		};
 	}
 
 	watch<TData, TVariables extends GraphqlVariables>(
@@ -2006,28 +2027,6 @@ export class DistributedReplicaImpl implements DistributedReplicaApi {
 		return marked;
 	}
 
-	retainRecord(model: ReplicaModelArtifact, identity: ReplicaIdentity): void {
-		this.#engine.retain(replicaRecordKey(model, identity));
-	}
-
-	releaseRecord(model: ReplicaModelArtifact, identity: ReplicaIdentity): void {
-		this.#engine.release(replicaRecordKey(model, identity));
-	}
-
-	gc(): readonly string[] {
-		const collected = this.#engine.gc();
-		if (this.#diagnostics !== undefined) {
-			this.#diagnosticEvent(
-				Object.freeze({
-					kind: 'gc',
-					records: collected.length
-				})
-			);
-		}
-		this.#syncDiagnostics();
-		return collected;
-	}
-
 	inspectRecord(
 		model: ReplicaModelArtifact,
 		identity: ReplicaIdentity
@@ -2161,24 +2160,9 @@ export class DistributedReplicaImpl implements DistributedReplicaApi {
 	#rememberRenderedOperation<TData, TVariables extends GraphqlVariables>(
 		key: string,
 		artifact: ReplicaOperationArtifact<TData, TVariables>,
-		variables: TVariables,
-		source: 'read' | 'watch'
+		variables: TVariables
 	): void {
-		this.#diagnosticOperation(artifact);
-		if (!this.#indexPlanRegistrations.has(key)) {
-			const registration = this.#indexMaintenance.registerOperation(
-				artifact,
-				variables
-			);
-			this.#indexPlanRegistrations.set(key, registration);
-			try {
-				this.#refreshIndexMaintenance();
-			} catch (error) {
-				this.#indexPlanRegistrations.delete(key);
-				registration.dispose();
-				throw error;
-			}
-		}
+		this.#registerIndexPlan(key, artifact, variables);
 		this.#renderedOperations.set(
 			key,
 			Object.freeze({
@@ -2186,32 +2170,155 @@ export class DistributedReplicaImpl implements DistributedReplicaApi {
 				variables
 			})
 		);
-		if (source === 'read') {
-			this.#readOperationKeys.add(key);
-		} else {
-			this.#watchRenderCounts.set(
-				key,
-				(this.#watchRenderCounts.get(key) ?? 0) + 1
-			);
+		this.#renderCounts.set(key, (this.#renderCounts.get(key) ?? 0) + 1);
+		this.#retired.delete(key);
+	}
+
+	#registerIndexPlan<TData, TVariables extends GraphqlVariables>(
+		key: string,
+		artifact: ReplicaOperationArtifact<TData, TVariables>,
+		variables: TVariables
+	): void {
+		this.#diagnosticOperation(artifact);
+		if (this.#indexPlanRegistrations.has(key)) return;
+		const registration = this.#indexMaintenance.registerOperation(
+			artifact,
+			variables
+		);
+		this.#indexPlanRegistrations.set(key, registration);
+		try {
+			this.#refreshIndexMaintenance();
+		} catch (error) {
+			this.#indexPlanRegistrations.delete(key);
+			registration.dispose();
+			throw error;
 		}
 	}
 
-	#forgetRenderedWatch(key: string): void {
-		const count = this.#watchRenderCounts.get(key);
+	#restoreIndexPlans(): void {
+		for (const [key, rendered] of this.#renderedOperations) {
+			this.#registerIndexPlan(key, rendered.artifact, rendered.variables);
+		}
+	}
+
+	#forgetRenderedOperation(key: string): void {
+		const count = this.#renderCounts.get(key);
 		if (count === undefined) return;
 		if (count > 1) {
-			this.#watchRenderCounts.set(key, count - 1);
+			this.#renderCounts.set(key, count - 1);
 			return;
 		}
-		this.#watchRenderCounts.delete(key);
-		if (!this.#readOperationKeys.has(key)) {
-			this.#renderedOperations.delete(key);
-			this.#disposeIndexPlan(key);
-		}
+		this.#renderCounts.delete(key);
+		const rendered = this.#renderedOperations.get(key);
+		this.#renderedOperations.delete(key);
+		this.#disposeIndexPlan(key);
+		if (rendered !== undefined) this.#retireOperation(key, rendered);
 	}
 
-	#finishDehydration(): void {
-		finishDehydrationOn(this.#hydrationHost());
+	/**
+	 * The last watch or retained handle of an operation left. Its protocol
+	 * state and cached result stay for a grace period, so a remount finds
+	 * them; then they are collected.
+	 */
+	#retireOperation(key: string, rendered: RenderedOperation): void {
+		if (!Number.isFinite(this.#retentionGraceMs)) return;
+		this.#retired.set(key, {
+			...rendered,
+			due: this.#scheduler.now() + this.#retentionGraceMs,
+			written: this.#operationWritten(key)
+		});
+		this.#scheduleCollection();
+	}
+
+	/** Identifies the last result written for an operation, however it arrived. */
+	#operationWritten(key: string): RetiredOperation['written'] {
+		const group = this.#operationProtocols.get(key);
+		return {
+			group,
+			query: group?.query?.indexRevision,
+			live: group?.live?.indexRevision
+		};
+	}
+
+	#scheduleCollection(): void {
+		// Every due time is "now + grace", so a pending timer is the earliest.
+		if (this.#retentionTimer !== undefined || this.#retired.size === 0) return;
+		let due = Infinity;
+		for (const retired of this.#retired.values()) due = Math.min(due, retired.due);
+		this.#retentionTimer = this.#scheduler.setTimeout(
+			() => {
+				this.#retentionTimer = undefined;
+				this.#collectRetiredOperations();
+			},
+			Math.max(0, due - this.#scheduler.now())
+		);
+		unrefTimer(this.#retentionTimer);
+	}
+
+	/**
+	 * Drop every retired operation whose grace period ended: its protocol and
+	 * query state, its in-flight request, and the indexes only it owned. Then
+	 * collect the records no remaining index, optimistic layer or retained
+	 * record reaches, with their clocks, scopes and projected fences.
+	 *
+	 * A result written for the operation during the grace period (a route
+	 * seed for a page about to mount, a late response) restarts the period
+	 * instead: something still produces this operation.
+	 */
+	#collectRetiredOperations(): void {
+		const now = this.#scheduler.now();
+		let dropped = false;
+		for (const [key, retired] of this.#retired) {
+			if (retired.due > now) continue;
+			const written = this.#operationWritten(key);
+			if (
+				written.group !== retired.written.group ||
+				written.query !== retired.written.query ||
+				written.live !== retired.written.live
+			) {
+				retired.written = written;
+				retired.due = now + this.#retentionGraceMs;
+				continue;
+			}
+			this.#retired.delete(key);
+			const controller = this.#inFlightAborts.get(key);
+			this.#inFlight.delete(key);
+			this.#inFlightAborts.delete(key);
+			controller?.abort();
+			for (const state of [written.group?.query, written.group?.live]) {
+				if (state !== undefined) {
+					this.#discardOperationSnapshot(
+						state,
+						retired.artifact,
+						retired.variables
+					);
+				}
+			}
+			this.#operationProtocols.delete(key);
+			this.#operationGenerations.delete(key);
+			this.#queryStates.delete(key);
+			dropped = true;
+		}
+		if (dropped) {
+			const collected = this.#engine.gc();
+			if (collected.length > 0) {
+				const gone = new Set(collected);
+				for (const key of collected) {
+					this.#recordClocks.delete(key);
+					this.#projectedRecordFences.delete(key);
+				}
+				for (const [scopeToken, key] of this.#recordKeysByScope) {
+					if (gone.has(key)) this.#recordKeysByScope.delete(scopeToken);
+				}
+			}
+			if (this.#diagnostics !== undefined) {
+				this.#diagnosticEvent(
+					Object.freeze({ kind: 'gc', records: collected.length })
+				);
+			}
+			this.#syncDiagnostics();
+		}
+		this.#scheduleCollection();
 	}
 
 	#disposeIndexPlan(key: string): void {
@@ -3026,12 +3133,7 @@ export class DistributedReplicaImpl implements DistributedReplicaApi {
 	_register<TData, TVariables extends GraphqlVariables>(
 		watch: ReplicaWatchState<TData, TVariables>
 	): () => void {
-		this.#rememberRenderedOperation(
-			watch.key,
-			watch.artifact,
-			watch.variables,
-			'watch'
-		);
+		this.#rememberRenderedOperation(watch.key, watch.artifact, watch.variables);
 		let watches = this.#watches.get(watch.key);
 		if (!watches) {
 			watches = new Set();
@@ -3052,9 +3154,40 @@ export class DistributedReplicaImpl implements DistributedReplicaApi {
 			unwatch();
 			watches?.delete(watch as ReplicaWatchState<unknown, GraphqlVariables>);
 			if (watches?.size === 0) this.#watches.delete(watch.key);
-			this.#forgetRenderedWatch(watch.key);
+			this.#forgetRenderedOperation(watch.key);
 			if (watch.liveRequested) this.#releaseLive(watch.key);
 		};
+	}
+
+	/**
+	 * Package-internal: how many entries each per-operation and per-record
+	 * structure holds. The retention test compares it with a baseline.
+	 */
+	_sizes(): Readonly<Record<string, number>> {
+		const cache = this.#engine.extract();
+		return Object.freeze({
+			records: cache.records.length,
+			indexes: cache.indexes.length,
+			queryStates: this.#queryStates.size,
+			watches: this.#watches.size,
+			lives: this.#lives.size,
+			inFlight: this.#inFlight.size,
+			inFlightAborts: this.#inFlightAborts.size,
+			operationProtocols: this.#operationProtocols.size,
+			operationGenerations: this.#operationGenerations.size,
+			recordClocks: this.#recordClocks.size,
+			recordKeysByScope: this.#recordKeysByScope.size,
+			projectedRecordFences: this.#projectedRecordFences.size,
+			membershipFences: this.#membershipFences.size,
+			deferredMembershipConfirms: this.#deferredMembershipConfirms.size,
+			anonymousRecordClocks: this.#anonymousRecordClocks.size,
+			freshnessPlans: this.#freshnessPlans.size,
+			optimisticReceipts: this.#optimisticReceipts.size,
+			renderedOperations: this.#renderedOperations.size,
+			renderCounts: this.#renderCounts.size,
+			retired: this.#retired.size,
+			indexPlans: this.#indexPlanRegistrations.size
+		});
 	}
 
 	/** Package-internal query-state lookup. */

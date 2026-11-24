@@ -31,8 +31,7 @@ import type {
 	ProtocolGeneration,
 	QueryState,
 	RecordProtocolClock,
-	RegisteredCommandAuthorityContract,
-	RenderedOperation
+	RegisteredCommandAuthorityContract
 } from './types.js';
 import type { ReplicaWatchState } from './watch.js';
 
@@ -59,9 +58,6 @@ export type ProtocolHost = {
 	readonly optimisticReceipts: Map<string, OptimisticReceiptState>;
 	readonly diagnosticLayers: Map<string, ReplicaDiagnosticLayerInput> | undefined;
 	readonly indexPlanRegistrations: Map<string, ReplicaIndexPlanRegistration>;
-	readonly renderedOperations: Map<string, RenderedOperation>;
-	readonly readOperationKeys: Set<string>;
-	readonly watchRenderCounts: Map<string, number>;
 	readonly watches: Map<
 		string,
 		Set<ReplicaWatchState<unknown, GraphqlVariables>>
@@ -86,12 +82,8 @@ export type ProtocolHost = {
 	syncDiagnostics(): void;
 	emitState(key: string, allowFetch: boolean): void;
 	diagnosticEvent(event: ReplicaDiagnosticEventInput): void;
-	rememberRenderedOperation<TData, TVariables extends GraphqlVariables>(
-		key: string,
-		artifact: ReplicaOperationArtifact<TData, TVariables>,
-		variables: TVariables,
-		source: 'read' | 'watch'
-	): void;
+	/** Register the index plans of every rendered operation again. */
+	restoreIndexPlans(): void;
 };
 
 export function validateProtocolBinding<
@@ -206,25 +198,14 @@ export function purgeProtocolGeneration(host: ProtocolHost): void {
 	host.setDiagnosticLayerSequence(0);
 	host.clearIndexMaintenance();
 	host.indexPlanRegistrations.clear();
-	host.renderedOperations.clear();
-	host.readOperationKeys.clear();
-	host.watchRenderCounts.clear();
 	host.setTrustedPresets(EMPTY_TRUSTED_PRESETS);
 	host.setProjectionGeneration(0);
 	host.setNextIndexRevision('0');
 	host.setProtocolGeneration(undefined);
 	host.engine.restore(EMPTY_CACHE_SNAPSHOT);
 	host.syncDiagnostics();
-	for (const watches of host.watches.values()) {
-		for (const watch of watches) {
-			host.rememberRenderedOperation(
-				watch.key,
-				watch.artifact,
-				watch.variables,
-				'watch'
-			);
-		}
-	}
+	// Watches and retained operations outlive the generation; their plans do not.
+	host.restoreIndexPlans();
 	for (const key of host.watches.keys()) host.emitState(key, true);
 	if (host.diagnostics.enabled) {
 		host.diagnosticEvent(

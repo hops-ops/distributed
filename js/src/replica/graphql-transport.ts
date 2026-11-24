@@ -1,7 +1,9 @@
 import { requestGraphql, type FetchLike } from '../request.js';
 import type { GqlAuth, GraphqlVariables } from '../types.js';
+import type { Scheduler } from '../lib/backoff.js';
 import {
-	subscribe as subscribeGraphqlWs,
+	createGraphqlWsConnection,
+	type GraphqlWsConnection,
 	type WebSocketConstructor
 } from '../websocket.js';
 import type {
@@ -26,6 +28,10 @@ export type ReplicaGraphqlTransportOptions = Readonly<{
 	fetch?: FetchLike;
 	/** Browser/test WebSocket constructor override. */
 	webSocket?: WebSocketConstructor;
+	/** Clock and timers of the WebSocket redial delay (tests). */
+	scheduler?: Scheduler;
+	/** Jitter source of the WebSocket redial delay (tests). */
+	random?: () => number;
 }>;
 
 /**
@@ -74,6 +80,15 @@ export function createReplicaGraphqlTransport(
 	if (typeof options.getAuth !== 'function') {
 		throw new TypeError('replica GraphQL transport requires getAuth');
 	}
+
+	// Every live operation and live document of this transport shares it.
+	const connection = createGraphqlWsConnection({
+		getUrl: options.getUrl,
+		getAuth: options.getAuth,
+		...(options.webSocket === undefined ? {} : { webSocket: options.webSocket }),
+		...(options.scheduler === undefined ? {} : { scheduler: options.scheduler }),
+		...(options.random === undefined ? {} : { random: options.random })
+	});
 
 	const execute = async (
 		document: string,
@@ -142,7 +157,7 @@ export function createReplicaGraphqlTransport(
 			request: ReplicaTransportRequest<TData, TVariables>,
 			observer: ReplicaLiveObserver<TData>
 		): () => void {
-			return subscribeReplicaOperation(options, request, observer);
+			return subscribeReplicaOperation(connection, request, observer);
 		},
 
 		async query<
@@ -182,7 +197,7 @@ export function createReplicaGraphqlTransport(
 			observer: ReplicaLiveObserver<TData>
 		): () => void {
 			return subscribeReplicaOperation<TData, TVariables>(
-				options,
+				connection,
 				{ document, variables },
 				observer
 			);
@@ -224,71 +239,42 @@ function subscribeReplicaOperation<
 	TData,
 	TVariables extends GraphqlVariables
 >(
-	options: ReplicaGraphqlTransportOptions,
+	connection: GraphqlWsConnection,
 	request: LiveRequest<TVariables>,
 	observer: ReplicaLiveObserver<TData>
 ): () => void {
-	let unsubscribe = (): void => undefined;
+	if (request.signal?.aborted) return () => undefined;
 	let closed = false;
-	const close = (): void => {
-		if (closed) return;
+	const end = (): boolean => {
+		if (closed) return false;
 		closed = true;
 		request.signal?.removeEventListener('abort', close);
-		unsubscribe();
+		return true;
 	};
-	const fail = (error: unknown): void => {
-		if (closed) return;
-		try {
-			observer.error(error);
-		} finally {
-			close();
+	const unsubscribe = connection.subscribe<TData, TVariables>(
+		request.document,
+		{
+			onNext: (result) => {
+				if (!closed) observer.next(result);
+			},
+			onError: (error) => {
+				if (end()) observer.error(error);
+			},
+			onComplete: () => {
+				if (end()) observer.complete();
+			}
+		},
+		{
+			variables: request.variables,
+			...(request.extensions === undefined
+				? {}
+				: { extensions: request.extensions }),
+			...(request.resume === undefined ? {} : { resume: request.resume })
 		}
-	};
-	if (request.signal?.aborted) {
-		return close;
+	);
+	function close(): void {
+		if (end()) unsubscribe();
 	}
 	request.signal?.addEventListener('abort', close, { once: true });
-
-	void Promise.resolve()
-		.then(() => options.getAuth())
-		.then((auth) => {
-			if (closed || request.signal?.aborted) return;
-			unsubscribe = subscribeGraphqlWs<TData, TVariables>(
-				request.document,
-				auth,
-				{
-					onNext: (result) => {
-						if (!closed) observer.next(result);
-					},
-					onError: fail,
-					onComplete: () => {
-						if (closed) return;
-						try {
-							observer.complete();
-						} finally {
-							close();
-						}
-					}
-				},
-				{
-					httpUrl: options.getUrl(),
-					variables: request.variables,
-					...(request.extensions === undefined
-						? {}
-						: { extensions: request.extensions }),
-					...(request.resume === undefined
-						? {}
-						: { resume: request.resume }),
-					...(options.webSocket === undefined
-						? {}
-						: { webSocket: options.webSocket })
-				}
-			);
-			if (closed || request.signal?.aborted) unsubscribe();
-		})
-		.catch((error: unknown) => {
-			fail(error);
-		});
-
 	return close;
 }

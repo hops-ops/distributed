@@ -617,8 +617,19 @@ const unsubscribe = todos.subscribe((snapshot) => {
 
 `watch()` reads synchronously, fetches only missing or stale projections,
 deduplicates work, and optionally maintains the generated live operation.
-`read()` is side-effect-free. `dehydrate()` and `hydrate()` transfer confirmed
-state without exposing a public storage schema. Cold `hydrate` seeds an empty
+`read()` is side-effect-free: it registers and retains nothing.
+`dehydrate()` serializes the confirmed state of the operations that are
+watched or held with `retainOperation(artifact, variables)` (which returns
+the release function), so a server render keeps its watches, or holds what it
+read, until it has taken the transfer. `hydrate()` restores it without
+exposing a public storage schema.
+
+When the last watch or hold of an operation goes, its cached result and
+protocol state stay for `retentionGraceMs` (30 seconds by default), so a
+remount renders from the cache. After that they are collected, together with
+the records no other operation or pending command still reaches. A live
+stream that fails or loses its connection is reopened by the replica with a
+jittered backoff, resuming from its cursors. Cold `hydrate` seeds an empty
 client; warm same-scope `hydrate` merges so soft navigation cannot discard
 confirmed session data the next boundary did not re-dehydrate. Layout
 retention survives child navigation, page retention is replaced on page exit,

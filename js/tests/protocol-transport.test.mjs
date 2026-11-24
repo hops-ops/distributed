@@ -6,14 +6,15 @@ import {
 	DistributedProtocolError,
 	parseDistributedProtocolEnvelope,
 	parseGraphqlResponseExtensions,
-	requestGraphql,
-	subscribe
+	createGraphqlWsConnection,
+	requestGraphql
 } from '@hops-ops/distributed';
 import {
 	COMMAND_CONSISTENCY,
 	COMMAND_STATE,
 	commandReceipt
 } from './fixtures/command-protocol.mjs';
+import { FakeScheduler } from './fixtures/game-harness.mjs';
 
 function distributedEnvelope() {
 	return {
@@ -532,23 +533,25 @@ class FakeWebSocket {
 	}
 }
 
-test('GraphQL-WS preserves valid envelopes and terminates on incompatible frames', () => {
+test('GraphQL-WS preserves valid envelopes and terminates on incompatible frames', async () => {
 	FakeWebSocket.instances.length = 0;
+	const scheduler = new FakeScheduler();
+	const connection = createGraphqlWsConnection({
+		getUrl: () => '/graphql',
+		webSocket: FakeWebSocket,
+		scheduler
+	});
 	const next = [];
 	const errors = [];
-	const stop = subscribe(
+	const stop = connection.subscribe(
 		'subscription Live { live { id } }',
-		{},
 		{
 			onNext: (result) => next.push(result),
 			onError: (error) => errors.push(error)
 		},
-		{
-			webSocket: FakeWebSocket,
-			httpUrl: '/graphql',
-			resume: distributedEnvelope().live.cursors
-		}
+		{ resume: distributedEnvelope().live.cursors }
 	);
+	await new Promise((resolve) => setImmediate(resolve));
 	const socket = FakeWebSocket.instances[0];
 	socket.open();
 	socket.message({ type: 'connection_ack' });
@@ -573,24 +576,23 @@ test('GraphQL-WS preserves valid envelopes and terminates on incompatible frames
 	});
 	assert.deepEqual(errors, []);
 	stop();
+	assert.deepEqual(socket.sent.at(-1), { type: 'complete', id: '1' });
 
 	const rejectedNext = [];
 	const rejectedErrors = [];
-	subscribe(
+	connection.subscribe(
 		'subscription Live { live { id } }',
-		{},
 		{
 			onNext: (result) => rejectedNext.push(result),
 			onError: (error) => rejectedErrors.push(error)
-		},
-		{ webSocket: FakeWebSocket, httpUrl: '/graphql' }
+		}
 	);
-	const rejectedSocket = FakeWebSocket.instances[1];
-	rejectedSocket.open();
-	rejectedSocket.message({ type: 'connection_ack' });
+	await new Promise((resolve) => setImmediate(resolve));
+	assert.equal(FakeWebSocket.instances.length, 1, 'the idle socket is reused');
+	const rejectedSocket = socket;
 	rejectedSocket.message({
 		type: 'next',
-		id: '1',
+		id: '2',
 		payload: {
 			data: { live: { id: 'must-not-be-trusted' } },
 			extensions: {
@@ -610,7 +612,9 @@ test('GraphQL-WS preserves valid envelopes and terminates on incompatible frames
 	);
 	assert.deepEqual(rejectedSocket.sent.at(-1), {
 		type: 'complete',
-		id: '1'
+		id: '2'
 	});
-	assert.equal(rejectedSocket.closeCount, 1);
+	assert.equal(rejectedSocket.closeCount, 0);
+	await scheduler.advance(1_000);
+	assert.equal(rejectedSocket.closeCount, 1, 'an idle socket closes');
 });

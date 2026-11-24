@@ -19,73 +19,7 @@ import {
 	COMMAND_STATE,
 	commandReceipt
 } from './fixtures/command-protocol.mjs';
-
-const Todo = Object.freeze({
-	id: 'TodoView',
-	identityFields: Object.freeze(['id'])
-});
-
-const NoVariables = Object.freeze({
-	version: 2,
-	limits: Object.freeze({
-		maxDepth: 8,
-		maxBoolWidth: 256,
-		maxInList: 1000
-	}),
-	variables: Object.freeze({}),
-	defaults: Object.freeze({}),
-	inputs: Object.freeze({})
-});
-
-const Todos = Object.freeze({
-	id: 'query:todos',
-	document: 'query Todos { todos { id title } }',
-	protocol: Object.freeze({
-		version: 1,
-		schemaHash: 'schema-a',
-		surface: Object.freeze({ kind: 'role', name: 'user' }),
-		operation: 'query:todos',
-		trustedPresets: Object.freeze([])
-	}),
-	variableCodec: NoVariables,
-	live: Object.freeze({
-		id: 'live:todos',
-		document: 'subscription TodosLive { todos { id title } }'
-	}),
-	roots: Object.freeze([
-		Object.freeze({
-			responseKey: 'todos',
-			field: 'todos',
-			cardinality: 'many',
-			nullable: false,
-			dependencies: Object.freeze(['todos']),
-			selection: Object.freeze({
-				typename: Todo.id,
-				storage: Object.freeze({
-					kind: 'normalized',
-					model: Todo.id,
-					identityFields: Todo.identityFields
-				}),
-				members: Object.freeze([
-					Object.freeze({
-						kind: 'scalar',
-						responseKey: 'id',
-						field: 'id',
-						codec: 'ID',
-						nullable: false
-					}),
-					Object.freeze({
-						kind: 'scalar',
-						responseKey: 'title',
-						field: 'title',
-						codec: 'String',
-						nullable: false
-					})
-				])
-			})
-		})
-	])
-});
+import { NoVariables, Todo, Todos, wireFrame } from './fixtures/replica-todos.mjs';
 
 const TodosOtherOperation = Object.freeze({
 	...Todos,
@@ -373,73 +307,6 @@ const GamesWithOwnerLiveOperation = Object.freeze({
 			'subscription GamesWithOwnerLive { games { id owner_id owner { id name } } }'
 	})
 });
-
-function wireFrame(options = {}) {
-	const rows = options.rows ?? [{ id: 'todo-1', title: 'one' }];
-	const position = options.position ?? '1';
-	const projection = options.projection ?? 'todos-projector';
-	const resume = {
-		projection,
-		position,
-		token: options.resumeToken ?? `resume:${position}`
-	};
-	const records =
-		options.records ??
-		rows.map((row, index) => ({
-			path: ['todos', String(index)],
-			model: 'TodoView',
-			scopeToken: options.recordScope ?? `record:${row.id}`,
-			incarnation: options.incarnation ?? '1',
-			revision: options.revision ?? position,
-			tombstone: false
-		}));
-	const snapshot = {
-		scopeToken: options.snapshotScope ?? 'snapshot:query',
-		recordsComplete: options.recordsComplete ?? true,
-		indexesComparable: options.indexesComparable ?? true,
-		records,
-		indexes:
-			options.indexes ??
-			(options.indexesComparable === false
-				? []
-				: [
-						{
-							projection,
-							scopeToken: options.indexScope ?? 'index:query',
-							position,
-							resume
-						}
-					]),
-		observations: options.observations ?? []
-	};
-	const live =
-		options.live === undefined
-			? undefined
-			: {
-					mode: options.live.mode ?? 'resumable',
-					reset: options.live.reset ?? false,
-					cursors:
-						options.live.cursors ??
-						(options.live.mode === 'snapshot' ? [] : [resume])
-				};
-	return {
-		data: { todos: rows },
-		extensions: {
-			distributed: {
-				protocolVersion: DISTRIBUTED_PROTOCOL_VERSION,
-				schemaHash: options.schemaHash ?? 'schema-a',
-				authorizationGeneration: 'auth-1',
-				cacheScope: options.cacheScope ?? 'cache:a',
-				operation: options.operation ?? 'query:todos',
-				...(options.command === undefined
-					? {}
-					: { command: options.command }),
-				snapshot,
-				...(live === undefined ? {} : { live })
-			}
-		}
-	};
-}
 
 function gamesFrame({
 	artifact,
@@ -1001,7 +868,7 @@ test('Atomic direct projection commits locally provable collection membership', 
 		TodosLocallyMaintainable
 	);
 	// Render once so the operation's compiler plan owns collection maintenance.
-	replica.read(TodosLocallyMaintainable, {});
+	replica.retainOperation(TodosLocallyMaintainable, {});
 	replica.createOptimisticLayer('cmd-atomic-create', (writer) => {
 		// Generated partial previews fail closed when the record is not known yet.
 		writer.writeRecord(Todo, 'todo-2', {
@@ -1040,7 +907,7 @@ test('Atomic direct projection keeps unprovable collection membership stale', ()
 		'network',
 		TodosServerOnly
 	);
-	replica.read(TodosServerOnly, {});
+	replica.retainOperation(TodosServerOnly, {});
 	replica.createOptimisticLayer('cmd-atomic-server-only', (writer) => {
 		writer.writeRecord(Todo, 'todo-2', {
 			fields: { id: 'todo-2', title: 'preview' },
@@ -2521,7 +2388,7 @@ test('retired live ownership survives dehydration before a later handoff', () =>
 		artifact: previousPage, responseKey: 'featuredGames', position: '1',
 		ownerId: 'user-1', ownerName: 'retired owner', indexesComparable: false
 	}), 'ssr');
-	replica.read(previousPage, {});
+	replica.retainOperation(previousPage, {});
 	const oldWatch = replica.watch(previousPage, {}, { live: true });
 	observers[0].next(oldFrame);
 	oldWatch.destroy();
@@ -2844,6 +2711,8 @@ function liveFailureHarness() {
 	const subscriptions = [];
 	let unsubscribeCount = 0;
 	const replica = createDistributedReplica({
+		// Exact delays: the jitter has its own test.
+		random: () => 0,
 		transport: {
 			fetch() {
 				let resolve;

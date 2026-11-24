@@ -49,7 +49,10 @@ export {
 export {
 	graphqlWsUrl,
 	httpUrlToWsUrl,
-	subscribe,
+	createGraphqlWsConnection,
+	GraphqlWsError,
+	type GraphqlWsConnection,
+	type GraphqlWsConnectionOptions,
 	type GqlWsHandlers,
 	type GqlWsResult,
 	type SubscribeOptions,

@@ -478,7 +478,7 @@ test('Svelte composition shares one diagnostics sink with operations and generat
 		}
 	});
 
-	client.operation(TodosArtifact).read({});
+	client.replica.retainOperation(TodosArtifact, {});
 	const snapshot = diagnostics.snapshot();
 	assert.equal(factoryOptions.diagnostics, diagnostics);
 	assert.deepEqual(

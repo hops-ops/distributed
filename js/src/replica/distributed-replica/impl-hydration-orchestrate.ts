@@ -66,8 +66,6 @@ export type HydrationHost = {
 	readonly optimisticReceipts: Map<string, OptimisticReceiptState>;
 	readonly diagnosticLayers: Map<string, ReplicaDiagnosticLayerInput> | undefined;
 	readonly renderedOperations: Map<string, RenderedOperation>;
-	readonly readOperationKeys: Set<string>;
-	readonly watchRenderCounts: Map<string, number>;
 	readonly indexPlanRegistrations: Map<string, ReplicaIndexPlanRegistration>;
 	readonly queryStates: Map<string, QueryState>;
 	readonly diagnostics: { readonly enabled: boolean };
@@ -92,7 +90,6 @@ export type HydrationHost = {
 	syncDiagnostics(): void;
 	diagnosticEvent(event: ReplicaDiagnosticEventInput): void;
 	refreshIndexMaintenance(): void;
-	finishDehydration(): void;
 };
 
 export function reachableConfirmedState(host: HydrationHost): {
@@ -220,23 +217,6 @@ export function reachableConfirmedState(host: HydrationHost): {
 	});
 }
 
-export function finishDehydration(host: HydrationHost): void {
-	let plansChanged = false;
-	for (const key of host.readOperationKeys) {
-		if (!host.watchRenderCounts.has(key)) {
-			host.renderedOperations.delete(key);
-			const registration = host.indexPlanRegistrations.get(key);
-			if (registration !== undefined) {
-				host.indexPlanRegistrations.delete(key);
-				registration.dispose();
-				plansChanged = true;
-			}
-		}
-	}
-	host.readOperationKeys.clear();
-	if (plansChanged) host.refreshIndexMaintenance();
-}
-
 export function dehydrateReplica(host: HydrationHost): ReplicaDehydratedState {
 	const scope = host.getProtocolGeneration();
 	if (scope === undefined) {
@@ -313,7 +293,6 @@ export function dehydrateReplica(host: HydrationHost): ReplicaDehydratedState {
 		}),
 		payload
 	});
-	host.finishDehydration();
 	return state;
 }
 

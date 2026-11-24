@@ -409,9 +409,11 @@ assert.equal(result.data.health, 'ok');
 assert.deepEqual(Object.keys(rootSurface).sort(), [
   'DISTRIBUTED_PROTOCOL_VERSION',
   'DistributedProtocolError',
+  'GraphqlWsError',
   'authIdentityKey',
   'buildAuthHeaders',
   'compareDistributedDecimal',
+  'createGraphqlWsConnection',
   'distributedLiveResumeExtensions',
   'documentToString',
   'graphqlWsUrl',
@@ -421,7 +423,6 @@ assert.deepEqual(Object.keys(rootSurface).sort(), [
   'parseDistributedProtocolEnvelope',
   'parseGraphqlResponseExtensions',
   'requestGraphql',
-  'subscribe',
   'wsConnectionInitPayload'
 ]);
 assert.deepEqual(Object.keys(replicaSurface).sort(), [

@@ -5,6 +5,7 @@ import type {
 	DistributedTrustedPresetCodec,
 	GraphqlResponseExtensions
 } from '../protocol.js';
+import type { Scheduler } from '../lib/backoff.js';
 import type { ReplicaDiagnosticsSink } from './diagnostics.js';
 
 export type ReplicaRevision = number | string | bigint;
@@ -637,6 +638,11 @@ export type ReplicaTransportRequest<
 
 export type ReplicaLiveObserver<TData = unknown> = {
 	next(result: ReplicaResultEnvelope<TData>): void;
+	/**
+	 * The stream ended without completing. An error whose `retryable`
+	 * property is `true` (a lost socket, a server reset) is reopened after a
+	 * backoff, like a live failure frame; any other error is terminal.
+	 */
 	error(error: unknown): void;
 	complete(): void;
 };
@@ -738,6 +744,17 @@ export type DistributedReplicaOptions = {
 	readonly onAuthorizationGenerationDispose?: () => void;
 	/** Opt-in framework-neutral diagnostics; absent in production by default. */
 	readonly diagnostics?: ReplicaDiagnosticsSink;
+	/** Clock and timers of the live reopen backoff and of retention (tests). */
+	readonly scheduler?: Scheduler;
+	/** Jitter source of the live reopen backoff (tests). */
+	readonly random?: () => number;
+	/**
+	 * How long an operation's protocol state and cached result outlive its
+	 * last watch or retained handle before they are collected. Default
+	 * 30 000 ms. `Infinity` never collects, for a replica that is discarded
+	 * whole (one server request).
+	 */
+	readonly retentionGraceMs?: number;
 };
 
 /** Server-issued authorization/cache namespace. Client-decoded claims never create one. */
@@ -855,10 +872,20 @@ export interface DistributedReplica {
 	readonly scope: ReplicaAuthoritativeScope | undefined;
 	/** Monotonic local fence for authorization changes and server scope changes. */
 	readonly authorizationGeneration: number;
+	/** The operation's current snapshot. Registers and retains nothing. */
 	read<TData, TVariables extends GraphqlVariables>(
 		artifact: ReplicaOperationArtifact<TData, TVariables>,
 		variables: TVariables
 	): ReplicaSnapshot<TData>;
+	/**
+	 * Hold an operation as rendered without watching it: `dehydrate` includes
+	 * its result and nothing collects it until the returned release function
+	 * is called. Server rendering holds what it read for the transfer.
+	 */
+	retainOperation<TData, TVariables extends GraphqlVariables>(
+		artifact: ReplicaOperationArtifact<TData, TVariables>,
+		variables: TVariables
+	): () => void;
 	watch<TData, TVariables extends GraphqlVariables>(
 		artifact: ReplicaOperationArtifact<TData, TVariables>,
 		variables: TVariables,
@@ -882,7 +909,10 @@ export interface DistributedReplica {
 	 * they cannot choose or restore a cache scope.
 	 */
 	invalidateAuthorization(): void;
-	/** Serialize confirmed state reachable from operations rendered by this replica. */
+	/**
+	 * Serialize confirmed state reachable from the operations this replica
+	 * currently watches or retains.
+	 */
 	dehydrate(): ReplicaDehydratedState;
 	/**
 	 * Restore a server-rendered payload against the independently authoritative
@@ -929,9 +959,6 @@ export interface DistributedReplica {
 		revision: ReplicaRevision
 	): boolean;
 	markIndexStale(target: ReplicaIndexTarget, reason: string): boolean;
-	retainRecord(model: ReplicaModelArtifact, identity: ReplicaIdentity): void;
-	releaseRecord(model: ReplicaModelArtifact, identity: ReplicaIdentity): void;
-	gc(): readonly string[];
 	inspectRecord(
 		model: ReplicaModelArtifact,
 		identity: ReplicaIdentity

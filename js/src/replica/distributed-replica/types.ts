@@ -35,8 +35,8 @@ export type LiveEntry = {
 	operationGeneration?: number;
 	/** Consecutive failed live executions; drives the reopen backoff. */
 	failures?: number;
-	/** Pending reopen of this inactive entry after a live failure frame. */
-	retry?: ReturnType<typeof setTimeout>;
+	/** Pending reopen of this inactive entry after a failed stream. */
+	retry?: unknown;
 	/**
 	 * Shared indexes whose independent owner disagreed with this stream's last
 	 * frame. Another operation rewriting one of them reopens this stream.
@@ -54,6 +54,18 @@ export type ProtocolGeneration = {
 export type RenderedOperation = {
 	readonly artifact: ReplicaOperationArtifact<unknown, GraphqlVariables>;
 	readonly variables: GraphqlVariables;
+};
+
+/** An operation without a watch or retained handle, awaiting collection. */
+export type RetiredOperation = RenderedOperation & {
+	/** Scheduler time at which its grace period ends. */
+	due: number;
+	/** The result held when it retired; a later write restarts the period. */
+	written: {
+		readonly group: OperationProtocolGroup | undefined;
+		readonly query: string | undefined;
+		readonly live: string | undefined;
+	};
 };
 
 export type SerializedOperationProtocolState = {
