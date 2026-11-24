@@ -95,7 +95,7 @@ impl Zone for TallyZone {
                     }
                     TallyInput::Door(c) => {
                         let target = format!("room-{}", c as char);
-                        let _ = ctx.handoff(player, &target, Vec::new());
+                        let _ = ctx.handoff(player, &target, &Vec::<u8>::new());
                     }
                 }
             }
