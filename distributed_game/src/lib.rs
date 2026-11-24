@@ -111,6 +111,9 @@ pub mod world;
 pub mod zone;
 pub mod zone_message;
 
+#[cfg(test)]
+mod test_zone;
+
 pub use authoring::{GameEvent, GameInput, Pushed, Replicated};
 pub use claims::{ExtensionError, ExtensionSchema, TicketExtension, TicketExtensions};
 pub use clock::{Clock, ManualClock, SystemClock};

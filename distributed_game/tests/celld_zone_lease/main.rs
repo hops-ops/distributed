@@ -15,11 +15,13 @@ use distributed_game::net::{GameServer, ServerConfig, TicketKey, ZoneFactory};
 use distributed_game::world::{
     ownership_conformance, restart_conformance, OwnershipError, ZoneOwnership,
 };
-use distributed_game::*;
 use serde_json::Value;
 
+#[path = "../support/arena.rs"]
+mod arena;
 #[path = "../support/celld.rs"]
 mod celld_support;
+use arena::{Arena, ArenaConfig};
 use celld_support::{Celld, SECRET};
 
 fn ownership(base: &str, host: &str) -> CellZoneOwnership {
@@ -59,32 +61,6 @@ async fn until(what: &str, within: Duration, mut check: impl AsyncFnMut() -> boo
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     panic!("timed out: {what}");
-}
-
-/// A zone with no players or state: enough to run under a lease.
-struct Beacon;
-
-impl Zone for Beacon {
-    type Config = ();
-    type Input = u8;
-    type Timer = ();
-    type Message = NoMessages;
-
-    fn schema() -> EntitySchema {
-        EntitySchema::new()
-    }
-
-    fn on_create(_ctx: &mut Ctx<'_, Self>, _config: ()) -> Self {
-        Beacon
-    }
-
-    fn decode_input(&self, _player: PlayerId, payload: &[u8]) -> Option<u8> {
-        payload.first().copied()
-    }
-
-    fn on_tick(&mut self, _ctx: &mut Ctx<'_, Self>) {}
-
-    fn replicate(&self, _view: &mut WorldView) {}
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -164,7 +140,10 @@ async fn zone_leases_live_in_celld_cells() {
     let mut config = ServerConfig::new(TicketKey::new("celld-lease-test-ticket-secret"));
     config.ownership_ttl = Duration::from_secs(3);
     config.ownership_renew_every = Duration::from_millis(500);
-    let server = GameServer::<Beacon>::new(config, ZoneFactory::sync(|_| Some(())))
+    let server = GameServer::<Arena>::new(
+        config,
+        ZoneFactory::sync(|_| Some(ArenaConfig::default())),
+    )
         .with_host_id("A")
         .with_ownership(Arc::new(ownership(&base, "host-a")));
     assert!(server.activate("zl-game").await, "zone activated");

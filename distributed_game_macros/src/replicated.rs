@@ -301,8 +301,8 @@ pub(crate) fn expand(input: DeriveInput) -> syn::Result<TokenStream> {
                 #position
             }
 
-            fn field_values(&self) -> #p::std::vec::Vec<#p::FieldValue> {
-                #p::std::vec![#(#values),*]
+            fn write_fields(&self, out: &mut #p::std::vec::Vec<#p::FieldValue>) {
+                out.extend([#(#values),*]);
             }
         }
 

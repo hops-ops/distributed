@@ -37,7 +37,7 @@ use std::collections::HashMap;
 use std::hash::{BuildHasherDefault, Hasher};
 use std::ops::Range;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::Arc;
 
 #[cfg(doc)]
 use crate::interest::UpdateRates;
@@ -95,6 +95,9 @@ impl EntityState {
 #[derive(Debug, Clone, Default)]
 pub struct WorldView {
     entities: Vec<EntityState>,
+    /// Emptied field vectors of the entities before [`clear`](Self::clear),
+    /// refilled by [`add`](Self::add).
+    spare: Vec<Vec<FieldValue>>,
 }
 
 impl WorldView {
@@ -110,6 +113,21 @@ impl WorldView {
 
     pub(crate) fn last_mut(&mut self) -> Option<&mut EntityState> {
         self.entities.last_mut()
+    }
+
+    /// Empty it for the next patch, keeping its allocations.
+    pub(crate) fn clear(&mut self) {
+        self.spare.extend(self.entities.drain(..).map(|entity| {
+            let mut fields = entity.fields;
+            fields.clear();
+            fields
+        }));
+    }
+
+    /// An empty field vector, kept from before [`clear`](Self::clear) when
+    /// there is one.
+    pub(crate) fn spare_fields(&mut self) -> Vec<FieldValue> {
+        self.spare.pop().unwrap_or_default()
     }
 }
 
@@ -162,26 +180,36 @@ static NEXT_REV: AtomicU64 = AtomicU64::new(1);
 #[derive(Debug)]
 struct Payload {
     rev: u64,
-    data: Vec<u8>,
-    offsets: Vec<usize>,
     /// The create record: `varuint id, varuint kind, data`.
     create: Vec<u8>,
+    /// Where the data starts in `create`.
+    data_start: usize,
+    /// Field boundaries in the data.
+    offsets: Box<[usize]>,
 }
 
+/// Longest varuint encoding of a `u32`.
+const MAX_VARUINT: usize = 5;
+
 impl Payload {
-    fn new(id: u32, kind: u16, data: Vec<u8>, offsets: Vec<usize>) -> Self {
-        let mut create = Writer::new();
-        create.varuint(id).varuint(u32::from(kind)).raw(&data);
+    fn new(id: u32, kind: u16, data: &[u8], offsets: &[usize]) -> Self {
+        let mut create = Writer::with_capacity(2 * MAX_VARUINT + data.len());
+        create.varuint(id).varuint(u32::from(kind)).raw(data);
+        let create = create.into_bytes();
         Self {
             rev: NEXT_REV.fetch_add(1, Ordering::Relaxed),
-            data,
-            offsets,
-            create: create.into_bytes(),
+            data_start: create.len() - data.len(),
+            create,
+            offsets: offsets.into(),
         }
     }
 
+    fn data(&self) -> &[u8] {
+        &self.create[self.data_start..]
+    }
+
     fn field(&self, index: usize) -> &[u8] {
-        &self.data[self.offsets[index]..self.offsets[index + 1]]
+        &self.data()[self.offsets[index]..self.offsets[index + 1]]
     }
 
     /// Mask of the first `fields` fields whose bytes differ from `old`.
@@ -236,6 +264,12 @@ struct UpdateCache {
 }
 
 /// A patch's encoded world, shared by every client.
+///
+/// Encoding allocates per patch a constant number of times (the entity
+/// table and its id index), plus per changed entity its new payload and
+/// update record: unchanged entities are encoded into a scratch buffer the
+/// chain keeps from patch to patch and compared there, and the interest
+/// grid keeps its cells.
 #[derive(Debug)]
 pub struct EncodedWorld {
     entities: Vec<EncodedEntity>,
@@ -246,7 +280,11 @@ pub struct EncodedWorld {
     /// Records encoded building this world (changed entities' payloads and
     /// shared updates).
     encoded: usize,
-    cache: Mutex<UpdateCache>,
+    cache: UpdateCache,
+    /// An entity's data, encoded before it is compared.
+    scratch: Writer,
+    /// Its field boundaries.
+    offsets: Vec<usize>,
 }
 
 impl Clone for EncodedWorld {
@@ -258,7 +296,9 @@ impl Clone for EncodedWorld {
             globals: self.globals.clone(),
             patch: self.patch,
             encoded: self.encoded,
-            cache: Mutex::default(),
+            cache: UpdateCache::default(),
+            scratch: Writer::new(),
+            offsets: Vec::new(),
         }
     }
 }
@@ -266,62 +306,78 @@ impl Clone for EncodedWorld {
 impl EncodedWorld {
     /// Encode `view` against `schema` as the first patch. Entities of
     /// unknown kinds or duplicate ids are skipped.
-    pub fn build(schema: &EntitySchema, view: WorldView, interest: &InterestConfig) -> Self {
-        Self::encode(schema, view, interest, None)
+    pub fn build(schema: &EntitySchema, view: &WorldView, interest: &InterestConfig) -> Self {
+        let mut world = Self::with_capacity(view.entities.len(), interest);
+        world.encode(schema, view, None);
+        world
     }
 
     /// Encode the patch after `self`: unchanged entities keep their
     /// revision, changed ones get one update record from their state here,
     /// shared by every client that has it. Update rates count patches along
     /// this chain, so build every patch after the first with `next`.
-    pub fn next(&self, schema: &EntitySchema, view: WorldView, interest: &InterestConfig) -> Self {
-        Self::encode(schema, view, interest, Some(self))
+    pub fn next(mut self, schema: &EntitySchema, view: &WorldView, interest: &InterestConfig) -> Self {
+        let mut world = Self::with_capacity(view.entities.len(), interest);
+        world.patch = self.patch.wrapping_add(1);
+        // The buffers move along the chain.
+        std::mem::swap(&mut world.grid, &mut self.grid);
+        world.grid.reset(interest.cell_size);
+        std::mem::swap(&mut world.globals, &mut self.globals);
+        world.globals.clear();
+        std::mem::swap(&mut world.cache, &mut self.cache);
+        world.cache.records.clear();
+        world.cache.bytes.clear();
+        std::mem::swap(&mut world.scratch, &mut self.scratch);
+        std::mem::swap(&mut world.offsets, &mut self.offsets);
+        world.encode(schema, view, Some(&self));
+        world
     }
 
-    fn encode(
-        schema: &EntitySchema,
-        view: WorldView,
-        interest: &InterestConfig,
-        previous: Option<&EncodedWorld>,
-    ) -> Self {
-        let mut world = Self {
-            entities: Vec::with_capacity(view.entities.len()),
-            by_id: IdMap::default(),
+    fn with_capacity(entities: usize, interest: &InterestConfig) -> Self {
+        Self {
+            entities: Vec::with_capacity(entities),
+            by_id: IdMap::with_capacity_and_hasher(entities, Default::default()),
             grid: SpatialGrid::new(interest.cell_size),
             globals: Vec::new(),
-            patch: previous.map_or(0, |p| p.patch.wrapping_add(1)),
+            patch: 0,
             encoded: 0,
-            cache: Mutex::default(),
-        };
+            cache: UpdateCache::default(),
+            scratch: Writer::new(),
+            offsets: Vec::new(),
+        }
+    }
+
+    fn encode(&mut self, schema: &EntitySchema, view: &WorldView, previous: Option<&EncodedWorld>) {
         let zero = FieldValue::U(0);
-        for e in view.entities {
+        for e in &view.entities {
             let Some(kind) = schema.get(e.kind) else {
                 continue;
             };
-            if world.by_id.contains_key(&e.id) {
+            if self.by_id.contains_key(&e.id) {
                 continue;
             }
-            let mut w = Writer::new();
-            let mut offsets = Vec::with_capacity(kind.fields.len() + 1);
+            self.scratch.clear();
+            self.offsets.clear();
             for (index, def) in kind.fields.iter().enumerate() {
-                offsets.push(w.len());
-                def.ty.encode(&mut w, e.fields.get(index).unwrap_or(&zero));
+                self.offsets.push(self.scratch.len());
+                def.ty
+                    .encode(&mut self.scratch, e.fields.get(index).unwrap_or(&zero));
             }
-            offsets.push(w.len());
-            let data = w.into_bytes();
+            self.offsets.push(self.scratch.len());
+            let (data, offsets) = (self.scratch.as_bytes(), &self.offsets[..]);
             let before = previous
                 .and_then(|p| p.by_id.get(&e.id).map(|&i| &p.entities[i]))
                 .filter(|p| p.kind == e.kind && p.payload.offsets.len() == offsets.len());
             let (payload, update) = match before {
-                Some(p) if p.payload.data == data && p.payload.offsets == offsets => {
+                Some(p) if p.payload.data() == data && *p.payload.offsets == *offsets => {
                     (p.payload.clone(), p.update.clone())
                 }
                 _ => {
                     let payload = Arc::new(Payload::new(e.id, e.kind, data, offsets));
-                    world.encoded += 1 + usize::from(before.is_some());
+                    self.encoded += 1 + usize::from(before.is_some());
                     let update = before.map(|p| {
                         let mask = payload.changed_since(&p.payload, kind.fields.len());
-                        let mut w = Writer::new();
+                        let mut w = Writer::with_capacity(2 * MAX_VARUINT + data.len());
                         payload.update(e.id, mask, &mut w);
                         Arc::new(SharedUpdate {
                             base: p.payload.rev,
@@ -332,14 +388,14 @@ impl EncodedWorld {
                     (payload, update)
                 }
             };
-            let index = world.entities.len() as u32;
+            let index = self.entities.len() as u32;
             if e.global {
-                world.globals.push(index);
+                self.globals.push(index);
             } else {
-                world.grid.insert(index, e.x, e.y);
+                self.grid.insert(index, e.x, e.y);
             }
-            world.by_id.insert(e.id, index as usize);
-            world.entities.push(EncodedEntity {
+            self.by_id.insert(e.id, index as usize);
+            self.entities.push(EncodedEntity {
                 id: e.id,
                 kind: e.kind,
                 x: e.x,
@@ -350,7 +406,6 @@ impl EncodedWorld {
                 update,
             });
         }
-        world
     }
 
     /// Entity count.
@@ -368,8 +423,7 @@ impl EncodedWorld {
     /// update records for older baselines built for clients. Encoding per
     /// client would cost one per record sent or deferred instead.
     pub fn encodes(&self) -> usize {
-        let cache = self.cache.lock().unwrap_or_else(PoisonError::into_inner);
-        self.encoded + cache.records.len()
+        self.encoded + self.cache.records.len()
     }
 }
 
@@ -405,8 +459,20 @@ struct Slot {
 pub struct ClientReplica {
     slots: IdMap<u32, Slot>,
     builds: u32,
+    scratch: DeltaScratch,
 }
 
+/// One Delta build's working sets, kept (emptied) for the next build.
+#[derive(Debug, Clone, Default)]
+struct DeltaScratch {
+    hits: Vec<u32>,
+    candidates: Vec<(usize, Candidate, f32)>,
+    removes: Vec<u32>,
+    creates: Writer,
+    updates: Writer,
+}
+
+#[derive(Debug, Clone)]
 enum Candidate {
     Create,
     Shared,
@@ -437,7 +503,7 @@ impl ClientReplica {
     pub fn build_delta(
         &mut self,
         schema: &EntitySchema,
-        world: &EncodedWorld,
+        world: &mut EncodedWorld,
         interest: &InterestConfig,
         view: &View,
         budget: usize,
@@ -448,18 +514,27 @@ impl ClientReplica {
         let stamp = self.builds;
         let radius = view.radius.max(0.0);
         let stay_radius = radius * (1.0 + interest.leave_margin.max(0.0));
-        let mut hits = Vec::new();
-        world.grid.query(view.x, view.y, stay_radius, &mut hits);
+        let DeltaScratch {
+            hits,
+            candidates,
+            removes,
+            creates,
+            updates,
+        } = &mut self.scratch;
+        hits.clear();
+        candidates.clear();
+        removes.clear();
+        creates.clear();
+        updates.clear();
+        world.grid.query(view.x, view.y, stay_radius, hits);
         hits.extend_from_slice(&world.globals);
-        let mut cache = world.cache.lock().unwrap_or_else(PoisonError::into_inner);
-        let cache = &mut *cache;
+        let cache = &mut world.cache;
 
         // Visible entities (indices are unique) become candidates with
         // accumulated priority.
         let mut visible = 0usize;
         let mut held = 0usize;
-        let mut candidates: Vec<(usize, Candidate, f32)> = Vec::new();
-        for index in hits {
+        for &index in hits.iter() {
             let index = index as usize;
             let e = &world.entities[index];
             let d = if e.global {
@@ -557,7 +632,6 @@ impl ClientReplica {
         }
 
         // Known entities gone or out of view.
-        let mut removes: Vec<u32> = Vec::new();
         if visible != self.slots.len() {
             self.slots.retain(|id, slot| {
                 if slot.seen != stamp && slot.known.is_some() {
@@ -567,7 +641,8 @@ impl ClientReplica {
             });
             removes.sort_unstable();
         }
-        candidates.sort_by(|a, b| {
+        // Ids are unique: a total order, so an unstable sort is the same.
+        candidates.sort_unstable_by(|a, b| {
             b.2.total_cmp(&a.2)
                 .then(world.entities[a.0].id.cmp(&world.entities[b.0].id))
         });
@@ -577,11 +652,10 @@ impl ClientReplica {
             held,
             ..DeltaStats::default()
         };
-        let mut creates = Writer::new();
-        let mut updates = Writer::new();
-        for (index, candidate, _) in candidates {
+        for (index, candidate, _) in candidates.iter() {
+            let index = *index;
             let e = &world.entities[index];
-            let record = match &candidate {
+            let record = match candidate {
                 Candidate::Create => &e.payload.create[..],
                 Candidate::Shared => &e.update.as_ref().expect("shared update").record[..],
                 Candidate::Cached(range) => &cache.bytes[range.clone()],
@@ -604,13 +678,15 @@ impl ClientReplica {
         }
         stats.budget_bytes = creates.len() + updates.len();
 
-        let mut frame = Writer::new();
+        let mut frame = Writer::with_capacity(
+            1 + MAX_VARUINT * (5 + removes.len()) + creates.len() + updates.len(),
+        );
         frame
             .u8(tag::DELTA)
             .varuint(server_tick)
             .varuint(ack_seq)
             .varuint(removes.len() as u32);
-        for id in &removes {
+        for id in removes.iter() {
             frame.varuint(*id);
         }
         frame
@@ -787,7 +863,7 @@ mod tests {
                         scratch
                             .varuint(e.id)
                             .varuint(u32::from(e.kind))
-                            .raw(&p.data);
+                            .raw(p.data());
                     }
                     RefCandidate::Update(mask) => {
                         scratch.varuint(e.id).varuint(mask);
@@ -818,8 +894,8 @@ mod tests {
                     e.id,
                     Known {
                         rev: p.rev,
-                        data: p.data.clone(),
-                        offsets: p.offsets.clone(),
+                        data: p.data().to_vec(),
+                        offsets: p.offsets.to_vec(),
                     },
                 );
             }
@@ -991,10 +1067,10 @@ mod tests {
         let mut world: Option<EncodedWorld> = None;
         for patch in 0..150u32 {
             let view = pool.step();
-            let next = match &world {
+            let mut next = match world.take() {
                 // Sometimes a fresh chain: no shared updates, patch 0.
-                Some(prev) if !rng.chance(0.05) => prev.next(&schema, view, &interest),
-                _ => EncodedWorld::build(&schema, view, &interest),
+                Some(prev) if !rng.chance(0.05) => prev.next(&schema, &view, &interest),
+                _ => EncodedWorld::build(&schema, &view, &interest),
             };
             for (i, pair) in pairs.iter_mut().enumerate() {
                 pair.view.x = (pair.view.x + rng.next_f32() * 8.0 - 4.0).clamp(-90.0, 90.0);
@@ -1012,7 +1088,7 @@ mod tests {
                 }
                 let new = pair.new.build_delta(
                     &schema,
-                    &next,
+                    &mut next,
                     &interest,
                     &pair.view,
                     pair.budget,
@@ -1109,9 +1185,9 @@ mod tests {
                 ));
             }
             let started = Instant::now();
-            let next = match (&world, before) {
-                (Some(prev), false) => prev.next(&schema, view, &interest),
-                _ => EncodedWorld::build(&schema, view, &interest),
+            let mut next = match (world.take(), before) {
+                (Some(prev), false) => prev.next(&schema, &view, &interest),
+                _ => EncodedWorld::build(&schema, &view, &interest),
             };
             let mut sent = 0;
             for (i, p) in players.iter().enumerate() {
@@ -1119,7 +1195,7 @@ mod tests {
                 let (frame, _) = if before {
                     old[i].build_delta(&schema, &next, &interest, &v, 4096, patch, 0)
                 } else {
-                    new[i].build_delta(&schema, &next, &interest, &v, 4096, patch, 0)
+                    new[i].build_delta(&schema, &mut next, &interest, &v, 4096, patch, 0)
                 };
                 sent += frame.len();
             }

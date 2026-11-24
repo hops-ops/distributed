@@ -2,7 +2,7 @@
 //! policy, handoff issuance, freeze readiness, tier-up forwarding,
 //! hibernate/restore hooks and version stamping.
 
-#[path = "../world/realm.rs"]
+#[path = "../support/realm.rs"]
 mod realm;
 
 use std::sync::{Arc, Mutex};

@@ -1,7 +1,7 @@
 //! P8 netcode: lag compensation through `Ctx::rewind`, and deterministic
 //! record/replay with divergence detection.
 
-#[path = "../zone_runtime/arena.rs"]
+#[path = "../support/arena.rs"]
 mod arena;
 
 use std::sync::Arc;
