@@ -92,13 +92,13 @@ impl Client {
         for e in entities {
             view.push(e);
         }
-        let world = match &self.world {
-            Some(last) => last.next(&schema(), view, &self.interest),
-            None => EncodedWorld::build(&schema(), view, &self.interest),
+        let mut world = match self.world.take() {
+            Some(last) => last.next(&schema(), &view, &self.interest),
+            None => EncodedWorld::build(&schema(), &view, &self.interest),
         };
         let (frame, _) = self.replica.build_delta(
             &schema(),
-            &world,
+            &mut world,
             &self.interest,
             &self.view,
             self.budget,

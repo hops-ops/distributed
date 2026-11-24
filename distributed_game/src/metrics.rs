@@ -629,44 +629,13 @@ fn histogram(out: &mut String, name: &str, zone: &str, h: &Histogram) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        ClientMirror, EntitySchema, EntityState, FieldType, FieldValue, KindDef, ManualClock, Role,
-        TicketClaims, WorldView, Zone, ZoneHost,
-    };
+    use crate::test_zone::Dots;
+    use crate::{ClientMirror, ManualClock, Role, TicketClaims, ZoneHost};
     use std::sync::Arc;
     use std::time::Duration;
 
-    struct Dots;
-
-    impl Zone for Dots {
-        type Config = ();
-        type Input = u8;
-        type Timer = ();
-        type Message = distributed_game::NoMessages;
-
-        fn schema() -> EntitySchema {
-            EntitySchema::new().kind(KindDef::new(1, "dot").field("v", FieldType::U8))
-        }
-
-        fn on_create(_ctx: &mut crate::Ctx<'_, Self>, _: ()) -> Self {
-            Dots
-        }
-
-        fn decode_input(&self, _p: crate::PlayerId, b: &[u8]) -> Option<u8> {
-            b.first().copied()
-        }
-
-        fn on_tick(&mut self, _ctx: &mut crate::Ctx<'_, Self>) {}
-
-        fn replicate(&self, out: &mut WorldView) {
-            for i in 0..3 {
-                out.push(EntityState::new(i, 1, 0.0, 0.0, vec![FieldValue::U(i)]));
-            }
-        }
-    }
-
     fn host(zone: &str, clock: &ManualClock) -> ZoneHost<Dots> {
-        ZoneHost::new(zone, Default::default(), Arc::new(clock.clone()), ())
+        ZoneHost::new(zone, Default::default(), Arc::new(clock.clone()), 3)
     }
 
     #[test]

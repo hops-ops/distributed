@@ -7,6 +7,7 @@
 
 #[path = "../support/celld.rs"]
 mod celld_support;
+#[path = "../support/realm.rs"]
 mod realm;
 
 use std::sync::{Arc, Mutex};

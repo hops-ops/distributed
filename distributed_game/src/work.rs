@@ -112,50 +112,10 @@ impl WorkCounters {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        EntitySchema, EntityState, FieldType, FieldValue, KindDef, ManualClock, Role, TicketClaims,
-        WorldView, Zone, ZoneHost,
-    };
+    use crate::test_zone::Dots;
+    use crate::{ManualClock, Role, TicketClaims, ZoneHost};
     use std::sync::Arc;
     use std::time::Duration;
-
-    /// Eight dots that all move every tick.
-    struct Dots(u32);
-
-    impl Zone for Dots {
-        type Config = ();
-        type Input = u8;
-        type Timer = ();
-        type Message = distributed_game::NoMessages;
-
-        fn schema() -> EntitySchema {
-            EntitySchema::new().kind(KindDef::new(1, "dot").field("v", FieldType::U16))
-        }
-
-        fn on_create(_ctx: &mut crate::Ctx<'_, Self>, _: ()) -> Self {
-            Dots(0)
-        }
-
-        fn decode_input(&self, _p: crate::PlayerId, b: &[u8]) -> Option<u8> {
-            b.first().copied()
-        }
-
-        fn on_tick(&mut self, _ctx: &mut crate::Ctx<'_, Self>) {
-            self.0 += 1;
-        }
-
-        fn replicate(&self, out: &mut WorldView) {
-            for i in 0..8 {
-                out.push(EntityState::new(
-                    i,
-                    1,
-                    i as f32,
-                    0.0,
-                    vec![FieldValue::U(self.0 + i)],
-                ));
-            }
-        }
-    }
 
     fn claims(principal: &str) -> TicketClaims {
         TicketClaims {
@@ -173,8 +133,9 @@ mod tests {
     #[test]
     fn counts_shared_encodes_and_per_client_records() {
         let clock = ManualClock::new();
+        // Eight dots that all move every tick.
         let mut host: ZoneHost<Dots> =
-            ZoneHost::new("z", Default::default(), Arc::new(clock.clone()), ());
+            ZoneHost::new("z", Default::default(), Arc::new(clock.clone()), 8);
         for p in ["a", "b", "c"] {
             host.join(&claims(p), 0, "").unwrap();
         }

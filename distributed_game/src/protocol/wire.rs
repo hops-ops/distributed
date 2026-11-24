@@ -56,6 +56,13 @@ impl Writer {
         Self::default()
     }
 
+    /// Empty writer with room for `capacity` bytes.
+    pub(crate) fn with_capacity(capacity: usize) -> Self {
+        Self {
+            buf: Vec::with_capacity(capacity),
+        }
+    }
+
     /// Bytes written so far.
     pub fn len(&self) -> usize {
         self.buf.len()

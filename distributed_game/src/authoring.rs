@@ -29,16 +29,28 @@ pub trait Replicated {
     /// Interest-plane position (the `x` / `y` fields unless overridden).
     fn position(&self) -> (f32, f32);
 
+    /// Append the field values in schema order to `out`.
+    fn write_fields(&self, out: &mut Vec<FieldValue>);
+
     /// Field values in schema order.
-    fn field_values(&self) -> Vec<FieldValue>;
+    fn field_values(&self) -> Vec<FieldValue> {
+        let mut values = Vec::new();
+        self.write_fields(&mut values);
+        values
+    }
 
     /// The entity for a [`WorldView`].
     fn entity(&self, id: u32) -> EntityState {
-        let (x, y) = self.position();
-        let mut entity = EntityState::new(id, Self::KIND_ID, x, y, self.field_values());
-        entity.global = Self::GLOBAL;
-        entity
+        entity_with(self, id, self.field_values())
     }
+}
+
+/// `view`'s entity `id` with `fields` (its field values).
+fn entity_with<R: Replicated + ?Sized>(view: &R, id: u32, fields: Vec<FieldValue>) -> EntityState {
+    let (x, y) = view.position();
+    let mut entity = EntityState::new(id, R::KIND_ID, x, y, fields);
+    entity.global = R::GLOBAL;
+    entity
 }
 
 /// Builds an [`EntitySchema`](crate::EntitySchema) from `Replicated` view
@@ -83,9 +95,13 @@ impl Pushed<'_> {
 }
 
 impl WorldView {
-    /// Push entity `id` described by a `Replicated` view.
+    /// Push entity `id` described by a `Replicated` view. Its field values
+    /// go into a vector the view kept from its last patch (the host reuses
+    /// one view), so numeric fields cost no allocation.
     pub fn add<R: Replicated>(&mut self, id: impl Into<crate::EntityId>, view: &R) -> Pushed<'_> {
-        self.push(view.entity(id.into().get()));
+        let mut fields = self.spare_fields();
+        view.write_fields(&mut fields);
+        self.push(entity_with(view, id.into().get(), fields));
         Pushed(self.last_mut().expect("just pushed"))
     }
 }

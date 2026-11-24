@@ -34,12 +34,23 @@ pub enum HallMessage {
         /// Sequence.
         n: u32,
     },
+    /// Send `Probe { n }` on to the zone `to` (`Ctx::send_zone`).
+    #[game_event(id = 3)]
+    Forward {
+        /// Target zone.
+        #[long]
+        to: String,
+        /// Sequence.
+        n: u32,
+    },
 }
 
 #[derive(Default)]
 struct Shared {
     /// `(n, tick seen, delivered inside a tick?)` per probe.
     probes: Vec<(u32, u64, bool)>,
+    /// `(receiving zone, sending zone, n)` per zone-to-zone probe.
+    zone_probes: Vec<(String, String, u32)>,
 }
 
 struct Hall {
@@ -92,6 +103,17 @@ impl Zone for Hall {
                     .probes
                     .push((n, ctx.tick(), self.in_tick));
             }
+            HallMessage::Forward { to, n } => ctx.send_zone(&to, &HallMessage::Probe { n }),
+        }
+    }
+
+    fn on_zone_message(&mut self, ctx: &mut Ctx<'_, Self>, from: &ZoneSender, message: HallMessage) {
+        if let HallMessage::Probe { n } = message {
+            self.shared.lock().unwrap().zone_probes.push((
+                ctx.zone_id().to_string(),
+                from.zone.clone(),
+                n,
+            ));
         }
     }
 
@@ -180,7 +202,7 @@ fn kick_removes_the_principal_with_a_lifecycle_fact_and_messages_reach_on_messag
 fn messages_are_in_the_surface_with_their_codec() {
     let surface = GameSurface::new("hall").messages::<<Hall as Zone>::Message>();
     let names: Vec<_> = surface.messages.iter().map(|m| m.name.as_str()).collect();
-    assert_eq!(names, ["set_motd", "probe"]);
+    assert_eq!(names, ["set_motd", "probe", "forward"]);
     assert!(surface.to_json().contains("\"messages\""));
     // No messages: nothing in the JSON (older surfaces stay identical).
     let quiet = GameSurface::new("quiet").messages::<NoMessages>();
@@ -375,6 +397,98 @@ async fn admin_route_authenticates_refuses_inactive_and_redirects_to_the_owner()
     let ns: Vec<_> = shared.lock().unwrap().probes.iter().map(|p| p.0).collect();
     assert_eq!(ns, [2, 5], "only the authorized, owned deliveries ran");
 
+    a.shutdown();
+    b.shutdown();
+    for handle in [ha, hb] {
+        tokio::time::timeout(Duration::from_secs(5), handle)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+}
+
+/// Wait (bounded) until `shared` holds `n` zone-to-zone probes.
+async fn zone_probes(shared: &Arc<Mutex<Shared>>, n: usize) -> Vec<(String, String, u32)> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let probes = shared.lock().unwrap().zone_probes.clone();
+        if probes.len() >= n || tokio::time::Instant::now() >= deadline {
+            return probes;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn zone_messages_reach_a_zone_on_the_same_server_and_never_wake_one() {
+    let shared = Arc::new(Mutex::new(Shared::default()));
+    let server = server(shared.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let handle = serve(&server, listener).await;
+    assert!(server.activate("hall.a").await);
+    assert!(server.activate("hall.b").await);
+    let forward = |to: &str, n| {
+        ZoneInbound::Message(HallMessage::Forward {
+            to: to.to_string(),
+            n,
+        })
+    };
+    // Sent in this order from one handler: the cold zone's is dropped
+    // before the one for `hall.b` is delivered.
+    server.send("hall.a", forward("hall.cold", 1)).await.unwrap();
+    server.send("hall.a", forward("hall.b", 2)).await.unwrap();
+    assert_eq!(
+        zone_probes(&shared, 1).await,
+        [("hall.b".to_string(), "hall.a".to_string(), 2)]
+    );
+    assert!(!server.is_active("hall.cold"), "a zone message never wakes a zone");
+    // A zone may message itself.
+    server.send("hall.a", forward("hall.a", 3)).await.unwrap();
+    assert_eq!(zone_probes(&shared, 2).await.len(), 2);
+    server.shutdown();
+    tokio::time::timeout(Duration::from_secs(5), handle)
+        .await
+        .unwrap()
+        .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn zone_messages_reach_a_zone_on_a_peer_host() {
+    let (la, lb) = (
+        tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap(),
+        tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap(),
+    );
+    let a_addr = HostAddr::new("A", la.local_addr().unwrap().to_string());
+    let b_addr = HostAddr::new("B", lb.local_addr().unwrap().to_string());
+    let directory = Arc::new(StaticDirectory::new());
+    directory.add_host(a_addr).add_host(b_addr);
+    directory
+        .assign("hall.a", "A")
+        .assign("hall.b", "B")
+        .assign("hall.cold", "B");
+    let shared = Arc::new(Mutex::new(Shared::default()));
+    let a = server(shared.clone())
+        .with_host_id("A")
+        .with_directory(directory.clone());
+    let b = server(shared.clone())
+        .with_host_id("B")
+        .with_directory(directory.clone());
+    let (ha, hb) = (serve(&a, la).await, serve(&b, lb).await);
+    assert!(a.activate("hall.a").await);
+    assert!(b.activate("hall.b").await);
+    for (to, n) in [("hall.cold", 1), ("hall.b", 2)] {
+        a.send(
+            "hall.a",
+            ZoneInbound::Message(HallMessage::Forward { to: to.into(), n }),
+        )
+        .await
+        .unwrap();
+    }
+    assert_eq!(
+        zone_probes(&shared, 1).await,
+        [("hall.b".to_string(), "hall.a".to_string(), 2)]
+    );
+    assert!(!b.is_active("hall.cold"), "a zone message never wakes a zone");
     a.shutdown();
     b.shutdown();
     for handle in [ha, hb] {

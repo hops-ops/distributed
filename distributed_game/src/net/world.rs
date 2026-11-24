@@ -10,6 +10,7 @@
 //! | `/admin/transfer` | `{op: reserve\|confirm\|release\|return, nonce}` | transfer record at the issuing host |
 //! | `/admin/child-event` | `{zone, event}` | deliver a tier-up event to a local zone |
 //! | `/admin/zone-message` | `{zone, kick: {principal, reason}}` or `{zone, message: {type_id, payload}}` | zone inbox ([`super::inbox`]): 404 inactive, 421 wrong owner |
+//! | `/admin/zone-envelope` | a [`ZoneEnvelope`](crate::ZoneEnvelope) | a zone message from a zone on a peer ([`crate::zone_message`]): 204 queued, 404 not running here, 503 queue full |
 //! | `/admin/barrier/prepare` | `{barrier, reason, version, notes, timeout_ms}` | freeze all zones, wait for acks (409 + `missing`) |
 //! | `/admin/barrier/commit` | `{barrier, version, notes, mode: rolling\|hard}` | apply version, resume (409 for another barrier than the current one) |
 //! | `/admin/barrier/abort` | `{barrier, notes}` | resume on the old version (409 likewise) |
@@ -51,11 +52,14 @@ use serde_json::{json, Value};
 use super::inbox::{delivered_json, InboxError, WireInbound};
 use super::peer::post_json;
 use super::InternalHttpSecret;
-use super::{activate_local, transfer_op, unix_now, GameServer, Inner, TransferOp, ZoneCmd};
+use super::{
+    activate_local, running_zone, transfer_op, unix_now, GameServer, Inner, TransferOp, ZoneCmd,
+};
 use crate::facts::BoxFuture;
 use crate::protocol::Notice;
 use crate::world::{BarrierMode, ChildEvent, HostAddr};
 use crate::zone::Zone;
+use crate::zone_message::ZoneEnvelope;
 use distributed::cell_host::CELL_INTERNAL_SECRET_HEADER;
 
 type Reply = (StatusCode, String);
@@ -171,6 +175,43 @@ where
         Err(e) => reply(
             StatusCode::BAD_REQUEST,
             json!({"ok": false, "error": e.to_string()}),
+        ),
+    }
+}
+
+/// A zone message from a zone on a peer host ([`crate::zone_message`]):
+/// queued for the target when it runs here (204), else 404; it never
+/// activates a zone.
+pub(super) async fn admin_zone_envelope<Z>(
+    State(inner): State<Arc<Inner<Z>>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Reply
+where
+    Z: Zone,
+    Z::Config: Send,
+{
+    let body = match authorize(&inner, &headers, &body) {
+        Ok(body) => body,
+        Err(r) => return r,
+    };
+    let Ok(envelope) = serde_json::from_value::<ZoneEnvelope>(body) else {
+        return reply(
+            StatusCode::BAD_REQUEST,
+            json!({"ok": false, "error": "a zone message is required"}),
+        );
+    };
+    let Some(tx) = running_zone(&inner, &envelope.to) else {
+        return reply(
+            StatusCode::NOT_FOUND,
+            json!({"ok": false, "error": "inactive"}),
+        );
+    };
+    match tx.try_send(ZoneCmd::ZoneMessage(envelope)) {
+        Ok(()) => (StatusCode::NO_CONTENT, String::new()),
+        Err(_) => reply(
+            StatusCode::SERVICE_UNAVAILABLE,
+            json!({"ok": false, "error": "zone busy"}),
         ),
     }
 }

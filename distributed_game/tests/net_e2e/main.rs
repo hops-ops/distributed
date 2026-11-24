@@ -3,7 +3,7 @@
 
 #[path = "../support/admission.rs"]
 mod admission;
-#[path = "../zone_runtime/arena.rs"]
+#[path = "../support/arena.rs"]
 mod arena;
 
 use std::time::Duration;

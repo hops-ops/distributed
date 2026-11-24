@@ -1,6 +1,7 @@
 //! P2 zone runtime behaviour: lifecycle, cadence, tiers, inputs,
 //! determinism and non-blocking facts.
 
+#[path = "../support/arena.rs"]
 mod arena;
 
 use std::sync::atomic::{AtomicU32, Ordering};

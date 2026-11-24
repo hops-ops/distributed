@@ -936,8 +936,11 @@ which game code cannot make: it came from a verified ticket in the sending
 zone, and facts on behalf of it go through `emit_fact_as`. Drivers move
 envelopes with `ZoneHost::take_zone_messages` and `deliver_zone`; on celld
 the object posts them to `POST /{zone}/__zone` on its own class with the
-internal secret (never a public route). A message for a sleeping zone is
-refused (409): messages never wake zones. Delivery is best effort, so a
+internal secret (never a public route); the native `net` server queues
+them for a zone on the same server or posts them to the owning peer's
+`POST /admin/zone-envelope` (internal secret). A message for a sleeping
+zone is refused (409 on celld, 404 native): messages never wake zones.
+Delivery is best effort and unordered (dropped, never retried), so a
 transfer that must not lose or duplicate state needs a protocol on top.
 
 **Lending an entity** ([`lease`](src/lease.rs)). To move an entity into
