@@ -230,6 +230,8 @@ test('a leaderboard follows a server restart over a real WebSocket', { timeout: 
 	const { wake, until } = createWaiter();
 	const scheduler = new FakeScheduler();
 	let server = await startGraphqlServer({ http: () => ({ data: board('http') }), notify: wake });
+	// Registered first: a failure anywhere below must not leave the server open.
+	t.after(() => server.stop());
 	const { port } = server;
 	const transport = createReplicaGraphqlTransport({
 		getUrl: () => `http://127.0.0.1:${port}/graphql`,
@@ -248,10 +250,7 @@ test('a leaderboard follows a server restart over a real WebSocket', { timeout: 
 		current = value;
 		wake();
 	});
-	t.after(async () => {
-		unsubscribe();
-		await server.stop();
-	});
+	t.after(() => unsubscribe());
 	const accepted = async () => {
 		await until(() => server.sockets[0]?.received[0]?.type === 'connection_init');
 		server.sockets[0].send({ type: 'connection_ack' });

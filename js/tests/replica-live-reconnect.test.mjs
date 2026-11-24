@@ -174,6 +174,8 @@ test('a server restart resumes live updates over a real WebSocket without a manu
 	const scheduler = new FakeScheduler();
 	let http = () => wireFrame({ position: '1', rows: row('one') });
 	let server = await startGraphqlServer({ http: (body) => http(body), notify: wake });
+	// Registered first: a failure anywhere below must not leave the server open.
+	t.after(() => server.stop());
 	const { port } = server;
 	const transport = createReplicaGraphqlTransport({
 		getUrl: () => `http://127.0.0.1:${port}/graphql`,
@@ -206,10 +208,9 @@ test('a server restart resumes live updates over a real WebSocket without a manu
 		error: () => wake(),
 		complete: () => undefined
 	});
-	t.after(async () => {
+	t.after(() => {
 		watch.destroy();
 		closeBoard();
-		await server.stop();
 	});
 
 	const socket = await accepted();
