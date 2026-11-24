@@ -191,10 +191,10 @@ pub(crate) fn parse_event_args(input: ParseStream) -> syn::Result<EventAttr> {
     }
 
     if let Some((key, _)) = &known {
-        if !matches!(domain, Some(DomainMode::State)) {
+        if !matches!(domain, Some(DomainMode::State | DomainMode::Event)) {
             return Err(syn::Error::new_spanned(
                 key,
-                "`known(...)` names fields of the domain state, so it needs `domain` (state mode) on the same #[event]",
+                "`known(...)` names fields of the domain state (`domain`) or of the event body (`domain = event`), so it needs one of those on the same #[event]",
             ));
         }
     }
@@ -1226,14 +1226,20 @@ fn expand_domain_commands_module(
             .iter()
             .map(|event| &event.domain_event_type)
             .collect::<Vec<_>>();
-        // `known(..)` on a state recorder: declared once next to the
-        // transition, checked against the state's fields when the command is
-        // registered.
+        // `known(..)` on a recorder: declared once next to the event, checked
+        // when the command is registered. A state recorder names fields of the
+        // domain state; an event-mode recorder names fields of its own body (a
+        // distinct event per outcome carries its constant, e.g. a status).
         let known_value_items = transition.events.iter().filter_map(|event| {
-            let (fields, state) = (event.known.as_ref()?, event.domain_state.as_ref()?);
+            let fields = event.known.as_ref()?;
             let event_type = &event.domain_event_type;
-            Some(quote! {
-                #framework::state_preview! { #event_type => #state { #fields } }
+            Some(match event.domain_state.as_ref() {
+                Some(state) => quote! {
+                    #framework::state_preview! { #event_type => #state { #fields } }
+                },
+                None => quote! {
+                    #framework::event_preview! { #event_type => #event_type { #fields } }
+                },
             })
         });
         let has_known_values = transition.events.iter().any(|event| event.known.is_some());
