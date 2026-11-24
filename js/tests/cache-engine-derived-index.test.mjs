@@ -36,11 +36,11 @@ function seed(engine) {
 
 function membershipReconciler(observations = []) {
 	return (confirmed, layers) => {
-		const index = confirmed.indexes.find(
-			(candidate) => candidate.key === TODOS && !candidate.deleted
-		);
+		const index = confirmed.index(TODOS);
 		observations.push({
-			confirmedRecords: confirmed.records.map(({ key }) => key),
+			confirmedRecords: [BASE, A, B, SERVER].filter(
+				(key) => confirmed.record(key) !== undefined
+			),
 			layers
 		});
 		if (index === undefined) return [];
@@ -411,9 +411,7 @@ test('reconciler failures and invalid mutations roll back base and layer lifecyc
 	let rejectBlocked = false;
 	let replacementBlocked = false;
 	engine.setDerivedIndexReconciler((confirmed, layers) => {
-		const title = confirmed.records
-			.find(({ key }) => key === BASE)
-			?.fields.title.value;
+		const title = confirmed.record(BASE)?.fields.title;
 		if (title === 'bad') throw new Error('cannot derive bad base');
 		if (rejectBlocked && layers.length === 0) {
 			throw new Error('cannot derive rejected layer');

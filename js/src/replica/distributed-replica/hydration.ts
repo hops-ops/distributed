@@ -1,3 +1,4 @@
+import { compareCodeUnits } from '../../lib/compare-code-units.js';
 import type { CacheEngineSnapshot } from '../../internal/cache-engine.js';
 import {
 	compareDistributedDecimal,
@@ -50,7 +51,7 @@ export function serializeOperationProtocolState(
 			: { snapshotScope: state.snapshotScope }),
 		indexClocks: Object.freeze(
 			[...state.indexClocks]
-				.sort(([left], [right]) => left.localeCompare(right))
+				.sort(([left], [right]) => compareCodeUnits(left, right))
 				.map(([projection, clock]) =>
 					Object.freeze([
 						projection,
@@ -70,7 +71,7 @@ export function serializeOperationProtocolState(
 		indexKeys: Object.freeze([...state.indexKeys].sort()),
 		pathRecords: Object.freeze(
 			[...state.pathRecords]
-				.sort(([left], [right]) => left.localeCompare(right))
+				.sort(([left], [right]) => compareCodeUnits(left, right))
 				.map(([path, key]) => Object.freeze([path, key] as const))
 		),
 		cursors: Object.freeze(

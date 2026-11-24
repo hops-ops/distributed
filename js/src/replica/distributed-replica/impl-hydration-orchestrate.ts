@@ -1,3 +1,4 @@
+import { compareCodeUnits } from '../../lib/compare-code-units.js';
 import {
 	createCacheEngine,
 	type CacheEngine,
@@ -259,13 +260,13 @@ export function dehydrateReplica(host: HydrationHost): ReplicaDehydratedState {
 		});
 	const recordClocks = [...host.recordClocks]
 		.filter(([key]) => reachable.clockRecordKeys.has(key))
-		.sort(([left], [right]) => left.localeCompare(right))
+		.sort(([left], [right]) => compareCodeUnits(left, right))
 		.map(([key, clock]) =>
 			Object.freeze([key, freezeRecordClock(clock)] as const)
 		);
 	const anonymousRecordClocks = [...host.anonymousRecordClocks]
 		.filter(([, value]) => reachable.models.has(value.model))
-		.sort(([left], [right]) => left.localeCompare(right))
+		.sort(([left], [right]) => compareCodeUnits(left, right))
 		.map(([scopeToken, value]) =>
 			Object.freeze([
 				scopeToken,

@@ -1,8 +1,9 @@
 import {
 	type BaseCacheWriter,
-	type CacheEngineSnapshot,
+	type CacheIndex,
 	type CacheIndexCoverage,
 	type CacheIndexMetadata,
+	type CacheReader,
 	type CacheValue,
 	type OptimisticLayerView
 } from '../../internal/cache-engine.js';
@@ -47,6 +48,7 @@ import type {
 	ReplicaRevision,
 	ReplicaSnapshot,
 	ReplicaStatus,
+	ReplicaValue,
 	ReplicaWriteSource
 } from '../types.js';
 import {
@@ -438,44 +440,37 @@ export function isReplicaResultObject(
 	return value !== null && typeof value === 'object' && !Array.isArray(value);
 }
 
+/** Confirmed cache state in the shape index maintenance reads. */
 export function indexMaintenanceSnapshot(
-	confirmed: CacheEngineSnapshot
+	confirmed: CacheReader
 ): ReplicaIndexMaintenanceSnapshot {
+	const index = (key: string) => {
+		const found = confirmed.index(key);
+		return found?.metadata === undefined
+			? undefined
+			: (found as CacheIndex & {
+					readonly metadata: NonNullable<CacheIndex['metadata']>;
+				});
+	};
 	return Object.freeze({
-		records: Object.freeze(
-			confirmed.records.flatMap((record) => {
-				if (record.tombstoneRevision !== undefined) return [];
-				const model = modelFromRecordKey(record.key);
-				if (model === undefined) return [];
-				return [
-					Object.freeze({
-						key: record.key,
-						model,
-						fields: Object.freeze(
-							Object.fromEntries(
-								Object.entries(record.fields).map(([name, field]) => [
-									name,
-									field.value
-								])
-							)
-						)
-					})
-				];
-			})
-		),
-		indexes: Object.freeze(
-			confirmed.indexes.flatMap((index) => {
-				if (index.deleted || index.metadata === undefined) return [];
-				return [
-					Object.freeze({
-						key: index.key,
-						records: index.records,
-						complete: index.complete,
-						metadata: index.metadata
-					})
-				];
-			})
-		)
+		record(key: string) {
+			const model = modelFromRecordKey(key);
+			if (model === undefined) return undefined;
+			const record = confirmed.record(key);
+			if (record === undefined) return undefined;
+			return Object.freeze({
+				key,
+				model,
+				fields: record.fields as Readonly<Record<string, ReplicaValue>>
+			});
+		},
+		index,
+		*indexes() {
+			for (const key of confirmed.indexKeys()) {
+				const found = index(key);
+				if (found !== undefined) yield found;
+			}
+		}
 	});
 }
 

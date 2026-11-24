@@ -2,6 +2,7 @@ import type {
 	CacheEngineSnapshot,
 	CacheIndexCoverage,
 	CacheIndexMetadata,
+	CacheReader,
 	CacheValue,
 	DerivedIndexMutation,
 	DerivedIndexOperation,
@@ -14,11 +15,11 @@ import type {
 	Revision,
 	StoredField,
 	StoredIndex,
-	StoredRecord,
-	VisibleRecord
+	StoredRecord
 } from './types.js';
 
 import { assertName } from '../../lib/assert-name.js';
+import { compareCodeUnits } from '../../lib/compare-code-units.js';
 import { deepEqual } from '../../lib/deep-equal.js';
 import { freezeRecord } from '../../lib/freeze-record.js';
 import { reportSafely, reportUnhandledError } from '../../lib/report.js';
@@ -90,7 +91,7 @@ export function parseSnapshot(snapshot: CacheEngineSnapshot): {
 		indexes.set(input.key, {
 			revision,
 			staleRevision,
-			records: [...input.records],
+			records: Object.freeze([...input.records]),
 			complete: Boolean(input.complete),
 			deleted: Boolean(input.deleted),
 			metadata:
@@ -102,7 +103,7 @@ export function parseSnapshot(snapshot: CacheEngineSnapshot): {
 
 export function runDerivedIndexReconciler(
 	reconciler: DerivedIndexReconciler,
-	confirmed: CacheEngineSnapshot,
+	confirmed: CacheReader,
 	layers: readonly OptimisticLayerView[]
 ): readonly DerivedIndexMutation[] {
 	const result = reconciler(confirmed, Object.freeze([...layers]));
@@ -206,7 +207,8 @@ export function cloneDerivedIndexOperations(
 	}
 	return Object.freeze(
 		operations.sort((left, right) =>
-			derivedIndexOperationKey(left).localeCompare(
+			compareCodeUnits(
+				derivedIndexOperationKey(left),
 				derivedIndexOperationKey(right)
 			)
 		)
@@ -282,30 +284,8 @@ export function indexDependency(key: IndexKey): string {
 	return JSON.stringify(['index', key]);
 }
 
-export function dependenciesChanged(
-	dependencies: ReadonlySet<string>,
-	changed: ReadonlySet<string>
-): boolean {
-	if (changed.size === 0 || changed.has('*')) return true;
-	for (const dependency of dependencies) {
-		if (changed.has(dependency)) return true;
-	}
-	return false;
-}
-
-export function emptyVisibleRecord(): VisibleRecord {
-	return {
-		revision: 0n,
-		incarnation: 0n,
-		tombstoned: false,
-		fields: new Map(),
-		links: new Map()
-	};
-}
-
-export function isVisibleRecordLive(record: VisibleRecord | undefined): boolean {
-	return record !== undefined && !record.tombstoned;
-}
+/** Read by `CacheReader.indexKeys`; changes whenever any index does. */
+export const indexKeysDependency = JSON.stringify(['indexes']);
 
 export function validateRecordKey(key: RecordKey): void {
 	assertName(key, 'record key');

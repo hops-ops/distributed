@@ -2,6 +2,7 @@
 export {
 	CacheRevisionConflictError,
 	OptimisticLayerNotFoundError,
+	cacheEngineWork,
 	cacheIndexKey,
 	createCacheEngine
 } from './cache-engine/index.js';

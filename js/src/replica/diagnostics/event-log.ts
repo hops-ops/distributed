@@ -74,8 +74,10 @@ class ReplicaDiagnosticsImpl implements ReplicaDiagnostics {
 		generation: 0,
 		established: false
 	});
-	#records: readonly ReplicaDiagnosticRecord[] = Object.freeze([]);
-	#indexes: readonly ReplicaDiagnosticIndex[] = Object.freeze([]);
+	/** The latest state; its records and indexes are read by `snapshot`. */
+	#state: ReplicaDiagnosticStateInput | undefined;
+	#records: readonly ReplicaDiagnosticRecord[] | undefined;
+	#indexes: readonly ReplicaDiagnosticIndex[] | undefined;
 	#layers: readonly ReplicaDiagnosticLayer[] = Object.freeze([]);
 	#receipts: readonly ReplicaDiagnosticReceipt[] = Object.freeze([]);
 	#events: ReplicaDiagnosticEvent[] = [];
@@ -137,16 +139,9 @@ class ReplicaDiagnosticsImpl implements ReplicaDiagnostics {
 			this.#clearScopedState();
 		}
 		this.#scope = freezeScope(state.scope);
-		this.#records = Object.freeze(
-			state.records
-				.map((record) => this.#record(record))
-				.sort((left, right) => left.key.localeCompare(right.key))
-		);
-		this.#indexes = Object.freeze(
-			state.indexes
-				.map((index) => this.#index(index))
-				.sort((left, right) => left.key.localeCompare(right.key))
-		);
+		this.#state = state;
+		this.#records = undefined;
+		this.#indexes = undefined;
 		this.#layers = Object.freeze(
 			state.layers
 				.map((layer) => this.#layer(layer))
@@ -214,6 +209,16 @@ class ReplicaDiagnosticsImpl implements ReplicaDiagnostics {
 	readonly snapshot = (): ReplicaDiagnosticsSnapshot => {
 		const cached = this.#snapshotCache;
 		if (cached !== undefined) return cached;
+		this.#records ??= Object.freeze(
+			(this.#state?.records ?? [])
+				.map((record) => this.#record(record))
+				.sort((left, right) => left.key.localeCompare(right.key))
+		);
+		this.#indexes ??= Object.freeze(
+			(this.#state?.indexes ?? [])
+				.map((index) => this.#index(index))
+				.sort((left, right) => left.key.localeCompare(right.key))
+		);
 		const snapshot = Object.freeze({
 			version: 1 as const,
 			marker: DIAGNOSTICS_BUNDLE_MARKER,
@@ -269,8 +274,9 @@ class ReplicaDiagnosticsImpl implements ReplicaDiagnostics {
 	}
 
 	#clearScopedState(): void {
-		this.#records = Object.freeze([]);
-		this.#indexes = Object.freeze([]);
+		this.#state = undefined;
+		this.#records = undefined;
+		this.#indexes = undefined;
 		this.#layers = Object.freeze([]);
 		this.#receipts = Object.freeze([]);
 		this.#events = [];

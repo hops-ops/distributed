@@ -63,6 +63,7 @@
     "check:generated": "tsc -p tsconfig.generated-tests.json --noEmit",
     "test": "npm run build && node --test tests/*.test.mjs",
     "measure:cache-engines": "node scripts/measure-cache-engines.mjs",
+    "measure:cache-scaling": "npm run build && node scripts/bench-cache-scaling.mjs",
     "pack:smoke": "node scripts/pack-smoke.mjs",
     "publint": "publint",
     "release:dry-run": "npm publish --dry-run",

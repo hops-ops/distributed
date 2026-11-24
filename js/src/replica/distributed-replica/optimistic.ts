@@ -1,3 +1,4 @@
+import { compareCodeUnits } from '../../lib/compare-code-units.js';
 import {
 	type CacheIndexMetadata,
 	type CacheValue,
@@ -104,7 +105,8 @@ export function diagnosticReceiptExpectations(
 				});
 			})
 			.sort((left, right) =>
-				`${left.projection}\0${left.model}`.localeCompare(
+				compareCodeUnits(
+					`${left.projection}\0${left.model}`,
 					`${right.projection}\0${right.model}`
 				)
 			)
