@@ -61,7 +61,7 @@
     "build": "npm run clean && tsc -p tsconfig.json",
     "check": "tsc -p tsconfig.json --noEmit && npm run check:generated",
     "check:generated": "tsc -p tsconfig.generated-tests.json --noEmit",
-    "test": "npm run build && node --test tests/*.test.mjs",
+    "test": "npm run build && node --experimental-websocket --test tests/*.test.mjs",
     "measure:cache-engines": "node scripts/measure-cache-engines.mjs",
     "pack:smoke": "node scripts/pack-smoke.mjs",
     "publint": "publint",
