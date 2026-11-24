@@ -68,13 +68,14 @@ mod causal;
 pub mod cell_host;
 mod context;
 mod dependencies;
-pub(crate) use dependencies::{BackendHost, CausalHostProjections};
+pub(crate) use dependencies::CausalHostProjections;
 mod descriptor;
 mod error;
 pub(crate) mod lifecycle;
 mod message_router;
 mod projector;
 mod runtime;
+pub mod schedule;
 mod service;
 mod session;
 // Worker loops need a Tokio runtime (spawn/sleep); only compile when a feature

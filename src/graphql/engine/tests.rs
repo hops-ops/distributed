@@ -174,7 +174,7 @@ mod client_surface_parity_tests {
     #[cfg(feature = "sqlite")]
     #[tokio::test]
     async fn repeated_protocol_accumulators_reuse_metadata_but_release_request_authority() {
-        use crate::graphql::identity::VerifiedPrincipal;
+        use crate::command_dispatch::VerifiedPrincipal;
         let engine = protocol_engine("request-cache-test");
         let export = &engine.inner.protocol.as_ref().unwrap().roles["user"]
             .surface
@@ -481,7 +481,7 @@ mod client_surface_parity_tests {
     #[cfg(feature = "sqlite")]
     #[tokio::test]
     async fn configured_protocol_attaches_stable_role_and_identity_bound_envelopes() {
-        use crate::graphql::identity::VerifiedPrincipal;
+        use crate::command_dispatch::VerifiedPrincipal;
 
         let engine = protocol_engine("public/graphql");
         let manifest = engine.client_manifest_for_role("user").unwrap();
@@ -1156,7 +1156,7 @@ mod client_surface_parity_tests {
     #[cfg(feature = "sqlite")]
     #[tokio::test]
     async fn cache_scope_tracks_only_relevant_claims_and_private_policy() {
-        use crate::graphql::identity::VerifiedPrincipal;
+        use crate::command_dispatch::VerifiedPrincipal;
 
         let engine = policy_protocol_engine("public/graphql", "x-tenant");
         let principal = VerifiedPrincipal::test_oidc(
@@ -1230,7 +1230,7 @@ mod client_surface_parity_tests {
     #[cfg(feature = "sqlite")]
     #[tokio::test]
     async fn protocol_stream_uses_one_request_accumulator_and_raw_engine_has_no_envelope() {
-        use crate::graphql::identity::VerifiedPrincipal;
+        use crate::command_dispatch::VerifiedPrincipal;
 
         let engine = protocol_engine("public/graphql");
         let mut session = Session::new();

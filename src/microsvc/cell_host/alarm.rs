@@ -10,7 +10,18 @@
 
 pub(crate) use crate::schedule::*;
 
-use super::CausalDispatchError;
+use super::{CausalDispatchError, CellCommandIdentity};
+
+impl ArmedSchedule {
+    /// Stable command-ledger identity of this arm in its cell's own ledger.
+    pub fn command_identity(&self) -> Result<CellCommandIdentity, CausalDispatchError> {
+        CellCommandIdentity::new(
+            SCHEDULE_SERVICE_ID,
+            SCHEDULE_SERVICE_ID,
+            schedule_command_id(&self.name, self.generation),
+        )
+    }
+}
 
 /// Whether a dispatch failure should be retried rather than disarm the
 /// schedule.

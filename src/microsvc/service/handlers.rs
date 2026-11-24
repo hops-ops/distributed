@@ -537,7 +537,7 @@ impl<'a, A> CausalCommandContext<'a, A> {
     /// SQL. Never a caller's time. Requires the route to declare
     /// `.requires(Capability::Clock)`; otherwise an error says so.
     pub fn now(&self) -> Result<std::time::SystemTime, HandlerError> {
-        crate::schedule::host_now(self.session).ok_or_else(|| {
+        crate::microsvc::schedule::host_now(self.session).ok_or_else(|| {
             HandlerError::Rejected(
                 "ctx.now() needs a route declared with .requires(Capability::Clock)".into(),
             )
@@ -547,7 +547,7 @@ impl<'a, A> CausalCommandContext<'a, A> {
     /// Due time of the schedule that fired this command; `None` for any
     /// command not dispatched by a schedule.
     pub fn scheduled_due(&self) -> Option<std::time::SystemTime> {
-        crate::schedule::scheduled_due(self.session)
+        crate::microsvc::schedule::scheduled_due(self.session)
     }
 }
 
@@ -636,7 +636,7 @@ where
     /// scheduled. The command must commit exactly one aggregate, which owns
     /// it. At the due time a host with [`Capability::Scheduling`] dispatches
     /// its command into that aggregate with the trusted
-    /// [`schedule_session`](crate::schedule::schedule_session); declare the
+    /// [`schedule_session`](crate::microsvc::schedule::schedule_session); declare the
     /// route with `.requires(Capability::Scheduling)` so a host that cannot
     /// dispatch refuses it at service construction.
     ///

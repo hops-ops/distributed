@@ -323,7 +323,7 @@ where
                         &alarm.command,
                         &identity,
                         alarm.input.clone(),
-                        super::schedule_session(&alarm),
+                        crate::microsvc::schedule::schedule_session(&alarm),
                     )
                     .await
                 }

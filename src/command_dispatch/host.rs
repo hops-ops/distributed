@@ -7,7 +7,7 @@ use serde_json::Value;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::graphql::identity::VerifiedPrincipal;
+use super::VerifiedPrincipal;
 use crate::graphql::protocol::ProtocolResponseAccumulator;
 use crate::microsvc::cell_host::{
     InternalHttpSecret, CELL_CAUSATION_ID_HEADER, CELL_INTERNAL_SECRET_HEADER,

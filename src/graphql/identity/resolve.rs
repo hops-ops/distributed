@@ -6,7 +6,8 @@ use axum::http::header::{AUTHORIZATION, COOKIE, PROXY_AUTHORIZATION};
 use axum::http::{HeaderMap, HeaderName};
 use subtle::ConstantTimeEq;
 
-use super::oidc::{OidcConfig, OidcValidator, ValidationError, VerifiedPrincipal};
+use super::oidc::{OidcConfig, OidcValidator, ValidationError};
+use crate::command_dispatch::VerifiedPrincipal;
 use crate::microsvc::Session;
 
 /// Who the GraphQL edge believes about the caller's identity.

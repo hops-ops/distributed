@@ -13,7 +13,7 @@ use super::claims::{map_claims_to_session_with_provenance, ClaimMapConfig};
 use crate::command_dispatch::principal::{
     normalize_issuer, VerifiedAudience, VerifiedAudienceSource,
 };
-pub use crate::command_dispatch::principal::{InvalidPrincipal, VerifiedPrincipal};
+use crate::command_dispatch::VerifiedPrincipal;
 use crate::microsvc::Session;
 
 const DEFAULT_JWKS_CACHE_TTL: Duration = Duration::from_secs(300);

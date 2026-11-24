@@ -371,7 +371,7 @@ impl Entity {
     /// Where and when the latest event recorded by the current unit of work
     /// (not yet committed) lands in the stream: its sequence and timestamp,
     /// as they will be committed. `None` when nothing was recorded. Command
-    /// results (receipts, leaderboard occurrences) read this instead of
+    /// results (receipts, ranking occurrences) read this instead of
     /// digging through [`events`](Self::events).
     pub fn last_recorded(&self) -> Option<Recorded> {
         self.new_events().last().map(|record| Recorded {

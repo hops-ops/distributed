@@ -8,7 +8,6 @@ mod oidc;
 mod resolve;
 
 pub use claims::{map_claims_to_session, ClaimMapConfig};
-pub use oidc::{InvalidPrincipal, VerifiedPrincipal};
 pub use oidc::{OidcConfig, OidcValidator, ValidationError};
 pub(crate) use resolve::ResolvedIdentity;
 pub use resolve::{

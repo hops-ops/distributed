@@ -13,6 +13,7 @@ mod manifest;
 mod module;
 mod projection_contract;
 mod registration;
+mod surface;
 
 pub use command::{
     admit_command_session, command_roles_require_principal, CommandDefinition, CommandMount,
@@ -29,12 +30,15 @@ pub use manifest::{
 };
 pub use module::{
     ModelFieldSpec, ModelRelationshipSpec, ModelSpec, Module, ModuleBuilder, ModuleManifest,
-    ProjectionSpec, SurfaceAggregateSpec, SurfaceArgumentSpec, SurfaceCommandSpec, SurfaceRootSpec,
-    SurfaceSpec,
+    ProjectionSpec,
 };
 pub(crate) use projection_contract::compact_projection_program_contract;
 pub use projection_contract::expand_projection_program_contract;
 pub use registration::{Application, ApplicationBuilder, ContractCompiler};
+pub use surface::{
+    SurfaceAggregateSpec, SurfaceArgumentSpec, SurfaceCommandSpec, SurfaceContract,
+    SurfaceRootSpec, SurfaceSelectionSpec, SurfaceSpec,
+};
 
 /// Compile-time duplicate check emitted by the module macro for generated
 /// command definition IDs. It compares the complete IDs, not a truncated or

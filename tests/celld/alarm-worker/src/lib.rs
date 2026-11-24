@@ -18,11 +18,12 @@ use distributed::cell_host::{
     CELL_PRINCIPAL_PARTITION_HEADER, CELL_SERVICE_ID_HEADER,
 };
 use distributed::command::{typed_command, PreparedCommand, Succeeded};
+use distributed::microsvc::schedule::schedule_guard;
 use distributed::microsvc::{
     CausalCommandContext, CausalRouteDependencies, HandlerError, PortableCommand, Routes, Session,
     ROLE_KEY, USER_ID_KEY,
 };
-use distributed::schedule::{schedule_guard, Capability, Schedule};
+use distributed::schedule::{Capability, Schedule};
 use distributed::{sourced, Entity};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};

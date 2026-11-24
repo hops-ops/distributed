@@ -758,7 +758,7 @@ impl CommandLedgerStore for CellStreamStore {
 /// A cell dispatches its due schedules (the Durable Object alarm on celld,
 /// `AggregateCell::fire_due_schedules` on the reference host) and stamps the
 /// cell clock.
-impl crate::microsvc::BackendHost for CellStreamStore {
+impl crate::schedule::BackendHost for CellStreamStore {
     fn capabilities(&self) -> crate::schedule::Capabilities {
         crate::schedule::Capabilities::ALL
     }
@@ -860,4 +860,116 @@ impl crate::microsvc::dependencies::CausalHostProjections for CellStreamStore {
 #[cfg(not(all(feature = "cloudflare-workers", target_arch = "wasm32")))]
 fn memory_repository() -> CellRepository {
     InMemoryRepository::new()
+}
+
+/// The cell host keeps a working copy in an [`InMemoryRepository`] and
+/// persists it to the cell's own SQLite: these export and restore it whole.
+#[cfg(not(all(feature = "cloudflare-workers", target_arch = "wasm32")))]
+impl InMemoryRepository {
+    /// Clone the event log for the cell's durable SQLite.
+    pub(crate) fn clone_events(
+        &self,
+    ) -> Result<std::collections::HashMap<String, Vec<EventRecord>>, RepositoryError> {
+        Ok(self
+            .event_store
+            .read()
+            .map_err(|_| RepositoryError::LockPoisoned("event log read"))?
+            .clone())
+    }
+
+    /// Replace the event log from the cell's durable SQLite.
+    pub(crate) fn replace_events(
+        &self,
+        events: std::collections::HashMap<String, Vec<EventRecord>>,
+    ) -> Result<(), RepositoryError> {
+        *self
+            .event_store
+            .write()
+            .map_err(|_| RepositoryError::LockPoisoned("event log write"))? = events;
+        Ok(())
+    }
+
+    /// Clone outbox rows for the cell's durable SQLite.
+    pub(crate) fn clone_outbox(&self) -> Result<Vec<OutboxMessage>, RepositoryError> {
+        Ok(self
+            .outbox_store
+            .read()
+            .map_err(|_| RepositoryError::LockPoisoned("outbox read"))?
+            .values()
+            .cloned()
+            .collect())
+    }
+
+    /// Replace outbox rows from the cell's durable SQLite.
+    pub(crate) fn replace_outbox(
+        &self,
+        messages: Vec<OutboxMessage>,
+    ) -> Result<(), RepositoryError> {
+        let mut map = std::collections::HashMap::new();
+        for message in messages {
+            map.insert(message.id.clone(), message);
+        }
+        *self
+            .outbox_store
+            .write()
+            .map_err(|_| RepositoryError::LockPoisoned("outbox write"))? = map;
+        Ok(())
+    }
+
+    /// Clone snapshot cache records for the cell's durable SQLite.
+    pub(crate) fn clone_snapshots(
+        &self,
+    ) -> Result<std::collections::HashMap<String, SnapshotRecord>, RepositoryError> {
+        Ok(self
+            .snapshot_store()
+            .storage
+            .read()
+            .map_err(|_| RepositoryError::LockPoisoned("snapshot log read"))?
+            .clone())
+    }
+
+    /// Replace snapshot cache records from the cell's durable SQLite.
+    pub(crate) fn replace_snapshots(
+        &self,
+        snapshots: std::collections::HashMap<String, SnapshotRecord>,
+    ) -> Result<(), RepositoryError> {
+        *self
+            .snapshot_store()
+            .storage
+            .write()
+            .map_err(|_| RepositoryError::LockPoisoned("snapshot log write"))? = snapshots;
+        Ok(())
+    }
+
+    pub(crate) fn clone_command_ledger(
+        &self,
+    ) -> Result<Vec<crate::command_ledger::CommandLedgerRecord>, RepositoryError> {
+        Ok(self
+            .command_ledger
+            .read()
+            .map_err(|_| RepositoryError::LockPoisoned("command ledger read"))?
+            .values()
+            .cloned()
+            .collect())
+    }
+
+    pub(crate) fn replace_command_ledger(
+        &self,
+        records: Vec<crate::command_ledger::CommandLedgerRecord>,
+    ) -> Result<(), RepositoryError> {
+        let mut ledger = std::collections::HashMap::with_capacity(records.len());
+        for record in records {
+            let key = record.key.clone();
+            if ledger.insert(key, record).is_some() {
+                return Err(RepositoryError::Model(
+                    "cell command ledger restore contains a duplicate key".into(),
+                ));
+            }
+        }
+        *self
+            .command_ledger
+            .write()
+            .map_err(|_| RepositoryError::LockPoisoned("command ledger write"))? = ledger;
+        Ok(())
+    }
 }

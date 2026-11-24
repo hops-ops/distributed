@@ -2,14 +2,13 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
-use super::command::{CommandDefinition, CommandMount, CommandSpec, CommandTypeSpec, EventSpec};
+use super::command::{CommandDefinition, CommandMount, CommandSpec, EventSpec};
 use super::error::{ApplicationError, ApplicationResult};
 use super::identity::{canonical_json, sha256_fingerprint, LogicalId};
+use super::surface::{SurfaceAggregateSpec, SurfaceArgumentSpec, SurfaceSpec};
 use crate::command::TypedCommandContract;
-use crate::graphql::surface::{
-    RootKind, Surface, SurfaceArgument, SurfaceCommand, SurfaceCommandShape,
-    SurfaceProjectionOwner, SurfaceRelationshipKeys, SurfaceSelection, SurfaceTypeDef,
-};
+use crate::graphql::surface::SurfaceProjectionOwner;
+use crate::table::RelationshipKind;
 
 /// One exposed model field in a portable surface/module artifact.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -43,32 +42,13 @@ pub struct ModelRelationshipSpec {
     pub name: String,
     pub target_model: String,
     pub target_object: String,
-    pub kind: String,
+    pub kind: RelationshipKind,
     pub list: bool,
     pub nullable: bool,
     pub arguments: Vec<SurfaceArgumentSpec>,
     pub keys: serde_json::Value,
     pub dependencies: Vec<String>,
     pub aggregate: Option<SurfaceAggregateSpec>,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct SurfaceArgumentSpec {
-    pub name: String,
-    pub kind: String,
-    pub type_name: String,
-    pub nullable: bool,
-    pub list: bool,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct SurfaceAggregateSpec {
-    pub name: String,
-    pub type_name: String,
-    pub arguments: Vec<SurfaceArgumentSpec>,
-    pub dependencies: Vec<String>,
 }
 
 impl ModelSpec {
@@ -113,7 +93,7 @@ impl ModelSpec {
         Ok(spec)
     }
 
-    fn refresh_fingerprint(&mut self) -> ApplicationResult<()> {
+    pub(super) fn refresh_fingerprint(&mut self) -> ApplicationResult<()> {
         let mut value = serde_json::to_value(&*self)?;
         if let serde_json::Value::Object(fields) = &mut value {
             fields.insert(
@@ -182,7 +162,7 @@ impl ProjectionSpec {
         Ok(self)
     }
 
-    fn from_owner(owner: &SurfaceProjectionOwner) -> ApplicationResult<Self> {
+    pub(super) fn from_owner(owner: &SurfaceProjectionOwner) -> ApplicationResult<Self> {
         let mut spec = Self {
             id: LogicalId::try_new("projection", owner.name.clone())?.into_string(),
             facts: owner.facts.clone(),
@@ -260,424 +240,6 @@ impl ProjectionSpec {
             );
         }
         serde_json::to_vec(&canonical_json(&value)).map_err(Into::into)
-    }
-}
-
-/// A root field identity retained by a surface contract.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct SurfaceRootSpec {
-    pub operation: String,
-    pub name: String,
-    pub kind: String,
-    pub object: String,
-    pub model: String,
-    pub dependencies: Vec<String>,
-    pub arguments: Vec<SurfaceArgumentSpec>,
-    pub default_limit: Option<u64>,
-    pub max_limit: Option<u64>,
-}
-
-/// A command shape as exposed by a selected surface.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct SurfaceCommandSpec {
-    pub id: String,
-    pub field_name: String,
-    pub roles: Vec<String>,
-    pub input: Option<CommandTypeSpec>,
-    pub output: Option<CommandTypeSpec>,
-    pub consistency: crate::command::CommandConsistency,
-    pub defaults: serde_json::Value,
-    pub projection_contract: serde_json::Value,
-    pub applies: serde_json::Value,
-    pub direct_projection: Option<serde_json::Value>,
-    pub projected_model: Option<String>,
-}
-
-/// Authorized, placement-independent surface identity.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct SurfaceSpec {
-    pub id: String,
-    pub selection: String,
-    pub eligible_roles: Vec<String>,
-    pub schema_roles: Vec<String>,
-    pub models: Vec<ModelSpec>,
-    pub roots: Vec<SurfaceRootSpec>,
-    pub commands: Vec<SurfaceCommandSpec>,
-    pub projections: Vec<ProjectionSpec>,
-    pub dialect: String,
-    pub aggregates: bool,
-    pub subscriptions: bool,
-    pub default_limit: u64,
-    pub max_limit: u64,
-    pub comparison_ops: BTreeMap<String, Vec<String>>,
-    pub commands_attached: bool,
-    pub projectors_attached: bool,
-    /// Canonical leaderboard sections (`LeaderboardSurface`), in contract
-    /// order. Absent when empty, so manifests without leaderboards keep
-    /// their bytes and fingerprints.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub leaderboards: Vec<serde_json::Value>,
-    /// Canonical lossless Surface IR snapshot. It is the identity authority
-    /// for SDL/client compilation and must never be reconstructed from tables.
-    pub contract: serde_json::Value,
-    pub fingerprint: String,
-}
-
-impl SurfaceSpec {
-    pub fn try_new(id: impl Into<String>) -> ApplicationResult<Self> {
-        let id = LogicalId::try_new("surface", id)?.into_string();
-        let mut spec = Self {
-            id,
-            selection: "catalog".into(),
-            eligible_roles: Vec::new(),
-            schema_roles: Vec::new(),
-            models: Vec::new(),
-            roots: Vec::new(),
-            commands: Vec::new(),
-            projections: Vec::new(),
-            dialect: "sqlite".into(),
-            aggregates: true,
-            subscriptions: true,
-            default_limit: 100,
-            max_limit: 1000,
-            comparison_ops: BTreeMap::new(),
-            commands_attached: false,
-            projectors_attached: false,
-            leaderboards: Vec::new(),
-            contract: serde_json::json!({
-                "version": 1,
-                "selection": {"kind": "catalog"},
-                "dialect": "sqlite",
-                "aggregates": true,
-                "subscriptions": true,
-                "default_limit": 100,
-                "max_limit": 1000,
-                "models": [],
-                "roots": [],
-                "comparison_ops": {},
-                "commands": [],
-                "commands_attached": false,
-                "projectors": [],
-                "projectors_attached": false,
-            }),
-            fingerprint: String::new(),
-        };
-        spec.refresh_fingerprint()?;
-        Ok(spec)
-    }
-
-    /// Compile the already-authorized Surface IR without constructing a
-    /// repository, service, lock manager, or handler mount.
-    pub fn from_surface(id: impl Into<String>, surface: &Surface) -> ApplicationResult<Self> {
-        let id = LogicalId::try_new("surface", id)?.into_string();
-        let (selection, mut eligible_roles, mut schema_roles) = match &surface.selection {
-            SurfaceSelection::Catalog => ("catalog".to_owned(), Vec::new(), Vec::new()),
-            SurfaceSelection::Role { name } => {
-                ("role".to_owned(), vec![name.clone()], vec![name.clone()])
-            }
-            SurfaceSelection::Application {
-                name,
-                eligible_roles,
-                schema_roles,
-            } => (
-                format!("application:{name}"),
-                eligible_roles.clone(),
-                schema_roles.clone(),
-            ),
-        };
-        eligible_roles.sort();
-        eligible_roles.dedup();
-        schema_roles.sort();
-        schema_roles.dedup();
-
-        let mut models = surface
-            .models
-            .values()
-            .map(|model| {
-                let mut spec = ModelSpec {
-                    id: LogicalId::try_new("model", model.model_name.clone())?.into_string(),
-                    table: model.table_name.clone(),
-                    object: model.object_name.clone(),
-                    fields: model
-                        .columns
-                        .iter()
-                        .map(|field| ModelFieldSpec {
-                            name: field.name.clone(),
-                            scalar: field.scalar.clone(),
-                            nullable: field.nullable,
-                        })
-                        .collect(),
-                    primary_key: model.primary_key.clone(),
-                    relationships: model
-                        .relationships
-                        .iter()
-                        .map(surface_relationship_spec)
-                        .collect::<ApplicationResult<Vec<_>>>()?,
-                    row_policy: surface_row_policy(&model.row_policy)?,
-                    role_limit: model.role_limit,
-                    aggregations: model.aggregations,
-                    fingerprint: String::new(),
-                };
-                spec.fields
-                    .sort_by(|left, right| left.name.cmp(&right.name));
-                spec.primary_key.sort();
-                spec.relationships
-                    .sort_by(|left, right| left.name.cmp(&right.name));
-                spec.refresh_fingerprint()?;
-                Ok(spec)
-            })
-            .collect::<ApplicationResult<Vec<_>>>()?;
-        models.sort_by(|left, right| left.id.cmp(&right.id));
-
-        let mut roots = surface
-            .query_fields
-            .iter()
-            .map(|root| ("query", root))
-            .chain(
-                surface
-                    .subscription_fields
-                    .iter()
-                    .map(|root| ("subscription", root)),
-            )
-            .map(|(operation, root)| SurfaceRootSpec {
-                operation: operation.into(),
-                name: root.name.clone(),
-                kind: match root.kind {
-                    RootKind::List => "list",
-                    RootKind::ByPk => "by_pk",
-                    RootKind::Aggregate => "aggregate",
-                }
-                .into(),
-                object: root.object.clone(),
-                model: root.model_name.clone(),
-                dependencies: root.dependencies.clone(),
-                arguments: root.arguments.iter().map(surface_argument_spec).collect(),
-                default_limit: root.default_limit,
-                max_limit: root.max_limit,
-            })
-            .collect::<Vec<_>>();
-        roots.sort_by(|left, right| {
-            (left.operation.as_str(), left.name.as_str())
-                .cmp(&(right.operation.as_str(), right.name.as_str()))
-        });
-
-        let mut commands = surface
-            .commands
-            .iter()
-            .map(surface_command_spec)
-            .collect::<ApplicationResult<Vec<_>>>()?;
-        commands.sort_by(|left, right| left.id.cmp(&right.id));
-
-        let mut projections = surface
-            .projectors
-            .iter()
-            .map(ProjectionSpec::from_owner)
-            .collect::<ApplicationResult<Vec<_>>>()?;
-        projections.sort_by(|left, right| left.id.cmp(&right.id));
-
-        let mut spec = Self {
-            id,
-            selection,
-            eligible_roles,
-            schema_roles,
-            models,
-            roots,
-            commands,
-            projections,
-            dialect: format!("{:?}", surface.dialect).to_ascii_lowercase(),
-            aggregates: surface.aggregates,
-            subscriptions: surface.subscriptions,
-            default_limit: surface.default_limit,
-            max_limit: surface.max_limit,
-            comparison_ops: surface.comparison_ops.clone(),
-            commands_attached: surface.commands_attached,
-            projectors_attached: surface.projectors_attached,
-            leaderboards: surface
-                .leaderboards
-                .iter()
-                .map(crate::graphql::surface::LeaderboardSurface::canonical_value)
-                .collect(),
-            contract: surface
-                .canonical_contract_value()
-                .map_err(ApplicationError::InvalidSpec)?,
-            fingerprint: String::new(),
-        };
-        spec.refresh_fingerprint()?;
-        Ok(spec)
-    }
-
-    fn refresh_fingerprint(&mut self) -> ApplicationResult<()> {
-        let mut value = serde_json::to_value(&*self)?;
-        if let serde_json::Value::Object(fields) = &mut value {
-            fields.insert(
-                "fingerprint".into(),
-                serde_json::Value::String(String::new()),
-            );
-        }
-        self.fingerprint = sha256_fingerprint(&serde_json::to_vec(&canonical_json(&value))?);
-        Ok(())
-    }
-
-    pub fn canonical_bytes(&self) -> ApplicationResult<Vec<u8>> {
-        let mut value = serde_json::to_value(self)?;
-        if let serde_json::Value::Object(fields) = &mut value {
-            fields.insert(
-                "fingerprint".into(),
-                serde_json::Value::String(String::new()),
-            );
-        }
-        serde_json::to_vec(&canonical_json(&value)).map_err(Into::into)
-    }
-}
-
-fn surface_command_spec(command: &SurfaceCommand) -> ApplicationResult<SurfaceCommandSpec> {
-    Ok(SurfaceCommandSpec {
-        id: LogicalId::try_new("command", command.command_name.clone())?.into_string(),
-        field_name: command.field_name.clone(),
-        roles: command.roles.clone(),
-        input: surface_shape_spec(&command.input),
-        output: surface_shape_spec(&command.output),
-        consistency: command.consistency,
-        defaults: serde_json::to_value(&command.input_defaults)?,
-        projection_contract: serde_json::to_value(&command.projections)?,
-        applies: serde_json::to_value(&command.projections.previews)?,
-        direct_projection: command
-            .direct_projection
-            .as_ref()
-            .map(crate::command::CommandDirectProjectionTarget::canonical_value),
-        projected_model: command
-            .projected_model
-            .as_ref()
-            .map(|model| model.model.clone()),
-    })
-}
-
-fn surface_argument_spec(argument: &SurfaceArgument) -> SurfaceArgumentSpec {
-    SurfaceArgumentSpec {
-        name: argument.name.clone(),
-        kind: match argument.kind {
-            crate::graphql::surface::SurfaceArgumentKind::Filter => "filter",
-            crate::graphql::surface::SurfaceArgumentKind::Order => "order",
-            crate::graphql::surface::SurfaceArgumentKind::Limit => "limit",
-            crate::graphql::surface::SurfaceArgumentKind::Offset => "offset",
-            crate::graphql::surface::SurfaceArgumentKind::PrimaryKey => "primary_key",
-        }
-        .into(),
-        type_name: argument.type_name.clone(),
-        nullable: argument.nullable,
-        list: argument.list,
-    }
-}
-
-fn surface_relationship_spec(
-    relationship: &crate::graphql::surface::RelField,
-) -> ApplicationResult<ModelRelationshipSpec> {
-    Ok(ModelRelationshipSpec {
-        name: relationship.name.clone(),
-        target_model: relationship.target_model.clone(),
-        target_object: relationship.target_object.clone(),
-        kind: format!("{:?}", relationship.kind).to_ascii_lowercase(),
-        list: relationship.list,
-        nullable: relationship.nullable,
-        arguments: relationship
-            .arguments
-            .iter()
-            .map(surface_argument_spec)
-            .collect(),
-        keys: surface_relationship_keys(&relationship.keys),
-        dependencies: relationship.dependencies.clone(),
-        aggregate: relationship
-            .aggregate
-            .as_ref()
-            .map(|aggregate| SurfaceAggregateSpec {
-                name: aggregate.name.clone(),
-                type_name: aggregate.type_name.clone(),
-                arguments: aggregate
-                    .arguments
-                    .iter()
-                    .map(surface_argument_spec)
-                    .collect(),
-                dependencies: aggregate.dependencies.clone(),
-            }),
-    })
-}
-
-fn surface_relationship_keys(keys: &SurfaceRelationshipKeys) -> serde_json::Value {
-    match keys {
-        SurfaceRelationshipKeys::Direct { local, remote } => {
-            serde_json::json!({"kind": "direct", "local": local, "remote": remote})
-        }
-        SurfaceRelationshipKeys::Through {
-            local,
-            remote,
-            table,
-            source_foreign_key,
-            target_foreign_key,
-        } => serde_json::json!({
-            "kind": "through",
-            "local": local,
-            "remote": remote,
-            "table": table,
-            "source_foreign_key": source_foreign_key,
-            "target_foreign_key": target_foreign_key,
-        }),
-        SurfaceRelationshipKeys::ThroughOpaque {
-            local,
-            remote,
-            dependency,
-        } => serde_json::json!({
-            "kind": "through_opaque",
-            "local": local,
-            "remote": remote,
-            "dependency": dependency,
-        }),
-        SurfaceRelationshipKeys::Embedded => serde_json::json!({"kind": "embedded"}),
-    }
-}
-
-fn surface_row_policy(
-    policy: &crate::graphql::surface::SurfaceRowPolicy,
-) -> ApplicationResult<serde_json::Value> {
-    Ok(match policy {
-        crate::graphql::surface::SurfaceRowPolicy::Unrestricted => {
-            serde_json::json!({"kind": "unrestricted"})
-        }
-        crate::graphql::surface::SurfaceRowPolicy::Predicate(predicate) => serde_json::json!({
-            "kind": "predicate",
-            "expression": predicate,
-        }),
-        crate::graphql::surface::SurfaceRowPolicy::ServerOnly(_) => {
-            serde_json::json!({"kind": "server_only"})
-        }
-    })
-}
-
-fn surface_shape_spec(shape: &SurfaceCommandShape) -> Option<CommandTypeSpec> {
-    match shape {
-        SurfaceCommandShape::None => None,
-        SurfaceCommandShape::Typed(definition) => Some(surface_type_spec(definition)),
-    }
-}
-
-fn surface_type_spec(definition: &SurfaceTypeDef) -> CommandTypeSpec {
-    CommandTypeSpec {
-        name: definition.name.clone(),
-        fields: definition
-            .fields
-            .iter()
-            .map(|field| super::command::CommandTypeField {
-                unsigned_integer: field.unsigned_integer,
-                name: field.name.clone(),
-                type_name: field.type_name.clone(),
-                nullable: field.nullable,
-                list: field.list,
-                item_nullable: field.item_nullable,
-                nested: field.nested.as_deref().map(surface_type_spec).map(Box::new),
-            })
-            .collect(),
     }
 }
 
@@ -967,7 +529,7 @@ impl ModuleBuilder {
         projections.extend(
             surfaces
                 .iter()
-                .flat_map(|surface| surface.projections.iter().cloned()),
+                .flat_map(|surface| surface.contract.projections.iter().cloned()),
         );
         projections.sort_by(|left, right| left.id.cmp(&right.id));
         projections = dedup_identical("projection", projections, |projection| {
@@ -1008,7 +570,7 @@ impl ModuleBuilder {
         models.extend(
             surfaces
                 .iter()
-                .flat_map(|surface| surface.models.iter().cloned()),
+                .flat_map(|surface| surface.contract.models.iter().cloned()),
         );
         models.sort_by(|left, right| left.id.cmp(&right.id));
         models = dedup_identical("model", models, |model| model.id.clone())?;

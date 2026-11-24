@@ -113,7 +113,7 @@ fn armed_from_row(row: &impl SqlRow) -> Result<ArmedSchedule, RepositoryError> {
 /// holds, until `claim_until_ms`, in one statement: concurrent workers get
 /// disjoint rows (`FOR UPDATE SKIP LOCKED` on Postgres; SQLite serializes
 /// the write). Returned earliest first, with their owners.
-#[cfg_attr(not(feature = "graphql"), allow(dead_code))]
+#[cfg_attr(not(any(feature = "sqlite", feature = "postgres")), allow(dead_code))]
 pub(crate) async fn claim_due<E: SqlExecutor>(
     executor: &mut E,
     now_ms: i64,
@@ -156,7 +156,7 @@ pub(crate) async fn claim_due<E: SqlExecutor>(
 /// Settle one fired arm. Only the generation that fired is touched: a
 /// handler that re-armed its own name produced a newer generation, which
 /// stays armed; a stale or already-settled arm is a no-op.
-#[cfg_attr(not(feature = "graphql"), allow(dead_code))]
+#[cfg_attr(not(any(feature = "sqlite", feature = "postgres")), allow(dead_code))]
 pub(crate) async fn settle(
     executor: &mut impl SqlExecutor,
     owner: &StreamIdentity,

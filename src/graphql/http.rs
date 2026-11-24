@@ -18,7 +18,8 @@ use crate::command_dispatch::{LocalCommandHost, SharedCommandHost};
 use crate::microsvc::{Service, Session, MAX_HTTP_BODY_BYTES, USER_ID_KEY};
 
 use super::engine::GraphqlEngine;
-use super::identity::{AuthError, IdentityConfig, ResolvedIdentity, VerifiedPrincipal};
+use super::identity::{AuthError, IdentityConfig, ResolvedIdentity};
+use crate::command_dispatch::VerifiedPrincipal;
 
 /// DevHeaders baked into GraphiQL for local exploration (not production security).
 const GRAPHIQL_DEV_USER: &str = "demo";

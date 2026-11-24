@@ -6,8 +6,8 @@
 //! use distributed::read_model::{ReadModelWritePlanBuilder, ReadModelWritePlanCommitExt};
 //!
 //! let mut read_models = ReadModelWritePlanBuilder::new();
-//! read_models.upsert(&player)?;
-//! read_models.upsert_related(&player, "weapons", &weapon)?;
+//! read_models.upsert(&customer)?;
+//! read_models.upsert_related(&customer, "orders", &order)?;
 //! repo.read_models(read_models).commit(&mut aggregate).await?;
 //! ```
 //!
@@ -28,8 +28,8 @@
 pub mod change;
 pub(crate) mod in_memory;
 mod load;
-mod scan;
 mod plan;
+mod scan;
 mod workspace;
 
 pub use change::ReadModelChange;
@@ -89,10 +89,10 @@ pub trait RelationalReadModelIncludes: RelationalReadModel {
     fn include_target_schema(include: &str) -> Result<&'static TableSchema, TableStoreError>;
 }
 
-pub use scan::{ReadModelScanCursor, ReadModelScanPage, ReadModelScanRequest};
 pub use in_memory::InMemoryReadModelStore;
 pub use load::{
     ReadModelIncludeRows, ReadModelLoadBuilder, ReadModelLoadGraph, ReadModelLoadRequest,
 };
 pub use plan::ReadModelWritePlanBuilder;
+pub use scan::{ReadModelScanCursor, ReadModelScanPage, ReadModelScanRequest};
 pub use workspace::{ReadModelWorkspace, ReadModelWorkspaceExt};

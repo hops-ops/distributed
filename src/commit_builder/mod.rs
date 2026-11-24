@@ -5,12 +5,12 @@
 //!
 //! ```ignore
 //! let mut read_models = distributed::read_model::ReadModelWritePlanBuilder::new();
-//! read_models.upsert(&player)?;
-//! read_models.upsert_related(&player, "weapons", &weapon)?;
+//! read_models.upsert(&customer)?;
+//! read_models.upsert_related(&customer, "orders", &order)?;
 //!
 //! repo
 //!     .read_models(read_models)
-//!     .commit(&mut game)
+//!     .commit(&mut account)
 //!     .await?;
 //! ```
 //!

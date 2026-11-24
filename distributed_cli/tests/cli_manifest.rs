@@ -41,12 +41,12 @@ fn distributed(args: &[&str]) -> String {
 fn describe_emits_manifest_json() {
     let json = distributed(&["describe"]);
     let manifest: serde_json::Value = serde_json::from_str(&json).unwrap();
-    assert_eq!(manifest["schema_version"], 2);
+    assert_eq!(manifest["schema_version"], 3);
     for inventory in ["commands", "events", "models", "projections"] {
         assert!(manifest.get(inventory).is_none(), "redundant {inventory}");
     }
     // This read-model-only fixture owns models through its Surface, not modules.
-    assert!(!manifest["surfaces"][0]["models"]
+    assert!(!manifest["surfaces"][0]["contract"]["models"]
         .as_array()
         .unwrap()
         .is_empty());

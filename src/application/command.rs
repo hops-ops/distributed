@@ -292,7 +292,7 @@ impl CommandSpec {
     /// an already compiled application Surface back to its portable command.
     pub fn with_surface_binding(
         mut self,
-        exposed: &super::module::SurfaceCommandSpec,
+        exposed: &super::surface::SurfaceCommandSpec,
     ) -> ApplicationResult<Self> {
         let mut mismatches = Vec::new();
         if self.id != exposed.id {
@@ -330,7 +330,7 @@ impl CommandSpec {
             })?;
         self.roles = exposed.roles.clone();
         self.defaults = exposed.defaults.clone();
-        self.applies = exposed.applies.clone();
+        self.applies = exposed.applies();
         self.projection_contract = exposed.projection_contract.clone();
         self.direct_projection = exposed.direct_projection.clone();
         self.projected_model = exposed.projected_model.clone();

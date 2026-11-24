@@ -35,9 +35,8 @@ use std::time::Duration;
 #[cfg(feature = "command-host")]
 use distributed::cell_host::{CelldCommandHost, InternalHttpSecret};
 #[cfg(feature = "command-host")]
-use distributed::command_dispatch::{CommandHost, LocalCommandHost};
+use distributed::command_dispatch::{CommandHost, LocalCommandHost, VerifiedPrincipal};
 #[cfg(feature = "command-host")]
-use distributed::graphql::identity::VerifiedPrincipal;
 #[cfg(feature = "command-host")]
 use distributed::microsvc::CausalDispatchError;
 use distributed::microsvc::Session;

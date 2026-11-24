@@ -9,8 +9,8 @@ use std::time::{Duration, SystemTime};
 use distributed::cell_host::{
     AggregateCell, CausalDispatchError, CellCommandIdentity, CellStreamStore,
 };
+use distributed::microsvc::schedule::schedule_session;
 use distributed::microsvc::{Session, ROLE_KEY, USER_ID_KEY};
-use distributed::schedule::schedule_session;
 use distributed::{Clock, ManualClock, StreamIdentity};
 use distributed_game::cell::command_id_for;
 use distributed_game::world::zone_lease::{

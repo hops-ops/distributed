@@ -1,8 +1,8 @@
 //! Saga - event-sourced process managers for cross-cell workflows.
 //!
 //! A cell has one atomic boundary. Anything that must change state in two
-//! cells (moving a player between zones, transferring a corpse's inventory,
-//! settling an encounter across participants) is a **saga**: a sequence of
+//! cells (moving an account between shards, transferring a balance,
+//! settling an order across participants) is a **saga**: a sequence of
 //! steps, each a command to one cell, with a compensating command per step
 //! that undoes it if a later step fails.
 //!

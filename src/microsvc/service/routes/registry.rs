@@ -424,7 +424,7 @@ impl<D: Send + Sync + 'static> Routes<D> {
             route_name, contract.name,
             "typed command route and contract ids must match"
         );
-        let capabilities = crate::microsvc::dependencies::BackendHost::capabilities(
+        let capabilities = crate::schedule::BackendHost::capabilities(
             self.dependencies.__causal_aggregate_repository().repo(),
         );
         let missing = capabilities.missing(&requires);

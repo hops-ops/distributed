@@ -14,13 +14,11 @@ use super::super::{AggregateCell, CellCommandIdentity, CellStreamStore};
 use super::owner_session;
 use crate::command::{typed_command, PreparedCommand, Succeeded};
 use crate::entity::Entity;
+use crate::microsvc::schedule::{schedule_guard, schedule_session, HOST_NOW_CLAIM};
 use crate::microsvc::service::{CausalCommandContext, PortableCommand, Routes};
 use crate::microsvc::HandlerError;
 use crate::repository::{CommitBatch, StreamIdentity, TransactionalCommit};
-use crate::schedule::{
-    schedule_guard, schedule_session, Capability, Schedule, ScheduleWrite, HOST_NOW_CLAIM,
-    SCHEDULE_RETRY_BASE,
-};
+use crate::schedule::{Capability, Schedule, ScheduleWrite, SCHEDULE_RETRY_BASE};
 use crate::{sourced, Clock, InMemoryRepository, ManualClock};
 
 #[derive(Clone, Default, Serialize, Deserialize, crate::Snapshot)]
@@ -545,10 +543,10 @@ async fn handlers_see_the_cell_clock_and_callers_cannot_forge_it() {
         Some(clock.now() + Duration::from_millis(1000))
     );
     let mut session = crate::microsvc::Session::new();
-    assert_eq!(crate::schedule::host_now(&session), None);
+    assert_eq!(crate::microsvc::schedule::host_now(&session), None);
     session.set(HOST_NOW_CLAIM, "1234");
     assert_eq!(
-        crate::schedule::host_now(&session),
+        crate::microsvc::schedule::host_now(&session),
         Some(SystemTime::UNIX_EPOCH + Duration::from_millis(1234))
     );
 }
