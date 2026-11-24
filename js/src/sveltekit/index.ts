@@ -51,7 +51,7 @@ export {
 	type DistributedSvelteKitLocationContext,
 	type SveltekitBoundaryLifecycleDiagnostic,
 	type SveltekitBoundaryRetention
-} from './boundary-lifecycle.js';
+} from '../boundary-lifecycle.js';
 export {
 	defineDistributedSvelteKitOperation,
 	provideDistributedSvelteKitClient,
@@ -68,19 +68,21 @@ export {
 	type DistributedSvelteKitClient,
 	type SveltekitBoundOperation,
 	type SveltekitBoundBoundaryOperation,
-	type SveltekitCommandRuntimeFactory,
-	type SveltekitCommandRuntimeFactoryOptions,
-	type SveltekitCommandRuntimeLike,
 	type SveltekitDistributedPageData,
 	type SveltekitPageDataSessionSource,
 	type SveltekitPageDataSource,
 	type SveltekitQuerySnapshot,
 	type SveltekitQueryStore,
-	type SveltekitReplicaAuthority,
-	type SveltekitReplicaHydration,
-	type SveltekitSessionSource,
 	type UseSveltekitOperationOptions
 } from './replica.js';
+export type {
+	SveltekitCommandRuntimeFactory,
+	SveltekitCommandRuntimeFactoryOptions,
+	SveltekitCommandRuntimeLike,
+	SveltekitReplicaAuthority,
+	SveltekitReplicaHydration,
+	SveltekitSessionSource
+} from '../client.js';
 export {
 	createDistributedSvelteKitServer,
 	type CreateDistributedSvelteKitServerOptions,

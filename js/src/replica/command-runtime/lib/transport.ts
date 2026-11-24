@@ -3,10 +3,8 @@ import {
 	type DistributedProtocolEnvelope
 } from '../../../protocol.js';
 import type { GqlError } from '../../../types.js';
-import {
-	verifyReplicaCommandReceipt,
-	type ReplicaPreparedCommand
-} from '../../commands.js';
+import { verifyReplicaCommandReceipt } from '../../commands/receipt.js';
+import type { ReplicaPreparedCommand } from '../../commands/types.js';
 import { ReplicaCommandRuntimeError } from '../errors.js';
 import type {
 	CapturedAuthority,

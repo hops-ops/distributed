@@ -4,12 +4,10 @@ import {
 	recordKeyMatchesModel,
 	replicaIndexKey,
 	resolveArguments
-} from '../identity.js';
-import {
-	compareReplicaOrder,
-	decideReplicaPaginationMaintenance,
-	evaluateReplicaFilter
-} from '../query-plan.js';
+} from '../identity/keys.js';
+import { compareReplicaOrder } from '../query-plan/order.js';
+import { decideReplicaPaginationMaintenance } from '../query-plan/pagination.js';
+import { evaluateReplicaFilter } from '../query-plan/filter.js';
 import type {
 	ReplicaFilterArtifact,
 	ReplicaCoverageArtifact,

@@ -11,8 +11,7 @@ import type {
 	DistributedOpaqueString,
 	DistributedTrustedPreset
 } from '../../protocol.js';
-import type { ReplicaTrustedPresetDescriptor } from '../commands.js';
-import type { ValidatedReplicaOperationBinding } from '../operation-binding.js';
+import type { ReplicaTrustedPresetDescriptor } from '../commands/types.js';
 import type {
 	ReplicaLiveState,
 	ReplicaOperationArtifact,
@@ -132,8 +131,6 @@ export type ReplicaArtifactBinding = {
 	surfaceIdentity?: string;
 	trustedPresets?: readonly ReplicaTrustedPresetDescriptor[];
 };
-
-export type ValidatedArtifactBinding = ValidatedReplicaOperationBinding;
 
 export type RecordProtocolClock = {
 	scopeToken: DistributedOpaqueString;

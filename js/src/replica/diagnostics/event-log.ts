@@ -1,8 +1,6 @@
 import { DIAGNOSTICS_BUNDLE_MARKER } from './types.js';
 import type { GraphqlVariables } from '../../types.js';
-import type {
-	ReplicaCommandArtifact
-} from '../commands.js';
+import type { ReplicaCommandArtifact } from '../commands/types.js';
 import type {
 	ReplicaIndexCoverage,
 	ReplicaOperationArtifact,

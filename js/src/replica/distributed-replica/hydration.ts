@@ -12,6 +12,14 @@ import {
 
 import { modelFromRecordKey } from './clocks.js';
 
+import type { GraphqlVariables } from '../../types.js';
+import { replicaIndexKey, resolveArguments } from '../identity/keys.js';
+import {
+	runtimeRoot,
+	type RuntimeObjectBranch,
+	type RuntimeObjectSelection,
+	type RuntimeRootSelection
+} from '../selection.js';
 import type { ReplicaAuthoritativeScope } from '../types.js';
 import { isPlainRecord } from '../../lib/is-plain-record.js';
 import { canonicalTrustedPresets } from './helpers.js';
@@ -23,10 +31,143 @@ import type {
 	ParsedReplicaHydration,
 	ProtocolGeneration,
 	RecordProtocolClock,
+	RenderedOperation,
 	ReplicaDehydratedPayloadV1,
 	SerializedOperationProtocolGroup,
 	SerializedOperationProtocolState
 } from './types.js';
+
+/**
+ * The confirmed records and indexes the rendered operations reach, with only
+ * the fields they select: what a dehydrated state carries.
+ */
+export function reachableConfirmedState(
+	snapshot: CacheEngineSnapshot,
+	rendered: ReadonlyMap<string, RenderedOperation>,
+	group: (key: string) => Readonly<OperationProtocolGroup> | undefined
+): {
+	readonly cache: CacheEngineSnapshot;
+	readonly recordKeys: ReadonlySet<string>;
+	readonly clockRecordKeys: ReadonlySet<string>;
+	readonly models: ReadonlySet<string>;
+} {
+	const indexes = new Map(snapshot.indexes.map((index) => [index.key, index]));
+	const records = new Map(snapshot.records.map((record) => [record.key, record]));
+	const indexKeys = new Set<string>();
+	const recordKeys = new Set<string>();
+	const clockRecordKeys = new Set<string>();
+	const recordFields = new Map<string, Set<string>>();
+	const models = new Set<string>();
+
+	const rememberSelection = (selection: RuntimeObjectSelection): void => {
+		if (selection.storage.kind === 'normalized') {
+			models.add(selection.storage.model);
+		}
+		for (const member of selection.members) {
+			if (member.kind === 'branch') rememberSelection(member.selection);
+		}
+	};
+	const rememberRecord = (
+		recordKey: string,
+		selection: RuntimeObjectSelection
+	): void => {
+		recordKeys.add(recordKey);
+		clockRecordKeys.add(recordKey);
+		let selected = recordFields.get(recordKey);
+		if (selected === undefined) {
+			selected = new Set();
+			recordFields.set(recordKey, selected);
+		}
+		for (const member of selection.members) {
+			if (member.kind === 'scalar') selected.add(member.field);
+		}
+	};
+	const visitObject = (
+		selection: RuntimeObjectSelection,
+		recordKey: string,
+		variables: GraphqlVariables
+	): void => {
+		rememberRecord(recordKey, selection);
+		for (const member of selection.members) {
+			if (member.kind !== 'branch') continue;
+			visitBranch(member, recordKey, variables);
+		}
+	};
+	const visitBranch = (
+		selection: RuntimeRootSelection | RuntimeObjectBranch,
+		parent: string | undefined,
+		variables: GraphqlVariables
+	): void => {
+		const key = replicaIndexKey({
+			...(parent === undefined ? {} : { parent }),
+			field: selection.field,
+			arguments: resolveArguments(
+				selection.arguments,
+				variables,
+				selection.coverage
+			)
+		});
+		const index = indexes.get(key);
+		if (index === undefined) return;
+		indexKeys.add(key);
+		for (const recordKey of index.records) {
+			visitObject(selection.selection, recordKey, variables);
+		}
+	};
+
+	for (const [key, operation] of rendered) {
+		for (const rootArtifact of operation.artifact.roots) {
+			const root = runtimeRoot(rootArtifact);
+			rememberSelection(root.selection);
+			visitBranch(root, undefined, operation.variables);
+		}
+		const protocol = group(key);
+		for (const state of [protocol?.query, protocol?.live]) {
+			for (const recordKey of state?.pathRecords.values() ?? []) {
+				clockRecordKeys.add(recordKey);
+			}
+		}
+	}
+
+	return Object.freeze({
+		cache: Object.freeze({
+			version: 1 as const,
+			records: Object.freeze(
+				[...recordKeys]
+					.sort()
+					.flatMap((key) => {
+						const record = records.get(key);
+						if (record === undefined) return [];
+						const selected = recordFields.get(key) ?? new Set();
+						return [
+							Object.freeze({
+								...record,
+								fields: Object.freeze(
+									Object.fromEntries(
+										Object.entries(record.fields).filter(([field]) =>
+											selected.has(field)
+										)
+									)
+								),
+								links: Object.freeze({})
+							})
+						];
+					})
+			),
+			indexes: Object.freeze(
+				[...indexKeys]
+					.sort()
+					.flatMap((key) => {
+						const index = indexes.get(key);
+						return index === undefined ? [] : [index];
+					})
+			)
+		}),
+		recordKeys,
+		clockRecordKeys,
+		models
+	});
+}
 
 export function serializeOperationProtocolGroup(
 	key: string,
@@ -46,7 +187,7 @@ export function serializeOperationProtocolGroup(
 	});
 }
 
-export function serializeOperationProtocolState(
+function serializeOperationProtocolState(
 	state: OperationProtocolState
 ): SerializedOperationProtocolState {
 	return Object.freeze({

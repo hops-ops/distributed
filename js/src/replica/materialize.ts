@@ -1,6 +1,6 @@
 import type { CacheIndex, CacheReader } from '../internal/cache-engine.js';
 import type { GraphqlVariables } from '../types.js';
-import { replicaIndexKey, resolveArguments } from './identity.js';
+import { replicaIndexKey, resolveArguments } from './identity/keys.js';
 import {
 	runtimeRoot,
 	type RuntimeObjectBranch,

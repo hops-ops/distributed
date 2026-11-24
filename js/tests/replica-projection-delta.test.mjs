@@ -3,14 +3,13 @@ import { createHash } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import test from 'node:test';
 
+import { canonicalCommandProjectionMetadata, canonicalProjectionDelta } from '../dist/replica/projection-delta/canonical.js';
 import {
-	canonicalCommandProjectionMetadata,
-	canonicalProjectionDelta,
 	parseCommandProjectionMetadata,
 	parseProjectionDelta,
 	validateCommandProjectionArtifact,
 	validateProjectionMetadataAuthority
-} from '../dist/replica/projection-delta/index.js';
+} from '../dist/replica/projection-delta/validate.js';
 
 const VECTOR_HASH =
 	'7bdc06e1d3accc4c62132f967df1310d31f2f3b856fa7e97a7c5d0907a4ae17b';

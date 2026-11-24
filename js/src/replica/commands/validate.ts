@@ -27,12 +27,8 @@ import {
 	trustedPresetName
 } from './presets.js';
 import { fieldAtPath } from './resolve.js';
-import {
-	ProjectionDeltaValidationError,
-	validateCommandProjectionArtifact,
-	type ProjectionPreviewValue,
-	type ReplicaCommandProjection
-} from '../projection-delta/index.js';
+import { ProjectionDeltaValidationError, validateCommandProjectionArtifact } from '../projection-delta/validate.js';
+import type { ProjectionPreviewValue, ReplicaCommandProjection } from '../projection-delta/types.js';
 
 /** A command artifact is an immutable generated constant, validated once. */
 export function validateArtifact<TInput, TOutput>(
@@ -247,7 +243,7 @@ function collectPreviewMutationPresets(
 		}
 	};
 	const scope = (
-		candidate: import('../projection-delta/index.js').ProjectionPreviewScope,
+		candidate: import('../projection-delta/types.js').ProjectionPreviewScope,
 		scopePath: string
 	): void => {
 		if (candidate.partition.kind === 'expression') {

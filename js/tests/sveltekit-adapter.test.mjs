@@ -25,7 +25,7 @@ import {
 	createReplicaCommandRuntime,
 	createReplicaDiagnostics
 } from '../dist/replica/index.js';
-import { replicaCommandProjectedLifecycle } from '../dist/replica/command-runtime.js';
+import { replicaCommandProjectedLifecycle } from '../dist/replica/command-runtime/symbols.js';
 
 async function flushMicrotasks() {
 	for (let iteration = 0; iteration < 12; iteration += 1) {

@@ -1,16 +1,15 @@
-import { createLazyReplicaCommandRuntime } from '../dist/replica/command-runtime/lazy.js';
+import { createLazyReplicaCommandRuntime } from '../dist/replica/lazy.js';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import test from 'node:test';
 
 import { createCacheEngine } from '../dist/internal/cache-engine.js';
+import { createReplicaCommandRuntime, ReplicaCommandRuntimeError } from '../dist/replica/index.js';
 import {
-	createReplicaCommandRuntime,
 	replicaCommandAuthority,
 	replicaCommandDirectProjection,
-	replicaCommandProjectionDelta,
-	ReplicaCommandRuntimeError
-} from '../dist/replica/command-runtime.js';
+	replicaCommandProjectionDelta
+} from '../dist/replica/command-runtime/symbols.js';
 import {
 	createDistributedReplica,
 	prepareReplicaCommand,
@@ -27,7 +26,7 @@ import {
 	TodoModel,
 	todoFrame
 } from './fixtures/adapter-conformance.mjs';
-import { createReplicaIndexedDbPersistence } from '../dist/replica/persistence.js';
+import { createReplicaIndexedDbPersistence } from '../dist/replica/index.js';
 import { FakeIndexedDb } from './fixtures/fake-indexeddb.mjs';
 
 const HASH_A = `sha256:${'a'.repeat(64)}`;

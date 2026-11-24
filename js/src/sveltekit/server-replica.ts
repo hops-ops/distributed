@@ -14,12 +14,9 @@ import {
 	type DistributedBoundaryOperation,
 	type DistributedBoundaryVariableContext
 } from './boundary-variables.js';
-import { boundaryOperationIdentity } from './operation-identity.js';
-import type {
-	SveltekitDistributedPageData,
-	SveltekitReplicaAuthority,
-	SveltekitReplicaHydration
-} from './replica.js';
+import { boundaryOperationIdentity } from '../operation-identity.js';
+import type { SveltekitReplicaAuthority, SveltekitReplicaHydration } from '../client.js';
+import type { SveltekitDistributedPageData } from './replica.js';
 
 export type SveltekitServerLoadEventLike<TLocals = unknown> = Readonly<{
 	locals: TLocals;

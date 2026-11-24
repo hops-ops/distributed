@@ -5,7 +5,7 @@ import {
 	createDistributedReplica,
 	replicaRecordKey
 } from '../dist/replica/index.js';
-import { replicaCommandAuthority } from '../dist/replica/command-runtime.js';
+import { replicaCommandAuthority } from '../dist/replica/command-runtime/symbols.js';
 
 const AUTH_SCHEMA_HASH = `sha256:${'a'.repeat(64)}`;
 const AUTH_PROTOCOL_HASH = `sha256:${'b'.repeat(64)}`;

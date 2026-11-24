@@ -65,7 +65,7 @@ export type ReplicaIndexMaintenanceReasonCode =
 	| 'relationship_maintenance_revalidate'
 	| 'relationship_mapping_unknown'
 	| 'unsupported_cardinality'
-	| import('../query-plan.js').ReplicaQueryPlanReasonCode;
+	| import('../query-plan/types.js').ReplicaQueryPlanReasonCode;
 
 export type ReplicaIndexMaintenanceReason = {
 	readonly code: ReplicaIndexMaintenanceReasonCode;

@@ -7,7 +7,7 @@ import type {
 	ReplicaSurfaceTrustedPresetDescriptor,
 	ReplicaValue
 } from '../types.js';
-import { resolveReplicaArgumentValue } from '../identity.js';
+import { resolveReplicaArgumentValue } from '../identity/keys.js';
 import type {
 	ReplicaFilterEvaluationOptions,
 	ReplicaQueryPlanPath,
