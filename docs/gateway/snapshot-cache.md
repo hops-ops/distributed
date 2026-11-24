@@ -1,7 +1,7 @@
 # Origin-validated query snapshots
 
-Enable `gateway-graphql-native,gateway-delivery` and the origin's SQL adapter.
-The portable `gateway-delivery` feature alone has no SQL or native runtime.
+Enable `gateway-graphql-native` and the origin's SQL adapter.
+The portable `gateway` feature alone has no SQL or native runtime.
 Caching is opt-in: mount `NativeBinding::GraphqlWithDelivery` with an explicit
 `NativeDelivery::snapshots(SnapshotLimits)` resource and declare `snapshots`
 on that binding. An unselected capability allocates no cache.

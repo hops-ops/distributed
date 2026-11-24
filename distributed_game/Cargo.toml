@@ -25,10 +25,10 @@ command-host = ["cell", "distributed/graphql"]
 celld = ["cell", "command-host", "dep:reqwest", "dep:uuid"]
 # celld worker glue (wasm32 Durable Objects): `world::zone_state::celld_worker`,
 # the zone-state HTTP surface over a cell and an R2 bucket binding.
-workers-rs = ["cell", "dep:worker", "distributed/workers-rs"]
+cloudflare-workers = ["cell", "dep:worker", "distributed/cloudflare-workers"]
 # Zones as celld Durable Objects (wasm32): `celld_zone::ZoneObject`,
 # `CelldObjectHost` (facts object to object), `celld_zone_object!`.
-celld-zone = ["cell", "ticket", "workers-rs", "dep:js-sys", "dep:wasm-bindgen", "dep:wasm-bindgen-futures", "dep:futures-util"]
+celld-zone = ["cell", "ticket", "cloudflare-workers", "dep:js-sys", "dep:wasm-bindgen", "dep:wasm-bindgen-futures", "dep:futures-util"]
 # Per-zone Prometheus metrics (dependency-free text exposition).
 metrics = []
 # Load-test bots (library + `game-bots` binary).

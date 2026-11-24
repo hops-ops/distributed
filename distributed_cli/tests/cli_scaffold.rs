@@ -168,6 +168,7 @@ fn knative_transport_serves_the_cloudevents_router() {
     // The scaffolded axum must match the major the `distributed` crate exposes
     // its `Router` from, or `axum::serve(listener, app)` cannot type-check.
     assert!(cargo.contains("axum = \"0.8\""), "{cargo}");
+    assert!(cargo.contains("\"knative\""), "{cargo}");
     let service = read(&out_dir, "src/service.rs");
     assert!(service.contains(".transport(\"knative\")"), "{service}");
 }

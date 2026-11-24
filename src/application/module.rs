@@ -691,7 +691,6 @@ pub struct ModuleManifest {
     pub projections: Vec<ProjectionSpec>,
     pub models: Vec<ModelSpec>,
     pub surfaces: Vec<SurfaceSpec>,
-    pub required_capabilities: Vec<String>,
     pub fingerprint: String,
 }
 
@@ -788,7 +787,6 @@ impl Module {
         Module::new(self.id())
             .command_definitions(self.definitions.clone())
             .models(self.manifest.models.clone())
-            .required_capabilities(self.manifest.required_capabilities.clone())
             .build()
     }
 
@@ -797,7 +795,6 @@ impl Module {
         Module::new(self.id())
             .projections(self.manifest.projections.clone())
             .models(self.manifest.models.clone())
-            .required_capabilities(self.manifest.required_capabilities.clone())
             .build()
     }
 
@@ -840,7 +837,6 @@ pub struct ModuleBuilder {
     projections: Vec<ProjectionSpec>,
     models: Vec<ModelSpec>,
     surfaces: Vec<SurfaceSpec>,
-    required_capabilities: Vec<String>,
 }
 
 impl ModuleBuilder {
@@ -851,7 +847,6 @@ impl ModuleBuilder {
             projections: Vec::new(),
             models: Vec::new(),
             surfaces: Vec::new(),
-            required_capabilities: Vec::new(),
         }
     }
 
@@ -897,20 +892,6 @@ impl ModuleBuilder {
 
     pub fn surfaces(mut self, surfaces: impl IntoIterator<Item = SurfaceSpec>) -> Self {
         self.surfaces.extend(surfaces);
-        self
-    }
-
-    pub fn required_capability(mut self, capability: impl Into<String>) -> Self {
-        self.required_capabilities.push(capability.into());
-        self
-    }
-
-    pub fn required_capabilities(
-        mut self,
-        capabilities: impl IntoIterator<Item = impl Into<String>>,
-    ) -> Self {
-        self.required_capabilities
-            .extend(capabilities.into_iter().map(Into::into));
         self
     }
 
@@ -1032,10 +1013,6 @@ impl ModuleBuilder {
         models.sort_by(|left, right| left.id.cmp(&right.id));
         models = dedup_identical("model", models, |model| model.id.clone())?;
 
-        let mut required_capabilities = self.required_capabilities;
-        required_capabilities.sort();
-        required_capabilities.dedup();
-
         let mut manifest = ModuleManifest {
             id,
             commands,
@@ -1043,7 +1020,6 @@ impl ModuleBuilder {
             projections,
             models,
             surfaces,
-            required_capabilities,
             fingerprint: String::new(),
         };
         manifest.fingerprint = sha256_fingerprint(&manifest.canonical_bytes()?);

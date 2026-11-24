@@ -14,6 +14,7 @@ pub use builder::{
     EventRouteBuilder, PortableCommand, ThinCommandBuilder, ThinCommandInvoked, ThinCommandLoaded,
     TypedRouteBuilder,
 };
+#[cfg(any(feature = "graphql", feature = "runtime-tokio"))]
 pub(crate) use erased::LedgerCompaction;
 pub(super) use erased::{CausalCommandPolicy, ErasedRoutes};
 pub(super) use outbox_wiring::configure_outbox_for;

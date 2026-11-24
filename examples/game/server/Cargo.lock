@@ -825,6 +825,7 @@ version = "0.1.0"
 dependencies = [
  "async-graphql",
  "async-graphql-axum",
+ "async-graphql-parser",
  "async-trait",
  "axum",
  "base64 0.23.1",

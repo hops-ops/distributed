@@ -915,7 +915,7 @@ async fn sqlite_matrix_repo() -> SqliteRepository {
     repo
 }
 
-#[cfg(feature = "http")]
+#[cfg(feature = "knative")]
 async fn run_checkout_over_knative<R>(repo: R, ids: FlowIds)
 where
     R: Clone
@@ -981,13 +981,13 @@ async fn matrix_sqlite_persistence_over_in_memory_bus() {
     .await;
 }
 
-#[cfg(feature = "http")]
+#[cfg(feature = "knative")]
 #[tokio::test]
 async fn matrix_in_memory_persistence_over_knative() {
     run_checkout_over_knative(inmem_matrix_repo(), matrix_ids("inmem-knative")).await;
 }
 
-#[cfg(all(feature = "http", feature = "sqlite"))]
+#[cfg(all(feature = "knative", feature = "sqlite"))]
 #[tokio::test]
 async fn matrix_sqlite_persistence_over_knative() {
     run_checkout_over_knative(sqlite_matrix_repo().await, matrix_ids("sqlite-knative")).await;
@@ -1272,7 +1272,7 @@ async fn matrix_postgres_persistence_over_kafka_bus() {
     run_matrix_cell(kafka_matrix_bus(&ns).await, repo, "pg-kafka").await;
 }
 
-#[cfg(all(feature = "postgres", feature = "http"))]
+#[cfg(all(feature = "postgres", feature = "knative"))]
 #[tokio::test]
 async fn matrix_postgres_persistence_over_knative() {
     let Some((_schema, repo)) = postgres_matrix_repo().await else {

@@ -127,8 +127,6 @@ pub struct ApplicationManifest {
     #[serde(default)]
     pub surfaces: Vec<SurfaceSpec>,
     #[serde(default)]
-    pub required_capabilities: Vec<String>,
-    #[serde(default)]
     pub extensions: Vec<ApplicationExtension>,
     #[serde(default)]
     pub fingerprints: ManifestFingerprint,
@@ -148,8 +146,6 @@ struct ManifestWire {
     #[serde(default)]
     surfaces: Vec<SurfaceSpec>,
     #[serde(default)]
-    required_capabilities: Vec<String>,
-    #[serde(default)]
     extensions: Vec<ApplicationExtension>,
     #[serde(default)]
     fingerprints: ManifestFingerprint,
@@ -165,7 +161,6 @@ impl<'de> Deserialize<'de> for ApplicationManifest {
             name: wire.name,
             modules: wire.modules,
             surfaces: wire.surfaces,
-            required_capabilities: wire.required_capabilities,
             extensions: wire.extensions,
             fingerprints: wire.fingerprints,
             provenance: wire.provenance,
@@ -263,7 +258,6 @@ impl ApplicationManifest {
             projections: Vec::new(),
             models: Vec::new(),
             surfaces: Vec::new(),
-            required_capabilities: Vec::new(),
             extensions: vec![framework_compatibility_extension()],
             fingerprints: ManifestFingerprint::default(),
             provenance: ManifestProvenance::default(),
@@ -293,14 +287,12 @@ impl ApplicationManifest {
         let mut events = Vec::new();
         let mut projections = Vec::new();
         let mut models = Vec::new();
-        let mut required_capabilities = Vec::new();
         let mut module_surfaces = Vec::new();
         for module in &module_manifests {
             commands.extend(module.commands.clone());
             events.extend(module.events.clone());
             projections.extend(module.projections.clone());
             models.extend(module.models.clone());
-            required_capabilities.extend(module.required_capabilities.clone());
             module_surfaces.extend(module.surfaces.clone());
         }
         let explicit_surfaces = surfaces.into_iter().collect::<Vec<_>>();
@@ -326,7 +318,6 @@ impl ApplicationManifest {
         manifest.projections = dedup_projections(projections)?;
         manifest.models = dedup_models(models)?;
         manifest.surfaces = surfaces;
-        manifest.required_capabilities = required_capabilities;
         manifest.canonicalize_collections();
         manifest.validate()?;
         manifest.refresh_fingerprints()?;
@@ -558,9 +549,6 @@ impl ApplicationManifest {
                 require_nested_fingerprints,
             )?;
         }
-        for capability in &self.required_capabilities {
-            validate_portable_text("capability", capability)?;
-        }
         let mut extension_ids = BTreeSet::new();
         for extension in &self.extensions {
             if !extension_ids.insert(extension.id.clone()) {
@@ -632,8 +620,6 @@ impl ApplicationManifest {
             .sort_by(|left, right| left.id.cmp(&right.id));
         self.models.sort_by(|left, right| left.id.cmp(&right.id));
         self.surfaces.sort_by(|left, right| left.id.cmp(&right.id));
-        self.required_capabilities.sort();
-        self.required_capabilities.dedup();
         self.extensions.sort_by(|left, right| {
             (left.id.as_str(), left.version).cmp(&(right.id.as_str(), right.version))
         });
@@ -682,10 +668,6 @@ fn validate_module(
     validate_collection_len("module projections", module.projections.len())?;
     validate_collection_len("module models", module.models.len())?;
     validate_collection_len("module surfaces", module.surfaces.len())?;
-    validate_collection_len(
-        "module required capabilities",
-        module.required_capabilities.len(),
-    )?;
     validate_fingerprint(
         "module",
         &module.id,
@@ -820,9 +802,6 @@ fn validate_module(
     }
     for model in &module.models {
         validate_model(model, &module_model_ids, require_nested_fingerprints)?;
-    }
-    for capability in &module.required_capabilities {
-        validate_portable_text("module capability", capability)?;
     }
     Ok(())
 }

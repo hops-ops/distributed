@@ -17,7 +17,7 @@
 //! **Size.** A snapshot up to [`ZONE_STATE_INLINE_MAX`] bytes is stored in
 //! the cell itself (in the `zone_state.saved` event and the aggregate
 //! snapshot). A larger one goes to object storage: the worker route
-//! (`celld_worker::fetch`, feature `workers-rs`) writes the bytes to an R2 bucket
+//! (`celld_worker::fetch`, feature `cloudflare-workers`) writes the bytes to an R2 bucket
 //! binding of celld (the fleet bucket; RustFS in the Hops stack) under
 //! `zone-state/{zone}/{token}-{sha256}` *before* the command, and the cell
 //! records only `{key, sha256, len}`. The blob a save or delete supersedes
@@ -366,7 +366,7 @@ pub fn blob_key(zone_id: &str, token: u64, sha256: &str) -> String {
 /// celld worker glue: the `zone-state/{zone}` HTTP surface over a
 /// `ZoneState` cell and an R2 bucket binding (see the module docs). The
 /// caller authenticates the internal secret first.
-#[cfg(all(feature = "workers-rs", target_arch = "wasm32"))]
+#[cfg(all(feature = "cloudflare-workers", target_arch = "wasm32"))]
 pub mod celld_worker {
     use super::*;
     use ::worker::{Bucket, Method, Request, Response, Result};

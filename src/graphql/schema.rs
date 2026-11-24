@@ -281,7 +281,7 @@ pub fn build_role_schema(
                         .unwrap_or_else(Session::new);
                     let authority = ctx.data_opt::<ExecutionAuthority>().cloned();
                     let protocol = ctx.data_opt::<ProtocolResponseAccumulator>().cloned();
-                    #[cfg(feature = "gateway-delivery")]
+                    #[cfg(feature = "gateway")]
                     let captured = ctx.data_opt::<super::delivery::PlanCapture>().cloned();
                     let selection = compile::selection_from_field(ctx.field());
                     SubscriptionFieldFuture::new(async move {
@@ -289,7 +289,7 @@ pub fn build_role_schema(
                             async_graphql::Error::new("GraphqlEngine not in request data")
                         })?;
                         let role = execution_privilege(authority.as_ref())?;
-                        #[cfg(feature = "gateway-delivery")]
+                        #[cfg(feature = "gateway")]
                         if let Some(captured) = captured {
                             let plan = compile::compile_query(
                                 &inner,
@@ -789,7 +789,7 @@ async fn resolve_root(
     let selection = compile::selection_from_field(ctx.field());
     let plan = compile::compile_query(&inner, &session, &role, model, kind, &selection)
         .map_err(|e| compile_client_error(&e))?;
-    #[cfg(feature = "gateway-delivery")]
+    #[cfg(feature = "gateway")]
     if let Some(captured) = ctx.data_opt::<super::delivery::PlanCapture>() {
         if let QueryPlan::Sql(plan) = plan {
             let mut plans = captured
@@ -813,7 +813,7 @@ async fn resolve_root(
             .map_err(|_| client_error("INTERNAL", "cell read dependency failed"))?,
         QueryPlan::Sql(plan) => {
             let (pool, primary) = (&inner.pool, true);
-            #[cfg(feature = "gateway-delivery")]
+            #[cfg(feature = "gateway")]
             let (pool, primary) = ctx
                 .data_opt::<super::engine::read_routing::ReadRequest>()
                 .map_or((pool, primary), |read| read.pool(&inner, &plan));

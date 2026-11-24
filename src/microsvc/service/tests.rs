@@ -1,6 +1,6 @@
 #[cfg(feature = "graphql")]
 use super::causal::collapse_projection_evidence;
-#[cfg(background_workers)]
+#[cfg(feature = "runtime-tokio")]
 use super::routes::LedgerCompaction;
 use super::*;
 use crate::aggregate::Aggregate;
@@ -14,7 +14,7 @@ use crate::command::{CommandInputType, CommandOutputType, CommandTypeDef, Comman
 #[cfg(feature = "graphql")]
 use crate::command_dispatch::SharedCommandHost;
 use crate::command_dispatch::VerifiedPrincipal;
-#[cfg(background_workers)]
+#[cfg(feature = "runtime-tokio")]
 use crate::command_ledger::CommandLedgerState;
 use crate::command_ledger::{
     AttemptFence, CausalCommitBatch, CausalGetStream, CausalRepositoryIdentity,
@@ -4392,6 +4392,7 @@ fn default_lane_name_cannot_be_used_as_a_named_lane() {
     let _ = Service::new().lane(DEFAULT_DELIVERY_LANE, lane_recorder(&log, "x"));
 }
 
+#[cfg(any(feature = "graphql", feature = "runtime-tokio"))]
 macro_rules! ledger_compaction_routes {
     ($repository:expr, $command:literal) => {
         Routes::new()
@@ -4413,7 +4414,7 @@ macro_rules! ledger_compaction_routes {
     };
 }
 
-#[cfg(background_workers)]
+#[cfg(feature = "runtime-tokio")]
 macro_rules! ledger_compaction_service {
     ($repository:expr) => {
         Service::new()
@@ -4422,7 +4423,7 @@ macro_rules! ledger_compaction_service {
     };
 }
 
-#[cfg(background_workers)]
+#[cfg(feature = "runtime-tokio")]
 async fn reserve_for_compaction<R: CommandLedgerStore>(
     repository: &R,
 ) -> (CommandLedgerKey, crate::command_ledger::CommandAttempt) {
@@ -4450,7 +4451,7 @@ async fn reserve_for_compaction<R: CommandLedgerStore>(
     }
 }
 
-#[cfg(background_workers)]
+#[cfg(feature = "runtime-tokio")]
 /// Writes a terminal row whose retention lapses 50 ms after commit, a
 /// terminal row retained for 300 s and an in-progress row, then runs the
 /// worker's pass until the first one is due. The ledger has no injectable
@@ -4521,7 +4522,7 @@ where
     ));
 }
 
-#[cfg(background_workers)]
+#[cfg(feature = "runtime-tokio")]
 #[tokio::test]
 async fn ledger_worker_pass_compacts_only_expired_rows_in_memory() {
     let repository = InMemoryRepository::new();
@@ -4539,6 +4540,7 @@ async fn ledger_worker_pass_compacts_only_expired_rows_in_sqlite() {
     worker_pass_compacts_only_expired_rows(&service, &repository).await;
 }
 
+#[cfg(any(feature = "graphql", feature = "runtime-tokio"))]
 #[tokio::test]
 async fn service_compacts_each_command_repository_once() {
     let shared = InMemoryRepository::new();
@@ -4553,7 +4555,7 @@ async fn service_compacts_each_command_repository_once() {
     assert_eq!(service.command_ledgers().len(), 2);
 }
 
-#[cfg(background_workers)]
+#[cfg(feature = "runtime-tokio")]
 /// `with_bus` starts the worker: with no explicit pass, the expired row is
 /// compacted. Tokio time is paused, so the worker's interval elapses as soon
 /// as the runtime is idle; the row's retention is wall-clock time.
@@ -4591,7 +4593,7 @@ async fn with_bus_runs_ledger_compaction() {
     drop(service);
 }
 
-#[cfg(background_workers)]
+#[cfg(feature = "runtime-tokio")]
 #[tokio::test]
 async fn dropping_the_ledger_compaction_worker_stops_it() {
     let ledger: LedgerCompaction = Arc::new(|_| Box::pin(async { Ok(0) }));

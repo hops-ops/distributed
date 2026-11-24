@@ -109,7 +109,6 @@ pub struct ApplicationBuilder {
     name: String,
     modules: Vec<Module>,
     surfaces: Vec<SurfaceSpec>,
-    required_capabilities: Vec<String>,
     extensions: Vec<ApplicationExtension>,
     provenance: Option<ManifestProvenance>,
 }
@@ -120,7 +119,6 @@ impl ApplicationBuilder {
             name: name.into(),
             modules: Vec::new(),
             surfaces: Vec::new(),
-            required_capabilities: Vec::new(),
             extensions: Vec::new(),
             provenance: None,
         }
@@ -146,20 +144,6 @@ impl ApplicationBuilder {
         self
     }
 
-    pub fn required_capability(mut self, capability: impl Into<String>) -> Self {
-        self.required_capabilities.push(capability.into());
-        self
-    }
-
-    pub fn required_capabilities(
-        mut self,
-        capabilities: impl IntoIterator<Item = impl Into<String>>,
-    ) -> Self {
-        self.required_capabilities
-            .extend(capabilities.into_iter().map(Into::into));
-        self
-    }
-
     pub fn extension(mut self, extension: ApplicationExtension) -> Self {
         self.extensions.push(extension);
         self
@@ -180,12 +164,6 @@ impl ApplicationBuilder {
 
     pub fn build(self) -> ApplicationResult<Application> {
         let mut application = Application::try_new(self.name, self.modules, self.surfaces)?;
-        application
-            .manifest
-            .required_capabilities
-            .extend(self.required_capabilities);
-        application.manifest.required_capabilities.sort();
-        application.manifest.required_capabilities.dedup();
         application.manifest.extensions.extend(self.extensions);
         if let Some(provenance) = self.provenance {
             application.manifest = application.manifest.with_provenance(provenance);

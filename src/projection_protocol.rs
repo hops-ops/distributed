@@ -61,12 +61,14 @@ const PROJECTION_RECORD_KEY_DIGEST_DOMAIN: &[u8] = b"distributed.projection.reco
 
 /// Complete projection key in declaration order.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg(any(feature = "graphql", test))]
 pub(crate) struct RecordKey {
     pub(crate) fields: Vec<RecordKeyField>,
 }
 
 /// One resolved field in a complete projection key.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg(any(feature = "graphql", test))]
 pub(crate) struct RecordKeyField {
     pub(crate) field: String,
     pub(crate) value: serde_json::Value,
@@ -441,6 +443,7 @@ impl ProjectionSource {
     /// This is crate-private because source adapters mint trusted identities;
     /// public callers cannot turn arbitrary database-shaped bytes into cursor
     /// authority.
+    #[cfg(any(feature = "graphql", feature = "sqlite", feature = "postgres", test))]
     pub(crate) fn from_canonical_name_bytes(
         canonical_name_bytes: &[u8],
         canonical_partition_bytes: impl Into<Vec<u8>>,
@@ -987,6 +990,7 @@ fn append_length_prefixed(target: &mut Vec<u8>, value: &[u8]) {
     target.extend_from_slice(value);
 }
 
+#[cfg(any(feature = "graphql", feature = "sqlite", feature = "postgres", test))]
 fn take_length_prefixed(bytes: &[u8]) -> Option<(&[u8], &[u8])> {
     let length_bytes: [u8; std::mem::size_of::<u64>()] =
         bytes.get(..std::mem::size_of::<u64>())?.try_into().ok()?;

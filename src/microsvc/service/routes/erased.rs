@@ -1,9 +1,8 @@
 #[cfg(feature = "graphql")]
-use super::super::causal::CausalCommandPublicStatus;
 use super::super::causal::{
-    CausalDispatchError, CausalDispatchResult, ExternalCausalAttempt, ExternalCausalReservation,
-    SealModeledProjection,
+    CausalCommandPublicStatus, ExternalCausalAttempt, ExternalCausalReservation,
 };
+use super::super::causal::{CausalDispatchError, CausalDispatchResult, SealModeledProjection};
 use super::super::handlers::{HandlerFuture, ProjectorBootstrapFuture};
 use super::outbox_wiring::DynBusPublisher;
 use super::spec::HandlerSpec;
@@ -12,12 +11,13 @@ use crate::bus::{Message, OrderedDelivery};
 use crate::command::CommandConsistency;
 use crate::command::TypedCommandContract;
 use crate::command_dispatch::VerifiedPrincipal;
+use crate::command_ledger::CommandLookup;
+#[cfg(any(feature = "graphql", feature = "runtime-tokio"))]
+use crate::command_ledger::{CausalStorageIdentity, CommandLedgerError};
 #[cfg(feature = "graphql")]
-use crate::command_ledger::CommandContractFingerprint;
-use crate::command_ledger::CommandLedgerError;
-use crate::command_ledger::{CausalStorageIdentity, CommandLookup, ExternalDispatchBinding};
-#[cfg(feature = "graphql")]
-use crate::command_ledger::{CommandId, CommandLedgerKey};
+use crate::command_ledger::{
+    CommandContractFingerprint, CommandId, CommandLedgerKey, ExternalDispatchBinding,
+};
 use crate::microsvc::cell_host::CellCommandIdentity;
 use crate::microsvc::projector::{
     ProjectionRepairHandle, ProjectorRegistration, ProjectorRepairFuture,
@@ -30,6 +30,7 @@ use serde_json::Value;
 use std::collections::BTreeMap;
 use std::future::Future;
 use std::pin::Pin;
+#[cfg(any(feature = "graphql", feature = "runtime-tokio"))]
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -62,18 +63,22 @@ pub(in crate::microsvc::service) type CausalStatusFuture<'a> = Pin<
 pub(in crate::microsvc::service) type CausalStatusRoute<'a> =
     dyn Fn(&str, &[u8; 32]) -> Option<CommandConsistency> + Send + Sync + 'a;
 
+#[cfg(feature = "graphql")]
 pub(in crate::microsvc::service) type ExternalReservationFuture<'a> = Pin<
     Box<dyn Future<Output = Result<ExternalCausalReservation, CausalDispatchError>> + Send + 'a>,
 >;
 
+#[cfg(feature = "graphql")]
 pub(in crate::microsvc::service) type ExternalCompletionFuture<'a> =
     Pin<Box<dyn Future<Output = Result<(), CausalDispatchError>> + Send + 'a>>;
 
+#[cfg(feature = "graphql")]
 pub(in crate::microsvc::service) type ExternalAbandonFuture<'a> =
     Pin<Box<dyn Future<Output = Result<(), CausalDispatchError>> + Send + 'a>>;
 
 /// One bounded compaction pass over a command ledger, owning its repository
 /// handle so a background worker can run it.
+#[cfg(any(feature = "graphql", feature = "runtime-tokio"))]
 pub(crate) type LedgerCompaction = Arc<
     dyn Fn(usize) -> Pin<Box<dyn Future<Output = Result<u64, CommandLedgerError>> + Send>>
         + Send
@@ -97,8 +102,10 @@ pub(in crate::microsvc::service) trait ErasedCausalHandler<D>:
         direct_projection: Option<crate::command::CommandDirectProjectionTarget>,
     );
 
+    #[cfg(any(feature = "graphql", feature = "runtime-tokio"))]
     fn storage_identity(&self, dependencies: &D) -> CausalStorageIdentity;
 
+    #[cfg(any(feature = "graphql", feature = "runtime-tokio"))]
     fn ledger_compaction(&self, dependencies: &D) -> LedgerCompaction;
 
     #[allow(clippy::too_many_arguments)]
@@ -146,6 +153,7 @@ pub(in crate::microsvc::service) trait ErasedCausalHandler<D>:
         protocol: Option<crate::graphql::protocol::ProtocolResponseAccumulator>,
     ) -> CausalStatusFuture<'a>;
 
+    #[cfg(feature = "graphql")]
     fn reserve_external<'a>(
         &'a self,
         dependencies: &'a D,
@@ -158,6 +166,7 @@ pub(in crate::microsvc::service) trait ErasedCausalHandler<D>:
         binding: ExternalDispatchBinding,
     ) -> ExternalReservationFuture<'a>;
 
+    #[cfg(feature = "graphql")]
     fn complete_external<'a>(
         &'a self,
         dependencies: &'a D,
@@ -165,6 +174,7 @@ pub(in crate::microsvc::service) trait ErasedCausalHandler<D>:
         result: &'a CausalDispatchResult,
     ) -> ExternalCompletionFuture<'a>;
 
+    #[cfg(feature = "graphql")]
     fn abandon_external<'a>(
         &'a self,
         dependencies: &'a D,
@@ -239,9 +249,11 @@ pub(in crate::microsvc::service) trait ErasedRoutes:
     ) -> Pin<Box<dyn Future<Output = Result<CommandLookup, CausalDispatchError>> + Send + 'a>>;
 
     /// The repository every typed command of this bundle commits to.
+    #[cfg(any(feature = "graphql", feature = "runtime-tokio"))]
     fn causal_storage_identity(&self) -> Option<CausalStorageIdentity>;
 
     /// Compaction of the ledger in that repository.
+    #[cfg(any(feature = "graphql", feature = "runtime-tokio"))]
     fn ledger_compaction(&self) -> Option<LedgerCompaction>;
 
     /// The consistency of this bundle's `command`, if `session` is still
@@ -264,6 +276,7 @@ pub(in crate::microsvc::service) trait ErasedRoutes:
         protocol: Option<crate::graphql::protocol::ProtocolResponseAccumulator>,
     ) -> CausalStatusFuture<'a>;
 
+    #[cfg(feature = "graphql")]
     fn reserve_external<'a>(
         &'a self,
         command: &'a str,
@@ -276,6 +289,7 @@ pub(in crate::microsvc::service) trait ErasedRoutes:
         binding: ExternalDispatchBinding,
     ) -> ExternalReservationFuture<'a>;
 
+    #[cfg(feature = "graphql")]
     fn complete_external<'a>(
         &'a self,
         command: &'a str,
@@ -283,6 +297,7 @@ pub(in crate::microsvc::service) trait ErasedRoutes:
         result: &'a CausalDispatchResult,
     ) -> ExternalCompletionFuture<'a>;
 
+    #[cfg(feature = "graphql")]
     fn abandon_external<'a>(
         &'a self,
         command: &'a str,

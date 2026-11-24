@@ -4,8 +4,11 @@
 //! authorization boundary. It never derives client semantics from physical
 //! table write plans.
 
+#[cfg(any(feature = "graphql", test))]
 pub(crate) mod authorization;
+#[cfg(any(feature = "graphql", test))]
 mod canonical;
+#[cfg(any(feature = "graphql", test))]
 pub(crate) mod lower;
 #[cfg(feature = "graphql")]
 pub(crate) mod runtime;

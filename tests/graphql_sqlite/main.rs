@@ -686,7 +686,7 @@ async fn domain_service_shaped_fixture() {
     assert_eq!(data["orders"][0]["name"], "widget");
 }
 
-#[cfg(feature = "gateway-delivery")]
+#[cfg(feature = "gateway")]
 #[tokio::test]
 async fn gateway_dependency_inventory_includes_empty_relationship_filters() {
     use distributed::graphql::delivery::GatewayVersionStore;

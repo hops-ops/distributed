@@ -25,16 +25,14 @@
 //! ```
 
 mod bus_publisher;
-#[cfg(any(background_workers, test))]
+#[cfg(any(feature = "runtime-tokio", test))]
 mod drain;
 mod outbox_dispatch;
 mod outbox_source;
-mod store;
+pub(crate) mod store;
 #[cfg(test)]
 pub(crate) mod testing;
 
-// Repository helpers
-pub(crate) use store::ensure_active_claim;
 pub use store::{
     ClaimOutboxMessages, OutboxBacklogStats, OutboxClaimRef, OutboxPublishFailureAction,
     OutboxStore, OUTBOX_RETRY,
@@ -42,7 +40,7 @@ pub use store::{
 
 // Outbox -> bus bridge (moved out of the bus module; depends up on bus traits).
 pub use bus_publisher::BusPublisher;
-#[cfg(any(background_workers, test))]
+#[cfg(any(feature = "runtime-tokio", test))]
 pub use drain::{
     drain_worker_id, OutboxDrainHandle, OutboxDrainRunner, OutboxPublishMailbox,
     DEFAULT_DRAIN_BATCH_SIZE, DEFAULT_DRAIN_ERROR_BACKOFF, DEFAULT_DRAIN_LEASE,

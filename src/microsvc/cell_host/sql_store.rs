@@ -1,7 +1,7 @@
 //! Cell-local execution of the ordinary SQL event/snapshot/receipt repository.
 //! No in-memory working copy and no whole-cell export are used here.
 //!
-//! Runs over Durable Object `storage.sql` (celld, `workers-rs`/wasm32): the
+//! Runs over Durable Object `storage.sql` (celld, `cloudflare-workers`/wasm32): the
 //! executor supplies only `read` and a synchronous all-or-nothing
 //! `transaction`; schema bootstrap, the command commit, ledger fencing and
 //! outbox leases are below.
@@ -11,7 +11,7 @@ use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 
 use sha2::{Digest, Sha256};
-#[cfg(all(feature = "workers-rs", target_arch = "wasm32"))]
+#[cfg(all(feature = "cloudflare-workers", target_arch = "wasm32"))]
 use worker::State;
 
 use super::sql_executor::CellSqlConnection;
@@ -64,7 +64,7 @@ pub(super) struct CellSqlRepository {
 }
 
 impl CellSqlRepository {
-    #[cfg(all(feature = "workers-rs", target_arch = "wasm32"))]
+    #[cfg(all(feature = "cloudflare-workers", target_arch = "wasm32"))]
     pub fn from_state(state: State) -> Result<Self, RepositoryError> {
         let connection = CellSqlConnection::from_state(state)?;
         Self::initialize(&connection)?;

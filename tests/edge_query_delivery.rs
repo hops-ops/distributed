@@ -1,4 +1,4 @@
-#![cfg(feature = "gateway-delivery")]
+#![cfg(feature = "gateway")]
 use distributed::gateway::delivery::*;
 use serde_json::json;
 fn identity(subject: &str) -> OriginIdentity {

@@ -95,7 +95,7 @@ struct ProtocolResponseState {
     stream_frames: Mutex<Option<VecDeque<DistributedEnvelopeV1>>>,
     dispatch_claimed: Mutex<bool>,
     codec: ProtocolTokenCodec,
-    #[cfg(feature = "gateway-delivery")]
+    #[cfg(feature = "gateway")]
     gateway: Mutex<Option<crate::graphql::delivery::GatewayCapture>>,
 }
 
@@ -110,7 +110,7 @@ impl ProtocolResponseAccumulator {
                 stream_frames: Mutex::new(None),
                 dispatch_claimed: Mutex::new(false),
                 codec,
-                #[cfg(feature = "gateway-delivery")]
+                #[cfg(feature = "gateway")]
                 gateway: Mutex::new(None),
             }),
         }
@@ -932,7 +932,7 @@ impl ProtocolResponseAccumulator {
             .map_err(|_| ProtocolAccumulatorError::Poisoned)
     }
 
-    #[cfg(feature = "gateway-delivery")]
+    #[cfg(feature = "gateway")]
     pub(crate) fn enable_gateway(
         &self,
         capture: crate::graphql::delivery::GatewayCapture,
@@ -944,11 +944,11 @@ impl ProtocolResponseAccumulator {
             .map_err(|_| ProtocolAccumulatorError::Poisoned)? = Some(capture);
         Ok(())
     }
-    #[cfg(feature = "gateway-delivery")]
+    #[cfg(feature = "gateway")]
     pub(crate) fn gateway_enabled(&self) -> bool {
         self.inner.gateway.lock().is_ok_and(|state| state.is_some())
     }
-    #[cfg(feature = "gateway-delivery")]
+    #[cfg(feature = "gateway")]
     pub(crate) fn record_gateway_versions(
         &self,
         versions: &crate::graphql::delivery::VersionVector,
@@ -993,7 +993,7 @@ impl ProtocolResponseAccumulator {
             serde_json::to_value(envelope).map_err(|_| ProtocolAccumulatorError::Encoding)?;
         let value = Value::from_json(json).map_err(|_| ProtocolAccumulatorError::Encoding)?;
         response.extensions.insert("distributed".into(), value);
-        #[cfg(feature = "gateway-delivery")]
+        #[cfg(feature = "gateway")]
         if response.errors.is_empty() {
             let state = self
                 .inner

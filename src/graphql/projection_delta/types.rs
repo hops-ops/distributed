@@ -35,6 +35,7 @@ impl ProjectionDeltaCacheScopeToken {
         Self::parse_wire(token.as_str())
     }
 
+    #[cfg(any(feature = "graphql", test))]
     pub(crate) fn as_str(&self) -> &str {
         &self.0
     }
@@ -290,6 +291,7 @@ impl ProjectionDelta {
     ///
     /// Returns [`ProjectionDeltaError::ReplayScopeMismatch`] when any
     /// role/application/generation identity differs.
+    #[cfg(any(feature = "graphql", test))]
     pub(crate) fn validate_replay_scope(
         &self,
         manifest: &crate::graphql::client_manifest::DistributedClientManifest,
@@ -639,6 +641,7 @@ pub enum DeltaValue {
 }
 
 impl DeltaValue {
+    #[cfg(any(feature = "graphql", test))]
     pub(crate) fn try_from_projection_ref(
         value: crate::ProjectionValueRef<'_>,
     ) -> Result<Self, ProjectionDeltaError> {
@@ -743,6 +746,7 @@ impl DeltaValue {
 
 /// Whether provenance is an applied event or a compiler preview.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg(any(feature = "graphql", test))]
 pub(crate) enum ProjectionMutationSource {
     Actual,
     Preview,
@@ -750,6 +754,7 @@ pub(crate) enum ProjectionMutationSource {
 
 /// Authorization visibility independent of record existence or liveness.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg(any(feature = "graphql", test))]
 pub(crate) enum ProjectionDeltaVisibility {
     Authorized,
     Denied,
@@ -759,6 +764,7 @@ pub(crate) enum ProjectionDeltaVisibility {
 /// Explicit authorization transition. A domain delete under stable permission
 /// is `Authorized` to `Authorized`; it is not an authorization transition.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg(any(feature = "graphql", test))]
 pub(crate) struct AuthorizationTransition {
     pub before: ProjectionDeltaVisibility,
     pub after: ProjectionDeltaVisibility,

@@ -1,12 +1,5 @@
 #![allow(clippy::module_inception)]
 #![doc = include_str!("../README.md")]
-// Projection + GraphQL client surfaces always compile (shared types), but many
-// call sites live behind optional features. Without those features rustc reports
-// false "never used" warnings for the protocol store helpers. CI builds with features.
-#![cfg_attr(
-    not(any(feature = "graphql", feature = "sqlite", feature = "postgres", test)),
-    allow(dead_code)
-)]
 
 // Allow proc-macros to reference this crate by name even when used internally
 extern crate self as distributed;
@@ -85,9 +78,8 @@ pub use entity::{
 pub use application::{
     admit_command_session, command_roles_require_principal, Application, ApplicationError,
     ApplicationManifest, CommandMount, CommandMountRegistrar, CommandSpec, ContractCompiler,
-    DeploymentPlan, FrameworkCompatibility, LogicalId, Module, ModuleManifest, MountSelector,
-    ProcessIntent, ProcessPreset, ProjectionSpec, Runtime, RuntimeDialect, SurfaceSpec,
-    APPLICATION_MANIFEST_SCHEMA_VERSION, DEPLOYMENT_PLAN_SCHEMA_VERSION,
+    FrameworkCompatibility, LogicalId, Module, ModuleManifest, ProjectionSpec, SurfaceSpec,
+    APPLICATION_MANIFEST_SCHEMA_VERSION,
 };
 #[cfg(feature = "graphql")]
 pub use command_dispatch::{
@@ -361,7 +353,7 @@ pub use outbox::{
 // `DEFAULT_OUTBOX_SOURCE_BATCH`, `DEFAULT_OUTBOX_SOURCE_LEASE`) stay reachable
 // under `distributed::outbox_worker::*` and are intentionally NOT re-exported
 // at the crate root.
-#[cfg(any(background_workers, test))]
+#[cfg(any(feature = "runtime-tokio", test))]
 pub use outbox_worker::{
     drain_worker_id, OutboxDrainHandle, OutboxDrainRunner, OutboxPublishMailbox,
     DEFAULT_OUTBOX_HINT_CAPACITY,

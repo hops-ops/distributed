@@ -3,7 +3,8 @@
 
 use super::{json_error, signed, unsigned, SqlBind, SqlExecutor, SqlPart, SqlRow, Statement};
 use crate::outbox::{OutboxMessage, OutboxMessageStatus};
-use crate::outbox_worker::{ensure_active_claim, ClaimOutboxMessages, OutboxClaimRef};
+use crate::outbox_worker::store::ensure_active_claim;
+use crate::outbox_worker::{ClaimOutboxMessages, OutboxClaimRef};
 use crate::repository::{sqlite_codec, RepositoryError};
 use std::borrow::Cow;
 use std::time::{Duration, SystemTime};

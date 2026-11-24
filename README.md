@@ -651,7 +651,8 @@ network servers.
 
 | Feature | Default | Adds |
 |---|---:|---|
-| `http` | No | Axum HTTP transport for `microsvc` + the Knative/CloudEvents ingress router. |
+| `http` | No | Axum HTTP transport for `microsvc`. |
+| `knative` | No | Knative: `bus::KnativeBus`, `bus::knative_triggers` and the CloudEvents ingress `microsvc::cloud_events_router` (implies `http`). |
 | `grpc` | No | Tonic gRPC transport for `microsvc`. |
 | `graphql` | No | GraphQL query service over read models (pulls in `http` + WebSocket). Pair with `sqlite` and/or `postgres` for a dialect. |
 | `postgres` | No | `PostgresRepository` and the Postgres outbox/transport (`PostgresBus`). |
@@ -663,13 +664,17 @@ network servers.
 | `leaderboard-background` | No | `leaderboard::BackgroundLeaderboard` (fire-and-forget updates on a Tokio task) over any `LeaderboardStore`, e.g. `InMemoryLeaderboard`, without pulling in Redis. |
 | `metrics` | No | `distributed::metrics`: framework counters and gauges with Prometheus text exposition (no SDK dependency); with `http`, a scrape handler. Bus receive loops record into it. |
 | `otel` | No | OpenTelemetry tracing spans for bus receive loops and `microsvc` dispatch/handlers (`opentelemetry`, `tracing-opentelemetry`). |
-| `workers-rs` | No | Cloudflare `worker` crate bindings for celld cells: the aggregate cell host and the celld Queue publisher/relay (`bus::CelldQueue*`) on `wasm32`. |
-| `gateway` | No | `distributed::gateway`: portable gateway declarations (bindings, routes, dispatch). Starts no listeners. |
+| `cloudflare-workers` | No | Code that runs inside a celld Worker (`wasm32` Durable Objects, Cloudflare `worker` crate): the cell host's Durable Object storage and outbox, and the celld Queue publisher/relay (`bus::CelldQueue*`). |
+| `gateway` | No | `distributed::gateway`: portable gateway declarations (bindings, routes, dispatch), whole-operation GraphQL selection (parser only) and the delivery identity/freshness contracts (snapshots, coalescing, live sharing). Starts no listeners. |
 | `gateway-native` | No | Native HTTP gateway adapter (hyper/tower), independent of GraphQL and SQL. |
-| `gateway-graphql` | No | Whole-operation GraphQL selection for the gateway (parser only). |
-| `gateway-delivery` | No | Portable identity, freshness and delivery contracts (snapshots, coalescing, live sharing). |
-| `gateway-graphql-native` | No | Native GraphQL execution behind the gateway, including WebSocket `@live` (implies `gateway-native`, `gateway-graphql`, `graphql`). |
+| `gateway-graphql-native` | No | Native GraphQL execution behind the gateway, including WebSocket `@live` and native delivery (snapshots, coalescing, live sharing; each opt-in at runtime). Implies `gateway-native`, `graphql`. |
 | `gateway-worker` | No | workers-rs gateway ingress and delivery contracts, without native executors. |
+
+`runtime-tokio` is internal: every Tokio-using feature above (`http`, `grpc`,
+`postgres`, `sqlite`, `nats`, `rabbitmq`, `kafka`, `redis`,
+`leaderboard-background`) implies it, and the crate gates its Tokio-only code
+(the outbox drain and consumer workers) on it. Enable the transport or store you
+need rather than `runtime-tokio` itself.
 
 > The `InMemoryBus`, `PostgresBus`, and `SqliteBus` need no separate broker
 > feature. SQL-backed bus support comes from the matching `postgres` or `sqlite`
@@ -1314,7 +1319,7 @@ are rejected before broker topology is created.
 | `NatsBus` | `nats` | shared durable `{group}_cmd` on the stream | durable `{group}_evt` per group |
 | `RabbitBus` | `rabbitmq` | default exchange → durable queue `{ns}.cmd.{name}` | topic exchange → queue `{ns}.evt.{group}` per group |
 | `KafkaBus` | `kafka` | shared consumer group `{ns}.{group}.cmd` | consumer group per service `{ns}.{group}.evt` |
-| `KnativeBus` | `http` | POST CloudEvent → `{target}-commands` broker ingress | POST → `{source}-events` broker; consume via generated Triggers |
+| `KnativeBus` | `knative` | POST CloudEvent → `{target}-commands` broker ingress | POST → `{source}-events` broker; consume via generated Triggers |
 
 `SqliteBus` uses the same single-database pattern scaled down to SQLite:
 `bus_queue` is claimed with a conditional `UPDATE ... RETURNING` lease because

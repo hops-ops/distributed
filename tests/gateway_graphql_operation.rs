@@ -1,4 +1,4 @@
-#![cfg(feature = "gateway-graphql")]
+#![cfg(feature = "gateway")]
 use distributed::gateway::{graphql::*, GraphqlCapabilities};
 use serde_json::json;
 

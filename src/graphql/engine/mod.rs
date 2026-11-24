@@ -97,10 +97,10 @@ pub fn core_sdl_for_catalog(tables: &[TableSchema]) -> Result<String, String> {
     validation::core_sdl_for_catalog(tables)
 }
 
-#[cfg(feature = "gateway-delivery")]
+#[cfg(feature = "gateway")]
 pub(crate) mod read_routing;
-#[cfg(feature = "gateway-delivery")]
+#[cfg(feature = "gateway")]
 pub use read_routing::ReadRouting;
 
-#[cfg(feature = "gateway-delivery")]
+#[cfg(feature = "gateway")]
 mod delivery;

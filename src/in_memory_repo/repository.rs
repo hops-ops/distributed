@@ -145,7 +145,7 @@ impl InMemoryRepository {
     }
 
     /// The stored state of a ledger row, without the lookup's expiry rule.
-    #[cfg(test)]
+    #[cfg(all(test, feature = "runtime-tokio"))]
     pub(crate) fn command_ledger_state(
         &self,
         key: &CommandLedgerKey,

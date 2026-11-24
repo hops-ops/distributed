@@ -142,6 +142,7 @@ pub enum ScorePolicy {
 }
 
 impl ScorePolicy {
+    #[cfg(feature = "redis")]
     pub(crate) fn as_str(self) -> &'static str {
         match self {
             ScorePolicy::Max => "max",

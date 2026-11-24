@@ -401,7 +401,7 @@ macro_rules! scenarios {
         }
 
         /// The Knative ingress: a CloudEvent marked as a command.
-        #[cfg(feature = "http")]
+        #[cfg(feature = "knative")]
         #[tokio::test]
         async fn the_knative_ingress_delivers_typed_commands_through_the_ledger() {
             let db = $fresh.await;

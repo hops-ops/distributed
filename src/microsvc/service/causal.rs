@@ -5,11 +5,12 @@ use serde_json::Value;
 use super::routes::CausalCommandPolicy;
 use crate::command::{CommandConsistency, TypedCommandContract};
 use crate::command_ledger::{
-    AttemptFence, CanonicalInputHash, CausationId, CommandAttempt, CommandContractFingerprint,
-    CommandId, CommandLedgerError, CommandLedgerKey, CommandLedgerState, CommandLedgerStore,
-    CommandLookup, CommandLookupScope, CommandReplay, CommandReservation, PrincipalPartitionId,
-    TerminalCommandState,
+    AttemptFence, CanonicalInputHash, CausationId, CommandContractFingerprint, CommandId,
+    CommandLedgerError, CommandLedgerKey, CommandLedgerState, CommandLedgerStore, CommandLookup,
+    CommandLookupScope, CommandReplay, CommandReservation, PrincipalPartitionId,
 };
+#[cfg(feature = "graphql")]
+use crate::command_ledger::{CommandAttempt, TerminalCommandState};
 use crate::microsvc::cell_host::{CellCommandIdentity, CellProjectionEventWireItem};
 use crate::microsvc::error::HandlerError;
 use crate::microsvc::session::Session;
@@ -196,17 +197,20 @@ pub struct CausalDispatchResult {
 /// Gateway-side capability for one externally dispatched command. The attempt
 /// owns the durable reservation and is consumed only by terminal completion or
 /// retryable-unknown recovery; it is never reconstructed from the wire.
+#[cfg(feature = "graphql")]
 pub(crate) struct ExternalCausalAttempt {
     pub(crate) command_name: String,
     pub(crate) attempt: CommandAttempt,
     pub(crate) retention: Duration,
 }
 
+#[cfg(feature = "graphql")]
 pub(crate) enum ExternalCausalReservation {
     Acquired(ExternalCausalAttempt),
     Replay(CausalDispatchResult),
 }
 
+#[cfg(feature = "graphql")]
 impl ExternalCausalAttempt {
     pub(crate) fn command_id(&self) -> &str {
         self.attempt.key().command_id()
@@ -264,7 +268,6 @@ impl ExternalCausalAttempt {
                 "external command attempt lost its immutable route binding".into(),
             )
         })?;
-        #[cfg(feature = "graphql")]
         if let Some(metadata) = result.receipt.projection_metadata.as_ref() {
             let bytes = metadata.canonical_bytes().map_err(|error| {
                 CausalDispatchError::Internal(format!(
@@ -814,6 +817,7 @@ pub(super) fn internal_ledger_error(error: CommandLedgerError) -> CausalDispatch
     CausalDispatchError::Internal(error.to_string())
 }
 
+#[cfg(feature = "graphql")]
 pub(super) async fn abandon_external_attempt<R>(
     repository: &R,
     attempt: ExternalCausalAttempt,

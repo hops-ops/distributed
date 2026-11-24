@@ -65,7 +65,7 @@ projector or event consumer. Disabling this mount restores previous entrypoints.
 
 ### GraphQL executors
 
-`gateway-graphql` adds a portable parser-based selected-operation policy; it
+`gateway` includes a portable parser-based selected-operation policy; it
 compiles to Wasm without an executor. `gateway-graphql-native` binds the existing
 GraphQL HTTP/WS executor or a whole remote endpoint to `NativeBinding::Graphql`.
 Build query-only engines without command inventory and with `subscriptions(false)`
@@ -83,7 +83,7 @@ the existing direct executor routes; no migration is required.
 
 ### Causal read routing
 
-`gateway-delivery` supplies bounded exact-scope identity, dependency overlap and
+`gateway` supplies bounded exact-scope identity, dependency overlap and
 record/index minima contracts without a server or SQL dependency. With GraphQL,
 `ReadRouting::new(replica).stale_tolerant(document, operation_name)` explicitly
 registers stale-tolerant reads. Pass it to `GraphqlEngineBuilder::read_routing`;
@@ -114,7 +114,7 @@ to primary; keep client revision fences active during a deployment rollback.
 The isolated physical standby fixture is documented in tests/gateway-postgres.
 
 Snapshot caching is available through the explicit `NativeDelivery::snapshots`
-resource (`gateway-graphql-native,gateway-delivery`). Origin-side
+resource (`gateway-graphql-native`). Origin-side
 `GatewayVersionStore` supplies transactional data/proof dependency versions;
 every hit authenticates and validates at the primary without result SQL.
 See [activation, limits, public-age policy and rollback](../../docs/gateway/snapshot-cache.md).

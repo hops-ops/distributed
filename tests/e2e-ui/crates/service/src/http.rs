@@ -56,7 +56,6 @@ pub fn gateway_router(
     service: Arc<Service>,
     options: &crate::HostOptions,
 ) -> Result<axum::Router, std::io::Error> {
-    use distributed::application::{MountSelector, Runtime};
     use distributed::command_dispatch::LocalCommandHost;
     use distributed::gateway::{delivery::*, native::*, *};
     use distributed::graphql::identity::OidcGatewayProvider;
@@ -131,91 +130,84 @@ pub fn gateway_router(
         .into_iter()
         .next()
         .ok_or_else(|| std::io::Error::other("application surface missing"))?;
-    let application = service
+    // The application declares the public gateway it is served through.
+    service
         .application(crate::E2E_UI_APPLICATION, surface)
         .map_err(std::io::Error::other)?
         .with_gateway("public", &gateway)
         .map_err(std::io::Error::other)?;
-    let selector = MountSelector::gateway("public").map_err(std::io::Error::other)?;
-    let runtime = Runtime::default()
-        .mount_gateway(&application, selector.clone(), gateway)
-        .map_err(std::io::Error::other)?;
-    runtime
-        .bind_gateway(&selector, |gateway| {
-            let graphql = GraphqlBinding::Embedded(
-                EmbeddedGraphql::new(
-                    engine.clone(),
-                    Some(Arc::new(LocalCommandHost::new(service.clone()))),
-                    capabilities,
-                )
-                .map_err(std::io::Error::other)?,
-            );
-            let graphql = if options.delivery == DeliveryCapabilities::default() {
-                NativeBinding::Graphql(graphql)
-            } else {
-                let delivery = NativeDelivery::new(NativeDeliveryOptions {
-                    snapshots: options.delivery.snapshots.then(SnapshotLimits::default),
-                    coalescing: options.delivery.coalescing.then(FlightLimits::default),
-                    live: options.delivery.live_sharing.then(LiveLimits::default),
-                })
-                .map_err(std::io::Error::other)?;
-                NativeBinding::GraphqlWithDelivery(graphql, Arc::new(delivery))
-            };
-            let auth = if let Some(config) = engine.identity_config().oidc().cloned() {
-                let provider = Arc::new(OidcGatewayProvider::new(config, "e2e-ui-oidc-v1"));
-                NativeAuth::new(move |credentials| {
-                    let provider = provider.clone();
-                    async move { provider.authenticate(&credentials).await }
-                })
-            } else {
-                NativeAuth::anonymous()
-            };
-
-            let ingress = service.clone();
-            let scrape = service.clone();
-            let service_routes = distributed::microsvc::router(service)
-                .route(
-                    "/zitadel.ingress.v1",
-                    post(move |headers: HeaderMap, Json(body): Json<Value>| {
-                        let svc = ingress.clone();
-                        async move {
-                            let caller = session_from_headers(&headers);
-                            command_response(
-                                zitadel::COMMAND,
-                                zitadel::receive(&svc, &caller, body).await,
-                            )
-                        }
-                    }),
-                )
-                .route(
-                    "/zitadel.scrape.v1",
-                    post(move |headers: HeaderMap| {
-                        let svc = scrape.clone();
-                        async move {
-                            let caller = session_from_headers(&headers);
-                            command_response(
-                                zitadel_scrape::COMMAND,
-                                zitadel_scrape::receive(&svc, &caller).await,
-                            )
-                        }
-                    }),
-                );
-
-            NativeGateway::new(
-                gateway.clone(),
-                NativeOptions::new(&options.public_origin),
-                [
-                    ("graphql".into(), graphql),
-                    ("ui".into(), NativeBinding::UiProxy { websocket: true }),
-                    ("service".into(), NativeBinding::Handler(service_routes)),
-                    ("closed".into(), NativeBinding::Handler(axum::Router::new())),
-                ],
-                auth,
-            )
-            .map(NativeGateway::router)
-            .map_err(std::io::Error::other)
+    let graphql = GraphqlBinding::Embedded(
+        EmbeddedGraphql::new(
+            engine.clone(),
+            Some(Arc::new(LocalCommandHost::new(service.clone()))),
+            capabilities,
+        )
+        .map_err(std::io::Error::other)?,
+    );
+    let graphql = if options.delivery == DeliveryCapabilities::default() {
+        NativeBinding::Graphql(graphql)
+    } else {
+        let delivery = NativeDelivery::new(NativeDeliveryOptions {
+            snapshots: options.delivery.snapshots.then(SnapshotLimits::default),
+            coalescing: options.delivery.coalescing.then(FlightLimits::default),
+            live: options.delivery.live_sharing.then(LiveLimits::default),
         })
-        .map(|adapter| adapter.expect("explicitly selected gateway"))
+        .map_err(std::io::Error::other)?;
+        NativeBinding::GraphqlWithDelivery(graphql, Arc::new(delivery))
+    };
+    let auth = if let Some(config) = engine.identity_config().oidc().cloned() {
+        let provider = Arc::new(OidcGatewayProvider::new(config, "e2e-ui-oidc-v1"));
+        NativeAuth::new(move |credentials| {
+            let provider = provider.clone();
+            async move { provider.authenticate(&credentials).await }
+        })
+    } else {
+        NativeAuth::anonymous()
+    };
+
+    let ingress = service.clone();
+    let scrape = service.clone();
+    let service_routes = distributed::microsvc::router(service)
+        .route(
+            "/zitadel.ingress.v1",
+            post(move |headers: HeaderMap, Json(body): Json<Value>| {
+                let svc = ingress.clone();
+                async move {
+                    let caller = session_from_headers(&headers);
+                    command_response(
+                        zitadel::COMMAND,
+                        zitadel::receive(&svc, &caller, body).await,
+                    )
+                }
+            }),
+        )
+        .route(
+            "/zitadel.scrape.v1",
+            post(move |headers: HeaderMap| {
+                let svc = scrape.clone();
+                async move {
+                    let caller = session_from_headers(&headers);
+                    command_response(
+                        zitadel_scrape::COMMAND,
+                        zitadel_scrape::receive(&svc, &caller).await,
+                    )
+                }
+            }),
+        );
+
+    NativeGateway::new(
+        gateway,
+        NativeOptions::new(&options.public_origin),
+        [
+            ("graphql".into(), graphql),
+            ("ui".into(), NativeBinding::UiProxy { websocket: true }),
+            ("service".into(), NativeBinding::Handler(service_routes)),
+            ("closed".into(), NativeBinding::Handler(axum::Router::new())),
+        ],
+        auth,
+    )
+    .map(NativeGateway::router)
+    .map_err(std::io::Error::other)
 }
 
 /// One backend owns the public listener; SvelteKit remains its UI/auth backend.

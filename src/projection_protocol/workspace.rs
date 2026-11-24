@@ -8,12 +8,14 @@
 use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 
+#[cfg(any(feature = "graphql", test))]
+use super::ProjectionExecutionSnapshotBatchRequest;
 use super::{
-    ProjectionCommitBatch, ProjectionEpoch, ProjectionExecutionSnapshotBatchRequest,
-    ProjectionModelOwnership, ProjectionObservationKind, ProjectionObservationRequest,
-    ProjectionObservationTarget, ProjectionProtocolError, ProjectionQuerySnapshotRequest,
-    ProjectionRecordExpectation, ProjectionRecordMutation, ProjectionRecordScope,
-    ProjectionScopeCodec, RecordRevision, RecordTransition, TrustedProjectionInput,
+    ProjectionCommitBatch, ProjectionEpoch, ProjectionModelOwnership, ProjectionObservationKind,
+    ProjectionObservationRequest, ProjectionObservationTarget, ProjectionProtocolError,
+    ProjectionQuerySnapshotRequest, ProjectionRecordExpectation, ProjectionRecordMutation,
+    ProjectionRecordScope, ProjectionScopeCodec, RecordRevision, RecordTransition,
+    TrustedProjectionInput,
 };
 use crate::read_model::RelationalReadModel;
 use crate::table::{
@@ -251,6 +253,7 @@ impl ProjectionWorkspace {
         )
     }
 
+    #[cfg(any(feature = "graphql", test))]
     pub(crate) fn execution_snapshot_request(
         &self,
         mutations: &[TableMutation],
@@ -270,6 +273,7 @@ impl ProjectionWorkspace {
         ProjectionExecutionSnapshotBatchRequest::new(requests)
     }
 
+    #[cfg(any(feature = "graphql", test))]
     pub(crate) fn record_scope(
         &self,
         schema: &'static TableSchema,
@@ -286,10 +290,12 @@ impl ProjectionWorkspace {
             .map_err(|error| ProjectionProtocolError::InvalidBatch(error.to_string()))
     }
 
+    #[cfg(any(feature = "graphql", test))]
     pub(crate) fn partition_value(&self) -> Option<&serde_json::Value> {
         self.partition_value.as_ref()
     }
 
+    #[cfg(any(feature = "graphql", test))]
     pub(crate) fn stage_execution_mutation(
         &mut self,
         mutation: TableMutation,
@@ -456,6 +462,7 @@ impl ProjectionWorkspace {
     }
 }
 
+#[cfg(any(feature = "graphql", test))]
 fn mutation_schema_key(mutation: &TableMutation) -> (&'static TableSchema, &RowKey) {
     match mutation {
         TableMutation::UpsertRow(mutation) => (mutation.schema, &mutation.key),
@@ -464,6 +471,7 @@ fn mutation_schema_key(mutation: &TableMutation) -> (&'static TableSchema, &RowK
     }
 }
 
+#[cfg(any(feature = "graphql", test))]
 fn validate_execution_mutation_shape(
     mutation: &TableMutation,
     expectation: &ProjectionRecordExpectation,

@@ -1,20 +1,20 @@
 #[cfg(feature = "graphql")]
 use super::super::causal::ensure_causal_grant;
 #[cfg(feature = "graphql")]
-use super::super::causal::CausalCommandPublicStatus;
-use super::super::causal::{
-    CausalDispatchError, CausalDispatchResult, ExternalCausalAttempt, SealModeledProjection,
-};
+use super::super::causal::{CausalCommandPublicStatus, ExternalCausalAttempt};
+use super::super::causal::{CausalDispatchError, CausalDispatchResult, SealModeledProjection};
 use super::super::handlers::{
     CausalGuardFn, GuardFn, HandlerFn, HandlerFuture, PreparedHandlerFn, ProjectorBootstrapFuture,
 };
 use super::builder::{EventRouteBuilder, PortableCommand, TypedRouteBuilder};
-use super::erased::{
-    CausalCommandPolicy, CausalHandlerFuture, ErasedCausalHandler, ErasedRoutes,
-    ExternalAbandonFuture, ExternalCompletionFuture, ExternalReservationFuture, LedgerCompaction,
-};
+#[cfg(any(feature = "graphql", feature = "runtime-tokio"))]
+use super::erased::LedgerCompaction;
+use super::erased::{CausalCommandPolicy, CausalHandlerFuture, ErasedCausalHandler, ErasedRoutes};
 #[cfg(feature = "graphql")]
-use super::erased::{CausalStatusFuture, CausalStatusRoute};
+use super::erased::{
+    CausalStatusFuture, CausalStatusRoute, ExternalAbandonFuture, ExternalCompletionFuture,
+    ExternalReservationFuture,
+};
 use super::execute::RegisteredCausalHandler;
 use super::outbox_wiring::{DynBusPublisher, OutboxConfigurator};
 use super::spec::HandlerSpec;
@@ -27,9 +27,11 @@ use crate::command::{
     TypedCommandContract,
 };
 use crate::command_dispatch::VerifiedPrincipal;
-use crate::command_ledger::{CausalStorageIdentity, CommandLookup, ExternalDispatchBinding};
+#[cfg(any(feature = "graphql", feature = "runtime-tokio"))]
+use crate::command_ledger::CausalStorageIdentity;
+use crate::command_ledger::CommandLookup;
 #[cfg(feature = "graphql")]
-use crate::command_ledger::{CommandId, CommandLedgerKey};
+use crate::command_ledger::{CommandId, CommandLedgerKey, ExternalDispatchBinding};
 use crate::graphql::SurfaceProjector;
 use crate::microsvc::cell_host::CellCommandIdentity;
 use crate::microsvc::context::Context;
@@ -873,12 +875,14 @@ where
         }
     }
 
+    #[cfg(any(feature = "graphql", feature = "runtime-tokio"))]
     fn causal_storage_identity(&self) -> Option<CausalStorageIdentity> {
         self.causal_handlers()
             .next()
             .map(|handler| handler.storage_identity(&self.dependencies))
     }
 
+    #[cfg(any(feature = "graphql", feature = "runtime-tokio"))]
     fn ledger_compaction(&self) -> Option<LedgerCompaction> {
         self.causal_handlers()
             .next()
@@ -923,6 +927,7 @@ where
         }
     }
 
+    #[cfg(feature = "graphql")]
     fn reserve_external<'a>(
         &'a self,
         command: &'a str,
@@ -949,6 +954,7 @@ where
         }
     }
 
+    #[cfg(feature = "graphql")]
     fn complete_external<'a>(
         &'a self,
         command: &'a str,
@@ -961,6 +967,7 @@ where
         }
     }
 
+    #[cfg(feature = "graphql")]
     fn abandon_external<'a>(
         &'a self,
         command: &'a str,

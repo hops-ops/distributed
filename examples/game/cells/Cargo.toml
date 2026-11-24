@@ -23,8 +23,8 @@ crate-type = ["cdylib"]
 
 [dependencies]
 console_error_panic_hook = "0.1"
-distributed = { path = "../../..", default-features = false, features = ["workers-rs"] }
-distributed_game = { path = "../../../distributed_game", default-features = false, features = ["cell", "workers-rs", "celld-zone"] }
+distributed = { path = "../../..", default-features = false, features = ["cloudflare-workers"] }
+distributed_game = { path = "../../../distributed_game", default-features = false, features = ["cell", "cloudflare-workers", "celld-zone"] }
 mobpit_crawler = { path = "../server/crawler" }
 # The world tiers (hood, borough, city cells) and their saga steps.
 mobpit_tiers = { path = "../server/tiers" }

@@ -1,7 +1,7 @@
 use crate::bus::{Bus, Message, MessageKind, MessagePublisher, TransportError};
 use crate::microsvc::dependencies::{ConfigurableOutboxPublisher, HasOutboxStore};
 use crate::outbox::OutboxPublisherConfig;
-#[cfg(any(background_workers, test))]
+#[cfg(any(feature = "runtime-tokio", test))]
 use crate::outbox_worker::{
     OutboxDispatcher, OutboxDrainRunner, OutboxPublishMailbox, DEFAULT_DRAIN_LEASE,
     DEFAULT_OUTBOX_HINT_CAPACITY,
@@ -77,7 +77,7 @@ pub(in crate::microsvc::service) fn configure_outbox_for<D>(
 {
     // One publish path either way: the commit leaves its rows pending and
     // the dispatcher claims them by id.
-    #[cfg(any(background_workers, test))]
+    #[cfg(any(feature = "runtime-tokio", test))]
     let config = {
         let _ = lease;
         let (mailbox, rx, wake) = OutboxPublishMailbox::channel(DEFAULT_OUTBOX_HINT_CAPACITY);
@@ -103,7 +103,7 @@ pub(in crate::microsvc::service) fn configure_outbox_for<D>(
 
     // No runtime to run a worker on: publish before the commit returns. A
     // publish failure leaves the rows pending for a separately run dispatcher.
-    #[cfg(not(any(background_workers, test)))]
+    #[cfg(not(any(feature = "runtime-tokio", test)))]
     let config = {
         let mut dispatcher = crate::OutboxDispatcher::new(
             dependencies.outbox_store(),

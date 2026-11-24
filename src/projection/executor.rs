@@ -4,26 +4,34 @@
 //! explicitly scoped snapshot batch. It never commits the physical
 //! [`crate::TableWritePlan`] directly.
 
+#[cfg(any(feature = "graphql", test))]
 use std::collections::{HashMap, HashSet};
 
+#[cfg(any(feature = "graphql", test))]
 use super::lower::LoweredProjectionPlan;
-use super::{
-    MutationKind, ProjectionValueRef, ResolvedProjectionKey, ResolvedProjectionPartitionRef,
-    MAX_PROJECTION_OPERATIONS_PER_OCCURRENCE,
-};
+#[cfg(any(feature = "graphql", test))]
+use super::{MutationKind, ResolvedProjectionKey, MAX_PROJECTION_OPERATIONS_PER_OCCURRENCE};
+use super::{ProjectionValueRef, ResolvedProjectionPartitionRef};
+#[cfg(any(feature = "graphql", test))]
 use crate::projection_protocol::{
     ProjectionExecutionSnapshotBatch, ProjectionExecutionSnapshotBatchRequest,
-    ProjectionProtocolError, ProjectionRecordExpectation, ProjectionRecordScope,
-    ProjectionScopedRowSnapshot, ProjectionWorkspace, RecordRevision, RecordTransition,
+    ProjectionRecordExpectation, ProjectionRecordScope, ProjectionWorkspace, RecordRevision,
+    RecordTransition,
 };
+use crate::projection_protocol::{ProjectionProtocolError, ProjectionScopedRowSnapshot};
+#[cfg(test)]
+use crate::table::TableWritePlan;
+#[cfg(any(feature = "graphql", test))]
 use crate::table::{
     key_from_row, ExpectedVersion, PatchMode, RowKey, RowValue, RowValues, RowWriteMode,
-    TableMutation, TableRowMutation, TableSchema, TableWritePlan,
+    TableMutation, TableRowMutation, TableSchema,
 };
 
 /// Maximum distinct protocol/query scopes one occurrence may inspect.
+#[cfg(any(feature = "graphql", test))]
 pub(crate) const MAX_PROJECTION_EXECUTION_SCOPES: usize = 4_096;
 
+#[cfg(any(feature = "graphql", test))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum LifecycleIntent {
     Insert,
@@ -34,6 +42,7 @@ enum LifecycleIntent {
     Recreate,
 }
 
+#[cfg(any(feature = "graphql", test))]
 #[derive(Clone, Debug)]
 struct ExecutionMutation {
     scope: ProjectionRecordScope,
@@ -42,6 +51,7 @@ struct ExecutionMutation {
     source_snapshot: Option<crate::projection_protocol::SourceSnapshotVersion>,
 }
 
+#[cfg(any(feature = "graphql", test))]
 /// Store-free execution preflight produced before any adapter read.
 #[derive(Debug)]
 pub(crate) struct PreparedProjectionExecution {
@@ -50,6 +60,7 @@ pub(crate) struct PreparedProjectionExecution {
     cached: HashMap<ProjectionRecordScope, ProjectionScopedRowSnapshot>,
 }
 
+#[cfg(any(feature = "graphql", test))]
 impl PreparedProjectionExecution {
     pub(crate) fn snapshot_request(&self) -> &ProjectionExecutionSnapshotBatchRequest {
         &self.snapshots
@@ -161,6 +172,7 @@ impl PreparedProjectionExecution {
 }
 
 /// Prepare one portable resolved plan without touching an adapter.
+#[cfg(any(feature = "graphql", test))]
 pub(crate) fn prepare_portable_projection(
     workspace: &ProjectionWorkspace,
     lowered: LoweredProjectionPlan,
@@ -244,12 +256,13 @@ pub(crate) fn prepare_portable_projection(
     prepare(workspace, mutations, HashMap::new())
 }
 
+#[cfg(any(feature = "graphql", test))]
 /// Prepare a stateful graph diff, retaining exact already-loaded revisions and
 /// querying only previously unseen mutation scopes.
 ///
 /// Used by projection protocol unit tests; portable/modeled handlers use
 /// [`prepare_portable_projection`].
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 pub(crate) fn prepare_graph_projection(
     workspace: &ProjectionWorkspace,
     plan: TableWritePlan,
@@ -278,6 +291,7 @@ pub(crate) fn prepare_graph_projection(
     prepare(workspace, mutations, cached)
 }
 
+#[cfg(any(feature = "graphql", test))]
 fn prepare(
     workspace: &ProjectionWorkspace,
     mutations: Vec<ExecutionMutation>,
@@ -331,6 +345,7 @@ fn prepare(
     })
 }
 
+#[cfg(any(feature = "graphql", test))]
 fn validate_resolved_partition(
     workspace: &ProjectionWorkspace,
     partition: &super::ResolvedProjectionPartition,
@@ -416,6 +431,7 @@ pub(crate) fn resolved_partition_json(
     }
 }
 
+#[cfg(any(feature = "graphql", test))]
 fn validate_execution_bounds(
     scopes: usize,
     client_visible: usize,
@@ -465,6 +481,7 @@ pub(crate) fn validate_snapshot_scope(
     }
 }
 
+#[cfg(any(feature = "graphql", test))]
 fn stage_source_snapshot(
     execution: ExecutionMutation,
     snapshot: &ProjectionScopedRowSnapshot,
@@ -508,6 +525,7 @@ fn stage_source_snapshot(
     }
 }
 
+#[cfg(any(feature = "graphql", test))]
 fn stage_for_snapshot(
     execution: ExecutionMutation,
     snapshot: &ProjectionScopedRowSnapshot,
@@ -596,6 +614,7 @@ fn stage_for_snapshot(
     }
 }
 
+#[cfg(any(feature = "graphql", test))]
 fn normalize_create(mutation: TableMutation) -> Result<TableMutation, ProjectionProtocolError> {
     let TableMutation::UpsertRow(mut row) = mutation else {
         return Err(invalid_shape("create", &mutation));
@@ -605,6 +624,7 @@ fn normalize_create(mutation: TableMutation) -> Result<TableMutation, Projection
     Ok(TableMutation::UpsertRow(row))
 }
 
+#[cfg(any(feature = "graphql", test))]
 fn normalize_save(mutation: TableMutation) -> Result<TableMutation, ProjectionProtocolError> {
     let TableMutation::UpsertRow(mut row) = mutation else {
         return Err(invalid_shape("save", &mutation));
@@ -614,6 +634,7 @@ fn normalize_save(mutation: TableMutation) -> Result<TableMutation, ProjectionPr
     Ok(TableMutation::UpsertRow(row))
 }
 
+#[cfg(any(feature = "graphql", test))]
 fn normalize_patch(mutation: TableMutation) -> Result<TableMutation, ProjectionProtocolError> {
     let TableMutation::PatchRow(mut patch) = mutation else {
         return Err(invalid_shape("patch", &mutation));
@@ -623,6 +644,7 @@ fn normalize_patch(mutation: TableMutation) -> Result<TableMutation, ProjectionP
     Ok(TableMutation::PatchRow(patch))
 }
 
+#[cfg(any(feature = "graphql", test))]
 fn normalize_delete(mutation: TableMutation) -> Result<TableMutation, ProjectionProtocolError> {
     let TableMutation::DeleteRow(mut delete) = mutation else {
         return Err(invalid_shape("delete", &mutation));
@@ -631,6 +653,7 @@ fn normalize_delete(mutation: TableMutation) -> Result<TableMutation, Projection
     Ok(TableMutation::DeleteRow(delete))
 }
 
+#[cfg(any(feature = "graphql", test))]
 fn upsert_patch_create(mutation: TableMutation) -> Result<TableMutation, ProjectionProtocolError> {
     let TableMutation::PatchRow(patch) = mutation else {
         return Err(invalid_shape("upsert-patch", &mutation));
@@ -656,6 +679,7 @@ fn upsert_patch_create(mutation: TableMutation) -> Result<TableMutation, Project
     }))
 }
 
+#[cfg(any(feature = "graphql", test))]
 fn invalid_shape(operation: &str, mutation: &TableMutation) -> ProjectionProtocolError {
     ProjectionProtocolError::InvalidBatch(format!(
         "projection {operation} lifecycle is incompatible with physical mutation `{}`",
@@ -663,6 +687,7 @@ fn invalid_shape(operation: &str, mutation: &TableMutation) -> ProjectionProtoco
     ))
 }
 
+#[cfg(any(feature = "graphql", test))]
 fn mutation_kind_name(mutation: &TableMutation) -> &'static str {
     match mutation {
         TableMutation::UpsertRow(_) => "full_row",
@@ -671,6 +696,7 @@ fn mutation_kind_name(mutation: &TableMutation) -> &'static str {
     }
 }
 
+#[cfg(any(feature = "graphql", test))]
 fn intent_for_logical(kind: MutationKind) -> LifecycleIntent {
     match kind {
         MutationKind::Insert | MutationKind::InsertRelated => LifecycleIntent::Insert,
@@ -682,6 +708,7 @@ fn intent_for_logical(kind: MutationKind) -> LifecycleIntent {
     }
 }
 
+#[cfg(test)]
 fn intent_for_physical(mutation: &TableMutation) -> LifecycleIntent {
     match mutation {
         TableMutation::UpsertRow(row) if row.mode == RowWriteMode::Insert => {
@@ -696,6 +723,7 @@ fn intent_for_physical(mutation: &TableMutation) -> LifecycleIntent {
     }
 }
 
+#[cfg(any(feature = "graphql", test))]
 fn validate_physical_intent(
     intent: LifecycleIntent,
     mutation: &TableMutation,
@@ -717,6 +745,7 @@ fn validate_physical_intent(
     }
 }
 
+#[cfg(any(feature = "graphql", test))]
 fn mutation_schema_key(mutation: &TableMutation) -> (&'static TableSchema, &RowKey) {
     match mutation {
         TableMutation::UpsertRow(mutation) => (mutation.schema, &mutation.key),
@@ -725,6 +754,7 @@ fn mutation_schema_key(mutation: &TableMutation) -> (&'static TableSchema, &RowK
     }
 }
 
+#[cfg(any(feature = "graphql", test))]
 fn resolved_row_key(
     schema: &TableSchema,
     key: &ResolvedProjectionKey,

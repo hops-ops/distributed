@@ -119,7 +119,7 @@ pub enum NativeBinding {
     #[cfg(feature = "gateway-graphql-native")]
     Graphql(GraphqlBinding),
     /// GraphQL with an explicitly allocated bounded delivery coordinator.
-    #[cfg(all(feature = "gateway-graphql-native", feature = "gateway-delivery"))]
+    #[cfg(feature = "gateway-graphql-native")]
     GraphqlWithDelivery(GraphqlBinding, Arc<NativeDelivery>),
     /// Configured UI proxy. Upgrades are disabled unless explicitly selected.
     UiProxy {
@@ -212,7 +212,7 @@ impl NativeGateway {
                 )?;
                 compatible = true;
             }
-            #[cfg(all(feature = "gateway-graphql-native", feature = "gateway-delivery"))]
+            #[cfg(feature = "gateway-graphql-native")]
             if let (
                 BindingKind::Graphql {
                     executor,
@@ -444,7 +444,7 @@ impl GatewayAdapter for NativeGateway {
                     .execute(&self.0, &selected.binding().kind, context, request)
                     .await
             }
-            #[cfg(all(feature = "gateway-graphql-native", feature = "gateway-delivery"))]
+            #[cfg(feature = "gateway-graphql-native")]
             NativeBinding::GraphqlWithDelivery(binding, coordinator) => {
                 request.extensions_mut().insert(Arc::clone(coordinator));
                 binding
@@ -472,16 +472,16 @@ impl GatewayAdapter for NativeGateway {
     }
 }
 
-#[cfg(all(feature = "gateway-graphql-native", feature = "gateway-delivery"))]
+#[cfg(feature = "gateway-graphql-native")]
 mod delivery;
-#[cfg(all(feature = "gateway-graphql-native", feature = "gateway-delivery"))]
+#[cfg(feature = "gateway-graphql-native")]
 pub use delivery::{NativeDelivery, NativeDeliveryOptions};
 
-#[cfg(all(feature = "gateway-graphql-native", feature = "gateway-delivery"))]
+#[cfg(feature = "gateway-graphql-native")]
 mod flight;
 
-#[cfg(all(feature = "gateway-graphql-native", feature = "gateway-delivery"))]
+#[cfg(feature = "gateway-graphql-native")]
 mod live;
 
-#[cfg(all(feature = "gateway-graphql-native", feature = "gateway-delivery"))]
+#[cfg(feature = "gateway-graphql-native")]
 mod live_transport;
