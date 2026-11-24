@@ -37,7 +37,7 @@ bots = ["net", "dep:tokio-tungstenite", "dep:futures-util", "tokio/rt-multi-thre
 # HMAC-signed admission tickets (`ticket`) without the axum server (the
 # celld zone host admits players with it).
 ticket = ["dep:hmac", "dep:sha2", "dep:base64"]
-net = ["runtime", "metrics", "ticket", "dep:axum", "dep:hmac", "dep:sha2", "dep:base64", "tokio/net", "tokio/macros", "tokio/io-util"]
+net = ["runtime", "metrics", "ticket", "dep:distributed", "dep:reqwest", "dep:axum", "dep:hmac", "dep:sha2", "dep:base64", "tokio/net", "tokio/macros", "tokio/io-util"]
 # `world::FencedLeaseOwnership`: zone ownership over `distributed::lease`.
 lease = ["dep:distributed"]
 

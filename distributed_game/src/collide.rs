@@ -336,6 +336,8 @@ pub struct Heightfield {
     ny: usize,
     heights: Vec<f32>,
     top: f32,
+    /// Lowest sample other than a hole (`INFINITY` if all are holes).
+    bottom: f32,
 }
 
 impl Heightfield {
@@ -361,6 +363,11 @@ impl Heightfield {
     pub fn from_samples(min: [f32; 2], cell: f32, nx: usize, ny: usize, heights: Vec<f32>) -> Self {
         assert!(nx >= 2 && ny >= 2 && heights.len() == nx * ny && cell > 0.0);
         let top = heights.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let bottom = heights
+            .iter()
+            .copied()
+            .filter(|&h| h != HOLE)
+            .fold(f32::INFINITY, f32::min);
         Self {
             min,
             cell,
@@ -368,6 +375,7 @@ impl Heightfield {
             ny,
             heights,
             top,
+            bottom,
         }
     }
 
@@ -421,10 +429,12 @@ impl Heightfield {
         Some((height, scale(raw, 1.0 / norm(raw))))
     }
 
-    /// Where `ray` first meets the surface (marched half a cell at a time,
-    /// then bisected); starting under it = 0.
+    /// Where `ray` first meets the surface (marched half a cell at a time
+    /// over the part of the ray above the grid and below its top, then
+    /// bisected); starting under it = 0. Any range (`f32::MAX`, infinite)
+    /// ends; a NaN range, origin or direction hits nothing.
     pub fn raycast(&self, ray: &Ray) -> Option<(f32, Vec3)> {
-        if ray.max_dist <= 0.0 || (ray.dir[2] >= 0.0 && ray.origin[2] > self.top) {
+        if ray.max_dist.is_nan() || ray.max_dist <= 0.0 {
             return None;
         }
         let under = |t: f32| {
@@ -434,8 +444,9 @@ impl Heightfield {
         if under(0.0) {
             return Some((0.0, scale(ray.dir, -1.0)));
         }
+        let (enter, exit) = self.span(ray)?;
         let step = self.cell * 0.5;
-        let (mut lo, mut t) = (0.0f32, step.min(ray.max_dist));
+        let (mut lo, mut t) = (enter, (enter + step).min(exit));
         loop {
             if under(t) {
                 let mut hi = t;
@@ -453,12 +464,46 @@ impl Heightfield {
                     .map_or([0.0, 0.0, 1.0], |(_, n)| n);
                 return Some((hi, normal));
             }
-            if t >= ray.max_dist {
+            if t >= exit {
                 return None;
             }
             lo = t;
-            t = (t + step).min(ray.max_dist);
+            t = (t + step).min(exit);
         }
+    }
+
+    /// The part `[enter, exit]` of `ray` (within its range) inside the
+    /// grid's box: over the grid, between its lowest and highest sample.
+    /// Always finite: `None` when there is no such part, or for a ray
+    /// that is degenerate or not finite. The range is not NaN.
+    fn span(&self, ray: &Ray) -> Option<(f32, f32)> {
+        let finite = ray.origin.iter().chain(&ray.dir).all(|v| v.is_finite());
+        let degenerate = ray.dir == [0.0; 3];
+        if !finite || degenerate {
+            return None;
+        }
+        if self.bottom > self.top {
+            return None; // all holes
+        }
+        let (mut enter, mut exit) = (0.0f32, ray.max_dist);
+        let extent = [self.nx, self.ny].map(|n| (n - 1) as f32 * self.cell);
+        for axis in 0..3 {
+            let (lo, hi) = match axis {
+                2 => (self.bottom, self.top),
+                _ => (self.min[axis], self.min[axis] + extent[axis]),
+            };
+            let (o, d) = (ray.origin[axis], ray.dir[axis]);
+            if d == 0.0 {
+                if !(lo..=hi).contains(&o) {
+                    return None;
+                }
+                continue;
+            }
+            let (a, b) = ((lo - o) / d, (hi - o) / d);
+            enter = enter.max(a.min(b));
+            exit = exit.min(a.max(b));
+        }
+        (enter <= exit).then_some((enter, exit))
     }
 }
 
@@ -1326,6 +1371,57 @@ mod tests {
         let platform = world.ground_at([0.0, 6.0], layer::ALL).unwrap();
         assert_eq!((platform.target, platform.height), (Target::Static(0), 1.5));
         assert!(world.ground_at([8.0, 0.0], layer::ALL).is_none());
+    }
+
+    /// Rays with unbounded or invalid ranges end (marching is clipped to
+    /// the grid), and hit what a bounded ray hits.
+    #[test]
+    fn terrain_raycasts_end_for_any_range() {
+        let (done, results) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let field = hill();
+            // Built as a struct: `Ray::new` turns a NaN range into 0.
+            let cast = |origin: Vec3, dir: Vec3, max_dist: f32| {
+                field.raycast(&Ray {
+                    max_dist,
+                    ..Ray::new(origin, dir, 1.0)
+                })
+            };
+            let mut got = Vec::new();
+            for range in [f32::MAX, f32::INFINITY, f32::NAN] {
+                // Level over the grid, outward, from far away, down onto the
+                // hill, and a NaN ray.
+                got.push(cast([0.0, 0.0, 5.0], [1.0, 0.0, 0.0], range).map(|h| h.0));
+                got.push(cast([0.0, 0.0, 5.0], [0.0, 0.0, 1.0], range).map(|h| h.0));
+                got.push(cast([-1e4, 0.0, 0.5], [1.0, 0.0, 0.0], range).map(|h| h.0));
+                got.push(cast([2.0, 0.0, 5.0], [0.0, 0.0, -1.0], range).map(|h| h.0));
+                got.push(cast([f32::NAN, 0.0, 5.0], [0.0, 0.0, -1.0], range).map(|h| h.0));
+                got.push(cast([8.0, 0.0, 5.0], [0.0, 0.0, -1.0], range).map(|h| h.0));
+            }
+            let _ = done.send(got);
+        });
+        let got = results
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("raycasts ended");
+        let hit = |t: Option<f32>, want: f32| t.is_some_and(|t| (t - want).abs() < 0.02);
+        for (range, cases) in ["MAX", "inf", "NaN"].iter().zip(got.as_chunks::<6>().0) {
+            if *range == "NaN" {
+                assert!(cases.iter().all(Option::is_none), "{range}: {cases:?}");
+                continue;
+            }
+            assert_eq!(cases[0], None, "{range}: over the hill");
+            assert_eq!(cases[1], None, "{range}: up");
+            // r = sqrt(16 * 0.5) from the hill's centre.
+            assert!(hit(cases[2], 1e4 - 8f32.sqrt()), "{range}: {:?}", cases[2]);
+            assert!(hit(cases[3], 4.25), "{range}: {:?}", cases[3]);
+            assert_eq!(cases[4], None, "{range}: NaN origin");
+            assert_eq!(cases[5], None, "{range}: down a hole");
+            let buried = Ray {
+                max_dist: f32::INFINITY,
+                ..Ray::new([0.0, 0.0, -5.0], [0.0, 0.0, 1.0], 1.0)
+            };
+            assert_eq!(hill().raycast(&buried).map(|h| h.0), Some(0.0), "under it");
+        }
     }
 
     #[test]

@@ -26,6 +26,7 @@ use super::plan::{
     cell_binding, classify_wait_path, zone_from_path, ObjectOptions, RoomState, StoredFact,
     TickSchedule, Window, CLOSE_RESTARTED, NETSIM_SHARD, OUTBOX_PREFIX, ZONE_DEV_KIND, ZONE_HEADER,
 };
+use crate::admission::{admit, AdmissionConfig, Admitted, Gate, InputGate};
 use crate::command_sink::{CommandFactSink, FactBatchHost, FactCall, FactHost, FactRoute};
 use crate::facts::{
     fact_channel, BoxFuture, Fact, FactBatchSink, FactError, FactQueue, FactReceipt, FactSink,
@@ -34,9 +35,9 @@ use crate::facts::{
 use crate::handoff::{HandoffRequest, Transfer};
 use crate::inbox::ZoneInbound;
 use crate::netsim::{DelayLine, NetSim, NetSimJson};
-use crate::protocol::{error, supports_protocol, ClientMessage, Notice, Role, ServerMessage};
+use crate::protocol::{error, kick, ClientMessage, Notice, Role, ServerMessage};
 use crate::stamp::FactStamp;
-use crate::ticket::{NonceCache, TicketKey, VerifiedTicket};
+use crate::ticket::{NonceCache, TicketKey};
 use crate::work::WorkCounters;
 use crate::world::content_rollout::{zone_step, ContentState, ZoneStep, CONTENT_ROLLOUT_KIND};
 use crate::world::watch::{
@@ -97,6 +98,13 @@ pub trait CelldZone: Zone {
     /// defaults.
     fn host_config(_zone_id: &str, _env: &ObjectEnv) -> HostConfig {
         HostConfig::default()
+    }
+
+    /// Who may join: the object builds the [`AdmissionConfig`] from its
+    /// ticket secret; add a custom ticket verifier or the zone's ticket
+    /// extensions here. Default: unchanged.
+    fn admission(config: AdmissionConfig, _env: &ObjectEnv) -> AdmissionConfig {
+        config
     }
 
     /// Fact routes of the zone (lifecycle facts too, if the host config
@@ -606,10 +614,14 @@ thread_local! {
 
 // ------------------------------------------------------------------ object
 
+/// What a socket carries across object hibernation.
 #[derive(Serialize, Deserialize)]
-struct Attachment {
-    client: u32,
-    activation: String,
+enum Attachment {
+    /// Accepted, no Hello yet: it must arrive before `deadline_ms`
+    /// (`Date.now()` ms).
+    Pending { deadline_ms: f64 },
+    /// Admitted by `activation` as `client`.
+    Joined { client: u32, activation: String },
 }
 
 #[derive(Serialize, Deserialize)]
@@ -657,12 +669,14 @@ struct Inner<Z: CelldZone> {
     activation: String,
     activation_epoch: u64,
     options: Option<ObjectOptions>,
-    key: Option<TicketKey>,
+    admission: Option<AdmissionConfig>,
     host: Option<ZoneHost<Z>>,
     restored: bool,
     wakes: u64,
     state: RoomState,
     sockets: HashMap<u32, WebSocket>,
+    /// Per admitted socket: its message rate limit.
+    gates: HashMap<u32, InputGate>,
     /// Observers whose ticket grants `wake` ([`TicketClaims::wake`]).
     may_wake: HashSet<u32>,
     /// Of those, the ones near right now: they keep the zone awake.
@@ -828,6 +842,7 @@ impl<Z: CelldZone> Inner<Z> {
     fn forget(&mut self, client: u32) {
         self.out_lines.remove(&client);
         self.in_lines.remove(&client);
+        self.gates.remove(&client);
         self.may_wake.remove(&client);
         self.near.remove(&client);
     }
@@ -995,9 +1010,12 @@ impl<Z: CelldZone> ZoneObject<Z> {
             worker::console_error!("celld zone: {e}");
         }
         let options = options.ok();
-        let key = options
-            .as_ref()
-            .map(|o| TicketKey::new(o.ticket_secret.clone().into_bytes()));
+        let admission = options.as_ref().map(|o| {
+            Z::admission(
+                AdmissionConfig::new(TicketKey::new(o.ticket_secret.clone().into_bytes())),
+                &env,
+            )
+        });
         let node = options
             .as_ref()
             .and_then(|o| o.node.clone())
@@ -1007,12 +1025,13 @@ impl<Z: CelldZone> ZoneObject<Z> {
             activation: random_hex(6),
             activation_epoch: (now_ms() * 1000.0) as u64,
             options,
-            key,
+            admission,
             host: None,
             restored: false,
             wakes: 0,
             state: RoomState::Cold,
             sockets: HashMap::new(),
+            gates: HashMap::new(),
             may_wake: HashSet::new(),
             near: HashSet::new(),
             ticking: false,
@@ -1098,9 +1117,28 @@ impl<Z: CelldZone> ZoneObject<Z> {
         if self.inner.borrow().options.is_none() {
             return Response::error("zone host is not configured", 503);
         }
-        // Not woken here: only a player's Hello wakes a sleeping zone.
+        // Not woken here: only a player's Hello wakes a sleeping zone. The
+        // Hello must come in time: a timer closes a silent socket, and a
+        // late Hello (the timer died with a hibernation) is refused.
         let pair = WebSocketPair::new()?;
         self.state.accept_web_socket(&pair.server);
+        let timeout = self
+            .inner
+            .borrow()
+            .admission
+            .as_ref()
+            .expect("configured")
+            .hello_timeout;
+        pair.server.serialize_attachment(Attachment::Pending {
+            deadline_ms: now_ms() + timeout.as_secs_f64() * 1000.0,
+        })?;
+        let ws = pair.server.clone();
+        wasm_bindgen_futures::spawn_local(async move {
+            sleep(timeout).await;
+            if let Ok(Some(Attachment::Pending { .. })) = ws.deserialize_attachment() {
+                reject(&ws, error::BAD_MESSAGE, "no Hello in time");
+            }
+        });
         Response::from_websocket(pair.client)
     }
 
@@ -1118,13 +1156,21 @@ impl<Z: CelldZone> ZoneObject<Z> {
         let attached: Option<Attachment> = ws.deserialize_attachment().ok().flatten();
         let activation = self.inner.borrow().activation.clone();
         let client = match attached {
-            Some(a) if a.activation == activation => Some(a.client),
+            Some(Attachment::Joined {
+                client,
+                activation: admitted_by,
+            }) if admitted_by == activation => Some(client),
             // The socket outlived the activation that admitted it.
-            Some(_) => {
+            Some(Attachment::Joined { .. }) => {
                 let _ = ws.close(Some(CLOSE_RESTARTED), Some("zone restarted; rejoin"));
                 return Ok(());
             }
-            None => None,
+            Some(Attachment::Pending { deadline_ms }) if now_ms() <= deadline_ms => None,
+            // Too late for a Hello (or a socket from before deadlines).
+            Some(Attachment::Pending { .. }) | None => {
+                reject(&ws, error::BAD_MESSAGE, "no Hello in time");
+                return Ok(());
+            }
         };
         let msg = match ClientMessage::decode(&bytes) {
             Ok(m) => m,
@@ -1133,6 +1179,50 @@ impl<Z: CelldZone> ZoneObject<Z> {
                 return Ok(());
             }
         };
+        // Every message of an admitted client but Leave spends a token.
+        if let Some(client) = client.filter(|_| !matches!(msg, ClientMessage::Leave)) {
+            let gate = {
+                let mut inner = self.inner.borrow_mut();
+                let now = Duration::from_secs_f64(now_ms().max(0.0) / 1000.0);
+                let Inner {
+                    gates, admission, ..
+                } = &mut *inner;
+                let admission = admission.as_ref().expect("configured");
+                gates
+                    .entry(client)
+                    .or_insert_with(|| InputGate::new(admission, now))
+                    .take(now)
+            };
+            match gate {
+                Gate::Pass => {}
+                Gate::Drop { warn } => {
+                    if warn {
+                        if let Ok(frame) = (ServerMessage::Error {
+                            code: error::RATE_LIMITED,
+                            message: "message dropped".into(),
+                        })
+                        .encode(&())
+                        {
+                            let _ = ws.send_with_bytes(frame);
+                        }
+                    }
+                    return Ok(());
+                }
+                Gate::Kick => {
+                    if let Ok(frame) = (ServerMessage::Kick {
+                        code: kick::RATE_LIMITED,
+                        message: "message flood".into(),
+                    })
+                    .encode(&())
+                    {
+                        let _ = ws.send_with_bytes(frame);
+                    }
+                    self.drop_socket(&ws);
+                    let _ = ws.close(Some(1008), Some("message flood"));
+                    return Ok(());
+                }
+            }
+        }
         match (client, msg) {
             (None, ClientMessage::Hello(hello)) => self.hello(&ws, hello).await?,
             (
@@ -1162,22 +1252,6 @@ impl<Z: CelldZone> ZoneObject<Z> {
                 self.inner
                     .borrow_mut()
                     .receive(client, InItem::Ping(client_time));
-            }
-            (None, ClientMessage::Ping { client_time }) => {
-                let server_time = self
-                    .inner
-                    .borrow()
-                    .host
-                    .as_ref()
-                    .map_or(0.0, |h| h.server_time_ms());
-                if let Ok(pong) = (ServerMessage::Pong {
-                    client_time,
-                    server_time,
-                })
-                .encode(&())
-                {
-                    let _ = ws.send_with_bytes(pong);
-                }
             }
             (Some(client), ClientMessage::Near { near }) => {
                 let start = self.inner.borrow_mut().set_near(client, near);
@@ -1438,7 +1512,12 @@ impl<Z: CelldZone> ZoneObject<Z> {
             if let Some(snapshot) = &stored {
                 host_config.content_version = snapshot.version.clone();
             }
-            let key = inner.key.clone().expect("ticket key with options");
+            let key = inner
+                .admission
+                .as_ref()
+                .expect("admission with options")
+                .key
+                .clone();
             let issuer_zone = zone_id.clone();
             let generation = inner.activation_epoch;
             let mut host =
@@ -1793,137 +1872,119 @@ impl<Z: CelldZone> ZoneObject<Z> {
     }
 
     async fn hello(&self, ws: &WebSocket, hello: crate::protocol::Hello) -> Result<()> {
-        // Answer in the client's version; refuse others before the ticket
-        // is touched, so the client can retry with an older one (§6.0).
-        if !supports_protocol(hello.protocol_version) {
-            let message = format!("protocol {} unsupported", hello.protocol_version);
-            reject(ws, error::VERSION_MISMATCH, &message);
-            return Ok(());
-        }
-        let cold = self.inner.borrow().host.is_none();
-        if cold && !hello.reconnect_token.is_empty() {
-            // Sessions die with the activation: rejoin with a ticket (which
-            // wakes the zone for a player, not for an observer).
-            reject(ws, error::RECONNECT_FAILED, "zone restarted; rejoin");
-            return Ok(());
-        }
         let now = (now_ms() / 1000.0) as u64;
-        // Transfer tickets are single use across activations too.
+        let admitted = {
+            let inner = self.inner.borrow();
+            let admission = inner.admission.as_ref().expect("configured");
+            admit(admission, &hello, &inner.zone_id, now)
+        };
+        let admitted = match admitted {
+            Ok(admitted) => admitted,
+            Err(refusal) => {
+                reject(ws, refusal.code, &refusal.message);
+                return Ok(());
+            }
+        };
+        let cold = self.inner.borrow().host.is_none();
         let mut principal = None;
         let mut wake_grant = false;
         let mut woke = false;
-        let joined = if hello.reconnect_token.is_empty() {
-            let verified = {
-                let inner = self.inner.borrow();
-                let key = inner.key.as_ref().expect("configured");
-                key.verify_ticket(&hello.ticket, now)
-            };
-            let verified = match verified {
-                Ok(v) => v,
-                Err(e) => {
-                    reject(ws, error::UNAUTHORIZED, &format!("{e:?}"));
+        let joined = match admitted {
+            Admitted::Reconnect(token) => {
+                // Sessions die with the activation: rejoin with a ticket
+                // (which wakes the zone for a player, not for an observer).
+                let mut inner = self.inner.borrow_mut();
+                let Some(host) = inner.host.as_mut() else {
+                    drop(inner);
+                    reject(ws, error::RECONNECT_FAILED, "zone restarted; rejoin");
                     return Ok(());
-                }
-            };
-            let zone_id = self.inner.borrow().zone_id.clone();
-            let (claims, transfer) = match verified {
-                VerifiedTicket::Join(claims) => (claims, None),
-                VerifiedTicket::Transfer(transfer) => (transfer.claims.clone(), Some(transfer)),
-            };
-            if claims.zone != zone_id {
+                };
+                host.speaking(hello.protocol_version)
+                    .reconnect_with_version(&token, hello.capabilities, &hello.content_version)
+            }
+            // A transfer's single use is recorded by the target object
+            // alone: a return to the source would make it usable twice.
+            Admitted::Return(_) => {
                 reject(ws, error::UNAUTHORIZED, "ticket is for another zone");
                 return Ok(());
             }
-            // A passive watcher never wakes a sleeping zone; a near one
-            // whose ticket grants `wake` does.
-            let observer = claims.role == Role::Observer;
-            wake_grant = observer && claims.wake;
-            if cold && observer && !(hello.near && wake_grant) {
-                reject(ws, error::ASLEEP, "zone asleep");
-                return Ok(());
-            }
-            let replayed = self
-                .inner
-                .borrow_mut()
-                .nonces
-                .check_and_insert(&claims.nonce, claims.expires_at, now)
-                .is_err();
-            let nonce_key = format!("{NONCE_PREFIX}{}", claims.nonce);
-            let used_before = transfer.is_some()
-                && self
-                    .state
-                    .storage()
-                    .get::<u64>(&nonce_key)
-                    .await
-                    .ok()
-                    .flatten()
-                    .is_some();
-            if replayed || used_before {
-                reject(ws, error::UNAUTHORIZED, "ticket already used");
-                return Ok(());
-            }
-            if transfer.is_some() {
-                let _ = self
-                    .state
-                    .storage()
-                    .put(&nonce_key, claims.expires_at)
-                    .await;
-            }
-            woke = match self.wake().await {
-                Ok(woke) => woke,
-                Err(e) => {
-                    reject(ws, error::NOT_FOUND, &e.to_string());
+            admitted @ (Admitted::Join(_) | Admitted::Arrival(_)) => {
+                let claims = admitted.claims().expect("a ticket").clone();
+                // A passive watcher never wakes a sleeping zone; a near one
+                // whose ticket grants `wake` does.
+                let observer = claims.role == Role::Observer;
+                wake_grant = observer && claims.wake;
+                if cold && observer && !(hello.near && wake_grant) {
+                    reject(ws, error::ASLEEP, "zone asleep");
                     return Ok(());
                 }
-            };
-            if claims.role == Role::Player {
-                principal = Some(claims.principal.clone());
-            }
-            // A client on another content version than the zone: the zone
-            // may be behind the world (it slept through a rollout), so it
-            // learns the live version before deciding.
-            let behind = {
-                let inner = self.inner.borrow();
-                inner
-                    .options
-                    .as_ref()
-                    .is_some_and(|o| o.content_rollout.is_some())
-                    && inner
-                        .host
+                // Transfer tickets are single use across activations too.
+                let arrival = matches!(admitted, Admitted::Arrival(_));
+                let nonce_key = format!("{NONCE_PREFIX}{}", claims.nonce);
+                let used_before = arrival
+                    && self
+                        .state
+                        .storage()
+                        .get::<u64>(&nonce_key)
+                        .await
+                        .ok()
+                        .flatten()
+                        .is_some();
+                let consumed = admitted.consume(&mut self.inner.borrow_mut().nonces, now);
+                if used_before || consumed.is_err() {
+                    reject(ws, error::UNAUTHORIZED, "ticket already used");
+                    return Ok(());
+                }
+                if arrival {
+                    let _ = self
+                        .state
+                        .storage()
+                        .put(&nonce_key, claims.expires_at)
+                        .await;
+                }
+                woke = match self.wake().await {
+                    Ok(woke) => woke,
+                    Err(e) => {
+                        reject(ws, error::NOT_FOUND, &e.to_string());
+                        return Ok(());
+                    }
+                };
+                if claims.role == Role::Player {
+                    principal = Some(claims.principal.clone());
+                }
+                // A client on another content version than the zone: the
+                // zone may be behind the world (it slept through a
+                // rollout), so it learns the live version before deciding.
+                let behind = {
+                    let inner = self.inner.borrow();
+                    inner
+                        .options
                         .as_ref()
-                        .is_some_and(|h| h.config().content_version != hello.content_version)
-            };
-            if behind {
-                if let Some(world) = self.content_world() {
-                    self.reconcile(&topic(CONTENT_ROLLOUT_KIND, &world)).await;
+                        .is_some_and(|o| o.content_rollout.is_some())
+                        && inner
+                            .host
+                            .as_ref()
+                            .is_some_and(|h| h.config().content_version != hello.content_version)
+                };
+                if behind {
+                    if let Some(world) = self.content_world() {
+                        self.reconcile(&topic(CONTENT_ROLLOUT_KIND, &world)).await;
+                    }
+                }
+                let mut inner = self.inner.borrow_mut();
+                let Some(host) = inner.host.as_mut() else {
+                    drop(inner);
+                    reject(ws, error::ZONE_UNAVAILABLE, "zone asleep");
+                    return Ok(());
+                };
+                let host = host.speaking(hello.protocol_version);
+                match &admitted {
+                    Admitted::Arrival(transfer) => {
+                        host.join_transfer(transfer, hello.capabilities, &hello.content_version)
+                    }
+                    _ => host.join(&claims, hello.capabilities, &hello.content_version),
                 }
             }
-            let mut inner = self.inner.borrow_mut();
-            let Some(host) = inner.host.as_mut() else {
-                drop(inner);
-                reject(ws, error::ZONE_UNAVAILABLE, "zone asleep");
-                return Ok(());
-            };
-            let host = host.speaking(hello.protocol_version);
-            match &transfer {
-                Some(transfer) => {
-                    host.join_transfer(transfer, hello.capabilities, &hello.content_version)
-                }
-                None => host.join(&claims, hello.capabilities, &hello.content_version),
-            }
-        } else {
-            let mut inner = self.inner.borrow_mut();
-            let Some(host) = inner.host.as_mut() else {
-                drop(inner);
-                reject(ws, error::RECONNECT_FAILED, "zone restarted; rejoin");
-                return Ok(());
-            };
-            host.speaking(hello.protocol_version)
-                .reconnect_with_version(
-                    &hello.reconnect_token,
-                    hello.capabilities,
-                    &hello.content_version,
-                )
         };
         match joined {
             Ok(joined) => {
@@ -1931,7 +1992,7 @@ impl<Z: CelldZone> ZoneObject<Z> {
                 {
                     let mut inner = self.inner.borrow_mut();
                     let activation = inner.activation.clone();
-                    ws.serialize_attachment(Attachment {
+                    ws.serialize_attachment(Attachment::Joined {
                         client: joined.client.0,
                         activation,
                     })?;
@@ -2028,11 +2089,17 @@ impl<Z: CelldZone> ZoneObject<Z> {
     fn drop_socket(&self, ws: &WebSocket) {
         let attached: Option<Attachment> = ws.deserialize_attachment().ok().flatten();
         let mut inner = self.inner.borrow_mut();
-        if let Some(a) = attached.filter(|a| a.activation == inner.activation) {
-            inner.sockets.remove(&a.client);
-            inner.forget(a.client);
+        let client = match attached {
+            Some(Attachment::Joined { client, activation }) if activation == inner.activation => {
+                Some(client)
+            }
+            _ => None,
+        };
+        if let Some(client) = client {
+            inner.sockets.remove(&client);
+            inner.forget(client);
             if let Some(host) = inner.host.as_mut() {
-                host.disconnect(ClientId(a.client), false);
+                host.disconnect(ClientId(client), false);
             }
             inner.flush();
             drop(inner);

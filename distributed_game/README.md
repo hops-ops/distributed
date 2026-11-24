@@ -1097,7 +1097,7 @@ stopped at a wall on the room's edge) as leaving.
 - Players are admitted only with a signed, single-use, expiring ticket.
   Your web backend mints it (in SvelteKit, `createGameTicketHandler` binds
   it to the verified session — see [SvelteKit apps](#sveltekit-apps)); plug
-  in your own verifier with `with_ticket_verifier`.
+  in your own verifier with `AdmissionConfig::with_ticket_verifier`.
 - The ticket's principal is the only identity the zone sees, and the only
   one attached to facts. Inputs are game data, never identity, owner or
   reward amounts.
@@ -1321,21 +1321,25 @@ ledger reservation and commit.
 ## Netcode and operations
 
 - **Admission tickets** (`net`): by default join tickets are HS256 JWTs
-  signed with `ServerConfig::ticket_key` (PROTOCOL.md §8). To admit tickets
-  your web backend already mints, plug in a verifier —
-  `ServerConfig::new(key).with_ticket_verifier(|token: &str, zone: &str, now: u64| { … })`
+  signed with the admission key (`ServerConfig::admission.key`, PROTOCOL.md
+  §8). Both drivers (the `net` server and celld zone objects) admit through
+  the same `admission::admit`. To admit tickets your web backend already
+  mints, plug in a verifier —
+  `config.admission = config.admission.with_ticket_verifier(|token: &str, zone: &str, now: u64| { … })`
+  (celld: the `CelldZone::admission` hook)
   (or implement `net::TicketVerifier`) — that checks your issuer, audience
   and lifetime (`net::decode_hs256` verifies an HS256 signature and
   returns the claims) and returns `TicketClaims` with `zone` = the route
   zone and `nonce` = your replay key (e.g. `jti`). The server still
   enforces route zone, expiry and single use; `TicketClaims::name` becomes
   `PlayerInfo::name` / `ObserverInfo::name` and travels with handoffs.
-  Transfer tickets always use `ticket_key`.
+  Transfer tickets always use the admission key.
 - **Extension claims**: game-declared claims the issuer vouches for (match
   id, team, party) travel in the ticket's `ext` object. Declare them once —
   `#[derive(Serialize, Deserialize, TicketExtension)] struct MatchClaims {
   match_id: String, team: u8 }` — and admit them with
-  `ServerConfig::with_ticket_extensions::<MatchClaims>()`. The derive
+  `AdmissionConfig::with_ticket_extensions::<MatchClaims>()` (`net`:
+  `config.admission`; celld: the `CelldZone::admission` hook). The derive
   refuses identity-, reward- and economy-looking names (the `FactCommand`
   deny list, shared with the JS handler through
   `tests/fixtures/trusted_field_denylist.json`); the server refuses tickets
@@ -1543,8 +1547,9 @@ token after reloading — stale clients already inside a gate when the
 rolling commit lands are reloaded there at once; `BarrierMode::Hard`
 reloads every stale client at once.
 
-Admin routes (enabled by `ServerConfig::admin_secret`, header
-`x-game-admin-secret`): `POST /admin/transfer`, `/admin/child-event`,
+Admin routes (enabled by `ServerConfig::admin_secret`, an
+`InternalHttpSecret`; header `x-distributed-internal-secret`, the internal
+secret convention): `POST /admin/transfer`, `/admin/child-event`,
 `/admin/barrier/{prepare,commit,abort}` — see `net::world`.
 
 ## Protocol

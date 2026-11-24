@@ -19,10 +19,10 @@
 //! **Extension claims.** An optional `ext` object carries game-declared
 //! claims ([`TicketExtensions`]: match id, team…). Join and transfer
 //! tickets sign them alike; the server admits them only when they match
-//! `ServerConfig::ticket_extensions` (see [`crate::claims`]).
+//! `AdmissionConfig::extensions` (see [`crate::claims`]).
 //!
 //! **Custom admission tickets.** Join tickets go through a
-//! [`TicketVerifier`] (`ServerConfig::ticket_verifier`); the default is the
+//! [`TicketVerifier`] (`AdmissionConfig::verifier`); the default is the
 //! `TicketKey` itself. A game whose web backend already mints its own tickets
 //! (different claim names, issuer/audience checks, no `zone`/`nonce`)
 //! implements `TicketVerifier` (or passes a closure) and maps them onto
@@ -32,7 +32,8 @@
 //! always minted and verified by the server's own `TicketKey`.
 //! [`decode_hs256`] helps verifiers of other HS256 JWTs.
 
-use std::collections::HashMap;
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, HashMap};
 
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
@@ -68,6 +69,9 @@ pub enum TicketError {
     WrongZone,
     /// Refused by a custom [`TicketVerifier`] (issuer, audience, ...).
     Invalid(String),
+    /// The single-use record is full of unexpired nonces: try again later
+    /// (forgetting one would let its ticket be replayed).
+    NonceCacheFull,
 }
 
 /// Verifies **join** tickets presented in Hello.
@@ -104,7 +108,7 @@ where
     }
 }
 
-/// A shared [`TicketVerifier`] (`ServerConfig::ticket_verifier`).
+/// A shared [`TicketVerifier`] (`AdmissionConfig::verifier`).
 #[derive(Clone)]
 pub struct SharedTicketVerifier(pub std::sync::Arc<dyn TicketVerifier>);
 
@@ -365,30 +369,73 @@ fn decode_json(segment: &str) -> Result<Value, TicketError> {
     serde_json::from_slice(&bytes).map_err(|_| TicketError::Malformed)
 }
 
-/// Remembers used nonces until their ticket expires (single-use tickets).
-#[derive(Debug, Default)]
+/// Remembers used nonces until their ticket expires (single-use tickets),
+/// at most `capacity` at once. Nonces leave in expiry order (each insert
+/// drops the ones expired by then, `O(log n)` each).
+#[derive(Debug)]
 pub struct NonceCache {
     seen: HashMap<String, u64>,
+    by_expiry: BinaryHeap<Reverse<(u64, String)>>,
+    capacity: usize,
+}
+
+impl Default for NonceCache {
+    /// Room for 262 144 live nonces.
+    fn default() -> Self {
+        Self::with_capacity(1 << 18)
+    }
 }
 
 impl NonceCache {
-    /// Record `nonce`; `Err(Replayed)` if already used and unexpired.
+    /// Room for `capacity` unexpired nonces.
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self {
+            seen: HashMap::new(),
+            by_expiry: BinaryHeap::new(),
+            capacity,
+        }
+    }
+
+    /// Unexpired nonces held (as of the last insert).
+    pub fn len(&self) -> usize {
+        self.seen.len()
+    }
+
+    /// No nonce held.
+    pub fn is_empty(&self) -> bool {
+        self.seen.is_empty()
+    }
+
+    /// Record `nonce`; `Err(Replayed)` if already used and unexpired,
+    /// `Err(NonceCacheFull)` when `capacity` unexpired nonces are held.
     pub fn check_and_insert(
         &mut self,
         nonce: &str,
         expires_at: u64,
         now_unix: u64,
     ) -> Result<(), TicketError> {
-        if self.seen.len() > 1024 {
-            self.seen.retain(|_, exp| *exp > now_unix);
-        }
-        match self.seen.get(nonce) {
-            Some(exp) if *exp > now_unix => Err(TicketError::Replayed),
-            _ => {
-                self.seen.insert(nonce.to_string(), expires_at);
-                Ok(())
+        while let Some(Reverse((exp, _))) = self.by_expiry.peek() {
+            if *exp > now_unix {
+                break;
+            }
+            let Some(Reverse((exp, expired))) = self.by_expiry.pop() else {
+                break;
+            };
+            // A nonce re-used after expiry has a newer entry: keep it.
+            if self.seen.get(&expired) == Some(&exp) {
+                self.seen.remove(&expired);
             }
         }
+        if self.seen.contains_key(nonce) {
+            return Err(TicketError::Replayed);
+        }
+        if self.seen.len() >= self.capacity {
+            return Err(TicketError::NonceCacheFull);
+        }
+        self.seen.insert(nonce.to_string(), expires_at);
+        self.by_expiry
+            .push(Reverse((expires_at, nonce.to_string())));
+        Ok(())
     }
 }
 
@@ -407,6 +454,40 @@ mod tests {
             extensions: Default::default(),
             wake: false,
         }
+    }
+
+    /// Expired nonces leave as they expire (not in a sweep of every live
+    /// one per insert), and a cache full of live nonces refuses new ones
+    /// instead of forgetting one that could then be replayed.
+    #[test]
+    fn the_nonce_cache_expires_in_order_and_is_bounded() {
+        let mut cache = NonceCache::with_capacity(3);
+        cache.check_and_insert("a", 10, 0).unwrap();
+        cache.check_and_insert("b", 20, 0).unwrap();
+        cache.check_and_insert("c", 30, 0).unwrap();
+        assert_eq!(
+            cache.check_and_insert("d", 40, 5),
+            Err(TicketError::NonceCacheFull)
+        );
+        assert_eq!(
+            cache.check_and_insert("a", 10, 5),
+            Err(TicketError::Replayed)
+        );
+        // "a" expired: room for one, and "a" may be seen again.
+        cache.check_and_insert("d", 40, 10).unwrap();
+        assert_eq!(cache.len(), 3);
+        assert_eq!(
+            cache.check_and_insert("b", 20, 15),
+            Err(TicketError::Replayed)
+        );
+        cache.check_and_insert("e", 50, 30).unwrap();
+        assert_eq!(cache.len(), 2, "b and c expired");
+        // A re-used nonce after expiry keeps its new expiry.
+        cache.check_and_insert("a", 60, 30).unwrap();
+        assert_eq!(
+            cache.check_and_insert("a", 60, 45),
+            Err(TicketError::Replayed)
+        );
     }
 
     #[test]

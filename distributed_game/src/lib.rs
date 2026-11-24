@@ -57,6 +57,8 @@
 // this crate too.
 extern crate self as distributed_game;
 
+#[cfg(feature = "ticket")]
+pub mod admission;
 pub mod authoring;
 #[cfg(feature = "bots")]
 pub mod bots;

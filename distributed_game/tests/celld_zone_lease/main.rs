@@ -12,7 +12,9 @@ use std::time::{Duration, Instant};
 use distributed::cell_host::InternalHttpSecret;
 use distributed_game::celld::CellZoneOwnership;
 use distributed_game::net::{GameServer, ServerConfig, TicketKey, ZoneFactory};
-use distributed_game::world::{ownership_conformance, OwnershipError, ZoneOwnership};
+use distributed_game::world::{
+    ownership_conformance, restart_conformance, OwnershipError, ZoneOwnership,
+};
 use distributed_game::*;
 use serde_json::Value;
 
@@ -124,6 +126,19 @@ async fn zone_leases_live_in_celld_cells() {
         .unwrap();
     assert!(next.token > dead.token);
     own.release(&next).await;
+
+    // 2b. A crash-restarted holder (same host, new incarnation): Held while
+    //     the dead claim lives, a larger token once the cell expired it.
+    let base_for_expiry = base.clone();
+    restart_conformance(
+        &own,
+        "zl-restart",
+        Duration::from_millis(1_500),
+        until("restart expiry", Duration::from_secs(20), async move || {
+            lease(&base_for_expiry, "zl-restart").await["state"]["holder"].is_null()
+        }),
+    )
+    .await;
 
     // 3. Renewals keep the lease past many TTLs, without expiry or outward
     //    events.

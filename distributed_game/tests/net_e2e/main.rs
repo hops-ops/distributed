@@ -1,6 +1,8 @@
 //! End-to-end: a real WebSocket client joins through signed-ticket
 //! admission, sends inputs, receives deltas, reconnects and is shut down.
 
+#[path = "../support/admission.rs"]
+mod admission;
 #[path = "../zone_runtime/arena.rs"]
 mod arena;
 
@@ -552,7 +554,8 @@ fn bff_ticket(jti: &str, exp_in: u64, zone_route: Option<&str>) -> String {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn custom_verifier_admits_web_bff_tickets_with_replay_protection() {
-    let config = ServerConfig::new(TicketKey::new(SECRET)).with_ticket_verifier(bff_verifier);
+    let mut config = ServerConfig::new(TicketKey::new(SECRET));
+    config.admission = config.admission.with_ticket_verifier(bff_verifier);
     let server = GameServer::<Arena>::new(
         config,
         ZoneFactory::sync(|a| a.zone_id.starts_with('z').then(ArenaConfig::default)),
@@ -691,7 +694,8 @@ fn extended_ticket(nonce: &str, ext: serde_json::Value) -> String {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn extension_claims_reach_on_auth_and_player_info() {
     assert_eq!(MatchClaims::CLAIMS, ["match_id", "team", "party"]);
-    let config = ServerConfig::new(TicketKey::new(SECRET)).with_ticket_extensions::<MatchClaims>();
+    let mut config = ServerConfig::new(TicketKey::new(SECRET));
+    config.admission = config.admission.with_ticket_extensions::<MatchClaims>();
     let server =
         GameServer::<Arena>::new(config, ZoneFactory::sync(|_| Some(ArenaConfig::default())));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1008,4 +1012,227 @@ async fn negotiates_the_protocol_version_in_hello() {
     ));
     drop((ws, ws2, ws3, ws4));
     stop(server, handle).await;
+}
+
+/// Ownership that records every acquisition (a lease per entry).
+#[derive(Default)]
+struct CountingOwnership {
+    inner: distributed_game::world::LocalOwnership,
+    acquired: std::sync::Mutex<Vec<String>>,
+}
+
+impl distributed_game::world::ZoneOwnership for CountingOwnership {
+    fn acquire<'a>(
+        &'a self,
+        zone_id: &'a str,
+        holder: &'a str,
+        ttl: Duration,
+    ) -> distributed_game::BoxFuture<
+        'a,
+        Result<distributed_game::world::ZoneClaim, distributed_game::world::OwnershipError>,
+    > {
+        self.acquired.lock().unwrap().push(zone_id.to_string());
+        self.inner.acquire(zone_id, holder, ttl)
+    }
+
+    fn renew<'a>(
+        &'a self,
+        claim: &'a distributed_game::world::ZoneClaim,
+        ttl: Duration,
+    ) -> distributed_game::BoxFuture<
+        'a,
+        Result<distributed_game::world::ZoneClaim, distributed_game::world::OwnershipError>,
+    > {
+        self.inner.renew(claim, ttl)
+    }
+
+    fn release<'a>(
+        &'a self,
+        claim: &'a distributed_game::world::ZoneClaim,
+    ) -> distributed_game::BoxFuture<'a, ()> {
+        self.inner.release(claim)
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unauthenticated_hellos_activate_nothing() {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::Arc;
+
+    let ownership = Arc::new(CountingOwnership::default());
+    let created = Arc::new(AtomicU32::new(0));
+    let counted = created.clone();
+    let server = GameServer::<Arena>::new(
+        ServerConfig::new(TicketKey::new(SECRET)),
+        ZoneFactory::sync(move |a| {
+            counted.fetch_add(1, Ordering::SeqCst);
+            a.zone_id.starts_with('z').then(ArenaConfig::default)
+        }),
+    )
+    .with_fact_sink(MemoryFactSink::new(), 64, RetryPolicy::default())
+    .with_ownership(ownership.clone());
+    let (url, handle) = serve_arena(&server).await;
+
+    let expired = TicketKey::new(SECRET).sign(&TicketClaims {
+        expires_at: 1,
+        ..claims_for("ana", "zg3", "g3")
+    });
+    let forged = TicketKey::new("not-the-server-key").sign(&claims_for("ana", "zg2", "g2"));
+    for (zone, ticket) in [
+        ("zg1", "garbage".to_string()),
+        ("zg2", forged),
+        ("zg3", expired),
+        ("zg4", ticket("ana", "zg9", "g4", Role::Player)),
+    ] {
+        expect_error(&url, zone, ticket, error::UNAUTHORIZED).await;
+    }
+    // A reconnect token never activates a zone either.
+    let mut ws = connect(&url, "zg5").await;
+    hello(&mut ws, String::new(), "forged-token".into()).await;
+    match next(&mut ws, &mut ClientMirror::new()).await {
+        Some(ServerMessage::Error { code, .. }) => assert_eq!(code, error::RECONNECT_FAILED),
+        other => panic!("expected RECONNECT_FAILED, got {other:?}"),
+    }
+    assert!(server.zone_ids().is_empty(), "{:?}", server.zone_ids());
+
+    // A real join afterwards: the only zone, lease and factory call.
+    let mut ws = connect(&url, "zok").await;
+    hello(
+        &mut ws,
+        ticket("ana", "zok", "ok1", Role::Player),
+        String::new(),
+    )
+    .await;
+    assert!(matches!(
+        next(&mut ws, &mut ClientMirror::new()).await,
+        Some(ServerMessage::Welcome(_))
+    ));
+    assert_eq!(server.zone_ids(), ["zok"]);
+    assert_eq!(*ownership.acquired.lock().unwrap(), ["zok"]);
+    assert_eq!(created.load(Ordering::SeqCst), 1);
+    stop(server, handle).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn max_zones_caps_activations() {
+    let mut config = ServerConfig::new(TicketKey::new(SECRET));
+    config.max_zones = 1;
+    let server = GameServer::<Arena>::new(
+        config,
+        ZoneFactory::sync(|a| a.zone_id.starts_with('z').then(ArenaConfig::default)),
+    );
+    let (url, handle) = serve_arena(&server).await;
+    let mut ws = connect(&url, "z1").await;
+    hello(
+        &mut ws,
+        ticket("ana", "z1", "m1", Role::Player),
+        String::new(),
+    )
+    .await;
+    assert!(matches!(
+        next(&mut ws, &mut ClientMirror::new()).await,
+        Some(ServerMessage::Welcome(_))
+    ));
+    expect_error(
+        &url,
+        "z2",
+        ticket("bo", "z2", "m2", Role::Player),
+        error::ZONE_UNAVAILABLE,
+    )
+    .await;
+    assert_eq!(server.zone_ids(), ["z1"]);
+    assert!(
+        !server.activate("z3").await,
+        "the cap applies to activate too"
+    );
+    // The running zone still admits.
+    let mut ws2 = connect(&url, "z1").await;
+    hello(
+        &mut ws2,
+        ticket("bo", "z1", "m3", Role::Player),
+        String::new(),
+    )
+    .await;
+    assert!(matches!(
+        next(&mut ws2, &mut ClientMirror::new()).await,
+        Some(ServerMessage::Welcome(_))
+    ));
+    stop(server, handle).await;
+}
+
+fn claims_for(principal: &str, zone: &str, nonce: &str) -> TicketClaims {
+    TicketClaims {
+        principal: principal.into(),
+        zone: zone.into(),
+        expires_at: 4_000_000_000,
+        nonce: nonce.into(),
+        role: Role::Player,
+        name: None,
+        extensions: Default::default(),
+        wake: false,
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn passes_the_admission_conformance_suite() {
+    let hello_timeout = Duration::from_millis(500);
+    let mut config = ServerConfig::new(TicketKey::new(SECRET));
+    config.admission.hello_timeout = hello_timeout;
+    let server = GameServer::<Arena>::new(
+        config,
+        ZoneFactory::sync(|a| a.zone_id.starts_with("room-").then(ArenaConfig::default)),
+    );
+    let (url, handle) = serve_arena(&server).await;
+    let probe = server.clone();
+    admission::run(admission::Target {
+        base: url,
+        key: TicketKey::new(SECRET),
+        hello_timeout,
+        awake: move |zone: String| {
+            let probe = probe.clone();
+            async move { probe.is_active(&zone) }
+        },
+    })
+    .await;
+    stop(server, handle).await;
+}
+
+/// Commands queued faster than the zone handles them (each handler here
+/// takes 1 ms, as an expensive game hook might) never hold a due tick
+/// back for more than a bounded batch.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_command_flood_never_holds_ticks_back() {
+    use std::sync::{Arc, Mutex};
+    let mut config = ServerConfig::new(TicketKey::new(SECRET));
+    config.host.idle_tick_rate = Some(30);
+    let server =
+        GameServer::<Arena>::new(config, ZoneFactory::sync(|_| Some(ArenaConfig::default())));
+    assert!(server.activate("zflood").await);
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let flood: Vec<_> = (0..400)
+        .map(|_| {
+            let (server, seen) = (server.clone(), seen.clone());
+            tokio::spawn(async move {
+                server
+                    .inspect("zflood", move |host| {
+                        std::thread::sleep(Duration::from_millis(1));
+                        seen.lock().unwrap().push(host.tick());
+                    })
+                    .await
+            })
+        })
+        .collect();
+    for task in flood {
+        task.await.unwrap().expect("handled");
+    }
+    let seen = seen.lock().unwrap().clone();
+    let longest = seen
+        .chunk_by(|a, b| a == b)
+        .map(<[u64]>::len)
+        .max()
+        .unwrap();
+    // 64 handlers (64 ms) then a look at the clock: a 33 ms tick is due.
+    assert!(longest <= 64, "{longest} commands without a tick: {seen:?}");
+    assert!(seen.last() > seen.first(), "ticks advanced: {seen:?}");
+    server.shutdown();
 }

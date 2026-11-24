@@ -1195,6 +1195,20 @@ impl<Z: Zone> ZoneHost<Z> {
         self.core.in_flight()
     }
 
+    /// Detach the fact queue without committing what it holds (the zone
+    /// lost its ownership: nothing more may reach the store). Queued facts
+    /// are dropped, the worker stops after any commit already in flight,
+    /// and later emits answer [`EmitError::NoSink`]. Returns the facts
+    /// left unsettled.
+    pub fn abandon_facts(&mut self) -> usize {
+        let unsettled = self.core.in_flight();
+        self.core.lifecycle_backlog.clear();
+        if let Some(queue) = self.core.facts.take() {
+            queue.abandon();
+        }
+        unsettled
+    }
+
     /// Facts emitted since the last call, when the fact queue keeps a
     /// journal ([`FactQueue::with_journal`]); empty otherwise.
     pub fn take_emitted_facts(&mut self) -> Vec<Fact> {

@@ -16,6 +16,8 @@
 //!   `Near { near: false }` lets it go dormant, `Near { near: true }` makes
 //!   it active again, and when it lets go for good the zone hibernates.
 //!   Without the grant, or without saying near, a watcher stays passive.
+//! - `admission`: `celld dev`. The admission conformance suite
+//!   (`tests/support/admission.rs`), as the `net` server runs it.
 //! - `fleet`: three celld nodes in production mode on one RustFS bucket
 //!   (docker compose). A zone is reached through a node that does not own
 //!   it, the owner is killed while 200 facts are in flight: the socket
@@ -44,6 +46,8 @@ use serde_json::Value;
 use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 use tokio_tungstenite::tungstenite::Message;
 
+#[path = "../support/admission.rs"]
+mod admission;
 #[path = "../support/celld.rs"]
 mod celld_support;
 #[path = "../support/fleet.rs"]
@@ -403,6 +407,26 @@ async fn single_node() {
     ana_b.input(&[1, 3]).await;
     assert_eq!(ana_b.total(2).await, 3);
     until(&base, "/tally/ana", long, |v| exactly_once(v, 8)).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn admission() {
+    let _serial = serial();
+    let Some(celld) = celld_support::Celld::start_worker(&worker(), REQUIRED) else {
+        return;
+    };
+    let base = celld.base();
+    let probe = base.clone();
+    admission::run(admission::Target {
+        base: base.replacen("http://", "ws://", 1),
+        key: TicketKey::new(TICKET_SECRET),
+        hello_timeout: Duration::from_secs(5),
+        awake: move |zone: String| {
+            let probe = probe.clone();
+            async move { get(&probe, &format!("/zones/{zone}/info")).await["awake"] == true }
+        },
+    })
+    .await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

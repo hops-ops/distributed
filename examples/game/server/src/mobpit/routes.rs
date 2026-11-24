@@ -79,6 +79,8 @@ struct Dev {
 pub const CONTENT_WORLD: &str = "world";
 /// The services' admin session principal.
 const ADMIN_PRINCIPAL: &str = "admin:dev";
+/// Header carrying the admin secret (the client's rollout panel sends it).
+const ADMIN_SECRET_HEADER: &str = "x-game-admin-secret";
 
 /// The router. `admin_secret` guards the admin routes (rollouts).
 pub fn routes(world: Arc<MobPitWorld>, key: TicketKey, admin_secret: String) -> Router {
@@ -373,7 +375,7 @@ async fn rollout(
     Json(request): Json<RolloutRequest>,
 ) -> ApiResult {
     let given = headers
-        .get(distributed_game::net::peer::ADMIN_SECRET_HEADER)
+        .get(ADMIN_SECRET_HEADER)
         .and_then(|v| v.to_str().ok())
         .unwrap_or_default();
     if dev.admin_secret.is_empty()

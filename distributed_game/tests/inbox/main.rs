@@ -6,10 +6,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use distributed_game::lifecycle::{LeftReason, Lifecycle};
-use distributed_game::net::peer::post_json;
 use distributed_game::net::{
-    GameServer, InboxError, ServerConfig, TicketKey, ZoneFactory, ZoneInboxClient,
-    ZONE_MESSAGE_PATH,
+    GameServer, InboxError, InternalHttpSecret, ServerConfig, TicketKey, ZoneFactory,
+    ZoneInboxClient, ZONE_MESSAGE_PATH,
 };
 use distributed_game::protocol::kick;
 use distributed_game::world::{HostAddr, StaticDirectory};
@@ -17,7 +16,7 @@ use distributed_game::*;
 use serde_json::json;
 
 const SECRET: &str = "inbox-secret";
-const ADMIN: &str = "inbox-admin";
+const ADMIN: &str = "inbox-test-internal-secret-0123456789";
 
 /// Messages a service may send into a hall.
 #[derive(Debug, Clone, PartialEq, GameEvent)]
@@ -206,7 +205,7 @@ async fn serve(
 
 fn server(shared: Arc<Mutex<Shared>>) -> GameServer<Hall> {
     let mut config = ServerConfig::new(TicketKey::new(SECRET));
-    config.admin_secret = Some(ADMIN.into());
+    config.admin_secret = Some(InternalHttpSecret::new(ADMIN).unwrap());
     config.host.tick_rate = 120;
     GameServer::new(
         config,
@@ -293,16 +292,17 @@ async fn admin_route_authenticates_refuses_inactive_and_redirects_to_the_owner()
             }
         })
     };
+    // Raw requests: the internal secret header as presented.
     let post = |url: String, secret: &'static str, body: serde_json::Value| async move {
-        post_json(
-            &url,
-            ZONE_MESSAGE_PATH,
-            secret,
-            &body,
-            Duration::from_secs(3),
-        )
-        .await
-        .unwrap()
+        let response = reqwest::Client::new()
+            .post(format!("{url}{ZONE_MESSAGE_PATH}"))
+            .header("x-distributed-internal-secret", secret)
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        let status = response.status().as_u16();
+        (status, response.json::<serde_json::Value>().await.unwrap())
     };
 
     // Unauthenticated (wrong or empty secret) is refused before anything.
@@ -339,7 +339,7 @@ async fn admin_route_authenticates_refuses_inactive_and_redirects_to_the_owner()
     // A service whose directory is stale (says B) follows the redirect.
     let stale = Arc::new(StaticDirectory::new());
     stale.add_host(b_addr.clone()).assign("hall.a", "B");
-    let client = ZoneInboxClient::new(stale, ADMIN);
+    let client = ZoneInboxClient::new(stale, InternalHttpSecret::new(ADMIN).unwrap());
     client
         .send("hall.a", &HallMessage::SetMotd { motd: "hi".into() })
         .await
@@ -362,7 +362,10 @@ async fn admin_route_authenticates_refuses_inactive_and_redirects_to_the_owner()
         client.send("hall.cold", &HallMessage::Probe { n: 6 }).await,
         Err(InboxError::Inactive)
     );
-    let unauthorized = ZoneInboxClient::new(directory.clone(), "wrong");
+    let unauthorized = ZoneInboxClient::new(
+        directory.clone(),
+        InternalHttpSecret::new("not-the-inbox-test-internal-secret").unwrap(),
+    );
     assert_eq!(
         unauthorized
             .send("hall.a", &HallMessage::Probe { n: 7 })

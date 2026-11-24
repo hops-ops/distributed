@@ -462,6 +462,12 @@ impl FactQueue {
         self.in_flight.len()
     }
 
+    /// Close the queue dropping the facts its worker has not taken yet
+    /// (a plain drop lets the worker commit them first).
+    pub fn abandon(self) {
+        self.shared.queue.lock().expect("fact queue lock").clear();
+    }
+
     /// Queue whose settlements come from a script instead of a worker
     /// (record/replay). Emitted facts are tracked for backpressure and
     /// duplicate keys exactly like a live queue but never committed.
