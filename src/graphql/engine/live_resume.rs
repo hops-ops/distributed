@@ -1,6 +1,6 @@
 use super::*;
 
-const MAX_LIVE_RESUME_PROJECTION_BYTES: usize = 512;
+pub(crate) const MAX_LIVE_RESUME_PROJECTION_BYTES: usize = 512;
 
 /// Parse the private request extension used by generated live operations.
 /// Invalid input is a conservative reset signal, never trusted cursor state.

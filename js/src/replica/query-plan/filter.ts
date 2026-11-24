@@ -1,4 +1,5 @@
 import type { GraphqlVariables } from '../../types.js';
+import { compareUtf8 } from '../../lib/compare-utf8.js';
 
 import type {
 	ReplicaFilterArtifact,
@@ -29,7 +30,6 @@ import type {
 	ResolvedOperand
 } from './types.js';
 import {
-	compareUtf8,
 	isFiniteNumber,
 	isInt32,
 	isName,

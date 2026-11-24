@@ -28,18 +28,6 @@ export function cloneScope(scope: ReplicaAuthoritativeScope): ReplicaAuthoritati
 	});
 }
 
-export function sameScope(
-	left: ReplicaAuthoritativeScope,
-	right: ReplicaAuthoritativeScope
-): boolean {
-	return (
-		left.protocolVersion === right.protocolVersion &&
-		left.schemaHash === right.schemaHash &&
-		left.authorizationGeneration === right.authorizationGeneration &&
-		left.cacheScope === right.cacheScope
-	);
-}
-
 export function sameSurface(
 	left: ReplicaClientSurface | undefined,
 	right: ReplicaClientSurface

@@ -350,7 +350,7 @@ pub struct DescribeArgs {
     /// Path to the local Distributed crate.
     #[arg(long)]
     pub distributed_path: Option<PathBuf>,
-    /// Exact wasm-pack JavaScript launcher owned by the resolved framework package.
+    /// Exact wasm-pack JavaScript launcher installed beside the resolved framework package.
     #[arg(long, hide = true)]
     pub wasm_pack_launcher: Option<PathBuf>,
 }

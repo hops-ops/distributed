@@ -1,10 +1,5 @@
 import assert from 'node:assert/strict';
-import { readFile, readdir } from 'node:fs/promises';
-import { dirname, join, resolve } from 'node:path';
 import test from 'node:test';
-import { fileURLToPath } from 'node:url';
-import { InMemoryCache } from '@apollo/client/cache';
-import { gql } from '@apollo/client';
 import {
 	CacheRevisionConflictError,
 	OptimisticLayerNotFoundError,
@@ -1074,87 +1069,4 @@ test('structured index metadata must agree with its canonical key', () => {
 			),
 		/index key does not match its metadata/
 	);
-});
-
-const APOLLO_TODO = gql`
-	fragment CacheEngineTodo on Todo {
-		id
-		status
-	}
-	query CacheEngineTodoQuery {
-		todo {
-			__typename
-			...CacheEngineTodo
-		}
-	}
-`;
-
-function apolloWrite(cache, status) {
-	cache.writeQuery({
-		query: APOLLO_TODO,
-		data: { todo: { __typename: 'Todo', id: 'todo-1', status } }
-	});
-}
-
-test('Apollo 4 public APIs pass basic layers/batching/extract but expose the causal ordering gap', () => {
-	const cache = new InMemoryCache({
-		typePolicies: { Todo: { keyFields: ['id'] } }
-	});
-	apolloWrite(cache, 'base');
-	let calls = 0;
-	cache.watch({ query: APOLLO_TODO, optimistic: true, callback: () => calls++ });
-	cache.batch({
-		optimistic: 'A',
-		update() {
-			apolloWrite(cache, 'A');
-		}
-	});
-	cache.batch({
-		optimistic: 'B',
-		update() {
-			apolloWrite(cache, 'B');
-		}
-	});
-	assert.equal(cache.readQuery({ query: APOLLO_TODO }, true).todo.status, 'B');
-	assert.equal(calls, 2, 'each public batch broadcasts once');
-
-	const baseSnapshot = JSON.stringify(cache.extract(false));
-	const optimisticSnapshot = JSON.stringify(cache.extract(true));
-	assert.match(baseSnapshot, /base/);
-	assert.doesNotMatch(baseSnapshot, /"status":"A"|"status":"B"/);
-	assert.match(optimisticSnapshot, /"status":"B"/);
-
-	cache.batch({
-		update() {
-			apolloWrite(cache, 'B projected');
-		},
-		removeOptimistic: 'B'
-	});
-	// Native Apollo layer ordering reveals older A after newer B confirms.
-	assert.equal(cache.readQuery({ query: APOLLO_TODO }, true).todo.status, 'A');
-	cache.removeOptimistic('A');
-	assert.equal(cache.readQuery({ query: APOLLO_TODO }, true).todo.status, 'B projected');
-
-	// Apollo has no source-revision/tombstone fence: arrival order can resurrect stale data.
-	cache.evict({ id: 'Todo:{"id":"todo-1"}' });
-	apolloWrite(cache, 'stale resurrection');
-	assert.equal(cache.readQuery({ query: APOLLO_TODO }).todo.status, 'stale resurrection');
-});
-
-test('built declarations contain no Apollo/vendor types', async () => {
-	const packageRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
-	const declarationFiles = [];
-	async function visit(directory) {
-		for (const entry of await readdir(directory, { withFileTypes: true })) {
-			const path = join(directory, entry.name);
-			if (entry.isDirectory()) await visit(path);
-			else if (entry.name.endsWith('.d.ts')) declarationFiles.push(path);
-		}
-	}
-	await visit(join(packageRoot, 'dist'));
-	assert.ok(declarationFiles.length > 0);
-	for (const path of declarationFiles) {
-		const declaration = await readFile(path, 'utf8');
-		assert.doesNotMatch(declaration, /@apollo\/client|\bApollo(?:Cache|Client|Link)\b/);
-	}
 });

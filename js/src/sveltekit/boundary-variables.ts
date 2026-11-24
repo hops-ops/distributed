@@ -2,6 +2,7 @@ import {
 	canonicalizeOperationVariables,
 	type ReplicaOperationArtifact
 } from '../replica/index.js';
+import { fnv1a64 } from '../lib/fnv1a64.js';
 import type { GraphqlVariables } from '../types.js';
 import type { ReplicaVariableInputRef } from '../replica/types.js';
 import {
@@ -425,15 +426,6 @@ function stableValue(value: unknown): unknown {
 		}
 	};
 	return visit(value, 0);
-}
-
-function fnv1a64(value: string): string {
-	let hash = 0xcbf29ce484222325n;
-	for (const byte of new TextEncoder().encode(value)) {
-		hash ^= BigInt(byte);
-		hash = BigInt.asUintN(64, hash * 0x100000001b3n);
-	}
-	return hash.toString(16).padStart(16, '0');
 }
 
 function freezeJson(value: unknown): unknown {

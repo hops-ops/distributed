@@ -1,4 +1,3 @@
-import { compareCodeUnits } from '../../lib/compare-code-units.js';
 import type { CacheValue } from '../../internal/cache-engine.js';
 import {
 	compareDistributedDecimal,
@@ -31,10 +30,6 @@ export function sameRecordRevision(
 		left.revision === right.revision &&
 		left.tombstone === right.tombstone
 	);
-}
-
-export function recordKeyMatchesModel(recordKey: string, model: string): boolean {
-	return recordKey.startsWith(`record:${encodeURIComponent(model)}:`);
 }
 
 export function modelFromRecordKey(recordKey: string): string | undefined {
@@ -193,17 +188,6 @@ export function incrementCanonicalDecimal(value: string): string {
 	}
 	if (carry) digits.unshift('1');
 	return digits.join('');
-}
-
-export function compareCanonicalDecimalStrings(
-	left: string,
-	right: string
-): number {
-	return left.length === right.length
-		? compareCodeUnits(left, right)
-		: left.length < right.length
-			? -1
-			: 1;
 }
 
 export function protocolInvalid(path: string): never {

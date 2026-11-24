@@ -1,4 +1,5 @@
 import { matchReplicaTrustedPresetInventory } from '../commands.js';
+import { sameScope } from '../distributed-replica/hydration.js';
 import { SHA256 } from './constants.js';
 import { ReplicaCommandRuntimeError } from './errors.js';
 import { defineBoundCommand, freezeCommandTree } from './lib/binding.js';
@@ -11,7 +12,6 @@ import {
 	cloneScope,
 	cloneSurface,
 	linkAbortSignals,
-	sameScope,
 	sameSurface
 } from './lib/util.js';
 import { replicaCommandAuthority } from './symbols.js';

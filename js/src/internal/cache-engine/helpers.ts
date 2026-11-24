@@ -19,6 +19,7 @@ import type {
 } from './types.js';
 
 import { assertName } from '../../lib/assert-name.js';
+import { canonicalJson } from '../../lib/canonical-json.js';
 import { compareCodeUnits } from '../../lib/compare-code-units.js';
 import { deepEqual } from '../../lib/deep-equal.js';
 import { freezeRecord } from '../../lib/freeze-record.js';
@@ -625,16 +626,6 @@ export function cloneCacheValue(value: CacheValue, ancestors = new Set<object>()
 	return cloned;
 }
 
-export function canonicalValue(value: CacheValue): string {
-	if (value === null || typeof value !== 'object') return JSON.stringify(value);
-	if (Array.isArray(value)) return `[${value.map(canonicalValue).join(',')}]`;
-	const record = value as Readonly<Record<string, CacheValue>>;
-	return `{${Object.keys(record)
-		.sort()
-		.map((key) => `${JSON.stringify(key)}:${canonicalValue(record[key]!)}`)
-		.join(',')}}`;
-}
-
 export function cacheIndexKey(input: {
 	parent?: RecordKey;
 	field: string;
@@ -643,7 +634,7 @@ export function cacheIndexKey(input: {
 	assertName(input.field, 'index field');
 	if (input.parent !== undefined) validateRecordKey(input.parent);
 	const argumentsValue = cloneCacheValue(input.arguments ?? {});
-	return `${input.parent ?? '$root'}.${input.field}(${canonicalValue(argumentsValue)})`;
+	return `${input.parent ?? '$root'}.${input.field}(${canonicalJson(argumentsValue)})`;
 }
 
 export { assertName, deepEqual, freezeRecord, reportSafely };

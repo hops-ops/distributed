@@ -366,7 +366,7 @@ test('a stricter current policy rewrites and removes previously durable data', a
 		[...factory.entries(DATABASE).values()][0].state.payload.cache.records.map(
 			(entry) => entry.key
 		),
-		[SecretKey, TodoKey]
+		[TodoKey, SecretKey]
 	);
 
 	const restricted = createReplicaIndexedDbPersistence({
@@ -485,7 +485,7 @@ test('malformed or command-like dehydration fields never enter IndexedDB', async
 
 	await assert.rejects(
 		() => persistence.save(malformed),
-		/unknown field state\.payload\.optimisticLayers/
+		/invalid replica state at state\.payload\.optimisticLayers/
 	);
 	assert.equal(factory.entries(DATABASE).size, 0);
 	persistence.close();

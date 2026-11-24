@@ -1,0 +1,670 @@
+{
+  "command": {
+    "causationId": "0190a000-0000-7000-8000-000000000017",
+    "commandId": "0190a000-0000-7000-8000-000000000042",
+    "dispatch": {
+      "atomic": {
+        "data": {
+          "todo_complete": {
+            "id": "todo-1",
+            "title": "sealed"
+          }
+        },
+        "extensions": {
+          "distributed": {
+            "authorizationGeneration": "sha256:a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7",
+            "cacheScope": "v1.cache-scope.lUsXGfYHX9iMPzQ_QvHaWhVUWuiXxSVpZ-XERUX9Kuw",
+            "command": {
+              "causationId": "0190a000-0000-7000-8000-000000000017",
+              "commandId": "0190a000-0000-7000-8000-000000000042",
+              "consistency": "atomic",
+              "expects": [],
+              "records": [
+                {
+                  "incarnation": "1",
+                  "model": "TodoView",
+                  "revision": "4",
+                  "scopeToken": "v1.record-revision.1SYfSxrPw7g5l_xQHNuyIR1cwISQTfuzwzj178ukDAM",
+                  "tombstone": false
+                }
+              ],
+              "state": "atomic"
+            },
+            "operation": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
+            "protocolVersion": 1,
+            "schemaHash": "sha256:5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c"
+          }
+        }
+      },
+      "in_progress": {
+        "data": {
+          "todo_complete": {
+            "id": "todo-1"
+          }
+        },
+        "extensions": {
+          "distributed": {
+            "authorizationGeneration": "sha256:a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7",
+            "cacheScope": "v1.cache-scope.lUsXGfYHX9iMPzQ_QvHaWhVUWuiXxSVpZ-XERUX9Kuw",
+            "command": {
+              "causationId": "0190a000-0000-7000-8000-000000000017",
+              "commandId": "0190a000-0000-7000-8000-000000000042",
+              "consistency": "eventual",
+              "expects": [],
+              "state": "in_progress"
+            },
+            "operation": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
+            "protocolVersion": 1,
+            "schemaHash": "sha256:5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c"
+          }
+        }
+      },
+      "rejected": {
+        "data": null,
+        "errors": [
+          {
+            "extensions": {
+              "code": "REJECTED",
+              "status": 422
+            },
+            "locations": [
+              {
+                "column": 3,
+                "line": 1
+              }
+            ],
+            "message": "todo is already done",
+            "path": [
+              "todo_complete"
+            ]
+          }
+        ],
+        "extensions": {
+          "distributed": {
+            "authorizationGeneration": "sha256:a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7",
+            "cacheScope": "v1.cache-scope.lUsXGfYHX9iMPzQ_QvHaWhVUWuiXxSVpZ-XERUX9Kuw",
+            "operation": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
+            "protocolVersion": 1,
+            "schemaHash": "sha256:5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c"
+          }
+        }
+      },
+      "succeeded": {
+        "data": {
+          "todo_complete": {
+            "id": "todo-1"
+          }
+        },
+        "extensions": {
+          "distributed": {
+            "authorizationGeneration": "sha256:a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7",
+            "cacheScope": "v1.cache-scope.lUsXGfYHX9iMPzQ_QvHaWhVUWuiXxSVpZ-XERUX9Kuw",
+            "command": {
+              "causationId": "0190a000-0000-7000-8000-000000000017",
+              "commandId": "0190a000-0000-7000-8000-000000000042",
+              "consistency": "succeeded",
+              "expects": [],
+              "state": "succeeded"
+            },
+            "operation": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
+            "protocolVersion": 1,
+            "schemaHash": "sha256:5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c"
+          }
+        }
+      },
+      "succeeded_pending_projection": {
+        "data": {
+          "todo_complete": {
+            "id": "todo-1"
+          }
+        },
+        "extensions": {
+          "distributed": {
+            "authorizationGeneration": "sha256:a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7",
+            "cacheScope": "v1.cache-scope.lUsXGfYHX9iMPzQ_QvHaWhVUWuiXxSVpZ-XERUX9Kuw",
+            "command": {
+              "causationId": "0190a000-0000-7000-8000-000000000017",
+              "commandId": "0190a000-0000-7000-8000-000000000042",
+              "consistency": "eventual",
+              "expects": [],
+              "state": "succeeded_pending_projection"
+            },
+            "operation": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
+            "protocolVersion": 1,
+            "schemaHash": "sha256:5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c"
+          }
+        }
+      }
+    },
+    "mutationField": "todo_complete",
+    "name": "todo.complete",
+    "status": {
+      "atomic": {
+        "data": {
+          "commandStatus": {
+            "state": "atomic"
+          }
+        },
+        "extensions": {
+          "distributed": {
+            "authorizationGeneration": "sha256:a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7",
+            "cacheScope": "v1.cache-scope.lUsXGfYHX9iMPzQ_QvHaWhVUWuiXxSVpZ-XERUX9Kuw",
+            "command": {
+              "causationId": "0190a000-0000-7000-8000-000000000017",
+              "commandId": "0190a000-0000-7000-8000-000000000042",
+              "consistency": "atomic",
+              "expects": [],
+              "records": [
+                {
+                  "incarnation": "1",
+                  "model": "TodoView",
+                  "revision": "4",
+                  "scopeToken": "v1.record-revision.1SYfSxrPw7g5l_xQHNuyIR1cwISQTfuzwzj178ukDAM",
+                  "tombstone": false
+                }
+              ],
+              "state": "atomic"
+            },
+            "operation": "sha256:4444444444444444444444444444444444444444444444444444444444444444",
+            "protocolVersion": 1,
+            "schemaHash": "sha256:5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c"
+          }
+        }
+      },
+      "expired": {
+        "data": {
+          "commandStatus": {
+            "state": "expired"
+          }
+        },
+        "extensions": {
+          "distributed": {
+            "authorizationGeneration": "sha256:a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7",
+            "cacheScope": "v1.cache-scope.lUsXGfYHX9iMPzQ_QvHaWhVUWuiXxSVpZ-XERUX9Kuw",
+            "operation": "sha256:4444444444444444444444444444444444444444444444444444444444444444",
+            "protocolVersion": 1,
+            "schemaHash": "sha256:5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c"
+          }
+        }
+      },
+      "in_progress": {
+        "data": {
+          "commandStatus": {
+            "state": "in_progress"
+          }
+        },
+        "extensions": {
+          "distributed": {
+            "authorizationGeneration": "sha256:a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7",
+            "cacheScope": "v1.cache-scope.lUsXGfYHX9iMPzQ_QvHaWhVUWuiXxSVpZ-XERUX9Kuw",
+            "command": {
+              "causationId": "0190a000-0000-7000-8000-000000000017",
+              "commandId": "0190a000-0000-7000-8000-000000000042",
+              "consistency": "eventual",
+              "expects": [],
+              "state": "in_progress"
+            },
+            "operation": "sha256:4444444444444444444444444444444444444444444444444444444444444444",
+            "protocolVersion": 1,
+            "schemaHash": "sha256:5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c"
+          }
+        }
+      },
+      "projection_failed": {
+        "data": {
+          "commandStatus": {
+            "state": "projection_failed"
+          }
+        },
+        "extensions": {
+          "distributed": {
+            "authorizationGeneration": "sha256:a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7",
+            "cacheScope": "v1.cache-scope.lUsXGfYHX9iMPzQ_QvHaWhVUWuiXxSVpZ-XERUX9Kuw",
+            "command": {
+              "causationId": "0190a000-0000-7000-8000-000000000017",
+              "commandId": "0190a000-0000-7000-8000-000000000042",
+              "consistency": "eventual",
+              "expects": [],
+              "state": "projection_failed"
+            },
+            "operation": "sha256:4444444444444444444444444444444444444444444444444444444444444444",
+            "protocolVersion": 1,
+            "schemaHash": "sha256:5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c"
+          }
+        }
+      },
+      "rejected": {
+        "data": {
+          "commandStatus": {
+            "state": "rejected"
+          }
+        },
+        "extensions": {
+          "distributed": {
+            "authorizationGeneration": "sha256:a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7",
+            "cacheScope": "v1.cache-scope.lUsXGfYHX9iMPzQ_QvHaWhVUWuiXxSVpZ-XERUX9Kuw",
+            "command": {
+              "causationId": "0190a000-0000-7000-8000-000000000017",
+              "commandId": "0190a000-0000-7000-8000-000000000042",
+              "consistency": "eventual",
+              "expects": [],
+              "state": "rejected"
+            },
+            "operation": "sha256:4444444444444444444444444444444444444444444444444444444444444444",
+            "protocolVersion": 1,
+            "schemaHash": "sha256:5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c"
+          }
+        }
+      },
+      "succeeded": {
+        "data": {
+          "commandStatus": {
+            "state": "succeeded"
+          }
+        },
+        "extensions": {
+          "distributed": {
+            "authorizationGeneration": "sha256:a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7",
+            "cacheScope": "v1.cache-scope.lUsXGfYHX9iMPzQ_QvHaWhVUWuiXxSVpZ-XERUX9Kuw",
+            "command": {
+              "causationId": "0190a000-0000-7000-8000-000000000017",
+              "commandId": "0190a000-0000-7000-8000-000000000042",
+              "consistency": "eventual",
+              "expects": [],
+              "state": "succeeded"
+            },
+            "operation": "sha256:4444444444444444444444444444444444444444444444444444444444444444",
+            "protocolVersion": 1,
+            "schemaHash": "sha256:5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c"
+          }
+        }
+      },
+      "succeeded_pending_projection": {
+        "data": {
+          "commandStatus": {
+            "state": "succeeded_pending_projection"
+          }
+        },
+        "extensions": {
+          "distributed": {
+            "authorizationGeneration": "sha256:a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7",
+            "cacheScope": "v1.cache-scope.lUsXGfYHX9iMPzQ_QvHaWhVUWuiXxSVpZ-XERUX9Kuw",
+            "command": {
+              "causationId": "0190a000-0000-7000-8000-000000000017",
+              "commandId": "0190a000-0000-7000-8000-000000000042",
+              "consistency": "eventual",
+              "expects": [],
+              "state": "succeeded_pending_projection"
+            },
+            "operation": "sha256:4444444444444444444444444444444444444444444444444444444444444444",
+            "protocolVersion": 1,
+            "schemaHash": "sha256:5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c"
+          }
+        }
+      },
+      "unknown": {
+        "data": {
+          "commandStatus": {
+            "state": "unknown"
+          }
+        },
+        "extensions": {
+          "distributed": {
+            "authorizationGeneration": "sha256:a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7",
+            "cacheScope": "v1.cache-scope.lUsXGfYHX9iMPzQ_QvHaWhVUWuiXxSVpZ-XERUX9Kuw",
+            "operation": "sha256:4444444444444444444444444444444444444444444444444444444444444444",
+            "protocolVersion": 1,
+            "schemaHash": "sha256:5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c"
+          }
+        }
+      }
+    }
+  },
+  "limits": {
+    "commandProjectionObligations": 128,
+    "evidenceItems": 4096,
+    "liveResumeCursors": 64,
+    "liveResumeProjectionBytes": 512,
+    "opaqueTokenBytes": 4096
+  },
+  "live": {
+    "delta": {
+      "data": {
+        "todos": [
+          {
+            "id": "todo-1",
+            "title": "second"
+          },
+          {
+            "id": "todo-2",
+            "title": "added"
+          }
+        ]
+      },
+      "extensions": {
+        "distributed": {
+          "authorizationGeneration": "sha256:a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7",
+          "cacheScope": "v1.cache-scope.lUsXGfYHX9iMPzQ_QvHaWhVUWuiXxSVpZ-XERUX9Kuw",
+          "live": {
+            "cursors": [
+              {
+                "position": "3",
+                "projection": "todos-projector",
+                "token": "v1.live-resume.wnTnR1_S3NoFT9Etj2FeGw7OHgMFJdMlxiy4IW8Oyzo"
+              }
+            ],
+            "mode": "resumable",
+            "reset": false
+          },
+          "operation": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+          "protocolVersion": 1,
+          "schemaHash": "sha256:5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c",
+          "snapshot": {
+            "indexes": [
+              {
+                "position": "3",
+                "projection": "todos-projector",
+                "resume": {
+                  "position": "3",
+                  "projection": "todos-projector",
+                  "token": "v1.live-resume.wnTnR1_S3NoFT9Etj2FeGw7OHgMFJdMlxiy4IW8Oyzo"
+                },
+                "scopeToken": "v1.query-index.hNn39BQAqcOQA4dyzt7LfI92OCjNzeBE_y8RPOyUsIE"
+              }
+            ],
+            "indexesComparable": true,
+            "observations": [
+              {
+                "causationId": "0190a000-0000-7000-8000-000000000017",
+                "model": "TodoView",
+                "projection": "todos-projector",
+                "scopeToken": "v1.projection-obligation.V-zwQuoZlwDQ124uHiYcNrPcbJtakUTwmLQAfoipZ0w"
+              }
+            ],
+            "records": [
+              {
+                "incarnation": "1",
+                "model": "TodoView",
+                "path": [
+                  "todos",
+                  "0"
+                ],
+                "revision": "2",
+                "scopeToken": "v1.record-revision.1SYfSxrPw7g5l_xQHNuyIR1cwISQTfuzwzj178ukDAM",
+                "tombstone": false
+              },
+              {
+                "incarnation": "1",
+                "model": "TodoView",
+                "path": [
+                  "todos",
+                  "1"
+                ],
+                "revision": "3",
+                "scopeToken": "v1.record-revision.8ZyjnisPgN7dxXftdGdrJmf6h3E7k8828Dh2m_9YEQU",
+                "tombstone": false
+              }
+            ],
+            "recordsComplete": true,
+            "scopeToken": "v1.query-snapshot.7q-sYBSAUBxVfgqSUaBsTdJ7k5G4zya4KY2xE6xP7QQ"
+          }
+        }
+      }
+    },
+    "failure": {
+      "data": null,
+      "errors": [
+        {
+          "locations": [
+            {
+              "column": 3,
+              "line": 1
+            }
+          ],
+          "message": "GraphQL query snapshot failed: fixture",
+          "path": [
+            "todos"
+          ]
+        }
+      ],
+      "extensions": {
+        "distributed": {
+          "authorizationGeneration": "sha256:a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7",
+          "cacheScope": "v1.cache-scope.lUsXGfYHX9iMPzQ_QvHaWhVUWuiXxSVpZ-XERUX9Kuw",
+          "operation": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+          "protocolVersion": 1,
+          "schemaHash": "sha256:5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c"
+        }
+      }
+    },
+    "opening": {
+      "data": {
+        "todos": [
+          {
+            "id": "todo-1",
+            "title": "second"
+          }
+        ]
+      },
+      "extensions": {
+        "distributed": {
+          "authorizationGeneration": "sha256:a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7",
+          "cacheScope": "v1.cache-scope.lUsXGfYHX9iMPzQ_QvHaWhVUWuiXxSVpZ-XERUX9Kuw",
+          "live": {
+            "cursors": [
+              {
+                "position": "2",
+                "projection": "todos-projector",
+                "token": "v1.live-resume.APMEJsAMVfOcKow3PduylNBBIhze165zTNroNM0REOU"
+              }
+            ],
+            "mode": "resumable",
+            "reset": true
+          },
+          "operation": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+          "protocolVersion": 1,
+          "schemaHash": "sha256:5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c",
+          "snapshot": {
+            "indexes": [
+              {
+                "position": "2",
+                "projection": "todos-projector",
+                "resume": {
+                  "position": "2",
+                  "projection": "todos-projector",
+                  "token": "v1.live-resume.APMEJsAMVfOcKow3PduylNBBIhze165zTNroNM0REOU"
+                },
+                "scopeToken": "v1.query-index.hNn39BQAqcOQA4dyzt7LfI92OCjNzeBE_y8RPOyUsIE"
+              }
+            ],
+            "indexesComparable": true,
+            "observations": [],
+            "records": [
+              {
+                "incarnation": "1",
+                "model": "TodoView",
+                "path": [
+                  "todos",
+                  "0"
+                ],
+                "revision": "2",
+                "scopeToken": "v1.record-revision.1SYfSxrPw7g5l_xQHNuyIR1cwISQTfuzwzj178ukDAM",
+                "tombstone": false
+              }
+            ],
+            "recordsComplete": true,
+            "scopeToken": "v1.query-snapshot.7q-sYBSAUBxVfgqSUaBsTdJ7k5G4zya4KY2xE6xP7QQ"
+          }
+        }
+      }
+    },
+    "reset": {
+      "data": {
+        "todos": [
+          {
+            "id": "todo-2",
+            "title": "after the gap"
+          }
+        ]
+      },
+      "extensions": {
+        "distributed": {
+          "authorizationGeneration": "sha256:a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7",
+          "cacheScope": "v1.cache-scope.lUsXGfYHX9iMPzQ_QvHaWhVUWuiXxSVpZ-XERUX9Kuw",
+          "live": {
+            "cursors": [
+              {
+                "position": "9007199254740993",
+                "projection": "todos-projector",
+                "token": "v1.live-resume.G-VUB4HgF4pXhWQgVHJLG7ahUps5doS0FQW9TwAzsVg"
+              }
+            ],
+            "mode": "resumable",
+            "reset": true
+          },
+          "operation": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+          "protocolVersion": 1,
+          "schemaHash": "sha256:5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c",
+          "snapshot": {
+            "indexes": [
+              {
+                "position": "9007199254740993",
+                "projection": "todos-projector",
+                "resume": {
+                  "position": "9007199254740993",
+                  "projection": "todos-projector",
+                  "token": "v1.live-resume.G-VUB4HgF4pXhWQgVHJLG7ahUps5doS0FQW9TwAzsVg"
+                },
+                "scopeToken": "v1.query-index.hNn39BQAqcOQA4dyzt7LfI92OCjNzeBE_y8RPOyUsIE"
+              }
+            ],
+            "indexesComparable": true,
+            "observations": [],
+            "records": [
+              {
+                "incarnation": "2",
+                "model": "TodoView",
+                "path": [
+                  "todos",
+                  "0"
+                ],
+                "revision": "9007199254740993",
+                "scopeToken": "v1.record-revision.8ZyjnisPgN7dxXftdGdrJmf6h3E7k8828Dh2m_9YEQU",
+                "tombstone": false
+              }
+            ],
+            "recordsComplete": true,
+            "scopeToken": "v1.query-snapshot.7q-sYBSAUBxVfgqSUaBsTdJ7k5G4zya4KY2xE6xP7QQ"
+          }
+        }
+      }
+    },
+    "unresumable": {
+      "data": {
+        "todos": [
+          {
+            "id": "todo-1",
+            "title": "first"
+          }
+        ]
+      },
+      "extensions": {
+        "distributed": {
+          "authorizationGeneration": "sha256:a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7",
+          "cacheScope": "v1.cache-scope.lUsXGfYHX9iMPzQ_QvHaWhVUWuiXxSVpZ-XERUX9Kuw",
+          "live": {
+            "cursors": [],
+            "mode": "snapshot",
+            "reset": true
+          },
+          "operation": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+          "protocolVersion": 1,
+          "schemaHash": "sha256:5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c",
+          "snapshot": {
+            "indexes": [],
+            "indexesComparable": false,
+            "observations": [],
+            "records": [
+              {
+                "incarnation": "1",
+                "model": "TodoView",
+                "path": [
+                  "todos",
+                  "0"
+                ],
+                "revision": "1",
+                "scopeToken": "v1.record-revision.1SYfSxrPw7g5l_xQHNuyIR1cwISQTfuzwzj178ukDAM",
+                "tombstone": false
+              }
+            ],
+            "recordsComplete": true,
+            "scopeToken": "v1.query-snapshot.7q-sYBSAUBxVfgqSUaBsTdJ7k5G4zya4KY2xE6xP7QQ"
+          }
+        }
+      }
+    }
+  },
+  "operations": {
+    "command": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
+    "live": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+    "query": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+    "status": "sha256:4444444444444444444444444444444444444444444444444444444444444444"
+  },
+  "query": {
+    "data": {
+      "todos": [
+        {
+          "id": "todo-1",
+          "title": "first"
+        }
+      ]
+    },
+    "extensions": {
+      "distributed": {
+        "authorizationGeneration": "sha256:a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7",
+        "cacheScope": "v1.cache-scope.lUsXGfYHX9iMPzQ_QvHaWhVUWuiXxSVpZ-XERUX9Kuw",
+        "operation": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+        "protocolVersion": 1,
+        "schemaHash": "sha256:5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c",
+        "snapshot": {
+          "indexes": [
+            {
+              "position": "1",
+              "projection": "todos-projector",
+              "resume": {
+                "position": "1",
+                "projection": "todos-projector",
+                "token": "v1.live-resume.hjiTeKRQrkR2L407VC-oB1JKwmXDkxoCld_K7DwJCHY"
+              },
+              "scopeToken": "v1.query-index.hNn39BQAqcOQA4dyzt7LfI92OCjNzeBE_y8RPOyUsIE"
+            }
+          ],
+          "indexesComparable": true,
+          "observations": [],
+          "records": [
+            {
+              "incarnation": "1",
+              "model": "TodoView",
+              "path": [
+                "todos",
+                "0"
+              ],
+              "revision": "1",
+              "scopeToken": "v1.record-revision.1SYfSxrPw7g5l_xQHNuyIR1cwISQTfuzwzj178ukDAM",
+              "tombstone": false
+            }
+          ],
+          "recordsComplete": true,
+          "scopeToken": "v1.query-snapshot.7q-sYBSAUBxVfgqSUaBsTdJ7k5G4zya4KY2xE6xP7QQ"
+        }
+      }
+    }
+  },
+  "scope": {
+    "authorizationGeneration": "sha256:a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7",
+    "cacheScope": "v1.cache-scope.lUsXGfYHX9iMPzQ_QvHaWhVUWuiXxSVpZ-XERUX9Kuw",
+    "protocolVersion": 1,
+    "schemaHash": "sha256:5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c"
+  },
+  "version": 1
+}

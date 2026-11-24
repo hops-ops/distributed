@@ -55,7 +55,7 @@ mod auth;
 mod builder;
 mod core;
 mod introspection;
-mod live_resume;
+pub(super) mod live_resume;
 mod metrics;
 mod protocol;
 mod public_api;

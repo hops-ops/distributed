@@ -3,6 +3,8 @@ import {
 	type DistributedCommandMetadata,
 	type DistributedProtocolEnvelope
 } from '../../protocol.js';
+import { sameScope } from '../distributed-replica/hydration.js';
+import { compareCodeUnits } from '../../lib/compare-code-units.js';
 import {
 	matchReplicaTrustedPresetInventory,
 	prepareReplicaCommandWithTrustedPresets,
@@ -39,7 +41,6 @@ import {
 	requireCommandEnvelope,
 	requireCommandRejectionEnvelope,
 	requireStatusEnvelope,
-	sameScope,
 	settleProjectionFailure,
 	settleProjectionSuccess,
 	settleTrackedProjection,
@@ -329,10 +330,6 @@ function capabilityAllowsPartition(
 
 function unionNames(values: readonly string[]): readonly string[] {
 	return Object.freeze([...new Set(values)].sort(compareCodeUnits));
-}
-
-function compareCodeUnits(left: string, right: string): number {
-	return left < right ? -1 : left > right ? 1 : 0;
 }
 
 function sameStrings(left: readonly string[], right: readonly string[]): boolean {

@@ -1,4 +1,5 @@
 import { isPlainRecord } from '../../lib/is-plain-record.js';
+import { compareUtf8 } from '../../lib/compare-utf8.js';
 import { oncePerIdentity } from '../../lib/once-per-identity.js';
 import {
 	canonicalCommandProjectionMetadata,
@@ -2243,20 +2244,6 @@ function compareStringArrays(
 }
 
 /** Rust `String::cmp` is lexicographic over UTF-8 bytes, not UTF-16 units. */
-function compareUtf8(left: string, right: string): number {
-	const leftBytes = encoder.encode(left);
-	const rightBytes = encoder.encode(right);
-	for (
-		let index = 0;
-		index < Math.min(leftBytes.length, rightBytes.length);
-		index += 1
-	) {
-		const compared = leftBytes[index]! - rightBytes[index]!;
-		if (compared !== 0) return compared;
-	}
-	return leftBytes.length - rightBytes.length;
-}
-
 function exactRecord(
 	value: unknown,
 	required: readonly string[],

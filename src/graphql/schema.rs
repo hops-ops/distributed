@@ -939,7 +939,7 @@ pub(crate) fn client_error(code: &str, message: impl Into<String>) -> async_grap
 }
 
 /// Command-mutation errors also carry numeric HTTP `extensions.status`.
-fn client_error_with_status(
+pub(crate) fn client_error_with_status(
     code: &str,
     status: u16,
     message: impl Into<String>,

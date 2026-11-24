@@ -50,6 +50,7 @@ import {
 } from '../command-runtime.js';
 import {
 	canonicalizeOperationVariables,
+	recordKeyMatchesModel,
 	replicaIndexKey,
 	replicaRecordKey,
 	resolveArguments
@@ -124,7 +125,6 @@ import type {
 	ValidatedArtifactBinding
 } from './types.js';
 import {
-	compareCanonicalDecimalStrings,
 	compareEvidenceToProjectedFence,
 	compareIndexVector,
 	compareProjectedRecordFields,
@@ -135,7 +135,6 @@ import {
 	isComparableHandoffDisposition,
 	latestCursors,
 	protocolInvalid,
-	recordKeyMatchesModel,
 	modelFromRecordKey,
 	responsePathKey,
 	sameRecordClock,
@@ -1277,7 +1276,7 @@ export class DistributedReplicaImpl implements DistributedReplicaApi {
 			activeState?.snapshotScope === undefined &&
 			activeState?.indexRevision !== undefined &&
 			requestRevision !== undefined &&
-			compareCanonicalDecimalStrings(requestRevision, activeState.indexRevision) > 0;
+			compareDistributedDecimal(requestRevision, activeState.indexRevision) > 0;
 		const handoffBlocked =
 			handoff &&
 			!snapshotLive &&
@@ -1944,7 +1943,7 @@ export class DistributedReplicaImpl implements DistributedReplicaApi {
 					current === undefined ||
 					!current.complete ||
 					(current.staleRevision !== undefined &&
-						compareCanonicalDecimalStrings(current.staleRevision, current.revision) > 0) ||
+						compareDistributedDecimal(current.staleRevision, current.revision) > 0) ||
 					(current.metadata?.nullValue === true) !== membership.nullValue ||
 					current.records.length !== membership.records.length ||
 					current.records.some(
@@ -2575,7 +2574,7 @@ export class DistributedReplicaImpl implements DistributedReplicaApi {
 					// A disposed stream is no longer an owner. Its boundary is
 					// still retained so a stream that started before disposal
 					// cannot win merely because the old transport later closed.
-					if (compareCanonicalDecimalStrings(liveStart, state.retiredAtRevision) > 0) {
+					if (compareDistributedDecimal(liveStart, state.retiredAtRevision) > 0) {
 						continue;
 					}
 					// Reopen at most once per observed retirement boundary: the
@@ -2585,7 +2584,7 @@ export class DistributedReplicaImpl implements DistributedReplicaApi {
 				}
 				latestOwnerRevision =
 					latestOwnerRevision === undefined ||
-					compareCanonicalDecimalStrings(
+					compareDistributedDecimal(
 						state.indexRevision,
 						latestOwnerRevision
 					) > 0
@@ -2617,7 +2616,7 @@ export class DistributedReplicaImpl implements DistributedReplicaApi {
 					// live stream or query ownership acquired after it started.
 					if (
 						liveStart !== undefined && state === group.query &&
-						compareCanonicalDecimalStrings(liveStart, state.indexRevision) > 0
+						compareDistributedDecimal(liveStart, state.indexRevision) > 0
 					) continue;
 					incomparable = true;
 					for (const indexKey of ownedIncomingKeys) fencedIndexKeys.add(indexKey);
@@ -2629,7 +2628,7 @@ export class DistributedReplicaImpl implements DistributedReplicaApi {
 				else {
 					equalRevision =
 						equalRevision === undefined ||
-						compareCanonicalDecimalStrings(
+						compareDistributedDecimal(
 							state.indexRevision,
 							equalRevision
 						) > 0
@@ -2663,7 +2662,7 @@ export class DistributedReplicaImpl implements DistributedReplicaApi {
 			}
 			if (requestRevision === undefined) return { compared: false };
 			return latestOwnerRevision !== undefined &&
-				compareCanonicalDecimalStrings(requestRevision, latestOwnerRevision) <
+				compareDistributedDecimal(requestRevision, latestOwnerRevision) <
 					0
 				? { compared: true, disposition: 'lower' }
 				: { compared: false };
