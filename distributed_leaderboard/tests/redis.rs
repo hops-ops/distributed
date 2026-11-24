@@ -1,27 +1,23 @@
-//! Redis leaderboard store and Redis Streams publisher integration tests.
+//! Redis leaderboard store integration tests.
 //!
 //! Tests that need a server skip (with a logged reason) when `REDIS_URL` is
 //! unset; the unavailable-server test always runs.
 //!
-//!   REDIS_URL=redis://127.0.0.1:6379 cargo test --test redis_leaderboard --features redis
+//!   REDIS_URL=redis://127.0.0.1:6379 cargo test -p distributed_leaderboard --features redis,graphql --test redis
 #![cfg(feature = "redis")]
 
-use distributed::graphql::IdentityConfig;
 use std::sync::Arc;
 use std::time::{Duration, UNIX_EPOCH};
 
-use distributed::bus::{Message, MessageKind, MessagePublisher, RedisStreamPublisher};
-use distributed::leaderboard::{
+use distributed::bus::{Message, MessageKind};
+use distributed::DomainEventOccurrence;
+use distributed_leaderboard::{
     conformance, Board, LeaderboardChange, LeaderboardError, LeaderboardErrorKind,
     LeaderboardProjector, LeaderboardStore, RedisLeaderboard, ScorePolicy, ScoreSubmission,
 };
-use distributed::DomainEventOccurrence;
 
-#[path = "../support/env.rs"]
+#[path = "../../tests/support/env.rs"]
 mod env_support;
-
-/// `XRANGE` reply row: entry id and field/value pairs.
-type StreamEntry = (String, Vec<(String, Vec<u8>)>);
 
 fn redis_url() -> Option<String> {
     env_support::require_service("REDIS_URL", "redis leaderboard test")
@@ -130,60 +126,6 @@ async fn redis_projector_dedupes_replays_and_rebuilds() {
 }
 
 #[tokio::test]
-async fn redis_stream_publisher_appends_and_dedupes_by_message_id() {
-    let Some(url) = redis_url() else { return };
-    let stream = unique("test:stream");
-    let publisher = RedisStreamPublisher::connect(&url)
-        .unwrap()
-        .with_stream(stream.clone());
-    let message = Message::new(
-        "dungeon.gold_looted",
-        MessageKind::Event,
-        b"\x00bin".to_vec(),
-    )
-    .with_id("msg-1")
-    .with_metadata("correlation_id", "corr-1");
-    assert!(publisher.publish_entry(&message).await.unwrap());
-    assert!(!publisher.publish_entry(&message).await.unwrap());
-    publisher.publish(message.clone()).await.unwrap();
-    publisher
-        .publish(Message::new(
-            "dungeon.gold_looted",
-            MessageKind::Event,
-            vec![],
-        ))
-        .await
-        .unwrap();
-
-    let client = redis::Client::open(url.as_str()).unwrap();
-    let mut conn = client.get_multiplexed_async_connection().await.unwrap();
-    let len: u64 = redis::cmd("XLEN")
-        .arg(&stream)
-        .query_async(&mut conn)
-        .await
-        .unwrap();
-    assert_eq!(len, 2, "the duplicate id must not append a second entry");
-    let entries: Vec<StreamEntry> = redis::cmd("XRANGE")
-        .arg(&stream)
-        .arg("-")
-        .arg("+")
-        .query_async(&mut conn)
-        .await
-        .unwrap();
-    let fields: std::collections::HashMap<_, _> = entries[0].1.iter().cloned().collect();
-    assert_eq!(fields["id"], b"msg-1");
-    assert_eq!(fields["kind"], b"event");
-    assert_eq!(fields["payload"], b"\x00bin");
-    assert_eq!(fields["meta:correlation_id"], b"corr-1");
-    let _: i64 = redis::cmd("DEL")
-        .arg(&stream)
-        .arg(RedisStreamPublisher::dedupe_key(&stream, "msg-1"))
-        .query_async(&mut conn)
-        .await
-        .unwrap();
-}
-
-#[tokio::test]
 async fn unreachable_redis_fails_fast_as_retryable() {
     // Port 1 is never a Redis server; construction must not block.
     let store = RedisLeaderboard::connect("redis://127.0.0.1:1").unwrap();
@@ -199,23 +141,16 @@ async fn unreachable_redis_fails_fast_as_retryable() {
     assert_eq!(err.kind(), LeaderboardErrorKind::Unavailable);
     assert!(err.into_transport_error().is_retryable());
     assert!(started.elapsed() < Duration::from_secs(10));
-
-    let publisher = RedisStreamPublisher::connect("redis://127.0.0.1:1").unwrap();
-    let err = publisher
-        .publish(Message::new("dungeon.gold_looted", MessageKind::Event, vec![]).with_id("x"))
-        .await
-        .unwrap_err();
-    assert!(err.is_retryable());
 }
 
 /// The same Redis boards served through GraphQL: roots read the sorted sets
 /// and an applied projector change refreshes a `@live` top-N.
-#[cfg(all(feature = "graphql", feature = "sqlite"))]
+#[cfg(feature = "graphql")]
 #[tokio::test]
 async fn redis_boards_serve_graphql_queries_and_live_updates() {
-    use distributed::graphql::surface::{LeaderboardGrant, LeaderboardSurface};
-    use distributed::graphql::GraphqlEngine;
+    use distributed::graphql::{GraphqlEngine, IdentityConfig};
     use distributed::microsvc::{Session, ROLE_KEY, USER_ID_KEY};
+    use distributed_leaderboard::{LeaderboardGrant, LeaderboardRoots, LeaderboardSurface};
     use futures_util::StreamExt;
 
     let Some(url) = redis_url() else { return };
@@ -244,10 +179,10 @@ async fn redis_boards_serve_graphql_queries_and_live_updates() {
     .unwrap()
     .identity(IdentityConfig::dev_headers())
     .roles(&["user"])
-    .leaderboard(
+    .external_read_source(Arc::new(LeaderboardRoots::new(
         LeaderboardSurface::single("gold", &board).grant("user", LeaderboardGrant::read()),
         store.clone(),
-    )
+    )))
     .build()
     .unwrap();
     let mut session = Session::new();
@@ -280,7 +215,7 @@ async fn redis_boards_serve_graphql_queries_and_live_updates() {
             },
         ),
     )
-    .with_change_listener(engine.leaderboard_change_listener());
+    .with_change_listener(distributed_leaderboard::change_listener(&engine));
     let mut live = engine.execute_stream(
         &session,
         async_graphql::Request::new("subscription { goldLeaderboard(first: 1) { member } }"),

@@ -838,7 +838,6 @@ dependencies = [
  "hyper-util",
  "js-sys",
  "jsonwebtoken",
- "redis",
  "reqwest",
  "serde",
  "serde_json",
@@ -885,6 +884,20 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.119",
+]
+
+[[package]]
+name = "distributed_leaderboard"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "distributed",
+ "redis",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]
@@ -1139,6 +1152,7 @@ dependencies = [
  "clap",
  "distributed",
  "distributed_game",
+ "distributed_leaderboard",
  "futures-util",
  "game_sim",
  "http-body-util",
@@ -1766,6 +1780,7 @@ dependencies = [
  "axum",
  "distributed",
  "distributed_game",
+ "distributed_leaderboard",
  "futures-util",
  "game_demos",
  "mobpit_crawler",

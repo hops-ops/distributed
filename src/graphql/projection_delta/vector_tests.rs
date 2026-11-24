@@ -1025,7 +1025,7 @@ fn replay_manifest() -> DistributedClientManifest {
         projectors: vec![],
         projection_programs: vec![],
         projection_bindings: vec![],
-        leaderboards: vec![],
+        external: Default::default(),
     }
 }
 

@@ -1,0 +1,36 @@
+[package]
+name = "distributed_leaderboard"
+description = "Sorted-set leaderboards for `distributed`: an idempotent, rebuildable projection target (in memory or Redis) served through GraphQL as an external read source."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[features]
+default = []
+# `RedisLeaderboard`: Redis sorted sets, every idempotent write one Lua script.
+redis = ["dep:redis"]
+# `@live` refresh of a `GraphqlEngine`'s board roots: `change_listener` (same
+# process) and `change_handlers` (board change notices over the bus).
+graphql = ["distributed/graphql"]
+
+[dependencies]
+async-trait = "0.1"
+distributed = { path = "..", default-features = false }
+redis = { version = "1.7.1", default-features = false, features = ["script", "tokio-comp", "connection-manager"], optional = true }
+serde = { version = "1.0.210", features = ["derive"] }
+serde_json = "1.0.128"
+tokio = { version = "1", features = ["rt", "sync", "time"] }
+tracing = "0.1"
+uuid = { version = "1", features = ["v7"] }
+
+[dev-dependencies]
+async-graphql = "7"
+distributed = { path = "..", features = ["graphql", "sqlite"] }
+distributed_cli = { path = "../distributed_cli" }
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "sqlite"] }
+tokio = { version = "1", features = ["full", "test-util"] }

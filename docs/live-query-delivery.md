@@ -119,11 +119,21 @@ This is a breaking v5 protocol change: `mode` replaces the ambiguous `supported`
 boolean. Upgrade server and generated-client runtime together. Old or unknown
 wire forms fail closed; applications do not need a polling or reload workaround.
 
-## Leaderboard roots
+## External read sources and leaderboard roots
 
-Sorted-set leaderboards (`distributed::leaderboard`, Redis with the `redis`
-feature) are exposed through the same surface by
-`GraphqlEngineBuilder::leaderboard(LeaderboardSurface, store)`. For a surface
+Roots that are not read-model roots come from an external read source
+(`distributed::graphql::surface::ExternalReadSource`, attached to a catalog
+Surface with `Surface::with_external_sources` and served with
+`GraphqlEngineBuilder::external_read_source(executor)`). The source declares
+its roots, result object types, per-role grants, the session claims it reads,
+its contract entry and its client-manifest entry; the engine renders,
+authorizes, fingerprints and exports them and runs each call through the
+source's `ExternalReadExecutor`, which returns the value, a scope (bound
+into the protocol scope token) and the change keys a live read waits on.
+
+Sorted-set leaderboards (the `distributed_leaderboard` crate, Redis with its
+`redis` feature) are the one external read source:
+`external_read_source(Arc::new(LeaderboardRoots::new(LeaderboardSurface, store)))`. For a surface
 named `xp`, a role's grant (`LeaderboardGrant`) selects the roots:
 `xpLeaderboard(first)`, `xpLeaderboardAround(radius)`, `xpMyRank` and, only
 with `rank_any_member`, `xpRank(member)`. A board family
@@ -131,14 +141,15 @@ with `rank_any_member`, `xpRank(member)`. A board family
 roots take the member from the verified session claim (default `x-user-id`,
 `LeaderboardSurface::member_claim`), never from an argument, and fail with
 `FORBIDDEN` when the claim is absent. The same declaration feeds the static
-SDL, the client manifest (`leaderboards`, omitted when empty so other
-manifests and fingerprints are unchanged) and the generated
+SDL, the client manifest (`external.leaderboards`, omitted when empty so
+other manifests and fingerprints are unchanged) and the generated
 `leaderboards.ts` (typed documents and `@live` subscription documents).
 
 `xpLeaderboard`, `xpLeaderboardAround` and `xpMyRank` are also subscription
 roots. They re-execute when the board's change key
-(`leaderboard:{board}`) is published, which
-`GraphqlEngine::leaderboard_change_listener` does when registered on the
+(`leaderboard:{board}`) or the every-board key (`leaderboard:*`) is
+published, which `distributed_leaderboard::change_listener(&engine)` does
+when registered on the
 `LeaderboardProjector` that writes the board (applied changes and rebuild
 promotions; duplicates are silent). Pushes are hash-gated like SQL live
 queries, and a failed execution is terminal. With the causal protocol on,
@@ -151,14 +162,18 @@ The listener is in-process. When the projector runs in another process
 (a zone server projecting kills into Redis while a GraphQL service serves
 the same boards), the change goes over the application's bus:
 
-- the projector's process registers `LeaderboardChangePublisher::listener()`
-  (feature `leaderboard-background`), which publishes a
-  `distributed.leaderboard.changed` event (`{ "board": "<name>" }`) per
-  changed board, coalescing bursts and retrying until the bus accepts it;
-- the GraphQL process runs `engine.leaderboard_change_handlers(group)` with
-  `bus.subscribe(..)` under a consumer group of its own, so every GraphQL
-  process receives every notice and republishes `leaderboard:{board}` on
-  its `ChangeHub`.
+- the projector's process registers `LeaderboardChangePublisher::listener()`,
+  which publishes a `distributed.leaderboard.changed` event
+  (`{ "board": "<name>" }`) per changed board. Pending boards are a bounded
+  set (`spawn(publisher, capacity)`): repeated changes to a board coalesce,
+  and a change to one board more than fits replaces the set with a single
+  every-board notice (`{}`), so a slow or down bus costs bounded memory and
+  subscribers resync instead. Retryable publish errors are retried with
+  backoff; permanently refused notices are dropped;
+- the GraphQL process runs `distributed_leaderboard::change_handlers(&engine,
+  group)` with `bus.subscribe(..)` under a consumer group of its own, so
+  every GraphQL process receives every notice and republishes
+  `leaderboard:{board}` (or `leaderboard:*`) on its `ChangeHub`.
 
 A notice only names the board; the subscriber re-reads its store, so
 duplicate or replayed notices push nothing new.

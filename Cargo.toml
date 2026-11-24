@@ -1,5 +1,5 @@
 [workspace]
-members = ["distributed_macros", "distributed_cli", "distributed_game", "distributed_game_macros", "tests/fixtures/renamed-dependency"]
+members = ["distributed_macros", "distributed_cli", "distributed_game", "distributed_leaderboard", "distributed_game_macros", "tests/fixtures/renamed-dependency"]
 exclude = ["tests/e2e-ui", "tests/celld/worker", "tests/celld/relay-worker", "tests/celld/alarm-worker", "tests/celld/fact-worker", "tests/celld/zone-worker", "tests/fixtures/wasm32-native-domain", "examples/game/server"]
 resolver = "2"
 
@@ -59,11 +59,8 @@ sqlite = ["dep:sqlx", "runtime-tokio", "sqlx/migrate", "sqlx/runtime-tokio", "sq
 nats = ["dep:async-nats", "dep:futures", "runtime-tokio"]
 rabbitmq = ["dep:lapin", "dep:futures", "runtime-tokio"]
 kafka = ["dep:rdkafka", "runtime-tokio"]
-# Redis sorted-set leaderboards and the Redis Streams `MessagePublisher`.
-redis = ["dep:redis", "runtime-tokio", "leaderboard-background"]
-# `leaderboard::BackgroundLeaderboard` (fire-and-forget updates on a Tokio
-# task) without Redis, e.g. over `InMemoryLeaderboard`.
-leaderboard-background = ["runtime-tokio"]
+# `bus::RedisStreamPublisher`: the Redis Streams `MessagePublisher`.
+redis-streams = ["dep:redis", "runtime-tokio"]
 # Code that runs inside a celld Worker (wasm32 Durable Objects): the cell
 # host's Durable Object storage and outbox, and the celld Queue publisher.
 cloudflare-workers = ["dep:worker"]

@@ -660,8 +660,7 @@ network servers.
 | `nats` | No | `NatsBus` (NATS JetStream source/publisher). |
 | `rabbitmq` | No | `RabbitBus` (RabbitMQ source/publisher). |
 | `kafka` | No | `KafkaBus` (Kafka source/publisher). |
-| `redis` | No | `leaderboard::RedisLeaderboard` (sorted-set leaderboards) and `bus::RedisStreamPublisher` (Redis Streams `XADD`, id dedupe); implies `leaderboard-background`. The `leaderboard` module and `InMemoryLeaderboard` are always available. |
-| `leaderboard-background` | No | `leaderboard::BackgroundLeaderboard` (fire-and-forget updates on a Tokio task) over any `LeaderboardStore`, e.g. `InMemoryLeaderboard`, without pulling in Redis. |
+| `redis-streams` | No | `bus::RedisStreamPublisher` (Redis Streams `XADD`, id dedupe). Sorted-set leaderboards live in the `distributed_leaderboard` crate (its own `redis` feature). |
 | `metrics` | No | `distributed::metrics`: framework counters and gauges with Prometheus text exposition (no SDK dependency); with `http`, a scrape handler. Bus receive loops record into it. |
 | `otel` | No | OpenTelemetry tracing spans for bus receive loops and `microsvc` dispatch/handlers (`opentelemetry`, `tracing-opentelemetry`). |
 | `cloudflare-workers` | No | Code that runs inside a celld Worker (`wasm32` Durable Objects, Cloudflare `worker` crate): the cell host's Durable Object storage and outbox, and the celld Queue publisher/relay (`bus::CelldQueue*`). |
@@ -671,8 +670,7 @@ network servers.
 | `gateway-worker` | No | workers-rs gateway ingress and delivery contracts, without native executors. |
 
 `runtime-tokio` is internal: every Tokio-using feature above (`http`, `grpc`,
-`postgres`, `sqlite`, `nats`, `rabbitmq`, `kafka`, `redis`,
-`leaderboard-background`) implies it, and the crate gates its Tokio-only code
+`postgres`, `sqlite`, `nats`, `rabbitmq`, `kafka`, `redis-streams`) implies it, and the crate gates its Tokio-only code
 (the outbox drain and consumer workers) on it. Enable the transport or store you
 need rather than `runtime-tokio` itself.
 
@@ -2665,7 +2663,6 @@ src/
   gateway/            # Portable application gateway contracts (feature = "gateway*")
   graphql/            # Query service: engine, permissions, identity, SDL, HTTP/WS (feature = "graphql")
   in_memory_repo/     # In-memory repository (implements every async trait)
-  leaderboard/        # Sorted-set leaderboards as a rebuildable projection target (memory, Redis)
   lease/              # TTL leases with monotonic fencing tokens
   lock/               # Lock + lock manager traits, in-memory locks
   metrics/            # Prometheus-compatible framework metrics (feature = "metrics")
@@ -2696,6 +2693,8 @@ distributed_cli/      # The `distributed` CLI (build/dev lifecycle, client codeg
 distributed_game/     # Authoritative multiplayer zone runtime: fixed tick, facts, replication,
                       #   WebSocket net, celld cells (zone lease/state, fact sink)
 distributed_game_macros/ # Derives for distributed_game: Replicated, GameInput, GameEvent, …
+distributed_leaderboard/ # Sorted-set leaderboards as a rebuildable projection target (memory,
+                      #   Redis), served through GraphQL as an external read source
 js/                   # @hops-ops/distributed JS/TS client, command runtime, SvelteKit adapter, game SDK
 examples/             # graphiql.rs, and examples/game (game demos + SvelteKit Mob Pit; own workspace)
 tests/e2e-ui/         # Full-stack CQRS + GraphQL + SvelteKit template (nested workspace)

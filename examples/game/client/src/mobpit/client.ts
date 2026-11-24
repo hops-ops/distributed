@@ -240,7 +240,6 @@ export type BoardSnapshot = Readonly<{
 	members: number;
 	kills: BoardRow[];
 	xp: BoardRow[];
-	background: { enqueued: number; applied: number; dropped: number; failed: number };
 	lastRebuild: RebuildReport | null;
 }>;
 export type RebuildReport = Readonly<{

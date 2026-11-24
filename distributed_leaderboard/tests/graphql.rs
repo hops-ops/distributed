@@ -1,8 +1,9 @@
 //! Leaderboards through the generated GraphQL surface: role-structured roots,
 //! viewer-bound `myRank`, `@live` top-N driven by the projector's change
-//! listener, the client manifest section and the static SDL.
+//! listener, the client manifest section and the static SDL, all through the
+//! engine's external read source extension point.
 
-#![cfg(all(feature = "graphql", feature = "sqlite"))]
+#![cfg(feature = "graphql")]
 
 use distributed::graphql::IdentityConfig;
 use std::sync::Arc;
@@ -14,16 +15,16 @@ use distributed::graphql::client_manifest::{
 };
 use distributed::graphql::sdl::graphql_sdl_from_surface;
 use distributed::graphql::surface::{
-    build_surface, surface_for_role, LeaderboardGrant, LeaderboardSurface, SurfaceDialect,
-    SurfaceOptions,
+    build_surface, surface_for_role, ExternalReadSource, SurfaceDialect, SurfaceOptions,
 };
 use distributed::graphql::GraphqlEngine;
-use distributed::leaderboard::{
-    Board, InMemoryLeaderboard, LeaderboardChange, LeaderboardError, LeaderboardProjector,
-    LeaderboardStore, ScorePolicy, ScoreSubmission,
-};
 use distributed::microsvc::{Session, ROLE_KEY, USER_ID_KEY};
 use distributed::{DomainEventOccurrence, ExternalEventSource};
+use distributed_leaderboard::{
+    Board, ClientLeaderboard, InMemoryLeaderboard, LeaderboardChange, LeaderboardError,
+    LeaderboardGrant, LeaderboardProjector, LeaderboardRoots, LeaderboardStore, LeaderboardSurface,
+    ScorePolicy, ScoreSubmission, LEADERBOARDS_SECTION,
+};
 use futures_util::StreamExt;
 
 fn xp_board() -> Board {
@@ -41,7 +42,7 @@ fn season_surface() -> LeaderboardSurface {
     LeaderboardSurface::family(
         "season",
         "season.xp",
-        distributed::leaderboard::ScoreOrder::HighFirst,
+        distributed_leaderboard::ScoreOrder::HighFirst,
     )
     .grant("user", LeaderboardGrant::top_only())
 }
@@ -55,8 +56,8 @@ async fn engine(store: Arc<InMemoryLeaderboard>) -> GraphqlEngine {
         .unwrap()
         .identity(IdentityConfig::dev_headers())
         .roles(&["user", "moderator"])
-        .leaderboard(xp_surface(), store.clone())
-        .leaderboard(season_surface(), store)
+        .external_read_source(Arc::new(LeaderboardRoots::new(xp_surface(), store.clone())))
+        .external_read_source(Arc::new(LeaderboardRoots::new(season_surface(), store)))
         .build()
         .expect("build engine")
 }
@@ -245,7 +246,7 @@ async fn live_top_n_updates_after_an_applied_score_change() {
             )])
         };
     let projector = LeaderboardProjector::new(store.clone(), Arc::new(projection))
-        .with_change_listener(engine.leaderboard_change_listener());
+        .with_change_listener(distributed_leaderboard::change_listener(&engine));
 
     let mut stream = engine.execute_stream(
         &session("user", Some("dan")),
@@ -298,8 +299,26 @@ fn surfaces() -> distributed::graphql::surface::Surface {
     };
     build_surface(&[], &options)
         .unwrap()
-        .with_leaderboards([xp_surface(), season_surface()])
+        .with_external_sources(sources([xp_surface(), season_surface()]))
         .unwrap()
+}
+
+fn sources<const N: usize>(
+    surfaces: [LeaderboardSurface; N],
+) -> impl Iterator<Item = Arc<dyn ExternalReadSource>> {
+    surfaces
+        .into_iter()
+        .map(|surface| Arc::new(surface) as Arc<dyn ExternalReadSource>)
+}
+
+fn leaderboards(manifest: &DistributedClientManifest) -> Vec<ClientLeaderboard> {
+    manifest
+        .external
+        .get(LEADERBOARDS_SECTION)
+        .into_iter()
+        .flatten()
+        .map(|value| serde_json::from_value(value.clone()).unwrap())
+        .collect()
 }
 
 fn role_manifest(role: &str) -> DistributedClientManifest {
@@ -315,8 +334,8 @@ fn role_manifest(role: &str) -> DistributedClientManifest {
 fn board_queries_are_in_the_client_manifest_per_role() {
     let user = role_manifest("user");
     assert!(user.capabilities.live_queries);
-    let names = user
-        .leaderboards
+    let user_boards = leaderboards(&user);
+    let names = user_boards
         .iter()
         .flat_map(|leaderboard| leaderboard.roots.iter().map(|root| root.name.as_str()))
         .collect::<Vec<_>>();
@@ -329,7 +348,7 @@ fn board_queries_are_in_the_client_manifest_per_role() {
             "xpMyRank"
         ]
     );
-    let xp = user.leaderboards.iter().find(|l| l.name == "xp").unwrap();
+    let xp = user_boards.iter().find(|l| l.name == "xp").unwrap();
     assert_eq!(xp.entry_typename, "LeaderboardEntry");
     assert_eq!(xp.order, "high_first");
     assert_eq!((xp.default_first, xp.max_first, xp.max_radius), (3, 5, 2));
@@ -341,18 +360,19 @@ fn board_queries_are_in_the_client_manifest_per_role() {
     assert!(my_rank.live && !my_rank.list);
 
     let moderator = role_manifest("moderator");
-    let rank = moderator.leaderboards[0]
+    let rank = leaderboards(&moderator)[0]
         .roots
-        .iter()
+        .clone()
+        .into_iter()
         .find(|root| root.name == "xpRank")
         .unwrap();
     assert!(!rank.live);
     assert_eq!(rank.arguments[0].name, "member");
 
     let guest = role_manifest("guest");
-    assert!(guest.leaderboards.is_empty());
+    assert!(guest.external.is_empty());
     let json = serde_json::to_value(&guest).unwrap();
-    assert!(json.get("leaderboards").is_none(), "absent when empty");
+    assert!(json.get("external").is_none(), "absent when empty");
 
     // Round-trips through the strict manifest schema.
     let encoded = serde_json::to_string(&user).unwrap();
@@ -389,7 +409,7 @@ async fn protocol_envelopes_mark_leaderboards_as_snapshot_only() {
         .identity(IdentityConfig::dev_headers())
         .roles(&["user", "moderator"])
         .protocol_token_key([7; 32])
-        .leaderboard(xp_surface(), store.clone())
+        .external_read_source(Arc::new(LeaderboardRoots::new(xp_surface(), store.clone())))
         .build()
         .expect("protocol engine");
     let cat = session("user", Some("cat"));
@@ -452,7 +472,7 @@ fn the_cli_compiles_a_framework_leaderboard_manifest_into_the_ts_client() {
     };
     let surface = build_surface(&[items], &options)
         .unwrap()
-        .with_leaderboards([xp_surface()])
+        .with_external_sources(sources([xp_surface()]))
         .unwrap();
     let grants = std::collections::BTreeMap::from([("ItemView".to_string(), read().all_columns())]);
     let selected = surface_for_role(&surface, "user", &grants).unwrap();
@@ -485,13 +505,12 @@ fn the_cli_compiles_a_framework_leaderboard_manifest_into_the_ts_client() {
 /// The projector runs in another process (here: another bus connection and
 /// no shared engine): it publishes `distributed.leaderboard.changed` on the
 /// bus, and the GraphQL process's bus handlers drive `@live` from it.
-#[cfg(feature = "leaderboard-background")]
 #[tokio::test]
 async fn live_boards_follow_a_projector_in_another_process_over_the_bus() {
     use distributed::bus::SqliteBus;
     use distributed::bus::{BusConsumer, RunOptions};
-    use distributed::leaderboard::LeaderboardChangePublisher;
     use distributed::outbox_worker::BusPublisher;
+    use distributed_leaderboard::LeaderboardChangePublisher;
 
     let path = std::env::temp_dir().join(format!(
         "distributed-board-notices-{}-{}.db",
@@ -521,7 +540,7 @@ async fn live_boards_follow_a_projector_in_another_process_over_the_bus() {
 
     // GraphQL process: engine + bus handlers under its own consumer group.
     let engine = engine(store.clone()).await;
-    let handlers = engine.leaderboard_change_handlers("graphql-1-boards");
+    let handlers = distributed_leaderboard::change_handlers(&engine, "graphql-1-boards");
     let graphql_bus = open().await;
     let consumer = tokio::spawn(async move {
         graphql_bus
@@ -531,7 +550,7 @@ async fn live_boards_follow_a_projector_in_another_process_over_the_bus() {
 
     // Projector process: no engine, only the bus.
     let projector_bus = open().await;
-    let notices = LeaderboardChangePublisher::spawn(BusPublisher::new(Arc::new(projector_bus)));
+    let notices = LeaderboardChangePublisher::spawn(BusPublisher::new(Arc::new(projector_bus)), 64);
     let projection =
         |event: &DomainEventOccurrence| -> Result<Vec<LeaderboardChange>, LeaderboardError> {
             let body: XpGained = event
@@ -580,7 +599,7 @@ async fn live_boards_follow_a_projector_in_another_process_over_the_bus() {
 #[test]
 fn an_application_manifest_carries_and_validates_its_leaderboards() {
     let spec = distributed::SurfaceSpec::from_surface("boards", &surfaces()).unwrap();
-    assert_eq!(spec.contract.leaderboards.len(), 2);
+    assert_eq!(spec.contract.external[LEADERBOARDS_SECTION].len(), 2);
     let built = distributed::Application::new("boards")
         .surface(spec.clone())
         .build()
@@ -590,7 +609,12 @@ fn an_application_manifest_carries_and_validates_its_leaderboards() {
 
     // Tampering with the leaderboard section breaks the surface fingerprint.
     let mut tampered = spec;
-    tampered.contract.leaderboards.pop();
+    tampered
+        .contract
+        .external
+        .get_mut(LEADERBOARDS_SECTION)
+        .unwrap()
+        .pop();
     assert!(distributed::Application::new("boards")
         .surface(tampered)
         .build()
@@ -607,7 +631,29 @@ fn an_application_manifest_carries_and_validates_its_leaderboards() {
         .unwrap(),
     )
     .unwrap();
-    assert!(!serde_json::to_string(&plain)
-        .unwrap()
-        .contains("leaderboards"));
+    assert!(!serde_json::to_string(&plain).unwrap().contains("external"));
+}
+
+#[test]
+fn attaching_sources_refuses_duplicates_and_root_collisions() {
+    let empty = || build_surface(&[], &SurfaceOptions::sqlite()).unwrap();
+    let duplicate = empty()
+        .with_external_sources(sources([xp_surface(), xp_surface()]))
+        .unwrap_err();
+    assert!(duplicate.contains("duplicate"), "{duplicate}");
+    // `xpMy` + `Rank` collides with `xp` + `MyRank`.
+    let colliding = LeaderboardSurface::single("xpMy", &xp_board())
+        .grant("moderator", LeaderboardGrant::read().rank_any_member());
+    let collision = empty()
+        .with_external_sources(sources([xp_surface(), colliding]))
+        .unwrap_err();
+    assert!(collision.contains("collides"), "{collision}");
+    // Two sources share the entry type.
+    assert!(empty()
+        .with_external_sources(sources([xp_surface(), season_surface()]))
+        .is_ok());
+    let invalid = empty()
+        .with_external_sources(sources([xp_surface().limits(0, 1, 1)]))
+        .unwrap_err();
+    assert!(invalid.contains("limits"), "{invalid}");
 }

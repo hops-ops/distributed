@@ -28,5 +28,8 @@ pub(crate) use distributed::projection::{
     ProjectionRelationshipEffectKind, ProjectionScalarTransform, ProjectionValueType,
     PROJECTION_OPERATION_SEMANTICS_VERSION, PROJECTION_PROGRAM_IR_VERSION,
 };
+pub(crate) use distributed_leaderboard::{
+    ClientLeaderboard, ClientLeaderboardRoot, LEADERBOARDS_SECTION,
+};
 
 pub(crate) use util::{canonical_json_value, hash_bytes, validate_exact_operation_hash};

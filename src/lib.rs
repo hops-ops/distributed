@@ -37,7 +37,6 @@ mod commit_builder;
 pub mod gateway;
 pub mod graphql;
 mod in_memory_repo;
-pub mod leaderboard;
 pub mod lease;
 pub mod lock;
 #[cfg(feature = "metrics")]

@@ -143,15 +143,12 @@ pub fn build_role_schema(
         }
     }
 
-    // Leaderboard roots granted to this role (resolved by their stores).
-    let (with_leaderboards, leaderboard_entry) =
-        super::leaderboard_roots::add_query_roots(query, role_surface);
-    query = with_leaderboards;
-    if leaderboard_entry {
-        registered_objects.insert(
-            super::surface::LEADERBOARD_ENTRY_TYPE.to_string(),
-            super::leaderboard_roots::entry_object(),
-        );
+    // External roots granted to this role (run by their executors).
+    let (with_external, external_roots) =
+        super::external_roots::add_query_roots(query, role_surface);
+    query = with_external;
+    for object in super::external_roots::objects(role_surface) {
+        registered_objects.insert(object.type_name().to_string(), object);
     }
 
     // Comparison input types come from this exact role Surface instance.
@@ -189,7 +186,7 @@ pub fn build_role_schema(
 
     // Empty-role Query must still define ≥1 field (async-graphql requirement).
     // Spec: empty role → FORBIDDEN with extensions.code (no query surface).
-    if role_surface.query_fields.is_empty() && !leaderboard_entry && !has_causal_commands {
+    if role_surface.query_fields.is_empty() && external_roots == 0 && !has_causal_commands {
         query = query.field(Field::new(
             "_empty",
             TypeRef::named_nn(TypeRef::BOOLEAN),
@@ -330,9 +327,9 @@ pub fn build_role_schema(
     }
 
     if role_surface.subscriptions {
-        let (with_leaderboards, added) =
-            super::leaderboard_roots::add_subscription_roots(subscription, role_surface);
-        subscription = with_leaderboards;
+        let (with_external, added) =
+            super::external_roots::add_subscription_roots(subscription, role_surface);
+        subscription = with_external;
         has_subscription |= added > 0;
     }
 
@@ -1265,7 +1262,7 @@ mod causal_command_schema_tests {
             projectors: Vec::new(),
             projectors_attached: false,
             service_binding: None,
-            leaderboards: Vec::new(),
+            external: Vec::new(),
         }
     }
 

@@ -4499,7 +4499,7 @@ fn generated_lazy_commands_defer_definitions_and_preserve_command_signatures() {
 
 fn leaderboard_manifest() -> JsonValue {
     let mut value = manifest();
-    value["leaderboards"] = json!([
+    value["external"]["leaderboards"] = json!([
         {
             "name": "xp",
             "entry_typename": "LeaderboardEntry",
@@ -4593,32 +4593,38 @@ fn malformed_leaderboard_sections_are_refused() {
         (
             "a member argument on my_rank",
             Box::new(|value: &mut JsonValue| {
-                value["leaderboards"][0]["roots"][1]["arguments"] =
+                value["external"]["leaderboards"][0]["roots"][1]["arguments"] =
                     json!([{"name": "member", "type_name": "String", "nullable": false}]);
             }),
         ),
         (
             "a live rank root",
             Box::new(|value: &mut JsonValue| {
-                value["leaderboards"][1]["roots"][0]["live"] = json!(true);
+                value["external"]["leaderboards"][1]["roots"][0]["live"] = json!(true);
             }),
         ),
         (
             "an unknown operation",
             Box::new(|value: &mut JsonValue| {
-                value["leaderboards"][0]["roots"][0]["operation"] = json!("everyone");
+                value["external"]["leaderboards"][0]["roots"][0]["operation"] = json!("everyone");
             }),
         ),
         (
             "a root colliding with a read-model root",
             Box::new(|value: &mut JsonValue| {
-                value["leaderboards"][0]["roots"][0]["name"] = json!("todos");
+                value["external"]["leaderboards"][0]["roots"][0]["name"] = json!("todos");
+            }),
+        ),
+        (
+            "an unknown field",
+            Box::new(|value: &mut JsonValue| {
+                value["external"]["leaderboards"][0]["extra"] = json!(true);
             }),
         ),
         (
             "a family root without board",
             Box::new(|value: &mut JsonValue| {
-                value["leaderboards"][1]["roots"][0]["arguments"] =
+                value["external"]["leaderboards"][1]["roots"][0]["arguments"] =
                     json!([{"name": "member", "type_name": "String", "nullable": false}]);
             }),
         ),
@@ -4631,9 +4637,16 @@ fn malformed_leaderboard_sections_are_refused() {
         assert_eq!(error.code, "client.manifest.leaderboard", "{case}: {error}");
     }
 
+    // A section this compiler does not know is refused.
+    let mut unknown = leaderboard_manifest();
+    unknown["external"]["search"] = json!([{"name": "docs"}]);
+    refresh_schema_fingerprint(&mut unknown);
+    let error = compile(input_with_manifest(unknown, LEADERBOARD_PAGE)).unwrap_err();
+    assert_eq!(error.code, "client.manifest.external", "{error}");
+
     // A stale fingerprint is still caught.
     let mut tampered = leaderboard_manifest();
-    tampered["leaderboards"][0]["max_first"] = json!(50);
+    tampered["external"]["leaderboards"][0]["max_first"] = json!(50);
     let error = compile(input_with_manifest(tampered, LEADERBOARD_PAGE)).unwrap_err();
     assert_eq!(error.code, "client.manifest.schema_fingerprint");
 }

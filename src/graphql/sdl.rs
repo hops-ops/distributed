@@ -118,7 +118,7 @@ pub fn graphql_sdl_for_role(
     graphql_sdl_from_surface(&role_surface)
 }
 
-fn leaderboard_root_sdl(root: &super::surface::LeaderboardRoot) -> String {
+fn external_root_sdl(root: &super::surface::ExternalRoot) -> String {
     let arguments = if root.arguments.is_empty() {
         String::new()
     } else {
@@ -126,22 +126,12 @@ fn leaderboard_root_sdl(root: &super::surface::LeaderboardRoot) -> String {
             "({})",
             root.arguments
                 .iter()
-                .map(|argument| format!(
-                    "{}: {}{}",
-                    argument.name,
-                    argument.type_name,
-                    if argument.nullable { "" } else { "!" }
-                ))
+                .map(|argument| format!("{}: {}", argument.name, argument.graphql_type()))
                 .collect::<Vec<_>>()
                 .join(", ")
         )
     };
-    let result = if root.operation.is_list() {
-        format!("[{}!]!", super::surface::LEADERBOARD_ENTRY_TYPE)
-    } else {
-        super::surface::LEADERBOARD_ENTRY_TYPE.to_string()
-    };
-    format!("  {}{arguments}: {result}\n", root.name)
+    format!("  {}{arguments}: {}\n", root.name, root.graphql_type())
 }
 
 /// Internal renderer over an already IR-filtered set of read models.
@@ -214,17 +204,18 @@ fn graphql_sdl_from_read_models(surface: &super::surface::Surface) -> Result<Str
     for root in &surface.subscription_fields {
         claim_name(&mut subscription_fields, &root.name)?;
     }
-    let leaderboard_roots = surface
-        .leaderboards
+    let external_roots = surface
+        .external
         .iter()
-        .flat_map(|leaderboard| leaderboard.roots(leaderboard.selected_grant()))
+        .flat_map(|source| source.roots())
         .collect::<Vec<_>>();
-    if !leaderboard_roots.is_empty() {
-        claim_name(&mut type_names, super::surface::LEADERBOARD_ENTRY_TYPE)?;
+    let external_types = super::surface::external::external_types(&surface.external);
+    for name in external_types.keys() {
+        claim_name(&mut type_names, name)?;
     }
-    for root in &leaderboard_roots {
+    for root in &external_roots {
         claim_name(&mut query_fields, &root.name)?;
-        if surface.subscriptions && root.operation.is_live() {
+        if surface.subscriptions && root.live {
             claim_name(&mut subscription_fields, &root.name)?;
         }
     }
@@ -268,11 +259,12 @@ fn graphql_sdl_from_read_models(surface: &super::surface::Surface) -> Result<Str
         }
     }
 
-    if !leaderboard_roots.is_empty() {
-        out.push_str(&format!(
-            "type {} {{\n  rank: Int!\n  member: String!\n  score: Float!\n}}\n\n",
-            super::surface::LEADERBOARD_ENTRY_TYPE
-        ));
+    for ty in external_types.values() {
+        out.push_str(&format!("type {} {{\n", ty.name));
+        for field in &ty.fields {
+            out.push_str(&format!("  {}: {}\n", field.name, field.graphql_type()));
+        }
+        out.push_str("}\n\n");
     }
 
     emit_command_types(&mut out, &surface.commands, &surface.models)?;
@@ -284,7 +276,7 @@ fn graphql_sdl_from_read_models(surface: &super::surface::Surface) -> Result<Str
     // schemas. This is what keeps hidden/partial by-PK identity and per-model
     // aggregate grants aligned with runtime and client manifest output.
     out.push_str("type Query {\n");
-    if surface.query_fields.is_empty() && leaderboard_roots.is_empty() && !has_causal_commands {
+    if surface.query_fields.is_empty() && external_roots.is_empty() && !has_causal_commands {
         // async-graphql requires a non-empty Query object and the runtime uses
         // this same fail-closed sentinel for roles with no readable models.
         // It is intentionally not a client-manifest root.
@@ -294,8 +286,8 @@ fn graphql_sdl_from_read_models(surface: &super::surface::Surface) -> Result<Str
             out.push_str(&surface_root_sdl(field));
             out.push('\n');
         }
-        for root in &leaderboard_roots {
-            out.push_str(&leaderboard_root_sdl(root));
+        for root in &external_roots {
+            out.push_str(&external_root_sdl(root));
         }
         if has_causal_commands {
             out.push_str(&format!(
@@ -305,18 +297,18 @@ fn graphql_sdl_from_read_models(surface: &super::surface::Surface) -> Result<Str
     }
     out.push_str("}\n");
 
-    let live_leaderboard_roots = leaderboard_roots
+    let live_external_roots = external_roots
         .iter()
-        .filter(|root| surface.subscriptions && root.operation.is_live())
+        .filter(|root| surface.subscriptions && root.live)
         .collect::<Vec<_>>();
-    if !surface.subscription_fields.is_empty() || !live_leaderboard_roots.is_empty() {
+    if !surface.subscription_fields.is_empty() || !live_external_roots.is_empty() {
         out.push_str("\ntype Subscription {\n");
         for field in &surface.subscription_fields {
             out.push_str(&surface_root_sdl(field));
             out.push('\n');
         }
-        for root in live_leaderboard_roots {
-            out.push_str(&leaderboard_root_sdl(root));
+        for root in live_external_roots {
+            out.push_str(&external_root_sdl(root));
         }
         out.push_str("}\n");
     }
@@ -703,7 +695,7 @@ mod causal_command_sdl_tests {
             projectors: Vec::new(),
             projectors_attached: false,
             service_binding: None,
-            leaderboards: Vec::new(),
+            external: Vec::new(),
         }
     }
 

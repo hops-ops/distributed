@@ -1,21 +1,22 @@
 use super::*;
 
-/// Leaderboard grants of `roles`, as fingerprint material, plus their member
-/// claims. Empty when no leaderboard is granted, so existing fingerprints are
-/// unchanged.
-fn leaderboard_material(
-    leaderboards: &[crate::graphql::surface::LeaderboardSurface],
+/// External read source grants of `roles`, as fingerprint material, plus the
+/// claims their reads depend on. Empty when no source is granted, so
+/// existing fingerprints are unchanged.
+fn external_material(
+    sources: &[Arc<dyn crate::graphql::surface::ExternalReadSource>],
     roles: &[&str],
     claim_keys: &mut BTreeSet<String>,
 ) -> Vec<serde_json::Value> {
     let mut material = Vec::new();
-    for leaderboard in leaderboards {
+    for source in sources {
         for role in roles {
-            if let Some(selected) = leaderboard.for_role(role) {
-                claim_keys.insert(selected.get_member_claim().to_string());
+            if let Some(selected) = source.select(role, &[role.to_string()]) {
+                claim_keys.extend(selected.claims());
                 material.push(serde_json::json!({
                     "role": role,
-                    "leaderboard": selected.canonical_value(),
+                    "section": selected.section(),
+                    "source": selected.contract(),
                 }));
             }
         }
@@ -26,7 +27,7 @@ fn leaderboard_material(
 pub(crate) fn role_authorization_info(
     role: &str,
     permissions: &BTreeMap<String, BTreeMap<String, ReadPermission>>,
-    leaderboards: &[crate::graphql::surface::LeaderboardSurface],
+    external: &[Arc<dyn crate::graphql::surface::ExternalReadSource>],
 ) -> Result<(String, Vec<String>), GraphqlBuildError> {
     #[derive(Serialize)]
     struct PermissionMaterial<'a> {
@@ -45,7 +46,7 @@ pub(crate) fn role_authorization_info(
         role: &'a str,
         permissions: Vec<PermissionMaterial<'a>>,
         #[serde(skip_serializing_if = "Vec::is_empty")]
-        leaderboards: Vec<serde_json::Value>,
+        external: Vec<serde_json::Value>,
     }
 
     let mut claim_keys = BTreeSet::from([ROLE_KEY.to_string(), USER_ID_KEY.to_string()]);
@@ -69,13 +70,13 @@ pub(crate) fn role_authorization_info(
             aggregations: permission.aggregations,
         });
     }
-    let leaderboards = leaderboard_material(leaderboards, &[role], &mut claim_keys);
+    let external = external_material(external, &[role], &mut claim_keys);
     let canonical = serde_json::to_vec(&RoleAuthorizationMaterial {
         domain: "distributed.graphql.authorization-surface",
         version: 1,
         role,
         permissions: role_permissions,
-        leaderboards,
+        external,
     })
     .map_err(|_| {
         GraphqlBuildError(format!(
@@ -93,7 +94,7 @@ pub(crate) fn role_authorization_info_for_roles(
     privilege_key: &str,
     schema_roles: &[String],
     permissions: &BTreeMap<String, BTreeMap<String, ReadPermission>>,
-    leaderboards: &[crate::graphql::surface::LeaderboardSurface],
+    external: &[Arc<dyn crate::graphql::surface::ExternalReadSource>],
 ) -> Result<(String, Vec<String>), GraphqlBuildError> {
     #[derive(Serialize)]
     struct MultiPrivilegeMaterial<'a> {
@@ -103,7 +104,7 @@ pub(crate) fn role_authorization_info_for_roles(
         schema_roles: &'a [String],
         models: Vec<&'a str>,
         #[serde(skip_serializing_if = "Vec::is_empty")]
-        leaderboards: Vec<serde_json::Value>,
+        external: Vec<serde_json::Value>,
     }
     let mut claim_keys = BTreeSet::from([USER_ID_KEY.to_string()]);
     let mut models = BTreeSet::new();
@@ -120,14 +121,14 @@ pub(crate) fn role_authorization_info_for_roles(
     }
     let models: Vec<&str> = models.into_iter().collect();
     let roles = schema_roles.iter().map(String::as_str).collect::<Vec<_>>();
-    let leaderboards = leaderboard_material(leaderboards, &roles, &mut claim_keys);
+    let external = external_material(external, &roles, &mut claim_keys);
     let canonical = serde_json::to_vec(&MultiPrivilegeMaterial {
         domain: "distributed.graphql.authorization-surface.multi",
         version: 1,
         privilege_key,
         schema_roles,
         models,
-        leaderboards,
+        external,
     })
     .map_err(|_| {
         GraphqlBuildError(format!(

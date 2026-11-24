@@ -607,9 +607,9 @@ pub struct Surface {
     /// Non-serializable provenance proving typed commands came from one
     /// executable Service inventory rather than a lookalike command list.
     pub(crate) service_binding: Option<crate::command::TypedServiceCommandBinding>,
-    /// Leaderboard surfaces ([`super::LeaderboardSurface`]). On a role or
+    /// External read sources ([`super::ExternalReadSource`]). On a role or
     /// application surface each one carries only that selection's grant.
-    pub(crate) leaderboards: Vec<super::LeaderboardSurface>,
+    pub(crate) external: Vec<std::sync::Arc<dyn super::ExternalReadSource>>,
 }
 
 /// Debug output is intentionally limited to already-authorized public IDs.
@@ -787,19 +787,19 @@ impl Surface {
 
     /// Attach and validate a mixed registry of asynchronous projectors and
     /// same-transaction-only projection owners.
-    /// Attach leaderboard surfaces to the unselected catalog Surface. Role and
-    /// application selection keep each one only where it is granted.
-    pub fn with_leaderboards(
+    /// Attach external read sources to the unselected catalog Surface. Role
+    /// and application selection keep each one only where it is granted.
+    pub fn with_external_sources(
         mut self,
-        leaderboards: impl IntoIterator<Item = super::LeaderboardSurface>,
+        sources: impl IntoIterator<Item = std::sync::Arc<dyn super::ExternalReadSource>>,
     ) -> Result<Self, String> {
         if !matches!(self.selection, SurfaceSelection::Catalog) {
             return Err(
-                "leaderboards can only be attached to the unselected catalog Surface before authorization selection"
+                "external read sources can only be attached to the unselected catalog Surface before authorization selection"
                     .into(),
             );
         }
-        let leaderboards = leaderboards.into_iter().collect::<Vec<_>>();
+        let sources = sources.into_iter().collect::<Vec<_>>();
         let roots = self
             .query_fields
             .iter()
@@ -816,14 +816,14 @@ impl Surface {
             .values()
             .map(|model| model.object_name.as_str())
             .collect::<Vec<_>>();
-        super::leaderboard::validate_leaderboards(&leaderboards, &roots, &types)?;
-        self.leaderboards = leaderboards;
+        super::external::validate_external_sources(&sources, &roots, &types)?;
+        self.external = sources;
         Ok(self)
     }
 
-    /// Leaderboard surfaces visible on this selection.
-    pub fn leaderboards(&self) -> &[super::LeaderboardSurface] {
-        &self.leaderboards
+    /// External read sources visible on this selection.
+    pub fn external_sources(&self) -> &[std::sync::Arc<dyn super::ExternalReadSource>] {
+        &self.external
     }
 
     pub fn with_projection_owners(

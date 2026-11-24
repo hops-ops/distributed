@@ -23,6 +23,8 @@ clap = { version = "4", features = ["derive"] }
 ctrlc = { version = "3", features = ["termination"] }
 distributed = { path = "..", default-features = false }
 distributed_game = { path = "../distributed_game" }
+# The client manifest's `leaderboards` section (`leaderboards.ts`).
+distributed_leaderboard = { path = "../distributed_leaderboard" }
 dotenvy = "0.15"
 fs2 = "0.4"
 glob = "0.3"

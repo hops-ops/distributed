@@ -86,10 +86,7 @@ async function render(board: BoardSnapshot): Promise<void> {
 	const me = api.last?.principal;
 	table($('kills'), board.kills, 'kills', me);
 	table($('xp'), board.xp, 'XP', me);
-	const bg = board.background;
-	status.textContent =
-		`update #${pushes} · version ${board.version} · store ${board.backend} · ${board.members} ranked` +
-		` · background updates: ${bg.applied} applied, ${bg.dropped} dropped, ${bg.failed} failed`;
+	status.textContent = `update #${pushes} · version ${board.version} · store ${board.backend} · ${board.members} ranked`;
 	status.classList.add('flash');
 	setTimeout(() => status.classList.remove('flash'), 120);
 	if (me === undefined) return;

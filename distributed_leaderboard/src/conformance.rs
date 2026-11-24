@@ -4,7 +4,7 @@
 //! implementations are held to identical ordering, policy, idempotency and
 //! rebuild semantics. Panics on the first violation.
 
-use super::{
+use crate::{
     ApplyKey, ApplyOutcome, Board, LeaderboardErrorKind, LeaderboardStore, ScorePolicy,
     ScoreSubmission,
 };

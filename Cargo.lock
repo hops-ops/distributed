@@ -1368,6 +1368,7 @@ dependencies = [
  "ctrlc",
  "distributed",
  "distributed_game",
+ "distributed_leaderboard",
  "dotenvy",
  "fs2",
  "glob",
@@ -1415,6 +1416,24 @@ dependencies = [
  "serde_json",
  "syn 2.0.119",
  "trybuild",
+]
+
+[[package]]
+name = "distributed_leaderboard"
+version = "0.1.0"
+dependencies = [
+ "async-graphql",
+ "async-trait",
+ "distributed",
+ "distributed_cli",
+ "futures-util",
+ "redis",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "tokio",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]

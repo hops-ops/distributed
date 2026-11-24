@@ -26,7 +26,7 @@ use async_trait::async_trait;
 use redis::aio::{ConnectionManager, ConnectionManagerConfig};
 use redis::{Client, Script, Value};
 
-use super::{
+use crate::{
     validate_member, ApplyKey, ApplyOutcome, Board, LeaderboardEntry, LeaderboardError,
     LeaderboardStore, ScoreOrder, ScoreSubmission,
 };

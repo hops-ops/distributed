@@ -12,9 +12,9 @@ use super::error::ApplicationResult;
 use super::identity::{canonical_json, sha256_fingerprint, LogicalId};
 use super::module::{ModelFieldSpec, ModelRelationshipSpec, ModelSpec, ProjectionSpec};
 use crate::graphql::surface::{
-    LeaderboardSurface, RelField, RootField, RootKind, Surface, SurfaceArgument,
-    SurfaceArgumentKind, SurfaceCommand, SurfaceCommandShape, SurfaceRelationshipKeys,
-    SurfaceRowPolicy, SurfaceSelection, SurfaceTypeDef,
+    RelField, RootField, RootKind, Surface, SurfaceArgument, SurfaceArgumentKind, SurfaceCommand,
+    SurfaceCommandShape, SurfaceRelationshipKeys, SurfaceRowPolicy, SurfaceSelection,
+    SurfaceTypeDef,
 };
 
 /// One selected surface: its contract and the fingerprint of its id and
@@ -51,10 +51,11 @@ pub struct SurfaceContract {
     /// Sorted by id.
     pub projections: Vec<ProjectionSpec>,
     pub projectors_attached: bool,
-    /// Canonical leaderboard sections (`LeaderboardSurface`), in contract
-    /// order. Absent when empty.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub leaderboards: Vec<serde_json::Value>,
+    /// Canonical external read source declarations
+    /// (`ExternalReadSource::contract`) by section, in attachment order.
+    /// Absent when empty.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub external: BTreeMap<String, Vec<serde_json::Value>>,
 }
 
 /// Who a surface was selected for.
@@ -275,11 +276,16 @@ impl SurfaceContract {
             commands_attached: surface.commands_attached,
             projections,
             projectors_attached: surface.projectors_attached,
-            leaderboards: surface
-                .leaderboards
-                .iter()
-                .map(LeaderboardSurface::canonical_value)
-                .collect(),
+            external: surface.external.iter().fold(
+                BTreeMap::<String, Vec<serde_json::Value>>::new(),
+                |mut sections, source| {
+                    sections
+                        .entry(source.section().to_string())
+                        .or_default()
+                        .push(source.contract());
+                    sections
+                },
+            ),
         })
     }
 }

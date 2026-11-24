@@ -35,19 +35,22 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use distributed::bus::{BusConsumer, RunOptions, SqliteBus};
-use distributed::graphql::surface::{LeaderboardGrant, LeaderboardSurface};
+use distributed::graphql::surface::ExternalReadSource;
 use distributed::graphql::{
     build_surface, read, surface_for_application_contract, DistributedClientSurfaceExport,
     GraphqlEngine, IdentityConfig, ModelPermissions, OidcConfig, ReadPermission, Surface,
     SurfaceOptions,
 };
-use distributed::leaderboard::{Board, LeaderboardStore, RedisLeaderboard};
 use distributed::microsvc::{
     spawn_service_consumer_loop, CausalProjectorContext, HandlerError, LifecycleGate,
     ModeledProjection, Routes, Service,
 };
 use distributed::{
     Application, ApplicationManifest, RelationalReadModel, SqliteRepository, SurfaceSpec,
+};
+use distributed_leaderboard::{
+    Board, LeaderboardGrant, LeaderboardRoots, LeaderboardStore, LeaderboardSurface,
+    RedisLeaderboard,
 };
 
 /// The rooms' status rows and their projection.
@@ -194,7 +197,11 @@ fn grants() -> BTreeMap<String, BTreeMap<String, ReadPermission>> {
 fn full_surface() -> Surface {
     build_surface(&read_model_catalog().tables, &SurfaceOptions::sqlite())
         .expect("mobpit Surface should build")
-        .with_leaderboards(leaderboard_surfaces())
+        .with_external_sources(
+            leaderboard_surfaces()
+                .into_iter()
+                .map(|surface| Arc::new(surface) as Arc<dyn ExternalReadSource>),
+        )
         .expect("mobpit boards should attach")
         .with_projection_owners([
             projector().into(),
@@ -259,7 +266,8 @@ pub fn build_engine(
 ) -> Result<GraphqlEngine, String> {
     let mut builder = GraphqlEngine::builder(repo.pool().clone());
     for surface in leaderboard_surfaces() {
-        builder = builder.leaderboard(surface, boards.clone());
+        builder =
+            builder.external_read_source(Arc::new(LeaderboardRoots::new(surface, boards.clone())));
     }
     builder
         .service_id(APPLICATION)
@@ -301,7 +309,10 @@ pub async fn open_shared_sqlite(url: &str) -> Result<sqlx::SqlitePool, sqlx::Err
 pub fn spawn_board_notices(engine: Arc<GraphqlEngine>, bus: sqlx::SqlitePool) {
     tokio::spawn(async move {
         loop {
-            let handlers = Arc::new(engine.leaderboard_change_handlers(BOARD_NOTICE_GROUP));
+            let handlers = Arc::new(distributed_leaderboard::change_handlers(
+                &engine,
+                BOARD_NOTICE_GROUP,
+            ));
             let bus = SqliteBus::new(bus.clone());
             if let Err(error) = bus.subscribe(handlers, RunOptions::default()).await {
                 eprintln!("mobpit-service: board notices: {error}");
