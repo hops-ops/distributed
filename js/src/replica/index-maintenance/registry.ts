@@ -1,6 +1,6 @@
 import type { GraphqlVariables } from '../../types.js';
 import type { DistributedTrustedPreset } from '../../protocol.js';
-import { canonicalizeOperationVariables } from '../identity.js';
+import { canonicalizeOperationVariables } from '../identity/codec.js';
 import { compareCodeUnits } from '../../lib/compare-code-units.js';
 import type { ReplicaOperationArtifact } from '../types.js';
 import type {

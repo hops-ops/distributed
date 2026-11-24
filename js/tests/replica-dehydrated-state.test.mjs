@@ -8,7 +8,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import { createDistributedReplica } from '../dist/replica/index.js';
-import { createReplicaIndexedDbPersistence } from '../dist/replica/persistence.js';
+import { createReplicaIndexedDbPersistence } from '../dist/replica/index.js';
 import { FakeIndexedDb } from './fixtures/fake-indexeddb.mjs';
 import { flush } from './fixtures/game-harness.mjs';
 import { scripted, Todos, wireFrame } from './fixtures/replica-todos.mjs';

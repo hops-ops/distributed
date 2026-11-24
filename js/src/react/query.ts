@@ -3,7 +3,7 @@
 import { useDebugValue, useMemo, useSyncExternalStore } from 'react';
 
 import type { GraphqlVariables } from '../types.js';
-import { canonicalizeOperationVariables } from '../replica/identity.js';
+import { canonicalizeOperationVariables } from '../replica/identity/codec.js';
 import type {
 	DistributedReplica,
 	ReplicaOperationArtifact,

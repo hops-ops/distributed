@@ -14,20 +14,19 @@ import {
 	type DistributedRecordRevision,
 	type DistributedTrustedPreset
 } from '../../protocol.js';
-import type { ReplicaTrustedPresetDescriptor } from '../commands.js';
-import type { ReplicaCommandSurfaceContract } from '../command-runtime.js';
+import type { ReplicaTrustedPresetDescriptor } from '../commands/types.js';
+import type { ReplicaCommandSurfaceContract } from '../command-runtime/types.js';
+import { canonicalVariables, cloneJsonValue } from '../identity/clone.js';
 import {
-	canonicalVariables,
-	cloneJsonValue,
 	replicaIndexKey,
 	replicaRecordKey,
 	resolveArguments
-} from '../identity.js';
-import {
-	type ReplicaIndexMaintenanceSnapshot,
-	type ReplicaIndexSemanticChange,
-	type ReplicaIndexSemanticLayer
-} from '../index-maintenance.js';
+} from '../identity/keys.js';
+import type {
+	ReplicaIndexMaintenanceSnapshot,
+	ReplicaIndexSemanticChange,
+	ReplicaIndexSemanticLayer
+} from '../index-maintenance/types.js';
 import type { MaterializedReplicaResult } from '../materialize.js';
 import { validateReplicaOperationBinding as validatedArtifactBinding } from '../operation-binding.js';
 import {
@@ -112,7 +111,7 @@ export function prepareRecordEvidence(
  * response order. `null` means it cannot be established from the response
  * alone (blocked by errors, missing, embedded, or without record evidence).
  */
-export type ReplicaIndexMembership = {
+type ReplicaIndexMembership = {
 	readonly records: readonly string[];
 	readonly nullValue: boolean;
 };
@@ -221,7 +220,7 @@ export function replicaResultIndexKeys<
 	return keys;
 }
 
-export function collectResultBranchIndexKeys(
+function collectResultBranchIndexKeys(
 	artifactId: string,
 	selection: RuntimeRootSelection | RuntimeObjectBranch,
 	value: unknown,
@@ -300,7 +299,7 @@ export function collectResultBranchIndexKeys(
 	);
 }
 
-export function collectResultObjectIndexKeys(
+function collectResultObjectIndexKeys(
 	artifactId: string,
 	selection: RuntimeObjectSelection,
 	value: unknown,
@@ -406,14 +405,14 @@ export function collectResultObjectIndexKeys(
 	return normalized ? parentKey : undefined;
 }
 
-export function resultPathBlocked(
+function resultPathBlocked(
 	errorPaths: readonly (readonly (string | number)[])[],
 	path: readonly (string | number)[]
 ): boolean {
 	return errorPaths.some((errorPath) => resultPathPrefix(errorPath, path));
 }
 
-export function resultPathHasErrors(
+function resultPathHasErrors(
 	errorPaths: readonly (readonly (string | number)[])[],
 	path: readonly (string | number)[]
 ): boolean {
@@ -424,7 +423,7 @@ export function resultPathHasErrors(
 	);
 }
 
-export function resultPathPrefix(
+function resultPathPrefix(
 	prefix: readonly (string | number)[],
 	value: readonly (string | number)[]
 ): boolean {
@@ -434,7 +433,7 @@ export function resultPathPrefix(
 	);
 }
 
-export function isReplicaResultObject(
+function isReplicaResultObject(
 	value: unknown
 ): value is Readonly<Record<string, unknown>> {
 	return value !== null && typeof value === 'object' && !Array.isArray(value);
@@ -692,7 +691,7 @@ export function operationKey<TData, TVariables extends GraphqlVariables>(
 	return `protocol:${artifactIdentity}:${canonicalVariables(variables)}`;
 }
 
-export function validatedSurfaceIdentity(
+function validatedSurfaceIdentity(
 	value: NonNullable<ReplicaOperationArtifact['protocol']>['surface']
 ): string {
 	if (
@@ -780,7 +779,7 @@ export function snapshotEqual<TData>(
 	);
 }
 
-export function freezeErrors(errors: readonly GqlError[]): readonly GqlError[] {
+function freezeErrors(errors: readonly GqlError[]): readonly GqlError[] {
 	if (errors.length === 0) return EMPTY_ERRORS;
 	return Object.freeze(
 		errors.map((error) =>

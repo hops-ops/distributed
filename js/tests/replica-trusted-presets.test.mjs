@@ -5,10 +5,8 @@ import {
 	DistributedProtocolError,
 	parseDistributedProtocolEnvelope
 } from '../dist/index.js';
-import {
-	matchReplicaTrustedPresetInventory,
-	prepareReplicaCommandWithTrustedPresets
-} from '../dist/replica/commands.js';
+import { matchReplicaTrustedPresetInventory } from '../dist/replica/commands/presets.js';
+import { prepareReplicaCommandWithTrustedPresets } from '../dist/replica/commands/prepare.js';
 import {
 	prepareReplicaCommand,
 	ReplicaCommandContractError

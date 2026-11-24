@@ -1,9 +1,7 @@
 import {
 	isDistributedTrustedPresetCodec
 } from '../../../protocol.js';
-import {
-	type ReplicaTrustedPresetDescriptor
-} from '../../commands.js';
+import type { ReplicaTrustedPresetDescriptor } from '../../commands/types.js';
 import {
 	SHA256
 } from '../constants.js';

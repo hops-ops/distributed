@@ -10,8 +10,9 @@ import type {
 	DistributedOpaqueString
 } from '../../protocol.js';
 
-import { cloneJsonValue, replicaRecordKey } from '../identity.js';
-import type { ReplicaIndexSemanticChange } from '../index-maintenance.js';
+import { cloneJsonValue } from '../identity/clone.js';
+import { replicaRecordKey } from '../identity/keys.js';
+import type { ReplicaIndexSemanticChange } from '../index-maintenance/types.js';
 import type {
 	ReplicaIdentity,
 	ReplicaIndexTarget,
@@ -268,7 +269,7 @@ export function replayReplicaOptimisticUpdate(
 	}
 }
 
-export function cloneOptimisticFields(
+function cloneOptimisticFields(
 	fields: ReplicaRecordPatch['fields']
 ): Readonly<Record<string, CacheValue>> {
 	if (fields === undefined) return Object.freeze({});
@@ -302,7 +303,7 @@ function cloneOptimisticUnset(
 	return Object.freeze(result);
 }
 
-export function cloneOptimisticLinks(
+function cloneOptimisticLinks(
 	links: ReplicaRecordPatch['links']
 ): Readonly<Record<string, RecordLink>> {
 	if (links === undefined) return Object.freeze({});
@@ -331,7 +332,7 @@ export function cloneOptimisticLinks(
 	);
 }
 
-export function assertPlainReplicaRecord(
+function assertPlainReplicaRecord(
 	value: object,
 	description: string
 ): void {
@@ -348,13 +349,13 @@ export function assertReplicaOptimisticLayerId(id: string): void {
 	assertReplicaName(id, 'optimistic layer id');
 }
 
-export function assertReplicaName(value: string, description: string): void {
+function assertReplicaName(value: string, description: string): void {
 	if (typeof value !== 'string' || value.length === 0) {
 		throw new TypeError(`${description} must be a non-empty string`);
 	}
 }
 
-export function assertReplicaOptimisticUpdateSynchronous(result: unknown): void {
+function assertReplicaOptimisticUpdateSynchronous(result: unknown): void {
 	if (
 		result !== null &&
 		(typeof result === 'object' || typeof result === 'function') &&

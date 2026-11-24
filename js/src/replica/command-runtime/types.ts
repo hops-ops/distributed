@@ -10,9 +10,9 @@ import type {
 	ReplicaCommandArtifact,
 	ReplicaPreparedCommand,
 	ReplicaTrustedPresetDescriptor
-} from '../commands.js';
-import type { ReplicaDiagnosticsSink } from '../diagnostics.js';
-import type { ReplicaIndexSemanticChange } from '../index-maintenance.js';
+} from '../commands/types.js';
+import type { ReplicaDiagnosticsSink } from '../diagnostics/types.js';
+import type { ReplicaIndexSemanticChange } from '../index-maintenance/types.js';
 import type {
 	DistributedReplica,
 	ReplicaAuthoritativeScope,
@@ -23,7 +23,7 @@ import type {
 	ReplicaResultEnvelope,
 	ReplicaValue
 } from '../types.js';
-import type { ReplicaPureFunction } from '../projection-delta/index.js';
+import type { ReplicaPureFunction } from '../projection-delta/types.js';
 import {
 	replicaCommandAuthority,
 	replicaCommandFreshness,

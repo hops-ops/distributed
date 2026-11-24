@@ -14,7 +14,7 @@ import {
 	parseDistributedProtocolEnvelope,
 	parseGraphqlResponseExtensions
 } from '../dist/index.js';
-import { createReplicaCommandRuntime } from '../dist/replica/command-runtime.js';
+import { createReplicaCommandRuntime } from '../dist/replica/index.js';
 import { flush } from './fixtures/game-harness.mjs';
 import { scripted, Todos } from './fixtures/replica-todos.mjs';
 

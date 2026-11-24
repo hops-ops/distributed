@@ -1,9 +1,5 @@
-export {
-	createReplicaDevelopmentCapability,
-	createReplicaDiagnostics,
-	inspectReplicaCommandArtifact,
-	inspectReplicaOperationArtifact
-} from './replica/diagnostics.js';
+export { createReplicaDevelopmentCapability, createReplicaDiagnostics } from './replica/diagnostics/event-log.js';
+export { inspectReplicaCommandArtifact, inspectReplicaOperationArtifact } from './replica/diagnostics/inspect.js';
 export type {
 	ReplicaArtifactSourceLocation,
 	ReplicaCommandArtifactInspection,
@@ -33,4 +29,4 @@ export type {
 	ReplicaOperationArtifactInspection,
 	ReplicaOperationIndexInspection,
 	ReplicaOperationInjectedFieldInspection
-} from './replica/diagnostics.js';
+} from './replica/diagnostics/types.js';

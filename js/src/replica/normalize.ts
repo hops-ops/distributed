@@ -7,13 +7,13 @@ import type {
 } from '../internal/cache-engine.js';
 import type { DistributedRecordRevision } from '../protocol.js';
 import type { GqlError, GraphqlVariables } from '../types.js';
+import { cloneJsonValue } from './identity/clone.js';
 import {
-	cloneJsonValue,
 	coverageFromArtifact,
 	replicaIndexKey,
 	replicaRecordKey,
 	resolveArguments
-} from './identity.js';
+} from './identity/keys.js';
 import {
 	embeddedRecordKey,
 	runtimeRoot,
