@@ -9,8 +9,6 @@ publish = false
 [features]
 default = ["gateway"]
 gateway = ["distributed/gateway"]
-gateway-graphql = ["gateway", "distributed/gateway-graphql"]
-gateway-delivery = ["gateway-graphql", "distributed/gateway-delivery"]
 
 [dependencies]
 distributed = { path = "../..", default-features = false }
@@ -38,6 +36,3 @@ path = "../gateway_graphql_operation.rs"
 name = "edge_query_delivery"
 path = "../edge_query_delivery.rs"
 
-[[test]]
-name = "gateway_mounts"
-path = "../gateway_mounts.rs"

@@ -1,18 +1,22 @@
 use super::super::causal::{
     abandon_attempt, ensure_causal_grant, handler_error_code, internal_ledger_error,
-    rejection_outcome, replay_result, resolve_ambiguous_lookup, CausalDispatchError,
-    CausalDispatchResult, CommandIngress, ExternalCausalAttempt, ExternalCausalReservation,
-    ModeledProjectionMetadata, SealModeledProjection,
+    rejection_outcome, resolve_ambiguous_lookup, CausalDispatchError, CausalDispatchResult,
+    CommandIngress, ModeledProjectionMetadata, SealModeledProjection,
 };
 #[cfg(feature = "graphql")]
-use super::super::causal::{evaluate_causal_command_status, CausalCommandPublicStatus};
+use super::super::causal::{
+    evaluate_causal_command_status, replay_result, CausalCommandPublicStatus,
+    ExternalCausalAttempt, ExternalCausalReservation,
+};
 use super::super::handlers::{CausalCommandContext, CausalGuardFn, PreparedHandlerFn};
-use super::erased::{
-    CausalCommandPolicy, CausalHandlerFuture, ErasedCausalHandler, ExternalAbandonFuture,
-    ExternalCompletionFuture, ExternalReservationFuture, LedgerCompaction,
-};
+#[cfg(any(feature = "graphql", feature = "runtime-tokio"))]
+use super::erased::LedgerCompaction;
+use super::erased::{CausalCommandPolicy, CausalHandlerFuture, ErasedCausalHandler};
 #[cfg(feature = "graphql")]
-use super::erased::{CausalStatusFuture, CausalStatusRoute};
+use super::erased::{
+    CausalStatusFuture, CausalStatusRoute, ExternalAbandonFuture, ExternalCompletionFuture,
+    ExternalReservationFuture,
+};
 use crate::bus::{Message, MessageKind};
 use crate::command::input::canonicalize_command_input;
 use crate::command::{CommandConsistency, CommandOutcome, TypedCommandContract};
@@ -21,13 +25,14 @@ use crate::command_ledger::{
     CanonicalInputHash, CausalCommitBatch, CommandAttempt, CommandContractFingerprint,
     CommandLedgerError, ReservationOutcome, TerminalCommandState,
 };
+#[cfg(any(feature = "graphql", feature = "runtime-tokio"))]
+use crate::command_ledger::{CausalRepositoryIdentity, CausalStorageIdentity};
+use crate::command_ledger::{CausalTransactionalCommit, CommandLedgerStore};
 use crate::command_ledger::{
-    CausalRepositoryIdentity, CausalTransactionalCommit, CommandLedgerStore,
+    CommandId, CommandLedgerKey, CommandLookup, CommandLookupScope, PrincipalPartitionId,
 };
-use crate::command_ledger::{
-    CausalStorageIdentity, CommandId, CommandLedgerKey, CommandLookup, CommandLookupScope,
-    CommandReservation, ExternalDispatchBinding, PrincipalPartitionId,
-};
+#[cfg(feature = "graphql")]
+use crate::command_ledger::{CommandReservation, ExternalDispatchBinding};
 use crate::microsvc::causal::CausalWorkspace;
 use crate::microsvc::cell_host::CellCommandIdentity;
 #[cfg(feature = "graphql")]
@@ -623,6 +628,7 @@ where
         self.fingerprint = CommandContractFingerprint::new(self.contract.fingerprint_bytes());
     }
 
+    #[cfg(any(feature = "graphql", feature = "runtime-tokio"))]
     fn storage_identity(&self, dependencies: &D) -> CausalStorageIdentity {
         dependencies
             .__causal_aggregate_repository()
@@ -630,6 +636,7 @@ where
             .causal_storage_identity()
     }
 
+    #[cfg(any(feature = "graphql", feature = "runtime-tokio"))]
     fn ledger_compaction(&self, dependencies: &D) -> LedgerCompaction {
         let repository = dependencies.__causal_aggregate_repository().repo().clone();
         Arc::new(move |limit| {
@@ -725,6 +732,7 @@ where
         })
     }
 
+    #[cfg(feature = "graphql")]
     fn reserve_external<'a>(
         &'a self,
         dependencies: &'a D,
@@ -788,6 +796,7 @@ where
         })
     }
 
+    #[cfg(feature = "graphql")]
     fn complete_external<'a>(
         &'a self,
         dependencies: &'a D,
@@ -833,6 +842,7 @@ where
         })
     }
 
+    #[cfg(feature = "graphql")]
     fn abandon_external<'a>(
         &'a self,
         dependencies: &'a D,

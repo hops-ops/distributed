@@ -540,6 +540,7 @@ impl SurfaceModel {
     }
 
     /// Whether this privilege may read `column`.
+    #[cfg(feature = "graphql")]
     pub(crate) fn allows_column(&self, column: &str) -> bool {
         self.columns.iter().any(|field| field.name == column)
     }

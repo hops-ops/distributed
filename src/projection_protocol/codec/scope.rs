@@ -3,14 +3,17 @@ use std::sync::Arc;
 
 use super::constants::{PARTITION_ENCODING_DOMAIN, RECORD_KEY_ENCODING_DOMAIN};
 use super::key::{
-    encode_json, encode_typed_key_value, key_column, row_value_from_graphql_json,
-    typed_value_from_json, typed_value_from_row, validate_model_schema, validate_registration_name,
-    CanonicalEncoder, TypedKeyValue,
+    encode_json, encode_typed_key_value, key_column, typed_value_from_row, validate_model_schema,
+    validate_registration_name, CanonicalEncoder, TypedKeyValue,
 };
+#[cfg(any(feature = "graphql", test))]
+use super::key::{row_value_from_graphql_json, typed_value_from_json};
 use super::ProjectionScopeCodecError;
+#[cfg(any(feature = "graphql", test))]
+use crate::projection_protocol::RecordKey;
 use crate::projection_protocol::{
-    PartitionId, ProjectionRecordScope, ProjectorTopologyId, RecordKey,
-    MAX_PROJECTION_PARTITION_BYTES, MAX_PROJECTION_RECORD_KEY_BYTES,
+    PartitionId, ProjectionRecordScope, ProjectorTopologyId, MAX_PROJECTION_PARTITION_BYTES,
+    MAX_PROJECTION_RECORD_KEY_BYTES,
 };
 use crate::table::{RowKey, TableColumn, TableSchema};
 
@@ -101,6 +104,7 @@ impl ProjectionScopeCodec {
         PartitionId::new(encoder.finish()).map_err(Into::into)
     }
 
+    #[cfg(any(feature = "graphql", test))]
     pub(crate) fn encode_resolved_obligation_scope(
         &self,
         projector: &str,
@@ -225,6 +229,7 @@ impl ProjectionScopeCodec {
     /// decimal string used by GraphQL `BigInt`. Byte keys require canonical
     /// standard-base64. Returned [`RowKey`] values use physical column names,
     /// ready for [`Self::encode_unpartitioned_row_key`].
+    #[cfg(any(feature = "graphql", test))]
     pub(crate) fn row_key_from_json_columns(
         &self,
         model: &str,

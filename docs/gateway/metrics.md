@@ -15,7 +15,7 @@ Run the actual load fixture after installing `tests/gateway-worker` and
 worker-build as described in [worker.md](worker.md):
 
 ```sh
-cargo test --no-default-features --features gateway-graphql-native,gateway-delivery,sqlite --test graphql_query_protocol separate_origin_and_client_savings -- --ignored --nocapture
+cargo test --no-default-features --features gateway-graphql-native,sqlite --test graphql_query_protocol separate_origin_and_client_savings -- --ignored --nocapture
 ```
 
 `tests/gateway-worker/load-runtime.mjs` writes its report to

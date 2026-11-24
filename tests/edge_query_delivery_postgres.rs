@@ -1,8 +1,4 @@
-#![cfg(all(
-    feature = "gateway-delivery",
-    feature = "graphql",
-    feature = "postgres"
-))]
+#![cfg(all(feature = "gateway", feature = "graphql", feature = "postgres"))]
 use async_graphql::Request;
 use distributed::graphql::IdentityConfig;
 use distributed::graphql::{read, GraphqlEngine, ModelPermissions, ReadRouting};

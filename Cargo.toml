@@ -34,31 +34,39 @@ required-features = ["graphql", "sqlite"]
 
 [features]
 default = []
-# Portable gateway declarations and dispatch only; runtime adapters are separate.
-gateway = ["dep:url"]
+# Internal: a Tokio runtime is linked. Every Tokio-using feature implies it and
+# the crate gates its Tokio-only code (outbox and consumer workers) on this one
+# name. Not a public switch: enable the transport or store you need instead.
+runtime-tokio = ["dep:tokio"]
+# Portable gateway declarations, dispatch, whole-operation GraphQL selection
+# and the delivery identity/freshness contracts; runtime adapters are separate.
+gateway = ["dep:url", "dep:async-graphql-parser"]
 # Native HTTP adapter remains independent of GraphQL and SQL.
 gateway-native = ["gateway", "http", "reqwest/stream", "dep:hyper", "dep:hyper-util", "dep:tower", "tokio/io-util"]
-# Whole-operation selection is portable; execution adapters are separately gated.
-gateway-graphql = ["gateway", "dep:async-graphql-parser"]
-# Shared portable identity, freshness and delivery contracts.
-gateway-delivery = ["gateway-graphql"]
 # workers-rs ingress and delivery contracts, without native executors.
-gateway-worker = ["gateway-delivery", "dep:worker", "dep:futures-channel"]
-gateway-graphql-native = ["gateway-native", "gateway-graphql", "graphql", "dep:tokio-tungstenite"]
+gateway-worker = ["gateway", "dep:worker", "dep:futures-channel"]
+# Native GraphQL execution behind the gateway, including native delivery
+# (snapshots, coalescing, live sharing; each still opt-in at runtime).
+gateway-graphql-native = ["gateway-native", "graphql", "dep:tokio-tungstenite"]
 metrics = []
-http = ["dep:axum", "dep:reqwest", "dep:tokio"]
-grpc = ["dep:tonic", "dep:tonic-prost", "dep:prost", "dep:tokio"]
-postgres = ["dep:sqlx", "dep:tokio", "sqlx/postgres", "sqlx/migrate", "sqlx/runtime-tokio", "sqlx/json"]
-sqlite = ["dep:sqlx", "dep:tokio", "sqlx/migrate", "sqlx/runtime-tokio", "sqlx/sqlite", "sqlx/json"]
-nats = ["dep:async-nats", "dep:futures", "dep:tokio"]
-rabbitmq = ["dep:lapin", "dep:futures", "dep:tokio"]
-kafka = ["dep:rdkafka", "dep:tokio"]
+http = ["dep:axum", "dep:reqwest", "runtime-tokio"]
+# Knative: `bus::KnativeBus`, `bus::knative_triggers` and the CloudEvents
+# ingress `microsvc::cloud_events_router`.
+knative = ["http"]
+grpc = ["dep:tonic", "dep:tonic-prost", "dep:prost", "runtime-tokio"]
+postgres = ["dep:sqlx", "runtime-tokio", "sqlx/postgres", "sqlx/migrate", "sqlx/runtime-tokio", "sqlx/json"]
+sqlite = ["dep:sqlx", "runtime-tokio", "sqlx/migrate", "sqlx/runtime-tokio", "sqlx/sqlite", "sqlx/json"]
+nats = ["dep:async-nats", "dep:futures", "runtime-tokio"]
+rabbitmq = ["dep:lapin", "dep:futures", "runtime-tokio"]
+kafka = ["dep:rdkafka", "runtime-tokio"]
 # Redis sorted-set leaderboards and the Redis Streams `MessagePublisher`.
-redis = ["dep:redis", "dep:tokio", "leaderboard-background"]
+redis = ["dep:redis", "runtime-tokio", "leaderboard-background"]
 # `leaderboard::BackgroundLeaderboard` (fire-and-forget updates on a Tokio
 # task) without Redis, e.g. over `InMemoryLeaderboard`.
-leaderboard-background = ["dep:tokio"]
-workers-rs = ["dep:worker"]
+leaderboard-background = ["runtime-tokio"]
+# Code that runs inside a celld Worker (wasm32 Durable Objects): the cell
+# host's Durable Object storage and outbox, and the celld Queue publisher.
+cloudflare-workers = ["dep:worker"]
 otel = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:tracing-opentelemetry"]
 graphql = ["dep:async-graphql", "dep:async-graphql-axum", "dep:futures-channel", "dep:hmac", "dep:jsonwebtoken", "dep:subtle", "futures-util/sink", "http", "axum?/ws"]
 

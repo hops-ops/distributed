@@ -41,11 +41,9 @@ pub use context::{BackendCredential, Credentials, Identity, RequestContext};
 pub mod native;
 
 /// Portable GraphQL operation selection and capability admission.
-#[cfg(feature = "gateway-graphql")]
 pub mod graphql;
 
 /// Portable authenticated delivery identity and freshness contracts.
-#[cfg(feature = "gateway-delivery")]
 pub mod delivery;
 
 /// workers-rs ingress and sharded Durable Object delivery adapter.

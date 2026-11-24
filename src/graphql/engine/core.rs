@@ -229,9 +229,9 @@ pub(crate) struct EngineInner {
     pub lifecycle: crate::microsvc::LifecycleGate,
     pub causal_storage_identity: Option<crate::command_ledger::CausalStorageIdentity>,
     pub pool: GraphqlPool,
-    #[cfg(feature = "gateway-delivery")]
+    #[cfg(feature = "gateway")]
     pub read_routing: Option<super::ReadRouting>,
-    #[cfg(feature = "gateway-delivery")]
+    #[cfg(feature = "gateway")]
     pub gateway_versions: Option<crate::graphql::delivery::GatewayVersionStore>,
     pub catalog: BTreeMap<String, CatalogEntry>,
     pub by_table: BTreeMap<String, String>,
@@ -321,9 +321,9 @@ pub struct GraphqlEngineBuilder {
     pub(crate) lifecycle: crate::microsvc::LifecycleGate,
     pub(crate) causal_storage_identity: Option<crate::command_ledger::CausalStorageIdentity>,
     pub(crate) pool: GraphqlPool,
-    #[cfg(feature = "gateway-delivery")]
+    #[cfg(feature = "gateway")]
     pub(crate) read_routing: Option<super::ReadRouting>,
-    #[cfg(feature = "gateway-delivery")]
+    #[cfg(feature = "gateway")]
     pub(crate) gateway_versions: Option<crate::graphql::delivery::GatewayVersionStore>,
     pub(crate) catalog: BTreeMap<String, CatalogEntry>,
     pub(crate) by_table: BTreeMap<String, String>,

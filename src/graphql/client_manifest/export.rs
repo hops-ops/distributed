@@ -141,7 +141,7 @@ impl DistributedClientSurfaceExport {
         &self.service_id
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "graphql", feature = "sqlite"))]
     pub(crate) fn manifest_cache_owners(&self) -> usize {
         Arc::strong_count(&self.manifest)
     }

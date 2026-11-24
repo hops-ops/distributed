@@ -62,7 +62,7 @@ tokio = {{ version = "1", features = ["macros", "net", "rt-multi-thread"] }}
         let mut features = Vec::new();
         match self.transport {
             ServiceTransport::Http => features.push("http"),
-            ServiceTransport::Knative => features.push("http"),
+            ServiceTransport::Knative => features.push("knative"),
         }
         match self.store {
             StoreTarget::Postgres => features.push("postgres"),

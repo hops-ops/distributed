@@ -11,9 +11,9 @@ impl GraphqlEngineBuilder {
             lifecycle: crate::microsvc::LifecycleGate::always_open(),
             causal_storage_identity: source.causal_storage_identity,
             pool: source.pool,
-            #[cfg(feature = "gateway-delivery")]
+            #[cfg(feature = "gateway")]
             read_routing: None,
-            #[cfg(feature = "gateway-delivery")]
+            #[cfg(feature = "gateway")]
             gateway_versions: None,
             catalog: BTreeMap::new(),
             by_table: BTreeMap::new(),
@@ -53,7 +53,7 @@ impl GraphqlEngineBuilder {
 
     /// Opt in selected exact query documents to a read replica. The engine's
     /// original repository remains the primary for current reads and evidence.
-    #[cfg(feature = "gateway-delivery")]
+    #[cfg(feature = "gateway")]
     pub fn read_routing(mut self, routing: ReadRouting) -> Self {
         if std::mem::discriminant(&self.pool) != std::mem::discriminant(&routing.replica) {
             self.pending_errors
@@ -65,7 +65,7 @@ impl GraphqlEngineBuilder {
 
     /// Enable origin dependency validation after installing version coverage
     /// in the engine's database. This allocates no gateway cache or coordinator.
-    #[cfg(feature = "gateway-delivery")]
+    #[cfg(feature = "gateway")]
     pub fn gateway_versions(
         mut self,
         store: crate::graphql::delivery::GatewayVersionStore,
@@ -1091,9 +1091,9 @@ impl GraphqlEngineBuilder {
             lifecycle: self.lifecycle,
             causal_storage_identity: self.causal_storage_identity,
             pool: self.pool,
-            #[cfg(feature = "gateway-delivery")]
+            #[cfg(feature = "gateway")]
             read_routing: self.read_routing,
-            #[cfg(feature = "gateway-delivery")]
+            #[cfg(feature = "gateway")]
             gateway_versions: self.gateway_versions,
             catalog: self.catalog,
             by_table: self.by_table,

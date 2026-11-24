@@ -55,7 +55,7 @@ impl GraphqlEngine {
         session: &Session,
         mut request: Request,
     ) -> Response {
-        #[cfg(feature = "gateway-delivery")]
+        #[cfg(feature = "gateway")]
         if delivery::action(&request).as_deref() == Some("validate") {
             return self.validate_delivery(session, request).await;
         }
@@ -92,7 +92,7 @@ impl GraphqlEngine {
             Ok(accumulator) => accumulator,
             Err(error) => return error.into_response(),
         };
-        #[cfg(feature = "gateway-delivery")]
+        #[cfg(feature = "gateway")]
         if let Some(accumulator) = &accumulator {
             if self
                 .enable_delivery_capture(session, &request, accumulator)
@@ -106,12 +106,12 @@ impl GraphqlEngine {
             // future classifier or request extension behaves unexpectedly.
             request = request.only_introspection();
         }
-        #[cfg(feature = "gateway-delivery")]
+        #[cfg(feature = "gateway")]
         let read = match self.prepare_read(session, &request) {
             Ok(read) => read,
             Err(error) => return read_routing::delivery_error(error),
         };
-        #[cfg(feature = "gateway-delivery")]
+        #[cfg(feature = "gateway")]
         let request = request.data(read.clone());
         let mut request = request
             .data(session.clone())
@@ -123,7 +123,7 @@ impl GraphqlEngine {
         let start = std::time::Instant::now();
         let response =
             attach_protocol_response(schema.execute(request).await, accumulator.as_ref());
-        #[cfg(feature = "gateway-delivery")]
+        #[cfg(feature = "gateway")]
         let response = read_routing::enforce_minimum(response, &read);
         let status = metrics_status_for_response(&response);
         let root_field = match &response.data {
@@ -192,14 +192,14 @@ impl GraphqlEngine {
         if introspection {
             request = request.only_introspection();
         }
-        #[cfg(feature = "gateway-delivery")]
+        #[cfg(feature = "gateway")]
         let read = match self.prepare_read(session, &request) {
             Ok(read) => read,
             Err(error) => {
                 return stream::once(async move { read_routing::delivery_error(error) }).boxed()
             }
         };
-        #[cfg(feature = "gateway-delivery")]
+        #[cfg(feature = "gateway")]
         let request = request.data(read.clone());
         let mut request = request
             .data(session.clone())
@@ -212,7 +212,7 @@ impl GraphqlEngine {
             .execute_stream(request)
             .map(move |response| {
                 let response = attach_protocol_response(response, accumulator.as_ref());
-                #[cfg(feature = "gateway-delivery")]
+                #[cfg(feature = "gateway")]
                 let response = read_routing::enforce_minimum(response, &read);
                 response
             })

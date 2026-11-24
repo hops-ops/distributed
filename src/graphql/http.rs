@@ -309,7 +309,7 @@ async fn resolve_http_identity(
     headers: &HeaderMap,
     request: &Request,
 ) -> Result<ResolvedIdentity, AuthError> {
-    #[cfg(feature = "gateway-delivery")]
+    #[cfg(feature = "gateway")]
     if let Some(init) = request
         .extensions
         .get("gatewayDelivery")

@@ -1625,7 +1625,7 @@ pub async fn unowned_legacy_query_is_explicitly_incomplete_and_still_strips_keys
     assert_opaque_token(&snapshot["scopeToken"], "query-snapshot");
 }
 
-#[cfg(feature = "gateway-delivery")]
+#[cfg(feature = "gateway")]
 pub async fn freshness_context_binds_origin_and_rejects_unproven_minima(db: Db) {
     use distributed::gateway::delivery::{FreshnessContext, Minimum};
     let fixture = protocol_fixture_with_retention(db, 10).await;
@@ -1717,7 +1717,7 @@ pub async fn freshness_context_binds_origin_and_rejects_unproven_minima(db: Db) 
     );
 }
 
-#[cfg(feature = "gateway-delivery")]
+#[cfg(feature = "gateway")]
 pub async fn gateway_validator_tracks_projection_commit_in_the_result_snapshot(db: Db) {
     use distributed::graphql::delivery::GatewayVersionStore;
     let fixture = protocol_fixture_with_retention(db, 10).await;
@@ -1794,7 +1794,7 @@ pub async fn gateway_validator_tracks_projection_commit_in_the_result_snapshot(d
     );
 }
 
-#[cfg(all(feature = "gateway-delivery", feature = "gateway-graphql-native"))]
+#[cfg(feature = "gateway-graphql-native")]
 pub async fn native_snapshot_cache_revalidates_each_consumer_without_result_sql(db: Db) {
     use axum::{routing::post, Router};
     use distributed::gateway::{delivery::SnapshotLimits, native::*, *};
@@ -2029,7 +2029,7 @@ pub async fn native_snapshot_cache_revalidates_each_consumer_without_result_sql(
     }
 }
 
-#[cfg(all(feature = "gateway-delivery", feature = "gateway-graphql-native"))]
+#[cfg(feature = "gateway-graphql-native")]
 pub async fn hundred_reads_one_execution_with_cache_disabled(db: Db) {
     use axum::{routing::post, Router};
     use distributed::gateway::{delivery::FlightLimits, native::*, *};
@@ -2227,17 +2227,17 @@ pub async fn hundred_reads_one_execution_with_cache_disabled(db: Db) {
     assert_eq!(delivery.flight_counts(), (0, 0));
 }
 
-#[cfg(all(feature = "gateway-delivery", feature = "gateway-graphql-native"))]
+#[cfg(feature = "gateway-graphql-native")]
 pub async fn hundred_subscribers_one_upstream_over_embedded_websockets(db: Db) {
     hundred_subscribers_one_upstream(db, false).await;
 }
 
-#[cfg(all(feature = "gateway-delivery", feature = "gateway-graphql-native"))]
+#[cfg(feature = "gateway-graphql-native")]
 pub async fn hundred_subscribers_one_upstream_over_remote_websockets(db: Db) {
     hundred_subscribers_one_upstream(db, true).await;
 }
 
-#[cfg(all(feature = "gateway-delivery", feature = "gateway-graphql-native"))]
+#[cfg(feature = "gateway-graphql-native")]
 async fn hundred_subscribers_one_upstream(db: Db, remote: bool) {
     use axum::Router;
     use distributed::gateway::{delivery::LiveLimits, native::*, *};
@@ -2537,7 +2537,7 @@ async fn hundred_subscribers_one_upstream(db: Db, remote: bool) {
     }
 }
 
-#[cfg(all(feature = "gateway-delivery", feature = "gateway-graphql-native"))]
+#[cfg(feature = "gateway-graphql-native")]
 #[tokio::test]
 #[ignore = "requires pinned tests/gateway-worker npm installation and worker-build; run explicitly in Worker CI"]
 async fn worker_coordinator_uses_actual_origin_projection_sql() {
@@ -2615,7 +2615,7 @@ async fn worker_coordinator_uses_actual_origin_projection_sql() {
     );
 }
 
-#[cfg(all(feature = "gateway-delivery", feature = "gateway-graphql-native"))]
+#[cfg(feature = "gateway-graphql-native")]
 #[tokio::test]
 #[ignore = "requires pinned local workerd fixture; run explicitly in Worker CI"]
 async fn worker_live_coordinator_uses_actual_oidc_origin() {
@@ -2711,7 +2711,7 @@ async fn worker_live_coordinator_uses_actual_oidc_origin() {
     );
 }
 
-#[cfg(all(feature = "gateway-delivery", feature = "gateway-graphql-native"))]
+#[cfg(feature = "gateway-graphql-native")]
 on_each_dialect! { ;
     projected_query_emits_exact_record_and_index_revisions_without_key_leaks,
     count_only_aggregate_emits_no_unselected_node_record_evidence,
@@ -2736,17 +2736,17 @@ on_each_dialect! { ;
     #[cfg(feature = "gateway-graphql-native")]
     gateway_remote_query_revision_parity,
     unowned_legacy_query_is_explicitly_incomplete_and_still_strips_keys,
-    #[cfg(feature = "gateway-delivery")]
+    #[cfg(feature = "gateway")]
     freshness_context_binds_origin_and_rejects_unproven_minima,
-    #[cfg(feature = "gateway-delivery")]
+    #[cfg(feature = "gateway")]
     gateway_validator_tracks_projection_commit_in_the_result_snapshot,
-    #[cfg(all(feature = "gateway-delivery", feature = "gateway-graphql-native"))]
+    #[cfg(feature = "gateway-graphql-native")]
     native_snapshot_cache_revalidates_each_consumer_without_result_sql,
-    #[cfg(all(feature = "gateway-delivery", feature = "gateway-graphql-native"))]
+    #[cfg(feature = "gateway-graphql-native")]
     hundred_reads_one_execution_with_cache_disabled,
-    #[cfg(all(feature = "gateway-delivery", feature = "gateway-graphql-native"))]
+    #[cfg(feature = "gateway-graphql-native")]
     hundred_subscribers_one_upstream_over_embedded_websockets,
-    #[cfg(all(feature = "gateway-delivery", feature = "gateway-graphql-native"))]
+    #[cfg(feature = "gateway-graphql-native")]
     hundred_subscribers_one_upstream_over_remote_websockets,
 }
 

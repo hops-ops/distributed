@@ -183,6 +183,7 @@ pub(crate) struct ProjectionExecutionSnapshotBatchRequest {
 }
 
 impl ProjectionExecutionSnapshotBatchRequest {
+    #[cfg(any(feature = "graphql", test))]
     pub(crate) fn new(
         requests: Vec<ProjectionQuerySnapshotRequest>,
     ) -> Result<Self, ProjectionProtocolError> {

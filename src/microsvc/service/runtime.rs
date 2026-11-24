@@ -11,10 +11,9 @@ use super::causal::{
     internal_ledger_error, CausalCommandPublicStatus, GraphqlServiceBindError,
     ModeledProjectionMetadata,
 };
-use super::causal::{
-    CausalDispatchError, CausalDispatchResult, ExternalCausalAttempt, ExternalCausalReservation,
-    SealModeledProjection,
-};
+use super::causal::{CausalDispatchError, CausalDispatchResult, SealModeledProjection};
+#[cfg(feature = "graphql")]
+use super::causal::{ExternalCausalAttempt, ExternalCausalReservation};
 use super::helpers::{
     is_json_content_type, message_to_json_input, message_to_session, names_by_kind,
     transport_command_error, transport_command_id, transport_session,
@@ -31,9 +30,11 @@ use crate::bus::{
 };
 use crate::command::{TypedCommandContract, TypedServiceCommandBinding};
 use crate::command_dispatch::VerifiedPrincipal;
+use crate::command_ledger::CommandLookup;
 #[cfg(feature = "graphql")]
-use crate::command_ledger::{CommandId, CommandLedgerKey, PrincipalPartitionId};
-use crate::command_ledger::{CommandLookup, ExternalDispatchBinding};
+use crate::command_ledger::{
+    CommandId, CommandLedgerKey, ExternalDispatchBinding, PrincipalPartitionId,
+};
 use crate::microsvc::error::HandlerError;
 use crate::microsvc::lifecycle::LifecycleGate;
 use crate::microsvc::projector::{ProjectionRepairHandle, ProjectorRegistration};
@@ -74,7 +75,7 @@ pub struct Service {
     #[cfg(feature = "graphql")]
     graphql: Option<std::sync::Arc<crate::graphql::GraphqlEngine>>,
     /// Started by `with_bus`; stops when the service is dropped.
-    #[cfg(background_workers)]
+    #[cfg(feature = "runtime-tokio")]
     ledger_compaction: Option<crate::microsvc::workers::LedgerCompactionWorker>,
 }
 
@@ -95,7 +96,7 @@ impl Service {
             http_command_routes: false,
             #[cfg(feature = "graphql")]
             graphql: None,
-            #[cfg(background_workers)]
+            #[cfg(feature = "runtime-tokio")]
             ledger_compaction: None,
         }
     }
@@ -681,6 +682,7 @@ impl Service {
     /// Reserve the gateway ledger row for a command that will be committed by
     /// an aggregate cell. The route performs canonical input and grant checks
     /// before any remote request is made.
+    #[cfg(feature = "graphql")]
     pub(crate) async fn reserve_external_causal(
         &self,
         command: &str,
@@ -714,6 +716,7 @@ impl Service {
     /// Persist a sealed terminal receipt for a command committed by a cell.
     /// This path only updates the gateway ledger and never invokes a local
     /// handler or appends a local event batch.
+    #[cfg(feature = "graphql")]
     pub(crate) async fn complete_external_causal(
         &self,
         command: &str,
@@ -740,6 +743,7 @@ impl Service {
 
     /// Mark a remote attempt retryable after a transport/protocol failure.
     /// The durable fence remains the authority for later replay or reclaim.
+    #[cfg(feature = "graphql")]
     pub(crate) async fn abandon_external_causal(
         &self,
         command: &str,
@@ -1326,6 +1330,7 @@ impl Service {
 
     /// Compaction of every command ledger this service's typed commands
     /// write, one per repository however many route bundles share it.
+    #[cfg(any(feature = "graphql", feature = "runtime-tokio"))]
     pub(crate) fn command_ledgers(&self) -> Vec<super::routes::LedgerCompaction> {
         let mut identities = Vec::new();
         let mut ledgers = Vec::new();
@@ -1344,7 +1349,7 @@ impl Service {
 
     /// Run command-ledger compaction beside the outbox drain for as long as
     /// this service lives.
-    #[cfg(background_workers)]
+    #[cfg(feature = "runtime-tokio")]
     pub(crate) fn start_ledger_compaction(&mut self) {
         let ledgers = self.command_ledgers();
         self.ledger_compaction = (!ledgers.is_empty())

@@ -79,7 +79,7 @@ mod service;
 mod session;
 // Worker loops need a Tokio runtime (spawn/sleep); only compile when a feature
 // that enables the optional `tokio` dep is active (default feature set does not).
-#[cfg(background_workers)]
+#[cfg(feature = "runtime-tokio")]
 mod workers;
 
 pub use crate::bus::{Message, MessageKind, PayloadDecodeError, SubscriptionPlan};
@@ -124,7 +124,7 @@ pub(crate) use service::{
     CausalCommandPublicState, CausalCommandReceiptSource, CausalProjectionEvidenceState,
 };
 pub use service::{CausalDispatchError, CausalDispatchResult};
-#[cfg(background_workers)]
+#[cfg(feature = "runtime-tokio")]
 pub use workers::{
     spawn_outbox_publish_loop, spawn_service_consumer_loop, spawn_service_consumer_loop_until,
 };
@@ -156,10 +156,10 @@ pub(crate) use http::session_from_headers;
 pub use http::{router, serve};
 
 // Knative / CloudEvents HTTP ingress (Service-coupled; the bus keeps only the
-// produce/manifest helpers). Requires the "http" feature.
-#[cfg(feature = "http")]
+// produce/manifest helpers).
+#[cfg(feature = "knative")]
 mod knative_ingress;
-#[cfg(feature = "http")]
+#[cfg(feature = "knative")]
 pub use knative_ingress::cloud_events_router;
 
 // gRPC transport (requires "grpc" feature)

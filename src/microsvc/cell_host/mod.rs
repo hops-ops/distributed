@@ -14,7 +14,7 @@
 //! delivery through celld Queue.
 //!
 //! Durable storage is one SQLite database per cell: Durable Object
-//! `storage.sql` on celld (`workers-rs`/wasm32, `sql_store.rs`). Durable
+//! `storage.sql` on celld (`cloudflare-workers`/wasm32, `sql_store.rs`). Durable
 //! cells run on celld only, for local development and deployment alike;
 //! there is no native durable cell backend. Native builds have the
 //! in-process reference host, for unit tests (the cell host itself stays
@@ -23,14 +23,14 @@
 pub(crate) mod alarm;
 pub(crate) mod causal;
 mod cell;
-#[cfg(feature = "workers-rs")]
+#[cfg(feature = "cloudflare-workers")]
 mod celld_outbox;
 #[cfg(feature = "graphql")]
 mod command;
 mod internal_auth;
-#[cfg(all(feature = "workers-rs", target_arch = "wasm32"))]
+#[cfg(all(feature = "cloudflare-workers", target_arch = "wasm32"))]
 mod sql_executor;
-#[cfg(all(feature = "workers-rs", target_arch = "wasm32"))]
+#[cfg(all(feature = "cloudflare-workers", target_arch = "wasm32"))]
 mod sql_store;
 mod store;
 mod wire;
@@ -47,7 +47,7 @@ pub use causal::{
     CELL_SERVICE_ID_HEADER,
 };
 pub use cell::{instance_name, parent_cell_name, AggregateCell, CellBatchCommand, CellNamespace};
-#[cfg(feature = "workers-rs")]
+#[cfg(feature = "cloudflare-workers")]
 pub use celld_outbox::{
     CelldAlarmOutcome, CelldOutbox, CelldOutboxDrainOutcome, CELLD_OUTBOX_DEFAULT_BATCH_SIZE,
     CELLD_OUTBOX_DEFAULT_BINDING, CELLD_OUTBOX_DEFAULT_DRAIN_INTERVAL_MS,
@@ -59,7 +59,7 @@ pub use internal_auth::{
     InternalHttpSecret, CELL_INTERNAL_SECRET_ENV, CELL_INTERNAL_SECRET_HEADER,
 };
 pub use store::CellStreamStore;
-#[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
+#[cfg(not(all(feature = "cloudflare-workers", target_arch = "wasm32")))]
 pub use store::{
     DurableAggregateCellState, DurableCellCommand, DurableCellEvents, DurableCellSnapshot,
     SealedRowReducer, DURABLE_AGGREGATE_CELL_STATE_VERSION,

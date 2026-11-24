@@ -10,7 +10,9 @@ use sha2::{Digest, Sha256};
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum VerifiedAudienceSource {
     Aud,
+    #[cfg(feature = "graphql")]
     AuthorizedParty,
+    #[cfg(feature = "graphql")]
     ClientId,
 }
 
@@ -85,6 +87,7 @@ impl VerifiedPrincipal {
 
     /// A principal proved by a bearer token the caller has validated against
     /// its issuer's keys.
+    #[cfg(feature = "graphql")]
     pub(crate) fn oidc(
         issuer: String,
         subject: String,
@@ -132,12 +135,12 @@ impl VerifiedPrincipal {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "graphql"))]
     pub(crate) fn issuer(&self) -> &str {
         &self.issuer
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "graphql"))]
     pub(crate) fn subject(&self) -> &str {
         &self.subject
     }
@@ -148,6 +151,7 @@ impl VerifiedPrincipal {
         self.expires_at
     }
 
+    #[cfg(feature = "graphql")]
     pub(crate) fn subject_matches(&self, subject: &str) -> bool {
         self.subject == subject
     }

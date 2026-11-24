@@ -34,6 +34,7 @@ struct State {
 }
 
 pub(crate) struct Membership {
+    #[cfg(any(feature = "graphql", test))]
     pub generation: ActiveGeneration,
     pub mutations_open: bool,
 }
@@ -73,6 +74,7 @@ fn resolve(source: &[u8], member_id: &str, instance_id: &str, startup: &str) -> 
         return None;
     }
     Some(Membership {
+        #[cfg(any(feature = "graphql", test))]
         generation,
         mutations_open: state.phase == "active",
     })
@@ -124,6 +126,7 @@ impl MembershipFile {
     }
 }
 
+#[cfg(feature = "graphql")]
 pub(crate) fn membership_from_environment() -> Option<Membership> {
     MembershipFile::from_env()?.read()
 }

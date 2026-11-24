@@ -1365,7 +1365,7 @@ mod tests {
     #[tokio::test]
     async fn sqlite_direct_projection_and_ledger_replay_commit_atomically() {
         let repository = repository().await;
-        #[cfg(all(feature = "graphql", feature = "gateway-delivery"))]
+        #[cfg(all(feature = "graphql", feature = "gateway"))]
         let (cache_store, cache_pool, cache_tables, cache_before) = {
             let pool = crate::graphql::GraphqlPool::Sqlite(repository.pool().clone());
             let tables = vec!["sql_todo_views".to_owned()];
@@ -1429,7 +1429,7 @@ mod tests {
             .await
             .unwrap();
 
-        #[cfg(all(feature = "graphql", feature = "gateway-delivery"))]
+        #[cfg(all(feature = "graphql", feature = "gateway"))]
         let cache_committed = {
             let committed = serde_json::to_value(
                 cache_store
@@ -1538,7 +1538,7 @@ mod tests {
                 .unwrap(),
             CommandLookup::InProgress { .. }
         ));
-        #[cfg(all(feature = "graphql", feature = "gateway-delivery"))]
+        #[cfg(all(feature = "graphql", feature = "gateway"))]
         assert_eq!(
             serde_json::to_value(
                 cache_store

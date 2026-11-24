@@ -86,9 +86,9 @@ mod in_memory_bus;
 mod kafka;
 #[cfg(feature = "kafka")]
 mod kafka_bus;
-#[cfg(feature = "http")]
+#[cfg(feature = "knative")]
 mod knative;
-#[cfg(feature = "http")]
+#[cfg(feature = "knative")]
 mod knative_bus;
 mod message;
 mod message_name;
@@ -122,9 +122,9 @@ mod topology;
 pub use kafka::{KafkaPublisher, KafkaReceived, KafkaSource};
 #[cfg(feature = "kafka")]
 pub use kafka_bus::{KafkaBus, KafkaBusConnect};
-#[cfg(feature = "http")]
+#[cfg(feature = "knative")]
 pub use knative::knative_triggers;
-#[cfg(feature = "http")]
+#[cfg(feature = "knative")]
 pub use knative_bus::KnativeBus;
 #[cfg(feature = "nats")]
 pub use nats::{NatsJetStreamSource, NatsPublisher, NatsReceived};
@@ -136,9 +136,9 @@ pub use rabbitmq::{RabbitPublisher, RabbitReceived, RabbitSource};
 pub use rabbitmq_bus::{RabbitBus, RabbitBusConnect};
 
 pub use bus::{Bus, BusConsumer};
-#[cfg(all(feature = "workers-rs", target_arch = "wasm32"))]
+#[cfg(all(feature = "cloudflare-workers", target_arch = "wasm32"))]
 pub use celld_queue::CelldQueueHttpPublisher;
-#[cfg(feature = "workers-rs")]
+#[cfg(feature = "cloudflare-workers")]
 pub use celld_queue::CelldQueuePublisher;
 pub use celld_queue::{
     celld_queue_relay_handler, CelldQueueEnvelope, CelldQueueRelay, CelldQueueRelayHandler,

@@ -293,6 +293,7 @@ impl Schedule {
     }
 
     /// The relative delay, for backends that resolve it in SQL.
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
     pub(crate) fn relative_delay_ms(&self) -> Option<u64> {
         match self.due {
             ScheduleDue::After(delay) => Some(delay),
@@ -325,6 +326,11 @@ impl Schedule {
         }
     }
 
+    #[cfg(any(
+        feature = "sqlite",
+        feature = "postgres",
+        all(feature = "cloudflare-workers", target_arch = "wasm32")
+    ))]
     pub(crate) fn input_json(&self) -> Result<String, RepositoryError> {
         serde_json::to_string(&self.input)
             .map_err(|error| RepositoryError::Model(format!("schedule input: {error}")))

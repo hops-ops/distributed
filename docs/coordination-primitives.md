@@ -336,7 +336,7 @@ A test network delivers outbox rows whose `deliver_at` is due on a
 ```sh
 cargo test --features sqlite,postgres --test saga_transfer --test coordination_lease --test scheduled_outbox
 cargo test --features sqlite --lib -- outbox lease clock
-cargo test --features workers-rs --lib cell_host
+cargo test --features cloudflare-workers --lib cell_host
 (cd tests/celld/alarm-worker && worker-build --release) && node tests/celld/alarms.mjs
 ```
 

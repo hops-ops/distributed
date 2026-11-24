@@ -3,7 +3,7 @@
 //! Drives `cloud_events_router` over a real ephemeral HTTP server and asserts
 //! the CloudEvents binding (binary + structured) and the ack/retry/permanent
 //! response-status mapping. Runs in-process — no external broker.
-#![cfg(feature = "http")]
+#![cfg(feature = "knative")]
 
 use std::sync::{Arc, Mutex};
 

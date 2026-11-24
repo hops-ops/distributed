@@ -319,7 +319,7 @@ pub(crate) async fn ensure_primary_backend(
     connection: &mut sqlx::PgConnection,
     primary: bool,
 ) -> Result<(), String> {
-    #[cfg(feature = "gateway-delivery")]
+    #[cfg(feature = "gateway")]
     if primary
         && sqlx::query_scalar::<_, bool>("SELECT pg_is_in_recovery()")
             .fetch_one(&mut *connection)

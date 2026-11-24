@@ -71,23 +71,8 @@ impl Dialect {
     }
 }
 
-/// Features that link a tokio runtime the service spawns its background
-/// workers on (outbox drain, ledger compaction).
-const BACKGROUND_WORKER_FEATURES: [&str; 7] = [
-    "HTTP", "GRPC", "POSTGRES", "SQLITE", "NATS", "RABBITMQ", "KAFKA",
-];
-
 fn main() {
     emit_migration_inventory();
-
-    // One name for the feature list, so every site gates on the same set.
-    println!("cargo:rustc-check-cfg=cfg(background_workers)");
-    if BACKGROUND_WORKER_FEATURES
-        .iter()
-        .any(|feature| std::env::var_os(format!("CARGO_FEATURE_{feature}")).is_some())
-    {
-        println!("cargo:rustc-cfg=background_workers");
-    }
 
     // Only run gRPC codegen when the "grpc" feature is enabled.
     // Cargo sets CARGO_FEATURE_GRPC when compiling with --features grpc.
@@ -177,7 +162,7 @@ fn emit_migration_inventory() {
 
 fn emit_dialect(generated: &mut String, name: &str, dialect: Dialect, inventory: &Inventory) {
     match dialect {
-        Dialect::Sqlite => generated.push_str("#[cfg(any(feature = \"sqlite\", all(feature = \"workers-rs\", target_arch = \"wasm32\")))]\n"),
+        Dialect::Sqlite => generated.push_str("#[cfg(any(feature = \"sqlite\", all(feature = \"cloudflare-workers\", target_arch = \"wasm32\")))]\n"),
         Dialect::Postgres => generated.push_str("#[cfg(feature = \"postgres\")]\n"),
     }
     generated.push_str("pub(crate) const ");

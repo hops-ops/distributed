@@ -616,7 +616,7 @@ pub(crate) async fn execute_query_with_protocol(
     let plan = plan.clone();
     let runtime = inner.query_protocol.clone();
     let statement_timeout = inner.statement_timeout;
-    #[cfg(feature = "gateway-delivery")]
+    #[cfg(feature = "gateway")]
     let gateway_versions = inner.gateway_versions.clone();
     match pool {
         #[cfg(feature = "sqlite")]
@@ -627,10 +627,10 @@ pub(crate) async fn execute_query_with_protocol(
                 let plan = plan.clone();
                 let runtime = runtime.clone();
                 let live_resume = live_resume.clone();
-                #[cfg(feature = "gateway-delivery")]
+                #[cfg(feature = "gateway")]
                 let gateway_versions = gateway_versions.clone();
                 Box::pin(async move {
-                    #[cfg(feature = "gateway-delivery")]
+                    #[cfg(feature = "gateway")]
                     if let Some(store) = &gateway_versions {
                         store.record_result();
                     }
@@ -647,7 +647,7 @@ pub(crate) async fn execute_query_with_protocol(
                         live_resume,
                     )
                     .await?;
-                    #[cfg(feature = "gateway-delivery")]
+                    #[cfg(feature = "gateway")]
                     if accumulator.gateway_enabled() {
                         if let Some(store) = &gateway_versions {
                             if store.covers(&plan.tables_touched) {
@@ -677,7 +677,7 @@ pub(crate) async fn execute_query_with_protocol(
                 let plan = plan.clone();
                 let runtime = runtime.clone();
                 let live_resume = live_resume.clone();
-                #[cfg(feature = "gateway-delivery")]
+                #[cfg(feature = "gateway")]
                 let gateway_versions = gateway_versions.clone();
                 Box::pin(async move {
                     let timeout_ms =
@@ -693,7 +693,7 @@ pub(crate) async fn execute_query_with_protocol(
                     execute::ensure_primary_backend(connection, primary)
                         .await
                         .map_err(query_execution_error)?;
-                    #[cfg(feature = "gateway-delivery")]
+                    #[cfg(feature = "gateway")]
                     if let Some(store) = &gateway_versions {
                         store.record_result();
                     }
@@ -710,7 +710,7 @@ pub(crate) async fn execute_query_with_protocol(
                         live_resume,
                     )
                     .await?;
-                    #[cfg(feature = "gateway-delivery")]
+                    #[cfg(feature = "gateway")]
                     if accumulator.gateway_enabled() {
                         if let Some(store) = &gateway_versions {
                             if store.covers(&plan.tables_touched) {

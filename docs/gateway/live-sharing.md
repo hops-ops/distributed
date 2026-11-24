@@ -1,6 +1,6 @@
 # Shared live GraphQL
 
-Enable `gateway-graphql-native,gateway-delivery`, select `live_sharing` on the
+Enable `gateway-graphql-native`, select `live_sharing` on the
 GraphQL declaration, and bind `NativeDelivery::live(LiveLimits::default())`.
 Snapshot caching, concurrent queries and live sharing can be selected separately
 with `NativeDeliveryOptions`. The origin needs the authenticated delivery control

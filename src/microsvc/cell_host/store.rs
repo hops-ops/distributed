@@ -5,13 +5,13 @@
 
 use std::future::Future;
 use std::sync::Arc;
-#[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
+#[cfg(not(all(feature = "cloudflare-workers", target_arch = "wasm32")))]
 use std::sync::Mutex;
 
-#[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
+#[cfg(not(all(feature = "cloudflare-workers", target_arch = "wasm32")))]
 use serde_json::Value;
 
-#[cfg(all(feature = "workers-rs", target_arch = "wasm32"))]
+#[cfg(all(feature = "cloudflare-workers", target_arch = "wasm32"))]
 use super::sql_store::CellSqlRepository;
 use crate::command_ledger::{
     AttemptFence, CausalCommitBatch, CausalGetStream, CausalRepositoryIdentity,
@@ -20,25 +20,25 @@ use crate::command_ledger::{
     ExternalCommandCompletion, ReservationOutcome,
 };
 use crate::entity::Entity;
-#[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
+#[cfg(not(all(feature = "cloudflare-workers", target_arch = "wasm32")))]
 use crate::entity::EventRecord;
 use crate::microsvc::HasOutboxStore;
-#[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
+#[cfg(not(all(feature = "cloudflare-workers", target_arch = "wasm32")))]
 use crate::outbox::OutboxMessage;
-#[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
+#[cfg(not(all(feature = "cloudflare-workers", target_arch = "wasm32")))]
 use crate::repository::{validate_commit_batch, PreparedEventAppend};
 use crate::repository::{
     CommitBatch, GetStream, RepositoryError, SnapshotStore, SnapshotWrite, StreamIdentity,
     TransactionalCommit,
 };
 use crate::snapshot::SnapshotRecord;
-#[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
+#[cfg(not(all(feature = "cloudflare-workers", target_arch = "wasm32")))]
 use crate::InMemoryRepository;
-#[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
+#[cfg(not(all(feature = "cloudflare-workers", target_arch = "wasm32")))]
 type CellRepository = InMemoryRepository;
-#[cfg(all(feature = "workers-rs", target_arch = "wasm32"))]
+#[cfg(all(feature = "cloudflare-workers", target_arch = "wasm32"))]
 type CellRepository = CellSqlRepository;
-#[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
+#[cfg(not(all(feature = "cloudflare-workers", target_arch = "wasm32")))]
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone)]
@@ -55,7 +55,7 @@ enum CellOwnership {
 
 /// One stream's event records in a native restart-test export.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
+#[cfg(not(all(feature = "cloudflare-workers", target_arch = "wasm32")))]
 pub struct DurableCellEvents {
     pub stream: String,
     pub events: Vec<EventRecord>,
@@ -63,7 +63,7 @@ pub struct DurableCellEvents {
 
 /// Snapshot cache record in a native restart-test export.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
+#[cfg(not(all(feature = "cloudflare-workers", target_arch = "wasm32")))]
 pub struct DurableCellSnapshot {
     pub stream: String,
     pub aggregate_type: String,
@@ -77,7 +77,7 @@ pub struct DurableCellSnapshot {
 
 /// One versioned command-ledger row in a native restart-test export.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
+#[cfg(not(all(feature = "cloudflare-workers", target_arch = "wasm32")))]
 pub struct DurableCellCommand {
     pub id: String,
     pub body: String,
@@ -87,7 +87,7 @@ pub struct DurableCellCommand {
 /// events (native hosts). Receives the current row and the event appends of
 /// the commit; `Ok(Some(row))` replaces the row, `Ok(None)` keeps it, and an
 /// error rolls the whole command back.
-#[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
+#[cfg(not(all(feature = "cloudflare-workers", target_arch = "wasm32")))]
 pub type SealedRowReducer = Arc<
     dyn Fn(Option<&Value>, &[PreparedEventAppend<'_>]) -> Result<Option<Value>, RepositoryError>
         + Send
@@ -95,14 +95,14 @@ pub type SealedRowReducer = Arc<
 >;
 
 /// Current native restart-test export version.
-#[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
+#[cfg(not(all(feature = "cloudflare-workers", target_arch = "wasm32")))]
 pub const DURABLE_AGGREGATE_CELL_STATE_VERSION: u16 = 1;
 
 /// Export of the native in-process reference host for restart conformance tests.
 /// This is not a production cell persistence API; Workers use SQLite rows.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-#[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
+#[cfg(not(all(feature = "cloudflare-workers", target_arch = "wasm32")))]
 pub struct DurableAggregateCellState {
     pub version: u16,
     pub events: Vec<DurableCellEvents>,
@@ -135,18 +135,18 @@ pub struct CellStreamStore {
     inner: CellRepository,
     /// Resolves relative alarm due times at commit and drives alarm firing.
     clock: Arc<dyn crate::Clock>,
-    #[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
+    #[cfg(not(all(feature = "cloudflare-workers", target_arch = "wasm32")))]
     sealed_row: Arc<Mutex<Option<Value>>>,
-    #[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
+    #[cfg(not(all(feature = "cloudflare-workers", target_arch = "wasm32")))]
     sealed_row_reducer: Option<SealedRowReducer>,
     /// Reference-host alarm table (SQL cells keep alarms in their database).
-    #[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
+    #[cfg(not(all(feature = "cloudflare-workers", target_arch = "wasm32")))]
     alarms: Arc<Mutex<super::alarm::MemorySchedules>>,
 }
 
 impl CellStreamStore {
     /// Open this runtime-owned SQLite database; no storage export callback exists.
-    #[cfg(all(feature = "workers-rs", target_arch = "wasm32"))]
+    #[cfg(all(feature = "cloudflare-workers", target_arch = "wasm32"))]
     pub fn from_state(
         state: worker::State,
         identity: StreamIdentity,
@@ -160,7 +160,7 @@ impl CellStreamStore {
 
     /// Open a parent-shard SQL cell. All owned sibling streams share this one
     /// database; the predicate never grants access to another cell's storage.
-    #[cfg(all(feature = "workers-rs", target_arch = "wasm32"))]
+    #[cfg(all(feature = "cloudflare-workers", target_arch = "wasm32"))]
     pub fn from_parent_state(
         state: worker::State,
         parent_type: impl Into<String>,
@@ -178,7 +178,7 @@ impl CellStreamStore {
     }
 
     /// Bind a store to one exact stream identity.
-    #[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
+    #[cfg(not(all(feature = "cloudflare-workers", target_arch = "wasm32")))]
     pub fn for_identity(identity: StreamIdentity) -> Self {
         Self::native(CellOwnership::Exclusive(identity), memory_repository())
     }
@@ -187,7 +187,7 @@ impl CellStreamStore {
     ///
     /// Child streams of any aggregate type live in this cell's SQLite. A
     /// transaction across two parent cells does not exist.
-    #[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
+    #[cfg(not(all(feature = "cloudflare-workers", target_arch = "wasm32")))]
     pub fn for_parent_shard(
         parent_type: impl Into<String>,
         parent_id: impl Into<String>,
@@ -202,7 +202,7 @@ impl CellStreamStore {
         ))
     }
 
-    #[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
+    #[cfg(not(all(feature = "cloudflare-workers", target_arch = "wasm32")))]
     fn native(ownership: CellOwnership, inner: CellRepository) -> Self {
         Self {
             ownership,
@@ -217,7 +217,7 @@ impl CellStreamStore {
     /// Maintain the sealed read-model row from each commit's events, inside
     /// the command's transaction (SQLite cells) or alongside its in-memory
     /// commit (reference host). A reducer error rejects the command.
-    #[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
+    #[cfg(not(all(feature = "cloudflare-workers", target_arch = "wasm32")))]
     pub fn with_sealed_row_reducer(
         mut self,
         reducer: impl Fn(Option<&Value>, &[PreparedEventAppend<'_>]) -> Result<Option<Value>, RepositoryError>
@@ -231,14 +231,14 @@ impl CellStreamStore {
     }
 
     /// The in-process reference repository backing whole-state export.
-    #[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
+    #[cfg(not(all(feature = "cloudflare-workers", target_arch = "wasm32")))]
     fn memory(&self) -> Result<&InMemoryRepository, RepositoryError> {
         Ok(&self.inner)
     }
 
     /// Reference-host sealed-row reduction. SQLite cells reduce inside their
     /// commit transaction instead, so this returns `None` for them.
-    #[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
+    #[cfg(not(all(feature = "cloudflare-workers", target_arch = "wasm32")))]
     fn reduce_memory_sealed_row(
         &self,
         batch: &CommitBatch<'_>,
@@ -258,7 +258,7 @@ impl CellStreamStore {
     }
 
     /// Named exclusive-cell constructor used by [`super::AggregateCell`].
-    #[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
+    #[cfg(not(all(feature = "cloudflare-workers", target_arch = "wasm32")))]
     pub fn new(
         aggregate_type: impl Into<String>,
         shard_id: impl Into<String>,
@@ -316,7 +316,7 @@ impl CellStreamStore {
     }
 
     /// Sealed read-model row for GET on this cell instance.
-    #[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
+    #[cfg(not(all(feature = "cloudflare-workers", target_arch = "wasm32")))]
     pub fn sealed_row(&self) -> Result<Option<Value>, RepositoryError> {
         self.sealed_row
             .lock()
@@ -325,7 +325,7 @@ impl CellStreamStore {
     }
 
     /// Replace the sealed read-model row (Atomic board / Todo view).
-    #[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
+    #[cfg(not(all(feature = "cloudflare-workers", target_arch = "wasm32")))]
     pub fn replace_sealed_row(&self, row: Value) -> Result<(), RepositoryError> {
         let mut guard = self
             .sealed_row
@@ -336,7 +336,7 @@ impl CellStreamStore {
     }
 
     /// Event log for Durable Object SQLite. Memory remains the working copy.
-    #[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
+    #[cfg(not(all(feature = "cloudflare-workers", target_arch = "wasm32")))]
     pub fn durable_events(&self) -> Result<Vec<DurableCellEvents>, RepositoryError> {
         Ok(self
             .memory()?
@@ -347,13 +347,13 @@ impl CellStreamStore {
     }
 
     /// Outbox rows committed with this cell's events (same private SQLite).
-    #[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
+    #[cfg(not(all(feature = "cloudflare-workers", target_arch = "wasm32")))]
     pub fn durable_outbox(&self) -> Result<Vec<OutboxMessage>, RepositoryError> {
         self.memory()?.clone_outbox()
     }
 
     /// Restore outbox rows from Durable Object SQLite.
-    #[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
+    #[cfg(not(all(feature = "cloudflare-workers", target_arch = "wasm32")))]
     pub fn restore_durable_outbox(
         &self,
         messages: Vec<OutboxMessage>,
@@ -362,7 +362,7 @@ impl CellStreamStore {
     }
 
     /// Replace the working event log from Durable Object SQLite.
-    #[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
+    #[cfg(not(all(feature = "cloudflare-workers", target_arch = "wasm32")))]
     pub fn restore_durable_events(
         &self,
         events: Vec<DurableCellEvents>,
@@ -376,7 +376,7 @@ impl CellStreamStore {
     }
 
     /// Snapshot cache for Durable Object SQLite.
-    #[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
+    #[cfg(not(all(feature = "cloudflare-workers", target_arch = "wasm32")))]
     pub fn durable_snapshots(&self) -> Result<Vec<DurableCellSnapshot>, RepositoryError> {
         Ok(self
             .memory()?
@@ -396,7 +396,7 @@ impl CellStreamStore {
     }
 
     /// Replace the working snapshot cache from Durable Object SQLite.
-    #[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
+    #[cfg(not(all(feature = "cloudflare-workers", target_arch = "wasm32")))]
     pub fn restore_durable_snapshots(
         &self,
         snapshots: Vec<DurableCellSnapshot>,
@@ -425,7 +425,7 @@ impl CellStreamStore {
     }
 
     /// Fenced command rows committed with this cell's domain effects.
-    #[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
+    #[cfg(not(all(feature = "cloudflare-workers", target_arch = "wasm32")))]
     pub fn durable_commands(&self) -> Result<Vec<DurableCellCommand>, RepositoryError> {
         self.memory()?
             .clone_command_ledger()?
@@ -441,7 +441,7 @@ impl CellStreamStore {
     }
 
     /// Restore the complete command ledger before accepting another request.
-    #[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
+    #[cfg(not(all(feature = "cloudflare-workers", target_arch = "wasm32")))]
     pub fn restore_durable_commands(
         &self,
         commands: Vec<DurableCellCommand>,
@@ -462,7 +462,7 @@ impl CellStreamStore {
     }
 
     /// Export every durable concern as one versioned persistence envelope.
-    #[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
+    #[cfg(not(all(feature = "cloudflare-workers", target_arch = "wasm32")))]
     pub fn durable_state(&self) -> Result<DurableAggregateCellState, RepositoryError> {
         Ok(DurableAggregateCellState {
             version: DURABLE_AGGREGATE_CELL_STATE_VERSION,
@@ -476,7 +476,7 @@ impl CellStreamStore {
     }
 
     /// Replace the complete working copy from one persisted envelope.
-    #[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
+    #[cfg(not(all(feature = "cloudflare-workers", target_arch = "wasm32")))]
     pub fn restore_durable_state(
         &self,
         state: DurableAggregateCellState,
@@ -503,7 +503,7 @@ impl CellStreamStore {
         Ok(())
     }
 
-    #[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
+    #[cfg(not(all(feature = "cloudflare-workers", target_arch = "wasm32")))]
     fn lock_alarms(
         &self,
     ) -> Result<std::sync::MutexGuard<'_, super::alarm::MemorySchedules>, RepositoryError> {
@@ -514,25 +514,25 @@ impl CellStreamStore {
 
     /// The SQL database holding alarms (the Durable Object's); `None` on
     /// the reference host, which keeps them in memory.
-    #[cfg(all(feature = "workers-rs", target_arch = "wasm32"))]
+    #[cfg(all(feature = "cloudflare-workers", target_arch = "wasm32"))]
     fn alarm_sql(&self) -> Option<&super::sql_store::CellSqlRepository> {
         Some(&self.inner)
     }
 
-    #[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
+    #[cfg(not(all(feature = "cloudflare-workers", target_arch = "wasm32")))]
     fn alarm_sql(&self) -> Option<&std::convert::Infallible> {
         None
     }
 
     /// Armed alarms, earliest first.
     pub fn armed_schedules(&self) -> Result<Vec<super::ArmedSchedule>, RepositoryError> {
-        #[cfg(all(feature = "workers-rs", target_arch = "wasm32"))]
+        #[cfg(all(feature = "cloudflare-workers", target_arch = "wasm32"))]
         if let Some(sql) = self.alarm_sql() {
             return sql.armed_alarms();
         }
-        #[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
+        #[cfg(not(all(feature = "cloudflare-workers", target_arch = "wasm32")))]
         return Ok(self.lock_alarms()?.armed());
-        #[cfg(all(feature = "workers-rs", target_arch = "wasm32"))]
+        #[cfg(all(feature = "cloudflare-workers", target_arch = "wasm32"))]
         Ok(Vec::new())
     }
 
@@ -542,25 +542,25 @@ impl CellStreamStore {
         now_ms: i64,
         limit: usize,
     ) -> Result<Vec<super::ArmedSchedule>, RepositoryError> {
-        #[cfg(all(feature = "workers-rs", target_arch = "wasm32"))]
+        #[cfg(all(feature = "cloudflare-workers", target_arch = "wasm32"))]
         if let Some(sql) = self.alarm_sql() {
             return sql.due_alarms(now_ms, limit);
         }
-        #[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
+        #[cfg(not(all(feature = "cloudflare-workers", target_arch = "wasm32")))]
         return Ok(self.lock_alarms()?.due(now_ms, limit));
-        #[cfg(all(feature = "workers-rs", target_arch = "wasm32"))]
+        #[cfg(all(feature = "cloudflare-workers", target_arch = "wasm32"))]
         Ok(Vec::new())
     }
 
     /// Due time (epoch ms) of the earliest armed alarm.
     pub(super) fn next_alarm_due_ms(&self) -> Result<Option<i64>, RepositoryError> {
-        #[cfg(all(feature = "workers-rs", target_arch = "wasm32"))]
+        #[cfg(all(feature = "cloudflare-workers", target_arch = "wasm32"))]
         if let Some(sql) = self.alarm_sql() {
             return sql.next_alarm_due_ms();
         }
-        #[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
+        #[cfg(not(all(feature = "cloudflare-workers", target_arch = "wasm32")))]
         return Ok(self.lock_alarms()?.next_due_ms());
-        #[cfg(all(feature = "workers-rs", target_arch = "wasm32"))]
+        #[cfg(all(feature = "cloudflare-workers", target_arch = "wasm32"))]
         Ok(None)
     }
 
@@ -570,18 +570,18 @@ impl CellStreamStore {
         generation: u64,
         settlement: &super::alarm::ScheduleSettlement,
     ) -> Result<(), RepositoryError> {
-        #[cfg(all(feature = "workers-rs", target_arch = "wasm32"))]
+        #[cfg(all(feature = "cloudflare-workers", target_arch = "wasm32"))]
         if let Some(sql) = self.alarm_sql() {
             return sql.settle_alarm(name, generation, settlement);
         }
-        #[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
+        #[cfg(not(all(feature = "cloudflare-workers", target_arch = "wasm32")))]
         self.lock_alarms()?.settle(name, generation, settlement);
         Ok(())
     }
 
     /// Reference host: validate and plan alarm writes before the commit so a
     /// rejected plan aborts it; install the plan only after the commit.
-    #[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
+    #[cfg(not(all(feature = "cloudflare-workers", target_arch = "wasm32")))]
     fn plan_memory_alarms(
         &self,
         batch: &mut CommitBatch<'_>,
@@ -594,7 +594,7 @@ impl CellStreamStore {
         self.lock_alarms()?.plan(&writes).map(Some)
     }
 
-    #[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
+    #[cfg(not(all(feature = "cloudflare-workers", target_arch = "wasm32")))]
     fn install_memory_alarms(
         &self,
         planned: Option<super::alarm::MemorySchedules>,
@@ -780,16 +780,16 @@ impl TransactionalCommit for CellStreamStore {
             self.ensure_batch(&batch)?;
             crate::schedule::schedule_owner(&batch)?;
             super::alarm::resolve_schedule_writes(&mut batch.schedules, self.clock.now())?;
-            #[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
+            #[cfg(not(all(feature = "cloudflare-workers", target_arch = "wasm32")))]
             let sealed = self.reduce_memory_sealed_row(&batch)?;
-            #[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
+            #[cfg(not(all(feature = "cloudflare-workers", target_arch = "wasm32")))]
             let alarms = self.plan_memory_alarms(&mut batch)?;
             TransactionalCommit::commit_batch(&self.inner, batch).await?;
-            #[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
+            #[cfg(not(all(feature = "cloudflare-workers", target_arch = "wasm32")))]
             if let Some(row) = sealed {
                 self.replace_sealed_row(row)?;
             }
-            #[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
+            #[cfg(not(all(feature = "cloudflare-workers", target_arch = "wasm32")))]
             self.install_memory_alarms(alarms)?;
             Ok(())
         }
@@ -808,22 +808,22 @@ impl CausalTransactionalCommit for CellStreamStore {
             crate::schedule::schedule_owner(&batch.domain).map_err(CommandLedgerError::Storage)?;
             super::alarm::resolve_schedule_writes(&mut batch.domain.schedules, self.clock.now())
                 .map_err(CommandLedgerError::Storage)?;
-            #[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
+            #[cfg(not(all(feature = "cloudflare-workers", target_arch = "wasm32")))]
             let sealed = self
                 .reduce_memory_sealed_row(&batch.domain)
                 .map_err(CommandLedgerError::Storage)?;
-            #[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
+            #[cfg(not(all(feature = "cloudflare-workers", target_arch = "wasm32")))]
             let alarms = self
                 .plan_memory_alarms(&mut batch.domain)
                 .map_err(CommandLedgerError::Storage)?;
             let completion =
                 CausalTransactionalCommit::commit_causal_batch(&self.inner, batch).await?;
-            #[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
+            #[cfg(not(all(feature = "cloudflare-workers", target_arch = "wasm32")))]
             if let Some(row) = sealed {
                 self.replace_sealed_row(row)
                     .map_err(CommandLedgerError::Storage)?;
             }
-            #[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
+            #[cfg(not(all(feature = "cloudflare-workers", target_arch = "wasm32")))]
             self.install_memory_alarms(alarms)
                 .map_err(CommandLedgerError::Storage)?;
             Ok(completion)
@@ -832,9 +832,9 @@ impl CausalTransactionalCommit for CellStreamStore {
 }
 
 impl HasOutboxStore for CellStreamStore {
-    #[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
+    #[cfg(not(all(feature = "cloudflare-workers", target_arch = "wasm32")))]
     type OutboxStore = crate::InMemoryOutboxStore;
-    #[cfg(all(feature = "workers-rs", target_arch = "wasm32"))]
+    #[cfg(all(feature = "cloudflare-workers", target_arch = "wasm32"))]
     type OutboxStore = super::sql_store::CellSqlOutboxStore;
 
     fn outbox_store(&self) -> Self::OutboxStore {
@@ -857,7 +857,7 @@ impl crate::microsvc::dependencies::CausalHostProjections for CellStreamStore {
     }
 }
 
-#[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
+#[cfg(not(all(feature = "cloudflare-workers", target_arch = "wasm32")))]
 fn memory_repository() -> CellRepository {
     InMemoryRepository::new()
 }

@@ -56,7 +56,7 @@ pub use handlers::{
 };
 pub use invoke::{invoke_transition, load_for_command, require_loaded, CommandLoad};
 pub(crate) use routes::DynBusPublisher;
-#[cfg(background_workers)]
+#[cfg(feature = "runtime-tokio")]
 pub(crate) use routes::LedgerCompaction;
 pub use routes::{
     DeliveryKind, EventRouteBuilder, HandlerNames, HandlerSpec, PortableCommand, Routes,

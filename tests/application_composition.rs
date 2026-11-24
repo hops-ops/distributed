@@ -4,7 +4,7 @@ use std::sync::Arc;
 use distributed::application::{
     admit_command_session, command_roles_require_principal, Application, ApplicationExtension,
     CommandDefinition, CommandMount, CommandSpec, CommandTypeField, CommandTypeSpec,
-    ContractCompiler, Module, ProjectionSpec, Runtime, RuntimeDialect, SurfaceSpec,
+    ContractCompiler, Module, ProjectionSpec, SurfaceSpec,
 };
 use distributed::command::{typed_command, CommandConsistency, Succeeded};
 use distributed::graphql::{
@@ -849,103 +849,6 @@ fn module_commands_only_keeps_command_identity() {
 }
 
 #[test]
-fn runtime_from_url_selects_dialect_and_workers() {
-    let module = Module::new("todo")
-        .command_definitions([definition("todo.create")])
-        .build()
-        .unwrap();
-    let sqlite = Runtime::from_database_url("sqlite:./app.db")
-        .unwrap()
-        .mount(module.clone());
-    assert_eq!(sqlite.dialect(), RuntimeDialect::Sqlite);
-    assert!(sqlite.starts_outbox());
-    assert!(!sqlite.starts_projector_consumer());
-    let postgres = Runtime::from_database_url("postgres://localhost/app").unwrap();
-    assert_eq!(postgres.dialect(), RuntimeDialect::Postgres);
-}
-
-#[test]
-fn runtime_rejects_atomic_without_seal() {
-    let mut command = command("blob.move");
-    command.consistency = CommandConsistency::Atomic;
-    command.fingerprint = distributed::application::sha256_fingerprint(
-        &command.canonical_bytes().expect("command bytes"),
-    );
-    let module = Module::new("blob")
-        .command_definitions([CommandDefinition::contract(command)])
-        .build()
-        .unwrap();
-    let runtime = Runtime::from_database_url("sqlite::memory:")
-        .unwrap()
-        .mount(module);
-    let error = runtime.validate().expect_err("atomic without seal");
-    assert!(error.to_string().contains("Atomic"));
-}
-
-#[test]
-fn runtime_rejects_atomic_with_unrelated_direct_projection() {
-    let mut command = command("blob.move");
-    command.consistency = CommandConsistency::Atomic;
-    command.projected_model = Some("BlobGames".into());
-    command.fingerprint = distributed::application::sha256_fingerprint(
-        &command.canonical_bytes().expect("command bytes"),
-    );
-    let blob = Module::new("blob")
-        .command_definitions([CommandDefinition::contract(command)])
-        .build()
-        .unwrap();
-    let projection = ProjectionSpec::try_new("project_todos", ["todo.created"], ["TodoView"])
-        .unwrap()
-        .with_direct(true)
-        .unwrap();
-    let todos = Module::new("todo").projection(projection).build().unwrap();
-    let error = Runtime::from_database_url("sqlite::memory:")
-        .unwrap()
-        .mount(blob)
-        .mount(todos)
-        .validate()
-        .expect_err("unrelated seal must not satisfy Atomic");
-    assert!(
-        error.to_string().contains("Atomic") || error.to_string().contains("direct"),
-        "{error}"
-    );
-}
-
-#[test]
-fn runtime_from_database_url_rejects_unsupported_schemes() {
-    let error =
-        Runtime::from_database_url("mysql://localhost/app").expect_err("unsupported scheme");
-    assert!(error.to_string().contains("unsupported"), "{error}");
-}
-
-#[test]
-fn runtime_route_for_prefers_longest_wildcard() {
-    let runtime = Runtime::from_database_url("sqlite::memory:")
-        .unwrap()
-        .dispatch_route("todo.*", "http://todo")
-        .dispatch_route("todo.admin.*", "http://todo-admin");
-    assert_eq!(
-        runtime.route_for("todo.admin.delete"),
-        Some("http://todo-admin")
-    );
-    assert_eq!(runtime.route_for("todo.create"), Some("http://todo"));
-}
-
-#[test]
-fn runtime_rejects_direct_seal_without_atomic_commands() {
-    let projection = ProjectionSpec::try_new("project_blob", ["blob.moved"], ["BlobGames"])
-        .unwrap()
-        .with_direct(true)
-        .unwrap();
-    let module = Module::new("blob").projection(projection).build().unwrap();
-    let runtime = Runtime::from_database_url("sqlite::memory:")
-        .unwrap()
-        .mount(module);
-    let error = runtime.validate().expect_err("seal without commands");
-    assert!(error.to_string().contains("direct projection"));
-}
-
-#[test]
 fn roles_are_admission_without_a_second_guard() {
     let roles = vec!["user".into(), "admin".into()];
     assert!(command_roles_require_principal(&roles));
@@ -1196,17 +1099,6 @@ fn attach_todo_and_chat_command_optimism(
 }
 
 #[test]
-fn explicit_dispatch_route_map() {
-    let runtime = Runtime::from_database_url("sqlite::memory:")
-        .unwrap()
-        .graphql()
-        .dispatch_route("todo.*", "http://commands");
-    assert_eq!(runtime.route_for("todo.create"), Some("http://commands"));
-    assert!(runtime.starts_graphql());
-    assert!(!runtime.starts_outbox());
-}
-
-#[test]
 fn application_surface_must_expose_a_schema_role() {
     let mut surface =
         distributed::application::SurfaceSpec::from_surface("web", &selected_surface()).unwrap();
@@ -1217,4 +1109,40 @@ fn application_surface_must_expose_a_schema_role() {
     let error = Application::try_new("role-owner", [], [surface])
         .expect_err("application surfaces without schema roles must fail closed");
     assert!(error.to_string().contains("schema role"));
+}
+
+/// The gateway's physical bindings (origins, hosts) are deployment detail:
+/// declaring the same gateway over different backends keeps the application
+/// identity, and none of the physical values leak into it.
+#[cfg(feature = "gateway")]
+#[test]
+fn gateway_physical_bindings_do_not_rewrite_application_identity() {
+    use distributed::gateway::{Binding, BindingKind, Gateway, GatewayConfig, Route, RoutePath};
+    fn ui(origin: &str) -> Gateway {
+        GatewayConfig {
+            bindings: vec![Binding::new(
+                "ui",
+                BindingKind::UiProxy {
+                    origin: origin.into(),
+                },
+            )],
+            routes: vec![Route::new("ui", RoutePath::prefix("/"), "ui")],
+        }
+        .build()
+        .unwrap()
+    }
+    let a = Application::new("site")
+        .build()
+        .unwrap()
+        .with_gateway("public", &ui("http://a.internal:3000"))
+        .unwrap();
+    let b = Application::new("site")
+        .build()
+        .unwrap()
+        .with_gateway("public", &ui("http://b.internal:4000"))
+        .unwrap();
+    assert_eq!(a.canonical_bytes().unwrap(), b.canonical_bytes().unwrap());
+    assert!(!String::from_utf8(a.canonical_bytes().unwrap())
+        .unwrap()
+        .contains("internal"));
 }

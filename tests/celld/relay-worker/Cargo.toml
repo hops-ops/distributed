@@ -14,7 +14,7 @@ crate-type = ["cdylib"]
 
 [dependencies]
 console_error_panic_hook = "0.1"
-distributed = { path = "../../..", default-features = false, features = ["workers-rs"] }
+distributed = { path = "../../..", default-features = false, features = ["cloudflare-workers"] }
 worker = { version = "0.8", features = ["queue"] }
 
 [package.metadata.wasm-pack.profile.release]

@@ -4,10 +4,20 @@ mod inbox;
 #[cfg(any(
     feature = "sqlite",
     feature = "postgres",
-    all(feature = "workers-rs", target_arch = "wasm32")
+    all(feature = "cloudflare-workers", target_arch = "wasm32")
 ))]
 pub(crate) mod migrations;
+#[cfg(any(
+    feature = "sqlite",
+    feature = "postgres",
+    all(feature = "cloudflare-workers", target_arch = "wasm32")
+))]
 pub(crate) mod sql;
+#[cfg(any(
+    feature = "sqlite",
+    feature = "postgres",
+    all(feature = "cloudflare-workers", target_arch = "wasm32")
+))]
 pub(crate) mod sqlite_codec;
 mod traits;
 mod validation;

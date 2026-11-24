@@ -9,7 +9,7 @@ use serde_json::Value;
 use super::alarm::{ArmedSchedule, ScheduleFireReport, ScheduleSettlement};
 use super::causal::CellCommandIdentity;
 use super::store::CellStreamStore;
-#[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
+#[cfg(not(all(feature = "cloudflare-workers", target_arch = "wasm32")))]
 use super::store::{
     DurableAggregateCellState, DurableCellCommand, DurableCellEvents, DurableCellSnapshot,
 };
@@ -53,11 +53,11 @@ where
 {
     shard: StreamIdentity,
     routes: Routes<AggregateRepository<CellStreamStore, A>>,
-    #[cfg(feature = "workers-rs")]
+    #[cfg(feature = "cloudflare-workers")]
     celld_outbox: Option<super::celld_outbox::CelldOutbox>,
-    #[cfg(all(feature = "workers-rs", any(target_arch = "wasm32", test)))]
+    #[cfg(all(feature = "cloudflare-workers", any(target_arch = "wasm32", test)))]
     activity: super::celld_outbox::CommandActivity,
-    #[cfg(all(feature = "workers-rs", target_arch = "wasm32"))]
+    #[cfg(all(feature = "cloudflare-workers", target_arch = "wasm32"))]
     storage: worker::send::SendWrapper<worker::Storage>,
 }
 
@@ -66,23 +66,23 @@ where
     A: Aggregate + Send + Sync + 'static,
 {
     /// Open a cell instance addressed as `{aggregate_type}:{shard_id}`.
-    #[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
+    #[cfg(not(all(feature = "cloudflare-workers", target_arch = "wasm32")))]
     pub fn new(shard_id: impl Into<String>) -> Result<Self, RepositoryError> {
         let shard = StreamIdentity::new(A::aggregate_type(), shard_id.into())?;
         let store = CellStreamStore::for_identity(shard.clone());
         Ok(Self {
             shard,
             routes: Routes::from_dependencies(AggregateRepository::new(store)),
-            #[cfg(feature = "workers-rs")]
+            #[cfg(feature = "cloudflare-workers")]
             celld_outbox: None,
-            #[cfg(all(feature = "workers-rs", any(target_arch = "wasm32", test)))]
+            #[cfg(all(feature = "cloudflare-workers", any(target_arch = "wasm32", test)))]
             activity: Default::default(),
         })
     }
 
     /// Host a prepared exclusive store (for example a SQLite cell configured
     /// with [`CellStreamStore::with_sealed_row_reducer`]).
-    #[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
+    #[cfg(not(all(feature = "cloudflare-workers", target_arch = "wasm32")))]
     pub fn from_store(store: CellStreamStore) -> Result<Self, RepositoryError> {
         let shard = Self::store_shard(&store)?;
         Ok(Self::from_repository(
@@ -91,7 +91,7 @@ where
         ))
     }
 
-    #[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
+    #[cfg(not(all(feature = "cloudflare-workers", target_arch = "wasm32")))]
     fn store_shard(store: &CellStreamStore) -> Result<StreamIdentity, RepositoryError> {
         match store.identity() {
             Some(identity) if identity.aggregate_type() == A::aggregate_type() => {
@@ -107,7 +107,7 @@ where
         }
     }
 
-    #[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
+    #[cfg(not(all(feature = "cloudflare-workers", target_arch = "wasm32")))]
     fn from_repository(
         shard: StreamIdentity,
         repository: AggregateRepository<CellStreamStore, A>,
@@ -115,9 +115,9 @@ where
         Self {
             shard,
             routes: Routes::from_dependencies(repository),
-            #[cfg(feature = "workers-rs")]
+            #[cfg(feature = "cloudflare-workers")]
             celld_outbox: None,
-            #[cfg(all(feature = "workers-rs", any(target_arch = "wasm32", test)))]
+            #[cfg(all(feature = "cloudflare-workers", any(target_arch = "wasm32", test)))]
             activity: Default::default(),
         }
     }
@@ -131,7 +131,7 @@ where
     /// released (or failed after `max_attempts`) for the next pass. A crash
     /// between publish and delete re-delivers the same stable message id, so
     /// delivery is at-least-once and consumers must deduplicate.
-    #[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
+    #[cfg(not(all(feature = "cloudflare-workers", target_arch = "wasm32")))]
     pub async fn drain_outbox_with<P>(
         &self,
         publisher: P,
@@ -154,7 +154,7 @@ where
 
     /// Open the named runtime-owned SQLite cell. Mount commands and configure
     /// its Queue binding before dispatch; no in-memory persistence path exists.
-    #[cfg(all(feature = "workers-rs", target_arch = "wasm32"))]
+    #[cfg(all(feature = "cloudflare-workers", target_arch = "wasm32"))]
     pub fn from_state(state: worker::State) -> Result<Self, RepositoryError> {
         let name = state.id().name().ok_or_else(|| {
             RepositoryError::Model("aggregate cells require a named Durable Object".into())
@@ -217,7 +217,7 @@ where
         input: Value,
         session: Session,
     ) -> Result<CausalDispatchResult, CausalDispatchError> {
-        #[cfg(all(feature = "workers-rs", target_arch = "wasm32"))]
+        #[cfg(all(feature = "cloudflare-workers", target_arch = "wasm32"))]
         let _command = self
             .begin_command()
             .await
@@ -226,7 +226,7 @@ where
             .routes
             .dispatch_cell_causal(command, identity, input, session, &self.shard)
             .await;
-        #[cfg(all(feature = "workers-rs", target_arch = "wasm32"))]
+        #[cfg(all(feature = "cloudflare-workers", target_arch = "wasm32"))]
         self.reschedule_after_command().await;
         result
     }
@@ -248,7 +248,7 @@ where
         if commands.is_empty() {
             return Vec::new();
         }
-        #[cfg(all(feature = "workers-rs", target_arch = "wasm32"))]
+        #[cfg(all(feature = "cloudflare-workers", target_arch = "wasm32"))]
         let _command = match self.begin_command().await {
             Ok(guard) => guard,
             Err(error) => return vec![Err(CausalDispatchError::Internal(error.to_string()))],
@@ -271,7 +271,7 @@ where
                 break;
             }
         }
-        #[cfg(all(feature = "workers-rs", target_arch = "wasm32"))]
+        #[cfg(all(feature = "cloudflare-workers", target_arch = "wasm32"))]
         self.reschedule_after_command().await;
         results
     }
@@ -405,13 +405,13 @@ where
     /// SQLite cells persist rows directly and return an error here; read
     /// history with [`history`](Self::history) /
     /// [`stream_events`](Self::stream_events) instead.
-    #[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
+    #[cfg(not(all(feature = "cloudflare-workers", target_arch = "wasm32")))]
     pub fn durable_events(&self) -> Result<Vec<DurableCellEvents>, RepositoryError> {
         self.routes.repo().repo().durable_events()
     }
 
     /// Restore the working event log from Durable Object SQLite.
-    #[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
+    #[cfg(not(all(feature = "cloudflare-workers", target_arch = "wasm32")))]
     pub fn restore_durable_events(
         &self,
         events: Vec<DurableCellEvents>,
@@ -420,7 +420,7 @@ where
     }
 
     /// Outbox rows committed with the aggregate (same cell SQLite).
-    #[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
+    #[cfg(not(all(feature = "cloudflare-workers", target_arch = "wasm32")))]
     pub fn durable_outbox(&self) -> Result<Vec<crate::OutboxMessage>, RepositoryError> {
         self.routes.repo().repo().durable_outbox()
     }
@@ -462,7 +462,7 @@ where
     }
 
     /// Attach the celld Queue binding and drain policy used by this cell host.
-    #[cfg(feature = "workers-rs")]
+    #[cfg(feature = "cloudflare-workers")]
     pub fn with_celld_outbox(mut self, outbox: super::celld_outbox::CelldOutbox) -> Self {
         self.celld_outbox = Some(outbox);
         self
@@ -471,7 +471,7 @@ where
     /// Drain committed rows to the configured Queue. Call from the alarm handler
     /// and optionally after dispatch for low latency. No persistence callback is
     /// needed. A post-commit drain error must not reject an accepted command.
-    #[cfg(all(feature = "workers-rs", target_arch = "wasm32"))]
+    #[cfg(all(feature = "cloudflare-workers", target_arch = "wasm32"))]
     pub async fn drain_outbox(
         &self,
         env: &worker::Env,
@@ -493,7 +493,7 @@ where
     ///     Response::ok("ok")
     /// }
     /// ```
-    #[cfg(all(feature = "workers-rs", target_arch = "wasm32"))]
+    #[cfg(all(feature = "cloudflare-workers", target_arch = "wasm32"))]
     pub async fn alarm(
         &self,
         env: &worker::Env,
@@ -512,7 +512,7 @@ where
     /// A command may have armed an alarm due before the prearmed watchdog
     /// wake; move the one Durable Object alarm earlier if so. Failure is only
     /// logged: the prearmed watchdog still wakes the cell, which re-plans.
-    #[cfg(all(feature = "workers-rs", target_arch = "wasm32"))]
+    #[cfg(all(feature = "cloudflare-workers", target_arch = "wasm32"))]
     async fn reschedule_after_command(&self) {
         let Ok(outbox) = self.outbox_config() else {
             return;
@@ -537,7 +537,7 @@ where
         }
     }
 
-    #[cfg(all(feature = "workers-rs", target_arch = "wasm32"))]
+    #[cfg(all(feature = "cloudflare-workers", target_arch = "wasm32"))]
     fn outbox_config(
         &self,
     ) -> Result<&super::celld_outbox::CelldOutbox, crate::bus::TransportError> {
@@ -548,7 +548,7 @@ where
         })
     }
 
-    #[cfg(all(feature = "workers-rs", target_arch = "wasm32"))]
+    #[cfg(all(feature = "cloudflare-workers", target_arch = "wasm32"))]
     async fn begin_command(
         &self,
     ) -> Result<super::celld_outbox::CommandGuard, crate::bus::TransportError> {
@@ -563,18 +563,18 @@ where
             .await
     }
 
-    #[cfg(all(feature = "workers-rs", any(target_arch = "wasm32", test)))]
+    #[cfg(all(feature = "cloudflare-workers", any(target_arch = "wasm32", test)))]
     pub(super) fn command_activity(&self) -> &super::celld_outbox::CommandActivity {
         &self.activity
     }
 
-    #[cfg(all(feature = "workers-rs", any(target_arch = "wasm32", test)))]
+    #[cfg(all(feature = "cloudflare-workers", any(target_arch = "wasm32", test)))]
     pub(super) fn outbox_store(&self) -> <CellStreamStore as HasOutboxStore>::OutboxStore {
         self.routes.repo().repo().outbox_store()
     }
 
     /// Restore outbox rows from Durable Object SQLite.
-    #[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
+    #[cfg(not(all(feature = "cloudflare-workers", target_arch = "wasm32")))]
     pub fn restore_durable_outbox(
         &self,
         messages: Vec<crate::OutboxMessage>,
@@ -583,13 +583,13 @@ where
     }
 
     /// Snapshot cache for Durable Object SQLite.
-    #[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
+    #[cfg(not(all(feature = "cloudflare-workers", target_arch = "wasm32")))]
     pub fn durable_snapshots(&self) -> Result<Vec<DurableCellSnapshot>, RepositoryError> {
         self.routes.repo().repo().durable_snapshots()
     }
 
     /// Restore the working snapshot cache from Durable Object SQLite.
-    #[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
+    #[cfg(not(all(feature = "cloudflare-workers", target_arch = "wasm32")))]
     pub fn restore_durable_snapshots(
         &self,
         snapshots: Vec<DurableCellSnapshot>,
@@ -601,13 +601,13 @@ where
     }
 
     /// Command-ledger rows for Durable Object SQLite.
-    #[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
+    #[cfg(not(all(feature = "cloudflare-workers", target_arch = "wasm32")))]
     pub fn durable_commands(&self) -> Result<Vec<DurableCellCommand>, RepositoryError> {
         self.routes.repo().repo().durable_commands()
     }
 
     /// Restore command-ledger rows before accepting another wait-path request.
-    #[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
+    #[cfg(not(all(feature = "cloudflare-workers", target_arch = "wasm32")))]
     pub fn restore_durable_commands(
         &self,
         commands: Vec<DurableCellCommand>,
@@ -617,13 +617,13 @@ where
 
     /// Export events, snapshots, command ledger, outbox, and sealed row as one
     /// versioned value suitable for a single durable storage write.
-    #[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
+    #[cfg(not(all(feature = "cloudflare-workers", target_arch = "wasm32")))]
     pub fn durable_state(&self) -> Result<DurableAggregateCellState, RepositoryError> {
         self.routes.repo().repo().durable_state()
     }
 
     /// Restore the complete working copy from one durable storage value.
-    #[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
+    #[cfg(not(all(feature = "cloudflare-workers", target_arch = "wasm32")))]
     pub fn restore_durable_state(
         &self,
         state: DurableAggregateCellState,
@@ -637,13 +637,13 @@ where
     }
 
     /// Sealed read-model JSON for GET on this instance.
-    #[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
+    #[cfg(not(all(feature = "cloudflare-workers", target_arch = "wasm32")))]
     pub fn sealed_row(&self) -> Result<Option<Value>, RepositoryError> {
         self.routes.repo().repo().sealed_row()
     }
 
     /// Persist the sealed read-model row next to events/snapshots.
-    #[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
+    #[cfg(not(all(feature = "cloudflare-workers", target_arch = "wasm32")))]
     pub fn replace_sealed_row(&self, row: Value) -> Result<(), RepositoryError> {
         self.routes.repo().repo().replace_sealed_row(row)
     }
@@ -654,7 +654,7 @@ where
     A: Aggregate + Snapshottable + Send + Sync + 'static,
 {
     /// Open a SQL cell with the ordinary repository snapshot policy.
-    #[cfg(all(feature = "workers-rs", target_arch = "wasm32"))]
+    #[cfg(all(feature = "cloudflare-workers", target_arch = "wasm32"))]
     pub fn from_state_with_snapshots(
         state: worker::State,
         frequency: u64,
@@ -677,7 +677,7 @@ where
     }
 
     /// Host a prepared exclusive store with repository snapshot caching.
-    #[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
+    #[cfg(not(all(feature = "cloudflare-workers", target_arch = "wasm32")))]
     pub fn from_store_with_snapshots(
         store: CellStreamStore,
         frequency: u64,
@@ -690,7 +690,7 @@ where
     }
 
     /// Open a cell with repository snapshot caching (`with_snapshots`).
-    #[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
+    #[cfg(not(all(feature = "cloudflare-workers", target_arch = "wasm32")))]
     pub fn new_with_snapshots(
         shard_id: impl Into<String>,
         frequency: u64,
@@ -702,9 +702,9 @@ where
             routes: Routes::from_dependencies(
                 AggregateRepository::new(store).with_snapshots(frequency),
             ),
-            #[cfg(feature = "workers-rs")]
+            #[cfg(feature = "cloudflare-workers")]
             celld_outbox: None,
-            #[cfg(all(feature = "workers-rs", any(target_arch = "wasm32", test)))]
+            #[cfg(all(feature = "cloudflare-workers", any(target_arch = "wasm32", test)))]
             activity: Default::default(),
         })
     }
@@ -773,7 +773,7 @@ where
     }
 
     /// Create or return the cell for `shard_id`.
-    #[cfg(not(all(feature = "workers-rs", target_arch = "wasm32")))]
+    #[cfg(not(all(feature = "cloudflare-workers", target_arch = "wasm32")))]
     pub fn get_or_create(
         &mut self,
         shard_id: &str,
@@ -788,7 +788,7 @@ where
     }
 }
 
-#[cfg(all(feature = "workers-rs", target_arch = "wasm32"))]
+#[cfg(all(feature = "cloudflare-workers", target_arch = "wasm32"))]
 fn alarm_transport_error(error: RepositoryError) -> crate::bus::TransportError {
     crate::bus::TransportError::retryable(format!("cell alarm storage: {error}"))
 }

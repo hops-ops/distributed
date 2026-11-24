@@ -16,7 +16,7 @@ python3 tests/gateway-worker/check_dependencies.py
 cargo check --manifest-path tests/gateway-worker/Cargo.toml --locked --target wasm32-unknown-unknown
 node tests/gateway-worker/proxy-runtime.mjs
 node tests/gateway-worker/run.mjs
-cargo test --no-default-features --features gateway-graphql-native,gateway-delivery,sqlite --test graphql_query_protocol worker_ -- --ignored --nocapture --test-threads=1
+cargo test --no-default-features --features gateway-graphql-native,sqlite --test graphql_query_protocol worker_ -- --ignored --nocapture --test-threads=1
 ```
 
 Run these runtime commands sequentially: worker-build writes one generated
