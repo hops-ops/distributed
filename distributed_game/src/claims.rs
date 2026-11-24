@@ -15,7 +15,7 @@
 //! ```rust,ignore
 //! #[derive(Serialize, Deserialize, TicketExtension)]
 //! pub struct MatchClaims { pub match_id: String, pub team: u8 }
-//! // net: ServerConfig { ticket_extensions: Some(ExtensionSchema::of::<MatchClaims>()), .. }
+//! // config.admission = config.admission.with_ticket_extensions::<MatchClaims>();
 //! ```
 //!
 //! The derive refuses identity-, reward- and economy-looking names (the

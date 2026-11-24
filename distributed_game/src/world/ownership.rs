@@ -9,8 +9,11 @@
 //! renewal fails ([`OwnershipError::Lost`]) must stop the zone immediately
 //! without persisting anything.
 //!
-//! Holders are `"{host_id}#{activation}"`, so a re-activation on the same
-//! host (after hibernation) waits for the previous activation to release.
+//! The `net` server's holders are `"{host_id}#{incarnation}#{activation}"`:
+//! a re-activation on the same host (after hibernation) waits for the
+//! previous activation to release, and a host restarted inside the TTL (a
+//! new incarnation) cannot take its dead incarnation's claim back; it gets
+//! a larger token once that claim expired ([`restart_conformance`]).
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -319,6 +322,54 @@ pub async fn ownership_conformance(ownership: &dyn ZoneOwnership, zone_id: &str)
         .expect("third acquire");
     assert!(third.token > second.token, "tokens survive release");
     ownership.release(&third).await;
+}
+
+/// What every [`ZoneOwnership`] with a TTL must do for a crash-restarted
+/// host. Its holder names the same host and activation ordinal as before
+/// but a new process nonce (`"{host}#{nonce}#{activation}"`), and its
+/// previous incarnation's claim was never released: while that claim
+/// lives the new holder is `Held` (never handed the old claim and token),
+/// and once `expire` has let it lapse (a manual clock, or waiting out a
+/// `ttl` the backend's own clock measures) the new holder gets a strictly
+/// larger token and the old claim stays lost. `zone_id` must be unused.
+/// Panics on a violation. ([`LocalOwnership`] has no TTL: a restart is a
+/// new instance, whose tokens start at a later epoch.)
+#[doc(hidden)]
+pub async fn restart_conformance(
+    ownership: &dyn ZoneOwnership,
+    zone_id: &str,
+    ttl: Duration,
+    expire: impl std::future::Future<Output = ()>,
+) {
+    let (dead, restarted) = ("h1#1a#1", "h1#2b#1");
+    let old = ownership
+        .acquire(zone_id, dead, ttl)
+        .await
+        .expect("first incarnation acquires");
+    assert_eq!(
+        ownership.acquire(zone_id, restarted, ttl).await,
+        Err(OwnershipError::Held {
+            holder: dead.into()
+        }),
+        "a restarted holder never gets its previous incarnation's live claim"
+    );
+    expire.await;
+    let new = ownership
+        .acquire(zone_id, restarted, ttl)
+        .await
+        .expect("the restarted holder acquires once the dead claim lapsed");
+    assert!(
+        new.token > old.token,
+        "a restarted holder gets a larger token ({} <= {})",
+        new.token,
+        old.token
+    );
+    assert_eq!(
+        ownership.renew(&old, ttl).await,
+        Err(OwnershipError::Lost),
+        "the dead incarnation's claim is lost"
+    );
+    ownership.release(&new).await;
 }
 
 #[cfg(test)]

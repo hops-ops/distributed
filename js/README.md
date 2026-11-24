@@ -515,7 +515,7 @@ Extension claims (match id, team, party) come from the server-side
 `claims({ principal, zone, role, session, event })` callback — never from the
 body — and are signed under the ticket's `ext`; the zone server admits them
 only against its declared `TicketExtension` schema
-(`ServerConfig::with_ticket_extensions`). Names that look like identity,
+(`AdmissionConfig::with_ticket_extensions`). Names that look like identity,
 rewards or economy values (`TRUSTED_FIELD_DENYLIST`, the same list as the
 Rust derives) and objects over 2 KiB are refused with 400 `invalid_claims`.
 

@@ -17,7 +17,9 @@ use distributed_game::world::zone_lease::{
     mount_zone_lease, ownership_error, ClaimPayload, ZoneLease, ACQUIRE, EXPIRE, RELEASE, RENEW,
     ZONE_HOST_ROLE,
 };
-use distributed_game::world::{ownership_conformance, OwnershipError, ZoneClaim, ZoneOwnership};
+use distributed_game::world::{
+    ownership_conformance, restart_conformance, OwnershipError, ZoneClaim, ZoneOwnership,
+};
 use distributed_game::BoxFuture;
 use serde_json::{json, Value};
 
@@ -159,6 +161,18 @@ async fn the_lease_cell_passes_the_ownership_conformance_suite() {
             "zone.released"
         ]
     );
+}
+
+#[tokio::test]
+async fn the_lease_cell_passes_the_restart_conformance_suite() {
+    let clock = clock();
+    let own = in_process(&clock, "restart");
+    let ttl = Duration::from_secs(10);
+    restart_conformance(own.as_ref(), "restart", ttl, async {
+        clock.advance(ttl);
+        assert_eq!(own.cell.fire_due_schedules().await.unwrap().fired.len(), 1);
+    })
+    .await;
 }
 
 #[tokio::test]

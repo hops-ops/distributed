@@ -78,7 +78,7 @@ pub struct TicketClaims {
     pub name: Option<String>,
     /// Game-declared claims the issuer vouches for (match id, team…; the
     /// ticket's `ext`), checked by the `net` server against
-    /// `ServerConfig::ticket_extensions`. Never identity or rewards.
+    /// `AdmissionConfig::extensions`. Never identity or rewards.
     pub extensions: TicketExtensions,
     /// The issuer lets this **observer** wake the zone and keep it awake
     /// while it declares itself near ([`Hello::near`](crate::protocol::Hello::near),

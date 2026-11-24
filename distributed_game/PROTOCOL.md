@@ -255,7 +255,10 @@ Focus  := 0x07, f32 x, f32 y
 ```
 
 - **Hello** MUST be the first message, sent within the server's hello
-  timeout (default 5 s). `protocol_version` is `2` or `1` (§6.0).
+  timeout (default 5 s); a silent connection is closed then, and any other
+  first message gets `Error(BAD_MESSAGE)` and close (no Pong before
+  Hello). Nothing is activated or woken before the Hello's ticket (or
+  reconnect token) is verified. `protocol_version` is `2` or `1` (§6.0).
   `content_version` MUST equal the server's when the server pins one.
   `capabilities` are game-defined bits, opaque to the runtime. For a fresh
   join `ticket` is a signed admission ticket (§8) and `reconnect_token` is
@@ -263,10 +266,12 @@ Focus  := 0x07, f32 x, f32 y
   token from the last Welcome. A second Hello gets `Error(BAD_MESSAGE)`.
   `near` is for observers (ignored for players): see **Near**.
 - **Input**: `payload` is game-defined. Duplicate or already-processed
-  `seq` values are ignored. Inputs are rate limited per connection
-  (default 120/s, burst 240); excess inputs are dropped and the server
-  sends `Error(RATE_LIMITED)` at most once per second; sustained abuse
-  gets `Kick(RATE_LIMITED)`. Observers' inputs are ignored.
+  `seq` values are ignored. Observers' inputs are ignored.
+  Every client message after the Welcome but Leave (inputs, pings,
+  focus, near, content, undecodable frames) is rate limited per
+  connection (default 120/s, burst 240): excess messages are dropped and
+  the server sends `Error(RATE_LIMITED)` at most once per second; more
+  than a burst dropped within a second gets `Kick(RATE_LIMITED)`.
   `client_tick` SHOULD be the latest `server_tick` the client has applied
   (the tick its interpolated view is based on). Servers that do lag
   compensation evaluate shots at `time(client_tick) - interp_delay`, where
@@ -558,7 +563,7 @@ unpadded base64url). Any HS256 JWT library can mint one.
 - Failures produce `Error(UNAUTHORIZED)` and close.
 
 **Custom ticket formats.** A server MAY admit join tickets in another
-format through a pluggable verifier (`ServerConfig::ticket_verifier`, e.g.
+format through a pluggable verifier (`AdmissionConfig::verifier`, e.g.
 a web backend's own JWTs with `iss`/`aud`/`jti` and no `zone`/`nonce`).
 The verifier maps the token to the same claims (principal, zone = route
 zone, expiry, replay key, role, name); the server still rejects a zone

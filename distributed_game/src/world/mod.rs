@@ -60,10 +60,10 @@ pub use allocation::{
 };
 pub use barrier::{BarrierMode, FreezeState, StalePolicy};
 pub use directory::{HashRing, HostAddr, StaticDirectory, ZoneDirectory};
-#[doc(hidden)]
-pub use ownership::ownership_conformance;
 #[cfg(feature = "lease")]
 pub use ownership::FencedLeaseOwnership;
+#[doc(hidden)]
+pub use ownership::{ownership_conformance, restart_conformance};
 pub use ownership::{LocalOwnership, OwnershipError, ZoneClaim, ZoneOwnership};
 #[doc(hidden)]
 pub use state::state_store_conformance;

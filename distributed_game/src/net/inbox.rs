@@ -2,7 +2,7 @@
 //! locally, `POST /admin/zone-message` for peers and services, and
 //! [`ZoneInboxClient`] for services (see [`crate::inbox`]).
 //!
-//! `POST /admin/zone-message` (header `x-game-admin-secret`), JSON body:
+//! `POST /admin/zone-message` (header `x-distributed-internal-secret`), JSON body:
 //!
 //! ```text
 //! {"zone": "pit-1", "kick": {"principal": "u-42", "reason": "banned"}}
@@ -25,6 +25,7 @@ use base64::Engine;
 use serde_json::{json, Value};
 
 use super::peer::post_json;
+use super::InternalHttpSecret;
 use crate::authoring::GameEvent;
 use crate::inbox::{Delivered, ZoneInbound};
 use crate::world::{HostAddr, ZoneDirectory};
@@ -157,7 +158,7 @@ pub(crate) fn delivered_json(delivered: Delivered) -> Value {
 #[derive(Clone)]
 pub struct ZoneInboxClient {
     directory: Arc<dyn ZoneDirectory>,
-    secret: String,
+    secret: InternalHttpSecret,
     timeout: Duration,
     max_redirects: u32,
 }
@@ -171,11 +172,11 @@ impl std::fmt::Debug for ZoneInboxClient {
 }
 
 impl ZoneInboxClient {
-    /// Client over `directory` with the hosts' shared admin secret.
-    pub fn new(directory: Arc<dyn ZoneDirectory>, admin_secret: impl Into<String>) -> Self {
+    /// Client over `directory` with the hosts' shared internal secret.
+    pub fn new(directory: Arc<dyn ZoneDirectory>, secret: InternalHttpSecret) -> Self {
         Self {
             directory,
-            secret: admin_secret.into(),
+            secret,
             timeout: Duration::from_secs(3),
             max_redirects: 3,
         }

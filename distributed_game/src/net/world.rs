@@ -2,7 +2,8 @@
 //!
 //! # Admin routes (`ServerConfig::admin_secret`)
 //!
-//! `POST` with header `x-game-admin-secret: <secret>` and a JSON body:
+//! `POST` with header `x-distributed-internal-secret: <secret>` (the
+//! internal secret convention) and a JSON body:
 //!
 //! | Route | Body | Effect |
 //! |---|---|---|
@@ -10,8 +11,8 @@
 //! | `/admin/child-event` | `{zone, event}` | deliver a tier-up event to a local zone |
 //! | `/admin/zone-message` | `{zone, kick: {principal, reason}}` or `{zone, message: {type_id, payload}}` | zone inbox ([`super::inbox`]): 404 inactive, 421 wrong owner |
 //! | `/admin/barrier/prepare` | `{barrier, reason, version, notes, timeout_ms}` | freeze all zones, wait for acks (409 + `missing`) |
-//! | `/admin/barrier/commit` | `{barrier, version, notes, mode: rolling\|hard}` | apply version, resume |
-//! | `/admin/barrier/abort` | `{barrier, notes}` | resume on the old version |
+//! | `/admin/barrier/commit` | `{barrier, version, notes, mode: rolling\|hard}` | apply version, resume (409 for another barrier than the current one) |
+//! | `/admin/barrier/abort` | `{barrier, notes}` | resume on the old version (409 likewise) |
 //!
 //! # Barrier
 //!
@@ -48,12 +49,14 @@ use base64::Engine;
 use serde_json::{json, Value};
 
 use super::inbox::{delivered_json, InboxError, WireInbound};
-use super::peer::{post_json, secret_eq, ADMIN_SECRET_HEADER};
+use super::peer::post_json;
+use super::InternalHttpSecret;
 use super::{activate_local, transfer_op, unix_now, GameServer, Inner, TransferOp, ZoneCmd};
 use crate::facts::BoxFuture;
 use crate::protocol::Notice;
 use crate::world::{BarrierMode, ChildEvent, HostAddr};
 use crate::zone::Zone;
+use distributed::cell_host::CELL_INTERNAL_SECRET_HEADER;
 
 type Reply = (StatusCode, String);
 
@@ -62,12 +65,14 @@ fn reply(status: StatusCode, body: Value) -> Reply {
 }
 
 fn authorize<Z: Zone>(inner: &Inner<Z>, headers: &HeaderMap, body: &[u8]) -> Result<Value, Reply> {
-    let expected = inner.config.admin_secret.as_deref().unwrap_or_default();
     let presented = headers
-        .get(ADMIN_SECRET_HEADER)
-        .map(|v| v.as_bytes())
-        .unwrap_or_default();
-    if expected.is_empty() || !secret_eq(expected.as_bytes(), presented) {
+        .get(CELL_INTERNAL_SECRET_HEADER)
+        .and_then(|v| v.to_str().ok());
+    let allowed = match (&inner.config.admin_secret, presented) {
+        (Some(secret), Some(presented)) => secret.matches(presented),
+        _ => false,
+    };
+    if !allowed {
         return Err(reply(
             StatusCode::UNAUTHORIZED,
             json!({"ok": false, "error": "unauthorized"}),
@@ -192,13 +197,13 @@ where
     // Deliver here only (never re-forward): a peer sent it because its
     // directory says we own the zone.
     match activate_local(&inner, &text(&body, "zone")) {
-        Some(tx) => {
+        Ok(tx) => {
             let _ = tx.send(ZoneCmd::ChildEvent(event)).await;
             reply(StatusCode::OK, json!({"ok": true}))
         }
-        None => reply(
-            StatusCode::NOT_FOUND,
-            json!({"ok": false, "error": "unknown zone"}),
+        Err(refused) => reply(
+            StatusCode::SERVICE_UNAVAILABLE,
+            json!({"ok": false, "error": refused}),
         ),
     }
 }
@@ -244,7 +249,7 @@ where
                 "hard" => BarrierMode::Hard,
                 _ => BarrierMode::Rolling,
             };
-            server
+            let applied = server
                 .commit_barrier(
                     barrier,
                     &text(&body, "version"),
@@ -252,13 +257,22 @@ where
                     mode,
                 )
                 .await;
-            reply(StatusCode::OK, json!({"ok": true}))
+            barrier_reply(applied)
         }
-        "abort" => {
-            server.abort_barrier(barrier, &text(&body, "notes")).await;
-            reply(StatusCode::OK, json!({"ok": true}))
-        }
+        "abort" => barrier_reply(server.abort_barrier(barrier, &text(&body, "notes")).await),
         _ => reply(StatusCode::NOT_FOUND, json!({"ok": false})),
+    }
+}
+
+/// 200, or 409 for a phase of another barrier than the current one.
+fn barrier_reply(applied: bool) -> Reply {
+    if applied {
+        reply(StatusCode::OK, json!({"ok": true}))
+    } else {
+        reply(
+            StatusCode::CONFLICT,
+            json!({"ok": false, "error": "stale barrier"}),
+        )
     }
 }
 
@@ -319,15 +333,21 @@ where
         mode: BarrierMode,
     ) -> BoxFuture<'a, Result<(), String>> {
         Box::pin(async move {
-            self.commit_barrier(barrier, version, notes, mode).await;
-            Ok(())
+            if self.commit_barrier(barrier, version, notes, mode).await {
+                Ok(())
+            } else {
+                Err(format!("{}: stale barrier", self.inner.host_id))
+            }
         })
     }
 
     fn abort<'a>(&'a self, barrier: u64, notes: &'a str) -> BoxFuture<'a, Result<(), String>> {
         Box::pin(async move {
-            self.abort_barrier(barrier, notes).await;
-            Ok(())
+            if self.abort_barrier(barrier, notes).await {
+                Ok(())
+            } else {
+                Err(format!("{}: stale barrier", self.inner.host_id))
+            }
         })
     }
 }
@@ -336,17 +356,17 @@ where
 #[derive(Debug, Clone)]
 pub struct RemoteHost {
     host: HostAddr,
-    secret: String,
+    secret: InternalHttpSecret,
     /// Extra time allowed on top of the barrier timeout for the HTTP call.
     slack: Duration,
 }
 
 impl RemoteHost {
-    /// Remote participant using the shared admin secret.
-    pub fn new(host: HostAddr, secret: impl Into<String>) -> Self {
+    /// Remote participant using the hosts' shared internal secret.
+    pub fn new(host: HostAddr, secret: InternalHttpSecret) -> Self {
         Self {
             host,
-            secret: secret.into(),
+            secret,
             slack: Duration::from_secs(2),
         }
     }
