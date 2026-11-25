@@ -47,15 +47,15 @@ use super::{
     run_source, Bus, BusConsumer, BusTopologyConfig, MessageRouter, OrderedDelivery,
     PublishDeadLetters, RunOptions, TransportError, TransportErrorKind,
 };
-use super::{Message, MessageKind};
+use super::{Message, MessageKind, WireEnvelope};
 
 pub(crate) const DEFAULT_LEASE: Duration = Duration::from_secs(30);
 const DEFAULT_POLL_INTERVAL: Duration = Duration::from_millis(25);
 
-/// Rows fetched per source refill. Buffering amortizes the claim/offset
-/// subquery across a batch instead of re-running it for every message. Kept
-/// well under the lease: a whole claimed batch must be processable before its
-/// leases start expiring.
+/// `bus_log` entries fetched per log-source refill. Buffering amortizes the
+/// offset subquery across a batch instead of re-running it for every message.
+/// The queue source claims one row per `recv` instead, so no claimed row waits
+/// behind another's handler.
 const SOURCE_BATCH: i64 = 16;
 
 /// Classify a database error transient vs permanent (via [`is_sqlx_transient`])
@@ -326,6 +326,15 @@ pub trait SqlBusDialect: Clone + Send + Sync + 'static {
         claim_token: &str,
     ) -> impl Future<Output = Result<(), TransportError>> + Send;
 
+    /// Extend a claimed queue row's lease to `lease_secs` from now, fenced by
+    /// its claim token. `false` when the claim is no longer held.
+    fn renew_claim(
+        &self,
+        seq: i64,
+        claim_token: &str,
+        lease_secs: f64,
+    ) -> impl Future<Output = Result<bool, TransportError>> + Send;
+
     /// Release a claimed queue row for redelivery, fenced by its claim token.
     fn release_claim(
         &self,
@@ -372,8 +381,11 @@ impl<B: SqlBusDialect> SqlBus<B> {
         self
     }
 
-    /// Override the claim lease for `listen` (how long a claimed command stays
-    /// invisible to other workers before it is eligible for redelivery).
+    /// Override the claim lease for `listen`: how long a claimed command stays
+    /// invisible to other workers after its worker stops renewing it. A worker
+    /// renews the lease every third of it while the handler runs, so a handler
+    /// may take longer than the lease; the lease bounds how long a crashed
+    /// worker's command waits for redelivery.
     pub fn with_lease(mut self, lease: Duration) -> Self {
         self.lease = lease;
         self
@@ -459,10 +471,12 @@ impl<B: SqlBusDialect> SqlBus<B> {
 
 impl<B: SqlBusDialect> Bus for SqlBus<B> {
     async fn send_message(&self, message: Message) -> Result<(), TransportError> {
+        WireEnvelope::validate(&message)?;
         self.dialect.insert_queue(&message).await
     }
 
     async fn publish_message(&self, message: Message) -> Result<(), TransportError> {
+        WireEnvelope::validate(&message)?;
         let epoch_candidate = self.source_epoch.clone().unwrap_or_else(fresh_log_epoch);
         self.dialect
             .insert_log(&message, &epoch_candidate, self.source_epoch.as_ref())
@@ -484,7 +498,7 @@ impl<B: SqlBusDialect> BusConsumer for SqlBus<B> {
         let source = SqlQueueSource {
             dialect: self.dialect.clone(),
             names,
-            lease_secs: self.lease.as_secs_f64(),
+            lease: self.lease,
             poll_interval: self.poll_interval,
         };
         run_source(router, source, self.with_dead_letters(options)).await
@@ -524,13 +538,15 @@ impl<B: SqlBusDialect> BusConsumer for SqlBus<B> {
 
 /// Competing-consumer source over `bus_queue` (atomic claim under a lease).
 ///
-/// One row is claimed per `recv`, so a row's lease starts when its handler
-/// does. Settlement is fenced by the claim token: a worker whose lease expired
-/// cannot settle a row another worker has since claimed.
+/// One row is claimed per `recv`, and its lease is renewed while the delivery
+/// is held, so a handler longer than the lease keeps its claim and no other
+/// worker runs the row concurrently. Settlement is fenced by the claim token:
+/// a worker that lost its claim (its renewals stopped reaching the database
+/// and the row was reclaimed under a new token) cannot settle the newer claim.
 struct SqlQueueSource<B> {
     dialect: B,
     names: Vec<String>,
-    lease_secs: f64,
+    lease: Duration,
     poll_interval: Duration,
 }
 
@@ -542,12 +558,25 @@ impl<B: SqlBusDialect> MessageSource for SqlQueueSource<B> {
     }
 
     async fn recv(&mut self) -> Result<Option<Self::Received>, TransportError> {
-        let claimed = self.dialect.claim(&self.names, self.lease_secs, 1).await?;
-        Ok(claimed.into_iter().next().map(|claimed| SqlQueueReceived {
-            dialect: self.dialect.clone(),
-            row: claimed.row,
-            claim_token: claimed.claim_token,
-            attempts: claimed.attempts,
+        let claimed = self
+            .dialect
+            .claim(&self.names, self.lease.as_secs_f64(), 1)
+            .await?;
+        Ok(claimed.into_iter().next().map(|claimed| {
+            let renewal = tokio::spawn(renew_lease(
+                self.dialect.clone(),
+                claimed.row.seq,
+                claimed.claim_token.clone(),
+                self.lease,
+            ))
+            .abort_handle();
+            SqlQueueReceived {
+                dialect: self.dialect.clone(),
+                row: claimed.row,
+                claim_token: claimed.claim_token,
+                attempts: claimed.attempts,
+                renewal,
+            }
         }))
     }
 
@@ -556,13 +585,51 @@ impl<B: SqlBusDialect> MessageSource for SqlQueueSource<B> {
     }
 }
 
+/// Keep a claim alive: extend its lease every third of the lease until the
+/// claim is lost. Runs until the delivery is settled or dropped, which aborts
+/// it. A failed renewal is retried at the next tick; the claim is lost only
+/// once the lease runs out with no renewal landing.
+async fn renew_lease<B: SqlBusDialect>(dialect: B, seq: i64, claim_token: String, lease: Duration) {
+    let every = (lease / 3).max(Duration::from_millis(10));
+    loop {
+        tokio::time::sleep(every).await;
+        match dialect
+            .renew_claim(seq, &claim_token, lease.as_secs_f64())
+            .await
+        {
+            Ok(true) => {}
+            Ok(false) => {
+                tracing::warn!(
+                    backend = B::BACKEND,
+                    seq,
+                    "bus_queue claim was lost while its handler ran; another worker may run it"
+                );
+                return;
+            }
+            Err(error) => tracing::warn!(
+                backend = B::BACKEND,
+                seq,
+                %error,
+                "renewing a bus_queue claim failed; retrying"
+            ),
+        }
+    }
+}
+
 /// A claimed `bus_queue` row: `ack` deletes it; `nack` makes it claimable
-/// again after the delay.
+/// again after the delay. Its lease is renewed until it is settled or dropped.
 pub struct SqlQueueReceived<B> {
     dialect: B,
     row: ReceivedRow,
     claim_token: String,
     attempts: u32,
+    renewal: tokio::task::AbortHandle,
+}
+
+impl<B> Drop for SqlQueueReceived<B> {
+    fn drop(&mut self) {
+        self.renewal.abort();
+    }
 }
 
 impl<B: SqlBusDialect> ReceivedMessage for SqlQueueReceived<B> {
@@ -579,12 +646,16 @@ impl<B: SqlBusDialect> ReceivedMessage for SqlQueueReceived<B> {
     }
 
     async fn ack(self) -> Result<(), TransportError> {
+        // Stop renewing first. A renewal already in flight is fenced by the
+        // claim token, so it cannot revive the row once it is settled.
+        self.renewal.abort();
         self.dialect
             .delete_claimed(self.row.seq, &self.claim_token)
             .await
     }
 
     async fn nack(self, delay: Duration) -> Result<(), TransportError> {
+        self.renewal.abort();
         self.dialect
             .release_claim(self.row.seq, &self.claim_token, delay.as_secs_f64())
             .await

@@ -28,13 +28,12 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
 use lapin::options::{
-    BasicPublishOptions, ConfirmSelectOptions, ExchangeDeclareOptions, QueueBindOptions,
-    QueueDeclareOptions,
+    ConfirmSelectOptions, ExchangeDeclareOptions, QueueBindOptions, QueueDeclareOptions,
 };
 use lapin::types::{FieldTable, ShortString};
 use lapin::{Channel, ExchangeKind};
 
-use super::rabbitmq::{connect_channel, message_properties, RabbitSource};
+use super::rabbitmq::{connect_channel, publish_confirmed, RabbitSource};
 use super::{
     retryable, run_source, Bus, BusConsumer, BusTopologyConfig, MessageRouter, PublishDeadLetters,
     RunOptions, TransportError,
@@ -264,33 +263,6 @@ impl RabbitBus {
         Ok(())
     }
 
-    async fn publish_confirmed(
-        &self,
-        exchange: &str,
-        routing_key: &str,
-        message: &Message,
-    ) -> Result<(), TransportError> {
-        let confirm = self
-            .channel
-            .basic_publish(
-                ShortString::from(exchange),
-                ShortString::from(routing_key),
-                BasicPublishOptions::default(),
-                &message.payload,
-                message_properties(message),
-            )
-            .await
-            .map_err(|err| retryable("amqp publish", err))?;
-        if confirm
-            .await
-            .map_err(|err| retryable("amqp publisher confirm", err))?
-            .is_nack()
-        {
-            return Err(TransportError::retryable("amqp publisher confirm: nack"));
-        }
-        Ok(())
-    }
-
     /// Declare the topic exchange, this group's queue, and bind it to the
     /// service's event names — the durable setup `subscribe` needs. Exposed so a
     /// producer can ensure all subscriber bindings exist *before* publishing
@@ -333,7 +305,7 @@ impl Bus for RabbitBus {
         let queue = self.command_queue(message.name())?;
         self.ensure_command_queue(&queue).await?;
         message.name = queue.clone();
-        self.publish_confirmed("", &queue, &message).await
+        publish_confirmed(&self.channel, "", &queue, message).await
     }
 
     async fn publish_message(&self, message: Message) -> Result<(), TransportError> {
@@ -341,8 +313,7 @@ impl Bus for RabbitBus {
         let exchange = self.events_exchange()?;
         self.ensure_events_exchange(&exchange).await?;
         let routing_key = message.name().to_string();
-        self.publish_confirmed(&exchange, &routing_key, &message)
-            .await
+        publish_confirmed(&self.channel, &exchange, &routing_key, message).await
     }
 }
 

@@ -40,6 +40,11 @@ use super::{Message, MessageKind};
 
 const DEFAULT_FETCH_TIMEOUT: Duration = Duration::from_millis(500);
 
+/// The outbox's payload-codec metadata key
+/// (`SOURCED_METADATA_PREFIX` + `payload-codec`), which marks an archived
+/// domain-event occurrence.
+const PAYLOAD_CODEC_HEADER: &str = "x-distributed-payload-codec";
+
 /// NATS JetStream [`Bus`] + [`BusConsumer`]. Cheap to clone.
 #[derive(Clone)]
 pub struct NatsBus {
@@ -270,7 +275,7 @@ impl NatsBus {
             };
             if message
                 .headers
-                .get("x-sourced-payload-codec")
+                .get(PAYLOAD_CODEC_HEADER)
                 .map(|v| v.as_str())
                 != Some("distributed.domain-event-occurrence+json")
             {
@@ -500,7 +505,7 @@ mod archive_tests {
         );
         // NATS does not promise historical catch-up for an added filter. Keep
         // any observed retained delivery visible in the test output.
-        eprintln!("filter update delivered: {delivered:?}");
+        tracing::info!(?delivered, "filter update delivered");
         drop(
             bus.source(
                 "filter-proof",
@@ -566,9 +571,11 @@ mod archive_tests {
             .unwrap();
             let mut headers = async_nats::HeaderMap::new();
             headers.insert(
-                "x-sourced-payload-codec",
+                PAYLOAD_CODEC_HEADER,
                 "distributed.domain-event-occurrence+json",
             );
+            headers.insert(crate::bus::WireEnvelope::ID, event.id());
+            headers.insert(crate::bus::WireEnvelope::KIND, "event");
             headers.insert("Nats-Msg-Id", event.id());
             bus.jetstream
                 .publish_with_headers(

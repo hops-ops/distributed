@@ -269,7 +269,7 @@ fn command_response(
             let status = StatusCode::from_u16(err.status_code())
                 .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
             if status.is_server_error() {
-                eprintln!("microsvc command `{command}` failed: {err}");
+                tracing::error!(%command, error = %err, "microsvc command failed");
             }
             let body = super::wait_path::wait_path_error_response(&err);
             (status, Json(body)).into_response()

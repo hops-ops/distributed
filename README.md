@@ -1105,7 +1105,7 @@ Entity.set_correlation_id("req-123")
   → subscriber receives the message with correlation_id() == "req-123"
 ```
 
-Framework-derived metadata (codec, destination, source aggregate) is namespaced under the reserved `x-sourced-` prefix so it cannot be shadowed by user metadata.
+Framework-derived metadata (codec, destination, source aggregate) is namespaced under the reserved `x-distributed-` prefix so it cannot be shadowed by user metadata.
 
 ### Reading Metadata
 
@@ -1401,6 +1401,26 @@ are rejected before broker topology is created.
 SQLite has no `FOR UPDATE SKIP LOCKED`, and `bus_log` / `bus_offset` provide
 fan-out. It is intended for local durable transport, tests, demos, and small
 single-node deployments, not as a high-throughput broker replacement.
+
+A SQL `listen` claims one `bus_queue` row per receive and renews its lease
+every third of the lease while the handler runs, so a handler may outlive the
+lease without a second worker running the same row. The lease (`with_lease`,
+default 30 s) is how long a crashed worker's command waits for redelivery.
+
+#### One wire envelope
+
+Every adapter writes and reads a `Message` through `WireEnvelope`. The id,
+kind and content type travel as the reserved headers `x-distributed-id`,
+`x-distributed-kind` and `x-distributed-content-type`, ahead of the metadata
+(Kafka record headers, NATS headers, the AMQP header table, Redis
+`header:<key>` fields). Knative maps them onto CloudEvents attributes: `ce-id`,
+`content-type` and the `distributedkind` extension. Metadata that names a
+reserved header in any letter case is refused at publish with a permanent
+error, and a delivery that repeats one is refused on receive. The same
+validation (message name, stable id, content type, metadata keys) runs at the
+publish boundary of the SQL, in-memory and celld Queue transports. NATS also
+writes `Nats-Msg-Id` for JetStream deduplication and refuses `Nats-*`
+metadata. A delivery without `x-distributed-kind` is an event.
 
 `KnativeBus` implements only `Bus` (produce → broker-ingress POST). It has no
 in-process consume loop: `KnativeBus::manifests(&plan, &subscriptions)` renders the

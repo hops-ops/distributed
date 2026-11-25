@@ -419,7 +419,7 @@ macro_rules! scenarios {
                     .header("ce-id", id)
                     .header("ce-type", name)
                     .header("ce-source", "/tests")
-                    .header("ce-sourcedkind", "command")
+                    .header("ce-distributedkind", "command")
                     .header("ce-x-user-id", "admin")
                     .header("ce-x-roles", "admin")
                     .header("content-type", "application/json")

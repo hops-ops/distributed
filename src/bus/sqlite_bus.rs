@@ -590,6 +590,25 @@ impl SqlBusDialect for SqliteBusDialect {
         Ok(())
     }
 
+    async fn renew_claim(
+        &self,
+        seq: i64,
+        claim_token: &str,
+        lease_secs: f64,
+    ) -> Result<bool, TransportError> {
+        let renewed = sqlx::query(
+            "UPDATE bus_queue SET locked_until = unixepoch('now','subsec') + ? \
+             WHERE seq = ? AND claim_token = ?",
+        )
+        .bind(lease_secs)
+        .bind(seq)
+        .bind(claim_token)
+        .execute(&self.pool)
+        .await
+        .map_err(|err| db_err("renew claim", err))?;
+        Ok(renewed.rows_affected() == 1)
+    }
+
     async fn release_claim(
         &self,
         seq: i64,

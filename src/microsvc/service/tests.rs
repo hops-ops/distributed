@@ -2010,15 +2010,15 @@ async fn causal_dispatch_uses_the_configured_immediate_outbox_publisher() {
                             message.name().to_string(),
                             message.causation_id().unwrap_or_default().to_string(),
                             message
-                                .metadata("x-sourced-source-aggregate-type")
+                                .metadata("x-distributed-source-aggregate-type")
                                 .unwrap_or_default()
                                 .to_string(),
                             message
-                                .metadata("x-sourced-source-aggregate-id")
+                                .metadata("x-distributed-source-aggregate-id")
                                 .unwrap_or_default()
                                 .to_string(),
                             message
-                                .metadata("x-sourced-source-sequence")
+                                .metadata("x-distributed-source-sequence")
                                 .unwrap_or_default()
                                 .to_string(),
                         ];
