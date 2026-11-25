@@ -7,8 +7,9 @@ client, optimistic replica update, and causal confirmation.
 Rust · TypeScript · CQRS / ES · SvelteKit · GraphQL `@live` · Postgres ·
 SQLite · celld + NATS (optional profile) · OIDC via Zitadel
 
-Default is **one command** (`make run`). The same UI can wait-dispatch Todo
-create/complete and `chat.post` to celld from [`../e2e-celld`](../e2e-celld).
+Default is **one command** (`make run`). [`../e2e-celld`](../e2e-celld) runs
+this same service crate on another command host: every Todo command and
+`chat.post` wait-dispatch to celld cells.
 Todo commands are `command!` declarations in `todo-domain`; hosts
 only `.mount` them. Chat is a small cell so `@live` still coming from GraphQL
 is the demo.

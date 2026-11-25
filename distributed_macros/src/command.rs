@@ -215,6 +215,7 @@ pub fn expand(input: TokenStream) -> syn::Result<TokenStream> {
                 .command_transition::<#transition, #input_ty, #outcome>(Self::COMMAND)
                 .field_name(#field)
                 .roles([#(#roles),*].into_iter())
+                .shard_by(|input: &#input_ty| Self::shard(input))
                 #defaults
                 #authenticated_user_field
                 #preview_reduce_known_record

@@ -46,14 +46,11 @@ fn authorized_internal(headers: &HeaderMap, secret: &InternalHttpSecret) -> bool
 ///
 /// Identity is the engine's (`OidcBearer` on `POST /graphql` / WS `connection_init`).
 /// HTTP command routes stay off — `POST /todo.create` is 404.
-pub async fn serve(
+pub(crate) async fn serve(
     service: Arc<Service>,
     host: SharedCommandHost,
-    addr: &str,
-    public_origin: &str,
-    ui_origin: &str,
     queue_relay: CelldQueueRelayHandler,
-    internal_secret: InternalHttpSecret,
+    options: &crate::HostOptions,
 ) -> Result<(), std::io::Error> {
     let engine = service
         .graphql_engine()
@@ -100,7 +97,7 @@ pub async fn serve(
         }),
     );
     app = app.merge(internal.route_layer(middleware::from_fn_with_state(
-        internal_secret,
+        options.internal_secret.clone(),
         require_internal,
     )));
 
@@ -137,7 +134,7 @@ pub async fn serve(
             Binding::new(
                 "ui",
                 BindingKind::UiProxy {
-                    origin: ui_origin.into(),
+                    origin: options.ui_origin.clone(),
                 },
             ),
             Binding::new("service", BindingKind::Handler),
@@ -159,7 +156,7 @@ pub async fn serve(
     // existing owners. UI, auth, HMR and lifecycle requests use this public edge.
     let app = NativeGateway::new(
         gateway,
-        NativeOptions::new(public_origin),
+        NativeOptions::new(&options.public_origin),
         [
             (
                 "graphql".into(),
@@ -175,6 +172,6 @@ pub async fn serve(
     )
     .map_err(std::io::Error::other)?
     .router();
-    let listener = tokio::net::TcpListener::bind(addr).await?;
+    let listener = tokio::net::TcpListener::bind(&options.bind).await?;
     axum::serve(listener, app).await
 }

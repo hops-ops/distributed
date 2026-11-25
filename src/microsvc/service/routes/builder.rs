@@ -53,8 +53,12 @@ pub struct TypedRouteBuilder<D, I, K: CommandOutcome> {
     pub(super) contract: TypedCommandContract,
     pub(super) mount: Option<CommandMount>,
     pub(super) requires: Vec<crate::schedule::Capability>,
+    pub(super) shard: Option<CommandShard<I>>,
     pub(super) _types: std::marker::PhantomData<fn(I) -> K>,
 }
+
+/// The aggregate id (shard) a command input addresses.
+pub(super) type CommandShard<I> = Arc<dyn Fn(&I) -> String + Send + Sync>;
 
 impl<D: Send + Sync + 'static> EventRouteBuilder<D> {
     /// Register an async handler without a guard.
@@ -143,6 +147,19 @@ where
         self
     }
 
+    /// Declare the aggregate id (shard) each input addresses: the stream it
+    /// loads or creates. A command host that places aggregates elsewhere (a
+    /// cell per shard) routes by it. `load_by`, `load_or_create_by` and
+    /// `create_by` declare their id this way.
+    #[must_use]
+    pub fn shard_by<F>(mut self, shard: F) -> Self
+    where
+        F: Fn(&I) -> String + Send + Sync + 'static,
+    {
+        self.shard = Some(Arc::new(shard));
+        self
+    }
+
     /// Declare a host capability this command needs
     /// ([`Capability::Scheduling`](crate::schedule::Capability::Scheduling)
     /// for `ctx.schedule`, [`Capability::Clock`](crate::schedule::Capability::Clock)
@@ -176,6 +193,7 @@ where
             None,
             boxed_prepared_handler(handler),
             self.requires,
+            self.shard,
         )
     }
 
@@ -193,6 +211,7 @@ where
             Some(guard),
             boxed_prepared_handler(handler),
             self.requires,
+            self.shard,
         )
     }
 }
@@ -214,7 +233,8 @@ where
     where
         F: Fn(&I) -> String + Send + Sync + 'static,
     {
-        self.thin(move |input| super::super::CommandLoad::Required(id(input)))
+        let (builder, id) = self.sharded_by(id);
+        builder.thin(move |input| super::super::CommandLoad::Required(id(input)))
     }
 
     /// Load the aggregate by id, or start a new one when it does not exist.
@@ -222,7 +242,8 @@ where
     where
         F: Fn(&I) -> String + Send + Sync + 'static,
     {
-        self.thin(move |input| super::super::CommandLoad::OrCreate(id(input)))
+        let (builder, id) = self.sharded_by(id);
+        builder.thin(move |input| super::super::CommandLoad::OrCreate(id(input)))
     }
 
     /// Start a new aggregate; the command is rejected when `id` already has one.
@@ -230,7 +251,18 @@ where
     where
         F: Fn(&I) -> String + Send + Sync + 'static,
     {
-        self.thin(move |input| super::super::CommandLoad::Create(Some(id(input))))
+        let (builder, id) = self.sharded_by(id);
+        builder.thin(move |input| super::super::CommandLoad::Create(Some(id(input))))
+    }
+
+    /// The id the command loads is its shard.
+    fn sharded_by<F>(mut self, id: F) -> (Self, CommandShard<I>)
+    where
+        F: Fn(&I) -> String + Send + Sync + 'static,
+    {
+        let id: CommandShard<I> = Arc::new(id);
+        self.shard = Some(Arc::clone(&id));
+        (self, id)
     }
 
     /// Start a new aggregate that names itself in its transition.
@@ -356,6 +388,7 @@ where
             self.guard,
             boxed_prepared_handler(handler),
             inner.requires,
+            inner.shard,
         )
     }
 }

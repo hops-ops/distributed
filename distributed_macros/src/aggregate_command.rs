@@ -539,6 +539,10 @@ pub(crate) fn expand(
         .roles
         .as_ref()
         .map(|roles| quote!(.roles([#(#roles),*])));
+    // The declared shard field is the cell address of a sharded command.
+    let shard_by = shard_fn
+        .as_ref()
+        .map(|_| quote!(.shard_by(|input: &#input_ty| Self::shard(input))));
     let finish = match &args.guard {
         Some(guard) => quote!(.guarded(#guard, Self::handle)),
         None => quote!(.handle(Self::handle)),
@@ -594,6 +598,7 @@ pub(crate) fn expand(
                 #registration
                     #field
                     #roles
+                    #shard_by
                     #finish
             }
         }

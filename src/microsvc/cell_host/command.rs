@@ -1,15 +1,21 @@
 //! GraphQL [`CommandHost`] for the celld wait-path.
 //!
-//! Aggregate crates supply a [`CelldRoute`] (kind, shard, payload map). The
-//! aggregate Worker owns outbox delivery through celld Queue; this host only
-//! invokes commands and seals the returned projection evidence.
+//! [`CelldCommandHost::route_aggregate`] routes an aggregate's mounted
+//! commands to its cells: the cell kind is the aggregate's
+//! [`Aggregate::aggregate_type`], the shard each command's declared shard. The
+//! cell's payload is the command's answer as-is; one that is not the declared
+//! output fails the dispatch. The aggregate Worker owns outbox delivery
+//! through celld Queue; this host only invokes commands and seals the
+//! returned projection evidence.
 
+use std::any::TypeId;
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde_json::Value;
 
 use super::InternalHttpSecret;
+use crate::aggregate::Aggregate;
 use crate::command_dispatch::VerifiedPrincipal;
 use crate::command_dispatch::{
     validate_principal_session, validate_principal_session_if_present, CellRequestContext,
@@ -22,34 +28,8 @@ use crate::microsvc::{
     ExternalCausalReservation, Service, Session,
 };
 
-/// One aggregate's cell wait-path: command names, URL kind, shard id, payload.
-#[derive(Clone, Copy)]
-pub struct CelldRoute {
-    pub commands: &'static [&'static str],
-    /// Path segment `{CELLD_URL}/{kind}/{shard}/{command}`.
-    pub kind: &'static str,
-    pub shard: fn(&Value) -> Option<String>,
-    pub payload: fn(command: &str, input: &Value, remote: &Value, session: &Session) -> Value,
-}
-
-impl CelldRoute {
-    pub const fn new(
-        commands: &'static [&'static str],
-        kind: &'static str,
-        shard: fn(&Value) -> Option<String>,
-        payload: fn(command: &str, input: &Value, remote: &Value, session: &Session) -> Value,
-    ) -> Self {
-        Self {
-            commands,
-            kind,
-            shard,
-            payload,
-        }
-    }
-}
-
-type CellShardFn = Arc<dyn Fn(&Value, &Session) -> Option<String> + Send + Sync>;
-type CellPayloadFn = fn(command: &str, input: &Value, remote: &Value, session: &Session) -> Value;
+type CellShardFn =
+    Arc<dyn Fn(&Value, &Session) -> Result<String, CausalDispatchError> + Send + Sync>;
 
 /// One registered cell route: commands, cell kind, shard of (input, session).
 #[derive(Clone)]
@@ -57,7 +37,6 @@ struct CellRoute {
     commands: Vec<String>,
     kind: String,
     shard: CellShardFn,
-    payload: Option<CellPayloadFn>,
 }
 
 /// Routes selected commands to celld cells.
@@ -120,19 +99,44 @@ impl CelldCommandHost {
         })
     }
 
-    pub fn route(mut self, route: CelldRoute) -> Self {
-        let shard = route.shard;
-        self.routes.push(CellRoute {
-            commands: route
-                .commands
-                .iter()
-                .map(|command| command.to_string())
-                .collect(),
-            kind: route.kind.to_string(),
-            shard: Arc::new(move |input, _| shard(input)),
-            payload: Some(route.payload),
-        });
-        self
+    /// Route every command of aggregate `A` mounted on this host's service
+    /// to `{kind}/{shard}/{command}`: `kind` is `A::aggregate_type()`, `shard`
+    /// the command's declared shard of its input (`shard:` in
+    /// [`command!`](crate::command), or the id of `load_by` / `create_by`).
+    ///
+    /// The cell's payload is returned as-is, after it is checked against the
+    /// command's declared output: a missing, undeclared or mistyped field
+    /// fails the dispatch.
+    ///
+    /// Fails when this host has no local service ([`remote`](Self::remote)),
+    /// when the service mounts no command of `A`, or when one of them declares
+    /// no shard.
+    pub fn route_aggregate<A: Aggregate + 'static>(mut self) -> Result<Self, CausalDispatchError> {
+        let kind = A::aggregate_type();
+        let local = self.local.as_ref().ok_or_else(|| {
+            CausalDispatchError::Internal(format!(
+                "route_aggregate::<{kind}> needs the host's local service; a remote host routes with cell_route"
+            ))
+        })?;
+        let shards = local.service().aggregate_command_shards(TypeId::of::<A>());
+        if shards.is_empty() {
+            return Err(CausalDispatchError::Internal(format!(
+                "the service mounts no command of aggregate `{kind}`"
+            )));
+        }
+        for (command, shard) in shards {
+            let shard = shard.ok_or_else(|| {
+                CausalDispatchError::Internal(format!(
+                    "command `{command}` of aggregate `{kind}` declares no shard, so it has no cell"
+                ))
+            })?;
+            self.insert_route(
+                command,
+                kind.to_string(),
+                Arc::new(move |input, _| shard(input)),
+            );
+        }
+        Ok(self)
     }
 
     /// Route `command` to `{kind}/{shard(input, session)}/{command}` and
@@ -155,16 +159,28 @@ impl CelldCommandHost {
         kind: impl Into<String>,
         shard: impl Fn(&Value, &Session) -> Option<String> + Send + Sync + 'static,
     ) {
-        let command = command.into();
+        let kind = kind.into();
+        let missing = format!("{kind} id required for celld wait-path");
+        self.insert_route(
+            command.into(),
+            kind,
+            Arc::new(move |input, session| {
+                shard(input, session)
+                    .ok_or_else(|| CausalDispatchError::BadRequest(missing.clone()))
+            }),
+        );
+    }
+
+    /// A later route for the same command replaces the earlier.
+    fn insert_route(&mut self, command: String, kind: String, shard: CellShardFn) {
         for route in &mut self.routes {
             route.commands.retain(|existing| existing != &command);
         }
         self.routes.retain(|route| !route.commands.is_empty());
         self.routes.push(CellRoute {
             commands: vec![command],
-            kind: kind.into(),
-            shard: Arc::new(shard),
-            payload: None,
+            kind,
+            shard,
         });
     }
 
@@ -248,21 +264,13 @@ impl CelldCommandHost {
                 .with_trusted_metadata(self.forwarded_metadata(session)?);
         let http = self.http.retarget_segments(&[&route.kind, shard])?;
         let (status, body) = http
-            .post_cell_wait_path_with_context(command, command_id, input.clone(), session, &context)
+            .post_cell_wait_path_with_context(command, command_id, input, session, &context)
             .await?;
         if status >= 400 {
             return Err(crate::microsvc::wait_path::wait_path_error(status, &body));
         }
-        let remote = CausalDispatchResult::from_wait_path_wire(body).map_err(|error| {
-            CausalDispatchError::Internal(format!("wait-path decode: {error:?}"))
-        })?;
-        Ok(match route.payload {
-            Some(payload) => {
-                let mapped = payload(command, &input, remote.payload(), session);
-                remote.with_payload(mapped)
-            }
-            None => remote,
-        })
+        CausalDispatchResult::from_wait_path_wire(body)
+            .map_err(|error| CausalDispatchError::Internal(format!("wait-path decode: {error:?}")))
     }
 }
 
@@ -290,14 +298,13 @@ impl CommandHost for CelldCommandHost {
                 ))),
             };
         };
-        let shard = (route.shard)(&input, &session)
-            .filter(|value| !value.is_empty())
-            .ok_or_else(|| {
-                CausalDispatchError::BadRequest(format!(
-                    "{} id required for celld wait-path",
-                    route.kind
-                ))
-            })?;
+        let shard = (route.shard)(&input, &session)?;
+        if shard.is_empty() {
+            return Err(CausalDispatchError::BadRequest(format!(
+                "{} id required for celld wait-path",
+                route.kind
+            )));
+        }
         let Some(local) = &self.local else {
             return self
                 .invoke_remote(
@@ -338,7 +345,7 @@ impl CommandHost for CelldCommandHost {
             .post_cell_wait_path_with_causation(
                 command,
                 command_id,
-                input.clone(),
+                input,
                 &session,
                 &service_id,
                 &principal_partition,
@@ -363,7 +370,7 @@ impl CommandHost for CelldCommandHost {
                 .await;
             return Err(error);
         }
-        let remote = match CausalDispatchResult::from_wait_path_wire(body) {
+        let mut remote = match CausalDispatchResult::from_wait_path_wire(body) {
             Ok(remote) => remote,
             Err(error) => {
                 let _ = local
@@ -382,13 +389,6 @@ impl CommandHost for CelldCommandHost {
                 .await;
             return Err(error);
         }
-        let mut remote = match route.payload {
-            Some(payload) => {
-                let mapped = payload(command, &input, remote.payload(), &session);
-                remote.with_payload(mapped)
-            }
-            None => remote,
-        };
         if let Some(protocol) = protocol {
             remote = match local
                 .service()

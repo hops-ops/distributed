@@ -707,6 +707,23 @@ impl Service {
             .build()
     }
 
+    /// Every typed command that commits to `aggregate`, by name, with its
+    /// declared shard (`None` when the command declares none).
+    #[cfg(feature = "graphql")]
+    pub(crate) fn aggregate_command_shards(
+        &self,
+        aggregate: std::any::TypeId,
+    ) -> Vec<(String, Option<super::routes::ErasedCommandShard>)> {
+        let mut shards = self
+            .routes
+            .iter()
+            .flat_map(|routes| routes.aggregate_command_shards(aggregate))
+            .map(|(command, shard)| (command.to_string(), shard))
+            .collect::<Vec<_>>();
+        shards.sort_by(|left, right| left.0.cmp(&right.0));
+        shards
+    }
+
     /// Attach Eventual projection metadata to a cell wait-path result using this
     /// process's command contract (no second aggregate write).
     #[cfg(feature = "graphql")]

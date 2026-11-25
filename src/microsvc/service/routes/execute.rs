@@ -9,6 +9,9 @@ use super::super::causal::{
     ExternalCausalAttempt, ExternalCausalReservation,
 };
 use super::super::handlers::{CausalCommandContext, CausalGuardFn, PreparedHandlerFn};
+use super::builder::CommandShard;
+#[cfg(feature = "graphql")]
+use super::erased::ErasedCommandShard;
 #[cfg(any(feature = "graphql", feature = "runtime-tokio"))]
 use super::erased::LedgerCompaction;
 use super::erased::{CausalCommandPolicy, CausalHandlerFuture, ErasedCausalHandler};
@@ -65,6 +68,9 @@ where
     /// The route declared [`Capability::Scheduling`](crate::schedule::Capability):
     /// only then may its handler stage schedule writes.
     requires_scheduling: bool,
+    /// The declared shard, over the wire input.
+    #[cfg(feature = "graphql")]
+    shard: Option<ErasedCommandShard>,
     /// Retryable, fail-closed bootstrap for the bound projector's complete
     /// model/table ownership inventory. `get_or_try_init` leaves the cell empty
     /// after a transient registration failure.
@@ -84,10 +90,29 @@ where
         handle: Arc<PreparedHandlerFn<A, I, K>>,
         requires_clock: bool,
         requires_scheduling: bool,
-    ) -> Result<Self, String> {
+        shard: Option<CommandShard<I>>,
+    ) -> Result<Self, String>
+    where
+        I: serde::de::DeserializeOwned + 'static,
+    {
+        #[cfg(not(feature = "graphql"))]
+        let _ = shard;
+        #[cfg(feature = "graphql")]
+        let shard = shard.map(|shard| {
+            let input = contract.input.clone();
+            Arc::new(move |wire: &Value| {
+                let (decoded, ..) = canonicalize_command_input(&input, wire.clone())
+                    .and_then(|canonical| canonical.decode::<I>())
+                    .map_err(|error| CausalDispatchError::BadRequest(error.to_string()))?
+                    .into_parts();
+                Ok(shard(&decoded))
+            }) as ErasedCommandShard
+        });
         Ok(Self {
             fingerprint: CommandContractFingerprint::new(contract.fingerprint_bytes()?),
             contract,
+            #[cfg(feature = "graphql")]
+            shard,
             guard,
             handle,
             requires_clock,
@@ -598,6 +623,16 @@ where
         &self.contract
     }
 
+    #[cfg(feature = "graphql")]
+    fn aggregate(&self) -> std::any::TypeId {
+        std::any::TypeId::of::<A>()
+    }
+
+    #[cfg(feature = "graphql")]
+    fn shard(&self) -> Option<ErasedCommandShard> {
+        self.shard.clone()
+    }
+
     fn dispatch_cell_causal<'a>(
         &'a self,
         dependencies: &'a D,
@@ -785,6 +820,7 @@ where
                 ReservationOutcome::Acquired(attempt) => {
                     Ok(ExternalCausalReservation::Acquired(ExternalCausalAttempt {
                         command_name: self.contract.name.clone(),
+                        output: self.contract.output.clone(),
                         attempt,
                         retention: policy.replay_retention,
                     }))

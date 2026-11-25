@@ -200,6 +200,8 @@ pub struct CausalDispatchResult {
 #[cfg(feature = "graphql")]
 pub(crate) struct ExternalCausalAttempt {
     pub(crate) command_name: String,
+    /// The command's declared output: a cell's payload must match it.
+    pub(crate) output: crate::command::CommandTypeDef,
     pub(crate) attempt: CommandAttempt,
     pub(crate) retention: Duration,
 }
@@ -238,7 +240,16 @@ impl ExternalCausalAttempt {
                 "cell wait-path returned a different causation ID".into(),
             ));
         }
-        Ok(())
+        // The cell's payload is the command's answer as-is: one that is not
+        // the declared output fails the dispatch, it is never completed.
+        crate::command::input::validate_command_output(&self.output, result.payload()).map_err(
+            |error| {
+                CausalDispatchError::Internal(format!(
+                    "cell wait-path payload for `{}` is not `{}`: {error}",
+                    self.command_name, self.output.name
+                ))
+            },
+        )
     }
 
     pub(crate) fn into_external_completion(

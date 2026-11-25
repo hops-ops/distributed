@@ -113,8 +113,16 @@ async fn live_todo_cell_create_complete_reopen_archive_and_isolate() {
     .await;
     assert_eq!(created.status(), 201, "{}", created.text().await.unwrap());
     let created: Value = created.json().await.unwrap();
-    assert_eq!(created["payload"]["id"], a);
-    assert_eq!(created["payload"]["status"], "open");
+    // The command's typed payload, as-is: `TodoCreatePayload`.
+    assert_eq!(
+        created["payload"],
+        serde_json::json!({
+            "todo_id": a,
+            "owner_id": "alice",
+            "title": "ship celld",
+            "status": "open",
+        })
+    );
     assert_eq!(
         created["receipt"]["commandId"],
         "0190a000-0000-7000-8000-000000000201"
@@ -362,7 +370,7 @@ async fn live_chat_cell_post_and_isolate() {
     let posted = send_through_dev_reload(
         trusted_cell_request(
             client
-                .post(format!("{base}/chat/{a}/chat.post"))
+                .post(format!("{base}/chat_message/{a}/chat.post"))
                 .header("x-user-id", "alice")
                 .header("x-roles", "user"),
         )
@@ -389,7 +397,7 @@ async fn live_chat_cell_post_and_isolate() {
     );
 
     let got: Value = send_through_dev_reload(
-        trusted_cell_request(client.get(format!("{base}/chat/{a}"))),
+        trusted_cell_request(client.get(format!("{base}/chat_message/{a}"))),
         "get chat message",
     )
     .await
@@ -401,7 +409,7 @@ async fn live_chat_cell_post_and_isolate() {
     assert_eq!(got["room_id"], "lobby");
 
     let other = send_through_dev_reload(
-        trusted_cell_request(client.get(format!("{base}/chat/{b}"))),
+        trusted_cell_request(client.get(format!("{base}/chat_message/{b}"))),
         "missing Chat cell",
     )
     .await;

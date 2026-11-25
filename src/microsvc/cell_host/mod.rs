@@ -10,8 +10,9 @@
 //! command declarations.
 //!
 //! The GraphQL wait-path (`CelldCommandHost`) is the same for every aggregate:
-//! routes only supply kind, shard, and payload. Aggregate Workers own outbox
-//! delivery through celld Queue.
+//! `route_aggregate::<A>()` derives the cell kind and shard from the commands
+//! mounted on the service, and the cell's payload is the command's typed
+//! answer. Aggregate Workers own outbox delivery through celld Queue.
 //!
 //! Durable storage is one SQLite database per cell: Durable Object
 //! `storage.sql` on celld (`cloudflare-workers`/wasm32, `sql_store.rs`). Durable
@@ -54,7 +55,7 @@ pub use celld_outbox::{
     CELLD_OUTBOX_DEFAULT_LEASE, CELLD_OUTBOX_DEFAULT_MAX_ATTEMPTS, CELLD_OUTBOX_DRAIN_INTERVAL_ENV,
 };
 #[cfg(feature = "graphql")]
-pub use command::{CelldCommandHost, CelldRoute};
+pub use command::CelldCommandHost;
 pub use internal_auth::{
     InternalHttpSecret, CELL_INTERNAL_SECRET_ENV, CELL_INTERNAL_SECRET_HEADER,
 };

@@ -13,13 +13,11 @@ use distributed::gateway::DeliveryCapabilities;
 use distributed::graphql::delivery::GatewayVersionStore;
 use distributed::graphql::IdentityConfig;
 use distributed::microsvc::{
-    spawn_service_consumer_loop, LifecycleGate, PostgresStores, Service, SqlStores, SqliteStores,
+    spawn_service_consumer_loop, LifecycleGate, PostgresStores, SqlStores, SqliteStores,
 };
 
 use crate::modules::graphql::build_graphql_engine_with_delivery;
-use crate::{
-    build_service, read_models, serve, spawn_scrape_loop, ZitadelScrapeConfig, E2E_UI_APPLICATION,
-};
+use crate::{build_service, read_models, serve, spawn_scrape_from_env, E2E_UI_APPLICATION};
 
 const BUS_GROUP: &str = "e2e-ui";
 
@@ -101,33 +99,9 @@ async fn host<St: SqlStores>(
             .with_lifecycle(lifecycle.clone())
             .with_bus(stores.bus(BUS_GROUP))
     });
-    spawn_zitadel_scrape(service.clone());
+    spawn_scrape_from_env(service.clone());
 
     eprintln!("e2e-ui ({backend}) listening on http://{}", options.bind);
     serve(service, &options).await?;
     Ok(())
-}
-
-fn spawn_zitadel_scrape(service: Arc<Service>) {
-    match ZitadelScrapeConfig::from_env() {
-        Some(cfg) if cfg.background_enabled() || cfg.on_start => {
-            eprintln!(
-                "zitadel scrape: enabled (api={}, interval={}s, on_start={})",
-                cfg.api_base,
-                cfg.interval.as_secs(),
-                cfg.on_start
-            );
-            spawn_scrape_loop(service, cfg);
-        }
-        Some(_) => {
-            eprintln!(
-                "zitadel scrape: credentials present, background off (interval=0); use POST /zitadel.scrape.v1"
-            );
-        }
-        None => {
-            eprintln!(
-                "zitadel scrape: disabled (set ZITADEL_SERVICE_USER_TOKEN + OIDC_ISSUER/ZITADEL_API_URL)"
-            );
-        }
-    }
 }
