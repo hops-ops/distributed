@@ -138,6 +138,14 @@ export class Overlay implements CacheGraph {
 		return this.indexes.has(key) ? this.indexes.get(key) : this.#base.index(key);
 	}
 
+	provisional(key: RecordKey): boolean {
+		// Only a layer can make a record visible that the base does not hold.
+		const visible = this.records.get(key);
+		if (visible === undefined || visible.tombstoned) return false;
+		const base = this.#base.record(key);
+		return base === undefined || base.tombstoned;
+	}
+
 	*indexKeys(): Iterable<IndexKey> {
 		yield* this.#base.indexKeys();
 		for (const key of this.indexes.keys()) {
@@ -332,6 +340,12 @@ export function graphReader(
 			const record = graph.record(key);
 			if (!record || record.tombstoned || !record.links.has(name)) return ABSENT;
 			return Object.freeze({ present: true, value: record.links.get(name)! });
+		},
+		provisional(key: RecordKey): boolean {
+			// Layer changes and base writes both mark every record they touch
+			// changed under this dependency.
+			dependencies?.add(recordWildcardDependency(key));
+			return graph.provisional?.(key) ?? false;
 		},
 		record(key: RecordKey): SparseRecord | undefined {
 			dependencies?.add(recordWildcardDependency(key));

@@ -376,13 +376,36 @@ import { Todos, useCommands } from '$distributed';
 const todos = Todos.use(); // generated @live attaches automatically
 const commands = useCommands();
 
-await commands.todo.create({ title: 'Ship it' });
-// $todos.data, $todos.status, $todos.pending
+const call = commands.todo.create({ title: 'Ship it' });
+call.input.todo_id; // generated now, before the server answers
+await call;
+// $todos.data, $todos.status, $todos.pending.has(row)
 ```
 
-When the Rust command declaration supplies a UUIDv7, ULID, or literal input
-default, generation makes that field optional and the runtime fills it exactly
-once. Components do not generate IDs or maintain optimistic/cache recipes.
+When the Rust command declaration supplies a `uuid_v7()`, `ulid()` or `now()`
+input default, generation makes that field optional and the runtime fills it
+exactly once. A call returns a promise of its receipt that also carries its
+`commandId` and the `input` it sends, defaults included, synchronously. The lazy
+command catalog carries the defaults too, so this holds before the command
+module loads. Components do not generate IDs or maintain optimistic/cache
+recipes.
+
+`now()` is unix milliseconds as a decimal string. The client value previews
+the optimistic row; the server always replaces it with its own host clock
+before decoding the input, so a client clock never becomes a stored ordering
+key. Retries of one command id keep their idempotency: the ledger hashes the
+submitted input, not the stamp.
+
+`$query.pending` is the set of provisional rows in the current snapshot: rows
+that exist only as an unsettled command's preview, because the server has not
+returned them yet (a create in flight). Commands on such a row would fail, so a
+page marks and disables it. A command that edits a row the server already
+returned shows its preview but never makes the row pending.
+`pending.has(row)` takes an object from the same snapshot's `data`;
+`pending.size` counts them. A row leaves the set as soon as the server row
+reaches the replica (by a live frame or a refetch), or when the command fails
+and its preview is rolled back. A typed result never contains a partially shaped object: an object
+missing a selected field is absent and the snapshot is incomplete.
 
 `@load` results are normalized on the server, dehydrated, and restored in the
 browser without a duplicate first request. Hydration cannot authorize itself:
@@ -648,8 +671,9 @@ frame, or optimistic command can update every affected view in one transaction.
 Generated `createCommands` binds the service-owned command artifacts to the
 same replica and GraphQL transport. A command call:
 
-1. validates and freezes its typed input;
-2. fills generated UUIDv7, ULID, or literal defaults exactly once;
+1. fixes its command id and fills generated `uuid_v7()`, `ulid()` and
+   `now()` defaults exactly once, returning both synchronously on the call;
+2. validates and freezes its typed input;
 3. applies the generated optimistic effect transaction (from `.applies` /
    portable mutation IR — works for **Eventual and Direct** when fields are known);
 4. dispatches the exact compiler-owned mutation;

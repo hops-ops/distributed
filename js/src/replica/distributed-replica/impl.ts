@@ -24,6 +24,7 @@ import {
 } from '../../protocol.js';
 import {
 	replicaCommandAuthority,
+	replicaCommandAwaitsFetch,
 	replicaCommandDirectProjection,
 	replicaCommandFreshness,
 	replicaCommandProjectionDelta,
@@ -304,6 +305,20 @@ export class DistributedReplicaImpl implements DistributedReplicaApi {
 		}
 		if (pending.length + minimum.length > 256) throw new Error('causal delivery context exceeds bounded evidence budget');
 		return Object.freeze({ version: 1, schemaHash: scope.schemaHash, protocolHash, authorizationGeneration: scope.authorizationGeneration, cacheScope: scope.cacheScope, pending, minimum });
+	}
+
+	[replicaCommandAwaitsFetch](
+		commandId: string,
+		plan: ReplicaRevalidationPlan
+	): boolean {
+		if (!this.#engine.optimisticLayerProvisional(commandId)) return false;
+		const matches = createReplicaRevalidationMatcher(plan);
+		for (const watch of this.#live.watchedOperations()) {
+			if (matches(watch.artifact) && this.#live.streaming(watch.key)) {
+				return false;
+			}
+		}
+		return true;
 	}
 
 	[replicaResultObservation](

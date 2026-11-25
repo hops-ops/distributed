@@ -79,7 +79,12 @@ const client = createDistributedSvelteKit({
 const todos = client.operation(Todos).use({}, { live: true });
 const selected = client.operation(TodoById).use({ id: 'todo-1' });
 selected.data.todo?.status;
-todos.pending.map((receipt) => receipt.status());
+const pendingTodo: boolean = todos.pending.has(todos.data.todos?.[0]);
+const pendingCount: number = todos.pending.size;
+void pendingTodo;
+void pendingCount;
+// @ts-expect-error Pending rows are a membership set, not a receipt list.
+todos.pending.map((receipt) => receipt);
 client.retainLocation(
 	{ id: 'active-page', pathname: '/todos/todo-1', kind: 'page' },
 	{ search: new URLSearchParams(), session: null, props: {} }

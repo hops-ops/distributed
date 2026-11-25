@@ -7,14 +7,37 @@ import {
 	type RuntimeObjectSelection,
 	type RuntimeRootSelection
 } from './selection.js';
-import type { ReplicaOperationArtifact, ReplicaSparse } from './types.js';
+import type {
+	ReplicaOperationArtifact,
+	ReplicaPendingRows,
+	ReplicaSparse
+} from './types.js';
 
 export type MaterializedReplicaResult<TData> = {
 	readonly data: ReplicaSparse<TData>;
 	readonly complete: boolean;
 	readonly stale: boolean;
+	/** Result objects that exist only through an unsettled command. */
+	readonly pending: ReplicaPendingRows;
 	readonly identitySignature: string;
 };
+
+const NO_PENDING_ROWS: ReplicaPendingRows = Object.freeze({
+	size: 0,
+	has: () => false
+});
+
+function pendingRows(rows: WeakSet<object>, size: number): ReplicaPendingRows {
+	if (size === 0) return NO_PENDING_ROWS;
+	return Object.freeze({
+		size,
+		has: (row: unknown) =>
+			row !== null && typeof row === 'object' && rows.has(row)
+	});
+}
+
+/** Collects the provisional objects of one materialization. */
+type PendingCollector = { readonly rows: WeakSet<object>; size: number };
 
 type MaterializedObject = {
 	value?: Readonly<Record<string, unknown>>;
@@ -45,12 +68,13 @@ export function materializeReplicaOperation<
 	let complete = true;
 	let stale = false;
 	const signatures: string[] = [];
+	const pending: PendingCollector = { rows: new WeakSet(), size: 0 };
 	for (const artifactRoot of artifact.roots) {
 		const root = runtimeRoot(artifactRoot);
 		const argumentsValue = resolveArguments(root.arguments, variables, root.coverage);
 		const indexKey = replicaIndexKey({ field: root.field, arguments: argumentsValue });
 		const index = reader.index(indexKey);
-		const branch = materializeBranch(reader, root, index, variables);
+		const branch = materializeBranch(reader, root, index, variables, pending);
 		if (branch.present) {
 			defineOutputValue(output, root.responseKey, branch.value);
 		}
@@ -62,6 +86,7 @@ export function materializeReplicaOperation<
 		data: Object.freeze(output) as ReplicaSparse<TData>,
 		complete,
 		stale,
+		pending: pendingRows(pending.rows, pending.size),
 		identitySignature: signatures.join('|')
 	});
 }
@@ -70,7 +95,8 @@ function materializeBranch(
 	reader: CacheReader,
 	selection: RuntimeBranchSelection,
 	index: CacheIndex | undefined,
-	variables: GraphqlVariables
+	variables: GraphqlVariables,
+	pending: PendingCollector
 ): MaterializedBranch {
 	if (!index || !index.metadata) {
 		return {
@@ -118,7 +144,7 @@ function materializeBranch(
 				identitySignature: `missing-record:${index.metadata.staleReason ?? ''}`
 			};
 		}
-		const object = materializeObject(reader, selection.selection, key, variables);
+		const object = materializeObject(reader, selection.selection, key, variables, pending);
 		return {
 			value: object.value,
 			present: object.value !== undefined,
@@ -133,7 +159,7 @@ function materializeBranch(
 	let childrenStale = false;
 	const signatures: string[] = [];
 	for (const key of index.records) {
-		const object = materializeObject(reader, selection.selection, key, variables);
+		const object = materializeObject(reader, selection.selection, key, variables, pending);
 		if (object.value !== undefined) values.push(object.value);
 		else childrenComplete = false;
 		childrenComplete &&= object.complete;
@@ -153,7 +179,8 @@ function materializeObject(
 	reader: CacheReader,
 	selection: RuntimeObjectSelection,
 	key: string,
-	variables: GraphqlVariables
+	variables: GraphqlVariables,
+	pending: PendingCollector
 ): MaterializedObject {
 	const record = reader.recordMeta(key);
 	if (!record) {
@@ -186,7 +213,8 @@ function materializeObject(
 			key,
 			record.incarnation,
 			member,
-			variables
+			variables,
+			pending
 		);
 		if (member.expose !== false && branchResult.present) {
 			defineOutputValue(output, member.responseKey, branchResult.value);
@@ -196,12 +224,20 @@ function materializeObject(
 		nestedSignatures.push(`${member.field}:${branchResult.identitySignature}`);
 	}
 
-	return {
-		value: Object.freeze(output),
-		complete,
-		stale,
-		identitySignature: `${key}@${record.incarnation}[${nestedSignatures.join('|')}]`
-	};
+	const provisional = reader.provisional(key);
+	const identitySignature = `${key}@${record.incarnation}${provisional ? '~' : ''}[${nestedSignatures.join('|')}]`;
+	/*
+	 * A typed result never carries a partially shaped object: an object missing
+	 * a selected field (an optimistic row still waiting for a value, a record
+	 * fetched by a narrower selection) is absent and its parent incomplete.
+	 */
+	if (!complete) return { complete, stale, identitySignature };
+	const value = Object.freeze(output);
+	if (provisional) {
+		pending.rows.add(value);
+		pending.size += 1;
+	}
+	return { value, complete, stale, identitySignature };
 }
 
 function materializeNestedBranch(
@@ -209,7 +245,8 @@ function materializeNestedBranch(
 	parentKey: string,
 	parentIncarnation: string,
 	selection: RuntimeObjectBranch,
-	variables: GraphqlVariables
+	variables: GraphqlVariables,
+	pending: PendingCollector
 ): MaterializedBranch {
 	const argumentsValue = resolveArguments(
 		selection.arguments,
@@ -245,7 +282,7 @@ function materializeNestedBranch(
 			identitySignature: `parent-incarnation-mismatch:${parentIncarnation}`
 		};
 	}
-	return materializeBranch(reader, selection, index, variables);
+	return materializeBranch(reader, selection, index, variables, pending);
 }
 
 function defineOutputValue(

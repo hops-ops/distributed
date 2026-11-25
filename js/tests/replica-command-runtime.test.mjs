@@ -7,6 +7,7 @@ import { createCacheEngine } from '../dist/internal/cache-engine.js';
 import { createReplicaCommandRuntime, ReplicaCommandRuntimeError } from '../dist/replica/index.js';
 import {
 	replicaCommandAuthority,
+	replicaCommandAwaitsFetch,
 	replicaCommandDirectProjection,
 	replicaCommandProjectionDelta
 } from '../dist/replica/command-runtime/symbols.js';
@@ -897,6 +898,170 @@ test('generated command runtime retains an accepted projection until a matching 
 	watch.destroy();
 });
 
+// A created row (`todo-2`) the base does not hold yet, proven by its receipt
+// or by a later status read. `race` lets a refetch store the server row
+// before the receipt arrives; `live` keeps an open stream covering the list.
+async function provenCreate({ via, race = false, live = false }) {
+	const BASE = { id: 'todo-1', title: 'base', status: 'open' };
+	const SERVER = { id: 'todo-2', title: 'server', status: 'open' };
+	// Each query answers with the rows it is given when the test releases it.
+	const fetches = [];
+	let liveObserver;
+	const replica = createDistributedReplica({
+		transport: {
+			fetch() {
+				let resolve;
+				const response = new Promise((settle) => (resolve = settle));
+				fetches.push((rows, position) =>
+					resolve(commandFrame(CommandTodos, rows, { position }))
+				);
+				return response;
+			},
+			...(live
+				? {
+						subscribe(_request, observer) {
+							liveObserver = observer;
+							return () => undefined;
+						}
+					}
+				: {})
+		}
+	});
+	replica.writeResult(
+		CommandTodos,
+		{},
+		commandFrame(CommandTodos, [BASE]),
+		'network'
+	);
+	const watch = replica.watch(CommandTodos, {}, live ? { live: true } : {});
+	if (live) assert.ok(liveObserver, 'live stream must be open');
+	const observed = (metadata) =>
+		Object.freeze({
+			...metadata,
+			observations: Object.freeze(
+				metadata.expects.map((expectation) =>
+					Object.freeze({
+						...expectation,
+						causationId: metadata.causationId
+					})
+				)
+			)
+		});
+	let respond;
+	let metadata;
+	const runtime = createReplicaCommandRuntime(
+		replica,
+		{
+			dispatch(request) {
+				return new Promise((resolve) => {
+					respond = () => {
+						metadata = commandMetadata(request, {
+							model: TodoModel,
+							actualTitle: 'server'
+						});
+						resolve(
+							envelope(request, {
+								command: via === 'receipt' ? observed(metadata) : metadata
+							})
+						);
+					};
+				});
+			},
+			status(request) {
+				return Promise.resolve(statusEnvelope(request, observed(metadata)));
+			}
+		},
+		{ change: artifact({ model: TodoModel }) },
+		{ status: STATUS }
+	);
+	const call = runtime.commands.change(
+		{ id: 'todo-2', title: 'server' },
+		{ commandId: COMMAND_A }
+	);
+	await new Promise((resolve) => setImmediate(resolve));
+	assert.ok(respond, 'dispatch must be in flight');
+	// Queries started before the proof answer now; under `race` the server
+	// row reaches the base this way, before the receipt does.
+	for (const release of fetches.splice(0)) {
+		release(race ? [BASE, SERVER] : [BASE], '2');
+	}
+	await new Promise((resolve) => setImmediate(resolve));
+	respond();
+	const receipt = await call;
+	assert.equal(receipt.state, 'succeeded_pending_projection');
+	// Let the receipt, or the status monitor's first read, prove it.
+	await new Promise((resolve) => setTimeout(resolve, 100));
+	const layerRetained = () => {
+		try {
+			replica.createOptimisticLayer(COMMAND_A, () => undefined);
+		} catch {
+			return true;
+		}
+		replica.rejectOptimisticLayer(COMMAND_A);
+		return false;
+	};
+	/** Queries started after the proof. */
+	const refetches = fetches;
+	const serve = () => refetches[0]([BASE, SERVER], '3');
+	return { watch, runtime, receipt, refetches, serve, layerRetained };
+}
+
+for (const via of ['receipt', 'status']) {
+	test(`a created row proven by its ${via} retires through a fetch without live delivery`, async () => {
+		// No live stream will ever deliver the row, so only a query started
+		// after the proof can bring it into the base and retire the layer.
+		const { watch, runtime, receipt, refetches, serve, layerRetained } =
+			await provenCreate({ via });
+		try {
+			assert.equal(refetches.length, 1);
+			// Until that fetch lands, the layer (and its preview) stays.
+			assert.equal(layerRetained(), true);
+			serve();
+			assert.equal((await receipt.projected).state, 'atomic');
+			assert.equal(layerRetained(), false);
+			assert.equal(watch.get().data.todos[1].title, 'server');
+			assert.equal(watch.get().pending.size, 0);
+			assert.equal(refetches.length, 1);
+		} finally {
+			runtime.dispose();
+			watch.destroy();
+		}
+	});
+
+	test(`a created row proven by its ${via} waits for an open live stream instead of fetching`, async () => {
+		const { watch, runtime, refetches, layerRetained } = await provenCreate({
+			via,
+			live: true
+		});
+		try {
+			// The stream will deliver the authoritative frame: no command-
+			// triggered query races sibling commands.
+			assert.equal(refetches.length, 0);
+			assert.equal(layerRetained(), true);
+		} finally {
+			runtime.dispose();
+			watch.destroy();
+		}
+	});
+}
+
+test('a created row a refetch already stored before its receipt is neither pending nor refetched', async () => {
+	const { watch, runtime, refetches } = await provenCreate({
+		via: 'receipt',
+		race: true
+	});
+	try {
+		// The base holds the server row, so the row is usable at once and the
+		// exact delta needs no further fetch.
+		assert.equal(refetches.length, 0);
+		assert.equal(watch.get().pending.size, 0);
+		assert.equal(watch.get().data.todos[1].title, 'server');
+	} finally {
+		runtime.dispose();
+		watch.destroy();
+	}
+});
+
 test('artifact v1 is rejected at the public boundary', () => {
 	assert.throws(
 		() =>
@@ -1447,6 +1612,11 @@ test('draining lifecycle live frames keep polling while pending and retire only 
 			},
 			status(request) {
 				statusCalls += 1;
+				// Status is durable and monotonic: a poll issued after the terminal
+				// frame can never report the earlier state. Polls back off on a
+				// timer (25 ms, then 75 ms, ...), so one may land while this test
+				// drives the live frames; hold it so it cannot race them.
+				if (terminalObserved) return new Promise(() => undefined);
 				return Promise.resolve(
 					statusEnvelope(
 						request,
@@ -3447,4 +3617,119 @@ test('offline outbox: optimistic command waits offline, drains in order and surf
 	assert.equal(factory.store('runtime-outbox', 'command-outbox').size, 0);
 	runtime.dispose();
 	persistence.close();
+});
+
+const ID_DEFAULT = Object.freeze({
+	version: 1,
+	defaults: Object.freeze([
+		Object.freeze({ path: Object.freeze(['id']), generator: 'uuid_v7' })
+	])
+});
+const UUID_V7 = /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+
+test('a command call holds its command id and generated input before dispatch settles', async () => {
+	const replica = new TestReplica();
+	const requests = [];
+	const runtime = createReplicaCommandRuntime(
+		replica,
+		{ dispatch: async (request) => (requests.push(request), envelope(request)) },
+		{ change: Object.freeze({ ...artifact(), inputDefaults: ID_DEFAULT }) }
+	);
+	const call = runtime.commands.change({ title: 'drafted' });
+	assert.match(call.commandId, UUID_V7);
+	assert.match(call.input.id, UUID_V7);
+	assert.equal(call.input.title, 'drafted');
+	assert.ok(Object.isFrozen(call));
+	// The preview row is keyed by the id the caller already holds.
+	assert.equal(replica.record(call.input.id).fields.title, 'drafted');
+	const receipt = await call;
+	assert.equal(receipt.commandId, call.commandId);
+	assert.equal(requests[0].variables.commandId, call.commandId);
+	assert.equal(requests[0].variables.input.id, call.input.id);
+
+	// An explicit value is sent as given and never regenerated.
+	const explicit = runtime.commands.change(
+		{ id: 'todo-9', title: 'mine' },
+		{ commandId: COMMAND_B }
+	);
+	assert.equal(explicit.commandId, COMMAND_B);
+	assert.equal(explicit.input.id, 'todo-9');
+	await explicit;
+	assert.equal(requests[1].variables.input.id, 'todo-9');
+	runtime.dispose();
+});
+
+test('a failed call rejects and leaves no provisional row behind', async () => {
+	const replica = new TestReplica();
+	const runtime = createReplicaCommandRuntime(
+		replica,
+		{ dispatch: async () => ({ status: 503, errors: [{ message: 'down' }] }) },
+		{ change: Object.freeze({ ...artifact(), inputDefaults: ID_DEFAULT }) }
+	);
+	const call = runtime.commands.change({ title: 'doomed' });
+	assert.ok(replica.layer(call.commandId), 'the preview exists while in flight');
+	await assert.rejects(call);
+	assert.equal(replica.layer(call.commandId), undefined);
+	assert.equal(replica.record(call.input.id), undefined);
+	runtime.dispose();
+});
+
+test('lazy commands generate catalog defaults before their code loads', async () => {
+	const replica = new TestReplica();
+	const gate = deferred();
+	const requests = [];
+	const runtime = createLazyReplicaCommandRuntime(
+		replica,
+		{
+			dispatch: async (request) => (requests.push(request), envelope(request)),
+			status: async () => { throw new Error('not requested'); }
+		},
+		{
+			commands: {
+				'todo.upsert': {
+					operationHash: HASH_A,
+					hasInput: true,
+					inputDefaults: ID_DEFAULT.defaults
+				}
+			},
+			status: STATUS
+		},
+		() => gate.promise
+	);
+	const call = runtime.commands.todo.upsert({ title: 'early' });
+	assert.match(call.commandId, UUID_V7);
+	assert.match(call.input.id, UUID_V7);
+	gate.resolve({
+		entries: {
+			'todo.upsert': Object.freeze({ ...artifact(), inputDefaults: ID_DEFAULT })
+		}
+	});
+	await call;
+	assert.equal(requests[0].variables.commandId, call.commandId);
+	assert.equal(requests[0].variables.input.id, call.input.id);
+	runtime.dispose();
+});
+
+test('lazy catalog defaults must match the loaded command', async () => {
+	const replica = new TestReplica();
+	const runtime = createLazyReplicaCommandRuntime(
+		replica,
+		{
+			dispatch: async () => { throw new Error('not dispatched'); },
+			status: async () => { throw new Error('not requested'); }
+		},
+		{
+			commands: {
+				'todo.upsert': {
+					operationHash: HASH_A,
+					hasInput: true,
+					inputDefaults: ID_DEFAULT.defaults
+				}
+			},
+			status: STATUS
+		},
+		async () => ({ entries: { 'todo.upsert': artifact() } })
+	);
+	await assert.rejects(runtime.preload(), /does not match its catalog/);
+	runtime.dispose();
 });

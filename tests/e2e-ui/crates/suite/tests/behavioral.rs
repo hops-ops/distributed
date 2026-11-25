@@ -660,11 +660,16 @@ async fn t9_chat_room_partition_projects_posted_message() {
     let base = ensure_target().await;
     let message_id = id("chat");
     let room_id = id("room");
-    let created_at = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_millis()
-        .to_string();
+    let now_ms = || {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis()
+    };
+    // `created_at` is a `now()` default: whatever the caller sends (here a
+    // value from 1970) only previews; the server stamps its own clock.
+    let created_at = "1";
+    let before = now_ms();
     let command_id = new_command_id();
     let mutation = format!(
         r#"mutation {{
@@ -704,6 +709,18 @@ async fn t9_chat_room_partition_projects_posted_message() {
     assert_eq!(projected["room_id"], room_id);
     assert_eq!(projected["author_id"], "alice");
     assert_eq!(projected["body"], "partitioned hello");
+    let stored: u128 = projected["created_at"]
+        .as_str()
+        .and_then(|value| value.parse().ok())
+        .expect("created_at is canonical unix milliseconds");
+    assert!(
+        (before.saturating_sub(5_000)..=now_ms() + 5_000).contains(&stored),
+        "server must stamp created_at, got {stored}"
+    );
+    assert_eq!(
+        response["data"]["chat_messages_post"]["created_at"], projected["created_at"],
+        "the command payload carries the stamped value"
+    );
 }
 
 #[tokio::test]

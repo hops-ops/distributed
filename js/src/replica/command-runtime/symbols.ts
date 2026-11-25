@@ -34,10 +34,6 @@ export const replicaCommandDirectProjection = Symbol(
 export const replicaCommandProjectionDelta = Symbol(
 	'distributed.replica.command-projection-delta'
 );
-/** @internal Package-private; intentionally absent from the public barrel. */
-export const replicaCommandProjectedLifecycle = Symbol(
-	'distributed.replica.command-projected-lifecycle'
-);
 /**
  * Package-private live-record field read for pure reduce optimism.
  * Returns undefined when the record is not present (fail closed).
@@ -50,3 +46,15 @@ export const replicaCommandReadRecord = Symbol(
 
 /** @internal Generated dependency registration before dispatch/optimism. */
 export const replicaCommandFreshness = Symbol('distributed.replica.command-freshness');
+
+/**
+ * Package-private retirement question implemented by DistributedReplica:
+ * whether a command's proven layer can only retire through a fetch, because
+ * it shows a row the base does not hold yet and no open live stream covers
+ * the command's revalidation plan to deliver that row.
+ *
+ * @internal
+ */
+export const replicaCommandAwaitsFetch = Symbol(
+	'distributed.replica.command-awaits-fetch'
+);

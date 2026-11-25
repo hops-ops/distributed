@@ -75,6 +75,7 @@ impl CommandInputDefaults {
 enum InputDefaultGenerator {
     UuidV7,
     Ulid,
+    Now,
 }
 
 struct InputDefault {
@@ -103,10 +104,11 @@ impl InputDefault {
         let generator = match generator.to_string().as_str() {
             "uuid_v7" => InputDefaultGenerator::UuidV7,
             "ulid" => InputDefaultGenerator::Ulid,
+            "now" => InputDefaultGenerator::Now,
             _ => {
                 return Err(syn::Error::new(
                     generator.span(),
-                    "unknown input-default generator; expected uuid_v7() or ulid()",
+                    "unknown input-default generator; expected uuid_v7(), ulid() or now()",
                 ));
             }
         };
@@ -127,6 +129,9 @@ impl InputDefault {
             },
             InputDefaultGenerator::Ulid => quote! {
                 #framework::command::__input_default_ulid::<#input, #marker>()
+            },
+            InputDefaultGenerator::Now => quote! {
+                #framework::command::__input_default_now::<#input, #marker>()
             },
         }
     }

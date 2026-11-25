@@ -756,7 +756,8 @@ export function snapshotFrom<TData>(
 		stale: materialized.stale,
 		complete: materialized.complete,
 		errors: state.errors,
-		live: state.live
+		live: state.live,
+		pending: materialized.pending
 	});
 	// `materializeReplicaOperation` only reports complete after every generated
 	// selection is present; that runtime invariant is what promotes sparse data
@@ -775,7 +776,8 @@ export function snapshotEqual<TData>(
 		left.stale === right.stale &&
 		left.complete === right.complete &&
 		left.errors === right.errors &&
-		left.live === right.live
+		left.live === right.live &&
+		left.pending === right.pending
 	);
 }
 

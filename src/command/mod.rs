@@ -34,7 +34,7 @@ pub(crate) use direct_projection::{
 };
 // Public seams used by derives / `command_input_defaults!` only.
 pub use effect_wire::{
-    __command_input_defaults, __input_default_ulid, __input_default_uuid_v7,
+    __command_input_defaults, __input_default_now, __input_default_ulid, __input_default_uuid_v7,
     CombineEffectNullability, CommandInputDefault, CompiledInputDefault, CompiledInputDefaults,
     EffectInputDescendableKind, EffectInputFieldMarker, EffectInputObjectKind, EffectInputPath,
     EffectInputPathKind, EffectInputTerminalKind, EffectModelFieldMarker, EffectNullable,

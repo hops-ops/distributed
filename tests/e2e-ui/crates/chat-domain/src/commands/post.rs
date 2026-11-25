@@ -1,5 +1,6 @@
 use distributed::command;
 use distributed::command::{Eventual, PreparedCommand};
+use distributed::command_input_defaults;
 use distributed::microsvc::{guards, CausalCommandContext, HandlerError};
 use serde::{Deserialize, Serialize};
 
@@ -10,8 +11,9 @@ pub struct ChatPostInput {
     pub message_id: String,
     pub body: String,
     pub room_id: String,
-    /// Client-generated unix milliseconds used by the optimistic row and
-    /// accepted only when it is close to server time.
+    /// Unix milliseconds. Declared `now()`: the client's value only previews
+    /// the optimistic row; the server stamps its own clock before this
+    /// handler runs, so the stored ordering key is never the caller's.
     pub created_at: String,
 }
 
@@ -29,7 +31,6 @@ pub async fn handle_post(
     input: ChatPostInput,
 ) -> Result<PreparedCommand<Eventual<ChatPostPayload>>, HandlerError> {
     let author = ctx.user_id()?.to_string();
-    let created_at = canonical_near_unix_millis(&input.created_at)?;
     let repo = ctx.repo();
 
     if repo.get(&input.message_id).await?.is_some() {
@@ -46,7 +47,7 @@ pub async fn handle_post(
             &input.room_id,
             &author,
             &input.body,
-            &created_at,
+            &input.created_at,
         )
         .map_err(HandlerError::rejected)?;
 
@@ -60,37 +61,6 @@ pub async fn handle_post(
             body: state.body,
             created_at: state.created_at,
         })
-}
-
-/// Accept a client timestamp only when it is canonical unix milliseconds
-/// within five minutes of server time.
-///
-/// `wasm32-unknown-unknown` has no `SystemTime::now` (cell hosts). There the
-/// value must still be canonical digits; the GraphQL wait-path already
-/// accepted it on the native host.
-pub fn canonical_near_unix_millis(value: &str) -> Result<String, HandlerError> {
-    let millis = value
-        .parse::<u128>()
-        .map_err(|_| HandlerError::rejected("created_at must be canonical unix milliseconds"))?;
-    if millis.to_string() != value {
-        return Err(HandlerError::rejected(
-            "created_at must be canonical unix milliseconds within five minutes of server time",
-        ));
-    }
-    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
-    {
-        use std::time::{SystemTime, UNIX_EPOCH};
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis();
-        if millis.abs_diff(now) > 300_000 {
-            return Err(HandlerError::rejected(
-                "created_at must be canonical unix milliseconds within five minutes of server time",
-            ));
-        }
-    }
-    Ok(value.to_string())
 }
 
 command! {
@@ -109,6 +79,11 @@ command! {
     ),
     guard: guards::authenticated,
     handle: handle_post,
+    defaults: command_input_defaults! {
+        input: ChatPostInput;
+        default input.message_id = uuid_v7();
+        default input.created_at = now();
+    },
 }
 
 #[cfg(test)]
@@ -116,12 +91,6 @@ mod tests {
     use super::*;
     use distributed::microsvc::Routes;
     use distributed::{AggregateBuilder, InMemoryRepository};
-
-    #[test]
-    fn created_at_rejects_non_canonical() {
-        assert!(canonical_near_unix_millis("not-a-time").is_err());
-        assert!(canonical_near_unix_millis("01").is_err());
-    }
 
     #[test]
     fn declaration_mounts_without_host_specific_dependencies() {

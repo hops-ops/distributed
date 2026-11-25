@@ -199,6 +199,7 @@ export type {
 	ReplicaRootSelection,
 	ReplicaScalarSelection,
 	ReplicaSelectionStorage,
+	ReplicaPendingRows,
 	ReplicaSparse,
 	ReplicaSnapshot,
 	ReplicaStatus,

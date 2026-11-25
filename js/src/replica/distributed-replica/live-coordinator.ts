@@ -182,6 +182,11 @@ export class LiveCoordinator {
 		return state;
 	}
 
+	/** Whether an operation's live stream is open and delivering frames. */
+	streaming(key: string): boolean {
+		return this.#queryStates.get(key)?.live === 'active';
+	}
+
 	/** The query state an operation has, if anything created one. */
 	peekState(key: string): QueryState | undefined {
 		return this.#queryStates.get(key);

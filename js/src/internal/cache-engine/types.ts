@@ -112,6 +112,13 @@ export type BaseRecordClock = {
 
 export interface CacheReader {
 	recordMeta(key: RecordKey): SparseRecordMeta | undefined;
+	/**
+	 * Whether this record is visible only through an optimistic layer: an
+	 * unsettled command created it and the base (server data) does not hold
+	 * it yet. A layer that edits a record the base holds does not make it
+	 * provisional.
+	 */
+	provisional(key: RecordKey): boolean;
 	field(key: RecordKey, name: string): CachePresence<CacheValue>;
 	link(key: RecordKey, name: string): CachePresence<RecordLink>;
 	record(key: RecordKey): SparseRecord | undefined;
@@ -265,6 +272,8 @@ export interface CacheEngine {
 	): T;
 	rejectOptimisticLayer(id: string): boolean;
 	optimisticLayerState(id: string): OptimisticLayerState | undefined;
+	/** Whether this layer shows a record the base does not hold yet. */
+	optimisticLayerProvisional(id: string): boolean;
 	/** How many confirmed records are held, tombstones included. */
 	readonly recordCount: number;
 	extract(): CacheEngineSnapshot;
@@ -352,6 +361,8 @@ export type CacheGraph = {
 	record(key: RecordKey): VisibleRecord | undefined;
 	index(key: IndexKey): VisibleIndex | undefined;
 	indexKeys(): Iterable<IndexKey>;
+	/** Only an optimistic overlay holds provisional records. */
+	provisional?(key: RecordKey): boolean;
 };
 
 export type Watcher<T = unknown> = {

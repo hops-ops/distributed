@@ -162,11 +162,13 @@ const todos = $derived($query.complete ? $query.data.todos : []);`
 			samples: [
 				{
 					file: 'routes/todos/+page.svelte',
-					caption: 'Call the generated command. The replica cache updates the UI. Do not change local component state for this list.',
+					caption: 'Call the generated command. `todo_id` is a `uuid_v7()` input default. The replica cache updates the UI, and `$query.pending.has(row)` marks a preview until the server row replaces it. Do not keep local pending state for this list.',
 					code: `const commands = useCommands();
 
 await commands.todo.create({ title: text });
-await commands.todo.complete({ todo_id });`
+await commands.todo.complete({ todo_id });
+
+{@const saving = $query.pending.has(t)}`
 				},
 				{
 					file: 'todo-domain/src/commands/complete.rs',
@@ -487,16 +489,12 @@ const livePage = $derived.by(() => {
 			samples: [
 				{
 					file: 'routes/chat/+page.svelte',
-					caption: 'The shared replica cache feeds every bound view. Wait on `receipt.projected` for the obligation.',
+					caption: '`message_id` (`uuid_v7()`) and `created_at` (`now()`) are input defaults. The preview shows this client\'s clock; the server stamps its own and that row replaces the preview. A row is Sent while `$lobby.pending.has(m)`, then Delivered.',
 					code: `const commands = useCommands();
-const receipt = await commands.chat.post({
-  message_id,
-  body,
-  room_id: LOBBY_ROOM,
-  created_at: String(now),
-});
-if (receipt.projected !== undefined) {
-  await receipt.projected;
+await commands.chat.post({ body, room_id: LOBBY_ROOM });
+
+function deliveryLabel(m: ChatMsg) {
+  return $lobby.pending.has(m) ? 'sent' : 'delivered';
 }`
 				},
 				{
@@ -520,13 +518,12 @@ export type GeneratedCommands = Readonly<Record<never, never>>;`
 			samples: [
 				{
 					file: 'chat-domain/src/commands/post.rs · handle_post',
-					caption: 'Get the principal. Reject a duplicate id. Create the aggregate. Call `post`. Commit Eventual.',
+					caption: 'Get the principal. Reject a duplicate id. Create the aggregate. Call `post`. Commit Eventual. `created_at` is already the host clock: the server overwrites the `now()` default before the handler runs.',
 					code: `pub async fn handle_post(
   ctx: &CausalCommandContext<'_, ChatMessage>,
   input: ChatPostInput,
 ) -> Result<PreparedCommand<Eventual<ChatPostPayload>>, HandlerError> {
   let author = principal(ctx)?;
-  let created_at = canonical_near_unix_millis(&input.created_at)?;
   let repo = ctx.repo();
 
   if repo.get(&input.message_id).await?.is_some() {
@@ -542,7 +539,7 @@ export type GeneratedCommands = Readonly<Record<never, never>>;`
     &input.room_id,
     &author,
     &input.body,
-    &created_at,
+    &input.created_at,
   )
   .map_err(rejected)?;
 

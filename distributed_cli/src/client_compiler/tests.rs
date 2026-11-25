@@ -3661,6 +3661,19 @@ fn command_protocol_and_extensions_are_preserved_exactly() {
     assert!(commands.contains("readonly \"tenantId\": string;"));
     assert!(commands.contains("\"mutationField\": \"createTodo\""));
     assert!(commands.contains("\"inputDefaults\""));
+    // The lazy catalog carries the defaults so a call returns its generated
+    // id before the command module loads.
+    let lazy = file(&project, "lazy-commands.ts");
+    let catalog = lazy
+        .split_once("const COMMAND_CATALOG = ")
+        .and_then(|(_, rest)| rest.split_once(" as const;"))
+        .map(|(catalog, _)| catalog)
+        .expect("lazy command catalog");
+    let catalog: JsonValue = serde_json::from_str(catalog).expect("catalog json");
+    assert_eq!(
+        catalog["todo.create"]["inputDefaults"],
+        json!([{"generator": "uuid_v7", "path": ["id"]}])
+    );
     assert!(commands.contains("\"projection\""));
     assert!(commands.contains("\"version\": 2"));
     assert!(commands.contains("\"deltaWireVersion\": 1"));

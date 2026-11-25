@@ -44,7 +44,11 @@ export type ReplicaCommandTypeField = {
 
 export type ReplicaCommandInputDefault = {
 	readonly path: readonly string[];
-	readonly generator: 'uuid_v7' | 'ulid';
+	/**
+	 * `now` is unix milliseconds as a canonical decimal string: the client's
+	 * value previews the row; the server replaces it with its own clock.
+	 */
+	readonly generator: 'uuid_v7' | 'ulid' | 'now';
 };
 
 export type ReplicaCommandInputDefaults = {
@@ -172,6 +176,8 @@ export type ReplicaPreparedCommand<TInput = void, TOutput = unknown> = {
 export type ReplicaCommandGenerators = {
 	readonly uuidV7?: () => string;
 	readonly ulid?: () => string;
+	/** Unix milliseconds for `now()` defaults; `Date.now` when omitted. */
+	readonly now?: () => number;
 };
 
 export type PrepareReplicaCommandOptions = {

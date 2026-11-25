@@ -8,7 +8,9 @@ import {
 } from '@hops-ops/distributed/replica';
 
 type CreateInput = {
-	readonly id: string;
+	/** Defaulted: optional to callers, always present on the sent input. */
+	readonly id?: string;
+	readonly note?: string | null;
 };
 
 type CreateOutput = {
@@ -71,3 +73,14 @@ lazy.commands.todo.create();
 lazy.commands.todo.ping({ id: 'todo-1' });
 // @ts-expect-error Lazy output inference stays specific to each command.
 lazy.commands.todo.create({ id: 'todo-1' }).then(receipt => receipt.result.pong);
+
+const call = runtime.commands.create({});
+const sentId: string = call.input.id;
+const sentNote: string | null | undefined = call.input.note;
+const callId: string = call.commandId;
+void [sentId, sentNote, callId];
+const pingCall = runtime.commands.ping();
+const noInput: undefined = pingCall.input;
+void noInput;
+// @ts-expect-error The sent input is read-only.
+call.input.id = 'other';

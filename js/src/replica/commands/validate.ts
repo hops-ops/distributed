@@ -412,7 +412,9 @@ export function validateDefaults(
 				(segment: unknown) =>
 					typeof segment !== 'string' || !GRAPHQL_NAME.test(segment)
 			) ||
-			(entry.generator !== 'uuid_v7' && entry.generator !== 'ulid')
+			(entry.generator !== 'uuid_v7' &&
+				entry.generator !== 'ulid' &&
+				entry.generator !== 'now')
 		) {
 			artifactInvalid(path);
 		}
