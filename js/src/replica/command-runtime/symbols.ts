@@ -58,3 +58,16 @@ export const replicaCommandFreshness = Symbol('distributed.replica.command-fresh
 export const replicaCommandAwaitsFetch = Symbol(
 	'distributed.replica.command-awaits-fetch'
 );
+
+/**
+ * Package-private layer question implemented by DistributedReplica: whether
+ * the replica still holds a command's optimistic layer. A layer can retire
+ * inside the replica (a frame proves its receipt, a scope change empties the
+ * cache) without the command runtime retiring it; the runtime asks this to
+ * drop its own entries for that command.
+ *
+ * @internal
+ */
+export const replicaCommandLayerHeld = Symbol(
+	'distributed.replica.command-layer-held'
+);

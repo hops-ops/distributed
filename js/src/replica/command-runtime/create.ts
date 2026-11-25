@@ -60,7 +60,8 @@ import {
 	replicaCommandProjectionDelta,
 	replicaCommandReadRecord,
 	replicaResultObservation,
-	replicaCommandAwaitsFetch
+	replicaCommandAwaitsFetch,
+	replicaCommandLayerHeld
 } from './symbols.js';
 import type {
 	CapturedAuthority,
@@ -481,17 +482,28 @@ export function createReplicaCommandRuntime<
 		);
 	}
 	const registration = replica[replicaCommandAuthority]?.(contract);
-	const pending = new Map<string, PendingProjection>();
 	/*
-	 * The applied projection delta of each command, kept so that a replayed
-	 * status or live envelope is recognised instead of applied twice. Keyed by
-	 * the prepared command itself: the entry lives exactly as long as
-	 * something (the pending projection, a recovery receipt) can still
-	 * replay that command, and no retirement path has to remember to delete
-	 * it.
+	 * Per-command state. Every entry ends with its command's optimistic layer:
+	 *
+	 * - `pending`: an accepted command whose `projected` promise waits for a
+	 *   proving frame. Deleted when that promise settles (proof, terminal
+	 *   status, scope change, dispose).
+	 * - `unmanagedLayers`: a layer with no `pending` controller that this
+	 *   runtime still has to retire or roll back (in flight, recovery, required
+	 *   revalidation). Deleted when the runtime retires or rejects it, or by
+	 *   `sweep` once the replica no longer holds the layer.
+	 * - `appliedProjections`: the actual projection delta applied to a layer,
+	 *   kept so a replayed status or live envelope is recognised instead of
+	 *   applied twice, and so revalidation covers the models that delta
+	 *   touched. Deleted by `sweep` once the replica no longer holds the layer.
+	 *   A revalidation reads its plan when it starts, so a sweep never drops
+	 *   the plan of a revalidation already under way.
+	 * - `dispatchTails`: the last dispatch per record key. Deleted when that
+	 *   dispatch settles.
 	 */
-	const appliedProjections = new WeakMap<
-		object,
+	const pending = new Map<string, PendingProjection>();
+	const appliedProjections = new Map<
+		ReplicaPreparedCommand<unknown, unknown>,
 		Readonly<{
 			canonical: string;
 			revalidation: ReplicaCommandRevalidationPlan | undefined;
@@ -501,6 +513,39 @@ export function createReplicaCommandRuntime<
 	const unmanagedLayers = new Set<string>();
 	const runtimeAbort = new AbortController();
 	let disposed = false;
+
+	/*
+	 * A layer can leave the replica without this runtime retiring it: a frame
+	 * proves its receipt, or a scope change empties the cache. A host without
+	 * the layer question keeps its entries until the runtime is disposed.
+	 */
+	const layerHeld = (commandId: string): boolean =>
+		replica[replicaCommandLayerHeld]?.(commandId) ?? true;
+	/*
+	 * Drop the entries of commands whose layer is gone. Runs at the end of
+	 * every entry point (dispatch, status read, observed result, background
+	 * revalidation), after the synchronous work that may still read them.
+	 */
+	const sweep = (): void => {
+		for (const commandId of unmanagedLayers) {
+			if (!layerHeld(commandId)) unmanagedLayers.delete(commandId);
+		}
+		for (const prepared of appliedProjections.keys()) {
+			if (!layerHeld(prepared.commandId)) appliedProjections.delete(prepared);
+		}
+	};
+	let sweptGeneration: AbortSignal | undefined;
+	/*
+	 * A closed authorization generation empties the replica right after it
+	 * aborts this signal, so sweep once that purge has run.
+	 */
+	const sweepWhenGenerationCloses = (signal: AbortSignal | undefined): void => {
+		if (signal === undefined || signal === sweptGeneration) return;
+		sweptGeneration = signal;
+		signal.addEventListener('abort', () => queueMicrotask(sweep), {
+			once: true
+		});
+	};
 
 	const reserveDispatch = (
 		prepared: ReplicaPreparedCommand<unknown, unknown>
@@ -598,6 +643,10 @@ export function createReplicaCommandRuntime<
 			return Object.freeze({
 				requiresRevalidation: actual.revalidate
 			});
+		}
+		if (!layerHeld(prepared.commandId)) {
+			// The layer already retired: there is nothing left to replace.
+			return Object.freeze({ requiresRevalidation: actual.revalidate });
 		}
 		assertActualProjectionCapabilities(
 			prepared.projection.contract,
@@ -817,6 +866,7 @@ export function createReplicaCommandRuntime<
 						prepared.commandId
 					);
 				}
+				sweep();
 			})
 			.catch(() => undefined);
 	};
@@ -837,6 +887,7 @@ export function createReplicaCommandRuntime<
 					);
 					settleProjectionSuccess(controller);
 					pending.delete(controller.commandId);
+					sweep();
 				} else if (!refreshed) onFailure?.();
 			})
 			.catch(() => onFailure?.());
@@ -1201,6 +1252,7 @@ export function createReplicaCommandRuntime<
 			let current: Promise<ReplicaCommandStatus>;
 			current = read().finally(() => {
 				if (tracker.inFlight === current) tracker.inFlight = undefined;
+				sweep();
 			});
 			tracker.inFlight = current;
 			return current;
@@ -1212,7 +1264,20 @@ export function createReplicaCommandRuntime<
 		input: TInput,
 		callOptions: ReplicaCommandCallOptions<TOutput>
 	): Promise<ReplicaCommandReceipt<TOutput>> => {
+		try {
+			return await dispatchCommand(artifact, input, callOptions);
+		} finally {
+			sweep();
+		}
+	};
+
+	const dispatchCommand = async <TInput, TOutput>(
+		artifact: ReplicaCommandArtifact<TInput, TOutput>,
+		input: TInput,
+		callOptions: ReplicaCommandCallOptions<TOutput>
+	): Promise<ReplicaCommandReceipt<TOutput>> => {
 		const authority = currentAuthority();
+		sweepWhenGenerationCloses(authority.signal);
 		const prepared = prepareReplicaCommandWithTrustedPresets(
 			artifact,
 			input,
@@ -1662,7 +1727,18 @@ export function createReplicaCommandRuntime<
 	freezeCommandTree(commands);
 
 	const observeResult = (envelope: ReplicaResultEnvelope<unknown>): void => {
-		if (disposed || pending.size === 0) return;
+		if (disposed) return;
+		try {
+			settlePendingProjections(envelope);
+		} finally {
+			// The frame may have retired layers this runtime does not track.
+			sweep();
+		}
+	};
+	const settlePendingProjections = (
+		envelope: ReplicaResultEnvelope<unknown>
+	): void => {
+		if (pending.size === 0) return;
 		let distributed: DistributedProtocolEnvelope | undefined;
 		try {
 			distributed = parseGraphqlResponseExtensions(envelope.extensions)
@@ -1841,6 +1917,19 @@ export function createReplicaCommandRuntime<
 				);
 			}
 			pending.clear();
+			appliedProjections.clear();
+		},
+		/**
+		 * Package-internal: how many entries each per-command structure holds.
+		 * The retention test compares it with a baseline.
+		 */
+		_sizes(): Readonly<Record<string, number>> {
+			return Object.freeze({
+				pendingProjections: pending.size,
+				unmanagedLayers: unmanagedLayers.size,
+				appliedProjections: appliedProjections.size,
+				dispatchTails: dispatchTails.size
+			});
 		}
 	});
 }

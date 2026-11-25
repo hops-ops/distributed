@@ -426,6 +426,10 @@ export class PurposeBuiltCacheEngine implements CacheEngine {
 		);
 	}
 
+	get optimisticLayerCount(): number {
+		return this.#layers.length;
+	}
+
 	extract(): CacheEngineSnapshot {
 		cacheEngineWork.extracts += 1;
 		const stored = <T>([name, field]: readonly [string, StoredField<T>]) =>

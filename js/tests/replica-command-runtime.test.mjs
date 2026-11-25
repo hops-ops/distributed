@@ -9,6 +9,7 @@ import {
 	replicaCommandAuthority,
 	replicaCommandAwaitsFetch,
 	replicaCommandDirectProjection,
+	replicaCommandLayerHeld,
 	replicaCommandProjectionDelta
 } from '../dist/replica/command-runtime/symbols.js';
 import {
@@ -648,6 +649,10 @@ class TestReplica {
 		return this.engine.optimisticLayerState(id);
 	}
 
+	[replicaCommandLayerHeld](id) {
+		return this.layer(id) !== undefined;
+	}
+
 	invalidate() {
 		this.authorizationGeneration += 1;
 		this.#controller.abort(new Error('scope changed'));
@@ -894,6 +899,212 @@ test('generated command runtime retains an accepted projection until a matching 
 	assert.equal(watch.get().data.todos[0].title, 'confirmed');
 	assert.equal(replica.inspectRecord(TodoModel, 'todo-1').revision, '6');
 	assert.equal((await receipt.projected).state, 'atomic');
+	runtime.dispose();
+	watch.destroy();
+});
+
+/*
+ * Retention: the per-command state of the runtime and of the replica returns
+ * to its baseline once every command has succeeded, failed or retired, however
+ * its layer left. (The watch-destroy half lives in replica-retention.test.mjs;
+ * this half needs this file's command fixtures.)
+ */
+test('per-command state returns to baseline after commands succeed, fail, are cancelled and retire', async () => {
+	const BASE = { id: 'todo-1', title: 'base', status: 'open' };
+	let liveObserver;
+	let position = 1;
+	const frame = (source, observations = []) =>
+		commandFrame(CommandTodos, [BASE], {
+			source,
+			position: String(source === 'live' ? ++position : position),
+			observations
+		});
+	const replica = createDistributedReplica({
+		transport: {
+			fetch: () => Promise.resolve(frame('query')),
+			subscribe(_request, observer) {
+				liveObserver = observer;
+				return () => undefined;
+			}
+		}
+	});
+	replica.writeResult(CommandTodos, {}, frame('query'), 'network');
+	const watch = replica.watch(CommandTodos, {}, { live: true });
+	liveObserver.next(frame('live'));
+	const settle = async () => {
+		for (let turn = 0; turn < 5; turn += 1) {
+			await new Promise((resolve) => setImmediate(resolve));
+		}
+	};
+	const observe = (metadata) =>
+		metadata.expects.map((expectation) => ({
+			...expectation,
+			causationId: metadata.causationId
+		}));
+
+	// Per command id: how dispatch and status answer, and the dispatched request.
+	const dispatches = new Map();
+	const statuses = new Map();
+	const requests = new Map();
+	const background = [];
+	const runtime = createReplicaCommandRuntime(
+		replica,
+		{
+			dispatch(request) {
+				requests.set(request.commandId, request);
+				return dispatches.get(request.commandId)(request);
+			},
+			status(request) {
+				const command = requests.get(request.commandId);
+				return Promise.resolve(
+					statusEnvelope(request, statuses.get(request.commandId)(command))
+				);
+			}
+		},
+		{
+			change: artifact({ model: TodoModel }),
+			refresh: artifact({
+				name: 'todo.refresh',
+				model: TodoModel,
+				modeled: false,
+				revalidate: true
+			})
+		},
+		{ status: STATUS, onBackgroundError: (error) => background.push(error) }
+	);
+	const runtimeBaseline = runtime._sizes();
+	const replicaBaseline = replica._sizes();
+	const nextId = (() => {
+		let counter = 0;
+		return () =>
+			`018f47de-3d2a-7${(++counter).toString(16).padStart(3, '0')}-8abc-0123456789ab`;
+	})();
+	const change = (commandId, options = {}) =>
+		runtime.commands.change(
+			{ id: 'todo-1', title: 'optimistic' },
+			{ commandId, ...options }
+		);
+
+	const ROUNDS = 3;
+	for (let round = 0; round < ROUNDS; round += 1) {
+		// 1. Accepted, then retired by a live frame proving its receipt.
+		const proven = nextId();
+		dispatches.set(proven, (request) =>
+			Promise.resolve(envelope(request, { model: TodoModel }))
+		);
+		const receipt = await change(proven);
+		assert.ok(runtime._sizes().appliedProjections > 0);
+		liveObserver.next(frame('live', observe(receipt.metadata)));
+		assert.equal((await receipt.projected).state, 'atomic');
+
+		// 2. Outcome pending, recovered by status, then retired by a live frame
+		// the runtime never sees as its own: no pending projection tracks it.
+		const recovered = nextId();
+		dispatches.set(recovered, (request) =>
+			Promise.resolve(
+				envelope(request, {
+					command: commandMetadata(request, {
+						state: 'in_progress',
+						projection: false
+					})
+				})
+			)
+		);
+		let metadata;
+		statuses.set(recovered, (request) =>
+			(metadata = commandMetadata(request, { model: TodoModel }))
+		);
+		let recovery;
+		await assert.rejects(change(recovered), (error) => {
+			recovery = error.recovery;
+			return error.code === 'REPLICA_COMMAND_OUTCOME_PENDING';
+		});
+		assert.equal((await recovery.status()).state, 'succeeded_pending_projection');
+		assert.deepEqual(runtime.pendingCommandIds(), [recovered]);
+		liveObserver.next(frame('live', observe(metadata)));
+		assert.deepEqual(
+			runtime.pendingCommandIds(),
+			[],
+			'a layer the replica retired is no longer pending'
+		);
+
+		// 3. Ambiguous transport, then a terminal rejection by status.
+		const ambiguous = nextId();
+		dispatches.set(ambiguous, () => Promise.reject(new Error('connection reset')));
+		statuses.set(ambiguous, (request) =>
+			commandMetadata(request, { model: TodoModel, state: 'rejected' })
+		);
+		await assert.rejects(change(ambiguous), (error) => {
+			recovery = error.recovery;
+			return error.code === 'REPLICA_COMMAND_TRANSPORT_AMBIGUOUS';
+		});
+		assert.equal((await recovery.status()).state, 'rejected');
+
+		// 4. A receipt with GraphQL errors fails closed and revalidates.
+		const invalid = nextId();
+		dispatches.set(invalid, (request) =>
+			Promise.resolve(
+				envelope(request, {
+					model: TodoModel,
+					errors: [{ message: 'unexpected resolver error' }]
+				})
+			)
+		);
+		await assert.rejects(change(invalid), {
+			code: 'REPLICA_COMMAND_PROTOCOL_INVALID'
+		});
+
+		// 5. A second command on the same record queues behind the first and
+		// is cancelled before it dispatches.
+		const first = nextId();
+		const queued = nextId();
+		let release;
+		dispatches.set(first, (request) =>
+			new Promise((resolve) => {
+				release = () => resolve(envelope(request, { model: TodoModel }));
+			})
+		);
+		dispatches.set(queued, () => assert.fail('a cancelled command dispatched'));
+		const firstCall = change(first);
+		const caller = new AbortController();
+		const queuedCall = change(queued, { signal: caller.signal });
+		await settle();
+		assert.ok(runtime._sizes().dispatchTails > 0);
+		caller.abort(new Error('superseded'));
+		release();
+		await assert.rejects(queuedCall, { code: 'REPLICA_COMMAND_ABORTED' });
+		const firstReceipt = await firstCall;
+		liveObserver.next(frame('live', observe(firstReceipt.metadata)));
+		await firstReceipt.projected;
+
+		// 6. Required revalidation without a modeled projection: retired by the
+		// refetch the runtime starts.
+		const refreshed = nextId();
+		dispatches.set(refreshed, (request) =>
+			Promise.resolve(
+				envelope(request, {
+					command: commandReceipt({
+						commandId: request.commandId,
+						causationId: `cause:${request.commandId}`,
+						state: COMMAND_STATE.SUCCEEDED,
+						consistency: COMMAND_CONSISTENCY.EVENTUAL
+					})
+				})
+			)
+		);
+		await runtime.commands.refresh(
+			{ id: 'todo-1', title: 'refresh' },
+			{ commandId: refreshed }
+		);
+		await settle();
+
+		await settle();
+		assert.deepEqual(runtime._sizes(), runtimeBaseline, `runtime, round ${round}`);
+		assert.deepEqual(replica._sizes(), replicaBaseline, `replica, round ${round}`);
+		assert.deepEqual(runtime.pendingCommandIds(), []);
+	}
+	assert.deepEqual(background, []);
+	assert.equal(watch.get().data.todos[0].title, 'base');
 	runtime.dispose();
 	watch.destroy();
 });
@@ -2767,6 +2978,42 @@ test('terminal status rolls back only its tracked optimistic layer', async () =>
 	assert.deepEqual(runtime.pendingCommandIds(), [COMMAND_A]);
 	assert.equal((await recovery.status()).state, 'rejected');
 	assert.equal(replica.layer(COMMAND_A), undefined);
+	runtime.dispose();
+});
+
+test('a closed authorization generation drops the entries of the layers its purge removed', async () => {
+	const replica = new TestReplica();
+	const runtime = createReplicaCommandRuntime(
+		replica,
+		{
+			dispatch: (request) =>
+				Promise.resolve(
+					envelope(request, {
+						command: commandMetadata(request, {
+							state: 'in_progress',
+							projection: false
+						})
+					})
+				),
+			status: () => Promise.reject(new Error('not read'))
+		},
+		{ change: artifact() },
+		{ status: STATUS }
+	);
+	await assert.rejects(
+		runtime.commands.change(
+			{ id: 'todo-1', title: 'preview' },
+			{ commandId: COMMAND_A }
+		),
+		{ code: 'REPLICA_COMMAND_OUTCOME_PENDING' }
+	);
+	assert.deepEqual(runtime.pendingCommandIds(), [COMMAND_A]);
+	// The replica aborts the generation, then empties its cache.
+	replica.invalidate();
+	replica.engine.rejectOptimisticLayer(COMMAND_A);
+	await Promise.resolve();
+	assert.deepEqual(runtime.pendingCommandIds(), []);
+	assert.equal(runtime._sizes().unmanagedLayers, 0);
 	runtime.dispose();
 });
 

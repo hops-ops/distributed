@@ -29,6 +29,7 @@ import {
 	replicaCommandAwaitsFetch,
 	replicaCommandFreshness,
 	replicaCommandDirectProjection,
+	replicaCommandLayerHeld,
 	replicaCommandProjectionDelta,
 	replicaCommandReadRecord,
 	replicaResultObservation
@@ -91,6 +92,7 @@ export type ReplicaCommandAuthorityHost = DistributedReplica & {
 		commandId: string,
 		plan: import('../types.js').ReplicaRevalidationPlan
 	) => boolean;
+	readonly [replicaCommandLayerHeld]?: (commandId: string) => boolean;
 };
 
 export type ReplicaCommandTransportRequest = Readonly<{
