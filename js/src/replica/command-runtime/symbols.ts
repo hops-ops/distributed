@@ -46,3 +46,15 @@ export const replicaCommandReadRecord = Symbol(
 
 /** @internal Generated dependency registration before dispatch/optimism. */
 export const replicaCommandFreshness = Symbol('distributed.replica.command-freshness');
+
+/**
+ * Package-private retirement question implemented by DistributedReplica:
+ * whether a command's proven layer can only retire through a fetch, because
+ * it shows a row the base does not hold yet and no open live stream covers
+ * the command's revalidation plan to deliver that row.
+ *
+ * @internal
+ */
+export const replicaCommandAwaitsFetch = Symbol(
+	'distributed.replica.command-awaits-fetch'
+);

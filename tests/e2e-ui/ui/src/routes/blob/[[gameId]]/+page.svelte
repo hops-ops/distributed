@@ -58,8 +58,13 @@
 	const levelComplete = $derived(!!selected?.current_level_completed);
 	const currentLevel = $derived(Number(selected?.current_level ?? 0));
 	const status = $derived(selected?.status ?? 'active');
-	/** The selected game shows a move or level the server has not sealed yet. */
-	const selectedPending = $derived(selected !== null && $query.pending.has(selected));
+	/*
+	 * Blob commands are Atomic: their preview is sealed by the response, so an
+	 * existing game is never a pending row. Next level waits for this page's own
+	 * in-flight moves and level starts instead.
+	 */
+	let commandsInFlight = $state(0);
+	const commandPending = $derived(commandsInFlight > 0);
 
 	function tileClass(t: number): string {
 		switch (t) {
@@ -131,6 +136,7 @@
 			return;
 		}
 		actionError = null;
+		commandsInFlight += 1;
 		try {
 			await commands.blob.move({
 				game_id: selected.game_id,
@@ -138,16 +144,21 @@
 			});
 		} catch (error) {
 			actionError = error instanceof Error ? error.message : 'Move failed';
+		} finally {
+			commandsInFlight -= 1;
 		}
 	}
 
 	async function nextLevel() {
-		if (!selected || playerDead || !levelComplete || selectedPending) return;
+		if (!selected || playerDead || !levelComplete || commandPending) return;
 		actionError = null;
+		commandsInFlight += 1;
 		try {
 			await commands.blob.start_level({ game_id: selected.game_id });
 		} catch (error) {
 			actionError = error instanceof Error ? error.message : 'Next level failed';
+		} finally {
+			commandsInFlight -= 1;
 		}
 	}
 
@@ -282,7 +293,7 @@
 							type="button"
 							variant="ink"
 							onclick={() => void nextLevel()}
-							disabled={selectedPending}
+							disabled={commandPending}
 						>
 							Next level
 						</Button>

@@ -17,7 +17,7 @@ export type MaterializedReplicaResult<TData> = {
 	readonly data: ReplicaSparse<TData>;
 	readonly complete: boolean;
 	readonly stale: boolean;
-	/** Result objects whose record an unconfirmed command still writes. */
+	/** Result objects that exist only through an unsettled command. */
 	readonly pending: ReplicaPendingRows;
 	readonly identitySignature: string;
 };
@@ -224,7 +224,7 @@ function materializeObject(
 		nestedSignatures.push(`${member.field}:${branchResult.identitySignature}`);
 	}
 
-	const provisional = reader.pending(key);
+	const provisional = reader.provisional(key);
 	const identitySignature = `${key}@${record.incarnation}${provisional ? '~' : ''}[${nestedSignatures.join('|')}]`;
 	/*
 	 * A typed result never carries a partially shaped object: an object missing

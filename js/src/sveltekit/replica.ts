@@ -90,7 +90,7 @@ export interface SveltekitQueryStore<TData> {
 	readonly live: ReplicaSnapshot<TData>['live'];
 	readonly errors: readonly GqlError[];
 	readonly error: GqlError | undefined;
-	/** `$query.pending.has(row)`: the row shows an unsettled command. */
+	/** `$query.pending.has(row)`: the row is a preview the server has not returned yet. */
 	readonly pending: ReplicaPendingRows;
 }
 

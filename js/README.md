@@ -396,12 +396,15 @@ before decoding the input, so a client clock never becomes a stored ordering
 key. Retries of one command id keep their idempotency: the ledger hashes the
 submitted input, not the stamp.
 
-`$query.pending` is the set of rows in the current snapshot whose values still
-come from an unsettled command: dispatched, or accepted and waiting for its
-projection. `pending.has(row)` takes an object from the same snapshot's `data`;
-`pending.size` counts them. A row leaves the set when the authoritative row
-replaces the preview, or when the command fails and its preview is rolled
-back. A typed result never contains a partially shaped object: an object
+`$query.pending` is the set of provisional rows in the current snapshot: rows
+that exist only as an unsettled command's preview, because the server has not
+returned them yet (a create in flight). Commands on such a row would fail, so a
+page marks and disables it. A command that edits a row the server already
+returned shows its preview but never makes the row pending.
+`pending.has(row)` takes an object from the same snapshot's `data`;
+`pending.size` counts them. A row leaves the set as soon as the server row
+reaches the replica (by a live frame or a refetch), or when the command fails
+and its preview is rolled back. A typed result never contains a partially shaped object: an object
 missing a selected field is absent and the snapshot is incomplete.
 
 `@load` results are normalized on the server, dehydrated, and restored in the

@@ -24,7 +24,8 @@ import {
 import {
 	createDistributedReplica,
 	createReplicaCommandRuntime,
-	createReplicaDiagnostics
+	createReplicaDiagnostics,
+	replicaRecordKey
 } from '../dist/replica/index.js';
 
 async function flushMicrotasks() {
@@ -236,7 +237,7 @@ test('component SSR subscriptions stay transport-free when browser is false', as
 	client.destroy();
 });
 
-test('$query.pending marks the rows an unsettled command writes', () => {
+test('$query.pending marks rows the server has not returned yet', () => {
 	const replica = createDistributedReplica();
 	const store = bindSveltekitOperation(replica, TodosArtifact).use();
 	const unsubscribe = store.subscribe(() => undefined);
@@ -246,19 +247,35 @@ test('$query.pending marks the rows an unsettled command writes', () => {
 		todoFrame(TodosArtifact, [{ id: 'todo-1', title: 'saved', status: 'open' }]),
 		'network'
 	);
+	// Editing a row the server returned shows the preview but is not pending.
 	replica.createOptimisticLayer('command-rename', (writer) => {
 		writer.writeRecord(TodoModel, 'todo-1', { fields: { title: 'renaming' } });
 	});
-	const [row] = store.get().data.todos;
-	assert.equal(row.title, 'renaming');
-	assert.equal(store.get().pending.has(row), true);
-	assert.equal(store.pending.has(row), true);
+	const [renamed] = store.get().data.todos;
+	assert.equal(renamed.title, 'renaming');
+	assert.equal(store.get().pending.has(renamed), false);
 
+	// A created row exists only as the command's preview: it is pending.
+	replica.createOptimisticLayer('command-create', (writer) => {
+		writer.writeRecord(TodoModel, 'todo-2', {
+			fields: { id: 'todo-2', title: 'new', status: 'open' }
+		});
+		writer.writeIndex(
+			{ field: 'todos', arguments: {}, dependencies: ['todos'], complete: true },
+			[replicaRecordKey(TodoModel, 'todo-1'), replicaRecordKey(TodoModel, 'todo-2')]
+		);
+	});
+	const [, created] = store.get().data.todos;
+	assert.equal(created.title, 'new');
+	assert.equal(store.get().pending.has(created), true);
+	assert.equal(store.pending.has(created), true);
+
+	replica.rejectOptimisticLayer('command-create');
 	replica.rejectOptimisticLayer('command-rename');
 	const [restored] = store.get().data.todos;
 	assert.equal(restored.title, 'saved');
+	assert.equal(store.get().data.todos.length, 1);
 	assert.equal(store.get().pending.size, 0);
-	assert.equal(store.get().pending.has(restored), false);
 	unsubscribe();
 	store.destroy();
 });

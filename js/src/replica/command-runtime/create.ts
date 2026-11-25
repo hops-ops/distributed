@@ -59,7 +59,8 @@ import {
 	replicaCommandFreshness,
 	replicaCommandProjectionDelta,
 	replicaCommandReadRecord,
-	replicaResultObservation
+	replicaResultObservation,
+	replicaCommandAwaitsFetch
 } from './symbols.js';
 import type {
 	CapturedAuthority,
@@ -755,6 +756,17 @@ export function createReplicaCommandRuntime<
 		);
 	};
 
+	const revalidationPlan = (
+		prepared: ReplicaPreparedCommand<unknown, unknown>
+	) => appliedProjections.get(prepared)?.revalidation ?? prepared.revalidation;
+	const awaitsFetch = (
+		prepared: ReplicaPreparedCommand<unknown, unknown>
+	): boolean =>
+		replica[replicaCommandAwaitsFetch]?.(
+			prepared.commandId,
+			revalidationPlan(prepared)
+		) ?? false;
+
 	const revalidate = async (
 		prepared: ReplicaPreparedCommand<unknown, unknown>,
 		authoritySignal?: AbortSignal
@@ -766,10 +778,7 @@ export function createReplicaCommandRuntime<
 		]);
 		try {
 			await waitForCommandOperation(
-				replicaRevalidate(
-					appliedProjections.get(prepared)?.revalidation ??
-						prepared.revalidation
-				),
+				replicaRevalidate(revalidationPlan(prepared)),
 				revalidationSignals.signal
 			);
 			return true;
@@ -1064,33 +1073,47 @@ export function createReplicaCommandRuntime<
 						prepared.commandId,
 						metadata
 					);
+					const exactDelta =
+						!prepared.revalidation.required &&
+						!statusRequiresRevalidation;
+					const proven =
+						metadata.state === 'atomic' ||
+						hasCompleteProjectionObservations(metadata);
 					if (!remainsPending) {
 						unmanagedLayers.delete(prepared.commandId);
 						if (tracker.pending !== undefined) {
 							settleTrackedProjection(tracker, pending);
 						}
 					} else if (
+						exactDelta &&
+						proven &&
+						!awaitsFetch(prepared)
+					) {
+						/*
+						 * An exact delta already shows the server's effect, and
+						 * every row it shows is one the base holds (or an open
+						 * live stream will deliver it). The proof settles the
+						 * projected wait; the accepted layer stays until a later
+						 * comparable authoritative result seals it, without
+						 * racing sibling commands with a command-triggered query.
+						 */
+						settleTrackedProjection(tracker, pending);
+					} else if (
 						metadata.state === 'atomic' ||
-						hasCompleteProjectionObservations(metadata) ||
+						(exactDelta && proven) ||
 						(metadata.state === 'succeeded' &&
 							metadata.expects.length === 0 &&
-							(prepared.revalidation.required ||
-								statusRequiresRevalidation))
+							!exactDelta)
 					) {
 						/*
 						 * Status is causal truth, but it carries no canonical
-						 * query payload. A terminal `atomic` state or a complete
-						 * set of this command's projection observations proves
-						 * the projection committed; `succeeded` is terminal when
-						 * the generated contract has no confirmations. In every
-						 * case only a query started after that proof may retire
-						 * optimism: until it settles the row stays pending,
-						 * because the base can still lack the command's effect.
-						 *
-						 * The proof alone never retires the layer, and waiting
-						 * for a later canonical frame is not enough: an `@load`
-						 * operation with no live delivery never receives one, so
-						 * the accepted layer would never retire.
+						 * query payload. `atomic` fences asynchronous projection;
+						 * `succeeded` is terminal when the generated contract has
+						 * no confirmations; a proven exact delta whose layer
+						 * shows a row the base lacks can get that row only from
+						 * a fetch when no live stream covers it (`@load` only, or
+						 * no live delivery). In every case only a query started
+						 * after the proof may retire optimism.
 						 */
 						let refreshed = false;
 						try {
@@ -1559,14 +1582,14 @@ export function createReplicaCommandRuntime<
 					};
 					if (
 						replicaRevalidate !== undefined &&
-						hasCompleteProjectionObservations(metadata)
+						hasCompleteProjectionObservations(metadata) &&
+						awaitsFetch(prepared)
 					) {
 						/*
 						 * The receipt already proves the projection committed,
-						 * but a receipt carries no canonical data and the base
-						 * may already hold the row (a query raced the response).
-						 * No later frame is guaranteed without live delivery, so
-						 * fetch canonical data started after this proof, then
+						 * but it carries no canonical data, and the layer shows
+						 * a row the base lacks that no live stream will deliver.
+						 * Fetch canonical data started after this proof, then
 						 * retire. The status monitor retries a failed fetch.
 						 */
 						revalidateDispositionAndRetireInBackground(

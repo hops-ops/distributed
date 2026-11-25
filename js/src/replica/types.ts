@@ -688,13 +688,18 @@ export type ReplicaSparse<T> = T extends readonly (infer TItem)[]
 		: T;
 
 /**
- * The rows of one snapshot whose visible values come from a command that is
- * not settled yet: dispatched, or accepted and waiting for its projection.
+ * The provisional rows of one snapshot: rows that exist only as a command's
+ * preview, because the server has not returned them yet (a create still in
+ * flight). Commands on such a row would fail, so a page marks and disables it.
+ *
+ * A command that edits a row the server already returned (complete, rename,
+ * archive) never makes it pending: its preview shows, and the row stays
+ * usable.
  *
  * `has(row)` takes an object from the same snapshot's `data`. A row leaves
- * the set when the authoritative row replaces the preview or the command
- * fails and its preview is rolled back, so a page never tracks command
- * lifecycles itself.
+ * the set as soon as the server row reaches the replica (by a live frame or
+ * a refetch), or when the command fails and its preview is rolled back, so a
+ * page never tracks command lifecycles itself.
  */
 export type ReplicaPendingRows = Readonly<{
 	has(row: unknown): boolean;

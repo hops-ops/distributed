@@ -449,7 +449,8 @@ await commands.todo.create({ title: text });
 await commands.todo.complete({ todo_id });
 // Replica applies SaveTodo (upsert_todos) to the cache. Page does not.
 
-// A row a command has not settled yet is pending: no hand-kept id sets.
+// A created row the server has not returned yet is pending: no hand-kept
+// id sets. Edits of a row the server returned never make it pending.
 {@const saving = $query.pending.has(todo)}
 ```
 
@@ -468,8 +469,9 @@ The generated call fills them, and returns them synchronously
 (`commands.chat.post(input).input.message_id`) before the server answers.
 A `now()` value only previews the row: the server overwrites it with its
 host clock before the handler runs, so the client's clock is never the
-stored ordering key. The server's row then replaces the preview. A failed
-command rolls its preview back, so its row leaves `pending` too.
+stored ordering key. The row leaves `pending` as soon as the server's row
+reaches the replica. A failed command rolls its preview back, so its row
+leaves `pending` too.
 
 ```rust,ignore
 // Advanced optimism: same domain pure, shipped as WASM

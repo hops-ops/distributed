@@ -26,6 +26,7 @@ import type {
 import type { ReplicaPureFunction } from '../projection-delta/types.js';
 import {
 	replicaCommandAuthority,
+	replicaCommandAwaitsFetch,
 	replicaCommandFreshness,
 	replicaCommandDirectProjection,
 	replicaCommandProjectionDelta,
@@ -86,6 +87,10 @@ export type ReplicaCommandAuthorityHost = DistributedReplica & {
 		model: ReplicaModelArtifact,
 		identity: ReplicaIdentity
 	) => Readonly<Record<string, ReplicaValue>> | undefined;
+	readonly [replicaCommandAwaitsFetch]?: (
+		commandId: string,
+		plan: import('../types.js').ReplicaRevalidationPlan
+	) => boolean;
 };
 
 export type ReplicaCommandTransportRequest = Readonly<{

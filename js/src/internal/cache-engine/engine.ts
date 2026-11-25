@@ -411,6 +411,17 @@ export class PurposeBuiltCacheEngine implements CacheEngine {
 		return this.#layers.find((layer) => layer.id === id)?.state;
 	}
 
+	optimisticLayerProvisional(id: string): boolean {
+		const layer = this.#layers.find((candidate) => candidate.id === id);
+		if (layer === undefined) return false;
+		const view = this.#view();
+		return layer.operations.some(
+			(operation) =>
+				operation.kind === 'write-record' &&
+				view.provisional?.(operation.write.key) === true
+		);
+	}
+
 	get recordCount(): number {
 		return this.#records.size;
 	}

@@ -35,7 +35,7 @@ function post(replica, layer, fields) {
 	});
 }
 
-test('a row an unsettled command writes is pending until its layer settles', () => {
+test('a row an unsettled command creates is pending until its layer settles', () => {
 	for (const settle of ['confirm', 'reject']) {
 		const replica = seeded();
 		const watch = replica.watch(Todos, {});
@@ -89,6 +89,50 @@ test('a row an unsettled command writes is pending until its layer settles', () 
 		unsubscribe();
 		watch.destroy();
 	}
+});
+
+test('a command editing a row the server returned never makes it pending', () => {
+	const replica = seeded();
+	const watch = replica.watch(Todos, {});
+	replica.createOptimisticLayer('cmd-rename', (writer) => {
+		writer.writeRecord(Todo, 'todo-1', {
+			fields: { id: 'todo-1', title: 'renamed' }
+		});
+	});
+	const snapshot = watch.get();
+	// The edit's preview shows, and the row stays usable.
+	assert.deepEqual(snapshot.data.todos, [{ id: 'todo-1', title: 'renamed' }]);
+	assert.equal(snapshot.pending.size, 0);
+	assert.equal(snapshot.pending.has(snapshot.data.todos[0]), false);
+	watch.destroy();
+});
+
+test('a created row stops being pending once the server row reaches the base', () => {
+	const replica = seeded();
+	const watch = replica.watch(Todos, {});
+	post(replica, 'cmd-post', { id: 'todo-2', title: 'posted' });
+	replica.markOptimisticLayerAccepted('cmd-post');
+	assert.equal(watch.get().pending.size, 1);
+
+	// A refetch (or live frame) returns the server row while the command's
+	// layer is still unsettled: the row is no longer only a preview.
+	replica.writeResult(
+		Todos,
+		{},
+		wireFrame({
+			position: '2',
+			rows: [
+				{ id: 'todo-1', title: 'first' },
+				{ id: 'todo-2', title: 'posted' }
+			]
+		}),
+		'network'
+	);
+	const snapshot = watch.get();
+	assert.equal(snapshot.data.todos.length, 2);
+	assert.equal(snapshot.pending.size, 0);
+	assert.equal(snapshot.pending.has(snapshot.data.todos[1]), false);
+	watch.destroy();
 });
 
 test('a typed result never surfaces a partially shaped row', () => {

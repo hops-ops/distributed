@@ -7,6 +7,7 @@ import { createCacheEngine } from '../dist/internal/cache-engine.js';
 import { createReplicaCommandRuntime, ReplicaCommandRuntimeError } from '../dist/replica/index.js';
 import {
 	replicaCommandAuthority,
+	replicaCommandAwaitsFetch,
 	replicaCommandDirectProjection,
 	replicaCommandProjectionDelta
 } from '../dist/replica/command-runtime/symbols.js';
@@ -897,128 +898,169 @@ test('generated command runtime retains an accepted projection until a matching 
 	watch.destroy();
 });
 
-for (const via of ['receipt', 'status']) {
-	test(`a row that reached the base before its ${via} proved the projection retires without live delivery`, async () => {
-		// A held command response: a query refetch already stored the server
-		// row, so no later canonical frame names this command, and with no
-		// live delivery none ever will. Once the receipt (or a later status
-		// read) fully observes the projection, the accepted layer must
-		// retire, but only after a query started after that proof settles.
-		const fetches = [];
-		const replica = createDistributedReplica({
-			transport: {
-				fetch() {
-					let resolve;
-					const response = new Promise((settle) => (resolve = settle));
-					fetches.push(() =>
-						resolve(
-							commandFrame(
-								CommandTodos,
-								[{ id: 'todo-1', title: 'server', status: 'open' }],
-								{ position: '3' }
-							)
-						)
-					);
-					return response;
-				}
-			}
-		});
-		replica.writeResult(
-			CommandTodos,
-			{},
-			commandFrame(CommandTodos, [
-				{ id: 'todo-1', title: 'base', status: 'open' }
-			]),
-			'network'
-		);
-		const watch = replica.watch(CommandTodos, {});
-		const row = () => watch.get().data.todos[0];
-		const observed = (metadata) =>
-			Object.freeze({
-				...metadata,
-				observations: Object.freeze(
-					metadata.expects.map((expectation) =>
-						Object.freeze({
-							...expectation,
-							causationId: metadata.causationId
-						})
-					)
-				)
-			});
-		let respond;
-		let metadata;
-		const runtime = createReplicaCommandRuntime(
-			replica,
-			{
-				dispatch(request) {
-					return new Promise((resolve) => {
-						respond = () => {
-							metadata = commandMetadata(request, {
-								model: TodoModel,
-								actualTitle: 'server'
-							});
-							resolve(
-								envelope(request, {
-									command:
-										via === 'receipt' ? observed(metadata) : metadata
-								})
-							);
-						};
-					});
-				},
-				status(request) {
-					return Promise.resolve(
-						statusEnvelope(request, observed(metadata))
-					);
-				}
+// A created row (`todo-2`) the base does not hold yet, proven by its receipt
+// or by a later status read. `race` lets a refetch store the server row
+// before the receipt arrives; `live` keeps an open stream covering the list.
+async function provenCreate({ via, race = false, live = false }) {
+	const BASE = { id: 'todo-1', title: 'base', status: 'open' };
+	const SERVER = { id: 'todo-2', title: 'server', status: 'open' };
+	// Each query answers with the rows it is given when the test releases it.
+	const fetches = [];
+	let liveObserver;
+	const replica = createDistributedReplica({
+		transport: {
+			fetch() {
+				let resolve;
+				const response = new Promise((settle) => (resolve = settle));
+				fetches.push((rows, position) =>
+					resolve(commandFrame(CommandTodos, rows, { position }))
+				);
+				return response;
 			},
-			{ change: artifact({ model: TodoModel }) },
-			{ status: STATUS }
-		);
-		try {
-			const call = runtime.commands.change(
-				{ id: 'todo-1', title: 'server' },
-				{ commandId: COMMAND_A }
-			);
-			await new Promise((resolve) => setImmediate(resolve));
-			assert.ok(respond, 'dispatch must be in flight');
-			assert.equal(watch.get().pending.has(row()), true);
-
-			// The row reaches the base before the receipt does.
-			replica.writeResult(
-				CommandTodos,
-				{},
-				commandFrame(
-					CommandTodos,
-					[{ id: 'todo-1', title: 'server', status: 'open' }],
-					{ position: '2' }
-				),
-				'network'
-			);
-			assert.equal(watch.get().pending.has(row()), true);
-
-			respond();
-			const receipt = await call;
-			assert.equal(receipt.state, 'succeeded_pending_projection');
-			for (let wait = 0; fetches.length === 0 && wait < 100; wait += 1) {
-				await new Promise((resolve) => setTimeout(resolve, 10));
+			...(live
+				? {
+						subscribe(_request, observer) {
+							liveObserver = observer;
+							return () => undefined;
+						}
+					}
+				: {})
+		}
+	});
+	replica.writeResult(
+		CommandTodos,
+		{},
+		commandFrame(CommandTodos, [BASE]),
+		'network'
+	);
+	const watch = replica.watch(CommandTodos, {}, live ? { live: true } : {});
+	if (live) assert.ok(liveObserver, 'live stream must be open');
+	const observed = (metadata) =>
+		Object.freeze({
+			...metadata,
+			observations: Object.freeze(
+				metadata.expects.map((expectation) =>
+					Object.freeze({
+						...expectation,
+						causationId: metadata.causationId
+					})
+				)
+			)
+		});
+	let respond;
+	let metadata;
+	const runtime = createReplicaCommandRuntime(
+		replica,
+		{
+			dispatch(request) {
+				return new Promise((resolve) => {
+					respond = () => {
+						metadata = commandMetadata(request, {
+							model: TodoModel,
+							actualTitle: 'server'
+						});
+						resolve(
+							envelope(request, {
+								command: via === 'receipt' ? observed(metadata) : metadata
+							})
+						);
+					};
+				});
+			},
+			status(request) {
+				return Promise.resolve(statusEnvelope(request, observed(metadata)));
 			}
-			// The proof alone does not retire the layer: the row stays pending
-			// until canonical data fetched after the proof is stored.
-			assert.equal(fetches.length, 1);
-			assert.equal(watch.get().pending.has(row()), true);
+		},
+		{ change: artifact({ model: TodoModel }) },
+		{ status: STATUS }
+	);
+	const call = runtime.commands.change(
+		{ id: 'todo-2', title: 'server' },
+		{ commandId: COMMAND_A }
+	);
+	await new Promise((resolve) => setImmediate(resolve));
+	assert.ok(respond, 'dispatch must be in flight');
+	// Queries started before the proof answer now; under `race` the server
+	// row reaches the base this way, before the receipt does.
+	for (const release of fetches.splice(0)) {
+		release(race ? [BASE, SERVER] : [BASE], '2');
+	}
+	await new Promise((resolve) => setImmediate(resolve));
+	respond();
+	const receipt = await call;
+	assert.equal(receipt.state, 'succeeded_pending_projection');
+	// Let the receipt, or the status monitor's first read, prove it.
+	await new Promise((resolve) => setTimeout(resolve, 100));
+	const layerRetained = () => {
+		try {
+			replica.createOptimisticLayer(COMMAND_A, () => undefined);
+		} catch {
+			return true;
+		}
+		replica.rejectOptimisticLayer(COMMAND_A);
+		return false;
+	};
+	/** Queries started after the proof. */
+	const refetches = fetches;
+	const serve = () => refetches[0]([BASE, SERVER], '3');
+	return { watch, runtime, receipt, refetches, serve, layerRetained };
+}
 
-			fetches[0]();
+for (const via of ['receipt', 'status']) {
+	test(`a created row proven by its ${via} retires through a fetch without live delivery`, async () => {
+		// No live stream will ever deliver the row, so only a query started
+		// after the proof can bring it into the base and retire the layer.
+		const { watch, runtime, receipt, refetches, serve, layerRetained } =
+			await provenCreate({ via });
+		try {
+			assert.equal(refetches.length, 1);
+			// Until that fetch lands, the layer (and its preview) stays.
+			assert.equal(layerRetained(), true);
+			serve();
 			assert.equal((await receipt.projected).state, 'atomic');
-			assert.equal(row().title, 'server');
+			assert.equal(layerRetained(), false);
+			assert.equal(watch.get().data.todos[1].title, 'server');
 			assert.equal(watch.get().pending.size, 0);
-			assert.equal(fetches.length, 1);
+			assert.equal(refetches.length, 1);
+		} finally {
+			runtime.dispose();
+			watch.destroy();
+		}
+	});
+
+	test(`a created row proven by its ${via} waits for an open live stream instead of fetching`, async () => {
+		const { watch, runtime, refetches, layerRetained } = await provenCreate({
+			via,
+			live: true
+		});
+		try {
+			// The stream will deliver the authoritative frame: no command-
+			// triggered query races sibling commands.
+			assert.equal(refetches.length, 0);
+			assert.equal(layerRetained(), true);
 		} finally {
 			runtime.dispose();
 			watch.destroy();
 		}
 	});
 }
+
+test('a created row a refetch already stored before its receipt is neither pending nor refetched', async () => {
+	const { watch, runtime, refetches } = await provenCreate({
+		via: 'receipt',
+		race: true
+	});
+	try {
+		// The base holds the server row, so the row is usable at once and the
+		// exact delta needs no further fetch.
+		assert.equal(refetches.length, 0);
+		assert.equal(watch.get().pending.size, 0);
+		assert.equal(watch.get().data.todos[1].title, 'server');
+	} finally {
+		runtime.dispose();
+		watch.destroy();
+	}
+});
 
 test('artifact v1 is rejected at the public boundary', () => {
 	assert.throws(
@@ -1849,7 +1891,7 @@ for (const statusState of ['atomic', 'succeeded_pending_projection']) {
 	});
 }
 
-test('terminal exact projection status retires the layer after authoritative revalidation', async () => {
+test('terminal exact projection status settles without command-triggered revalidation', async () => {
 	const replica = new TestReplica();
 	let pendingMetadata;
 	const runtime = createReplicaCommandRuntime(
@@ -1891,14 +1933,13 @@ test('terminal exact projection status retires the layer after authoritative rev
 
 	assert.equal((await receipt.status()).state, 'atomic');
 	assert.equal((await receipt.projected).state, 'atomic');
-	// The terminal status carries no canonical data. Without a later frame
-	// (no live delivery) only a query started after it may retire the layer.
-	assert.equal(replica.revalidations.length, 1);
-	assert.equal(replica.layer(COMMAND_A), undefined);
+	assert.deepEqual(replica.revalidations, []);
+	assert.equal(replica.layer(COMMAND_A), 'accepted');
+	assert.equal(replica.record('todo-1').fields.title, 'accepted');
 	runtime.dispose();
 });
 
-test('terminal succeeded status with exact observations retires the layer after authoritative revalidation', async () => {
+test('terminal succeeded status with exact observations settles delivery without retiring the layer', async () => {
 	const replica = new TestReplica();
 	let pendingMetadata;
 	const runtime = createReplicaCommandRuntime(
@@ -1952,8 +1993,9 @@ test('terminal succeeded status with exact observations retires the layer after 
 			)
 		]);
 		assert.equal(state, 'atomic');
-		assert.equal(replica.revalidations.length, 1);
-		assert.equal(replica.layer(COMMAND_A), undefined);
+		assert.deepEqual(replica.revalidations, []);
+		assert.equal(replica.layer(COMMAND_A), 'accepted');
+		assert.equal(replica.record('todo-1').fields.title, 'accepted');
 	} finally {
 		runtime.dispose();
 	}
