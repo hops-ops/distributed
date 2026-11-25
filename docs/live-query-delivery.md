@@ -33,7 +33,8 @@ slow subscriber never holds the others back.
 At most `GraphqlEngineBuilder::live_concurrency` live executions (default
 8) run at once per engine: first reads, refreshes and catch-ups together.
 When the last subscriber of a read leaves, its producer stops.
-`GraphqlEngine::live_subscriber_count()` counts producers, not subscribers.
+`GraphqlEngine::live_producer_count()` counts producers (distinct reads);
+`GraphqlEngine::live_subscriber_count()` counts subscription streams.
 
 ## Failed live executions
 

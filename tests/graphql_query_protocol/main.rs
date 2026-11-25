@@ -2282,7 +2282,8 @@ pub async fn hundred_origin_subscribers_share_one_execution_per_change(db: Db) {
         assert_live_frame(&frame, "causal_query_views", "causal row", "1", false);
     }
     let opened = versions.metrics().result_executions;
-    let producers = engine.live_subscriber_count();
+    let producers = engine.live_producer_count();
+    assert_eq!(engine.live_subscriber_count(), 100, "every stream is counted");
 
     project_item(&fixture.repository, &fixture.bus, 2, "causal row 2").await;
     let mut first = None;
@@ -2307,7 +2308,7 @@ pub async fn hundred_origin_subscribers_share_one_execution_per_change(db: Db) {
 
     drop(streams);
     tokio::time::timeout(Duration::from_secs(5), async {
-        while engine.live_subscriber_count() != 0 {
+        while engine.live_producer_count() != 0 {
             tokio::task::yield_now().await;
         }
     })
@@ -2527,7 +2528,7 @@ async fn hundred_subscribers_one_upstream(db: Db, remote: bool) {
             (delivery.live_counts().0, delivery.live_counts().1),
             (1, 100)
         );
-        assert_eq!(engine.live_subscriber_count(), 1);
+        assert_eq!(engine.live_producer_count(), 1);
         assert_eq!(versions.metrics().validations, 100);
         assert_eq!(
             versions.metrics().result_executions,
@@ -2550,7 +2551,7 @@ async fn hundred_subscribers_one_upstream(db: Db, remote: bool) {
             bob_frame["extensions"]["distributed"]["cacheScope"]
         );
         assert_eq!(
-            (delivery.live_counts().0, engine.live_subscriber_count()),
+            (delivery.live_counts().0, engine.live_producer_count()),
             (2, 2),
             "identical roles/data must not cross subject scopes"
         );
@@ -2576,7 +2577,7 @@ async fn hundred_subscribers_one_upstream(db: Db, remote: bool) {
         let replay = next(&mut resumed, "legacy-resume", "committed-live").await;
         assert_eq!(replay["extensions"]["distributed"]["live"]["reset"], false);
         tokio::time::timeout(Duration::from_secs(5), async {
-            while delivery.live_counts().0 != 1 || engine.live_subscriber_count() != 1 {
+            while delivery.live_counts().0 != 1 || engine.live_producer_count() != 1 {
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
         })
@@ -2602,7 +2603,7 @@ async fn hundred_subscribers_one_upstream(db: Db, remote: bool) {
         .await
         .unwrap();
         assert_eq!(
-            engine.live_subscriber_count(),
+            engine.live_producer_count(),
             1,
             "remaining resumed client retains upstream ownership"
         );
@@ -2616,7 +2617,7 @@ async fn hundred_subscribers_one_upstream(db: Db, remote: bool) {
             .unwrap();
         let _ = resumed.close(None).await;
         tokio::time::timeout(Duration::from_secs(5), async {
-            while delivery.live_counts().0 != 0 || engine.live_subscriber_count() != 0 {
+            while delivery.live_counts().0 != 0 || engine.live_producer_count() != 0 {
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
         })
@@ -2760,7 +2761,7 @@ async fn worker_live_coordinator_uses_actual_oidc_origin() {
     let router = distributed::graphql::graphql_router_composed(engine.clone(), None, None);
     let repository = fixture.repository.clone();
     let bus = fixture.bus.clone();
-    let control=Router::new().route("/__metrics",axum::routing::get(move ||{let engine=engine.clone();let versions=versions.clone();async move{let metrics=versions.metrics();axum::Json(json!({"producers":engine.live_subscriber_count(),"validations":metrics.validations,"resultExecutions":metrics.result_executions}))}}))
+    let control=Router::new().route("/__metrics",axum::routing::get(move ||{let engine=engine.clone();let versions=versions.clone();async move{let metrics=versions.metrics();axum::Json(json!({"subscribers":engine.live_subscriber_count(),"producers":engine.live_producer_count(),"validations":metrics.validations,"resultExecutions":metrics.result_executions}))}}))
     .route("/__commit",axum::routing::post(move ||{let repository=repository.clone();let bus=bus.clone();async move{project_item(&repository,&bus,2,"worker committed").await;"committed"}}));
     let next_repository = fixture.repository.clone();
     let next_bus = fixture.bus.clone();
