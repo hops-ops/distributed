@@ -79,6 +79,14 @@ per attempt. A close that reconnecting cannot fix is not retried: a refused
 the reason `token expired`. An `error` message for one subscription is retried
 only when it is `LIVE_RESET_REQUIRED` or `FRESHNESS_SCOPE_CHANGED`.
 
+A lost connection is not a query error. The query keeps its data, status and
+`errors`; its `live` state is `reconnecting` until the reopened stream delivers
+a frame, and an HTTP refresh that fails meanwhile adds no error either. The
+replica reports the loss once, as `liveConnection` (`online` or
+`reconnecting`, with `subscribeLiveConnection`; in SvelteKit the store
+`useDistributedLiveConnection()`), so an application shows one
+"reconnecting" notice instead of an error in every query.
+
 Whichever of the HTTP refresh and the reopened stream answers first is
 admitted; the other is fenced by the operation generation, so the cache never
 moves back.

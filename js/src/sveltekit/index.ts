@@ -56,6 +56,7 @@ export {
 	defineDistributedSvelteKitOperation,
 	provideDistributedSvelteKitClient,
 	retainDistributedSvelteKitBoundary,
+	useDistributedLiveConnection,
 	useDistributedSvelteKitClient,
 	useDistributedSvelteKitCommands
 } from './context.js';

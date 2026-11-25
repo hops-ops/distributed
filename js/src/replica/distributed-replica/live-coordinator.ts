@@ -23,6 +23,7 @@ import type { ReplicaAuthority } from './authority.js';
 import type { DiagnosticsReporter } from './diagnostics.js';
 import type { OperationProtocols } from './operation-protocols.js';
 import type { RecordClocks } from './record-clocks.js';
+import type { ReplicaLiveConnection } from '../types.js';
 import type { LiveEntry, QueryState } from './types.js';
 import type { ReplicaWatchState } from './watch.js';
 
@@ -79,6 +80,10 @@ export class LiveCoordinator {
 	readonly #inFlight = new Map<string, Promise<void>>();
 	readonly #inFlightAborts = new Map<string, AbortController>();
 	readonly #lives = new Map<string, LiveEntry>();
+	readonly #connectionListeners = new Set<
+		(connection: ReplicaLiveConnection) => void
+	>();
+	#connection: ReplicaLiveConnection = 'online';
 
 	constructor(options: {
 		transport: ReplicaTransport | undefined;
@@ -115,10 +120,44 @@ export class LiveCoordinator {
 		watches.add(watch);
 	}
 
+	/** `reconnecting` while a watched operation is reopening a lost stream. */
+	get connection(): ReplicaLiveConnection {
+		return this.#connection;
+	}
+
+	subscribeConnection(
+		listener: (connection: ReplicaLiveConnection) => void
+	): () => void {
+		this.#connectionListeners.add(listener);
+		return () => {
+			this.#connectionListeners.delete(listener);
+		};
+	}
+
+	#noteConnection(): void {
+		let connection: ReplicaLiveConnection = 'online';
+		for (const key of this.#watches.keys()) {
+			if (this.#queryStates.get(key)?.live === 'reconnecting') {
+				connection = 'reconnecting';
+				break;
+			}
+		}
+		if (connection === this.#connection) return;
+		this.#connection = connection;
+		for (const listener of [...this.#connectionListeners]) {
+			try {
+				listener(connection);
+			} catch {
+				// A listener's failure is its own; the others still hear.
+			}
+		}
+	}
+
 	removeWatch(watch: Watch): void {
 		const watches = this.#watches.get(watch.key);
 		watches?.delete(watch);
 		if (watches?.size === 0) this.#watches.delete(watch.key);
+		this.#noteConnection();
 	}
 
 	/** One watch of every watched operation. */
@@ -150,6 +189,7 @@ export class LiveCoordinator {
 
 	clearStates(): void {
 		this.#queryStates.clear();
+		this.#noteConnection();
 	}
 
 	/** Tell an operation's watches its state changed. */
@@ -157,6 +197,7 @@ export class LiveCoordinator {
 		for (const watch of this.#watches.get(key) ?? []) {
 			watch._stateChanged(allowFetch);
 		}
+		this.#noteConnection();
 	}
 
 	/** Tell every watch its state changed; each may start a request. */
@@ -171,6 +212,7 @@ export class LiveCoordinator {
 		this.#inFlightAborts.delete(key);
 		controller?.abort();
 		this.#queryStates.delete(key);
+		this.#noteConnection();
 	}
 
 	/** The local revision at which an operation's open stream started. */
@@ -363,6 +405,8 @@ export class LiveCoordinator {
 			.catch((error: unknown) => {
 				if (this.#inFlight.get(watch.key) !== flight) return;
 				if (controller.signal.aborted) return;
+				// The reopen owns recovery: it refreshes again once it is back.
+				if (state.live === 'reconnecting') return;
 				state.errors = stableErrors(state.errors, [graphqlError(error)]);
 			})
 			.finally(() => {
@@ -388,7 +432,8 @@ export class LiveCoordinator {
 		}
 		this.#operations.reviveLive(watch.key);
 		const state = this.state(watch.key);
-		state.live = 'connecting';
+		// A reopened stream is reconnecting until it delivers again.
+		if (state.live !== 'reconnecting') state.live = 'connecting';
 		const entry: LiveEntry = {
 			count: 1,
 			unsubscribe: () => undefined,
@@ -481,10 +526,12 @@ export class LiveCoordinator {
 								this.#failLive(watch, entry, result.errors);
 								return;
 							}
+							const reconnected = state.live === 'reconnecting';
 							state.live = 'active';
 							entry.operationGeneration =
 								this.#operations.generation(watch.key);
 							entry.failures = undefined;
+							if (reconnected) this.emit(watch.key, false);
 						} catch (error) {
 							state.live = 'error';
 							state.errors = stableErrors(state.errors, [graphqlError(error)]);
@@ -494,7 +541,9 @@ export class LiveCoordinator {
 					error: (error) => {
 						if (!entry.active || this.#lives.get(watch.key) !== entry) return;
 						if (liveErrorIsRetryable(error)) {
-							this.#failLive(watch, entry, [graphqlError(error)]);
+							// Lost, not failed: keep the data, reopen, and say so once
+							// through the replica's live connection.
+							this.#failLive(watch, entry, undefined);
 							return;
 						}
 						this.#operations.retireLive(watch.key);
@@ -527,7 +576,7 @@ export class LiveCoordinator {
 				}
 				return;
 			}
-			state.live = 'active';
+			if (state.live !== 'reconnecting') state.live = 'active';
 		} catch (error) {
 			this.#operations.retireLive(watch.key);
 			entry.active = false;
@@ -610,6 +659,7 @@ export class LiveCoordinator {
 		);
 		if (watch === undefined) {
 			this.state(key).live = 'off';
+			this.#noteConnection();
 			return;
 		}
 		this.retainLive(watch);
@@ -664,7 +714,8 @@ export class LiveCoordinator {
 	#failLive<TData, TVariables extends GraphqlVariables>(
 		watch: ReplicaWatchState<TData, TVariables>,
 		entry: LiveEntry,
-		errors: readonly GqlError[]
+		/** The failure frame's errors; absent when the stream was lost. */
+		errors: readonly GqlError[] | undefined
 	): void {
 		if (!entry.active || this.#lives.get(watch.key) !== entry) return;
 		const key = watch.key;
@@ -702,8 +753,12 @@ export class LiveCoordinator {
 			}
 		}, delay);
 		const state = this.state(key);
-		state.live = 'error';
-		state.errors = stableErrors(state.errors, errors);
+		if (errors === undefined) {
+			state.live = 'reconnecting';
+		} else {
+			state.live = 'error';
+			state.errors = stableErrors(state.errors, errors);
+		}
 		this.emit(key, false);
 	}
 

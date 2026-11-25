@@ -1,6 +1,7 @@
 import { getContext, setContext } from 'svelte';
 
 import type {
+	ReplicaLiveConnection,
 	ReplicaOperationArtifact,
 	ReplicaSnapshot
 } from '../replica/index.js';
@@ -72,6 +73,23 @@ export function useDistributedSvelteKitClient<
 		);
 	}
 	return client as DistributedSvelteKitClient<TCommands>;
+}
+
+/**
+ * The nearest client's live connection as a Svelte store: `reconnecting`
+ * while any watched live operation is reopening a lost stream. Render one
+ * notice from it; queries keep their data and report no error meanwhile.
+ */
+export function useDistributedLiveConnection(): Readonly<{
+	subscribe(run: (connection: ReplicaLiveConnection) => void): () => void;
+}> {
+	const replica = useDistributedSvelteKitClient().replica;
+	return Object.freeze({
+		subscribe(run: (connection: ReplicaLiveConnection) => void): () => void {
+			run(replica.liveConnection);
+			return replica.subscribeLiveConnection(run);
+		}
+	});
 }
 
 /** Resolve the nearest generated command surface without a global proxy. */

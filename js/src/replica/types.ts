@@ -664,7 +664,21 @@ export type ReplicaTransport = {
 };
 
 export type ReplicaStatus = 'loading' | 'ready' | 'stale' | 'error';
-export type ReplicaLiveState = 'off' | 'connecting' | 'active' | 'error';
+/**
+ * `reconnecting`: the stream's connection was lost and is being reopened.
+ * The admitted data stays readable and the loss is not one of the query's
+ * `errors`; {@link DistributedReplica.liveConnection} reports it once for the
+ * whole replica.
+ */
+export type ReplicaLiveState =
+	| 'off'
+	| 'connecting'
+	| 'active'
+	| 'reconnecting'
+	| 'error';
+
+/** Whether every watched live operation has its stream (`online`) or some are reopening a lost one. */
+export type ReplicaLiveConnection = 'online' | 'reconnecting';
 
 /** The exact runtime shape while some selected cache fields are still absent. */
 export type ReplicaSparse<T> = T extends readonly (infer TItem)[]
@@ -872,6 +886,16 @@ export interface DistributedReplica {
 	readonly scope: ReplicaAuthoritativeScope | undefined;
 	/** Monotonic local fence for authorization changes and server scope changes. */
 	readonly authorizationGeneration: number;
+	/**
+	 * `reconnecting` while any watched live operation is reopening a lost
+	 * stream: one signal for an app-wide "reconnecting" notice, instead of an
+	 * error in every query.
+	 */
+	readonly liveConnection: ReplicaLiveConnection;
+	/** Call `listener` with each change of {@link liveConnection}; returns its removal. */
+	subscribeLiveConnection(
+		listener: (connection: ReplicaLiveConnection) => void
+	): () => void;
 	/** The operation's current snapshot. Registers and retains nothing. */
 	read<TData, TVariables extends GraphqlVariables>(
 		artifact: ReplicaOperationArtifact<TData, TVariables>,
