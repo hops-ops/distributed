@@ -60,7 +60,7 @@ distributed::projection! {
 mod tests {
     use distributed::domain_event::DomainEventContract;
     use distributed::projection::placement::ProjectionExecutionClass;
-    use distributed::{DomainEventBodyKind, RelationalReadModel, RowValue, TableMutation};
+    use distributed::{DomainEventBodyKind, MutationKind, RelationalReadModel, RowValue};
 
     use super::*;
     use todo_domain::{Todo, TodoPurgedDomainEvent};
@@ -73,11 +73,12 @@ mod tests {
         todo.complete("alice").unwrap();
         let occurrence = todo.entity.pending_domain_events().last().unwrap();
         let lowered = TODOS.server_executor().unwrap().plan(occurrence).unwrap();
-        let TableMutation::UpsertRow(row) = &lowered.write_plan.mutations[0] else {
-            panic!("expected upsert");
+        let [(resolved, record)] = lowered.records().collect::<Vec<_>>()[..] else {
+            panic!("expected one record");
         };
+        assert_eq!(resolved.kind(), MutationKind::Upsert);
         assert_eq!(
-            row.values.get("status"),
+            record.values().get("status"),
             Some(&RowValue::String("completed".into()))
         );
         assert_eq!(Todos::schema().table_name, "todos");
@@ -102,11 +103,12 @@ mod tests {
             &TodoPurgedDomainEvent::descriptor()
         );
         let lowered = TODOS.server_executor().unwrap().plan(occurrence).unwrap();
-        let TableMutation::DeleteRow(delete) = &lowered.write_plan.mutations[0] else {
-            panic!("expected delete");
+        let [(resolved, record)] = lowered.records().collect::<Vec<_>>()[..] else {
+            panic!("expected one record");
         };
+        assert_eq!(resolved.kind(), MutationKind::Delete);
         assert_eq!(
-            delete.key.get("todo_id"),
+            record.key().get("todo_id"),
             Some(&RowValue::String("todo-1".into()))
         );
     }

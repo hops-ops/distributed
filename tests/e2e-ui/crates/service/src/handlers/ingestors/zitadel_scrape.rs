@@ -176,7 +176,8 @@ mod tests {
     use super::super::zitadel::{user_profile, HUMAN_UPDATED};
     use super::*;
     use distributed::microsvc::Routes;
-    use distributed::{InMemoryRepository, OutboxStore};
+    use distributed::read_model::ReadModelWritePlanBuilder;
+    use distributed::{InMemoryRepository, OutboxStore, RelationalReadModel};
     use e2e_projections::{ZitadelUserProfile, AUTH_USERS};
 
     fn listed_user(subject: &str, display_name: &str) -> MappedDelivery {
@@ -236,7 +237,8 @@ mod tests {
                 .map(|profile| (profile.user_id, profile.display_name))
                 .collect::<Vec<_>>()
         };
-        // Run the `auth_users` projection over everything published.
+        // Run the `auth_users` projection over everything published, writing
+        // each projected row as an upsert.
         let project = || async {
             for message in repo.outbox_store().pending(usize::MAX).await.unwrap() {
                 let occurrence = message.domain_event_occurrence().unwrap();
@@ -245,7 +247,14 @@ mod tests {
                     .unwrap()
                     .plan(&occurrence)
                     .unwrap();
-                repo.commit_write_plan(lowered.write_plan).await.unwrap();
+                let mut rows = ReadModelWritePlanBuilder::new();
+                for (_, record) in lowered.records() {
+                    rows.upsert(&AuthUsers::from_row(record.values().clone()).unwrap())
+                        .unwrap();
+                }
+                repo.commit_write_plan(rows.into_write_plan().unwrap())
+                    .await
+                    .unwrap();
             }
         };
         let users = vec![listed_user("ada", "Ada"), listed_user("grace", "Grace")];

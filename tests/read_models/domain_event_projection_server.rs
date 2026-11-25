@@ -7,10 +7,10 @@ use distributed::read_model::ReadModelWritePlanBuilder;
 #[cfg(feature = "sqlite")]
 use distributed::table::TableSchemaRegistry;
 use distributed::{
-    Entity, InMemoryRepository, MutationKind, ProjectionArm, ProjectionEventSet,
+    Entity, ExpectedVersion, InMemoryRepository, MutationKind, ProjectionArm, ProjectionEventSet,
     ProjectionExpression, ProjectionPartition, ProjectionPlanTemplate, ProjectionProgram,
     ProjectionProgramError, ProjectionValue, ReadModelWorkspaceExt, ReadModelWritePlanStore,
-    RowKey, RowValue, TableMutation, TableWritePlan,
+    RowKey, RowValue, RowWriteMode, TableMutation, TableRowMutation, TableWritePlan,
 };
 use serde::{Deserialize, Serialize};
 
@@ -188,7 +188,7 @@ fn player_program() -> Result<ProjectionProgram, ProjectionProgramError> {
 fn lower_player_program(
     plan: &distributed::ResolvedProjectionPlan,
 ) -> Result<LoweredProjectionPlan, ProjectionLoweringError> {
-    let mut builder = ReadModelWritePlanBuilder::new();
+    let mut records = Vec::new();
     for mutation in plan.mutations() {
         let operation = mutation
             .provenance()
@@ -196,17 +196,46 @@ fn lower_player_program(
             .first()
             .map(String::as_str)
             .expect("each resolved mutation retains an operation ID");
-        match operation {
-            "upsert-summary" => lower_model_mutation::<PlayerSummary>(&mut builder, mutation)?,
-            "upsert-player" => lower_model_mutation::<Players>(&mut builder, mutation)?,
+        records.push(match operation {
+            "upsert-summary" => lower_model_mutation::<PlayerSummary>(mutation)?,
+            "upsert-player" => lower_model_mutation::<Players>(mutation)?,
             "upsert-weapon" => lower_related_mutation::<
                 __DistributedPlayersEffectRelationship_weapons,
-            >(&mut builder, plan, mutation, "upsert-player")?,
-            "insert-link" => lower_model_mutation::<PlayerWeaponLinks>(&mut builder, mutation)?,
+            >(plan, mutation, "upsert-player")?,
+            "insert-link" => lower_model_mutation::<PlayerWeaponLinks>(mutation)?,
             other => panic!("unexpected manual projection operation `{other}`"),
-        }
+        });
     }
-    finish_lowering(builder, plan)
+    finish_lowering(plan, records)
+}
+
+/// The physical plan a server-side builder would stage for these records:
+/// inserts must not exist yet, upserts replace. The executor makes this
+/// choice from each record's snapshot; these fixtures start empty.
+fn fluent_shaped_plan(lowered: &LoweredProjectionPlan) -> TableWritePlan {
+    TableWritePlan::new(
+        lowered
+            .records()
+            .map(|(resolved, record)| {
+                let (mode, expected_version) = match resolved.kind() {
+                    MutationKind::Insert | MutationKind::InsertRelated => {
+                        (RowWriteMode::Insert, ExpectedVersion::NotExists)
+                    }
+                    MutationKind::Upsert | MutationKind::UpsertRelated => {
+                        (RowWriteMode::Upsert, ExpectedVersion::Any)
+                    }
+                    other => panic!("fixture lowers only full rows, not `{other:?}`"),
+                };
+                TableMutation::UpsertRow(TableRowMutation {
+                    schema: record.schema(),
+                    key: record.key().clone(),
+                    values: record.values().clone(),
+                    expected_version,
+                    mode,
+                })
+            })
+            .collect(),
+    )
 }
 
 fn player_key() -> RowKey {
@@ -286,9 +315,8 @@ fn portable_and_fluent_plans() -> (distributed::TableWritePlan, distributed::Tab
     .expect("exact event set")
     .resolve(&occurrence())
     .expect("portable program resolves");
-    let portable = lower_player_program(&resolved)
-        .expect("portable program lowers")
-        .write_plan;
+    let portable =
+        fluent_shaped_plan(&lower_player_program(&resolved).expect("portable program lowers"));
     let (player, weapon, summary, link) = expected_models();
     let mut fluent = ReadModelWritePlanBuilder::new();
     fluent
@@ -349,7 +377,7 @@ fn collision_projection_plan() -> TableWritePlan {
         .expect("collision event set")
         .resolve(&collision_occurrence())
         .expect("collision projection resolves");
-    let mut builder = ReadModelWritePlanBuilder::new();
+    let mut records = Vec::new();
     for mutation in resolved.mutations() {
         let operation = mutation
             .provenance()
@@ -357,26 +385,20 @@ fn collision_projection_plan() -> TableWritePlan {
             .first()
             .map(String::as_str)
             .expect("collision operation provenance");
-        match operation {
+        records.push(match operation {
             "upsert-collision-parent" => {
-                lower_model_mutation::<CollisionParent>(&mut builder, mutation)
-                    .expect("lower collision parent");
+                lower_model_mutation::<CollisionParent>(mutation).expect("lower collision parent")
             }
-            "upsert-collision-child" => {
-                lower_related_mutation::<__DistributedCollisionParentEffectRelationship_children>(
-                    &mut builder,
-                    &resolved,
-                    mutation,
-                    "upsert-collision-parent",
-                )
-                .expect("lower collision child");
-            }
+            "upsert-collision-child" => lower_related_mutation::<
+                __DistributedCollisionParentEffectRelationship_children,
+            >(
+                &resolved, mutation, "upsert-collision-parent"
+            )
+            .expect("lower collision child"),
             other => panic!("unexpected collision operation `{other}`"),
-        }
+        });
     }
-    finish_lowering(builder, &resolved)
-        .expect("finish collision lowering")
-        .write_plan
+    fluent_shaped_plan(&finish_lowering(&resolved, records).expect("finish collision lowering"))
 }
 
 fn child_parent_id(plan: &TableWritePlan) -> Option<&RowValue> {

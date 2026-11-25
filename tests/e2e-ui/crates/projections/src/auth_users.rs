@@ -76,7 +76,7 @@ distributed::projection! {
 
 #[cfg(test)]
 mod tests {
-    use distributed::{DomainEventOccurrence, ExternalEventSource, RowValue, TableMutation};
+    use distributed::{DomainEventOccurrence, ExternalEventSource, MutationKind, RowValue};
 
     use super::*;
 
@@ -111,9 +111,10 @@ mod tests {
             .unwrap()
             .plan(&occurrence)
             .unwrap();
-        let TableMutation::UpsertRow(row) = &lowered.write_plan.mutations[0] else {
-            panic!("expected upsert");
+        let [(resolved, record)] = lowered.records().collect::<Vec<_>>()[..] else {
+            panic!("expected one record");
         };
+        assert_eq!(resolved.kind(), MutationKind::Upsert);
         for (column, value) in [
             ("user_id", "user-99"),
             ("display_name", "Ada"),
@@ -121,7 +122,7 @@ mod tests {
             ("approval_status", "pending"),
         ] {
             assert_eq!(
-                row.values.get(column),
+                record.values().get(column),
                 Some(&RowValue::String(value.into())),
                 "{column}"
             );

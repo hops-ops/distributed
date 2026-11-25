@@ -130,14 +130,6 @@ impl TableMutation {
         }
     }
 
-    pub(crate) fn operation_rank(&self) -> u8 {
-        match self {
-            TableMutation::UpsertRow(_) => 1,
-            TableMutation::PatchRow(_) => 2,
-            TableMutation::DeleteRow(_) => 3,
-        }
-    }
-
     fn schema(&self) -> &'static TableSchema {
         match self {
             TableMutation::UpsertRow(mutation) => mutation.schema,
@@ -146,41 +138,108 @@ impl TableMutation {
         }
     }
 
-    fn depends_on_table(&self, table_name: &str) -> bool {
-        let schema = self.schema();
-        schema.columns.iter().any(|column| {
+    /// This mutation's place in the canonical apply order.
+    pub(crate) fn write_position(&self, sequence: u64) -> WritePosition {
+        match self {
+            TableMutation::UpsertRow(row) => {
+                WritePosition::full_row(row.schema, &row.key, sequence)
+            }
+            TableMutation::PatchRow(patch) => {
+                WritePosition::patch(patch.schema, &patch.key, sequence)
+            }
+            TableMutation::DeleteRow(delete) => {
+                WritePosition::delete(delete.schema, &delete.key, sequence)
+            }
+        }
+    }
+
+    /// Validate the row, key and version fence against the schema.
+    pub(crate) fn validate(&self) -> Result<(), TableStoreError> {
+        match self {
+            TableMutation::UpsertRow(mutation) => validate_row_mutation(mutation),
+            TableMutation::PatchRow(mutation) => validate_patch_mutation(mutation),
+            TableMutation::DeleteRow(mutation) => validate_delete_mutation(mutation),
+        }
+    }
+}
+
+/// One staged write's place in the canonical apply order: full rows, then
+/// patches, then deletes; a parent row before the child that references it
+/// (the child first when both are deletes); then table and key; then the
+/// order the writes were staged in.
+pub(crate) struct WritePosition {
+    schema: &'static TableSchema,
+    rank: u8,
+    sort_key: String,
+    sequence: u64,
+}
+
+impl WritePosition {
+    const FULL_ROW: u8 = 1;
+    const PATCH: u8 = 2;
+    const DELETE: u8 = 3;
+
+    pub(crate) fn full_row(schema: &'static TableSchema, key: &RowKey, sequence: u64) -> Self {
+        Self::new(schema, Self::FULL_ROW, key, sequence)
+    }
+
+    pub(crate) fn patch(schema: &'static TableSchema, key: &RowKey, sequence: u64) -> Self {
+        Self::new(schema, Self::PATCH, key, sequence)
+    }
+
+    pub(crate) fn delete(schema: &'static TableSchema, key: &RowKey, sequence: u64) -> Self {
+        Self::new(schema, Self::DELETE, key, sequence)
+    }
+
+    fn new(schema: &'static TableSchema, rank: u8, key: &RowKey, sequence: u64) -> Self {
+        // Built once per write; formatting inside the comparator would
+        // allocate two Strings per comparison.
+        let sort_key = format!("{rank}|{}|{}", schema.table_name, key_fingerprint(key));
+        Self {
+            schema,
+            rank,
+            sort_key,
+            sequence,
+        }
+    }
+
+    fn depends_on(&self, other: &Self) -> bool {
+        self.schema.columns.iter().any(|column| {
             column
                 .foreign_key
                 .as_ref()
-                .is_some_and(|foreign_key| foreign_key.table == table_name)
+                .is_some_and(|foreign_key| foreign_key.table == other.schema.table_name)
         })
     }
 
-    pub(crate) fn dependency_order(&self, other: &Self) -> Option<Ordering> {
-        let self_depends_on_other = self.depends_on_table(other.table_name());
-        let other_depends_on_self = other.depends_on_table(self.table_name());
-
-        match (self_depends_on_other, other_depends_on_self) {
-            (true, false) if self.operation_rank() == 3 && other.operation_rank() == 3 => {
-                Some(Ordering::Less)
-            }
+    fn dependency_order(&self, other: &Self) -> Option<Ordering> {
+        let both_delete = self.rank == Self::DELETE && other.rank == Self::DELETE;
+        match (self.depends_on(other), other.depends_on(self)) {
+            (true, false) if both_delete => Some(Ordering::Less),
             (true, false) => Some(Ordering::Greater),
-            (false, true) if self.operation_rank() == 3 && other.operation_rank() == 3 => {
-                Some(Ordering::Greater)
-            }
+            (false, true) if both_delete => Some(Ordering::Greater),
             (false, true) => Some(Ordering::Less),
             _ => None,
         }
     }
 
-    pub(crate) fn sort_key(&self) -> String {
-        format!(
-            "{}|{}|{}",
-            self.operation_rank(),
-            self.table_name(),
-            key_fingerprint(self.key())
-        )
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.rank
+            .cmp(&other.rank)
+            .then_with(|| self.dependency_order(other).unwrap_or(Ordering::Equal))
+            .then_with(|| self.sort_key.cmp(&other.sort_key))
+            .then(self.sequence.cmp(&other.sequence))
     }
+}
+
+/// Sort staged writes into the canonical apply order (see [`WritePosition`]).
+pub(crate) fn sort_writes<T>(writes: Vec<T>, position: impl Fn(&T) -> WritePosition) -> Vec<T> {
+    let mut positioned = writes
+        .into_iter()
+        .map(|write| (position(&write), write))
+        .collect::<Vec<_>>();
+    positioned.sort_by(|(left, _), (right, _)| left.cmp(right));
+    positioned.into_iter().map(|(_, write)| write).collect()
 }
 
 pub(crate) fn validate_row_mutation(mutation: &TableRowMutation) -> Result<(), TableStoreError> {

@@ -1541,13 +1541,14 @@ mod tests {
             .as_ref()
             .expect("validation must retain the selected authoritative lowering");
         assert_eq!(lowered.resolved.mutations().len(), 1);
-        let [TableMutation::UpsertRow(row)] = lowered.write_plan.mutations.as_slice() else {
-            panic!("modeled direct lowering must contain one full-row upsert");
+        let [(resolved, record)] = lowered.records().collect::<Vec<_>>()[..] else {
+            panic!("modeled direct lowering must contain one record");
         };
-        assert_eq!(row.schema.model_name, "ModeledDirectView");
-        assert_eq!(row.schema.table_name, "modeled_direct_views");
+        assert_eq!(resolved.kind(), crate::MutationKind::Upsert);
+        assert_eq!(record.schema().model_name, "ModeledDirectView");
+        assert_eq!(record.schema().table_name, "modeled_direct_views");
         assert_eq!(
-            row.values.get("title"),
+            record.values().get("title"),
             Some(&RowValue::String("authoritative".into()))
         );
     }

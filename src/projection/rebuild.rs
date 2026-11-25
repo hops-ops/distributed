@@ -4,8 +4,8 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use crate::projection::lower::ProjectionServerExecutorDescriptor;
 use crate::projection_protocol::*;
 use crate::table::{TableMutation, TableWritePlan};
-use crate::DomainEventOccurrence;
 use crate::{repository::StreamIdentity, EventRecord};
+use crate::{DomainEventOccurrence, MutationKind};
 use sha2::{Digest, Sha256};
 
 pub(crate) const MAX_REBUILD_RECORDS: usize = 10_000;
@@ -402,26 +402,26 @@ impl SnapshotProjectionRebuild {
             if !lowered.resolved.source_snapshots() {
                 return Err(invalid("snapshot rebuild resolved a non-snapshot program"));
             }
-            lowered.write_plan.validate()?;
             let source = SourceSnapshotVersion::from_occurrence(event)?;
-            for mut mutation in lowered.write_plan.mutations {
-                // Protocol inventory CAS, not a domain version column, fences maintenance.
-                match &mut mutation {
-                    TableMutation::UpsertRow(row) => {
-                        row.expected_version = crate::table::ExpectedVersion::Any;
-                        row.mode = crate::table::RowWriteMode::Upsert;
+            for (index, record) in lowered.records {
+                // Protocol inventory CAS, not a domain version column, fences
+                // maintenance: every snapshot row is written unfenced.
+                let mutation = match lowered.resolved.mutations()[index].kind() {
+                    MutationKind::Delete => record.delete(),
+                    MutationKind::Patch | MutationKind::UpsertPatch => {
+                        return Err(invalid("snapshot rebuild cannot apply patches"))
                     }
-                    TableMutation::DeleteRow(row) => {
-                        row.expected_version = crate::table::ExpectedVersion::Any
-                    }
-                    _ => {}
-                }
+                    MutationKind::Insert
+                    | MutationKind::Upsert
+                    | MutationKind::Recreate
+                    | MutationKind::InsertRelated
+                    | MutationKind::UpsertRelated => record.upsert(),
+                };
+                mutation.validate()?;
                 let (schema, key) = match &mutation {
                     TableMutation::UpsertRow(row) => (row.schema, &row.key),
                     TableMutation::DeleteRow(row) => (row.schema, &row.key),
-                    TableMutation::PatchRow(_) => {
-                        return Err(invalid("snapshot rebuild cannot apply patches"))
-                    }
+                    TableMutation::PatchRow(_) => unreachable!("patches were rejected above"),
                 };
                 let scope = self
                     .context

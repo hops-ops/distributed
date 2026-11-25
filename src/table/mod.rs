@@ -24,8 +24,8 @@ pub use metadata::{
 };
 pub(crate) use mutation::{
     belongs_to_join_columns, column_name_for, has_many_join_columns, key_fingerprint, key_from_row,
-    validate_delete_mutation, validate_expected_version, validate_key, validate_patch_mutation,
-    validate_row_mutation, validate_row_values,
+    sort_writes, validate_delete_mutation, validate_expected_version, validate_key,
+    validate_patch_mutation, validate_row_mutation, validate_row_values, WritePosition,
 };
 pub use mutation::{
     DeleteTableRowMutation, ExpectedVersion, PatchMode, PatchTableRowMutation, RowPatch,

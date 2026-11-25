@@ -106,11 +106,11 @@ fn generated_modeled_projector_lower(
     crate::projection::lower::ProjectionLoweringError,
 > {
     use crate::projection::lower::{finish_lowering, lower_model_mutation};
-    let mut builder = crate::read_model::ReadModelWritePlanBuilder::new();
+    let mut records = Vec::new();
     for mutation in plan.mutations() {
         match mutation.target().model() {
-            "PrimaryView" => lower_model_mutation::<PrimaryView>(&mut builder, mutation)?,
-            "SecondaryView" => lower_model_mutation::<SecondaryView>(&mut builder, mutation)?,
+            "PrimaryView" => records.push(lower_model_mutation::<PrimaryView>(mutation)?),
+            "SecondaryView" => records.push(lower_model_mutation::<SecondaryView>(mutation)?),
             other => {
                 return Err(crate::projection::lower::ProjectionLoweringError::Table(
                     crate::TableStoreError::Metadata(format!("unknown model `{other}`")),
@@ -118,7 +118,7 @@ fn generated_modeled_projector_lower(
             }
         }
     }
-    finish_lowering(builder, plan)
+    finish_lowering(plan, records)
 }
 
 #[cfg(feature = "graphql")]
