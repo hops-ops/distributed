@@ -45,8 +45,7 @@ use tracing::Instrument as _;
 use tracing_opentelemetry::OpenTelemetrySpanExt as _;
 use tracing_subscriber::layer::SubscriberExt as _;
 
-#[path = "../support/env.rs"]
-mod env_support;
+use common::env as env_support;
 
 /// The parent span id we inject; the exported framework span must be its child.
 const REMOTE_PARENT_SPAN_ID: &str = "00f067aa0ba902b7";

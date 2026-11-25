@@ -13,9 +13,7 @@ use distributed::{
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-#[path = "../support/graphql.rs"]
-mod common;
-use common::Db;
+use common::graphql::Db;
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, ReadModel)]
 #[table("boxed_accounts")]

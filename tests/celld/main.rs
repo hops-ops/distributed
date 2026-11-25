@@ -15,8 +15,7 @@ use serde_json::Value;
 const TEST_SERVICE_ID: &str = "celld-live-test";
 const TEST_PRINCIPAL_PARTITION: &str = "test-principal-alice";
 
-#[path = "../support/env.rs"]
-mod env_support;
+use common::env as env_support;
 
 #[tokio::test]
 async fn live_cell_private_routes_reject_missing_forged_and_malformed_authority() {

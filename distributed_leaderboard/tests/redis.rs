@@ -16,8 +16,7 @@ use distributed_leaderboard::{
     LeaderboardProjector, LeaderboardStore, RedisLeaderboard, ScorePolicy, ScoreSubmission,
 };
 
-#[path = "../../tests/support/env.rs"]
-mod env_support;
+use common::env as env_support;
 
 fn redis_url() -> Option<String> {
     env_support::require_service("REDIS_URL", "redis leaderboard test")

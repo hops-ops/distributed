@@ -25,8 +25,7 @@ use distributed::outbox_worker::OutboxDispatcher;
 use distributed::{CommitBatch, InMemoryRepository, OutboxMessage, TransactionalCommit};
 use serde_json::json;
 
-#[path = "../support/env.rs"]
-mod env_support;
+use common::env as env_support;
 
 #[derive(Debug, serde::Deserialize, distributed::CommandInput)]
 struct CreateOrder {

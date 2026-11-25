@@ -1,12 +1,14 @@
-use distributed::{sourced, Entity};
+//! The shared Todo aggregate.
+
+use distributed::{sourced, Entity, Snapshot};
 use serde::{Deserialize, Serialize};
 
-#[derive(Default)]
+#[derive(Default, Snapshot)]
 pub struct Todo {
     pub entity: Entity,
-    user_id: String,
-    task: String,
-    completed: bool,
+    pub user_id: String,
+    pub task: String,
+    pub completed: bool,
 }
 
 #[sourced(entity)]
@@ -27,8 +29,10 @@ impl Todo {
         self.completed = true;
     }
 
-    pub fn snapshot(&self) -> TodoSnapshot {
-        TodoSnapshot {
+    /// The Todo's state as a plain value (a non-event method, which the
+    /// `#[sourced]` macro passes through unchanged).
+    pub fn state(&self) -> TodoState {
+        TodoState {
             id: self.entity.id().to_string(),
             user_id: self.user_id.clone(),
             task: self.task.clone(),
@@ -37,8 +41,10 @@ impl Todo {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct TodoSnapshot {
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+/// What [`Todo::state`] returns; the generated `TodoSnapshot` is the
+/// snapshot payload.
+pub struct TodoState {
     pub id: String,
     pub user_id: String,
     pub task: String,

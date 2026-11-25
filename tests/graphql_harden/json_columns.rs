@@ -11,7 +11,7 @@ use distributed::{
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-use super::common::{exec_json, session, Db};
+use common::graphql::{exec_json, session, Db};
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, ReadModel)]
 #[table("folders")]

@@ -571,7 +571,7 @@ claim → role/session). Live against three local IdPs — not mocks only:
 | **[Keycloak](tests/graphql_oidc_keycloak/)** | `./scripts/oidc-keycloak-up.sh` | `cargo test --test graphql_oidc_keycloak --features graphql,sqlite` | `KEYCLOAK_E2E=1` |
 | **[Authentik](tests/graphql_oidc_authentik/)** | `./scripts/oidc-authentik-up.sh` | `cargo test --test graphql_oidc_authentik --features graphql,sqlite` | `AUTHENTIK_E2E=1` |
 
-Shared **E1–E8** in [`tests/graphql_oidc_common/`](tests/graphql_oidc_common/).
+Shared **E1–E8** in [`tests/common/src/oidc.rs`](tests/common/src/oidc.rs).
 Gated binaries skip cleanly when unset. Offline:
 `cargo test --test graphql_identity --features graphql,sqlite`.
 

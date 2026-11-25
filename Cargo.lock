@@ -898,6 +898,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "common"
+version = "0.0.0"
+dependencies = [
+ "async-graphql",
+ "axum",
+ "base64 0.23.1",
+ "bitcode",
+ "distributed",
+ "jsonwebtoken",
+ "rand 0.8.8",
+ "reqwest",
+ "rsa",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "tokio",
+ "tower",
+]
+
+[[package]]
 name = "concurrent-queue"
 version = "2.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1314,6 +1334,7 @@ dependencies = [
  "axum",
  "base64 0.23.1",
  "bitcode",
+ "common",
  "distributed_cli",
  "distributed_macros",
  "futures",
@@ -1424,6 +1445,7 @@ version = "0.1.0"
 dependencies = [
  "async-graphql",
  "async-trait",
+ "common",
  "distributed",
  "distributed_cli",
  "futures-util",

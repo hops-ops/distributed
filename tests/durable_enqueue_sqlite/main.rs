@@ -37,8 +37,7 @@ impl Counter {
 
 type Repo = AggregateRepository<QueuedRepository<SqliteRepository>, Counter>;
 
-#[path = "../support/commands.rs"]
-mod commands;
+use common::commands;
 
 #[derive(Debug, Deserialize, distributed::CommandInput)]
 struct Touch {}

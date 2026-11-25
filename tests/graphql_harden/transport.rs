@@ -13,7 +13,7 @@ use distributed::{
 use serde::{Deserialize, Serialize};
 use tower::util::ServiceExt;
 
-use super::common::{seed_orders, session, Db, OrderView};
+use common::graphql::{seed_orders, session, Db, OrderView};
 
 #[derive(Default)]
 struct T4Aggregate {

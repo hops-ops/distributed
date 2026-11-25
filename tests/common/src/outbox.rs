@@ -1,6 +1,4 @@
-//! Outbox lookup helpers over the public `OutboxStore` surface, shared across
-//! test targets via `#[path = "../support/outbox.rs"]`.
-#![allow(dead_code)] // each including target uses a subset
+//! Outbox lookups over the public `OutboxStore` surface.
 
 use distributed::{OutboxMessage, OutboxMessageStatus, OutboxStore};
 

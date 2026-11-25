@@ -18,15 +18,16 @@ struct SeatView {
     status: String,
 }
 
-/// The table schemas backing these scenarios, so SQL backends can bootstrap
-/// the `conformance_seat_views` table in their `repository()` factory.
-/// (Unused by the in-memory target, which needs no schema.)
-#[allow(dead_code)]
+/// The tables the conformance scenarios write, which SQL backends bootstrap
+/// in `open`; the in-memory repository needs no schema.
 pub fn conformance_table_registry() -> TableSchemaRegistry {
     let mut registry = TableSchemaRegistry::new();
     registry
         .register::<SeatView>()
         .expect("SeatView schema should register");
+    registry
+        .register::<super::storage::CounterView>()
+        .expect("CounterView schema should register");
     registry
 }
 

@@ -1,5 +1,5 @@
 [workspace]
-members = ["distributed_macros", "distributed_cli", "distributed_game", "distributed_leaderboard", "distributed_game_macros", "tests/fixtures/renamed-dependency"]
+members = ["tests/common", "distributed_macros", "distributed_cli", "distributed_game", "distributed_leaderboard", "distributed_game_macros", "tests/fixtures/renamed-dependency"]
 exclude = ["tests/e2e-ui", "tests/celld/worker", "tests/celld/relay-worker", "tests/celld/alarm-worker", "tests/celld/fact-worker", "tests/celld/zone-worker", "tests/fixtures/wasm32-native-domain", "examples/game/server"]
 resolver = "2"
 
@@ -54,8 +54,8 @@ http = ["dep:axum", "dep:reqwest", "runtime-tokio"]
 # ingress `microsvc::cloud_events_router`.
 knative = ["http"]
 grpc = ["dep:tonic", "dep:tonic-prost", "dep:prost", "runtime-tokio"]
-postgres = ["dep:sqlx", "runtime-tokio", "sqlx/postgres", "sqlx/migrate", "sqlx/runtime-tokio", "sqlx/json"]
-sqlite = ["dep:sqlx", "runtime-tokio", "sqlx/migrate", "sqlx/runtime-tokio", "sqlx/sqlite", "sqlx/json"]
+postgres = ["dep:sqlx", "runtime-tokio", "sqlx/postgres", "sqlx/migrate", "sqlx/runtime-tokio", "sqlx/json", "common/postgres"]
+sqlite = ["dep:sqlx", "runtime-tokio", "sqlx/migrate", "sqlx/runtime-tokio", "sqlx/sqlite", "sqlx/json", "common/sqlite"]
 nats = ["dep:async-nats", "dep:futures", "runtime-tokio"]
 rabbitmq = ["dep:lapin", "dep:futures", "runtime-tokio"]
 kafka = ["dep:rdkafka", "runtime-tokio"]
@@ -65,7 +65,7 @@ redis-streams = ["dep:redis", "runtime-tokio"]
 # host's Durable Object storage and outbox, and the celld Queue publisher.
 cloudflare-workers = ["dep:worker"]
 otel = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:tracing-opentelemetry"]
-graphql = ["dep:async-graphql", "dep:async-graphql-axum", "dep:futures-channel", "dep:hmac", "dep:jsonwebtoken", "dep:subtle", "futures-util/sink", "http", "axum?/ws"]
+graphql = ["common/graphql", "dep:async-graphql", "dep:async-graphql-axum", "dep:futures-channel", "dep:hmac", "dep:jsonwebtoken", "dep:subtle", "futures-util/sink", "http", "axum?/ws"]
 
 [dependencies]
 async-nats = { version = "0.50", optional = true }
@@ -118,6 +118,9 @@ sha2 = "0.10"
 tonic-build = { version = "0.14", default-features = false, features = ["transport"] }
 
 [dev-dependencies]
+# Shared integration-test fixtures and conformance suites; `sqlite`,
+# `postgres` and `graphql` forward to it.
+common = { path = "tests/common" }
 axum = { version = "0.8", features = ["ws"] }
 distributed_cli = { path = "distributed_cli" }
 tower = { version = "0.5", features = ["util"] }

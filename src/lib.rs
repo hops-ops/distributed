@@ -14,10 +14,7 @@ pub mod __private {
 
 /// Service guard shared with the integration tests.
 #[cfg(test)]
-#[path = "../tests/support/env.rs"]
-pub(crate) mod test_env;
-#[cfg(test)]
-mod test_env_tests;
+pub(crate) use common::env as test_env;
 
 mod time;
 

@@ -1,6 +1,4 @@
-//! In-process typed command dispatch, shared across test targets via
-//! `#[path = "../support/commands.rs"]`.
-#![allow(dead_code)] // each including target uses a subset
+//! In-process typed command dispatch.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 

@@ -1,6 +1,8 @@
 #[cfg(feature = "graphql")]
 use super::super::causal::ensure_causal_grant;
 #[cfg(feature = "graphql")]
+use super::super::causal::GraphqlServiceBindError;
+#[cfg(feature = "graphql")]
 use super::super::causal::{CausalCommandPublicStatus, ExternalCausalAttempt};
 use super::super::causal::{CausalDispatchError, CausalDispatchResult, SealModeledProjection};
 use super::super::handlers::{
@@ -781,7 +783,7 @@ where
     fn bind_typed_command_contracts(
         &mut self,
         contracts: &BTreeMap<String, TypedCommandContract>,
-    ) -> Result<(), String> {
+    ) -> Result<(), GraphqlServiceBindError> {
         for handlers in self.handlers.values_mut() {
             for registered in handlers.values_mut() {
                 let RegisteredHandler::Causal(handler) = registered else {
@@ -789,10 +791,9 @@ where
                 };
                 let current = handler.contract();
                 let bound = contracts.get(&current.name).ok_or_else(|| {
-                    format!(
-                        "GraphQL engine is missing typed command `{}` from the executable service",
-                        current.name
-                    )
+                    GraphqlServiceBindError::MissingTypedCommand {
+                        command: current.name.clone(),
+                    }
                 })?;
                 let mut current_without_owner = current.clone();
                 current_without_owner.direct_projection = None;
@@ -801,16 +802,15 @@ where
                 if current.input_type_id != bound.input_type_id
                     || current.output_type_id != bound.output_type_id
                 {
-                    return Err("typed command Rust input/output TypeId mismatch".into());
+                    return Err(GraphqlServiceBindError::TypeIdMismatch);
                 }
                 if current.consistency != bound.consistency
                     || current.projected_model != bound.projected_model
                     || current_without_owner.canonical_value()
                         != bound_without_owner.canonical_value()
                 {
-                    return Err(format!(
-                        "typed command structural fingerprint mismatch for executable route `{}`",
-                        current.name
+                    return Err(GraphqlServiceBindError::StructuralFingerprintMismatch(
+                        format!("executable route `{}`", current.name),
                     ));
                 }
                 handler.bind_direct_projection(bound.direct_projection.clone());

@@ -15,11 +15,9 @@ use distributed::microsvc::{Context, Message, MessageKind, Routes, Service};
 use serde_json::json;
 
 // Shared broker-test helpers (bus scenarios, unique, ...).
-#[path = "../transport_conformance/mod.rs"]
-mod conformance;
+use common::env as env_support;
+use common::transport as conformance;
 use conformance::unique;
-#[path = "../support/env.rs"]
-mod env_support;
 
 fn nats_url() -> Option<String> {
     env_support::require_service("NATS_URL", "nats transport test")
@@ -449,7 +447,7 @@ impl conformance::bus::BusHarness for Nats {
     }
 }
 
-conformance::bus::bus_conformance_tests!(Nats);
+common::bus_conformance_tests!(Nats);
 
 /// `send` + `listen`: replicas sharing a `group` compete for the command — each
 /// message is handled exactly once across the pool (point-to-point).

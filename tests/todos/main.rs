@@ -1,6 +1,4 @@
-mod aggregate;
-
-use aggregate::{Todo, TodoSnapshot};
+use common::todo::{Todo, TodoState};
 use distributed::bus::{Message, MessagePublisher, TransportError};
 use distributed::{
     AggregateBuilder, CommitBuilderExt, InMemoryOutboxStore, InMemoryRepository, Lock, LockManager,
@@ -30,7 +28,7 @@ fn todo_outbox_message(
     id: &str,
     suffix: &str,
     event_type: &str,
-    snapshot: &TodoSnapshot,
+    snapshot: &TodoState,
 ) -> OutboxMessage {
     OutboxMessage::encode(format!("{id}:{suffix}"), event_type, snapshot).unwrap()
 }
@@ -94,7 +92,7 @@ async fn todos() {
     let repo = InMemoryRepository::new().queued().aggregate::<Todo>();
 
     let (mut todo, id1) = initialized_todo("user1", "Buy groceries");
-    let init_message = todo_outbox_message(&id1, "init", "todo.initialized", &todo.snapshot());
+    let init_message = todo_outbox_message(&id1, "init", "todo.initialized", &todo.state());
 
     // Commit the Todo + Outbox message to the repository
     repo.outbox(init_message)
@@ -118,12 +116,8 @@ async fn todos() {
     // Retrieve the Todo from the repository and complete it, then commit again
     let mut retrieved_todo = repo.get(&id1).await.unwrap().expect("Todo not found");
     retrieved_todo.complete().unwrap();
-    let complete_message = todo_outbox_message(
-        &id1,
-        "complete",
-        "todo.completed",
-        &retrieved_todo.snapshot(),
-    );
+    let complete_message =
+        todo_outbox_message(&id1, "complete", "todo.completed", &retrieved_todo.state());
 
     repo.outbox(complete_message)
         .commit(&mut retrieved_todo)
@@ -150,10 +144,10 @@ async fn todos() {
         .await
         .unwrap()
         .expect("Updated Todo not found");
-    assert!(completed_todo.snapshot().id == id1);
-    assert!(completed_todo.snapshot().user_id == "user1");
-    assert!(completed_todo.snapshot().task == "Buy groceries");
-    assert!(completed_todo.snapshot().completed);
+    assert!(completed_todo.state().id == id1);
+    assert!(completed_todo.state().user_id == "user1");
+    assert!(completed_todo.state().task == "Buy groceries");
+    assert!(completed_todo.state().completed);
     drop(completed_todo);
 
     let (mut todo2, id2) = initialized_todo("user1", "Buy Sauna");
@@ -181,10 +175,10 @@ async fn get_commit_roundtrip() {
     repo.commit(&mut todo).await.unwrap();
 
     let retrieved = repo.peek(&id).await.unwrap().expect("Todo not found");
-    assert_eq!(retrieved.snapshot().id, id);
-    assert_eq!(retrieved.snapshot().user_id, "user1");
-    assert_eq!(retrieved.snapshot().task, "Roundtrip");
-    assert!(!retrieved.snapshot().completed);
+    assert_eq!(retrieved.state().id, id);
+    assert_eq!(retrieved.state().user_id, "user1");
+    assert_eq!(retrieved.state().task, "Roundtrip");
+    assert!(!retrieved.state().completed);
 }
 
 #[tokio::test]
@@ -200,10 +194,10 @@ async fn get_all_commit_all_roundtrip() {
 
     let todos = repo.get_all(&[&id1, &id2]).await.unwrap();
     assert_eq!(todos.len(), 2);
-    assert_eq!(todos[0].snapshot().id, id1);
-    assert!(!todos[0].snapshot().completed);
-    assert_eq!(todos[1].snapshot().id, id2);
-    assert!(!todos[1].snapshot().completed);
+    assert_eq!(todos[0].state().id, id1);
+    assert!(!todos[0].state().completed);
+    assert_eq!(todos[1].state().id, id2);
+    assert!(!todos[1].state().completed);
 
     let mut iter = todos.into_iter();
     let mut todo1v2 = iter.next().unwrap();
@@ -219,17 +213,17 @@ async fn get_all_commit_all_roundtrip() {
     let v2_todos = repo.peek_all(&[&id1, &id2]).await.unwrap();
 
     assert_eq!(v2_todos.len(), 2);
-    assert_eq!(v2_todos[0].snapshot().id, id1);
-    assert!(v2_todos[0].snapshot().completed);
-    assert_eq!(v2_todos[1].snapshot().id, id2);
-    assert!(v2_todos[1].snapshot().completed);
+    assert_eq!(v2_todos[0].state().id, id1);
+    assert!(v2_todos[0].state().completed);
+    assert_eq!(v2_todos[1].state().id, id2);
+    assert!(v2_todos[1].state().completed);
 }
 
 #[tokio::test]
 async fn outbox_records_persisted() {
     let repo = InMemoryRepository::new();
     let (mut todo, id) = initialized_todo("user1", "Outbox demo");
-    let snapshot = todo.snapshot();
+    let snapshot = todo.state();
     let message = todo_outbox_message(&id, "init", "todo.initialized", &snapshot);
 
     repo.outbox(message).commit(&mut todo).await.unwrap();
@@ -239,7 +233,7 @@ async fn outbox_records_persisted() {
     assert_eq!(pending.len(), 1);
     assert_eq!(pending[0].event_type, "todo.initialized");
 
-    let published: TodoSnapshot = bitcode::deserialize(&pending[0].payload).unwrap();
+    let published: TodoState = bitcode::deserialize(&pending[0].payload).unwrap();
     assert_eq!(published.id, snapshot.id);
     assert_eq!(published.user_id, snapshot.user_id);
     assert_eq!(published.task, snapshot.task);
@@ -250,7 +244,7 @@ async fn outbox_records_persisted() {
 async fn outbox_dispatch_publishes_and_completes_committed_row() {
     let repo = InMemoryRepository::new();
     let (mut todo, id) = initialized_todo("user1", "Outbox dispatch");
-    let message = todo_outbox_message(&id, "init", "todo.initialized", &todo.snapshot());
+    let message = todo_outbox_message(&id, "init", "todo.initialized", &todo.state());
     let message_id = message.id().to_string();
     repo.outbox(message).commit(&mut todo).await.unwrap();
 
@@ -481,7 +475,7 @@ async fn commit_failure_keeps_lock_until_abort() {
 async fn outbox_dispatch_drains_one_row_at_a_time() {
     let repo = InMemoryRepository::new();
     let (mut todo, id) = initialized_todo("user1", "Process next test");
-    let snapshot = todo.snapshot();
+    let snapshot = todo.state();
 
     // Queue 3 messages
     let message1 = todo_outbox_message(&id, "1", "todo.first_recorded", &snapshot);
@@ -546,7 +540,7 @@ async fn metadata_flows_from_entity_through_outbox_to_publisher() {
     assert_eq!(new_events[0].meta("user_id"), Some("u-42"));
 
     // 3. Create outbox message — metadata propagates automatically from entity
-    let snapshot = todo.snapshot();
+    let snapshot = todo.state();
     let message = OutboxMessage::encode_for_entity(
         format!("{}:init", id),
         "todo.initialized",

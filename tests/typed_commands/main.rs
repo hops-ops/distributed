@@ -14,6 +14,7 @@ use distributed::command::{
     typed_command, Atomic, CommandInputType, CommandOutputType, CommandTypeDef, CommandTypeField,
     EffectInputFieldMarker, EffectModelFieldMarker, Eventual, PreparedCommand, Succeeded,
 };
+use distributed::domain_event::DomainEventContract;
 use distributed::graphql::{
     build_surface, graphql_router_with_service, read, surface_for_role, ClientProjectionAssignment,
     ClientProjectionExpression, ClientProjectionFallback, ClientProjectionInvalidation,
@@ -22,7 +23,9 @@ use distributed::graphql::{
     SurfaceDirectProjection, SurfaceModeledProjection, SurfaceOptions, SurfaceProjector,
 };
 use distributed::microsvc::Session;
-use distributed::microsvc::{CausalCommandContext, HandlerError, Routes, Service};
+use distributed::microsvc::{
+    CausalCommandContext, GraphqlServiceBindError, HandlerError, Routes, Service,
+};
 use distributed::projection::catalog::{ProjectionBindingActivation, ProjectionCatalog};
 use distributed::projection::lower::{DirectCandidate, EventualOnly, ProjectionDescriptor};
 use distributed::projection::placement::{
@@ -33,10 +36,10 @@ use distributed::projection::placement::{
 use distributed::projection::ProjectionEventSelector;
 use distributed::projection_protocol::ProjectorTopologyId;
 use distributed::{
-    command_input_defaults, compile_projection, state_upsert_program_for_model, Aggregate,
+    bind_event_apply_mutation, command_input_defaults, compile_projection, Aggregate,
     AggregateRepository, CommandInput, CommandOutput, DomainEventDescriptor, Entity, EventRecord,
-    InMemoryRepository, MutationKind, ProjectionArm, ProjectionAssignment, ProjectionExpression,
-    ProjectionField, ProjectionHandler, ProjectionInputSource, ProjectionKeyField,
+    InMemoryRepository, Mutation, MutationKind, ProjectionArm, ProjectionAssignment,
+    ProjectionExpression, ProjectionField, ProjectionInputSource, ProjectionKeyField,
     ProjectionOperation, ProjectionPartition, ProjectionProgram, ProjectionProgramError,
     ProjectionValue, ProjectionValueType, ReadModel, RelationalReadModel, SqliteRepository,
 };
@@ -433,30 +436,31 @@ fn patch_program(
     )
 }
 
-/// One arm that upserts the whole `M` row from the event body.
-fn upsert_program<M: RelationalReadModel>(
-    name: &str,
-    selector: ProjectionEventSelector,
-    partition: ProjectionPartition,
-) -> Result<ProjectionProgram, ProjectionProgramError> {
-    compile_projection(
-        name,
-        1,
-        partition,
-        [ProjectionHandler::try_new(
-            "changed",
-            selector,
-            vec![ProjectionInputSource::Body.binding("row")?],
-            state_upsert_program_for_model::<M>("save", 1, "upsert-row", "row")?,
-        )?],
-    )
+/// Upsert the whole `PlanView` row from the `row` input.
+#[allow(non_snake_case)]
+fn SavePlan() -> Mutation<()> {
+    distributed::mutation! {
+        mutation SavePlan {
+            upsert_PlanView(object: $input.row)
+        }
+    }
 }
 
+/// The `projection!` event-first form only builds unit-partitioned programs;
+/// this one partitions by the plan id (the generated-default test reads the
+/// partition slot), so it binds the declared mutation through the
+/// `program:` escape hatch.
 fn plan_projection_program() -> Result<ProjectionProgram, ProjectionProgramError> {
-    upsert_program::<PlanView>(
+    compile_projection(
         "typed_commands_plan",
-        state_selector::<PlanView>("plan.changed", 1)?,
+        1,
         ProjectionPartition::Expression(body(ProjectionValueType::String, "id")),
+        [bind_event_apply_mutation(
+            &PlanChangedDomainEvent::descriptor(),
+            SavePlan().program()?,
+            "row",
+            ProjectionInputSource::Body,
+        )?],
     )
 }
 
@@ -470,15 +474,13 @@ distributed::projection! {
     };
 }
 
-fn plan_title_program() -> Result<ProjectionProgram, ProjectionProgramError> {
-    patch_program(
-        "typed_commands_plan_title",
-        "changed",
-        state_selector::<PlanView>("plan.changed", 1)?,
-        ("PlanView", "plan_views"),
-        &["id"],
-        vec![("title", body(ProjectionValueType::String, "title"))],
-    )
+#[allow(non_snake_case)]
+fn RenamePlan() -> Mutation<()> {
+    distributed::mutation! {
+        mutation RenamePlan {
+            update_PlanView_by_pk(id: $input.plan.id, _set: { title: $input.plan.title })
+        }
+    }
 }
 
 distributed::projection! {
@@ -487,10 +489,17 @@ distributed::projection! {
         version: 1,
         epoch: "typed-commands-plan-title-v1",
         model: PlanView,
-        program: plan_title_program,
+        on {
+            events: [PlanChangedDomainEvent],
+            mutation: RenamePlan,
+            input: { plan: body },
+        },
     };
 }
 
+// `mutation!` binds columns to input paths only; a constant assignment (an
+// enum variant or null) has no mutation syntax, so the next three programs
+// are hand-built.
 fn plan_close_program() -> Result<ProjectionProgram, ProjectionProgramError> {
     patch_program(
         "typed_commands_plan_close",
@@ -517,18 +526,16 @@ distributed::projection! {
 
 state_event_contract!(JsonChangedDomainEvent, JsonView, "json.changed");
 
-fn json_projection_program() -> Result<ProjectionProgram, ProjectionProgramError> {
-    patch_program(
-        "typed_commands_json",
-        "changed",
-        state_selector::<JsonView>("json.changed", 1)?,
-        ("JsonView", "json_views"),
-        &["id"],
-        vec![
-            ("tags", body(ProjectionValueType::Json, "tags")),
-            ("details", body(ProjectionValueType::Json, "details")),
-        ],
-    )
+#[allow(non_snake_case)]
+fn PatchJson() -> Mutation<()> {
+    distributed::mutation! {
+        mutation PatchJson {
+            update_JsonView_by_pk(
+                id: $input.row.id,
+                _set: { tags: $input.row.tags, details: $input.row.details }
+            )
+        }
+    }
 }
 
 distributed::projection! {
@@ -537,7 +544,11 @@ distributed::projection! {
         version: 1,
         epoch: "typed-commands-json-v1",
         model: JsonView,
-        program: json_projection_program,
+        on {
+            events: [JsonChangedDomainEvent],
+            mutation: PatchJson,
+            input: { row: body },
+        },
     };
 }
 
@@ -547,15 +558,17 @@ state_event_contract!(
     "composite.changed"
 );
 
-fn composite_projection_program() -> Result<ProjectionProgram, ProjectionProgramError> {
-    patch_program(
-        "typed_commands_composite",
-        "changed",
-        state_selector::<CompositeKeyView>("composite.changed", 1)?,
-        ("CompositeKeyView", "composite_key_views"),
-        &["tenant_id", "id"],
-        vec![("title", body(ProjectionValueType::String, "title"))],
-    )
+#[allow(non_snake_case)]
+fn PatchComposite() -> Mutation<()> {
+    distributed::mutation! {
+        mutation PatchComposite {
+            update_CompositeKeyView_by_pk(
+                tenant_id: $input.row.tenant_id,
+                id: $input.row.id,
+                _set: { title: $input.row.title }
+            )
+        }
+    }
 }
 
 distributed::projection! {
@@ -564,18 +577,23 @@ distributed::projection! {
         version: 1,
         epoch: "typed-commands-composite-v1",
         model: CompositeKeyView,
-        program: composite_projection_program,
+        on {
+            events: [CompositeChangedDomainEvent],
+            mutation: PatchComposite,
+            input: { row: body },
+        },
     };
 }
 
 state_event_contract!(BigIntChangedDomainEvent, BigIntKeyView, "bigint.changed");
 
-fn bigint_projection_program() -> Result<ProjectionProgram, ProjectionProgramError> {
-    upsert_program::<BigIntKeyView>(
-        "typed_commands_bigint",
-        state_selector::<BigIntKeyView>("bigint.changed", 1)?,
-        ProjectionPartition::Unit,
-    )
+#[allow(non_snake_case)]
+fn SaveBigInt() -> Mutation<()> {
+    distributed::mutation! {
+        mutation SaveBigInt {
+            upsert_BigIntKeyView(object: $input.row)
+        }
+    }
 }
 
 distributed::projection! {
@@ -584,7 +602,11 @@ distributed::projection! {
         version: 1,
         epoch: "typed-commands-bigint-v1",
         model: BigIntKeyView,
-        program: bigint_projection_program,
+        on {
+            events: [BigIntChangedDomainEvent],
+            mutation: SaveBigInt,
+            input: { row: body },
+        },
     };
 }
 
@@ -1005,7 +1027,7 @@ async fn attachment_checks_exact_rust_types_after_structural_parity() {
         .try_with_graphql(engine)
         .err()
         .expect("lookalike Rust types must not bind");
-    assert!(error.to_string().contains("TypeId mismatch"));
+    assert_eq!(error, GraphqlServiceBindError::TypeIdMismatch);
 }
 
 #[tokio::test]
@@ -1028,9 +1050,13 @@ async fn attachment_checks_full_structure_and_service_identity() {
         .try_with_graphql(engine)
         .err()
         .expect("structural drift must not bind");
-    assert!(error
-        .to_string()
-        .contains("structural fingerprint mismatch"));
+    assert!(
+        matches!(
+            error,
+            GraphqlServiceBindError::StructuralFingerprintMismatch(_)
+        ),
+        "{error:?}"
+    );
 
     let engine_source = service_a("todos-a");
     let engine = GraphqlEngine::builder(pool())
@@ -1043,7 +1069,13 @@ async fn attachment_checks_full_structure_and_service_identity() {
         .try_with_graphql(engine)
         .err()
         .expect("service identity drift must not bind");
-    assert!(error.to_string().contains("service ID mismatch"));
+    assert_eq!(
+        error,
+        GraphqlServiceBindError::ServiceIdMismatch {
+            executable: "todos-b".into(),
+            engine: "todos-a".into(),
+        }
+    );
 }
 
 #[tokio::test]
@@ -1064,12 +1096,7 @@ async fn projected_command_binding_rejects_a_raw_pool_source() {
         .try_with_graphql(engine)
         .err()
         .expect("Atomic commands must reject a raw GraphQL pool");
-    assert!(
-        error
-            .to_string()
-            .contains("require a GraphQL pool derived from the same repository handle"),
-        "{error}"
-    );
+    assert_eq!(error, GraphqlServiceBindError::AtomicPoolNotFromRepository);
 }
 
 #[tokio::test]
@@ -1091,11 +1118,9 @@ async fn projected_command_binding_rejects_an_independent_repository_over_the_sa
         .try_with_graphql(engine)
         .err()
         .expect("Atomic commands must reject a different repository identity");
-    assert!(
-        error
-            .to_string()
-            .contains("repository and GraphQL query pool storage identities differ"),
-        "{error}"
+    assert_eq!(
+        error,
+        GraphqlServiceBindError::AtomicStorageIdentityMismatch
     );
 }
 
@@ -1150,9 +1175,13 @@ async fn projector_topology_identity_drift_changes_service_binding_fingerprint()
         .try_with_graphql(engine)
         .err()
         .expect("different emitted event sets must change service identity");
-    assert!(error
-        .to_string()
-        .contains("structural fingerprint mismatch"));
+    assert!(
+        matches!(
+            error,
+            GraphqlServiceBindError::StructuralFingerprintMismatch(_)
+        ),
+        "{error:?}"
+    );
 }
 
 #[tokio::test]
@@ -1168,12 +1197,7 @@ async fn matched_typed_inventory_rejects_attachment_without_protocol_tokens() {
         .try_with_graphql(engine)
         .err()
         .expect("causal mutations must not be served without opaque protocol tokens");
-    assert!(
-        error
-            .to_string()
-            .contains("require a configured GraphQL protocol token key"),
-        "{error}"
-    );
+    assert_eq!(error, GraphqlServiceBindError::MissingProtocolTokenKey);
 }
 
 #[tokio::test]
@@ -1206,10 +1230,15 @@ async fn matched_typed_inventory_attaches_while_unverified_mutations_fail_closed
         )
         .await;
     assert_eq!(mutation.errors.len(), 1, "{mutation:?}");
-    assert!(
-        mutation.errors[0]
-            .message
-            .contains("durable commands require a verified OIDC bearer"),
+    let extensions = mutation.errors[0].extensions.as_ref().expect("error code");
+    assert_eq!(
+        extensions.get("code"),
+        Some(&async_graphql::Value::from("UNAUTHORIZED")),
+        "{mutation:?}"
+    );
+    assert_eq!(
+        extensions.get("status"),
+        Some(&async_graphql::Value::from(401)),
         "{mutation:?}"
     );
 }
@@ -1279,9 +1308,14 @@ async fn router_construction_runs_full_binding_validation() {
         .map(String::as_str)
         .or_else(|| panic.downcast_ref::<&str>().copied())
         .unwrap_or("unknown panic");
-    assert!(
-        message.contains("TypeId mismatch"),
-        "unexpected panic: {message}"
+    // The router panics with the bind error; panics carry no type, so the
+    // message is compared with the typed error's rendering.
+    assert_eq!(
+        message,
+        format!(
+            "cannot serve GraphQL with this service: {}",
+            GraphqlServiceBindError::TypeIdMismatch
+        )
     );
 }
 
@@ -1534,9 +1568,13 @@ async fn generated_input_default_is_reused_as_the_effect_key_and_fingerprinted()
         .try_with_graphql(engine)
         .err()
         .expect("input-default drift must change the service binding fingerprint");
-    assert!(error
-        .to_string()
-        .contains("structural fingerprint mismatch"));
+    assert!(
+        matches!(
+            error,
+            GraphqlServiceBindError::StructuralFingerprintMismatch(_)
+        ),
+        "{error:?}"
+    );
 }
 
 #[tokio::test]
@@ -1664,9 +1702,14 @@ async fn embedded_primary_keys_reject_keyed_effects_while_composite_keys_remain_
     let schema_error = NullableKeyView::schema()
         .validate()
         .expect_err("relational primary keys cannot be nullable");
-    assert!(schema_error
-        .to_string()
-        .contains("primary-key column `key` must be non-null"));
+    assert!(
+        matches!(
+            &schema_error,
+            distributed::TableStoreError::Metadata(message)
+                if message.contains("primary-key column `key` must be non-null")
+        ),
+        "{schema_error:?}"
+    );
 
     let composite_service = Service::new().named("composite").routes(
         causal_routes()

@@ -193,14 +193,12 @@ impl Service {
         if !self.typed_command_contracts().is_empty() {
             let contracts = engine
                 .typed_command_contracts_for_service()
-                .map_err(GraphqlServiceBindError)?
+                .map_err(GraphqlServiceBindError::InvalidInventory)?
                 .into_iter()
                 .map(|contract| (contract.name.clone(), contract))
                 .collect::<BTreeMap<_, _>>();
             for routes in &mut self.routes {
-                routes
-                    .bind_typed_command_contracts(&contracts)
-                    .map_err(GraphqlServiceBindError)?;
+                routes.bind_typed_command_contracts(&contracts)?;
             }
         }
         self.validate_graphql_engine(&engine)?;
@@ -213,25 +211,18 @@ impl Service {
         &self,
         engine: &crate::graphql::GraphqlEngine,
     ) -> Result<(), GraphqlServiceBindError> {
-        let service_id = self.name().ok_or_else(|| {
-            GraphqlServiceBindError(
-                "GraphQL attachment requires a stable Service::named identity".into(),
-            )
-        })?;
-        let engine_service_id = engine.service_id().ok_or_else(|| {
-            GraphqlServiceBindError(
-                "GraphQL attachment requires an engine with a validated service ID".into(),
-            )
-        })?;
+        let service_id = self.name().ok_or(GraphqlServiceBindError::UnnamedService)?;
+        let engine_service_id = engine
+            .service_id()
+            .ok_or(GraphqlServiceBindError::EngineWithoutServiceId)?;
         if service_id != engine_service_id {
-            return Err(GraphqlServiceBindError(format!(
-                "service ID mismatch: executable service `{service_id}` vs GraphQL engine `{engine_service_id}`"
-            )));
+            return Err(GraphqlServiceBindError::ServiceIdMismatch {
+                executable: service_id.to_owned(),
+                engine: engine_service_id.to_owned(),
+            });
         }
         if self.handles_message(crate::bus::MessageKind::Command, "graphql") {
-            return Err(GraphqlServiceBindError(
-                "a command named `graphql` is already registered".into(),
-            ));
+            return Err(GraphqlServiceBindError::GraphqlCommandTaken);
         }
 
         let typed_commands = self.typed_command_contracts();
@@ -239,44 +230,37 @@ impl Service {
             (true, None) => {}
             (_, Some(engine_binding)) => {
                 if !engine.lifecycle().is(&self.lifecycle) {
-                    return Err(GraphqlServiceBindError(
-                        "GraphQL engine and service have different lifecycle gates; call Service::with_lifecycle before building the engine from the service".into(),
-                    ));
+                    return Err(GraphqlServiceBindError::LifecycleMismatch);
                 }
                 let service_binding = self
                     .typed_command_binding()
-                    .map_err(GraphqlServiceBindError)?;
+                    .map_err(GraphqlServiceBindError::InvalidInventory)?;
                 if service_binding.service_id != engine_binding.service_id {
-                    return Err(GraphqlServiceBindError(format!(
-                        "service ID mismatch: executable service `{}` vs GraphQL engine `{}`",
-                        service_binding.service_id, engine_binding.service_id
-                    )));
+                    return Err(GraphqlServiceBindError::ServiceIdMismatch {
+                        executable: service_binding.service_id,
+                        engine: engine_binding.service_id.clone(),
+                    });
                 }
                 if service_binding.structural_fingerprint != engine_binding.structural_fingerprint {
-                    return Err(GraphqlServiceBindError(format!(
-                        "typed command structural fingerprint mismatch: executable `{}` vs GraphQL `{}`",
-                        service_binding.structural_fingerprint,
-                        engine_binding.structural_fingerprint
-                    )));
+                    return Err(GraphqlServiceBindError::StructuralFingerprintMismatch(
+                        format!(
+                            "executable `{}` vs GraphQL `{}`",
+                            service_binding.structural_fingerprint,
+                            engine_binding.structural_fingerprint
+                        ),
+                    ));
                 }
                 if service_binding.types != engine_binding.types {
-                    return Err(GraphqlServiceBindError(
-                        "typed command Rust input/output TypeId mismatch".into(),
-                    ));
+                    return Err(GraphqlServiceBindError::TypeIdMismatch);
                 }
             }
             (false, None) => {
-                return Err(GraphqlServiceBindError(
-                    "GraphQL engine was not derived from this service's typed command inventory"
-                        .into(),
-                ));
+                return Err(GraphqlServiceBindError::EngineNotDerivedFromService);
             }
         }
 
         if !typed_commands.is_empty() && !engine.causal_protocol_configured() {
-            return Err(GraphqlServiceBindError(
-                "typed causal commands require a configured GraphQL protocol token key".into(),
-            ));
+            return Err(GraphqlServiceBindError::MissingProtocolTokenKey);
         }
 
         let projected_identities = self
@@ -285,20 +269,14 @@ impl Service {
             .flat_map(|routes| routes.projected_storage_identities())
             .collect::<Vec<_>>();
         if !projected_identities.is_empty() {
-            let engine_identity = engine.causal_storage_identity().ok_or_else(|| {
-                GraphqlServiceBindError(
-                    "Atomic commands require a GraphQL pool derived from the same repository handle"
-                        .into(),
-                )
-            })?;
+            let engine_identity = engine
+                .causal_storage_identity()
+                .ok_or(GraphqlServiceBindError::AtomicPoolNotFromRepository)?;
             if projected_identities
                 .iter()
                 .any(|identity| *identity != engine_identity)
             {
-                return Err(GraphqlServiceBindError(
-                    "Atomic command repository and GraphQL query pool storage identities differ"
-                        .into(),
-                ));
+                return Err(GraphqlServiceBindError::AtomicStorageIdentityMismatch);
             }
         }
 

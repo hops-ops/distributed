@@ -1,4 +1,4 @@
-#![cfg(feature = "postgres")]
+//! A throwaway Postgres schema per test.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -7,8 +7,7 @@ use distributed::PostgresRepository;
 use sqlx::postgres::PgPoolOptions;
 use sqlx::Executor;
 
-#[path = "env.rs"]
-mod env_support;
+use crate::env as env_support;
 
 static NEXT_SCHEMA_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -55,7 +54,6 @@ impl PostgresTestSchema {
         })
     }
 
-    #[allow(dead_code)]
     pub fn schema_name(&self) -> &str {
         &self.schema_name
     }
@@ -68,7 +66,6 @@ impl PostgresTestSchema {
         repo
     }
 
-    #[allow(dead_code)]
     pub async fn repository_unmigrated(&self) -> PostgresRepository {
         PostgresRepository::new(
             PgPoolOptions::new()

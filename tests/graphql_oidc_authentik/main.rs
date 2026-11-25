@@ -3,14 +3,13 @@
 
 #![cfg(all(feature = "graphql", feature = "sqlite"))]
 
-#[path = "../graphql_oidc_common/mod.rs"]
-mod common;
+use common::oidc;
 
 use distributed::graphql::OidcConfig;
 use serde_json::Value;
 
 fn e2e_enabled() -> bool {
-    common::gate_enabled("AUTHENTIK_E2E")
+    oidc::gate_enabled("AUTHENTIK_E2E")
 }
 
 #[tokio::test]
@@ -27,9 +26,9 @@ async fn e1_through_e8_live() {
     }
     let jwks_uri = std::env::var("OIDC_JWKS_URI").unwrap_or_default();
     // GLOBAL issuer mode puts iss at origin; discovery/JWKS live under application slug.
-    let discovery_ok = common::discovery_ready(&iss).await
+    let discovery_ok = oidc::discovery_ready(&iss).await
         || (!jwks_uri.is_empty() && jwks_reachable(&jwks_uri).await)
-        || common::discovery_ready(&format!(
+        || oidc::discovery_ready(&format!(
             "{}/application/o/graphql-e2e-customer/",
             iss.trim_end_matches('/')
         ))
@@ -69,7 +68,7 @@ async fn e1_through_e8_live() {
     }
     oidc.claim_map.role_claims = vec!["groups".into(), "roles".into()];
 
-    common::run_e1_through_e8(
+    oidc::run_e1_through_e8(
         oidc,
         async { mint_client_credentials(&token_url, &c_id, &c_sec).await },
         async { mint_client_credentials(&token_url, &a_id, &a_sec).await },

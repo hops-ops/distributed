@@ -12,7 +12,7 @@ use async_graphql::Request;
 use distributed::graphql::IdentityConfig;
 use distributed::graphql::{read, GraphqlEngine, ModelPermissions};
 
-use super::common::{
+use common::graphql::{
     assert_no_sql_leak, engine_all_columns, error_messages, extension_code, seed_orders, session,
     Db, OrderView,
 };

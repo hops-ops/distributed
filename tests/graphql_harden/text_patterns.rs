@@ -9,7 +9,7 @@ use distributed::ReadModel;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-use super::common::{extension_code, session, Db};
+use common::graphql::{extension_code, session, Db};
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, ReadModel)]
 #[table("words")]

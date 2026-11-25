@@ -215,7 +215,7 @@ pub(in crate::microsvc::service) trait ErasedRoutes:
     fn bind_typed_command_contracts(
         &mut self,
         contracts: &BTreeMap<String, TypedCommandContract>,
-    ) -> Result<(), String>;
+    ) -> Result<(), super::super::causal::GraphqlServiceBindError>;
 
     fn dispatch<'a>(
         &'a self,

@@ -1,15 +1,13 @@
 #![cfg(all(feature = "graphql", feature = "sqlite"))]
 
-#[path = "../support/graphql.rs"]
-mod common;
-
 use distributed::graphql::IdentityConfig;
 use std::sync::Arc;
 use std::time::Duration;
 
 use async_graphql::Request;
 use base64::Engine as _;
-use common::{on_each_dialect, with_repository, Db};
+use common::graphql::Db;
+use common::{on_each_dialect, with_repository};
 use distributed::bus::{Bus, InMemoryBus, Message, MessageKind, RunOptions};
 use distributed::graphql::{
     col, read, GraphqlEngine, ModelNormalization, ModelPermissions, SurfaceProjector,
@@ -2283,7 +2281,11 @@ pub async fn hundred_origin_subscribers_share_one_execution_per_change(db: Db) {
     }
     let opened = versions.metrics().result_executions;
     let producers = engine.live_producer_count();
-    assert_eq!(engine.live_subscriber_count(), 100, "every stream is counted");
+    assert_eq!(
+        engine.live_subscriber_count(),
+        100,
+        "every stream is counted"
+    );
 
     project_item(&fixture.repository, &fixture.bus, 2, "causal row 2").await;
     let mut first = None;

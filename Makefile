@@ -26,7 +26,7 @@ TEST_DATABASES = distributed_projection_protocol distributed_snapshots distribut
 
 # Every service variable `test-local` provides. Naming them in
 # DISTRIBUTED_REQUIRE_SERVICES makes a test that cannot reach its service
-# fail instead of returning early (see tests/support/env.rs).
+# fail instead of returning early (see tests/common/src/env.rs).
 REQUIRED_SERVICES = DATABASE_URL,AMQP_URL,KAFKA_BROKERS,NATS_URL,REDIS_URL,DISTRIBUTED_TEST_POSTGRES_URL,DISTRIBUTED_SNAPSHOT_TEST_POSTGRES_URL,DISTRIBUTED_REBUILD_TEST_POSTGRES_URL,DISTRIBUTED_UNIQUE_KEY_TEST_POSTGRES_URL,DISTRIBUTED_ARCHIVE_TEST_NATS_URL
 
 test: test-local

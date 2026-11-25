@@ -1,14 +1,10 @@
 mod checkout;
 mod checkout_saga_service;
-#[path = "../support/commands.rs"]
-mod commands;
-#[path = "../support/env.rs"]
-mod env_support;
-#[path = "../support/ids.rs"]
-mod ids;
+use common::commands;
+use common::env as env_support;
+use common::ids;
 #[cfg(feature = "postgres")]
-#[path = "../support/postgres.rs"]
-mod postgres;
+use common::postgres;
 mod projection_service;
 mod query_service;
 mod read_models;

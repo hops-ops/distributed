@@ -6,13 +6,12 @@
 //! is unset.
 #![cfg(feature = "postgres")]
 
-#[path = "../support/postgres.rs"]
-mod postgres;
+use common::postgres;
 
 // Shared broker-test helpers (recording_for, bus scenarios).
-#[path = "../transport_conformance/mod.rs"]
-mod conformance;
-use conformance::{outbox_support, recording_for};
+use common::outbox as outbox_support;
+use common::transport as conformance;
+use conformance::recording_for;
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -196,7 +195,7 @@ impl conformance::bus::BusHarness for Postgres {
     }
 }
 
-conformance::bus::bus_conformance_tests!(Postgres);
+common::bus_conformance_tests!(Postgres);
 
 #[derive(Default)]
 struct OrderedEvidenceRecorder {

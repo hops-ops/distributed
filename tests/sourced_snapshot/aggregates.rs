@@ -2,35 +2,10 @@ use distributed::{sourced, Entity, Snapshot};
 use serde::{Deserialize, Serialize};
 
 // ============================================================================
-// Default case: id + all fields
+// Default case: id + all fields (the shared Todo)
 // ============================================================================
 
-#[derive(Default, Snapshot)]
-pub struct Todo {
-    pub entity: Entity,
-    pub user_id: String,
-    pub task: String,
-    pub completed: bool,
-}
-
-#[sourced(entity)]
-impl Todo {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    #[event("initialized")]
-    pub fn initialize(&mut self, id: String, user_id: String, task: String) {
-        self.entity.set_id(&id);
-        self.user_id = user_id;
-        self.task = task;
-    }
-
-    #[event("completed", when = !self.completed)]
-    pub fn complete(&mut self) {
-        self.completed = true;
-    }
-}
+pub use common::todo::{Todo, TodoSnapshot};
 
 // ============================================================================
 // Custom ID key: snapshot(id = "sku")

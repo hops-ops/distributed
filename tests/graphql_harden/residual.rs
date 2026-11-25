@@ -5,7 +5,7 @@ use distributed::graphql::IdentityConfig;
 use distributed::graphql::{claim, col, read, GraphqlEngine, ModelPermissions};
 use distributed::{ReadModelCatalog, RelationalReadModel, RelationshipDef, RelationshipKind};
 
-use super::common::{
+use common::graphql::{
     assert_no_sql_leak, child, engine_all_columns, error_messages, extension_code, parent,
     seed_orders, session, ChildView, Db, OrderView, ParentView,
 };

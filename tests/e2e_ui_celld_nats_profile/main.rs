@@ -2,8 +2,7 @@
 //! `CELLD_URL` and `NATS_URL` are set.
 
 #[cfg(all(feature = "graphql", feature = "http", feature = "sqlite"))]
-#[path = "../support/env.rs"]
-mod env_support;
+use common::env as env_support;
 
 #[cfg(all(feature = "graphql", feature = "http", feature = "sqlite"))]
 mod live {

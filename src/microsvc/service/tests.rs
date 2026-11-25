@@ -4755,5 +4755,8 @@ async fn a_closed_lifecycle_gate_refuses_writes_on_every_transport() {
         .try_with_graphql(engine)
         .err()
         .expect("the engine does not share the service's gate");
-    assert!(mismatch.0.contains("lifecycle"), "{}", mismatch.0);
+    assert_eq!(
+        mismatch,
+        crate::microsvc::GraphqlServiceBindError::LifecycleMismatch
+    );
 }

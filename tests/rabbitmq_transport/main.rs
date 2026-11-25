@@ -17,11 +17,9 @@ use lapin::{BasicProperties, Connection, ConnectionProperties};
 use serde_json::json;
 
 // Shared broker-test helpers (recording_for, named_recording_for, unique, ...).
-#[path = "../transport_conformance/mod.rs"]
-mod conformance;
+use common::env as env_support;
+use common::transport as conformance;
 use conformance::{named_recording_for, recording_for, unique};
-#[path = "../support/env.rs"]
-mod env_support;
 
 fn amqp_url() -> Option<String> {
     env_support::require_service("AMQP_URL", "rabbitmq transport test")
@@ -122,7 +120,7 @@ impl conformance::bus::BusHarness for Rabbit {
     }
 }
 
-conformance::bus::bus_conformance_tests!(Rabbit);
+common::bus_conformance_tests!(Rabbit);
 
 // ---- RabbitBus: send/listen (default exchange) + publish/subscribe (topic exchange) ----
 
