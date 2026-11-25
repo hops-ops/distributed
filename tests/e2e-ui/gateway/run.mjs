@@ -121,8 +121,10 @@ try{
  }
 }finally{await rm(temporary,{recursive:true,force:true});}
 
-// Delay a real old HTTP envelope while an Atomic response advances the replica.
-// Delivery-enabled requests exercise the cache path; the body/proof are unchanged.
+// Atomic moves paint from their direct response, without an HTTP refetch, and
+// survive a reload. A revalidation that started before an Atomic move cannot
+// roll it back with later evidence: js/tests/replica-protocol.test.mjs proves
+// that deterministically, so the page carries no refetch hook.
 async function verifyBlobRace(page){
   await expect(page.locator('[data-blob-hydrated="1"]')).toBeVisible();
   const player=page.locator('.blob-board .tile-player');
@@ -133,26 +135,10 @@ async function verifyBlobRace(page){
     await page.keyboard.press(key);assert.ok((await result).ok());await expect(player).toHaveAttribute('aria-label',label);
   };
   await move('ArrowRight','r0 c1');
-  assert.equal(queries,0,'Atomic direct response should paint without an HTTP refetch');
-  let release,arrived;const barrier=new Promise(resolve=>release=resolve),ready=new Promise(resolve=>arrived=resolve);
-  let held=false;
-  await page.route('**/graphql',async route=>{
-    if(held||!(route.request().postData()||'').includes('query BlobGames'))return route.continue();
-    held=true;const response=await route.fetch();assert.ok((await response.json()).data?.blob_games?.length);arrived();await barrier;await route.fulfill({response});
-  });
-  const refetch=()=>page.evaluate(()=>globalThis.__distributedBlobRefetch());
-  const oldRequest=refetch();await ready;
   const hole=(await page.locator('.cell[aria-label="r0 c2"]').getAttribute('class')).includes('tile-hole');
   const label=hole?'r1 c1':'r0 c2';await move(hole?'ArrowDown':'ArrowRight',label);
-  await page.evaluate(()=>{
-    globalThis.__gatewaySamples=[];
-    globalThis.__gatewayObserver=new MutationObserver(()=>globalThis.__gatewaySamples.push(document.querySelector('.blob-board .tile-player')?.getAttribute('aria-label')??'missing'));
-    globalThis.__gatewayObserver.observe(document.querySelector('.blob-page'),{attributes:true,childList:true,subtree:true,characterData:true});
-  });
-  release();await oldRequest;await refetch();await expect(player).toHaveAttribute('aria-label',label);
-  const samples=await page.evaluate(()=>{globalThis.__gatewayObserver.disconnect();return globalThis.__gatewaySamples;});
-  assert.ok(samples.every(sample=>sample===label),'late HTTP/cache observation regressed the Atomic board');
-  page.off('request',count);await page.unroute('**/graphql');
+  assert.equal(queries,0,'Atomic direct responses should paint without an HTTP refetch');
+  page.off('request',count);
   await page.reload();await expect(player).toHaveAttribute('aria-label',label);
 }
 async function verifyAuth(context,idp,origin){

@@ -1,5 +1,0 @@
-# Syntax-only read-model mutation → MutationProgram IR.
-# Not a public GraphQL schema field.
-mutation SaveBlobGame {
-  upsert_blob_games(object: $input.game)
-}

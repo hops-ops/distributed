@@ -3666,3 +3666,39 @@ test('Atomic installs a retained outgoing floor without an automatic fetch', asy
 	assert.equal(replica.read(artifact, {}).data.todos[0].title, 'committed');
 	watch.destroy();
 });
+
+test('a revalidation started before an Atomic row cannot roll it back with later evidence', async () => {
+	const { replicaCommandFreshness } = await import('../dist/replica/command-runtime/symbols.js');
+	const artifact = { ...Todos, protocol: { ...Todos.protocol, protocolHash: 'protocol-a' } };
+	let releaseHeld;
+	const held = new Promise(resolve => { releaseHeld = resolve; });
+	let heldStarted;
+	const started = new Promise(resolve => { heldStarted = resolve; });
+	const replica = createDistributedReplica({
+		transport: {
+			async fetch() {
+				heldStarted();
+				await held;
+				// The body was read before the Atomic command committed, but its
+				// evidence was issued after it and is numerically newer.
+				return wireFrame({ position: '1', revision: '999999999999999999', rows: [{ id: 'todo-1', title: 'base' }] });
+			}
+		}
+	});
+	write(replica, { position: '1', rows: [{ id: 'todo-1', title: 'base' }] }, 'network', artifact);
+	const watch = replica.watch(artifact, {});
+	const refresh = watch.refresh();
+	await started;
+	replica[replicaCommandFreshness]('atomic', { dependencies: ['todos'], models: [Todo.id], relationships: [] });
+	replica.createOptimisticLayer('atomic', writer => writer.writeRecord(Todo, 'todo-1', { fields: { title: 'preview' } }));
+	replica[replicaCommandDirectProjection]('atomic', { model: Todo, identity: 'todo-1', evidence: { model: Todo.id, scopeToken: 'record:todo-1', incarnation: '1', revision: '2', tombstone: false }, fields: { id: 'todo-1', title: 'committed', __typename: Todo.id } });
+	assert.equal(replica.read(artifact, {}).data.todos[0].title, 'committed');
+	releaseHeld();
+	await refresh;
+	assert.equal(
+		replica.read(artifact, {}).data.todos[0].title,
+		'committed',
+		'an older query body must never replace the Atomic row'
+	);
+	watch.destroy();
+});

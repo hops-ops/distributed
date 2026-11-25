@@ -507,7 +507,7 @@ mod client_surface_tests {
             "blob move still exports projection arms for Atomic sealing"
         );
         // Thin input: only game_id + direction. Board fields come from pure
-        // reduce (`blob.simulate_move` over the known cache row) + Atomic seal.
+        // reduce (`blob-domain::preview_move` over the known cache row) + Atomic seal.
         let move_input = match &blob_move.input {
             distributed::graphql::ClientCommandShape::Object { definition } => definition,
             other => panic!("blob move should be object input, got {other:?}"),

@@ -207,7 +207,7 @@ fn collect_wasm_pures(manifest: &Value) -> Result<BTreeSet<WasmPure>, Box<dyn Er
                             .filter(|package| !package.is_empty())
                             .ok_or_else(|| {
                                 format!(
-                                    "WASM pure `{import}` does not identify its declaring Cargo package; declare it through `command!`"
+                                    "WASM pure `{import}` does not identify its declaring Cargo package; declare it with `distributed::wasm_pure!`"
                                 )
                             })?;
                         found.insert(WasmPure {
@@ -698,19 +698,20 @@ mod tests {
     #[test]
     fn collects_declared_wasm_pures_recursively() {
         let manifest = json!({"commands": [{"pure_reduces": [{
-            "wasm_package": "blob/pkg/blob_wasm",
+            "wasm_package": "wasm/blob-domain/blob_domain",
             "wasm_rust_package": "blob-domain"
         }]}]});
         let found = collect_wasm_pures(&manifest).unwrap();
         assert!(found.contains(&WasmPure {
             rust_package: "blob-domain".to_string(),
-            import: "blob/pkg/blob_wasm".to_string(),
+            import: "wasm/blob-domain/blob_domain".to_string(),
         }));
     }
 
     #[test]
     fn rejects_declared_wasm_without_a_rust_package() {
-        let error = collect_wasm_pures(&json!({"wasm_package": "blob/pkg/blob_wasm"})).unwrap_err();
+        let error = collect_wasm_pures(&json!({"wasm_package": "wasm/blob-domain/blob_domain"}))
+            .unwrap_err();
         assert!(error.to_string().contains("declaring Cargo package"));
     }
 

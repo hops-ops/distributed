@@ -293,7 +293,7 @@ check: application-build
 clean: stop
 	cargo clean
 	rm -f e2e-ui.db
-	rm -rf ui/node_modules ui/build ui/.svelte-kit ui/src/lib/blob/pkg
+	rm -rf ui/node_modules ui/build ui/.svelte-kit ui/src/lib/wasm
 
 help:
 	@echo "e2e-ui"

@@ -4,25 +4,26 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 publish.workspace = true
-description = "Blob game domain: pure board core, aggregate host, optional WASM export"
+description = "Blob game domain: pure board core, aggregate, browser WASM preview"
 
 [lib]
 crate-type = ["cdylib", "rlib"]
 
 [features]
 default = ["domain"]
-# Aggregate + levels + distributed host (server / tests).
-domain = ["dep:distributed", "dep:thiserror", "dep:rand", "dep:e2e-readmodels"]
-# Client pure export (wasm-pack / wasm32).
+# Aggregate + levels (server / tests / cells).
+domain = ["dep:thiserror", "dep:rand"]
+# The browser export of `PREVIEW_MOVE` (built by `distributed build`).
 wasm = ["dep:wasm-bindgen"]
 
 [dependencies]
 serde = { workspace = true }
 serde_json = { workspace = true }
-distributed = { workspace = true, optional = true }
+# Path + default-features: the pure core and the aggregate build for wasm32
+# (browser and cells) without e2e-ui's server features.
+distributed = { path = "../../../..", default-features = false }
 thiserror = { workspace = true, optional = true }
 rand = { workspace = true, optional = true }
-e2e-readmodels = { path = "../readmodels", optional = true }
 wasm-bindgen = { version = "0.2", optional = true }
 
 [dev-dependencies]

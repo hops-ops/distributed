@@ -305,8 +305,8 @@ jobs:
         run: |
           set -euo pipefail
           ../../target/debug/distributed build . --output json
-          test -s ui/src/lib/blob/pkg/blob_wasm.js
-          test -s ui/src/lib/blob/pkg/blob_wasm_bg.wasm
+          test -s ui/src/lib/wasm/blob-domain/blob_domain.js
+          test -s ui/src/lib/wasm/blob-domain/blob_domain_bg.wasm
 
       - name: Start kind and apply the Cluster GitOps tree
         run: |

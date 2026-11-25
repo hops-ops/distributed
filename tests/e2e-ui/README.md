@@ -225,7 +225,7 @@ command! {
 ```
 
 Blob uses a **handler-owned Atomic** commit
-(`crates/blob-domain/src/commands/move_dir.rs`): the handler materializes the
+(`crates/service/src/modules/blob.rs`): the handler materializes the
 row from the same mutation the event bindings use, stages it, and seals
 `Atomic`:
 
@@ -344,7 +344,7 @@ the normal GraphQL command result.
 | `crates/*-domain/` | Aggregates, replay events, and outward domain-state contracts. |
 | `crates/readmodels/` | Query shapes, relationships, and model-owned read RBAC. |
 | `crates/projections/` | Todo, Chat, and Blob event-to-read-model programs. |
-| `crates/*-domain/src/commands/` | `command!` handlers: repository → get/create → domain operation → fluent commit. |
+| `crates/*-domain/src/commands/` | `command!` handlers: repository → get/create → domain operation → fluent commit. Blob's Atomic commands seal `BlobGames` rows, so they live in `crates/service/src/modules/blob.rs` and `blob-domain` does not depend on the read models. |
 | `crates/service/src/application.rs` | Composition root: application name and client surfaces (declared once). |
 | `crates/service/src/modules/` | One module per bounded context (`todo`, `chat`, `blob`, `identity`) mounting its typed commands and projections; `compose.rs` lists them, and the application manifest is derived from that Service. |
 | `crates/service/src/host.rs` | Infrastructure: one host for SQLite and Postgres (`SqlStores`), OIDC, serving. |

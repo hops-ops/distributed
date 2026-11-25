@@ -19,10 +19,12 @@
 # with `celld-zone` (the celld zone host: zones as Durable Objects), plus the
 # game zones hosted that way (examples/game/server/rooms).
 #
-# Excluded, with the reason (a crate here never runs in a cell):
-#   tests/e2e-ui/crates/blob-domain  e2e-ui blob game host: its `domain`
-#     feature mounts SQL read models (e2e-readmodels, workspace distributed
-#     with sqlx/tokio). Its pure board core builds for wasm via `--features wasm`.
+# Partly checked, with the reason:
+#   tests/e2e-ui/crates/blob-domain  only its browser build (`--no-default-
+#     features --features wasm`: the pure board core and the PREVIEW_MOVE
+#     export) is checked. Its `domain` feature (the aggregate) draws OS entropy
+#     for level generation (rand/getrandom has no wasm32-unknown-unknown
+#     backend) and runs on the e2e-ui server, never in a cell.
 set -eu
 
 root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
@@ -67,6 +69,14 @@ for manifest in $(manifests); do
     failed=1
   fi
 done
+
+blob=tests/e2e-ui/crates/blob-domain/Cargo.toml
+printf '==> wasm32 %s --features wasm (browser build)\n' "$blob"
+if ! "$cargo" build --quiet --lib --target "$target" --manifest-path "$blob" \
+  --target-dir "$target_dir" --no-default-features --features wasm; then
+  printf 'FAIL: %s browser build does not build for %s\n' "$blob" "$target" >&2
+  failed=1
+fi
 
 # The celld zone host is wasm32 code by design.
 printf '==> wasm32 distributed_game/Cargo.toml --features celld-zone\n'

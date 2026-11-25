@@ -49,6 +49,27 @@ pub(super) fn column_type_tokens(ty: &Type, jsonb: bool, text: bool) -> proc_mac
     quote! { #framework::ColumnType::Unsupported(#type_name.to_string()) }
 }
 
+/// The column's JSON shape (`Some(<T as JsonType>::json_shape())`) when the
+/// column stores JSON, so generated clients type it exactly; `None` otherwise.
+pub(super) fn json_type_tokens(ty: &Type, jsonb: bool, text: bool) -> proc_macro2::TokenStream {
+    let framework = crate::shared::framework();
+    let inner = option_inner_type(ty).unwrap_or(ty);
+    let json = jsonb
+        || (!text
+            && last_type_segment(inner).is_some_and(|last| {
+                match last.ident.to_string().as_str() {
+                    "Vec" => !vec_inner_is_u8(last),
+                    "HashMap" | "BTreeMap" | "Value" => true,
+                    _ => false,
+                }
+            }));
+    if json {
+        quote! { Some(<#inner as #framework::JsonType>::json_shape()) }
+    } else {
+        quote! { None }
+    }
+}
+
 pub(super) fn effect_model_wire_tokens(
     ty: &Type,
     jsonb: bool,

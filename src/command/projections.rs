@@ -157,25 +157,27 @@ pub(crate) struct CommandProjectionEventPreview {
 /// Pure reducer over a known cache row for client auto-optimism.
 ///
 /// Domain owns pure semantics. Client delivery is either:
-/// - **WASM** ([`Self::wasm`]): gen-client emits a `createWasmJsonPure` host in
-///   `pures.ts` — no app TypeScript pure file required.
+/// - **WASM** ([`Self::known_record`]): a [`WasmPure`] declared with
+///   [`wasm_pure!`](crate::wasm_pure) in the domain package. The CLI compiles
+///   that package's `wasm` feature and gen-client hosts the export in
+///   `pures.ts`; the model, key, arguments and patched fields all come from
+///   Rust types.
 /// - **Hand module** ([`Self::client_module`]): gen-client imports a named export
 ///   from `$lib/<module>` (escape hatch).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct CommandProjectionPureReduce {
-    /// Stable pure id, e.g. `blob.simulate_move`.
+    /// Stable pure id, e.g. `blob-domain::simulate_move`.
     pub fn_name: String,
     /// Path under app `$lib` without extension for a hand-written pure (empty if WASM).
     pub client_module: String,
     /// Named export in that hand module (empty if WASM).
     pub client_export: String,
-    /// wasm-pack package under `$lib` without extension, e.g. `blob/pkg/blob_wasm`.
+    /// Browser module under `$lib` without extension, e.g.
+    /// `wasm/blob-domain/blob_domain`. The CLI builds it there.
     pub wasm_package: String,
     /// Named WASM export `(recordJson, argsJson) -> assignJson | undefined`.
     pub wasm_export: String,
-    /// Cargo package that declared this WASM pure. `command!` fills
-    /// this from `CARGO_PKG_NAME`; application authors do not maintain a
-    /// parallel build inventory.
+    /// Cargo package that declared this WASM pure (its `CARGO_PKG_NAME`).
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub wasm_rust_package: String,
     /// Projection model id (e.g. `BlobGames`).
@@ -186,6 +188,10 @@ pub struct CommandProjectionPureReduce {
     pub args: Vec<CommandProjectionPureArg>,
     /// Fields taken from the pure result and patched onto the known row.
     pub assign: Vec<String>,
+    /// Disagreements between a typed pure and its model, reported when the
+    /// command's projections are validated.
+    #[serde(skip)]
+    pub(crate) declaration_errors: Vec<String>,
 }
 
 /// One named pure-reduce binding (key field or pure arg).
@@ -193,6 +199,91 @@ pub struct CommandProjectionPureReduce {
 pub struct CommandProjectionPureArg {
     pub name: String,
     pub source: CommandProjectionPreviewSource,
+}
+
+/// A browser pure function over a known read-model row, compiled to
+/// WebAssembly from the package that declares it.
+///
+/// Declare it with [`wasm_pure!`](crate::wasm_pure) next to the Rust function;
+/// mount it on a command with [`CommandProjectionPureReduce::known_record`].
+/// The three shapes are the serialized forms of the function's row, argument
+/// and output types: field names in them are read-model columns (row,
+/// output) and command input fields (arguments).
+#[derive(Clone, Copy, Debug)]
+pub struct WasmPure {
+    /// The Rust function name, which is also its WASM export name.
+    pub export: &'static str,
+    /// The declaring Cargo package, which the CLI builds with `--features wasm`.
+    pub rust_package: &'static str,
+    pub row: fn() -> crate::JsonShape,
+    pub args: fn() -> crate::JsonShape,
+    pub output: fn() -> crate::JsonShape,
+}
+
+/// Run a typed pure over JSON: the bridge behind every `wasm_pure!` export.
+/// Any decode failure, `None` or encode failure fails closed (`None`).
+#[doc(hidden)]
+pub fn __run_wasm_pure<R, A, O>(
+    row: &str,
+    args: &str,
+    pure: fn(R, A) -> Option<O>,
+) -> Option<String>
+where
+    R: serde::de::DeserializeOwned,
+    A: serde::de::DeserializeOwned,
+    O: Serialize,
+{
+    let row = serde_json::from_str(row).ok()?;
+    let args = serde_json::from_str(args).ok()?;
+    serde_json::to_string(&pure(row, args)?).ok()
+}
+
+/// Declare a browser pure function over a known read-model row.
+///
+/// ```ignore
+/// pub fn simulate_move(row: MoveRow, args: MoveArgs) -> Option<MovePatch> { … }
+///
+/// distributed::wasm_pure! {
+///     /// Client preview of `blob.move`.
+///     pub const SIMULATE_MOVE = simulate_move(MoveRow, MoveArgs) -> MovePatch;
+/// }
+/// ```
+///
+/// This defines `SIMULATE_MOVE: WasmPure` and, when the declaring package is
+/// built with its `wasm` feature, a wasm-bindgen export named after the
+/// function that decodes the row and arguments, calls it and encodes the
+/// result. The row, argument and output types derive
+/// [`JsonType`](crate::JsonType) and Serde. The package needs a `wasm` feature
+/// that enables `wasm-bindgen`.
+#[macro_export]
+macro_rules! wasm_pure {
+    (
+        $(#[$meta:meta])*
+        $vis:vis const $name:ident = $pure:ident($row:ty, $args:ty) -> $output:ty;
+    ) => {
+        $(#[$meta])*
+        $vis const $name: $crate::command::WasmPure = $crate::command::WasmPure {
+            export: ::core::stringify!($pure),
+            rust_package: ::core::env!("CARGO_PKG_NAME"),
+            row: <$row as $crate::JsonType>::json_shape,
+            args: <$args as $crate::JsonType>::json_shape,
+            output: <$output as $crate::JsonType>::json_shape,
+        };
+        // The declared types are the function's types, with or without `wasm`.
+        const _: fn($row, $args) -> ::core::option::Option<$output> = $pure;
+        // Only the declaring package's `wasm` build exports it.
+        #[allow(unexpected_cfgs)]
+        const _: () = {
+            #[cfg(feature = "wasm")]
+            #[::wasm_bindgen::prelude::wasm_bindgen(js_name = $pure)]
+            pub fn __distributed_wasm_pure(
+                row: &str,
+                args: &str,
+            ) -> ::core::option::Option<::std::string::String> {
+                $crate::command::__run_wasm_pure::<$row, $args, $output>(row, args, $pure)
+            }
+        };
+    };
 }
 
 impl CommandProjectionPureReduce {
@@ -214,52 +305,99 @@ impl CommandProjectionPureReduce {
             key: Vec::new(),
             args: Vec::new(),
             assign: Vec::new(),
+            declaration_errors: Vec::new(),
         }
     }
 
-    /// Domain pure shipped as wasm-pack under `$lib/<package>`; gen-client hosts it.
-    pub fn wasm(
-        fn_name: impl Into<String>,
-        wasm_package: impl Into<String>,
-        wasm_export: impl Into<String>,
-        model: impl Into<String>,
-    ) -> Self {
+    /// Run `pure` over the known `M` row the command addresses.
+    ///
+    /// The row is keyed by `M`'s primary key, read from the same-named command
+    /// input fields; each pure argument is the same-named input field; the
+    /// output's fields are patched onto the row. Row and output fields must be
+    /// columns of `M` (a JSON column with the same shape), and the output may
+    /// not assign the key.
+    pub fn known_record<M>(pure: WasmPure) -> Self
+    where
+        M: crate::read_model::RelationalReadModel,
+    {
+        let schema = M::schema();
+        let row = (pure.row)();
+        let args = (pure.args)();
+        let output = (pure.output)();
+        let mut errors = Vec::new();
+        let pure_name = format!("{}::{}", pure.rust_package, pure.export);
+        for (role, shape) in [("row", &row), ("arguments", &args), ("output", &output)] {
+            if !matches!(shape, crate::JsonShape::Object { fields } if !fields.is_empty()) {
+                errors.push(format!(
+                    "pure `{pure_name}` {role} must be a struct with named fields"
+                ));
+            }
+        }
+        for (role, field) in row
+            .fields()
+            .iter()
+            .map(|field| ("row", field))
+            .chain(output.fields().iter().map(|field| ("output", field)))
+        {
+            let Some(column) = schema
+                .columns
+                .iter()
+                .find(|column| !column.skipped && column.column_name == field.name)
+            else {
+                errors.push(format!(
+                    "pure `{pure_name}` {role} field `{}` is not a column of `{}`",
+                    field.name, schema.model_name
+                ));
+                continue;
+            };
+            if column
+                .json_type
+                .as_ref()
+                .is_some_and(|shape| *shape != field.shape)
+            {
+                errors.push(format!(
+                    "pure `{pure_name}` {role} field `{}` does not have the JSON shape of column `{}.{}`",
+                    field.name, schema.model_name, column.column_name
+                ));
+            }
+            if role == "output" && schema.primary_key.columns.contains(&column.column_name) {
+                errors.push(format!(
+                    "pure `{pure_name}` output assigns key column `{}`",
+                    field.name
+                ));
+            }
+        }
+        let input = |name: &str| CommandProjectionPureArg {
+            name: name.to_owned(),
+            source: CommandProjectionPreviewSource::input([name]),
+        };
         Self {
-            fn_name: fn_name.into(),
+            fn_name: pure_name,
             client_module: String::new(),
             client_export: String::new(),
-            wasm_package: wasm_package.into(),
-            wasm_export: wasm_export.into(),
-            wasm_rust_package: String::new(),
-            model: model.into(),
-            key: Vec::new(),
-            args: Vec::new(),
+            wasm_package: format!(
+                "wasm/{}/{}",
+                pure.rust_package,
+                pure.rust_package.replace('-', "_")
+            ),
+            wasm_export: pure.export.to_owned(),
+            wasm_rust_package: pure.rust_package.to_owned(),
+            model: schema.model_name.clone(),
+            key: schema
+                .primary_key
+                .columns
+                .iter()
+                .map(|column| input(column))
+                .collect(),
+            args: args
+                .fields()
+                .iter()
+                .map(|field| input(&field.name))
+                .collect(),
             assign: Vec::new(),
+            declaration_errors: errors,
         }
-    }
-
-    /// Attach the Cargo package that owns a declared WASM pure.
-    ///
-    /// Normal application code receives this through `command!`.
-    /// It is public only so generated declarations can remain ordinary Rust.
-    #[doc(hidden)]
-    #[must_use]
-    pub fn declared_in_rust_package(mut self, package: impl Into<String>) -> Self {
-        if !self.wasm_package.is_empty() || !self.wasm_export.is_empty() {
-            self.wasm_rust_package = package.into();
-        }
-        self
-    }
-
-    /// Deprecated alias for [`Self::client_module`].
-    #[deprecated(note = "use client_module() or wasm()")]
-    pub fn new(
-        fn_name: impl Into<String>,
-        client_module: impl Into<String>,
-        client_export: impl Into<String>,
-        model: impl Into<String>,
-    ) -> Self {
-        Self::client_module(fn_name, client_module, client_export, model)
+        .assign(output.fields().iter().map(|field| field.name.clone()))
     }
 
     #[must_use]
@@ -432,6 +570,11 @@ impl CommandProjectionEvents {
             true,
         )?;
         for reduce in &mut self.pure_reduces {
+            if let Some(error) = reduce.declaration_errors.first() {
+                return Err(format!(
+                    "typed command `{command}` pure reduce is invalid: {error}"
+                ));
+            }
             if reduce.fn_name.trim().is_empty() || reduce.model.trim().is_empty() {
                 return Err(format!(
                     "typed command `{command}` pure reduce requires non-empty fn and model"

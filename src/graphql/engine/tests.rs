@@ -1595,9 +1595,14 @@ mod client_surface_parity_tests {
             .iter()
             .cloned()
             .collect();
-        assert_eq!(metadata_ops, runtime_json);
-        for required in ["_contains", "_contained_in", "_has_key"] {
-            assert!(metadata_ops.contains(required));
+        // The client contract is dialect-neutral: every operator it offers is
+        // accepted by this runtime, and the Postgres-only `jsonb` operators
+        // stay on the GraphQL schema for raw GraphQL but out of the manifest,
+        // so its schema hash equals a SQLite deployment's.
+        assert!(metadata_ops.is_subset(&runtime_json));
+        for postgres_only in ["_contains", "_contained_in", "_has_key"] {
+            assert!(runtime_json.contains(postgres_only));
+            assert!(!metadata_ops.contains(postgres_only));
         }
         assert_eq!(manifest.service_id, "orders-service");
         assert_digest(&manifest.schema_fingerprint);

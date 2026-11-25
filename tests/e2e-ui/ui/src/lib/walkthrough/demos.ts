@@ -732,14 +732,15 @@ export const blobWalkthrough: DemoWalkthrough = {
   blob_games(order_by: [{ game_id: asc }]) {
     game_id
     score
-    map_json
+    map
+    moves
     owner { user_id display_name }
   }
 }`
 				},
 				{
 					file: 'readmodels/models/blob_games.rs · BlobGames',
-					caption: 'This is the query row for one board. `map_json` is the serialized level. `owner` joins `AuthUsers`.',
+					caption: 'This is the query row for one board. `map` and `moves` are JSON columns typed from Rust: the generated client types `map` as rows of tile names and `moves` as directions. `owner` joins `AuthUsers`.',
 					code: `#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, ReadModel)]
 #[readmodel(primary_key = ["game_id"])]
 pub struct BlobGames {
@@ -750,7 +751,8 @@ pub struct BlobGames {
   pub player_dead: bool,
   pub current_level: i64,
   pub current_level_completed: bool,
-  pub map_json: String,
+  pub map: Vec<Vec<Tile>>,      // "player" | "hole" | "unvisited" | …
+  pub moves: Vec<Direction>,    // legal directions from here
   /// active | dead | level_complete
   pub status: String,
   #[readmodel(belongs_to = "AuthUsers", foreign_key = "owner_id")]
@@ -780,6 +782,8 @@ pub struct BlobGames {
 const games = $derived(
   $query.complete ? $query.data.blob_games : []
 );
+// selected.map: readonly (readonly Tile[])[] — no JSON.parse, no casts.
+<div class="cell tile-{cell}">…</div>
 
 <SelectedBlobGame />`
 				},
@@ -808,54 +812,53 @@ const query = SelectedBlobGame.use(
 			samples: [
 				{
 					file: 'Why pure reduce (not only Atomic seal)',
-					caption: 'Optimism from input cannot calculate `map_json`. A known-row pure function can calculate it.',
+					caption: 'Optimism from input cannot calculate `map`. A known-row pure function can calculate it.',
 					code: `// Without a pure function: the UI waits for the Atomic body.
 // With a pure function: known BlobGames row + direction → simulate_move
-//   → assign map_json, score, player_dead, status immediately.
+//   → assign map, moves, score, player_dead, status immediately.
 // After commit: the Atomic response overwrites with the server row.
 // If the row is missing: the pure function returns null. Do not invent.`
 				},
 				{
 					file: 'routes/blob/[[gameId]]/+page.svelte',
-					caption: 'The input is only `game_id` and `direction`. Load the generated WASM hosts before the first move.',
-					code: `onMount(() => {
-  void ensurePureFunctionsReady(); // generated/user/pures.ts
-});
-
+					caption: 'The input is only `game_id` and `direction`. The domain lists the legal moves, so the page has no board rules.',
+					code: `if (!selected.moves.includes(direction)) return; // edge: no command
 await commands.blob.move({ game_id, direction });
-// pure may patch map_json/score/… from known row;
-// Atomic seal confirms or corrects`
+// the pure patches map/moves/score/… from the known row;
+// the Atomic seal confirms or corrects`
 				},
 				{
-					file: 'blob-domain/src/commands/move_dir.rs · mount',
-					caption: 'The domain mount names the pure function, the WASM package, the keys, the args, and the assign fields.',
-					code: `.mount(blob_domain::commands::move_dir())
-// preview: blob.simulate_move → blobSimulateMove WASM`
+					file: 'service/src/modules/blob.rs · blob.move',
+					caption: 'The command names the pure and the read model. The key, the argument and the patched columns come from the Rust types, and declaration fails if they disagree with `BlobGames`.',
+					code: `command! {
+  name: "blob.move",
+  outcome: Atomic<BlobGames>,
+  preview_reduce_known_record:
+    CommandProjectionPureReduce::known_record::<BlobGames>(PREVIEW_MOVE),
+  …
+}`
 				},
 				{
 					file: 'generated/user/pures.ts',
-					caption: 'The generated client hosts WASM. The app has no TypeScript simulate file.',
+					caption: 'The generated client hosts WASM and starts loading it in the browser. Until it is ready the pure returns null, so there is no optimism yet. The app has no TypeScript simulate file.',
 					code: `const pureHost_0 = createWasmJsonPure({
-  load: () => import('$lib/blob/pkg/blob_wasm.js'),
-  exportName: 'blobSimulateMove',
+  load: () => import('$lib/wasm/blob-domain/blob_domain.js'),
+  exportName: 'preview_move',
 });
 export const PURE_FUNCTIONS = {
-  'blob.simulate_move': pureHost_0.pure,
-} as const;
-export async function ensurePureFunctionsReady() {
-  await pureHost_0.ensureReady();
-}`
+  'blob-domain::preview_move': pureHost_0.pure,
+} as const;`
 				},
 				{
 					file: 'Runtime shape (framework)',
 					caption: 'The replica pure function always has this shape: (record, args) → assign fields or null.',
 					code: `// createWasmJsonPure JSON-roundtrips to WASM:
 //   pure(record, args) {
-//     return JSON.parse(wasm.blobSimulateMove(
+//     return JSON.parse(wasm.preview_move(
 //       JSON.stringify(record), JSON.stringify(args)
 //     )) ?? null;
 //   }
-// Validation (direction, map parse, edge) lives in the domain pure.`
+// Decoding and validation (direction, tiles, edge) live in Rust.`
 				}
 			]
 		},
@@ -866,7 +869,7 @@ export async function ensurePureFunctionsReady() {
 			principle: 'A command changes the write model. A table is only for reads.',
 			samples: [
 				{
-					file: 'blob-domain/src/commands/move_dir.rs · handle_move',
+					file: 'service/src/modules/blob.rs · handle_move',
 					caption: 'Load the game. Call `move_dir`. Stage `SaveBlobGame`. Commit Atomic. The Atomic row is replica authority.',
 					code: `pub async fn handle_move(
   ctx: &CausalCommandContext<'_, BlobGame>,
@@ -899,19 +902,20 @@ export async function ensurePureFunctionsReady() {
 {
 			id: 'domain',
 			label: '4 · Domain + pure core',
-			lede: 'The `blob-domain` crate has two faces. `core` holds the pure board rules. Those rules can compile to WASM. `models` holds the sourced aggregate. The pure function has no ownership and no Entity. Those stay on the aggregate. The client and the server share `core`. Optimism cannot diverge from the Atomic commit.',
+			lede: 'The `blob-domain` crate has two faces. `core` holds the pure board rules and the tile and direction types. Those rules can compile to WASM. `models` holds the sourced aggregate. The domain does not know the read models: the commands that seal `BlobGames` rows live with the service. The pure function has no ownership and no Entity. Those stay on the aggregate. The client and the server share `core`. Optimism cannot diverge from the Atomic commit.',
 			principle: 'Start with the domain. Share the pure function. Do not write a second ruleset.',
 			samples: [
 				{
 					file: 'blob-domain/src/core · simulate_move',
 					caption: 'This function is pure. Input is map, score, and direction. Output is the next board. There is no Entity, no ownership, and no I/O.',
 					code: `pub fn simulate_move(
-  map: &[Vec<u8>],
+  map: &[Vec<Tile>],
   score: i64,
   direction: Direction,
 ) -> Result<MovePreview, SimulateError> {
   // step player, mark visited, hole/suicide/score, level complete…
-  Ok(MovePreview { map, score, player_dead, level_complete })
+  Ok(MovePreview { map, moves, score, player_dead,
+                   current_level_completed, status })
 }`
 				},
 				{
@@ -927,7 +931,7 @@ export async function ensurePureFunctionsReady() {
   self.record_moved(
     preview.score,
     preview.player_dead,
-    preview.level_complete,
+    preview.current_level_completed,
     preview.map,
     direction.as_str().to_string(),
   )?;
@@ -935,25 +939,30 @@ export async function ensurePureFunctionsReady() {
 }`
 				},
 				{
-					file: 'blob-domain · wasm export',
-					caption: 'The WASM adapter takes record JSON and args JSON. It returns assign JSON or None. None is fail-closed.',
-					code: `#[wasm_bindgen(js_name = blobSimulateMove)]
-pub fn blob_simulate_move(record_json: &str, args_json: &str)
-  -> Option<String>
-{
-  // parse map_json / score / direction → simulate_move → assign fields
-  // None = fail closed (illegal move or bad input)
+					file: 'blob-domain/src/core/preview.rs · PREVIEW_MOVE',
+					caption: '`wasm_pure!` declares the browser pure from typed Rust: the row, the arguments and the output. The `wasm` build exports it; the JSON bridge is the framework\'s. None is fail-closed.',
+					code: `#[derive(Deserialize, JsonType)]
+pub struct MoveRow { pub map: Vec<Vec<Tile>>, pub score: i64 }
+#[derive(Deserialize, JsonType)]
+pub struct MoveArgs { pub direction: Direction }
+
+pub fn preview_move(row: MoveRow, args: MoveArgs) -> Option<MovePreview> {
+  simulate_move(&row.map, row.score, args.direction).ok()
+}
+
+distributed::wasm_pure! {
+  pub const PREVIEW_MOVE = preview_move(MoveRow, MoveArgs) -> MovePreview;
 }`
 				},
 				{
 					file: 'blob-domain · features + distributed build',
-					caption: 'The server builds the default `domain` feature. `distributed build` (and `distributed dev`) compiles the declared pure with wasm-pack and `--features wasm` into `$lib/blob/pkg`. There is no separate make target.',
+					caption: 'The server builds the default `domain` feature. `distributed build` (and `distributed dev`) compiles the declaring package with wasm-pack and `--features wasm` into `$lib/wasm/blob-domain`. There is no separate make target.',
 					code: `// Cargo.toml
-// default = ["domain"]  → aggregate + levels + distributed
-// wasm                 → blobSimulateMove
+// default = ["domain"]  → aggregate + levels
+// wasm                 → the preview_move export
 //
-// move_dir.rs declares the package path:
-// CommandProjectionPureReduce::wasm("blob.simulate_move", "blob/pkg/blob_wasm", …)`
+// The output path and export name come from PREVIEW_MOVE:
+// wasm/<package>/<package_snake>, export = the function name`
 				}
 			]
 		},

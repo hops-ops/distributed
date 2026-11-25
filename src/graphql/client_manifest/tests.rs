@@ -2404,3 +2404,49 @@ fn catalog_or_mismatched_surface_cannot_be_labeled_as_authorized() {
     .unwrap_err();
     assert!(error.to_string().contains("does not match"));
 }
+
+#[test]
+fn json_columns_give_one_client_contract_for_every_dialect() {
+    #[derive(Clone, Default, serde::Serialize, serde::Deserialize, crate::ReadModel)]
+    #[readmodel(primary_key = ["board_id"])]
+    struct Boards {
+        board_id: String,
+        cells: Vec<Vec<String>>,
+        #[readmodel(jsonb)]
+        metadata: serde_json::Value,
+    }
+    use crate::RelationalReadModel;
+
+    let manifest = |options: SurfaceOptions| {
+        let full = build_surface(&[Boards::schema().clone()], &options).expect("surface");
+        manifest_for_all_models("boards-service", "user", &full)
+    };
+    let sqlite = manifest(SurfaceOptions::sqlite());
+    let postgres = manifest(SurfaceOptions::postgres());
+    assert_eq!(sqlite.schema_fingerprint, postgres.schema_fingerprint);
+    assert_eq!(sqlite, postgres);
+
+    let operators = |field: &str| {
+        postgres
+            .roots
+            .iter()
+            .find_map(|root| root.filter.as_ref())
+            .unwrap()
+            .fields
+            .iter()
+            .find(|candidate| candidate.name == field)
+            .unwrap()
+            .operators
+            .clone()
+    };
+    for field in ["cells", "metadata"] {
+        let operators = operators(field);
+        assert!(operators.iter().any(|op| op == "_eq"), "{operators:?}");
+        for postgres_only in ["_contains", "_contained_in", "_has_key"] {
+            assert!(
+                !operators.iter().any(|op| op == postgres_only),
+                "{operators:?}"
+            );
+        }
+    }
+}

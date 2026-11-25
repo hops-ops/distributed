@@ -2160,12 +2160,14 @@ mod tests {
                     scalar: "ID".into(),
                     codec: "string".into(),
                     nullable: false,
+                    json_type: None,
                 },
                 ClientField {
                     name: "metadata".into(),
                     scalar: "JSON".into(),
                     codec: "json".into(),
                     nullable: true,
+                    json_type: None,
                 },
             ],
             relationships: Vec::new(),
@@ -2540,6 +2542,7 @@ mod tests {
                 scalar: "JSON".into(),
                 codec: "json".into(),
                 nullable: false,
+                json_type: None,
             }));
         let mut operations = Vec::new();
         let mut recoveries = Vec::new();

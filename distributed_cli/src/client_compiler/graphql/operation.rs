@@ -540,14 +540,15 @@ pub(super) fn variable_type_compatible(variable: &Type, argument: &Type) -> bool
     }
 }
 
-pub(crate) fn typescript_scalar(
-    field: &CompiledScalar,
-) -> Result<&'static str, ClientCompileError> {
+pub(crate) fn typescript_scalar(field: &CompiledScalar) -> Result<String, ClientCompileError> {
     match field.codec.as_str() {
-        "boolean" => Ok("boolean"),
-        "float64" | "int32" | "json_number_precision_limited" => Ok("number"),
-        "string" | "base64" | "string_unvalidated_timestamp" => Ok("string"),
-        "json" => Ok("unknown"),
+        "boolean" => Ok("boolean".into()),
+        "float64" | "int32" | "json_number_precision_limited" => Ok("number".into()),
+        "string" | "base64" | "string_unvalidated_timestamp" => Ok("string".into()),
+        "json" => Ok(field
+            .json_type
+            .as_ref()
+            .map_or_else(|| "unknown".into(), typescript_json)),
         codec => Err(ClientCompileError::manifest(
             "client.scalar.codec_unsupported",
             format!(
@@ -555,6 +556,60 @@ pub(crate) fn typescript_scalar(
                 field.field
             ),
         )),
+    }
+}
+
+/// The TypeScript type of a JSON value of this shape (read-only, like every
+/// generated data type).
+pub(crate) fn typescript_json(shape: &distributed::JsonShape) -> String {
+    use distributed::JsonShape;
+    let quote = |value: &str| serde_json::to_string(value).expect("a string serializes");
+    let element = |shape: &JsonShape| {
+        let item = typescript_json(shape);
+        // A union or a readonly array needs parentheses before `[]`.
+        if item.contains(' ') && !item.starts_with('{') {
+            format!("({item})")
+        } else {
+            item
+        }
+    };
+    match shape {
+        JsonShape::Boolean => "boolean".into(),
+        JsonShape::Number => "number".into(),
+        JsonShape::String => "string".into(),
+        JsonShape::Enum { values } if values.is_empty() => "never".into(),
+        JsonShape::Enum { values } => values
+            .iter()
+            .map(|value| quote(value))
+            .collect::<Vec<_>>()
+            .join(" | "),
+        JsonShape::Array { items } => format!("readonly {}[]", element(items)),
+        JsonShape::Tuple { items } => format!(
+            "readonly [{}]",
+            items
+                .iter()
+                .map(typescript_json)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        JsonShape::Nullable { value } => format!("{} | null", typescript_json(value)),
+        JsonShape::Map { values } => {
+            format!("{{ readonly [key: string]: {} }}", typescript_json(values))
+        }
+        JsonShape::Object { fields } if fields.is_empty() => "{}".into(),
+        JsonShape::Object { fields } => format!(
+            "{{ {} }}",
+            fields
+                .iter()
+                .map(|field| format!(
+                    "readonly {}: {};",
+                    quote(&field.name),
+                    typescript_json(&field.shape)
+                ))
+                .collect::<Vec<_>>()
+                .join(" ")
+        ),
+        JsonShape::Unknown => "unknown".into(),
     }
 }
 
@@ -595,6 +650,45 @@ pub(super) fn source_error(
 #[cfg(test)]
 mod local_tests {
     use super::module_stem;
+
+    #[test]
+    fn json_shapes_render_exact_readonly_types() {
+        use distributed::{JsonField, JsonShape};
+        let tile = JsonShape::Enum {
+            values: vec!["hole".into(), "player".into()],
+        };
+        let board = JsonShape::Array {
+            items: Box::new(JsonShape::Array {
+                items: Box::new(tile),
+            }),
+        };
+        assert_eq!(
+            super::typescript_json(&board),
+            r#"readonly (readonly ("hole" | "player")[])[]"#
+        );
+        let object = JsonShape::Object {
+            fields: vec![
+                JsonField {
+                    name: "at".into(),
+                    shape: JsonShape::Tuple {
+                        items: vec![JsonShape::Number, JsonShape::Number],
+                    },
+                },
+                JsonField {
+                    name: "tags".into(),
+                    shape: JsonShape::Map {
+                        values: Box::new(JsonShape::Nullable {
+                            value: Box::new(JsonShape::String),
+                        }),
+                    },
+                },
+            ],
+        };
+        assert_eq!(
+            super::typescript_json(&object),
+            r#"{ readonly "at": readonly [number, number]; readonly "tags": { readonly [key: string]: string | null }; }"#
+        );
+    }
 
     #[test]
     fn module_names_are_portable() {

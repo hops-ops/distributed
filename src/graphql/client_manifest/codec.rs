@@ -52,6 +52,13 @@ pub(super) fn filter_input(
     })
 }
 
+/// The filter operators a generated client may use: the dialect-neutral set.
+///
+/// One application presents one client contract (and schema hash) whatever
+/// database serves it. Postgres also accepts its `jsonb` operators
+/// (`_contains`, `_contained_in`, `_has_key`) on JSON columns, but only in its
+/// GraphQL schema: a client compiled from this manifest cannot emit an
+/// operator a SQLite server would reject.
 fn filter_fields(
     surface: &Surface,
     model: &crate::graphql::surface::SurfaceModel,
@@ -64,6 +71,9 @@ fn filter_fields(
             operators: surface
                 .comparison_ops_for_scalar(&field.scalar)
                 .into_iter()
+                .filter(|op| {
+                    crate::graphql::comparison_op_fields(&field.scalar, false).contains(op)
+                })
                 .map(str::to_string)
                 .collect(),
         })

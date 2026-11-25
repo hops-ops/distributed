@@ -474,15 +474,21 @@ reaches the replica. A failed command rolls its preview back, so its row
 leaves `pending` too.
 
 ```rust,ignore
-// Advanced optimism: same domain pure, shipped as WASM
-.preview_reduce_known_record(CommandProjectionPureReduce::wasm(
-    "blob.simulate_move",
-    "blob/pkg/blob_wasm",   // wasm-pack under $lib
-    "blobSimulateMove",     // (recordJson, argsJson) → assignJson
-    "BlobGames",
-))
+// Advanced optimism: the same domain pure, shipped as WASM.
+// blob-domain: typed row, arguments and output.
+pub fn preview_move(row: MoveRow, args: MoveArgs) -> Option<MovePreview> {
+    simulate_move(&row.map, row.score, args.direction).ok()
+}
+distributed::wasm_pure! {
+    pub const PREVIEW_MOVE = preview_move(MoveRow, MoveArgs) -> MovePreview;
+}
 
-// Generated client hosts the module. No TypeScript board rules.
+// The command: key, argument and patched columns come from the types.
+preview_reduce_known_record:
+    CommandProjectionPureReduce::known_record::<BlobGames>(PREVIEW_MOVE),
+
+// distributed build compiles it; the generated client hosts it.
+// No TypeScript board rules.
 ```
 
 JS package deep-dive: [`js/README.md`](js/README.md).
@@ -1910,6 +1916,30 @@ pub struct GameView {
     pub metadata: serde_json::Value,
 }
 ```
+
+### Typed JSON columns
+
+A `Vec`, map or `#[readmodel(jsonb)]` field is a JSON column. Its Rust type
+must implement `JsonType`, the serialized shape of the value. Generated
+clients type the column from it instead of `unknown`: a
+`Vec<Vec<Tile>>` with a unit-only `Tile` enum becomes
+`readonly (readonly ("hole" | "player" | …)[])[]`. Derive it next to Serde:
+
+```rust,ignore
+#[derive(Clone, Copy, Serialize, Deserialize, distributed::JsonType)]
+#[serde(rename_all = "snake_case")]
+pub enum Tile { Hole, Unvisited, Visited, DeadBySuicide, DeadByHole, Player }
+```
+
+The derive covers named-field structs and unit-only enums, and follows
+`rename` / `rename_all`. A Serde attribute that changes the shape
+(`flatten`, `skip*`, `with`, `tag`, `untagged`, …) is a compile error. A
+`serde_json::Value` column states that its shape is unknown.
+
+A generated client's contract (and its schema hash) does not depend on the
+database. Its JSON-column filters are the dialect-neutral operators (`_eq`,
+`_in`, `_is_null`, …); Postgres's `jsonb` operators (`_contains`,
+`_contained_in`, `_has_key`) are on its GraphQL schema for raw GraphQL only.
 
 ### Atomic Commits (Read Model + Aggregate)
 

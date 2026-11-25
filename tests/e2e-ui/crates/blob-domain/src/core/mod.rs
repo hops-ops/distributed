@@ -1,10 +1,14 @@
-//! Pure board rules — no I/O, no `distributed`, WASM-eligible.
+//! Pure board rules — no I/O, WASM-eligible.
 //!
-//! Shared by the aggregate host (`models`) and the client WASM surface (`wasm`).
+//! Shared by the aggregate (`models`) and the browser: [`PREVIEW_MOVE`] is the
+//! same [`simulate_move`] compiled to WebAssembly for `blob.move` optimism.
 
 mod direction;
+mod preview;
 mod simulate;
-pub mod tile;
+mod tile;
 
 pub use direction::Direction;
-pub use simulate::{simulate_move, MovePreview, SimulateError};
+pub use preview::{preview_move, MoveArgs, MoveRow, PREVIEW_MOVE};
+pub use simulate::{legal_moves, simulate_move, status_of, MovePreview, SimulateError};
+pub use tile::Tile;

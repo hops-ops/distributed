@@ -287,6 +287,7 @@ pub(super) fn compile_model_object<'ast>(
                 codec: "string".into(),
                 nullable: false,
                 expose: true,
+                json_type: None,
             },
         }));
     }
@@ -509,6 +510,7 @@ pub(super) fn compile_aggregate_object<'ast>(
                     codec: "string".into(),
                     nullable: false,
                     expose: true,
+                    json_type: None,
                 }));
             }
             "aggregate" | "nodes" => {
@@ -581,6 +583,7 @@ pub(super) fn compile_aggregate_fields_object<'ast>(
                 codec: "int32".into(),
                 nullable: false,
                 expose: true,
+                json_type: None,
             })),
             "__typename" => members.push(CompiledMember::Scalar(CompiledScalar {
                 response_key,
@@ -588,6 +591,7 @@ pub(super) fn compile_aggregate_fields_object<'ast>(
                 codec: "string".into(),
                 nullable: false,
                 expose: true,
+                json_type: None,
             })),
             "sum" | "avg" | "min" | "max" => {
                 return Err(source_error(
@@ -630,5 +634,6 @@ pub(super) fn compiled_scalar(
         codec: field.codec.clone(),
         nullable: field.nullable,
         expose,
+        json_type: field.json_type.clone(),
     }
 }

@@ -10,16 +10,41 @@ fn not_mallory(ctx: &CausalCommandContext<'_, Hero>) -> bool {
     ctx.session().user_id() != Some("mallory")
 }
 
+/// The row a hero's client preview reads (a subset of [`Heroes`]).
+#[derive(Deserialize, distributed::JsonType)]
+pub struct HeroRow {
+    pub items: Vec<String>,
+}
+
+#[derive(Deserialize, distributed::JsonType)]
+pub struct HeroArgs {
+    pub item: String,
+}
+
+#[derive(Serialize, distributed::JsonType)]
+pub struct HeroPatch {
+    pub items: Vec<String>,
+}
+
+pub fn equip_preview(row: HeroRow, args: HeroArgs) -> Option<HeroPatch> {
+    let mut items = row.items;
+    items.push(args.item);
+    Some(HeroPatch { items })
+}
+
+distributed::wasm_pure! {
+    pub const EQUIP_PREVIEW = equip_preview(HeroRow, HeroArgs) -> HeroPatch;
+}
+
+#[derive(Clone, Default, Serialize, Deserialize, distributed::ReadModel)]
+#[readmodel(primary_key = ["hero_id"])]
+pub struct Heroes {
+    pub hero_id: String,
+    pub items: Vec<String>,
+}
+
 fn hero_preview() -> CommandProjectionPureReduce {
-    CommandProjectionPureReduce::wasm(
-        "hero.preview",
-        "hero/pkg/hero_wasm",
-        "heroPreview",
-        "Heroes",
-    )
-    .key_input("hero_id", ["hero_id"])
-    .arg_input("item", ["item"])
-    .assign(["items"])
+    CommandProjectionPureReduce::known_record::<Heroes>(EQUIP_PREVIEW)
 }
 
 command! {
@@ -210,10 +235,25 @@ fn declarations_register_their_fields_and_the_declaring_package() {
     let outfit = specs.iter().find(|spec| spec.id == "hero.outfit").unwrap();
     let contract = &outfit.projection_contract;
     let pure = &contract["pure_reduces"][0];
-    assert_eq!(pure["fn_name"], "hero.preview", "{contract}");
+    let package = env!("CARGO_PKG_NAME");
     assert_eq!(
-        pure["wasm_rust_package"],
-        env!("CARGO_PKG_NAME"),
+        pure["fn_name"],
+        format!("{package}::equip_preview"),
         "{contract}"
+    );
+    assert_eq!(pure["wasm_rust_package"], package, "{contract}");
+    assert_eq!(pure["wasm_export"], "equip_preview", "{contract}");
+    assert_eq!(pure["model"], "Heroes", "{contract}");
+    assert_eq!(pure["key"][0]["name"], "hero_id", "{contract}");
+    assert_eq!(pure["args"][0]["name"], "item", "{contract}");
+    assert_eq!(pure["assign"], serde_json::json!(["items"]), "{contract}");
+    assert_eq!(
+        distributed::command::__run_wasm_pure(
+            r#"{"items":["a"],"hero_id":"h"}"#,
+            r#"{"item":"b"}"#,
+            equip_preview
+        )
+        .as_deref(),
+        Some(r#"{"items":["a","b"]}"#)
     );
 }

@@ -9,3 +9,5 @@ description = "Query models, relationships, and read authorization"
 distributed = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+# The board's column types (`Tile`, `Direction`).
+blob-domain = { path = "../blob-domain", default-features = false }

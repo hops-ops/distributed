@@ -28,6 +28,6 @@ export default defineConfig({
         // server has no reverse API proxy, so it cannot loop back into ingress.
 	},
 	optimizeDeps: {
-		exclude: ['$lib/blob/pkg/blob_wasm.js']
+		exclude: ['$lib/wasm/blob-domain/blob_domain.js']
 	}
 });
