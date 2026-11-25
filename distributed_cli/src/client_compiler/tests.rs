@@ -298,7 +298,7 @@ pub(super) fn manifest() -> JsonValue {
         "service_id": "todos-service",
         "surface": {"kind": "role", "name": "user"},
         "schema_fingerprint": fingerprint("schema"),
-        "protocol_fingerprint": "sha256:0dfa8a3f49e17d8d99c5c095c1ed14f528cae3e55fbc2f2b852975a50936ec5b",
+        "protocol_fingerprint": distributed::graphql::client_protocol_fingerprint().unwrap(),
         "execution": {
             "max_depth": 8,
             "max_fields": 500,

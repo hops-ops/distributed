@@ -14,12 +14,6 @@ pub(crate) mod lower;
 pub(crate) mod runtime;
 mod types;
 
-#[allow(
-    unused_imports,
-    reason = "Task 11 names this authenticated request seam"
-)]
-pub(crate) use types::ProjectionDeltaCacheScopeToken;
-
 #[cfg(test)]
 mod tests;
 #[cfg(test)]

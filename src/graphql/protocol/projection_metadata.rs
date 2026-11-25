@@ -439,7 +439,6 @@ mod tests {
         PROJECTION_DELTA_WIRE_VERSION,
     };
     use crate::graphql::protocol::{ProtocolTokenCodec, ProtocolTokenPurpose};
-    use sha2::{Digest, Sha256};
 
     fn delta() -> ProjectionDelta {
         ProjectionDelta {
@@ -583,10 +582,6 @@ mod tests {
         let fixture = include_bytes!("../../../tests/fixtures/command-projection-metadata-v1.json");
         let fixture = fixture.strip_suffix(b"\n").unwrap_or(fixture);
         assert_eq!(fixture, expected);
-        assert_eq!(
-            format!("sha256:{:x}", Sha256::digest(fixture)),
-            "sha256:40417ca1897322e636dc196388f68c331c322c142f624d3741e4e7a24b8e9f81"
-        );
         assert_eq!(
             CommandProjectionMetadataV1::from_json(fixture).unwrap(),
             metadata

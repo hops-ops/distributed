@@ -67,7 +67,7 @@ impl DistributedClientSurfaceExport {
                 name,
                 eligible_roles,
                 schema_roles,
-            } => ClientSurfaceIdentity::application_with_schema_roles(
+            } => ClientSurfaceIdentity::application(
                 name,
                 eligible_roles.clone(),
                 schema_roles.clone(),
@@ -100,7 +100,7 @@ impl DistributedClientSurfaceExport {
                 name,
                 eligible_roles,
                 schema_roles,
-            } => ClientSurfaceIdentity::application_with_schema_roles(
+            } => ClientSurfaceIdentity::application(
                 name,
                 eligible_roles.clone(),
                 schema_roles.clone(),

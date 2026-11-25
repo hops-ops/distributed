@@ -120,18 +120,14 @@ pub(crate) trait ProjectionVisibilityEvaluator {
 /// Unrestricted models are safe for exact local consequences. Predicate and
 /// server-only policies require trusted runtime before/after evidence, so this
 /// evaluator reports them as unknown and lowering emits only recovery.
-#[allow(
-    dead_code,
-    reason = "Task 11 composes this into the authenticated request authority"
-)]
+// Only the graphql runtime constructs it; a test build without that feature
+// compiles this module for the lowering tests alone.
+#[cfg_attr(not(feature = "graphql"), allow(dead_code))]
 pub(crate) struct SelectedSurfacePolicyVisibility<'a> {
     surface: &'a crate::graphql::surface::Surface,
 }
 
-#[allow(
-    dead_code,
-    reason = "Task 11 composes this into the authenticated request authority"
-)]
+#[cfg_attr(not(feature = "graphql"), allow(dead_code))]
 impl<'a> SelectedSurfacePolicyVisibility<'a> {
     pub(crate) fn try_new(
         surface: &'a crate::graphql::surface::Surface,

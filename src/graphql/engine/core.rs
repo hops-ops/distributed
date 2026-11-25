@@ -190,7 +190,6 @@ pub(crate) struct ProtocolApplicationInfo {
     /// Eligible wire roles (who may open).
     pub(crate) eligible_roles: Vec<String>,
     /// Privilege packs for portable schema + server execution grants.
-    #[allow(dead_code)] // inspected by tests / future multi-privilege diagnostics
     pub(crate) schema_roles: Vec<String>,
     /// Privilege role key used for SQL grants / prebuilt schema lookup.
     /// Single-privilege apps use that role name; multi-privilege apps use
