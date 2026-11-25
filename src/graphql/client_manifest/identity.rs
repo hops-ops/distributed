@@ -26,14 +26,6 @@ impl ClientSurfaceIdentity {
         eligible_roles: impl IntoIterator<Item = impl Into<String>>,
         schema_roles: impl IntoIterator<Item = impl Into<String>>,
     ) -> Self {
-        Self::application_with_schema_roles(name, eligible_roles, schema_roles)
-    }
-
-    pub fn application_with_schema_roles(
-        name: impl Into<String>,
-        eligible_roles: impl IntoIterator<Item = impl Into<String>>,
-        schema_roles: impl IntoIterator<Item = impl Into<String>>,
-    ) -> Self {
         let mut eligible_roles: Vec<String> = eligible_roles.into_iter().map(Into::into).collect();
         let mut schema_roles: Vec<String> = schema_roles.into_iter().map(Into::into).collect();
         eligible_roles.sort();

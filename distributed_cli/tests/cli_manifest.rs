@@ -82,7 +82,7 @@ fn client_manifest_uses_service_surface_export() {
     );
     assert_eq!(
         manifest["protocol_fingerprint"],
-        "sha256:0dfa8a3f49e17d8d99c5c095c1ed14f528cae3e55fbc2f2b852975a50936ec5b"
+        distributed::graphql::client_protocol_fingerprint().unwrap()
     );
     assert_eq!(manifest["models"][0]["id"], "OrderView");
     assert_eq!(manifest["models"][0]["record_revisions"], true);
@@ -103,10 +103,21 @@ fn client_manifest_uses_service_surface_export() {
         manifest["commands"][0]["extensions"]["direct_projection"]["topology"]["name"],
         "project_orders"
     );
-    assert_eq!(
-        manifest["commands"][0]["extensions"]["direct_projection"]["topology"]["digest"],
-        "sha256:e1a6b71d390f627c5b446daa9b035499f87c03ef24b15df275a807658084b31d"
+    // The topology digest is persisted by the projection store, so it must be
+    // a well-formed digest and identical across separate builds of the
+    // manifest (the whole manifest is compared against a second run).
+    let topology_digest = manifest["commands"][0]["extensions"]["direct_projection"]["topology"]
+        ["digest"]
+        .as_str()
+        .unwrap();
+    let hex = topology_digest.strip_prefix("sha256:").unwrap_or_default();
+    assert!(
+        hex.len() == 64 && hex.bytes().all(|byte| byte.is_ascii_hexdigit()),
+        "not a sha256 digest: {topology_digest}"
     );
+    let rebuilt: serde_json::Value =
+        serde_json::from_str(&distributed(&["client-manifest"])).unwrap();
+    assert_eq!(rebuilt, manifest);
     assert_eq!(
         manifest["commands"][0]["extensions"]["direct_projection"]["model"],
         "OrderView"

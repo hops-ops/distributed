@@ -51,9 +51,8 @@ use commands::*;
 use projections::{command_projection_extension, projection_manifest};
 use validation::validate_surface_structure;
 
-// Used by unit tests (and still a thin production-friendly wrapper).
-#[cfg_attr(not(test), allow(unused_imports))]
-pub(crate) use build::client_manifest_from_surface;
+#[cfg(test)]
+use build::client_manifest_from_surface;
 pub use codec::client_protocol_fingerprint;
 pub use commands::{command_operation, command_status_operation};
 pub use error::ClientManifestError;

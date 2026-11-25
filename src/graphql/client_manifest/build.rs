@@ -1,8 +1,8 @@
 use super::*;
 
-/// Convenience wrapper used heavily by unit tests; production uses
-/// [`client_manifest_from_surface_with_execution`].
-#[cfg_attr(not(test), allow(dead_code))]
+/// Unit-test shorthand for [`client_manifest_from_surface_with_execution`]
+/// with default limits.
+#[cfg(test)]
 pub(crate) fn client_manifest_from_surface(
     service_id: &str,
     identity: ClientSurfaceIdentity,

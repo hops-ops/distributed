@@ -16,8 +16,6 @@ const ROLE_MANIFEST: &str = r#"{
     "kind": "role",
     "name": "user"
   },
-  "schema_fingerprint": "sha256:eb28c89f691ba3b5500f63a610f427dfa6a2a2a46e8874330411a98199e21d15",
-  "protocol_fingerprint": "sha256:0dfa8a3f49e17d8d99c5c095c1ed14f528cae3e55fbc2f2b852975a50936ec5b",
   "execution": {
     "max_depth": 8,
     "max_fields": 500,
@@ -286,11 +284,33 @@ const SECOND_TODOS_QUERY: &str = r#"query SecondTodos {
 }
 "#;
 
+/// Stamp a test manifest with the crate's protocol fingerprint and the schema
+/// fingerprint of its own content, as the exporter does, so an edited fixture
+/// stays a valid export without pasting digests.
+fn sealed_manifest(json: &str) -> String {
+    let mut value: serde_json::Value = serde_json::from_str(json).expect("test manifest is JSON");
+    value["protocol_fingerprint"] = distributed::graphql::client_protocol_fingerprint()
+        .expect("protocol fingerprint")
+        .into();
+    value["schema_fingerprint"] = "".into();
+    let manifest: distributed::graphql::DistributedClientManifest =
+        serde_json::from_value(value.clone()).expect("test manifest decodes");
+    value["schema_fingerprint"] = manifest
+        .computed_schema_fingerprint()
+        .expect("test manifest is serializable")
+        .into();
+    serde_json::to_string_pretty(&value).expect("serialize test manifest")
+}
+
 fn project_dir(name: &str) -> PathBuf {
     let project = Path::new(env!("CARGO_TARGET_TMPDIR")).join(name);
     let _ = fs::remove_dir_all(&project);
     fs::create_dir_all(&project).expect("create disposable client project");
-    fs::write(project.join("client-manifest.json"), ROLE_MANIFEST).expect("write client manifest");
+    fs::write(
+        project.join("client-manifest.json"),
+        sealed_manifest(ROLE_MANIFEST),
+    )
+    .expect("write client manifest");
     project
 }
 
@@ -377,13 +397,9 @@ fn literal_text_search_generates_a_typed_load_island() {
     let project = project_dir("client-literal-text");
     fs::write(
         project.join("client-manifest.json"),
-        ROLE_MANIFEST
-            .replace("\"_ilike\"", "\"_ilike\", \"_icontains\"")
-            // Adding a filter changes the selected schema contract.
-            .replace(
-                "sha256:eb28c89f691ba3b5500f63a610f427dfa6a2a2a46e8874330411a98199e21d15",
-                "sha256:ef5eca766105f3447552a5662d8553ef6b4c9a0a9ae20b70257152208aca88ca",
-            ),
+        // Adding a filter changes the selected schema contract; sealing
+        // re-stamps the fingerprint of the edited content.
+        sealed_manifest(&ROLE_MANIFEST.replace("\"_ilike\"", "\"_ilike\", \"_icontains\"")),
     )
     .unwrap();
     write_document(

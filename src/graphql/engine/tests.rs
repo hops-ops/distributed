@@ -774,7 +774,7 @@ mod client_surface_parity_tests {
             .expect("registered multi-role application manifest");
         assert_eq!(
             manifest.surface,
-            crate::graphql::ClientSurfaceIdentity::application_with_schema_roles(
+            crate::graphql::ClientSurfaceIdentity::application(
                 "console",
                 ["admin", "user"],
                 ["user"],

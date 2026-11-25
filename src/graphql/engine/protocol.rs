@@ -137,11 +137,7 @@ pub(crate) fn resolve_execution_authority(
             Ok(ExecutionAuthority {
                 privilege_role: application.privilege_key.clone(),
                 asserted_roles: asserted,
-                surface: ClientSurfaceIdentity::application_with_schema_roles(
-                    name,
-                    eligible_roles,
-                    schema_roles,
-                ),
+                surface: ClientSurfaceIdentity::application(name, eligible_roles, schema_roles),
             })
         }
     }
@@ -182,7 +178,7 @@ pub(crate) fn select_protocol_surface<'a>(
                 return Err(());
             }
             Ok((
-                ClientSurfaceIdentity::application_with_schema_roles(
+                ClientSurfaceIdentity::application(
                     name.clone(),
                     eligible_roles.clone(),
                     schema_roles.clone(),

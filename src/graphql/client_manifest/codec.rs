@@ -265,30 +265,27 @@ pub(super) fn scalar_codec(scalar: &str) -> Option<&'static str> {
     }
 }
 
-/// Fingerprint of the client protocol family this crate speaks: the wire
-/// versions and scalar codecs every manifest it exports (or accepts) uses.
-///
-/// # Errors
-///
-/// Never in practice; the material is plain data.
-pub fn client_protocol_fingerprint() -> Result<String, ClientManifestError> {
-    #[derive(Serialize)]
-    struct ProtocolMaterial {
-        manifest_version: u32,
-        protocol_version: u32,
-        key_encoding: &'static str,
-        command_extension_slots_version: u32,
-        projector_entry_version: u32,
-        protocol_operations_version: u32,
-        query_capabilities_version: u32,
-        projection_program_version: u32,
-        projection_binding_version: u32,
-        projection_operation_semantics_version: u32,
-        command_projection_extension_version: u32,
-        unsigned_command_codecs_version: u32,
-        scalar_codecs: Vec<ScalarCodec>,
-    }
-    hash_json(&ProtocolMaterial {
+/// Everything the client protocol fingerprint commits to: the wire versions
+/// and scalar codecs every manifest this crate exports (or accepts) uses.
+#[derive(Serialize)]
+pub(super) struct ProtocolMaterial {
+    manifest_version: u32,
+    protocol_version: u32,
+    key_encoding: &'static str,
+    command_extension_slots_version: u32,
+    projector_entry_version: u32,
+    protocol_operations_version: u32,
+    query_capabilities_version: u32,
+    projection_program_version: u32,
+    projection_binding_version: u32,
+    projection_operation_semantics_version: u32,
+    command_projection_extension_version: u32,
+    unsigned_command_codecs_version: u32,
+    scalar_codecs: Vec<ScalarCodec>,
+}
+
+pub(super) fn protocol_material() -> ProtocolMaterial {
+    ProtocolMaterial {
         manifest_version: DISTRIBUTED_CLIENT_PROTOCOL_MANIFEST_EPOCH,
         protocol_version: DISTRIBUTED_CLIENT_PROTOCOL_VERSION,
         key_encoding: KEY_ENCODING,
@@ -304,7 +301,17 @@ pub fn client_protocol_fingerprint() -> Result<String, ClientManifestError> {
             super::projections::COMMAND_PROJECTION_EXTENSION_VERSION,
         unsigned_command_codecs_version: 1,
         scalar_codecs: supported_scalar_codecs(),
-    })
+    }
+}
+
+/// Fingerprint of the client protocol family this crate speaks: the hash of
+/// [`protocol_material`].
+///
+/// # Errors
+///
+/// Never in practice; the material is plain data.
+pub fn client_protocol_fingerprint() -> Result<String, ClientManifestError> {
+    hash_json(&protocol_material())
 }
 
 pub(super) fn hash_json(value: &impl Serialize) -> Result<String, ClientManifestError> {

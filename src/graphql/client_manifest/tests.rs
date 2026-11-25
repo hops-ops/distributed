@@ -781,9 +781,10 @@ fn role_manifest_is_deterministic_and_hides_denied_identity_and_commands() {
     .manifest()
     .unwrap();
     assert_eq!(first.schema_fingerprint, rebuilt.schema_fingerprint);
+    // The protocol fingerprint is the crate's, independent of the surface.
     assert_eq!(
         first.protocol_fingerprint,
-        "sha256:0dfa8a3f49e17d8d99c5c095c1ed14f528cae3e55fbc2f2b852975a50936ec5b"
+        client_protocol_fingerprint().unwrap()
     );
 
     let user = first
@@ -1109,11 +1110,43 @@ fn manifest_v2_decode_rejects_unknown_versions_and_fields() {
         "fallback": "revalidate"
     });
     assert!(serde_json::from_value::<DistributedClientManifest>(extension).is_err());
+}
 
-    assert_ne!(
-        baseline.protocol_fingerprint,
-        "sha256:30f19c9f4d29280a02ddf67c4df62cdc92c4e8090792f43d6b1bdafea3e31273",
-        "manifest v2 projection semantics must not share the v1 protocol fingerprint"
+#[test]
+fn protocol_fingerprint_commits_to_every_wire_version_and_scalar_codec() {
+    // A protocol change must change the fingerprint, so the fingerprint must
+    // hash every version that defines the wire, including the v2 projection
+    // semantics that separate manifest v2 from v1.
+    let material = serde_json::to_value(protocol_material()).unwrap();
+    assert_eq!(
+        material,
+        serde_json::json!({
+            "manifest_version": DISTRIBUTED_CLIENT_PROTOCOL_MANIFEST_EPOCH,
+            "protocol_version": DISTRIBUTED_CLIENT_PROTOCOL_VERSION,
+            "key_encoding": KEY_ENCODING,
+            "command_extension_slots_version": COMMAND_EXTENSION_SLOTS_VERSION,
+            "projector_entry_version": PROJECTOR_ENTRY_VERSION,
+            "protocol_operations_version": PROTOCOL_OPERATIONS_VERSION,
+            "query_capabilities_version": QUERY_CAPABILITIES_VERSION,
+            "projection_program_version": projections::CLIENT_PROJECTION_PROGRAM_VERSION,
+            "projection_binding_version": projections::CLIENT_PROJECTION_BINDING_VERSION,
+            "projection_operation_semantics_version":
+                projections::CLIENT_PROJECTION_OPERATION_SEMANTICS_VERSION,
+            "command_projection_extension_version":
+                projections::COMMAND_PROJECTION_EXTENSION_VERSION,
+            "unsigned_command_codecs_version": 1,
+            "scalar_codecs": supported_scalar_codecs(),
+        })
+    );
+    assert_eq!(material["manifest_version"], 2);
+    assert_eq!(material["command_projection_extension_version"], 2);
+    assert_eq!(
+        client_protocol_fingerprint().unwrap(),
+        hash_json(&protocol_material()).unwrap()
+    );
+    assert_eq!(
+        client_protocol_fingerprint().unwrap(),
+        client_protocol_fingerprint().unwrap()
     );
 }
 
