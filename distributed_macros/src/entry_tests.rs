@@ -54,19 +54,6 @@ mod tests {
     // ---- sourced ---------------------------------------------------------
 
     #[test]
-    fn parse_sourced_args_requires_entity_field() {
-        let attr = quote! {};
-        let err = sourced::parse_sourced_args
-            .parse2(attr)
-            .err()
-            .expect("missing entity should error");
-        assert!(
-            err.to_string().contains("requires the entity field name"),
-            "got: {err}"
-        );
-    }
-
-    #[test]
     fn parse_sourced_args_rejects_unknown_key() {
         let attr = quote! { entity, evnts = "Foo" };
         let err = sourced::parse_sourced_args

@@ -179,27 +179,3 @@ fn named_fields(input: &DeriveInput) -> syn::Result<&syn::FieldsNamed> {
         )),
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn expansion_freezes_explicit_event_schema_and_fingerprint() {
-        let input: DeriveInput = syn::parse_quote! {
-            #[domain_event(name = "todo.ownership-transferred", version = 2)]
-            struct TodoOwnershipTransferred {
-                todo_id: String,
-                previous_owner_id: String,
-                new_owner_id: String,
-            }
-        };
-
-        let expanded = expand_domain_event(input).unwrap().to_string();
-
-        assert!(expanded.contains("todo.ownership-transferred"));
-        assert!(expanded
-            .contains("sha256:c3f0bc1645b8685a8c496a74650ec41c70f9a8356e81d26cd254a4bd7a8ae9ac"));
-        assert!(expanded.contains("DomainEventBodyKind :: Event"));
-    }
-}

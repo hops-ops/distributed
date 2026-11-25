@@ -339,28 +339,6 @@ mod tests {
     }
 
     #[test]
-    fn expand_snapshot_rejects_missing_entity_field() {
-        let input: DeriveInput = syn::parse_quote! {
-            #[snapshot(entity = "state")]
-            struct Todo {
-                entity: distributed::Entity,
-                task: String,
-            }
-        };
-
-        let err = expand_snapshot(input).expect_err("missing entity field should return an error");
-
-        assert!(
-            err.to_string().contains("snapshot entity field `state`"),
-            "unexpected error: {err}"
-        );
-        assert!(
-            err.to_string().contains("entity, task"),
-            "unexpected error: {err}"
-        );
-    }
-
-    #[test]
     fn expand_snapshot_rejects_missing_custom_id_field() {
         let input: DeriveInput = syn::parse_quote! {
             #[snapshot(id = "sku")]

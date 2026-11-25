@@ -1,3 +1,4 @@
+mod body_derives;
 mod custom_body_helpers;
 mod domain_events;
 mod flat_preview;
