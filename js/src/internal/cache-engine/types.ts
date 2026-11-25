@@ -274,6 +274,8 @@ export interface CacheEngine {
 	optimisticLayerState(id: string): OptimisticLayerState | undefined;
 	/** Whether this layer shows a record the base does not hold yet. */
 	optimisticLayerProvisional(id: string): boolean;
+	/** How many optimistic layers are pending. */
+	readonly optimisticLayerCount: number;
 	extract(): CacheEngineSnapshot;
 	restore(snapshot: CacheEngineSnapshot): void;
 	/**

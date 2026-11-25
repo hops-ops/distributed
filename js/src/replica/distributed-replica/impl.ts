@@ -27,6 +27,7 @@ import {
 	replicaCommandAwaitsFetch,
 	replicaCommandDirectProjection,
 	replicaCommandFreshness,
+	replicaCommandLayerHeld,
 	replicaCommandProjectionDelta,
 	replicaCommandReadRecord,
 	replicaResultObservation
@@ -319,6 +320,10 @@ export class DistributedReplicaImpl implements DistributedReplicaApi {
 			}
 		}
 		return true;
+	}
+
+	[replicaCommandLayerHeld](commandId: string): boolean {
+		return this.#engine.optimisticLayerState(commandId) !== undefined;
 	}
 
 	[replicaResultObservation](
@@ -1678,6 +1683,7 @@ export class DistributedReplicaImpl implements DistributedReplicaApi {
 		return Object.freeze({
 			records: cache.records.length,
 			indexes: cache.indexes.length,
+			optimisticLayers: this.#engine.optimisticLayerCount,
 			...this.#live.sizes(),
 			...this.#operations.sizes(),
 			...this.#clocks.sizes(),

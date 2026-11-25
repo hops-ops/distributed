@@ -178,14 +178,13 @@ export class OptimisticLayers {
 			'atomic',
 			this.#receipts.get(id)
 		);
-		this.#receipts.delete(id);
+		this.#forget(id);
 		this.#diagnostics.sync();
 		return result;
 	}
 
 	reject(id: string): boolean {
 		this.#clearMembershipFences(id);
-		this.#deferredConfirms.delete(id);
 		const rejected = this.#engine.rejectOptimisticLayer(id);
 		if (rejected) {
 			this.#diagnostics.retireLayer(
@@ -194,9 +193,9 @@ export class OptimisticLayers {
 				'rejected',
 				this.#receipts.get(id)
 			);
-			this.#receipts.delete(id);
-			this.#diagnostics.sync();
 		}
+		this.#forget(id);
+		if (rejected) this.#diagnostics.sync();
 		return rejected;
 	}
 
@@ -254,7 +253,7 @@ export class OptimisticLayers {
 		for (const [id, receipt] of plan.updates) {
 			if (plan.satisfied.includes(id)) {
 				this.#diagnostics.retireLayer(id, 'retired', 'atomic', receipt);
-				this.#receipts.delete(id);
+				this.#forget(id);
 			} else {
 				this.#accept(id, receipt);
 			}
@@ -377,6 +376,19 @@ export class OptimisticLayers {
 		this.#receipts.clear();
 		this.#membershipFences.clear();
 		this.#deferredConfirms.clear();
+		this.#freshnessPlans.clear();
+	}
+
+	/**
+	 * A layer left the cache (confirmed, proven or rejected): drop its
+	 * receipt, any confirmation deferred behind its memberships, and its
+	 * freshness plan. The memberships themselves stay until a complete index
+	 * echoes them, since that index is what they fence.
+	 */
+	#forget(id: string): void {
+		this.#receipts.delete(id);
+		this.#deferredConfirms.delete(id);
+		this.#freshnessPlans.delete(id);
 	}
 
 	sizes(): Record<string, number> {
