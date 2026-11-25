@@ -1186,6 +1186,8 @@ struct Severable {
     renewals: Mutex<Renewals>,
     /// Acquisitions answered so far.
     acquired: std::sync::atomic::AtomicUsize,
+    /// When a claim was last released (passed through or not).
+    released_at: Mutex<Option<tokio::time::Instant>>,
 }
 
 impl Severable {
@@ -1194,6 +1196,7 @@ impl Severable {
             inner,
             renewals: Mutex::new(Renewals::Pass),
             acquired: Default::default(),
+            released_at: Mutex::new(None),
         })
     }
 
@@ -1233,6 +1236,7 @@ impl ZoneOwnership for Severable {
     }
 
     fn release<'a>(&'a self, claim: &'a world::ZoneClaim) -> BoxFuture<'a, ()> {
+        *self.released_at.lock().unwrap() = Some(tokio::time::Instant::now());
         if *self.renewals.lock().unwrap() == Renewals::Pass {
             self.inner.release(claim)
         } else {
@@ -1370,6 +1374,211 @@ async fn a_zone_that_cannot_renew_fences_itself() {
             sink.committed()
         );
         server.shutdown();
+    }
+}
+
+/// Credits a [`Ledger`] zone is told to record.
+#[derive(Debug, Clone, PartialEq, GameEvent)]
+enum LedgerMessage {
+    #[game_event(id = 1)]
+    Credit { n: u32 },
+}
+
+/// Emits a fact per credit and one on disposal: drives the fact worker
+/// without clients.
+struct Ledger;
+
+impl Zone for Ledger {
+    type Config = ();
+    type Input = u8;
+    type Timer = ();
+    type Message = LedgerMessage;
+
+    fn schema() -> EntitySchema {
+        EntitySchema::new()
+    }
+
+    fn on_create(_ctx: &mut Ctx<'_, Self>, _: ()) -> Self {
+        Ledger
+    }
+
+    fn decode_input(&self, _player: PlayerId, _payload: &[u8]) -> Option<u8> {
+        None
+    }
+
+    fn on_tick(&mut self, _ctx: &mut Ctx<'_, Self>) {}
+
+    fn on_message(&mut self, ctx: &mut Ctx<'_, Self>, message: LedgerMessage) {
+        let LedgerMessage::Credit { n } = message;
+        let fact = Fact::new(
+            format!("credit:{n}"),
+            "ledger.credit",
+            serde_json::json!({}),
+        );
+        ctx.emit_fact(fact).expect("queued");
+    }
+
+    fn on_dispose(&mut self, ctx: &mut Ctx<'_, Self>) {
+        let _ = ctx.emit_fact(Fact::new(
+            "disposed",
+            "ledger.disposed",
+            serde_json::json!({}),
+        ));
+    }
+}
+
+/// A store taking `delay` per commit; records each commit's key and the
+/// instant it landed.
+#[derive(Clone)]
+struct SlowStore {
+    delay: Duration,
+    landed: Arc<Mutex<Vec<(String, tokio::time::Instant)>>>,
+}
+
+impl SlowStore {
+    fn new(delay: Duration) -> Self {
+        Self {
+            delay,
+            landed: Default::default(),
+        }
+    }
+
+    fn landed(&self) -> Vec<(String, tokio::time::Instant)> {
+        self.landed.lock().unwrap().clone()
+    }
+
+    fn keys(&self) -> Vec<String> {
+        self.landed().into_iter().map(|(key, _)| key).collect()
+    }
+}
+
+impl FactSink for SlowStore {
+    fn commit<'a>(&'a self, fact: &'a Fact) -> BoxFuture<'a, Result<FactReceipt, FactError>> {
+        Box::pin(async move {
+            tokio::time::sleep(self.delay).await;
+            self.landed
+                .lock()
+                .unwrap()
+                .push((fact.key().to_string(), tokio::time::Instant::now()));
+            Ok(FactReceipt {
+                payload: serde_json::Value::Null,
+                replayed: false,
+            })
+        })
+    }
+}
+
+/// A ledger zone on paused time: TTL 3 s, renewals every 1 s, so a zone
+/// fences 2 s after its last successful renewal began; commits take 1.5 s.
+async fn ledger(
+    ownership: Arc<Severable>,
+    settle_timeout: Duration,
+) -> (GameServer<Ledger>, SlowStore) {
+    let store = SlowStore::new(Duration::from_millis(1_500));
+    let mut config = base_config();
+    config.ownership_ttl = Duration::from_secs(3);
+    config.ownership_renew_every = Duration::from_secs(1);
+    config.settle_timeout = settle_timeout;
+    let server = GameServer::<Ledger>::with_clock(
+        config,
+        Arc::new(distributed_game::ManualClock::new()),
+        ZoneFactory::sync(|_| Some(())),
+    )
+    .with_fact_sink(store.clone(), 64, RetryPolicy::default())
+    .with_ownership(ownership);
+    assert!(server.activate("ledger").await);
+    (server, store)
+}
+
+async fn credit(server: &GameServer<Ledger>, credits: std::ops::RangeInclusive<u32>) {
+    for n in credits {
+        server
+            .send(
+                "ledger",
+                distributed_game::inbox::ZoneInbound::Message(LedgerMessage::Credit { n }),
+            )
+            .await
+            .unwrap();
+    }
+}
+
+/// Renewals that fail, hang or answer `Lost` from the start: the zone
+/// stops before its claim can expire, the commit already running when the
+/// fence passes is abandoned, and the facts queued behind it (and the
+/// disposal's) are never published.
+#[tokio::test(start_paused = true)]
+async fn a_fenced_zone_publishes_no_fact_it_can_no_longer_prove() {
+    for renewals in [Renewals::Fail, Renewals::Hang, Renewals::Lose] {
+        let ownership = Severable::new(Arc::new(LocalOwnership::new()));
+        let start = tokio::time::Instant::now();
+        let (server, store) = ledger(ownership.clone(), Duration::from_secs(2)).await;
+        ownership.cut(renewals);
+        credit(&server, 1..=3).await;
+        // The first renewal (1 s) fails: `Lost` fences at once, otherwise
+        // the fence stays at 0 s + (3 s - 1 s) = 2 s.
+        let fence = start
+            + match renewals {
+                Renewals::Lose => Duration::from_secs(1),
+                _ => Duration::from_secs(2),
+            };
+        tokio::time::sleep_until(fence - Duration::from_millis(100)).await;
+        assert!(server.is_active("ledger"), "{renewals:?}: before the fence");
+        tokio::time::sleep_until(fence + Duration::from_millis(100)).await;
+        assert!(!server.is_active("ledger"), "{renewals:?}: fenced");
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        let expected: &[&str] = match renewals {
+            // credit:1 lands at 1.5 s, inside the fence; credit:2 would at
+            // 3 s and is abandoned; credit:3 never starts.
+            Renewals::Fail | Renewals::Hang => &["credit:1"],
+            Renewals::Lose => &[],
+            Renewals::Pass => unreachable!(),
+        };
+        assert_eq!(store.keys(), expected, "{renewals:?}");
+        assert!(
+            store.landed().iter().all(|(_, at)| *at < fence),
+            "{renewals:?}: a fact landed after the fence: {:?}",
+            store.landed()
+        );
+        server.shutdown();
+    }
+}
+
+/// A shutdown settles the queued facts while the claim is renewed and
+/// releases the claim only after the last commit; under a partition the
+/// settling stops at the fence instead of running on past the claim.
+#[tokio::test(start_paused = true)]
+async fn a_shutdown_settles_facts_only_while_the_claim_holds() {
+    for renewals in [Renewals::Pass, Renewals::Fail] {
+        let ownership = Severable::new(Arc::new(LocalOwnership::new()));
+        let start = tokio::time::Instant::now();
+        let (server, store) = ledger(ownership.clone(), Duration::from_secs(30)).await;
+        ownership.cut(renewals);
+        credit(&server, 1..=4).await;
+        server.shutdown();
+        tokio::time::sleep(Duration::from_secs(40)).await;
+        let released = ownership.released_at.lock().unwrap().expect("released");
+        match renewals {
+            // 1.5 s per commit, renewed throughout: all four and the
+            // disposal's fact land by 7.5 s, then the claim goes.
+            Renewals::Pass => {
+                assert_eq!(
+                    store.keys(),
+                    ["credit:1", "credit:2", "credit:3", "credit:4", "disposed"]
+                );
+            }
+            // The fence (2 s) cuts the settling after credit:1.
+            _ => {
+                assert_eq!(store.keys(), ["credit:1"]);
+                assert!(store
+                    .landed()
+                    .iter()
+                    .all(|(_, at)| *at < start + Duration::from_secs(2)));
+            }
+        }
+        assert!(
+            store.landed().iter().all(|(_, at)| *at <= released),
+            "{renewals:?}: a fact landed after the claim was released"
+        );
     }
 }
 

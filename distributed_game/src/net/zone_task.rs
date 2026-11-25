@@ -3,6 +3,7 @@
 //! messages, tier-up events).
 
 use super::*;
+use crate::facts::{Fact, FactBatchSink, FactError, FactReceipt};
 
 /// Route a tier-up event to `parent` (local activation or peer host).
 pub(super) fn deliver_child<Z>(inner: &Arc<Inner<Z>>, parent: String, event: ChildEvent)
@@ -53,19 +54,23 @@ pub(super) enum Exit {
     Lost,
 }
 
+/// Acquire the claim, waiting up to `activation_timeout` for a held one.
+/// Returns it with the instant its successful attempt began (the claim's
+/// TTL runs from no earlier than that).
 pub(super) async fn acquire_claim<Z: Zone>(
     inner: &Arc<Inner<Z>>,
     zone_id: &str,
     holder: &str,
-) -> Result<ZoneClaim, String> {
+) -> Result<(ZoneClaim, Instant), String> {
     let deadline = Instant::now() + inner.config.activation_timeout;
     loop {
+        let began = Instant::now();
         let error = match inner
             .ownership
             .acquire(zone_id, holder, inner.config.ownership_ttl)
             .await
         {
-            Ok(claim) => return Ok(claim),
+            Ok(claim) => return Ok((claim, began)),
             Err(OwnershipError::Held { holder }) => format!("zone is owned by {holder}"),
             Err(e) => format!("{e:?}"),
         };
@@ -161,6 +166,104 @@ pub(super) async fn fence_moved(fence: &mut watch::Receiver<Instant>) {
     }
 }
 
+/// Run `work` while the fence holds: None, without polling it, when the
+/// fence has passed already, and None, dropping it, when the fence passes
+/// first. A renewal that moves the fence while `work` runs extends it.
+async fn before_fence<T>(
+    fence: &watch::Receiver<Instant>,
+    work: impl Future<Output = T>,
+) -> Option<T> {
+    let mut fence = fence.clone();
+    tokio::pin!(work);
+    loop {
+        let at = *fence.borrow_and_update();
+        if Instant::now() >= at {
+            return None;
+        }
+        tokio::select! {
+            biased;
+            done = &mut work => return Some(done),
+            _ = fence_moved(&mut fence) => {}
+            _ = tokio::time::sleep_until(at) => {}
+        }
+    }
+}
+
+/// One activation's fact sink, bound by its fence: a commit (or batch)
+/// starts only while the fence holds and is abandoned when the fence passes
+/// first, so the worker sends nothing the zone can no longer prove it owns.
+/// A fenced fact settles [`FactError::Permanent`].
+///
+/// Facts already carry the fencing token (the stamp's `activation`), but a
+/// player cell cannot check it without reading the zone's lease in another
+/// cell, and that read would race the lease anyway; the zone, which holds
+/// the lease, enforces it here instead. What is left is a request already
+/// on the wire at the fence: it reaches the store before the claim expires
+/// unless it is delayed by more than the fence's margin (`renew_every`).
+pub(super) struct FencedSink<S> {
+    sink: S,
+    fence: watch::Receiver<Instant>,
+}
+
+impl<S: FactSink> FencedSink<S> {
+    pub(super) fn new(sink: S, fence: watch::Receiver<Instant>) -> Self {
+        Self { sink, fence }
+    }
+}
+
+fn fenced() -> FactError {
+    FactError::Permanent("zone fenced: its ownership is no longer proven".into())
+}
+
+impl<S: FactSink> FactSink for FencedSink<S> {
+    fn commit<'a>(&'a self, fact: &'a Fact) -> BoxFuture<'a, Result<FactReceipt, FactError>> {
+        Box::pin(async move {
+            before_fence(&self.fence, self.sink.commit(fact))
+                .await
+                .unwrap_or_else(|| Err(fenced()))
+        })
+    }
+
+    fn batches(&self) -> Option<&dyn FactBatchSink> {
+        self.sink.batches().map(|_| self as &dyn FactBatchSink)
+    }
+}
+
+impl<S: FactSink> FactBatchSink for FencedSink<S> {
+    fn commit_batch<'a>(
+        &'a self,
+        facts: &'a [Fact],
+    ) -> BoxFuture<'a, Vec<Result<FactReceipt, FactError>>> {
+        Box::pin(async move {
+            let Some(batches) = self.sink.batches() else {
+                return crate::facts::commit_each(self, facts).await;
+            };
+            before_fence(&self.fence, batches.commit_batch(facts))
+                .await
+                .unwrap_or_else(|| facts.iter().map(|_| Err(fenced())).collect())
+        })
+    }
+}
+
+/// Stop the fact worker and wait until it is gone (an aborted commit is
+/// dropped, never resumed).
+async fn stop_worker(worker: JoinHandle<()>) {
+    worker.abort();
+    let _ = worker.await;
+}
+
+/// The queue is closed (the host was dropped): let the worker commit what
+/// it still holds within `settle_timeout` (and the fence), then stop it.
+async fn settle_worker(worker: Option<JoinHandle<()>>, settle_timeout: Duration) {
+    let Some(mut worker) = worker else { return };
+    if tokio::time::timeout(settle_timeout, &mut worker)
+        .await
+        .is_err()
+    {
+        stop_worker(worker).await;
+    }
+}
+
 /// Commands a zone handles between two looks at its clock: a flood of
 /// commands (inputs, focus, inbox messages) never holds a due tick back
 /// longer than this many command handlers; the rest stay queued.
@@ -170,7 +273,6 @@ pub(super) const COMMANDS_PER_ITERATION: usize = 64;
 pub(super) async fn run_zone<Z>(
     inner: Arc<Inner<Z>>,
     zone_id: String,
-    facts: Option<(FactQueue, JoinHandle<()>)>,
     mut rx: mpsc::Receiver<ZoneCmd>,
     activation: u64,
     world: WorldState,
@@ -178,11 +280,11 @@ pub(super) async fn run_zone<Z>(
     Z: Zone,
     Z::Config: Send,
 {
-    // 1. Fenced ownership.
+    // 1. Fenced ownership, kept alive from here on: the fence is the instant
+    // the zone (and its fact worker) must stop by.
     let holder = format!("{}#{}#{activation}", inner.host_id, inner.incarnation);
-    let acquired_at = Instant::now();
-    let claim = match acquire_claim(&inner, &zone_id, &holder).await {
-        Ok(claim) => claim,
+    let (claim, acquired_at) = match acquire_claim(&inner, &zone_id, &holder).await {
+        Ok(acquired) => acquired,
         Err(message) => {
             return refuse_activation(
                 &inner,
@@ -194,12 +296,35 @@ pub(super) async fn run_zone<Z>(
             )
         }
     };
+    let token = claim.token;
+    let current = Arc::new(Mutex::new(claim));
+    let (fence_tx, mut fence) = watch::channel(acquired_at + fence_after(&inner.config));
+    let renewer = tokio::spawn(renew_claim(
+        inner.ownership.clone(),
+        current.clone(),
+        (
+            inner.config.ownership_renew_every,
+            inner.config.ownership_ttl,
+            fence_after(&inner.config),
+        ),
+        fence_tx,
+    ));
+    let release = |renewer: JoinHandle<()>| {
+        let inner = inner.clone();
+        let current = current.clone();
+        async move {
+            renewer.abort();
+            let _ = renewer.await;
+            let claim = current.lock().expect("claim").clone();
+            inner.ownership.release(&claim).await;
+        }
+    };
     // 2. Restore the hibernated snapshot, if any.
     let saved = match &inner.state_store {
         Some(store) => match store.load(&zone_id).await {
             Ok(saved) => saved,
             _ => {
-                inner.ownership.release(&claim).await;
+                release(renewer).await;
                 return refuse_activation(
                     &inner,
                     &zone_id,
@@ -220,7 +345,7 @@ pub(super) async fn run_zone<Z>(
         };
         (inner.factory.0)(ZoneActivation {
             zone_id: zone_id.clone(),
-            activation: claim.token,
+            activation: token,
             allocation,
         })
         .await
@@ -229,7 +354,7 @@ pub(super) async fn run_zone<Z>(
     let zone_config = match created {
         Ok(Ok(Some(config))) => config,
         refused => {
-            inner.ownership.release(&claim).await;
+            release(renewer).await;
             let (code, message) = match refused {
                 Ok(Ok(None)) => (error::NOT_FOUND, "unknown zone".to_string()),
                 Ok(Err(e)) => (error::ZONE_UNAVAILABLE, e.to_string()),
@@ -249,10 +374,10 @@ pub(super) async fn run_zone<Z>(
     host_config.content_version = world.version.clone();
     // Fencing tokens grow across activations and restarts: a restart-safe
     // epoch for fact keys (`Ctx::boot_epoch`).
-    host_config.boot_epoch = claim.token;
+    host_config.boot_epoch = token;
     let token_inner = inner.clone();
     let issuer_inner = inner.clone();
-    let generation = claim.token;
+    let generation = token;
     let mut host = ZoneHost::<Z>::new(
         zone_id.clone(),
         host_config,
@@ -290,7 +415,8 @@ pub(super) async fn run_zone<Z>(
     if let Some(saved) = &saved {
         host.restore(&saved.state, &saved.content_version);
     }
-    let mut fact_worker = match facts {
+    // 4. The fact worker, bound by the same fence.
+    let fact_worker = match inner.facts.as_ref().map(|spawn| spawn(fence.clone())) {
         Some((queue, worker)) => {
             host = host.with_facts(queue);
             Some(worker)
@@ -300,20 +426,6 @@ pub(super) async fn run_zone<Z>(
     if let Some((_, notice)) = world.barrier {
         host.request_freeze(notice);
     }
-
-    // 4. Keep the claim alive; without it the zone stops at the fence.
-    let current = Arc::new(Mutex::new(claim));
-    let (fence_tx, mut fence) = watch::channel(acquired_at + fence_after(&inner.config));
-    let renewer = tokio::spawn(renew_claim(
-        inner.ownership.clone(),
-        current.clone(),
-        (
-            inner.config.ownership_renew_every,
-            inner.config.ownership_ttl,
-            fence_after(&inner.config),
-        ),
-        fence_tx,
-    ));
 
     let mut conns: HashMap<ClientId, mpsc::Sender<ConnOut>> = HashMap::new();
     let mut freeze_acks: Vec<oneshot::Sender<()>> = Vec::new();
@@ -401,8 +513,8 @@ pub(super) async fn run_zone<Z>(
             } => {}
         }
     };
-    renewer.abort();
-    let claim = current.lock().expect("claim").clone();
+    // The claim stays renewed until the fact worker is gone: no fact is
+    // committed after the claim is released.
     match exit {
         Exit::Hibernate(leftovers) => {
             let snapshot = host.hibernate_state();
@@ -414,7 +526,7 @@ pub(super) async fn run_zone<Z>(
             if let (Some(state), Some(store)) = (snapshot, inner.state_store.clone()) {
                 let id = zone_id.clone();
                 let stored = StoredZoneState {
-                    token: claim.token,
+                    token,
                     content_version,
                     state,
                 };
@@ -429,13 +541,13 @@ pub(super) async fn run_zone<Z>(
                 inner.metrics.record_hibernation_save(outcome);
                 if outcome != "saved" {
                     eprintln!(
-                        "distributed_game: hibernation snapshot of zone {zone_id} (token {}) not saved: {saved:?}",
-                        claim.token
+                        "distributed_game: hibernation snapshot of zone {zone_id} (token {token}) not saved: {saved:?}",
                     );
                 }
             }
-            inner.ownership.release(&claim).await;
             drop(host);
+            settle_worker(fact_worker, inner.config.settle_timeout).await;
+            release(renewer).await;
             for cmd in leftovers {
                 if matches!(
                     cmd,
@@ -454,31 +566,27 @@ pub(super) async fn run_zone<Z>(
             }
         }
         Exit::Shutdown => {
-            inner.ownership.release(&claim).await;
             drop(host);
+            settle_worker(fact_worker, inner.config.settle_timeout).await;
+            release(renewer).await;
         }
         Exit::Lost => {
             // Fenced: another host may run the zone. Nothing more is
-            // persisted or committed: queued facts are dropped (an
-            // in-flight commit cannot be recalled), the worker stops and
-            // the disposal's facts go nowhere. Clients are kicked.
+            // persisted or committed: queued facts are dropped, the worker
+            // stops (its sink already refuses past the fence) and the
+            // disposal's facts go nowhere. Clients are kicked.
+            renewer.abort();
             let dropped = host.abandon_facts();
-            if let Some(worker) = fact_worker.take() {
-                worker.abort();
+            if let Some(worker) = fact_worker {
+                stop_worker(worker).await;
             }
             host.dispose();
             route(&mut host, &mut conns);
             eprintln!(
-                "distributed_game: zone {zone_id} (token {}) fenced without a live claim; {dropped} unsettled facts dropped",
-                claim.token
+                "distributed_game: zone {zone_id} (token {token}) fenced without a live claim; {dropped} unsettled facts dropped",
             );
             drop(host);
         }
-    }
-    // The fact worker commits everything still queued once the queue is
-    // dropped; give it a bounded moment so nothing is lost on dispose.
-    if let Some(worker) = fact_worker {
-        let _ = tokio::time::timeout(inner.config.settle_timeout, worker).await;
     }
     let mut zones = inner.zones.lock().expect("zones");
     if zones
@@ -710,5 +818,149 @@ pub(super) fn route<Z: Zone>(
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Takes `delay` per commit (or batch); records what it started and
+    /// what it finished.
+    #[derive(Clone, Default)]
+    struct Slow {
+        delay: Duration,
+        batching: bool,
+        started: Arc<Mutex<Vec<String>>>,
+        finished: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl Slow {
+        fn new(delay: Duration) -> Self {
+            Self {
+                delay,
+                ..Self::default()
+            }
+        }
+
+        async fn take(&self, facts: &[Fact]) -> Vec<Result<FactReceipt, FactError>> {
+            let keys: Vec<String> = facts.iter().map(|f| f.key().to_string()).collect();
+            self.started.lock().unwrap().extend(keys.iter().cloned());
+            tokio::time::sleep(self.delay).await;
+            self.finished.lock().unwrap().extend(keys);
+            facts
+                .iter()
+                .map(|_| {
+                    Ok(FactReceipt {
+                        payload: serde_json::Value::Null,
+                        replayed: false,
+                    })
+                })
+                .collect()
+        }
+
+        fn started(&self) -> Vec<String> {
+            self.started.lock().unwrap().clone()
+        }
+
+        fn finished(&self) -> Vec<String> {
+            self.finished.lock().unwrap().clone()
+        }
+    }
+
+    impl FactSink for Slow {
+        fn commit<'a>(&'a self, fact: &'a Fact) -> BoxFuture<'a, Result<FactReceipt, FactError>> {
+            Box::pin(async move {
+                self.take(std::slice::from_ref(fact))
+                    .await
+                    .pop()
+                    .expect("one result")
+            })
+        }
+
+        fn batches(&self) -> Option<&dyn FactBatchSink> {
+            self.batching.then_some(self as &dyn FactBatchSink)
+        }
+    }
+
+    impl FactBatchSink for Slow {
+        fn commit_batch<'a>(
+            &'a self,
+            facts: &'a [Fact],
+        ) -> BoxFuture<'a, Vec<Result<FactReceipt, FactError>>> {
+            Box::pin(self.take(facts))
+        }
+    }
+
+    fn fact(key: &str) -> Fact {
+        Fact::new(key, "test.fact", serde_json::Value::Null)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn nothing_starts_once_the_fence_has_passed() {
+        let slow = Slow::new(Duration::from_millis(10));
+        let (_tx, fence) = watch::channel(Instant::now());
+        let sink = FencedSink::new(slow.clone(), fence);
+        assert_eq!(sink.commit(&fact("a")).await, Err(fenced()));
+        assert!(slow.started().is_empty(), "{:?}", slow.started());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_commit_still_running_at_the_fence_is_abandoned() {
+        let slow = Slow::new(Duration::from_secs(2));
+        let start = Instant::now();
+        let (_tx, fence) = watch::channel(start + Duration::from_secs(1));
+        let sink = FencedSink::new(slow.clone(), fence);
+        assert_eq!(sink.commit(&fact("a")).await, Err(fenced()));
+        assert_eq!(Instant::now() - start, Duration::from_secs(1));
+        assert_eq!(slow.started(), ["a"]);
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        assert!(slow.finished().is_empty(), "dropped, never resumed");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_renewal_during_a_commit_lets_it_finish() {
+        let slow = Slow::new(Duration::from_secs(2));
+        let start = Instant::now();
+        let (tx, fence) = watch::channel(start + Duration::from_secs(1));
+        let sink = FencedSink::new(slow.clone(), fence);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            tx.send_replace(start + Duration::from_secs(5));
+            // Keep the sender: a dropped one freezes the fence, which is
+            // also fine, but this is the renewer's shape.
+            std::future::pending::<()>().await;
+        });
+        assert!(sink.commit(&fact("a")).await.is_ok());
+        assert_eq!(slow.finished(), ["a"]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_fenced_batch_fails_every_fact_in_it() {
+        let mut slow = Slow::new(Duration::from_secs(2));
+        slow.batching = true;
+        let (_tx, fence) = watch::channel(Instant::now() + Duration::from_secs(1));
+        let sink = FencedSink::new(slow.clone(), fence);
+        let batches = sink.batches().expect("batching passes through");
+        let results = batches.commit_batch(&[fact("a"), fact("b")]).await;
+        assert_eq!(results, vec![Err(fenced()), Err(fenced())]);
+        assert!(slow.finished().is_empty());
+    }
+
+    /// Through the feed: settled before the fence, abandoned at it, never
+    /// started after it.
+    #[tokio::test(start_paused = true)]
+    async fn the_worker_commits_nothing_past_the_fence() {
+        let slow = Slow::new(Duration::from_millis(1_500));
+        let (_tx, fence) = watch::channel(Instant::now() + Duration::from_secs(2));
+        let (mut queue, feed) = crate::facts::fact_channel(8, RetryPolicy::default());
+        let worker = crate::facts::spawn_fact_worker(feed, FencedSink::new(slow.clone(), fence));
+        for key in ["a", "b", "c"] {
+            queue.try_send(fact(key)).unwrap();
+        }
+        drop(queue);
+        worker.await.unwrap();
+        assert_eq!(slow.finished(), ["a"]);
+        assert_eq!(slow.started(), ["a", "b"], "c never started");
     }
 }

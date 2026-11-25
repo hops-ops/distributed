@@ -39,7 +39,9 @@
 //!   successful renewal the zone fences itself at `ttl - renew_every` after
 //!   the last one began (renewals time out at `renew_every / 2`); fenced or
 //!   `Lost`, it stops at once: nothing more is persisted, queued facts are
-//!   dropped uncommitted and clients are kicked.
+//!   dropped uncommitted and clients are kicked. The fact worker obeys the
+//!   same fence (no commit starts past it, one in progress is abandoned),
+//!   and the claim is released only after the worker is gone.
 //! - **Activate on demand / hibernate**: zones are created on first use;
 //!   one that stays Dormant for `hibernate_after` is snapshotted
 //!   ([`Zone::hibernate`]) into the [`ZoneStateStore`] under its fencing
@@ -153,9 +155,10 @@ pub struct ServerConfig {
     /// Transfer ticket lifetime (and target reservation bound).
     pub transfer_ttl: Duration,
     /// After a zone is disposed, how long to wait for its fact worker to
-    /// commit the facts still queued; whatever is unsettled after that is
-    /// dropped (native facts are at most once, see
-    /// [`GameServer::with_fact_sink`]).
+    /// commit the facts still queued (its claim is renewed meanwhile and
+    /// released after); whatever is unsettled after that, or when the
+    /// ownership fence passes first, is dropped (native facts are at most
+    /// once, see [`GameServer::with_fact_sink`]).
     pub settle_timeout: Duration,
     /// The hosts' shared internal secret: enables the `/admin/*` routes
     /// (which require it in [`CELL_INTERNAL_SECRET_HEADER`]) and peer calls.
@@ -329,7 +332,8 @@ impl<C: Send + 'static> ZoneFactory<C> {
         }))
     }
 }
-type FactsFactory = dyn Fn(&str) -> Option<(FactQueue, JoinHandle<()>)> + Send + Sync;
+/// Spawns one activation's fact worker, bound by that activation's fence.
+type FactsFactory = dyn Fn(watch::Receiver<Instant>) -> (FactQueue, JoinHandle<()>) + Send + Sync;
 type HostConfigFn = dyn Fn(&str, &mut HostConfig) + Send + Sync;
 
 struct ZoneEntry {
@@ -715,7 +719,10 @@ where
     /// in this process: while it runs, every fact is committed exactly once
     /// (retried per `policy` under its idempotent key), but a crash, a
     /// kill, a disposal that outlives [`ServerConfig::settle_timeout`] or a
-    /// lost ownership drops the facts not yet settled. The celld zone
+    /// lost ownership drops the facts not yet settled. Commits are bound by
+    /// the zone's ownership fence ([`ServerConfig::ownership_renew_every`]):
+    /// none starts after it, and one still running when it passes is
+    /// abandoned and settles [`FactError::Permanent`](crate::FactError). The celld zone
     /// object spools its facts to storage instead (at least once).
     pub fn with_fact_sink<S: FactSink>(
         mut self,
@@ -726,11 +733,11 @@ where
         let sink = Arc::new(sink);
         let inner = Arc::get_mut(&mut self.inner).expect("configure before sharing the server");
         let concurrency = inner.config.max_concurrent_commits;
-        inner.facts = Some(Box::new(move |_zone: &str| {
+        inner.facts = Some(Box::new(move |fence| {
             let (queue, feed) = fact_channel(capacity, policy);
             let feed = feed.with_max_concurrent_commits(concurrency);
-            let worker = spawn_fact_worker(feed, sink.clone());
-            Some((queue, worker))
+            let worker = spawn_fact_worker(feed, zone_task::FencedSink::new(sink.clone(), fence));
+            (queue, worker)
         }));
         self
     }
@@ -878,11 +885,9 @@ where
             activation,
         },
     );
-    let facts = inner.facts.as_ref().and_then(|f| f(zone_id));
     let task = tokio::spawn(run_zone::<Z>(
         inner.clone(),
         zone_id.to_string(),
-        facts,
         rx,
         activation,
         world,
