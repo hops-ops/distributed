@@ -12,6 +12,13 @@ mod env_support;
 
 static NEXT_SCHEMA_ID: AtomicU64 = AtomicU64::new(1);
 
+/// A fresh schema of `DATABASE_URL`, dropped (with everything in it) when this
+/// value is dropped — including when the test panics.
+///
+/// Keep it alive as long as any repository or pool made from it: those
+/// connections resolve tables through `search_path`, so they stop working once
+/// the schema is gone. Fixtures return it next to what they build
+/// (`(schema, repo)`); bind it to a named variable, not `_`, which drops at once.
 pub struct PostgresTestSchema {
     database_url: String,
     schema_name: String,
@@ -81,6 +88,53 @@ impl PostgresTestSchema {
                 .await
                 .expect("Postgres test repository should connect"),
         )
+    }
+}
+
+impl Drop for PostgresTestSchema {
+    /// `Drop` cannot await, and the test's runtime may be the current thread,
+    /// so the drop runs on a short-lived thread with its own runtime. A
+    /// connection that still holds a lock in the schema (a transaction left
+    /// open by a panic) makes the drop give up after `lock_timeout` instead of
+    /// hanging the test; the schema is then left behind, as before.
+    fn drop(&mut self) {
+        let database_url = self.database_url.clone();
+        let drop_schema = format!(
+            "DROP SCHEMA IF EXISTS {} CASCADE",
+            quote_identifier(&self.schema_name)
+        );
+        let dropped = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|error| error.to_string())?;
+            runtime.block_on(async move {
+                let pool = PgPoolOptions::new()
+                    .max_connections(1)
+                    .connect(&database_url)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                let mut connection = pool.acquire().await.map_err(|error| error.to_string())?;
+                connection
+                    .execute("SET lock_timeout = '5s'")
+                    .await
+                    .map_err(|error| error.to_string())?;
+                connection
+                    .execute(audited_schema_sql(drop_schema))
+                    .await
+                    .map_err(|error| error.to_string())?;
+                drop(connection);
+                pool.close().await;
+                Ok::<_, String>(())
+            })
+        })
+        .join();
+        let error = match dropped {
+            Ok(Ok(())) => return,
+            Ok(Err(error)) => error,
+            Err(_) => "the drop thread panicked".to_owned(),
+        };
+        eprintln!("left test schema {} behind: {error}", self.schema_name);
     }
 }
 

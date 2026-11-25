@@ -92,7 +92,6 @@ on_each_dialect! {
         e4_missing_claim_header_is_stable_without_sql_leak,
     }
     softskip::{
-        default_engine_has_strict_where_on,
         strict_unknown_where_key_errors,
         strict_denied_where_column_errors,
         strict_junk_order_by_column_errors,

@@ -223,19 +223,6 @@ fn manifest_graphql_sdl_method() {
     assert!(!sdl.contains("OutboxMessage"));
 }
 
-#[test]
-fn capture_sdl_to_scratch() {
-    let path = std::env::var("GROK_SCRATCH_SDL").unwrap_or_else(|_| "/dev/null".into());
-    if path == "/dev/null" {
-        return;
-    }
-    let players = players();
-    let weapons = weapons();
-    let sdl = graphql_sdl_for_tables(&[players, weapons]).unwrap();
-    std::fs::write(&path, &sdl).unwrap();
-    assert!(sdl.contains("type PlayerView"));
-}
-
 /// Default / SQLite SDL omits PG jsonb comparison operators (weapons has JSON meta).
 #[test]
 fn sqlite_sdl_omits_postgres_json_comparison_ops() {

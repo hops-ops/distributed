@@ -306,10 +306,6 @@ async fn protocol_fixture_with_retention(db: Db, retention: u64) -> ProtocolFixt
     }
 }
 
-async fn protocol_engine_with_rows(db: Db) -> GraphqlEngine {
-    protocol_fixture_with_rows(db).await.engine
-}
-
 fn wire_response(response: async_graphql::Response) -> Value {
     assert!(
         !response.is_err(),
@@ -424,7 +420,12 @@ fn tamper_first_cursor_token(mut cursors: Value) -> Value {
 }
 
 pub async fn projected_query_emits_exact_record_and_index_revisions_without_key_leaks(db: Db) {
-    let engine = protocol_engine_with_rows(db).await;
+    // `_db` holds the Postgres test schema the engine reads from.
+    let ProtocolFixture {
+        engine,
+        repository: _db,
+        ..
+    } = protocol_fixture_with_rows(db).await;
     let response = wire_response(
         engine
             .execute(
@@ -496,7 +497,12 @@ pub async fn projected_query_emits_exact_record_and_index_revisions_without_key_
 }
 
 pub async fn count_only_aggregate_emits_no_unselected_node_record_evidence(db: Db) {
-    let engine = protocol_engine_with_rows(db).await;
+    // `_db` holds the Postgres test schema the engine reads from.
+    let ProtocolFixture {
+        engine,
+        repository: _db,
+        ..
+    } = protocol_fixture_with_rows(db).await;
     let response = wire_response(
         engine
             .execute(
@@ -538,7 +544,12 @@ pub async fn count_only_aggregate_emits_no_unselected_node_record_evidence(db: D
 }
 
 pub async fn aggregate_node_aliases_drive_data_and_exact_record_paths(db: Db) {
-    let engine = protocol_engine_with_rows(db).await;
+    // `_db` holds the Postgres test schema the engine reads from.
+    let ProtocolFixture {
+        engine,
+        repository: _db,
+        ..
+    } = protocol_fixture_with_rows(db).await;
     let response = wire_response(
         engine
             .execute(
@@ -1149,7 +1160,12 @@ pub async fn resumed_suffix_coalesces_delete_recreate_and_repeated_upserts(db: D
 }
 
 pub async fn multi_root_causal_query_fails_before_merging_independent_snapshots(db: Db) {
-    let engine = protocol_engine_with_rows(db).await;
+    // `_db` holds the Postgres test schema the engine reads from.
+    let ProtocolFixture {
+        engine,
+        repository: _db,
+        ..
+    } = protocol_fixture_with_rows(db).await;
     let response = engine
         .execute(
             &user_session(),
@@ -1595,7 +1611,12 @@ async fn exercise_query_transport(db: Db, mode: QueryGatewayMode) {
 }
 
 pub async fn unowned_legacy_query_is_explicitly_incomplete_and_still_strips_keys(db: Db) {
-    let engine = protocol_engine_with_rows(db).await;
+    // `_db` holds the Postgres test schema the engine reads from.
+    let ProtocolFixture {
+        engine,
+        repository: _db,
+        ..
+    } = protocol_fixture_with_rows(db).await;
     let response = wire_response(
         engine
             .execute(

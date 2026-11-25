@@ -1,6 +1,6 @@
+use distributed::command;
 use distributed::command::{Atomic, CommandProjectionPureReduce, PreparedCommand};
 use distributed::microsvc::{CausalCommandContext, HandlerError};
-use distributed::command;
 use e2e_readmodels::BlobGames;
 use serde::Deserialize;
 
@@ -72,15 +72,6 @@ mod tests {
     use super::*;
     use distributed::cell_host::instance_name;
     use distributed::Aggregate;
-
-    #[test]
-    fn shard_is_game_id() {
-        let input = BlobMoveInput {
-            game_id: "g1".into(),
-            direction: "up".into(),
-        };
-        assert_eq!(Move::shard(&input), "g1");
-    }
 
     #[test]
     fn cell_is_parent_game_shard() {

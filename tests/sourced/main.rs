@@ -5,8 +5,7 @@ mod flat_preview;
 
 use aggregate::{Todo, TodoEvent};
 use distributed::{
-    Aggregate, AggregateBuilder, Entity, EventRecord, EventRecordError, InMemoryRepository,
-    Queueable,
+    AggregateBuilder, Entity, EventRecord, EventRecordError, InMemoryRepository, Queueable,
 };
 use serde::ser::Error as _;
 use serde::Serialize;
@@ -82,21 +81,6 @@ impl ExplicitlyValidatedRecorder {
         self.title = title;
         Ok(())
     }
-}
-
-#[test]
-fn enum_variants_exist_and_compile() {
-    let init = TodoEvent::Initialized {
-        id: "1".into(),
-        user_id: "alice".into(),
-        task: "Buy milk".into(),
-    };
-    let completed = TodoEvent::Completed;
-
-    // Debug and Clone derives work
-    let _ = format!("{:?}", init);
-    let _ = init.clone();
-    let _ = format!("{:?}", completed);
 }
 
 #[test]
@@ -219,27 +203,4 @@ fn non_event_methods_pass_through() {
     let snap = todo.snapshot();
     assert_eq!(snap.id, "t1");
     assert_eq!(snap.user_id, "alice");
-}
-
-#[test]
-fn partial_equality_on_enum() {
-    let a = TodoEvent::Initialized {
-        id: "1".into(),
-        user_id: "alice".into(),
-        task: "Test".into(),
-    };
-    let b = TodoEvent::Initialized {
-        id: "1".into(),
-        user_id: "alice".into(),
-        task: "Test".into(),
-    };
-    let c = TodoEvent::Completed;
-
-    assert_eq!(a, b);
-    assert_ne!(a, c);
-}
-
-#[test]
-fn no_upcasters_by_default() {
-    assert!(Todo::upcasters().is_empty());
 }

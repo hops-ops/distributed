@@ -24,3 +24,5 @@ trybuild = "=1.0.121"
 # Cargo permits dev-dependency cycles.
 distributed = { path = ".." }
 serde = { version = "1.0", features = ["derive"] }
+# Reads `cargo check --message-format=json` in tests/rustc_fail.rs.
+serde_json = "1"

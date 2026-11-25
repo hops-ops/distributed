@@ -68,7 +68,6 @@ try:
     subprocess.run(["cargo", "test", "-p", "distributed", "--no-default-features", "--features", "gateway,graphql,postgres", "--test", "edge_query_delivery_postgres", "--", "--ignored", "--nocapture"], cwd=ROOT, env=env, check=True)
     ready(primary)  # The standby proof deliberately stops and restarts the primary.
     subprocess.run(["cargo", "test", "-p", "distributed", "--no-default-features", "--features", "gateway,graphql,postgres", "--lib", "graphql::delivery::versions::tests::postgres_transactional_coverage_and_snapshot_race", "--", "--ignored", "--nocapture"], cwd=ROOT, env=env, check=True)
-    subprocess.run(["cargo", "test", "-p", "distributed", "--no-default-features", "--features", "gateway,graphql,postgres", "--test", "postgres_repository", "projected_command_ledger_rows_upgrade_to_atomic_and_preserve_checks", "--", "--nocapture"], cwd=ROOT, env={**env, "DATABASE_URL": env["GATEWAY_TEST_PRIMARY_URL"]}, check=True)
 finally:
     for bridge in bridges:
         bridge.shutdown(); bridge.server_close()

@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize};
 
 #[cfg(feature = "postgres")]
 #[path = "postgres.rs"]
-mod postgres;
+pub mod postgres;
 
 /// Run `$body` with `$repository` bound to the concrete repository in `$db`.
 macro_rules! with_repository {
@@ -26,7 +26,7 @@ macro_rules! with_repository {
         match $db {
             Db::Sqlite($repository) => $body,
             #[cfg(feature = "postgres")]
-            Db::Postgres($repository) => $body,
+            Db::Postgres($repository, _) => $body,
         }
     };
 }
@@ -88,8 +88,12 @@ pub(crate) use on_each_dialect;
 #[derive(Clone)]
 pub enum Db {
     Sqlite(SqliteRepository),
+    /// The schema is shared by every clone and dropped with the last one.
     #[cfg(feature = "postgres")]
-    Postgres(distributed::PostgresRepository),
+    Postgres(
+        distributed::PostgresRepository,
+        std::sync::Arc<postgres::PostgresTestSchema>,
+    ),
 }
 
 impl Db {
@@ -111,7 +115,8 @@ impl Db {
     #[cfg(feature = "postgres")]
     pub async fn postgres(what: &str) -> Option<Self> {
         let schema = postgres::PostgresTestSchema::create_from_env("graphql", what).await?;
-        Some(Db::Postgres(schema.repository().await))
+        let repository = schema.repository().await;
+        Some(Db::Postgres(repository, std::sync::Arc::new(schema)))
     }
 
     pub fn is_postgres(&self) -> bool {
@@ -141,9 +146,10 @@ impl Db {
                 Db::Sqlite(repository.with_projection_change_retention(retention))
             }
             #[cfg(feature = "postgres")]
-            Db::Postgres(repository) => {
-                Db::Postgres(repository.with_projection_change_retention(retention))
-            }
+            Db::Postgres(repository, schema) => Db::Postgres(
+                repository.with_projection_change_retention(retention),
+                schema,
+            ),
         }
     }
 

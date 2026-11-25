@@ -1200,21 +1200,21 @@ async fn postgres_matrix_repo() -> Option<(
 }
 
 #[cfg(feature = "postgres")]
-async fn postgres_matrix_bus() -> Option<distributed::bus::PostgresBus> {
+async fn postgres_matrix_bus(
+) -> Option<(postgres::PostgresTestSchema, distributed::bus::PostgresBus)> {
     use distributed::bus::PostgresBus;
     let schema =
         postgres::PostgresTestSchema::create_from_env("matrix_pgbus", "Postgres-bus matrix cell")
             .await?;
     let bus = PostgresBus::new(schema.repository().await.pool().clone()).group("matrix");
     bus.ensure_tables().await.expect("postgres bus tables");
-    // The schema has no Drop, so the bus's tables outlive this fixture.
-    Some(bus)
+    Some((schema, bus))
 }
 
 #[cfg(all(feature = "postgres", feature = "sqlite"))]
 #[tokio::test]
 async fn matrix_sqlite_persistence_over_postgres_bus() {
-    let Some(bus) = postgres_matrix_bus().await else {
+    let Some((_bus_schema, bus)) = postgres_matrix_bus().await else {
         return;
     };
     run_matrix_cell(bus, sqlite_matrix_repo().await, "sqlite-pgbus").await;
@@ -1223,7 +1223,7 @@ async fn matrix_sqlite_persistence_over_postgres_bus() {
 #[cfg(feature = "postgres")]
 #[tokio::test]
 async fn matrix_postgres_persistence_over_postgres_bus() {
-    let (Some((_schema, repo)), Some(bus)) =
+    let (Some((_schema, repo)), Some((_bus_schema, bus))) =
         (postgres_matrix_repo().await, postgres_matrix_bus().await)
     else {
         return;

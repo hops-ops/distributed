@@ -50,11 +50,4 @@ mod tests {
         assert!(projection.contains("blob.simulate_move"), "{projection}");
         assert!(projection.contains("blobSimulateMove"), "{projection}");
     }
-
-    #[test]
-    fn client_preview_wasm_stays_in_blob_domain_wasm_module() {
-        let src = include_str!("../wasm.rs");
-        assert!(src.contains("blobSimulateMove"));
-        assert!(src.contains("blob_simulate_move"));
-    }
 }

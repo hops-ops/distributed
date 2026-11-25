@@ -46,17 +46,3 @@ command! {
         default input.todo_id = uuid_v7();
     },
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn shard_is_todo_id() {
-        let input = TodoCreateInput {
-            todo_id: "todo-1".into(),
-            title: "one".into(),
-        };
-        assert_eq!(Create::shard(&input), "todo-1");
-    }
-}

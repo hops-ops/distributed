@@ -1175,6 +1175,32 @@ mod tests {
             error,
             ProjectionTopologyError::DirectIneligible { .. }
         ));
+
+        // A multi-row program (two output models) is never direct evidence.
+        let error = ProjectionBinding::materialize_direct(
+            DirectProjectionPlacement::new(&descriptor),
+            ProjectionSourceBinding::try_new("todo-domain", "ordered-domain-events", 1).unwrap(),
+            ProjectionOwner::try_new("todo-direct").unwrap(),
+            "distributed-projection-partition",
+            1,
+            vec![
+                ProjectionOutput::try_new("Todos", "todos", todo_schema("todos")).unwrap(),
+                ProjectionOutput::try_new(
+                    "TodoAudits",
+                    "todo_audits",
+                    model_schema("TodoAudits", "todo_audits"),
+                )
+                .unwrap(),
+            ],
+            vec![],
+            None,
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            ProjectionTopologyError::DirectIneligible { .. }
+        ));
     }
 
     fn activation(

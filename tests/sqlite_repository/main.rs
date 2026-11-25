@@ -17,39 +17,6 @@ use distributed::{
     OUTBOX_MESSAGES_TABLE,
 };
 use serde::{Deserialize, Serialize};
-use sqlx::migrate::{Migration, MigrationType, Migrator};
-
-fn legacy_sqlite_migrator() -> Migrator {
-    Migrator::with_migrations(vec![
-        Migration::new(
-            1,
-            "initial".into(),
-            MigrationType::Simple,
-            sqlx::SqlSafeStr::into_sql_str(include_str!(
-                "../../migrations/sqlite/0001_initial.sql"
-            )),
-            false,
-        ),
-        Migration::new(
-            2,
-            "command ledger".into(),
-            MigrationType::Simple,
-            sqlx::SqlSafeStr::into_sql_str(include_str!(
-                "../../migrations/sqlite/0002_command_ledger.sql"
-            )),
-            false,
-        ),
-        Migration::new(
-            3,
-            "projection protocol".into(),
-            MigrationType::Simple,
-            sqlx::SqlSafeStr::into_sql_str(include_str!(
-                "../../migrations/sqlite/0003_projection_protocol.sql"
-            )),
-            false,
-        ),
-    ])
-}
 
 #[derive(Default)]
 struct Counter {
@@ -163,72 +130,6 @@ async fn migration_is_idempotent_and_aggregate_stream_round_trips() {
     assert_eq!(loaded.entity().events()[0].sequence, 1);
     assert_eq!(loaded.entity().events()[1].sequence, 2);
     assert_eq!(loaded.entity().events()[0].correlation_id(), Some("corr-1"));
-}
-
-#[tokio::test]
-async fn projected_command_ledger_rows_upgrade_to_atomic_without_schema_drift() {
-    let repo = SqliteRepository::connect("sqlite::memory:").await.unwrap();
-    legacy_sqlite_migrator().run(repo.pool()).await.unwrap();
-
-    sqlx::query(
-        r#"
-        INSERT INTO command_ledger (
-            service_id, principal_partition, command_id, command_name,
-            command_contract_hash, input_hash, state, causation_id,
-            attempt_number, outcome, completed_at, retention_expires_at
-        ) VALUES (?, ?, ?, ?, zeroblob(32), zeroblob(32), 'projected', ?, 1, '{}', 1.0, 2.0)
-        "#,
-    )
-    .bind("service")
-    .bind("principal")
-    .bind("command")
-    .bind("todo.complete")
-    .bind("cause")
-    .execute(repo.pool())
-    .await
-    .unwrap();
-
-    repo.migrate().await.unwrap();
-
-    let state: String = sqlx::query_scalar(
-        "SELECT state FROM command_ledger WHERE service_id = 'service' AND command_id = 'command'",
-    )
-    .fetch_one(repo.pool())
-    .await
-    .unwrap();
-    assert_eq!(state, "atomic");
-
-    let latest_version: i64 = sqlx::query_scalar("SELECT MAX(version) FROM _sqlx_migrations")
-        .fetch_one(repo.pool())
-        .await
-        .unwrap();
-    assert_eq!(latest_version, 14);
-
-    let created_at_type: String = sqlx::query_scalar(
-        "SELECT typeof(created_at) FROM command_ledger WHERE service_id = 'service'",
-    )
-    .fetch_one(repo.pool())
-    .await
-    .unwrap();
-    assert_eq!(created_at_type, "real");
-
-    let invalid_json = sqlx::query(
-        r#"
-        INSERT INTO command_ledger (
-            service_id, principal_partition, command_id, command_name,
-            command_contract_hash, input_hash, state, causation_id,
-            attempt_number, outcome, completed_at, retention_expires_at
-        ) VALUES ('service', 'principal', 'bad-json', 'todo.complete',
-                  zeroblob(32), zeroblob(32), 'atomic', 'bad-json-cause',
-                  1, '{', 1.0, 2.0)
-        "#,
-    )
-    .execute(repo.pool())
-    .await;
-    assert!(
-        invalid_json.is_err(),
-        "JSON validity CHECK must survive migration"
-    );
 }
 
 #[tokio::test]

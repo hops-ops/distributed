@@ -16,15 +16,6 @@ fn e2e_enabled() -> bool {
     common::gate_enabled("ZITADEL_E2E")
 }
 
-/// E0 offline: binary runs without gate.
-#[tokio::test]
-async fn e0_skips_when_not_gated() {
-    if e2e_enabled() {
-        return;
-    }
-    eprintln!("ZITADEL_E2E not set — skip live E1–E8 (D12)");
-}
-
 /// Live E1–E8 against real Zitadel issuer + shipped OidcBearer HTTP path.
 #[tokio::test]
 async fn e1_through_e8_live() {
