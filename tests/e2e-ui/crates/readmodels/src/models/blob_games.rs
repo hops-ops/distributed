@@ -1,3 +1,4 @@
+use blob_domain::{Direction, Tile};
 use distributed::graphql::{claim, col, read, AuthorizedReadModel, ModelPermissions};
 use distributed::ReadModel;
 use serde::{Deserialize, Serialize};
@@ -15,7 +16,10 @@ pub struct BlobGames {
     pub player_dead: bool,
     pub current_level: i64,
     pub current_level_completed: bool,
-    pub map_json: String,
+    /// The board: a JSON column typed from [`Tile`] in generated clients.
+    pub map: Vec<Vec<Tile>>,
+    /// Directions the player can take without leaving the board.
+    pub moves: Vec<Direction>,
     /// `active` | `dead` | `level_complete`
     pub status: String,
     #[readmodel(belongs_to = "AuthUsers", foreign_key = "owner_id")]

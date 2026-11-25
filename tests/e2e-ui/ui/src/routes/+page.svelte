@@ -162,15 +162,21 @@ await commands.todo.create({ title: text });
 await commands.todo.complete({ todo_id });
 // Replica applies SaveTodo (upsert_todos) to the cache. Page does not.`;
 
-	const codeWasm = `// Advanced optimism: same domain pure, shipped as WASM
-.preview_reduce_known_record(CommandProjectionPureReduce::wasm(
-    "blob.simulate_move",
-    "blob/pkg/blob_wasm",   // wasm-pack under $lib
-    "blobSimulateMove",     // (recordJson, argsJson) → assignJson
-    "BlobGames",
-))
+	const codeWasm = `// Advanced optimism: the same domain pure, shipped as WASM.
+// blob-domain: typed row, arguments and output.
+pub fn preview_move(row: MoveRow, args: MoveArgs) -> Option<MovePreview> {
+    simulate_move(&row.map, row.score, args.direction).ok()
+}
+distributed::wasm_pure! {
+    pub const PREVIEW_MOVE = preview_move(MoveRow, MoveArgs) -> MovePreview;
+}
 
-// Generated client hosts the module. No TypeScript board rules.`;
+// The command: key, argument and patched columns come from the types.
+preview_reduce_known_record:
+    CommandProjectionPureReduce::known_record::<BlobGames>(PREVIEW_MOVE),
+
+// distributed build compiles it; the generated client hosts it.
+// No TypeScript board rules.`;
 
 	const codeLive = `# The nested layout retains one live window across child pages.
 query ChatMessages($limit: Int!, $offset: Int!) @load @live {

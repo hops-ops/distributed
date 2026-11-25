@@ -9,7 +9,8 @@ use crate::shared::{
 use super::attrs::{foreign_key_tokens, FieldAttrs, RelationshipKindAttr, StructAttrs};
 use super::types::{
     box_inner_type, bytes_row_value_tokens, column_type_tokens, default_storage_name,
-    effect_model_wire_tokens, option_inner_type, option_string_tokens, vec_inner_type,
+    effect_model_wire_tokens, json_type_tokens, option_inner_type, option_string_tokens,
+    vec_inner_type,
 };
 
 pub(super) fn expand_relational_read_model(
@@ -146,6 +147,7 @@ pub(super) fn expand_relational_read_model(
             .any(|pk| pk == &field_name || pk == &column_name);
         let nullable = attrs.nullable || option_inner_type(&field.ty).is_some();
         let column_type = column_type_tokens(&field.ty, attrs.jsonb, attrs.text);
+        let json_type = json_type_tokens(&field.ty, attrs.jsonb, attrs.text);
         let default_tokens = option_string_tokens(attrs.default.as_deref());
         let foreign_key = attrs
             .foreign_key
@@ -191,6 +193,7 @@ pub(super) fn expand_relational_read_model(
                 foreign_key: #foreign_key,
                 delegated_from: #delegated_from,
                 skipped: false,
+                json_type: #json_type,
             }
         });
 

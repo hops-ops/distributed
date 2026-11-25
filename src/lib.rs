@@ -388,11 +388,12 @@ pub use read_model::{
 // so they are part of the crate-root surface; SQL rendering helpers stay under
 // `distributed::table::*`.
 pub use table::{
-    ColumnType, DeleteTableRowMutation, ExpectedVersion, ForeignKey, PatchMode,
-    PatchTableRowMutation, PrimaryKey, ReadModelCatalog, RelationshipDef, RelationshipKind, RowKey,
-    RowPatch, RowValue, RowValues, RowWriteMode, TableColumn, TableIndex, TableKind,
-    TableMigrationArtifact, TableMutation, TableRowMutation, TableSchema, TableSchemaBootstrap,
-    TableSchemaRegistry, TableStoreError, TableWritePlan, DEFAULT_TABLE_VERSION_COLUMN,
+    ColumnType, DeleteTableRowMutation, ExpectedVersion, ForeignKey, JsonField, JsonShape,
+    JsonType, PatchMode, PatchTableRowMutation, PrimaryKey, ReadModelCatalog, RelationshipDef,
+    RelationshipKind, RowKey, RowPatch, RowValue, RowValues, RowWriteMode, TableColumn, TableIndex,
+    TableKind, TableMigrationArtifact, TableMutation, TableRowMutation, TableSchema,
+    TableSchemaBootstrap, TableSchemaRegistry, TableStoreError, TableWritePlan,
+    DEFAULT_TABLE_VERSION_COLUMN,
 };
 pub use trace_context::{
     is_valid_traceparent, TraceContext, CAUSATION_ID, CORRELATION_ID, TRACEPARENT, TRACESTATE,
@@ -419,5 +420,5 @@ pub use microsvc::{
 // mount); commands predict events via `.emits`/`.preview`.
 pub use distributed_macros::{
     command, command_input_defaults, mutation, mutation_file, sourced, CommandInput, CommandOutput,
-    DomainEvent, DomainState, ReadModel, Snapshot,
+    DomainEvent, DomainState, JsonType, ReadModel, Snapshot,
 };

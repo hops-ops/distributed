@@ -193,9 +193,7 @@ pub fn expand(input: TokenStream) -> syn::Result<TokenStream> {
     });
     let preview_reduce_known_record = args.preview_reduce_known_record.as_ref().map(|preview| {
         quote! {
-            .preview_reduce_known_record(
-                (#preview).declared_in_rust_package(env!("CARGO_PKG_NAME"))
-            )
+            .preview_reduce_known_record(#preview)
         }
     });
 

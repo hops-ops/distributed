@@ -335,6 +335,10 @@ pub struct ClientField {
     pub scalar: String,
     pub codec: String,
     pub nullable: bool,
+    /// The exact value shape of a `json` field, from the read model's Rust
+    /// type. Generated clients type the field with it instead of `unknown`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub json_type: Option<crate::table::JsonShape>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

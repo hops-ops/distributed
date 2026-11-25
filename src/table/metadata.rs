@@ -98,6 +98,10 @@ pub struct TableColumn {
     pub foreign_key: Option<ForeignKey>,
     pub delegated_from: Option<String>,
     pub skipped: bool,
+    /// The serialized shape of a JSON column's values, from the field's Rust
+    /// type ([`JsonType`](super::JsonType)); `None` for every other column.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub json_type: Option<super::JsonShape>,
 }
 
 impl TableColumn {
@@ -117,6 +121,7 @@ impl TableColumn {
             foreign_key: None,
             delegated_from: None,
             skipped: false,
+            json_type: None,
         }
     }
 }

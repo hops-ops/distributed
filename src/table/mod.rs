@@ -8,6 +8,7 @@
 
 mod catalog;
 mod error;
+mod json_type;
 mod metadata;
 mod mutation;
 mod plan;
@@ -16,6 +17,7 @@ mod sql;
 
 pub use catalog::ReadModelCatalog;
 pub use error::TableStoreError;
+pub use json_type::{JsonField, JsonShape, JsonType};
 pub use metadata::{
     ColumnType, ForeignKey, PrimaryKey, RelationshipDef, RelationshipKind, RowKey, RowValue,
     RowValues, TableColumn, TableIndex, TableKind, TableSchema, DEFAULT_TABLE_VERSION_COLUMN,

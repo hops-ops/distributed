@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::bomberman::domain::types::Tile;
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, distributed::JsonType)]
 pub struct PlayerState {
     pub id: String,
     pub name: String,
@@ -12,7 +12,7 @@ pub struct PlayerState {
     pub alive: bool,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, distributed::JsonType)]
 pub struct BombState {
     pub id: String,
     pub owner: String,
@@ -21,7 +21,7 @@ pub struct BombState {
     pub ticks: u8,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, distributed::JsonType)]
 pub struct ExplosionState {
     pub id: String,
     pub owner: String,

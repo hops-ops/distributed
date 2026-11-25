@@ -8,7 +8,7 @@ use syn::{
 };
 
 #[derive(Clone, Copy)]
-enum SerdeDirection {
+pub(crate) enum SerdeDirection {
     Deserialize,
     Serialize,
 }
@@ -34,7 +34,7 @@ impl SerdeDirection {
     clippy::enum_variant_names,
     reason = "variant names intentionally mirror serde's public rename_all terminology"
 )]
-enum RenameRule {
+pub(crate) enum RenameRule {
     LowerCase,
     UpperCase,
     PascalCase,
@@ -65,7 +65,7 @@ impl RenameRule {
         }
     }
 
-    fn apply(self, field: &str) -> String {
+    pub(crate) fn apply(self, field: &str) -> String {
         match self {
             Self::KebabCase => field.replace('_', "-"),
             Self::ScreamingKebabCase => field.replace('_', "-").to_ascii_uppercase(),
@@ -404,7 +404,7 @@ fn extract_path_arg<'a>(ty: &'a Type, wrapper: &str) -> Option<&'a Type> {
     })
 }
 
-fn serde_rename_all(
+pub(crate) fn serde_rename_all(
     attrs: &[Attribute],
     direction: SerdeDirection,
 ) -> syn::Result<Option<RenameRule>> {
@@ -548,7 +548,7 @@ fn validate_serde_container_shape(
     Ok(())
 }
 
-fn serde_field_rename(
+pub(crate) fn serde_field_rename(
     attrs: &[Attribute],
     direction: SerdeDirection,
 ) -> syn::Result<Option<String>> {

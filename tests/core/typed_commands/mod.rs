@@ -192,7 +192,7 @@ struct ForgedView {
     count: i64,
 }
 
-#[derive(Clone, Serialize, Deserialize, CommandInput)]
+#[derive(Clone, Serialize, Deserialize, CommandInput, distributed::JsonType)]
 struct JsonDocument {
     label: String,
 }
@@ -300,12 +300,12 @@ struct FloatEffectView {
     value: Option<f64>,
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize, distributed::JsonType)]
 struct NestedJsonFloat {
     value: f64,
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize, distributed::JsonType)]
 struct NestedJsonDocument {
     nested: NestedJsonFloat,
 }

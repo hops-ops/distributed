@@ -1,4 +1,4 @@
-//! Blob: mutations + projections.
+//! Blob: the row mutation and its projection.
 
 use blob_domain::{
     BlobInitializedDomainEvent, BlobLevelStartedDomainEvent, BlobMovedDomainEvent,
@@ -26,7 +26,7 @@ distributed::projection! {
     pub const BLOB_GAMES: ProjectionDescriptor<DirectCandidate> = {
         name: "project_blob",
         version: 1,
-        epoch: "e2e-ui-blob-v2",
+        epoch: "e2e-ui-blob-v3",
         model: BlobGames,
         on {
             events: [
@@ -58,7 +58,9 @@ mod tests {
             .expect("mutation from_state builds the projected row");
         assert_eq!(row.game_id, "g1");
         assert_eq!(row.owner_id, "alice");
-        assert_eq!(row.map_json, state.map_json);
+        assert_eq!(row.map, state.map);
+        assert_eq!(row.moves, state.moves);
+        assert!(!row.moves.is_empty());
         assert!(row.owner.is_none());
     }
 

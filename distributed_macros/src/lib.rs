@@ -5,6 +5,7 @@ mod command_input_defaults;
 mod command_types;
 mod domain_event;
 mod domain_state;
+mod json_type;
 mod mutation;
 // Event-owning `projection!` authoring removed (mutation projectors cutover).
 mod read_model;
@@ -135,6 +136,17 @@ pub fn derive_command_input(input: TokenStream) -> TokenStream {
 pub fn derive_command_output(input: TokenStream) -> TokenStream {
     let input = syn::parse_macro_input!(input as DeriveInput);
     match command_types::expand_command_output(input) {
+        Ok(tokens) => tokens.into(),
+        Err(err) => err.to_compile_error().into(),
+    }
+}
+
+/// Derive the serialized JSON shape (`distributed::JsonType`) of a
+/// named-field struct or a unit-only enum, following its Serde names.
+#[proc_macro_derive(JsonType, attributes(serde))]
+pub fn derive_json_type(input: TokenStream) -> TokenStream {
+    let input = syn::parse_macro_input!(input as DeriveInput);
+    match json_type::expand(input) {
         Ok(tokens) => tokens.into(),
         Err(err) => err.to_compile_error().into(),
     }

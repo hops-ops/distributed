@@ -624,3 +624,95 @@ fn invalid_projection_declaration_is_an_error_not_a_panic() {
     assert!(contract.canonical_value().is_err());
     assert!(crate::application::CommandSpec::from_contract(&contract).is_err());
 }
+
+mod wasm_pure_declarations {
+    use super::super::{CommandProjectionEvents, CommandProjectionPureReduce};
+    use serde::{Deserialize, Serialize};
+
+    #[derive(Clone, Default, Serialize, Deserialize, crate::ReadModel)]
+    #[readmodel(primary_key = ["board_id"])]
+    struct Boards {
+        board_id: String,
+        cells: Vec<Vec<u8>>,
+        moves: Vec<String>,
+    }
+
+    #[derive(Deserialize, crate::JsonType)]
+    struct Row {
+        cells: Vec<Vec<u8>>,
+    }
+
+    #[derive(Deserialize, crate::JsonType)]
+    struct Args {
+        step: String,
+    }
+
+    #[derive(Serialize, crate::JsonType)]
+    struct Patch {
+        cells: Vec<Vec<u8>>,
+        moves: Vec<String>,
+    }
+
+    fn step(_: Row, _: Args) -> Option<Patch> {
+        None
+    }
+
+    crate::wasm_pure! {
+        const STEP = step(Row, Args) -> Patch;
+    }
+
+    #[derive(Serialize, crate::JsonType)]
+    struct WrongPatch {
+        cells: Vec<String>,
+        inventory: Vec<String>,
+        board_id: String,
+    }
+
+    fn wrong(_: Row, _: Args) -> Option<WrongPatch> {
+        None
+    }
+
+    crate::wasm_pure! {
+        const WRONG = wrong(Row, Args) -> WrongPatch;
+    }
+
+    fn validate(reduce: CommandProjectionPureReduce) -> Result<(), String> {
+        let mut projections = CommandProjectionEvents::default();
+        projections.add_pure_reduce(reduce);
+        projections.canonicalize_and_validate("board.step")
+    }
+
+    #[test]
+    fn known_record_derives_the_binding_from_rust_types() {
+        let reduce = CommandProjectionPureReduce::known_record::<Boards>(STEP);
+        let package = env!("CARGO_PKG_NAME");
+        assert_eq!(reduce.fn_name, format!("{package}::step"));
+        assert_eq!(reduce.wasm_export, "step");
+        assert_eq!(reduce.wasm_rust_package, package);
+        assert_eq!(reduce.wasm_package, format!("wasm/{package}/{package}"));
+        assert_eq!(reduce.model, "Boards");
+        assert_eq!(reduce.key[0].name, "board_id");
+        assert_eq!(reduce.args[0].name, "step");
+        assert_eq!(reduce.assign, ["cells", "moves"]);
+        validate(reduce).unwrap();
+    }
+
+    #[test]
+    fn a_pure_that_disagrees_with_its_model_fails_closed() {
+        let error =
+            validate(CommandProjectionPureReduce::known_record::<Boards>(WRONG)).unwrap_err();
+        assert!(
+            error.contains("does not have the JSON shape of column `Boards.cells`"),
+            "{error}"
+        );
+        let reduce = CommandProjectionPureReduce::known_record::<Boards>(WRONG);
+        assert!(reduce
+            .declaration_errors
+            .iter()
+            .any(|e| e.contains("`inventory` is not a column of `Boards`")));
+        assert!(reduce
+            .declaration_errors
+            .iter()
+            .any(|e| e.contains("assigns key column `board_id`")));
+    }
+}

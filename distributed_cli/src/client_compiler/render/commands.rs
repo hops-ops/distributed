@@ -222,7 +222,6 @@ pub(super) fn render_pures(
         sections.push("import { createWasmJsonPure } from '@hops-ops/distributed/replica';".into());
     }
     let mut entries = Vec::new();
-    let mut ready_calls = Vec::new();
     for (index, (fn_name, delivery)) in inventory.iter().enumerate() {
         match delivery {
             PureDelivery::ClientModule { module, export } => {
@@ -240,8 +239,9 @@ pub(super) fn render_pures(
                     "const {host} = createWasmJsonPure({{\n  load: () => import('{specifier}'),\n  exportName: {export_lit}\n}});",
                     export_lit = serde_json::to_string(export).unwrap_or_else(|_| "\"\"".into()),
                 ));
+                // The host starts loading as soon as the module is imported in
+                // a browser; until it is ready the pure fails closed (no optimism).
                 entries.push(format!("  {}: {host}.pure", quoted_property(fn_name)));
-                ready_calls.push(format!("  await {host}.ensureReady();"));
             }
         }
     }
@@ -249,12 +249,6 @@ pub(super) fn render_pures(
         "export const PURE_FUNCTIONS = {{\n{}\n}} as const;",
         entries.join(",\n")
     ));
-    if !ready_calls.is_empty() {
-        sections.push(format!(
-            "/** Instantiate WASM pure hosts (no-op when none / already ready). */\nexport async function ensurePureFunctionsReady(): Promise<void> {{\n{}\n}}",
-            ready_calls.join("\n")
-        ));
-    }
     Ok(Some(format!("{}\n", sections.join("\n\n"))))
 }
 

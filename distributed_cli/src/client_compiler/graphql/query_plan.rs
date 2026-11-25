@@ -52,6 +52,7 @@ pub(super) fn inject_wire_fields(
             codec: "string".into(),
             nullable: false,
             expose: false,
+            json_type: None,
         }));
     }
     Ok(())

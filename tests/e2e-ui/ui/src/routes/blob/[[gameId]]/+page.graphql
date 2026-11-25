@@ -7,7 +7,8 @@ query BlobGames @load {
     player_dead
     current_level
     current_level_completed
-    map_json
+    map
+    moves
     status
     owner {
       user_id

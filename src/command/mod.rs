@@ -54,9 +54,9 @@ pub(crate) use projection_proof::{
 pub use projections::{
     __command_projection_event_descriptor, __command_projection_event_preview,
     __command_projection_events, __command_projection_preview_constant,
-    __command_projection_state_preview, CommandEventSet, CommandProjectionBody,
+    __command_projection_state_preview, __run_wasm_pure, CommandEventSet, CommandProjectionBody,
     CommandProjectionEventSet, CommandProjectionPreview, CommandProjectionPreviewSource,
-    CommandProjectionPureArg, CommandProjectionPureReduce,
+    CommandProjectionPureArg, CommandProjectionPureReduce, WasmPure,
 };
 pub(crate) use projections::{authenticated_user_field_preview, CommandProjectionEvents};
 pub use typed_command::{command_transition, typed_command, TypedCommand};

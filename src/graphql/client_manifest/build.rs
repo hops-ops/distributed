@@ -76,11 +76,18 @@ pub(super) fn client_manifest_from_surface_with_execution(
                         model.model_name, field.name, field.scalar
                     ))
                 })?;
+                let json_type = model
+                    .schema
+                    .columns
+                    .iter()
+                    .find(|column| !column.skipped && column.column_name == field.name)
+                    .and_then(|column| column.json_type.clone());
                 Ok(ClientField {
                     name: field.name.clone(),
                     scalar: field.scalar.clone(),
                     codec: codec.into(),
                     nullable: field.nullable,
+                    json_type,
                 })
             })
             .collect::<Result<_, ClientManifestError>>()?;
