@@ -26,7 +26,7 @@ pub(crate) mod causal;
 mod cell;
 #[cfg(feature = "cloudflare-workers")]
 mod celld_outbox;
-#[cfg(feature = "graphql")]
+#[cfg(feature = "http")]
 mod command;
 mod internal_auth;
 #[cfg(all(feature = "cloudflare-workers", target_arch = "wasm32"))]
@@ -54,7 +54,7 @@ pub use celld_outbox::{
     CELLD_OUTBOX_DEFAULT_BINDING, CELLD_OUTBOX_DEFAULT_DRAIN_INTERVAL_MS,
     CELLD_OUTBOX_DEFAULT_LEASE, CELLD_OUTBOX_DEFAULT_MAX_ATTEMPTS, CELLD_OUTBOX_DRAIN_INTERVAL_ENV,
 };
-#[cfg(feature = "graphql")]
+#[cfg(feature = "http")]
 pub use command::CelldCommandHost;
 pub use internal_auth::{
     InternalHttpSecret, CELL_INTERNAL_SECRET_ENV, CELL_INTERNAL_SECRET_HEADER,

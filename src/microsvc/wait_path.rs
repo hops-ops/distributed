@@ -68,6 +68,7 @@ pub(crate) fn wait_path_error_response(error: &CausalDispatchError) -> Value {
 /// A server error that names no known code (a proxy, a crashed host) is
 /// [`CausalDispatchError::Internal`], which callers retry; only a client
 /// error is a rejection.
+#[cfg(feature = "http")]
 pub(crate) fn wait_path_error(status: u16, body: &Value) -> CausalDispatchError {
     let message = body
         .get("error")

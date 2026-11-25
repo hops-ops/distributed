@@ -19,7 +19,7 @@ cell = ["dep:distributed", "dep:sha2", "dep:base64"]
 # `command_sink::CommandFactSink` over `CelldCommandHost` /
 # `LocalCommandHost` (a local service over any repository, or celld cells
 # over HTTP). The sink itself is portable (`cell`).
-command-host = ["cell", "distributed/graphql"]
+command-host = ["cell", "distributed/http"]
 # celld clients: `CelldFactSink` (the command sink over a remote-only
 # `CelldCommandHost`), `CellZoneOwnership`, `CellZoneStateStore`.
 celld = ["cell", "command-host", "dep:reqwest", "dep:uuid"]

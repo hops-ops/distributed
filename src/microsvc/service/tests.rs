@@ -1277,6 +1277,61 @@ async fn causal_dispatch_replays_canonical_equivalent_input_without_reinvoking_h
     assert_eq!(handler_calls.load(Ordering::SeqCst), 1);
 }
 
+/// The command host is core: it runs and replays a typed command in every
+/// build, the GraphQL transport included or not.
+#[tokio::test]
+async fn local_command_host_runs_typed_commands_through_the_ledger() {
+    use crate::command_dispatch::{CommandHost, LocalCommandHost};
+
+    let service = Arc::new(
+        Service::new().named("causal-tests").routes(
+            Routes::new()
+                .with_repo(InMemoryRepository::new().aggregate::<CausalDispatcherAggregate>())
+                .typed_command(typed_command::<CausalTestInput, Succeeded<TypedOutput>>(
+                    "causal.host",
+                ))
+                .handle(
+                    |_context: &CausalCommandContext<'_, CausalDispatcherAggregate>,
+                     input: CausalTestInput| async move {
+                        Ok(
+                            PreparedCommand::<Succeeded<TypedOutput>>::prepare(TypedOutput {
+                                id: input.id,
+                            })
+                            .unwrap(),
+                        )
+                    },
+                ),
+        ),
+    );
+    let host = LocalCommandHost::new(Arc::clone(&service));
+    assert!(host
+        .ledger()
+        .is_some_and(|ledger| Arc::ptr_eq(ledger, &service)));
+
+    let mut session = Session::new();
+    session.set(crate::microsvc::USER_ID_KEY, "causal-test-subject");
+    let command_id = causal_test_command_id();
+    let invoke = || {
+        host.invoke(
+            "causal.host",
+            &command_id,
+            causal_test_input("todo-host", "label"),
+            session.clone(),
+            causal_test_principal(),
+            None,
+        )
+    };
+
+    let first = invoke().await.expect("the host runs the command");
+    assert_eq!(first.payload(), &json!({ "id": "todo-host" }));
+    assert_eq!(first.state(), "succeeded");
+    assert!(!first.replayed());
+
+    let replay = invoke().await.expect("the ledger replays the command ID");
+    assert!(replay.replayed());
+    assert_eq!(replay.causation_id(), first.causation_id());
+}
+
 #[cfg(feature = "graphql")]
 #[tokio::test]
 async fn causal_dispatch_receipt_and_status_use_the_exact_durable_replay() {
@@ -1339,7 +1394,7 @@ async fn causal_dispatch_receipt_and_status_use_the_exact_durable_replay() {
     assert_eq!(handler_calls.load(Ordering::SeqCst), 1);
 
     let status = service
-        .causal_command_status(&command_id, &Session::new(), principal)
+        .causal_command_status(&command_id, &Session::new(), principal, None)
         .await
         .expect("same principal and current grant should resolve status");
     assert_eq!(status.state, CausalCommandPublicState::Succeeded);
@@ -1799,14 +1854,24 @@ async fn causal_status_lookup_does_not_disclose_another_routes_command() {
     assert_eq!(cross_route, CommandLookup::Unknown);
 
     let authorized = service
-        .causal_command_status(&command_id, &session_with_role("admin"), principal.clone())
+        .causal_command_status(
+            &command_id,
+            &session_with_role("admin"),
+            principal.clone(),
+            None,
+        )
         .await
         .expect("current admin grant should recover the command without its route name");
     assert_eq!(authorized.state, CausalCommandPublicState::Succeeded);
     assert_eq!(authorized.command_id, command_id);
 
     let revoked = service
-        .causal_command_status(&command_id, &session_with_role("user"), principal.clone())
+        .causal_command_status(
+            &command_id,
+            &session_with_role("user"),
+            principal.clone(),
+            None,
+        )
         .await
         .expect("revoked routes must collapse to a non-enumerating status");
     assert_eq!(revoked.state, CausalCommandPublicState::Unknown);
@@ -1817,7 +1882,12 @@ async fn causal_status_lookup_does_not_disclose_another_routes_command() {
         &["distributed-tests"],
     );
     let wrong_principal = service
-        .causal_command_status(&command_id, &session_with_role("admin"), other_principal)
+        .causal_command_status(
+            &command_id,
+            &session_with_role("admin"),
+            other_principal,
+            None,
+        )
         .await
         .expect("another principal must not learn whether the command exists");
     assert_eq!(wrong_principal.state, CausalCommandPublicState::Unknown);
@@ -1827,6 +1897,7 @@ async fn causal_status_lookup_does_not_disclose_another_routes_command() {
             "not-a-command-id",
             &session_with_role("admin"),
             principal.clone(),
+            None,
         )
         .await
         .expect("malformed IDs are non-enumerating, not validation or storage errors");
@@ -1835,7 +1906,7 @@ async fn causal_status_lookup_does_not_disclose_another_routes_command() {
 
     let missing_id = causal_test_command_id();
     let missing = service
-        .causal_command_status(&missing_id, &session_with_role("admin"), principal)
+        .causal_command_status(&missing_id, &session_with_role("admin"), principal, None)
         .await
         .expect("absent IDs are non-enumerating");
     assert_eq!(missing.state, CausalCommandPublicState::Unknown);
@@ -2334,7 +2405,7 @@ async fn succeeded_causal_dispatch_replays_and_stages_its_outbox_fact() {
     assert_eq!(result, json!({ "id": "todo-obligation" }));
 
     let status = service
-        .causal_command_status(&command_id, &Session::new(), principal.clone())
+        .causal_command_status(&command_id, &Session::new(), principal.clone(), None)
         .await
         .expect("status should load");
     assert_eq!(status.consistency, Some(CommandConsistency::Succeeded));
@@ -3180,7 +3251,7 @@ async fn projected_command_auto_binds_bootstraps_and_replays_exact_direct_eviden
     assert_eq!(handler_calls.load(Ordering::SeqCst), 1);
 
     let direct_status = service
-        .causal_command_status(&command_id, &Session::new(), causal_test_principal())
+        .causal_command_status(&command_id, &Session::new(), causal_test_principal(), None)
         .await
         .expect("direct projected status should use ledger replay evidence");
     assert_eq!(direct_status.state, CausalCommandPublicState::Atomic);

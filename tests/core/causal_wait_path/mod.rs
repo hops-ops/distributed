@@ -1505,6 +1505,27 @@ async fn graphql_only_engine_wait_dispatches_to_loopback_writer() {
     );
     let data = mutation.data.into_json().unwrap();
     assert_eq!(data["todo_create"]["id"], "todo-gql-only");
+
+    // The command ledger is the writer's, so this engine cannot answer status:
+    // it says so instead of reporting the committed command as `unknown`.
+    assert!(host.ledger().is_none());
+    let status = engine
+        .execute(
+            &session,
+            Request::new(format!(
+                "query {{ commandStatus(commandId: \"{command_id}\") {{ state }} }}"
+            ))
+            .data(Arc::clone(&host))
+            .data(VerifiedPrincipal::internal("alice").unwrap()),
+        )
+        .await;
+    assert_eq!(status.errors.len(), 1, "{status:?}");
+    assert!(
+        status.errors[0]
+            .message
+            .contains("needs the service that owns the command ledger"),
+        "{status:?}"
+    );
 }
 
 #[tokio::test]
