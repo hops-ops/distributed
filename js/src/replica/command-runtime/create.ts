@@ -812,7 +812,8 @@ export function createReplicaCommandRuntime<
 			.catch(() => undefined);
 	};
 	const revalidateDispositionAndRetireInBackground = (
-		controller: PendingProjection
+		controller: PendingProjection,
+		onFailure?: () => void
 	): void => {
 		void revalidate(controller.prepared, controller.authority.signal)
 			.then((refreshed) => {
@@ -827,9 +828,9 @@ export function createReplicaCommandRuntime<
 					);
 					settleProjectionSuccess(controller);
 					pending.delete(controller.commandId);
-				}
+				} else if (!refreshed) onFailure?.();
 			})
-			.catch(() => undefined);
+			.catch(() => onFailure?.());
 	};
 
 	const commitStatusProgression = (
@@ -1069,33 +1070,8 @@ export function createReplicaCommandRuntime<
 							settleTrackedProjection(tracker, pending);
 						}
 					} else if (
-						metadata.state === 'succeeded' &&
-						!prepared.revalidation.required &&
-						!statusRequiresRevalidation &&
-						hasCompleteProjectionObservations(metadata)
-					) {
-						/*
-						 * A cell may keep a committed external receipt in the public
-						 * `succeeded` state after its exact modeled observation is durable.
-						 * That proof settles the projected delivery wait, but it does not
-						 * retire the accepted layer: no canonical query/live frame has
-						 * confirmed read-model membership yet.
-						 */
-						settleTrackedProjection(tracker, pending);
-					} else if (
-						metadata.state === 'atomic' &&
-						!prepared.revalidation.required &&
-						!statusRequiresRevalidation
-					) {
-						/*
-						 * An exact terminal delta proves delivery but carries no
-						 * canonical revision. Keep its accepted overlay until a later
-						 * comparable authoritative result seals it, without racing
-						 * sibling commands with a command-triggered query.
-						 */
-						settleTrackedProjection(tracker, pending);
-					} else if (
 						metadata.state === 'atomic' ||
+						hasCompleteProjectionObservations(metadata) ||
 						(metadata.state === 'succeeded' &&
 							metadata.expects.length === 0 &&
 							(prepared.revalidation.required ||
@@ -1103,10 +1079,18 @@ export function createReplicaCommandRuntime<
 					) {
 						/*
 						 * Status is causal truth, but it carries no canonical
-						 * query payload. `projected` fences asynchronous
-						 * projection; `succeeded` is terminal when the generated
-						 * contract has no confirmations. In both cases, only a
-						 * query started after that fence may retire optimism.
+						 * query payload. A terminal `atomic` state or a complete
+						 * set of this command's projection observations proves
+						 * the projection committed; `succeeded` is terminal when
+						 * the generated contract has no confirmations. In every
+						 * case only a query started after that proof may retire
+						 * optimism: until it settles the row stays pending,
+						 * because the base can still lack the command's effect.
+						 *
+						 * The proof alone never retires the layer, and waiting
+						 * for a later canonical frame is not enough: an `@load`
+						 * operation with no live delivery never receives one, so
+						 * the accepted layer would never retire.
 						 */
 						let refreshed = false;
 						try {
@@ -1551,24 +1535,46 @@ export function createReplicaCommandRuntime<
 					/*
 					 * Receipt/status observations prove durable causality, not
 					 * that canonical query data was atomically ingested. Keep
-					 * the layer and await DistributedReplica retirement even
-					 * when every observation is already present here.
+					 * the layer until a canonical frame retires it, or until
+					 * a query started after a complete proof settles.
 					 */
 					pending.set(prepared.commandId, controller);
 					unmanagedLayers.delete(prepared.commandId);
 					attachAuthorityAbort(controller, () =>
 						pending.delete(prepared.commandId)
 					);
+					const monitor = () => {
+						if (
+							statusArtifact !== undefined &&
+							replicaRevalidate !== undefined
+						) {
+							monitorPendingProjection(
+								controller,
+								readStatus,
+								() =>
+									pending.get(prepared.commandId) === controller,
+								options.onBackgroundError
+							);
+						}
+					};
 					if (
-						statusArtifact !== undefined &&
-						replicaRevalidate !== undefined
+						replicaRevalidate !== undefined &&
+						hasCompleteProjectionObservations(metadata)
 					) {
-						monitorPendingProjection(
+						/*
+						 * The receipt already proves the projection committed,
+						 * but a receipt carries no canonical data and the base
+						 * may already hold the row (a query raced the response).
+						 * No later frame is guaranteed without live delivery, so
+						 * fetch canonical data started after this proof, then
+						 * retire. The status monitor retries a failed fetch.
+						 */
+						revalidateDispositionAndRetireInBackground(
 							controller,
-							readStatus,
-							() => pending.get(prepared.commandId) === controller,
-							options.onBackgroundError
+							monitor
 						);
+					} else {
+						monitor();
 					}
 				}
 				projected = callerProjectedPromise(
@@ -1763,16 +1769,17 @@ export function createReplicaCommandRuntime<
 			 * snapshot/observations were admissible. This callback runs only
 			 * after that exact frame committed.
 			 *
-			 * Eventual list membership fences may keep the optimistic overlay
-			 * until @live includes the new row. `projected` is delivery, not
-			 * overlay retirement. Query/live frames have no command payload;
-			 * settle those so Send/busy can clear. Frames that name a command
-			 * still wait for overlay retirement or the command-state paths
-			 * above (status regression must be able to reject `projected`).
+			 * Settle only once the overlay is retired. A frame without a
+			 * command payload (a query refetch, perhaps one that raced the
+			 * receipt) proves nothing about this command. Settling on it would
+			 * stop the status monitor while the accepted layer remains, and
+			 * with no live delivery nothing else would ever retire the layer:
+			 * its row would stay pending. The command-state paths above still
+			 * settle or reject `projected` (status regression can reject it).
 			 */
 			const remainsPending =
 				replica.markOptimisticLayerAccepted(commandId);
-			if (!remainsPending || command === undefined) {
+			if (!remainsPending) {
 				settleProjectionSuccess(controller);
 				pending.delete(commandId);
 			}
