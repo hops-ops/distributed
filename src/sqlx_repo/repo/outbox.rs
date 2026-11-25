@@ -208,7 +208,7 @@ where
                 .and_then(|source| source.downcast_ref::<sqlx::Error>())
                 .is_some_and(DB::is_unique_violation)
             {
-                return Err(RepositoryError::DuplicateOutboxMessageInBatch {
+                return Err(RepositoryError::DuplicateOutboxMessage {
                     id: insert.first_id.to_string(),
                 });
             }

@@ -1,55 +1,15 @@
 //! Process HTTP: GraphQL is the user edge (engine `OidcBearer`).
 //!
 //! App writes are GraphQL-only (HTTP command routes stay off). Zitadel Action
-//! ingress still needs HTTP, so those two commands get an explicit edge here:
-//! it checks the shared secret and dispatches them through the command ledger
-//! as the ingestor — `POST /todo.create` stays 404 (suite T0).
-//!
-//! Note: `microsvc::router` already applies `.with_state(service)`, so handlers
-//! cannot use `State<Arc<Service>>`. Capture the `Arc` in the route closures.
+//! ingress still needs HTTP, so the service exposes those two commands
+//! through their own edges (`Service::with_http_command` in `compose`): each
+//! checks the shared secret and dispatches as the ingestor. Every other
+//! command path is the service's 404 — `POST /todo.create` (suite T0) — and
+//! never falls through to the UI.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
-use axum::http::{HeaderMap, StatusCode};
-use axum::response::IntoResponse;
-use axum::routing::post;
-use axum::Json;
-use distributed::microsvc::{CausalDispatchError, Service, Session};
-use serde_json::{json, Value};
-
-use crate::handlers::ingestors::{zitadel, zitadel_scrape};
-
-/// The request's headers, for the ingestor's authenticity check only: they
-/// are never the session a command runs with.
-fn session_from_headers(headers: &HeaderMap) -> Session {
-    let mut vars = HashMap::new();
-    for (name, value) in headers.iter() {
-        if let Ok(v) = value.to_str() {
-            vars.insert(name.as_str().to_string(), v.to_string());
-        }
-    }
-    Session::from_map(vars)
-}
-
-/// The HTTP answer of a ledgered command.
-fn command_response(
-    command: &str,
-    result: Result<Value, CausalDispatchError>,
-) -> axum::response::Response {
-    match result {
-        Ok(value) => (StatusCode::OK, Json(value)).into_response(),
-        Err(error) => {
-            let status = StatusCode::from_u16(error.status_code())
-                .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-            if status.is_server_error() {
-                eprintln!("command `{command}` failed: {error}");
-            }
-            let body = json!({ "code": error.code(), "error": error.client_message() });
-            (status, Json(body)).into_response()
-        }
-    }
-}
+use distributed::microsvc::Service;
 
 /// Compose the application's explicit public gateway without opening a listener.
 pub fn gateway_router(
@@ -73,34 +33,16 @@ pub fn gateway_router(
         Route::new("auth-api", RoutePath::prefix("/api/auth"), "ui"),
         Route::new("ui", RoutePath::prefix("/"), "ui"),
     ];
-    for path in [
-        "/zitadel.ingress.v1",
-        "/zitadel.scrape.v1",
-        "/health",
-        "/healthz",
-        "/metrics",
-        "/graphiql",
-    ] {
+    for path in ["/health", "/healthz", "/metrics", "/graphiql"] {
         routes.push(Route::new(
             format!("http-{}", routes.len()),
             RoutePath::prefix(path),
             "service",
         ));
     }
-    // Old HTTP command URLs retain API ownership and cannot become UI HTML.
-    for command in service.command_specs().map_err(std::io::Error::other)? {
-        let path = format!("/{}", command.id);
-        if !routes
-            .iter()
-            .any(|route| route.path == RoutePath::prefix(&path))
-        {
-            routes.push(Route::new(
-                format!("command-{}", routes.len()),
-                RoutePath::exact(path),
-                "closed",
-            ));
-        }
-    }
+    // Every command path is the service's: it answers the exposed Zitadel
+    // commands, and no other command URL can become UI HTML.
+    routes.extend(service.command_gateway_routes("service"));
     let gateway = GatewayConfig {
         bindings: vec![
             Binding::new(
@@ -119,7 +61,6 @@ pub fn gateway_router(
                 },
             ),
             Binding::new("service", BindingKind::Handler),
-            Binding::new("closed", BindingKind::Handler),
         ],
         routes,
     }
@@ -165,35 +106,7 @@ pub fn gateway_router(
         NativeAuth::anonymous()
     };
 
-    let ingress = service.clone();
-    let scrape = service.clone();
-    let service_routes = distributed::microsvc::router(service)
-        .route(
-            "/zitadel.ingress.v1",
-            post(move |headers: HeaderMap, Json(body): Json<Value>| {
-                let svc = ingress.clone();
-                async move {
-                    let caller = session_from_headers(&headers);
-                    command_response(
-                        zitadel::COMMAND,
-                        zitadel::receive(&svc, &caller, body).await,
-                    )
-                }
-            }),
-        )
-        .route(
-            "/zitadel.scrape.v1",
-            post(move |headers: HeaderMap| {
-                let svc = scrape.clone();
-                async move {
-                    let caller = session_from_headers(&headers);
-                    command_response(
-                        zitadel_scrape::COMMAND,
-                        zitadel_scrape::receive(&svc, &caller).await,
-                    )
-                }
-            }),
-        );
+    let service_routes = distributed::microsvc::router(service);
 
     NativeGateway::new(
         gateway,
@@ -202,7 +115,6 @@ pub fn gateway_router(
             ("graphql".into(), graphql),
             ("ui".into(), NativeBinding::UiProxy { websocket: true }),
             ("service".into(), NativeBinding::Handler(service_routes)),
-            ("closed".into(), NativeBinding::Handler(axum::Router::new())),
         ],
         auth,
     )

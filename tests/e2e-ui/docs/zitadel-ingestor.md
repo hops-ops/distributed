@@ -20,6 +20,11 @@ The fixture accepts the ingress secret through
 `x-zitadel-ingestor-secret: <secret>` or
 `Authorization: Bearer <secret>`. A missing or invalid secret returns HTTP 401.
 
+Both commands are exposed with `Service::with_http_command`: each has an HTTP
+edge (`http_edge`) that checks the secret and dispatches the command as the
+ingestor, so no request header reaches it. No other command has an HTTP path;
+`POST /todo.create` is a 404 from the service, not the UI.
+
 ## Start the fixture
 
 ```bash
@@ -40,7 +45,7 @@ curl -sS -X POST "http://127.0.0.1:8791/zitadel.scrape.v1" \
   -d '{}'
 ```
 
-The response reports `{ listed, published, skipped }`.
+The response is `{ payload: { listed, published, skipped }, receipt }`.
 
 ## Verify ingress authentication
 
@@ -77,9 +82,14 @@ curl -sS -X POST "$BASE/zitadel.ingress.v1" \
   }"
 ```
 
-The request publishes `zitadel.user.human.created.v1`. After the outbox drains,
-the corresponding `auth_users` row supplies chat-author and Blob Game owner
-display data.
+The response is `{ payload, receipt }`; `payload.published` names the Zitadel
+event the delivery was (`zitadel.user.human.created.v1`). The command
+publishes the user's profile as a `zitadel.user_profile` external fact
+(`publish_external`) with its ledger receipt. After the outbox drains, the
+`AUTH_USERS` projection (`crates/projections/src/auth_users.rs`) writes the
+`auth_users` row that supplies chat-author and Blob Game owner display data.
+A redelivery of the same `delivery_id` replays the receipt and publishes
+nothing more.
 
 ## Verify GraphQL joins
 
@@ -117,5 +127,6 @@ instead.
 ```bash
 cd tests/e2e-ui
 cargo test -p e2e-service --lib
+cargo test -p e2e-projections --lib
 cargo test -p e2e-readmodels --lib
 ```

@@ -171,8 +171,10 @@ command ledger under its command ID, whichever ingress delivers it:
   projection atomicity;
 - for a browser-facing GraphQL service, bind that exact `Service` through
   `GraphqlEngineBuilder::service` and configure public OIDC. HTTP command
-  routes stay off; browser writes use only the GraphQL command proxy. Call
-  `.with_http_command_routes()` only for an intentional non-GraphQL ingress;
+  routes stay off; browser writes use only the GraphQL command proxy. Expose
+  one command for an intentional non-GraphQL ingress with
+  `.with_http_command(command, edge)` (the edge authenticates the request);
+  call `.with_http_command_routes()` only behind a trusted proxy;
 - generate the strictly typed client with `distributed client`.
 
 Use the `distributed-graphql` skill for the complete route, consistency,

@@ -1,0 +1,5 @@
+# Syntax-only read-model mutation → MutationProgram IR.
+# Not a public GraphQL schema field.
+mutation SaveAuthUser {
+  upsert_auth_users(object: $input.user)
+}

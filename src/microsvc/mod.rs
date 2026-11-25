@@ -154,7 +154,7 @@ mod http;
 #[allow(unused_imports)]
 pub(crate) use http::session_from_headers;
 #[cfg(feature = "http")]
-pub use http::{router, serve};
+pub use http::{command_router, router, serve, HttpCommandDispatch};
 
 // Knative / CloudEvents HTTP ingress (Service-coupled; the bus keeps only the
 // produce/manifest helpers).

@@ -6,13 +6,14 @@
 
 use std::env;
 
+use axum::http::HeaderMap;
 use distributed::command_dispatch::VerifiedPrincipal;
 use distributed::microsvc::{HandlerError, Session, ROLE_KEY, USER_ID_KEY};
 
 /// Env var for the shared secret (required for fixture/curl path).
 pub const SECRET_ENV: &str = "ZITADEL_INGESTOR_SECRET";
 
-/// Preferred Action/HTTP header (lowercase session keys).
+/// Preferred Action/HTTP header.
 pub const SECRET_HEADER: &str = "x-zitadel-ingestor-secret";
 
 /// When `1`/`true`, accept native Actions v2 event envelopes without shared secret.
@@ -54,11 +55,12 @@ pub fn allow_action_events() -> bool {
     )
 }
 
-pub fn presented_secret(session: &Session) -> Option<String> {
-    if let Some(v) = session.get(SECRET_HEADER).filter(|s| !s.is_empty()) {
+pub fn presented_secret(headers: &HeaderMap) -> Option<String> {
+    let header = |name: &str| headers.get(name).and_then(|value| value.to_str().ok());
+    if let Some(v) = header(SECRET_HEADER).filter(|s| !s.is_empty()) {
         return Some(v.to_string());
     }
-    if let Some(auth) = session.get("authorization") {
+    if let Some(auth) = header("authorization") {
         if let Some(token) = auth
             .strip_prefix("Bearer ")
             .or_else(|| auth.strip_prefix("bearer "))
@@ -72,8 +74,11 @@ pub fn presented_secret(session: &Session) -> Option<String> {
     None
 }
 
-pub fn verify_authenticity(session: &Session, is_action_event: bool) -> Result<(), HandlerError> {
-    if let Some(presented) = presented_secret(session) {
+/// Whether the request with `headers` may run an ingestor command: it
+/// presents the configured secret, or it is an Actions v2 event body
+/// (`is_action_event`) and those are allowed.
+pub fn verify_authenticity(headers: &HeaderMap, is_action_event: bool) -> Result<(), HandlerError> {
+    if let Some(presented) = presented_secret(headers) {
         let expected = configured_secret().ok_or_else(|| {
             HandlerError::Unauthorized(format!(
                 "{SECRET_ENV} is not configured; refusing Zitadel ingress"
@@ -110,7 +115,6 @@ pub fn verify_authenticity(session: &Session, is_action_event: bool) -> Result<(
 #[cfg(test)]
 pub(super) mod tests {
     use super::*;
-    use std::collections::HashMap;
     use std::sync::{Mutex, MutexGuard};
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
@@ -161,18 +165,18 @@ pub(super) mod tests {
         f();
     }
 
-    fn session(pairs: &[(&str, &str)]) -> Session {
-        let mut m = HashMap::new();
-        for (k, v) in pairs {
-            m.insert((*k).to_string(), (*v).to_string());
+    fn headers(pairs: &[(&'static str, &str)]) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        for (name, value) in pairs {
+            headers.insert(*name, value.parse().unwrap());
         }
-        Session::from_map(m)
+        headers
     }
 
     #[test]
     fn rejects_when_secret_not_configured() {
         with_env(None, false, || {
-            let err = verify_authenticity(&session(&[(SECRET_HEADER, "x")]), false).unwrap_err();
+            let err = verify_authenticity(&headers(&[(SECRET_HEADER, "x")]), false).unwrap_err();
             assert!(matches!(err, HandlerError::Unauthorized(_)));
         });
     }
@@ -180,14 +184,26 @@ pub(super) mod tests {
     #[test]
     fn accepts_matching_header() {
         with_env(Some("s3cret"), false, || {
-            verify_authenticity(&session(&[(SECRET_HEADER, "s3cret")]), false).unwrap();
+            verify_authenticity(&headers(&[(SECRET_HEADER, "s3cret")]), false).unwrap();
         });
     }
 
     #[test]
     fn accepts_action_event_when_allowed() {
         with_env(None, true, || {
-            verify_authenticity(&Session::new(), true).unwrap();
+            verify_authenticity(&HeaderMap::new(), true).unwrap();
+        });
+    }
+
+    #[test]
+    fn accepts_matching_bearer_and_rejects_a_wrong_secret() {
+        with_env(Some("s3cret"), true, || {
+            verify_authenticity(&headers(&[("authorization", "Bearer s3cret")]), false).unwrap();
+            // A wrong secret is refused even for an allowed Action event body.
+            let err = verify_authenticity(&headers(&[(SECRET_HEADER, "nope")]), true).unwrap_err();
+            assert!(matches!(err, HandlerError::Unauthorized(_)));
+            let err = verify_authenticity(&HeaderMap::new(), false).unwrap_err();
+            assert!(matches!(err, HandlerError::Unauthorized(_)));
         });
     }
 }

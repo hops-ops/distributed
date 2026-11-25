@@ -11,6 +11,7 @@ use crate::modules::projections;
 use e2e_celld_blob as blob;
 use e2e_celld_chat as chat;
 use e2e_celld_identity as identity;
+use e2e_celld_identity::handlers::ingestors::{zitadel, zitadel_scrape};
 use e2e_celld_todo as todo;
 
 /// Explicit module inventory for the celld example (same ids as e2e-ui so the UI client matches).
@@ -60,15 +61,18 @@ where
         projections.chat,
     );
     let blob = blob::routes(repo.clone(), locks, read_models.clone(), projections.blob);
-    let identity = identity::routes(repo, read_models);
+    let identity = identity::routes(repo, read_models, projections.auth);
 
     // GraphQL-only public write surface. POST /todo.* stays 404 (suite T0).
-    // Zitadel Action ingress is the identity crate; `http::serve` gives its
-    // commands an authenticating edge.
+    // Zitadel Action ingress is the identity crate: its two commands are
+    // exposed through edges that check the shared secret and run as the
+    // ingestor (`http::serve` also requires the cell internal secret).
     Service::new()
         .named("e2e-ui")
         .routes(todos)
         .routes(chat)
         .routes(blob)
         .routes(identity)
+        .with_http_command(zitadel::COMMAND, zitadel::http_edge)
+        .with_http_command(zitadel_scrape::COMMAND, zitadel_scrape::http_edge)
 }

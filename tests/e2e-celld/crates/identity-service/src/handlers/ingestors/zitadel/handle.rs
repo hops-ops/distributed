@@ -1,12 +1,14 @@
-//! Command: `zitadel.ingress.v1` — map one provider delivery and publish its
-//! provider message. No aggregate: the message commits with the command's
-//! ledger receipt.
+//! Command: `zitadel.ingress.v1` — map one provider delivery and publish the
+//! user's profile. No aggregate: the profile is an external fact, committed
+//! with the command's ledger receipt and projected into `auth_users`.
 
+use axum::http::HeaderMap;
 use distributed::command::{typed_command, PreparedCommand, Succeeded, TypedCommand};
 use distributed::command_dispatch::deterministic_command_id;
 use distributed::microsvc::{
-    CausalCommandContext, CausalDispatchError, HandlerError, Service, Session,
+    CausalCommandContext, CausalDispatchError, HandlerError, HttpCommandDispatch,
 };
+use distributed::ExternalEventSource;
 use serde::Serialize;
 use serde_json::Value;
 
@@ -14,14 +16,14 @@ use super::auth::{ingestor_principal, ingestor_session, verify_authenticity, ING
 use super::map::{
     looks_like_action_event, map_action_delivery, normalize_ingress_body, ZitadelIngressInput,
 };
-use super::publish::provider_message;
 
 /// Command name, and the path of its HTTP edge (POST `/{COMMAND}`).
 pub const COMMAND: &str = "zitadel.ingress.v1";
 
 #[derive(Debug, Serialize, distributed::CommandOutput)]
 pub struct ZitadelIngressPayload {
-    /// Provider message published; `None` when the event type maps to none.
+    /// Provider event the delivery was; `None` when the event type maps to
+    /// none, and nothing was published.
     pub published: Option<String>,
     /// Why nothing was published.
     pub skipped: Option<String>,
@@ -53,20 +55,26 @@ pub async fn handle(
         .map_err(|error| HandlerError::Other(Box::new(error)));
     };
 
-    // Provider envelope only — the projector maps it to auth_users.
-    let command_id = ctx.message_id().unwrap_or_default();
-    let message = provider_message(format!("{COMMAND}:{command_id}"), &mapped)?;
-    ctx.outbox(message)
+    // The profile is identified by this command: a redelivery is this
+    // command again, and another command never publishes the same fact.
+    let source = ExternalEventSource {
+        producer: COMMAND.into(),
+        stream: ctx.message_id().unwrap_or_default().into(),
+        position: 1,
+        key: mapped.profile.user_id.clone(),
+    };
+    let payload = ZitadelIngressPayload {
+        published: Some(mapped.message_name),
+        skipped: None,
+        event_type: input.event_type,
+        event_id: Some(mapped.delivery_id),
+        provider_subject: Some(mapped.profile.user_id.clone()),
+        user_kind: Some(mapped.profile.user_kind.clone()),
+        approval_status: Some(mapped.profile.approval_status.clone()),
+    };
+    ctx.publish_external(source, mapped.profile)
         .commit()?
-        .succeeded(ZitadelIngressPayload {
-            published: Some(mapped.message_name),
-            skipped: None,
-            event_type: input.event_type,
-            event_id: Some(mapped.delivery_id),
-            provider_subject: Some(mapped.payload.provider_subject),
-            user_kind: Some(mapped.payload.user_kind),
-            approval_status: Some(mapped.payload.approval_status),
-        })
+        .succeeded(payload)
 }
 
 /// The ledger command id of one delivery. Zitadel delivers an event again
@@ -86,15 +94,14 @@ pub fn ingress_command_id(input: &ZitadelIngressInput) -> String {
     }
 }
 
-/// HTTP edge of [`COMMAND`]: authenticate the caller, then dispatch the
-/// delivery as the ingestor. `caller` is the request's headers; none of them
+/// HTTP edge of [`COMMAND`] (`Service::with_http_command`): authenticate the
+/// caller, then dispatch the delivery as the ingestor. No request header
 /// reaches the command.
-pub async fn receive(
-    service: &Service,
-    caller: &Session,
+pub fn http_edge(
+    headers: &HeaderMap,
     body: Value,
-) -> Result<Value, CausalDispatchError> {
-    verify_authenticity(caller, looks_like_action_event(&body))
+) -> Result<HttpCommandDispatch, CausalDispatchError> {
+    verify_authenticity(headers, looks_like_action_event(&body))
         .map_err(CausalDispatchError::Handler)?;
     if body.is_null() {
         return Err(CausalDispatchError::BadRequest(
@@ -105,52 +112,67 @@ pub async fn receive(
     let command_id = ingress_command_id(&input);
     let input = serde_json::to_value(input)
         .map_err(|error| CausalDispatchError::Internal(error.to_string()))?;
-    service
-        .dispatch_causal(
-            COMMAND,
-            &command_id,
-            input,
-            ingestor_session(),
-            ingestor_principal(),
-        )
-        .await
+    Ok(HttpCommandDispatch {
+        command_id,
+        input,
+        session: ingestor_session(),
+        principal: ingestor_principal(),
+    })
 }
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::super::auth::tests::IngestorEnv;
     use super::super::auth::SECRET_HEADER;
-    use super::super::map::HUMAN_CREATED;
     use super::*;
-    use distributed::microsvc::Routes;
+    use distributed::microsvc::{self, Routes, Service};
     use distributed::{InMemoryRepository, OutboxStore};
+    use e2e_projections::ZitadelUserProfile;
     use serde_json::json;
 
-    fn caller(secret: &str) -> Session {
-        let mut caller = Session::new();
-        caller.set(SECRET_HEADER, secret);
-        caller
-    }
-
-    async fn provider_messages(repo: &InMemoryRepository) -> usize {
+    /// The `zitadel.user_profile` facts in the outbox.
+    async fn published_profiles(repo: &InMemoryRepository) -> Vec<ZitadelUserProfile> {
         repo.outbox_store()
             .pending(usize::MAX)
             .await
             .unwrap()
             .iter()
-            .filter(|message| message.event_type == HUMAN_CREATED)
-            .count()
+            .filter_map(|message| message.domain_event_occurrence().ok())
+            .map(|occurrence| occurrence.decode_body().unwrap())
+            .collect()
+    }
+
+    async fn post(base: &str, secret: &str, body: &Value) -> (u16, Value) {
+        let response = reqwest::Client::new()
+            .post(format!("{base}/{COMMAND}"))
+            .header(SECRET_HEADER, secret)
+            // A caller-chosen identity never reaches the command.
+            .header("x-user-id", "attacker")
+            .json(body)
+            .send()
+            .await
+            .unwrap();
+        (response.status().as_u16(), response.json().await.unwrap())
     }
 
     #[tokio::test]
-    async fn a_redelivered_webhook_publishes_one_provider_message() {
+    async fn a_redelivered_webhook_publishes_one_profile() {
         let _env = IngestorEnv::set(Some("s3cret"), false);
         let repo = InMemoryRepository::new();
-        let service = Service::new().named("identity").routes(
-            Routes::for_stores(repo.clone(), repo.clone())
-                .typed_command(command())
-                .handle(handle),
-        );
+        let service = Service::new()
+            .named("identity")
+            .routes(
+                Routes::for_stores(repo.clone(), repo.clone())
+                    .typed_command(command())
+                    .handle(handle),
+            )
+            .with_http_command(COMMAND, http_edge);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let app = microsvc::router(Arc::new(service));
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         let delivery = json!({
             "event_id": "evt-1",
             "event_type": "user.human.created",
@@ -160,29 +182,24 @@ mod tests {
         });
 
         // A caller without the secret runs no command.
-        let refused = receive(&service, &caller("wrong"), delivery.clone()).await;
-        assert!(
-            matches!(
-                refused,
-                Err(CausalDispatchError::Handler(HandlerError::Unauthorized(_)))
-            ),
-            "{refused:?}"
-        );
-        assert_eq!(provider_messages(&repo).await, 0);
+        let (status, refused) = post(&base, "wrong", &delivery).await;
+        assert_eq!(status, 401, "{refused}");
+        assert!(published_profiles(&repo).await.is_empty());
 
-        let first = receive(&service, &caller("s3cret"), delivery.clone())
-            .await
-            .unwrap();
-        assert_eq!(first["published"], HUMAN_CREATED);
-        assert_eq!(first["event_id"], "evt-1");
-        assert_eq!(provider_messages(&repo).await, 1);
+        let (status, first) = post(&base, "s3cret", &delivery).await;
+        assert_eq!(status, 200, "{first}");
+        assert_eq!(first["payload"]["published"], super::super::HUMAN_CREATED);
+        assert_eq!(first["payload"]["event_id"], "evt-1");
+        let profiles = published_profiles(&repo).await;
+        assert_eq!(profiles.len(), 1);
+        assert_eq!(profiles[0].user_id, "sub-1");
+        assert_eq!(profiles[0].display_name, "Ada");
+        assert_eq!(profiles[0].status, "active");
 
         // The provider delivers the event again: the stored receipt answers.
-        let again = receive(&service, &caller("s3cret"), delivery)
-            .await
-            .unwrap();
+        let (_, again) = post(&base, "s3cret", &delivery).await;
         assert_eq!(again, first);
-        assert_eq!(provider_messages(&repo).await, 1);
+        assert_eq!(published_profiles(&repo).await.len(), 1);
 
         // One delivery id for another event is refused, not published.
         let other = json!({
@@ -190,11 +207,8 @@ mod tests {
             "event_type": "user.human.created",
             "user_id": "sub-2",
         });
-        let reused = receive(&service, &caller("s3cret"), other).await;
-        assert!(
-            matches!(reused, Err(CausalDispatchError::CommandIdReuse)),
-            "{reused:?}"
-        );
-        assert_eq!(provider_messages(&repo).await, 1);
+        let (status, reused) = post(&base, "s3cret", &other).await;
+        assert_eq!(status, 409, "{reused}");
+        assert_eq!(published_profiles(&repo).await.len(), 1);
     }
 }

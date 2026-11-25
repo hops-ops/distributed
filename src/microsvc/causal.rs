@@ -326,6 +326,7 @@ pub(crate) struct AggregatePublication {
 struct WorkspaceState {
     aggregates: Vec<StagedAggregate>,
     identities: HashSet<StreamIdentity>,
+    external_events: Vec<crate::DomainEventOccurrence>,
     outbox_messages: Vec<OutboxMessage>,
     read_model_plans: Vec<TableWritePlan>,
     snapshots: Vec<SnapshotWrite>,
@@ -458,6 +459,20 @@ where
 }
 
 impl<A> CausalWorkspace<'_, A> {
+    /// Stage one external fact. Its causation is the ledger's, applied in
+    /// [`CausalWorkspaceParts::prepare_domain_publications`].
+    pub(crate) fn stage_external_event(
+        &self,
+        occurrence: crate::DomainEventOccurrence,
+    ) -> Result<(), CausalWorkspaceError> {
+        self.state
+            .lock()
+            .map_err(|_| CausalWorkspaceError::Poisoned)?
+            .external_events
+            .push(occurrence);
+        Ok(())
+    }
+
     pub(crate) fn stage_outbox(&self, message: OutboxMessage) -> Result<(), CausalWorkspaceError> {
         self.state
             .lock()
@@ -600,6 +615,7 @@ impl<A> CausalWorkspace<'_, A> {
             .map_err(|_| CausalWorkspaceError::Poisoned)?;
         Ok(CausalWorkspaceParts {
             aggregates: state.aggregates,
+            external_events: state.external_events,
             outbox_messages: state.outbox_messages,
             read_model_plans: state.read_model_plans,
             snapshots: state.snapshots,
@@ -618,6 +634,8 @@ impl<A> CausalWorkspace<'_, A> {
 /// construction of the ledger-fenced commit batch.
 pub(crate) struct CausalWorkspaceParts {
     aggregates: Vec<StagedAggregate>,
+    /// External facts staged by the handler, causation not yet applied.
+    external_events: Vec<crate::DomainEventOccurrence>,
     outbox_messages: Vec<OutboxMessage>,
     read_model_plans: Vec<TableWritePlan>,
     snapshots: Vec<SnapshotWrite>,
@@ -696,6 +714,12 @@ impl CausalWorkspaceParts {
                 self.outbox_messages
                     .push(OutboxMessage::from_domain_event_occurrence(&occurrence)?);
             }
+        }
+        for mut occurrence in std::mem::take(&mut self.external_events) {
+            occurrence.overwrite_causation_id(causation_id);
+            self.outbox_messages
+                .push(OutboxMessage::from_domain_event_occurrence(&occurrence)?);
+            self.domain_event_occurrences.push(occurrence);
         }
         Ok(())
     }

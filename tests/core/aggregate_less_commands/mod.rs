@@ -8,7 +8,9 @@
 //! - a second dispatch of one command id replays and stages nothing more;
 //! - a refusal is recorded and replayed, with nothing staged;
 //! - a commit that fails records no receipt;
-//! - a command that stages nothing succeeds.
+//! - a command that stages nothing succeeds;
+//! - an external fact (`publish_external`) is published as a domain-event
+//!   occurrence, identified by its source and caused by the command.
 //!
 //! The scenarios run on the in-memory repository and, with `sqlite`, on a
 //! SQLite file.
@@ -22,11 +24,14 @@ use serde_json::json;
 use distributed::command::{typed_command, PreparedCommand, Succeeded};
 use distributed::command_dispatch::{deterministic_command_id, VerifiedPrincipal};
 use distributed::microsvc::{
-    CausalCommandContext, CausalDispatchError, HandlerError, HasOutboxStore, Routes, Service,
-    Session, ROLE_KEY, USER_ID_KEY,
+    CausalCommandContext, CausalDispatchError, CausalDispatchResult, HandlerError, HasOutboxStore,
+    Routes, Service, Session, ROLE_KEY, USER_ID_KEY,
 };
 use distributed::read_model::ReadModelWritePlanBuilder;
-use distributed::{OutboxMessage, OutboxStore, ReadModel, ReadModelWorkspaceExt, RowKey, RowValue};
+use distributed::{
+    ExternalEventSource, OutboxMessage, OutboxStore, ReadModel, ReadModelWorkspaceExt, RowKey,
+    RowValue,
+};
 
 const RECEIVE: &str = "webhook.receive";
 const SUBJECT: &str = "system:webhook";
@@ -36,9 +41,27 @@ const ROLE: &str = "webhook";
 struct ReceiveInput {
     /// The id of the outbox message the handler stages.
     delivery: String,
-    /// `publish`, `record` (also upserts a read-model row), `nothing` or
-    /// `reject`.
+    /// `publish`, `record` (also upserts a read-model row), `external`
+    /// (publishes [`WebhookReceived`] instead of a raw message), `nothing`
+    /// or `reject`.
     mode: String,
+}
+
+/// The external fact the `external` mode publishes.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, distributed::DomainEvent)]
+#[domain_event(name = "webhook.received", version = 1)]
+struct WebhookReceived {
+    delivery: String,
+}
+
+/// Where the `external` mode's fact comes from: the provider's delivery.
+fn webhook_source(delivery: &str) -> ExternalEventSource {
+    ExternalEventSource {
+        producer: RECEIVE.into(),
+        stream: delivery.into(),
+        position: 1,
+        key: "delivery".into(),
+    }
 }
 
 #[derive(Debug, Serialize, distributed::CommandOutput)]
@@ -92,6 +115,15 @@ async fn receive(
     };
     match input.mode.as_str() {
         "reject" => Err(HandlerError::Rejected("not a delivery we accept".into())),
+        "external" => ctx
+            .publish_external(
+                webhook_source(&input.delivery),
+                WebhookReceived {
+                    delivery: input.delivery.clone(),
+                },
+            )
+            .commit()?
+            .succeeded(payload(true)),
         "nothing" => PreparedCommand::prepare(payload(false))
             .map_err(|error| HandlerError::Other(Box::new(error))),
         "record" => {
@@ -137,11 +169,22 @@ async fn dispatch(
     delivery: &str,
     mode: &str,
 ) -> Result<serde_json::Value, CausalDispatchError> {
+    dispatch_with_receipt(service, command_id, delivery, mode)
+        .await
+        .map(|result| result.payload().clone())
+}
+
+async fn dispatch_with_receipt(
+    service: &Service,
+    command_id: &str,
+    delivery: &str,
+    mode: &str,
+) -> Result<CausalDispatchResult, CausalDispatchError> {
     let mut session = Session::new();
     session.set(USER_ID_KEY, SUBJECT);
     session.set(ROLE_KEY, ROLE);
     service
-        .dispatch_causal(
+        .dispatch_causal_with_receipt(
             RECEIVE,
             command_id,
             json!({ "delivery": delivery, "mode": mode }),
@@ -243,6 +286,59 @@ macro_rules! scenarios {
             }
             assert_eq!(runs(delivery), 1, "the stored rejection answers the retry");
             assert_eq!(staged(&repo.outbox_store(), delivery).await, 0);
+        }
+
+        #[tokio::test]
+        async fn an_external_fact_is_an_occurrence_of_its_source_caused_by_the_command() {
+            let db = $fresh.await;
+            let repo: $repo_ty = db.repo().await;
+            let service = service(repo.clone());
+            let delivery = concat!($backend, "-external");
+            let id = command_id(delivery);
+
+            let result = dispatch_with_receipt(&service, &id, delivery, "external")
+                .await
+                .unwrap();
+            let again = dispatch_with_receipt(&service, &id, delivery, "external")
+                .await
+                .unwrap();
+            assert_eq!(again.causation_id(), result.causation_id());
+            assert_eq!(runs(delivery), 1);
+
+            let published: Vec<_> = repo
+                .outbox_store()
+                .pending(usize::MAX)
+                .await
+                .unwrap()
+                .into_iter()
+                .filter_map(|message| {
+                    let occurrence = message.domain_event_occurrence().ok()?;
+                    (occurrence.external_source() == Some(&webhook_source(delivery)))
+                        .then_some((message, occurrence))
+                })
+                .collect();
+            assert_eq!(published.len(), 1, "one occurrence per source");
+            let (message, occurrence) = &published[0];
+            assert_eq!(message.id(), occurrence.id());
+            assert_eq!(message.event_type, "webhook.received");
+            assert_eq!(occurrence.causation_id(), Some(result.causation_id()));
+            assert_eq!(
+                occurrence.decode_body::<WebhookReceived>().unwrap(),
+                WebhookReceived {
+                    delivery: delivery.into()
+                }
+            );
+
+            // Another command publishing the same source fact is the typed
+            // duplicate: its transaction fails whole, with no receipt.
+            let other = command_id(concat!($backend, "-external-again"));
+            let error = dispatch(&service, &other, delivery, "external")
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(error, CausalDispatchError::Internal(_)),
+                "{error:?}"
+            );
         }
 
         #[tokio::test]

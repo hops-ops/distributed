@@ -22,7 +22,11 @@ pub enum RepositoryError {
     DuplicateStreamInBatch {
         id: String,
     },
-    DuplicateOutboxMessageInBatch {
+    /// An outbox message id is repeated within the batch, or was already
+    /// committed. The whole batch rolls back. Message ids are the publication
+    /// identity, so a producer that derives them from its input (a command id,
+    /// a source position) can treat this as "already published".
+    DuplicateOutboxMessage {
         id: String,
     },
     /// A consumer inbox receipt `(consumer, message_id)` was already recorded.
@@ -135,7 +139,7 @@ impl RepositoryError {
             }
             RepositoryError::LockPoisoned(_)
             | RepositoryError::DuplicateStreamInBatch { .. }
-            | RepositoryError::DuplicateOutboxMessageInBatch { .. }
+            | RepositoryError::DuplicateOutboxMessage { .. }
             | RepositoryError::DuplicateInboxReceipt { .. }
             | RepositoryError::InvalidInboxReceipt { .. }
             | RepositoryError::CausalWriteRequired { .. }
@@ -171,8 +175,8 @@ impl fmt::Display for RepositoryError {
             RepositoryError::DuplicateStreamInBatch { id } => {
                 write!(f, "duplicate stream id in commit batch: {}", id)
             }
-            RepositoryError::DuplicateOutboxMessageInBatch { id } => {
-                write!(f, "duplicate outbox message id in commit batch: {}", id)
+            RepositoryError::DuplicateOutboxMessage { id } => {
+                write!(f, "duplicate outbox message id: {}", id)
             }
             RepositoryError::DuplicateInboxReceipt {
                 consumer,

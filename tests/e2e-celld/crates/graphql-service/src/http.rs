@@ -4,7 +4,6 @@
 //! shared secret or process-local, not a user Bearer. User writes stay on
 //! `/graphql`.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use axum::extract::{Request, State};
@@ -18,37 +17,8 @@ use distributed::cell_host::{InternalHttpSecret, CELL_INTERNAL_SECRET_HEADER};
 use distributed::command_dispatch::SharedCommandHost;
 use distributed::gateway::{native::*, *};
 use distributed::graphql::identity::OidcGatewayProvider;
-use distributed::microsvc::{CausalDispatchError, Service, Session};
-use e2e_celld_identity::handlers::ingestors::{zitadel, zitadel_scrape};
-use serde_json::{json, Value};
-
-/// The request's headers, for the ingestor's authenticity check only: they
-/// are never the session a command runs with.
-fn session_from_headers(headers: &HeaderMap) -> Session {
-    let mut vars = HashMap::new();
-    for (name, value) in headers.iter() {
-        if let Ok(v) = value.to_str() {
-            vars.insert(name.as_str().to_string(), v.to_string());
-        }
-    }
-    Session::from_map(vars)
-}
-
-/// The HTTP answer of a ledgered command.
-fn command_response(command: &str, result: Result<Value, CausalDispatchError>) -> Response {
-    match result {
-        Ok(value) => (StatusCode::OK, Json(value)).into_response(),
-        Err(error) => {
-            let status = StatusCode::from_u16(error.status_code())
-                .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-            if status.is_server_error() {
-                eprintln!("command `{command}` failed: {error}");
-            }
-            let body = json!({ "code": error.code(), "error": error.client_message() });
-            (status, Json(body)).into_response()
-        }
-    }
-}
+use distributed::microsvc::{self, Service};
+use serde_json::json;
 
 async fn require_internal(
     State(secret): State<InternalHttpSecret>,
@@ -88,8 +58,6 @@ pub async fn serve(
     let engine = service
         .graphql_engine()
         .ok_or_else(|| std::io::Error::other("serve requires GraphQL"))?;
-    let ingress = service.clone();
-    let scrape = service.clone();
     let commands: Vec<String> = service
         .command_names()
         .into_iter()
@@ -108,33 +76,10 @@ pub async fn serve(
             async move { Json(body) }
         }),
     );
-    let mut internal = Router::new()
-        .route(
-            "/zitadel.ingress.v1",
-            post(move |headers: HeaderMap, Json(body): Json<Value>| {
-                let svc = ingress.clone();
-                async move {
-                    let caller = session_from_headers(&headers);
-                    command_response(
-                        zitadel::COMMAND,
-                        zitadel::receive(&svc, &caller, body).await,
-                    )
-                }
-            }),
-        )
-        .route(
-            "/zitadel.scrape.v1",
-            post(move |headers: HeaderMap| {
-                let svc = scrape.clone();
-                async move {
-                    let caller = session_from_headers(&headers);
-                    command_response(
-                        zitadel_scrape::COMMAND,
-                        zitadel_scrape::receive(&svc, &caller).await,
-                    )
-                }
-            }),
-        );
+    // The commands the service exposes (the Zitadel ingress and scrape, each
+    // through its own edge) and the Queue relay are internal: the cell
+    // secret first, then each edge's own check.
+    let mut internal = microsvc::command_router(service.clone()).with_state(service.clone());
     internal = internal.route(
         CELLD_QUEUE_RELAY_PATH,
         post(move |Json(envelope): Json<CelldQueueEnvelope>| {
@@ -168,28 +113,16 @@ pub async fn serve(
         Route::new("graphql", RoutePath::prefix("/graphql"), "graphql"),
         Route::new("ui", RoutePath::prefix("/"), "ui"),
     ];
-    for path in [
-        "/health",
-        "/zitadel.ingress.v1",
-        "/zitadel.scrape.v1",
-        CELLD_QUEUE_RELAY_PATH,
-    ] {
+    for path in ["/health", CELLD_QUEUE_RELAY_PATH] {
         routes.push(Route::new(
             format!("service-{}", routes.len()),
             RoutePath::exact(path),
             "service",
         ));
     }
-    for command in service.command_names() {
-        let path = RoutePath::exact(format!("/{command}"));
-        if !routes.iter().any(|route| route.path == path) {
-            routes.push(Route::new(
-                format!("closed-{}", routes.len()),
-                path,
-                "closed",
-            ));
-        }
-    }
+    // Every command path is the service's: it answers the exposed Zitadel
+    // commands, and no other command URL can become UI HTML.
+    routes.extend(service.command_gateway_routes("service"));
     let gateway = GatewayConfig {
         bindings: vec![
             Binding::new(
@@ -208,7 +141,6 @@ pub async fn serve(
                 },
             ),
             Binding::new("service", BindingKind::Handler),
-            Binding::new("closed", BindingKind::Handler),
         ],
         routes,
     }
@@ -238,7 +170,6 @@ pub async fn serve(
             ),
             ("ui".into(), NativeBinding::UiProxy { websocket: true }),
             ("service".into(), NativeBinding::Handler(app)),
-            ("closed".into(), NativeBinding::Handler(Router::new())),
         ],
         auth,
     )

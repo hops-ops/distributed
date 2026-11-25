@@ -3,10 +3,11 @@ name = "e2e-celld-identity"
 version.workspace = true
 edition.workspace = true
 publish = false
-description = "Zitadel identity ingestor + AuthUsers projector (in-process; not a cell)"
+description = "Zitadel identity ingestor + AuthUsers projection (in-process; not a cell)"
 
 [dependencies]
 distributed = { workspace = true }
+axum = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }

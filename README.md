@@ -378,8 +378,10 @@ Service::new()
 ```
 
 HTTP `POST /{command}` is **off by default**. Browser writes use the
-GraphQL command proxy. Call `.with_http_command_routes()` only for an
-intentional non-GraphQL ingress.
+GraphQL command proxy. For an intentional non-GraphQL ingress (a provider
+webhook), expose that one command with `.with_http_command(command, edge)`:
+its edge authenticates the request and returns what to dispatch. Call
+`.with_http_command_routes()` only behind a trusted proxy.
 
 ### 08 · Browser replica
 
@@ -1678,6 +1680,31 @@ curl -X POST http://localhost:3000/counter.initialize \
 
 curl http://localhost:3000/health
 ```
+
+To expose one command without trusting any header, give it an edge with `Service::with_http_command`. The edge sees the request headers and JSON body (`null` when empty) and returns an `HttpCommandDispatch { command_id, input, session, principal }`, or a `CausalDispatchError` (a 401 for a bad secret). The command runs through the ledger like any other dispatch, with only the session the edge built, and answers `{ payload, receipt }`. No other command path is mounted. Behind a gateway, `Service::command_gateway_routes(binding)` (feature `gateway`) gives every command path to the service binding, so an unexposed one is the service's 404 rather than a UI page:
+
+```rust,ignore
+fn webhook_edge(
+    headers: &HeaderMap,
+    body: Value,
+) -> Result<HttpCommandDispatch, CausalDispatchError> {
+    verify_shared_secret(headers)?;
+    Ok(HttpCommandDispatch {
+        command_id: delivery_command_id(&body),
+        input: body,
+        session: webhook_session(),
+        principal: VerifiedPrincipal::internal("system:webhook").expect("a subject"),
+    })
+}
+
+let service = Service::new()
+    .named("identity")
+    .routes(routes)
+    .with_http_command("webhook.receive", webhook_edge);
+gateway_routes.extend(service.command_gateway_routes("service"));
+```
+
+`microsvc::command_router(service)` is the command paths alone, to compose under your own router and middleware.
 
 The command ID is a client-created UUIDv7: retrying a request with the same ID
 replays the committed receipt. A command needs an authenticated user

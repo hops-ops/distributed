@@ -98,6 +98,7 @@ fn build_engine(
             projections.todo.into(),
             projections.chat.into(),
             projections.blob.into(),
+            projections.auth.into(),
         ])
         .identity(identity)
         .graphiql(graphiql);
@@ -145,6 +146,7 @@ fn pool_free_full_surface() -> Surface {
             projections.todo.into(),
             projections.chat.into(),
             projections.blob.into(),
+            projections.auth.into(),
         ])
         .expect("e2e-ui projector topology should bind")
         .with_service(&service)
