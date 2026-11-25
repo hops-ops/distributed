@@ -182,7 +182,7 @@ mod client_contract {
     use distributed::command::{typed_command, Eventual, PreparedCommand};
     use distributed::graphql::{
         build_surface, read, surface_for_role, ClientProjectionPreviewSource,
-        ClientProjectionValue, DistributedClientSurfaceExport, SurfaceOptions,
+        DistributedClientSurfaceExport, SurfaceOptions,
     };
     use distributed::microsvc::{CausalCommandContext, HandlerError, Routes, Service};
     use distributed::projection::lower::{EventualOnly, ProjectionDescriptor};
@@ -427,8 +427,8 @@ mod client_contract {
             .preview_occurrences
             .iter()
             .any(|occurrence| occurrence.values.iter().any(
-                |field| matches!(&field.source, ClientProjectionPreviewSource::Constant {
-                value: ClientProjectionValue::String(status) } if status == "archived")
+                |field| matches!(&field.source, ClientProjectionPreviewSource::Constant { value }
+                    if value.as_ref() == distributed::projection::ProjectionValueRef::String("archived"))
             )));
     }
 
@@ -478,8 +478,8 @@ mod client_contract {
         let projection = manifest.commands[0].extensions.projection.as_ref().unwrap();
         assert_eq!(projection.preview_occurrences.len(), 1);
         assert!(projection.preview_occurrences[0].values.iter().any(
-            |field| matches!(&field.source, ClientProjectionPreviewSource::Constant {
-                value: ClientProjectionValue::String(status) } if status == "approved")
+            |field| matches!(&field.source, ClientProjectionPreviewSource::Constant { value }
+                    if value.as_ref() == distributed::projection::ProjectionValueRef::String("approved"))
         ));
         assert!(projection.preview_occurrences[0].values.iter().any(|field|
             matches!(&field.source, ClientProjectionPreviewSource::Input { path } if path == &["id"])));

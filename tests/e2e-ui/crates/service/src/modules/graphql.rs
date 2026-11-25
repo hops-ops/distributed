@@ -295,7 +295,8 @@ mod client_surface_tests {
 
     #[test]
     fn todo_commands_auto_derive_optimism_without_applies() {
-        use distributed::graphql::{ClientProjectionPreviewSource, ClientProjectionValue};
+        use distributed::graphql::ClientProjectionPreviewSource;
+        use distributed::projection::ProjectionValueRef;
 
         let manifest = distributed_client_surface().manifest().unwrap();
         let create = manifest
@@ -342,9 +343,8 @@ mod client_surface_tests {
         assert!(
             sources.iter().any(|source| matches!(
                 source,
-                ClientProjectionPreviewSource::Constant {
-                    value: ClientProjectionValue::String(value),
-                } if value == "open"
+                ClientProjectionPreviewSource::Constant { value }
+                    if value.as_ref() == ProjectionValueRef::String("open")
             )),
             "create status must come from the sourced transition: {sources:?}"
         );
@@ -408,9 +408,8 @@ mod client_surface_tests {
             assert!(
                 status_sources.iter().any(|source| matches!(
                     source,
-                    ClientProjectionPreviewSource::Constant {
-                        value: ClientProjectionValue::String(value),
-                    } if value == expected_status
+                    ClientProjectionPreviewSource::Constant { value }
+                        if value.as_ref() == ProjectionValueRef::String(expected_status)
                 )),
                 "{mutation_field} status must come from the sourced transition: {status_sources:?}"
             );

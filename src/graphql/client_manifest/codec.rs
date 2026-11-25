@@ -325,7 +325,7 @@ pub(super) fn hash_json(value: &impl Serialize) -> Result<String, ClientManifest
 /// enabled serde_json's `preserve_order` feature in the final Cargo graph.
 /// Client-manifest bytes must be identical in the server harness and the
 /// distributed CLI.
-pub(super) fn canonical_json_value(value: serde_json::Value) -> serde_json::Value {
+pub fn canonical_json_value(value: serde_json::Value) -> serde_json::Value {
     match value {
         serde_json::Value::Array(values) => {
             serde_json::Value::Array(values.into_iter().map(canonical_json_value).collect())
@@ -341,7 +341,8 @@ pub(super) fn canonical_json_value(value: serde_json::Value) -> serde_json::Valu
     }
 }
 
-pub(super) fn hash_bytes(bytes: &[u8]) -> String {
+/// The manifest's fingerprint format, `sha256:<lowercase hex>`, of `bytes`.
+pub fn hash_bytes(bytes: &[u8]) -> String {
     let digest = Sha256::digest(bytes);
     format!("sha256:{digest:x}")
 }

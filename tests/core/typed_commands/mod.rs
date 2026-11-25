@@ -18,8 +18,8 @@ use distributed::graphql::{
     build_surface, graphql_router_with_service, read, surface_for_role, ClientProjectionAssignment,
     ClientProjectionExpression, ClientProjectionFallback, ClientProjectionInvalidation,
     ClientProjectionMutationKind, ClientProjectionPartition, ClientProjectionPreviewSource,
-    ClientProjectionValue, DistributedClientSurfaceExport, GraphqlEngine, ModelPermissions,
-    SurfaceDirectProjection, SurfaceModeledProjection, SurfaceOptions, SurfaceProjector,
+    DistributedClientSurfaceExport, GraphqlEngine, ModelPermissions, SurfaceDirectProjection,
+    SurfaceModeledProjection, SurfaceOptions, SurfaceProjector,
 };
 use distributed::microsvc::Session;
 use distributed::microsvc::{
@@ -1952,10 +1952,8 @@ async fn nonfinite_float_constant_is_rejected_but_explicit_null_is_portable() {
     assert!(matches!(
         value,
         ClientProjectionAssignment::Set {
-            expression: ClientProjectionExpression::Constant {
-                value: ClientProjectionValue::Null
-            }
-        }
+            expression: ClientProjectionExpression::Constant { value }
+        } if value.is_null()
     ));
 }
 
@@ -1995,10 +1993,8 @@ async fn json_backed_constants_reject_nonfinite_floats_but_preserve_json_null() 
     assert!(matches!(
         value,
         ClientProjectionAssignment::Set {
-            expression: ClientProjectionExpression::Constant {
-                value: ClientProjectionValue::Null
-            }
-        }
+            expression: ClientProjectionExpression::Constant { value }
+        } if value.is_null()
     ));
 }
 

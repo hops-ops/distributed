@@ -489,7 +489,7 @@ fn operation_projection_occurrence_and_recovery_limits_accept_128_and_reject_129
 
 #[test]
 fn wire_decode_streams_no_more_than_128_top_level_delta_items() {
-    let recovery = ProjectionDeltaRecovery {
+    let recovery: ProjectionDeltaRecovery = ProjectionDeltaRecovery {
         occurrence_ordinal: 0,
         projection_refs: vec![0],
         condition: ProjectionDeltaRecoveryCondition::Always,

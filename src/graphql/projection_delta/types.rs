@@ -559,12 +559,18 @@ pub struct ProjectionDeltaOccurrence {
 }
 
 /// A complete normalized-record scope.
+///
+/// `V` is the field value and `P` the partition. The server delta carries
+/// concrete [`DeltaValue`]s and opaque partitions; the client compiler's
+/// command preview carries symbolic input expressions in the same shape, so
+/// one canonical merge ([`canonicalize_operations`](super::canonicalize_operations))
+/// serves both.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct ProjectionDeltaScope {
-    pub partition: ProjectionDeltaPartition,
+pub struct ProjectionDeltaScope<V = DeltaValue, P = ProjectionDeltaPartition> {
+    pub partition: P,
     pub model: String,
-    pub key: Vec<DeltaKeyField>,
+    pub key: Vec<DeltaKeyField<V>>,
 }
 
 impl ProjectionDeltaScope {
@@ -605,18 +611,18 @@ impl ProjectionDeltaPartition {
 /// One authorized component of a composite normalized key.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct DeltaKeyField {
+pub struct DeltaKeyField<V = DeltaValue> {
     pub ordinal: u32,
     pub field: String,
-    pub value: DeltaValue,
+    pub value: V,
 }
 
 /// One authorized record-field assignment.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct DeltaField {
+pub struct DeltaField<V = DeltaValue> {
     pub field: String,
-    pub value: DeltaValue,
+    pub value: V,
 }
 
 /// Strict tagged value. Null is a value; omitted fields are unknown; unset is
@@ -773,58 +779,55 @@ pub(crate) struct AuthorizationTransition {
 /// One final operation with exact contributing projection identities.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct ProjectionDeltaOperation {
+pub struct ProjectionDeltaOperation<V = DeltaValue, P = ProjectionDeltaPartition> {
     pub occurrence_ordinal: u32,
     pub projection_refs: Vec<u32>,
-    pub mutation: ProjectionDeltaMutation,
+    pub mutation: ProjectionDeltaMutation<V, P>,
 }
 
 /// Closed portable client mutation set.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
-pub enum ProjectionDeltaMutation {
+#[serde(bound(deserialize = "V: Deserialize<'de>, P: Deserialize<'de>"))]
+pub enum ProjectionDeltaMutation<V = DeltaValue, P = ProjectionDeltaPartition> {
     Upsert {
-        scope: ProjectionDeltaScope,
-        fields: Vec<DeltaField>,
+        scope: ProjectionDeltaScope<V, P>,
+        fields: Vec<DeltaField<V>>,
         replace: Vec<String>,
     },
     Patch {
-        scope: ProjectionDeltaScope,
+        scope: ProjectionDeltaScope<V, P>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
-        set: Vec<DeltaField>,
+        set: Vec<DeltaField<V>>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         unset: Vec<String>,
         if_present: bool,
     },
     Delete {
-        scope: ProjectionDeltaScope,
+        scope: ProjectionDeltaScope<V, P>,
     },
     Link {
         relationship: String,
-        source: ProjectionDeltaScope,
-        target: ProjectionDeltaScope,
+        source: ProjectionDeltaScope<V, P>,
+        target: ProjectionDeltaScope<V, P>,
     },
     Unlink {
         relationship: String,
-        source: ProjectionDeltaScope,
-        target: ProjectionDeltaScope,
+        source: ProjectionDeltaScope<V, P>,
+        target: ProjectionDeltaScope<V, P>,
     },
     InvalidateModel {
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        partition: Option<ProjectionDeltaPartition>,
+        partition: Option<P>,
         model: String,
     },
     InvalidateRelationship {
         relationship: String,
-        source: ProjectionDeltaScope,
+        source: ProjectionDeltaScope<V, P>,
     },
 }
 
 impl ProjectionDeltaOperation {
-    pub(crate) fn occurrence_ordinal(&self) -> u32 {
-        self.occurrence_ordinal
-    }
-
     pub(crate) fn validate(
         &self,
         projection_count: usize,
@@ -902,8 +905,10 @@ impl ProjectionDeltaOperation {
         }
         Ok(())
     }
+}
 
-    pub(crate) fn canonical_scope(&self) -> OperationScope {
+impl<V: Clone, P: Clone> ProjectionDeltaOperation<V, P> {
+    pub(crate) fn canonical_scope(&self) -> OperationScope<V, P> {
         match &self.mutation {
             ProjectionDeltaMutation::Upsert { scope, .. }
             | ProjectionDeltaMutation::Patch { scope, .. }
@@ -938,37 +943,37 @@ impl ProjectionDeltaOperation {
         }
     }
 
-    pub(crate) fn canonical_order(&self) -> (OperationScope, u32) {
-        (self.canonical_scope(), self.occurrence_ordinal())
+    pub(crate) fn canonical_order(&self) -> (OperationScope<V, P>, u32) {
+        (self.canonical_scope(), self.occurrence_ordinal)
     }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) enum OperationScope {
-    Record(ProjectionDeltaScope),
+pub(crate) enum OperationScope<V, P> {
+    Record(ProjectionDeltaScope<V, P>),
     Edge {
         relationship: String,
-        source: ProjectionDeltaScope,
-        target: ProjectionDeltaScope,
+        source: ProjectionDeltaScope<V, P>,
+        target: ProjectionDeltaScope<V, P>,
     },
     Model {
-        partition: Option<ProjectionDeltaPartition>,
+        partition: Option<P>,
         model: String,
     },
     Relationship {
         relationship: String,
-        source: ProjectionDeltaScope,
+        source: ProjectionDeltaScope<V, P>,
     },
 }
 
 /// A conservative client recovery request.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct ProjectionDeltaRecovery {
+pub struct ProjectionDeltaRecovery<V = DeltaValue, P = ProjectionDeltaPartition> {
     pub occurrence_ordinal: u32,
     pub projection_refs: Vec<u32>,
     pub condition: ProjectionDeltaRecoveryCondition,
-    pub target: ProjectionDeltaRecoveryTarget,
+    pub target: ProjectionDeltaRecoveryTarget<V, P>,
 }
 
 /// When a conservative recovery is applied by the client.
@@ -996,8 +1001,10 @@ impl ProjectionDeltaRecovery {
         }
         self.target.validate()
     }
+}
 
-    pub(crate) fn canonical_order(&self) -> (ProjectionDeltaRecoveryTarget, u32) {
+impl<V: Clone, P: Clone> ProjectionDeltaRecovery<V, P> {
+    pub(crate) fn canonical_order(&self) -> (ProjectionDeltaRecoveryTarget<V, P>, u32) {
         (self.target.clone(), self.occurrence_ordinal)
     }
 }
@@ -1005,17 +1012,18 @@ impl ProjectionDeltaRecovery {
 /// Narrowest safely addressable recovery scope.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
-pub enum ProjectionDeltaRecoveryTarget {
+#[serde(bound(deserialize = "V: Deserialize<'de>, P: Deserialize<'de>"))]
+pub enum ProjectionDeltaRecoveryTarget<V = DeltaValue, P = ProjectionDeltaPartition> {
     Record {
-        scope: ProjectionDeltaScope,
+        scope: ProjectionDeltaScope<V, P>,
     },
     Relationship {
         relationship: String,
-        source: ProjectionDeltaScope,
+        source: ProjectionDeltaScope<V, P>,
     },
     Model {
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        partition: Option<ProjectionDeltaPartition>,
+        partition: Option<P>,
         model: String,
     },
 }

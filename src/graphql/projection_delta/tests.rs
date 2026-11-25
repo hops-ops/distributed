@@ -2466,7 +2466,6 @@ fn sparse_patch_program_preview_lowers_to_conditional_patch_with_missing_record_
 fn selected_manifest_exposes_partition_expression_and_projection_field_slots() {
     use crate::graphql::client_manifest::{
         ClientProjectionAssignment, ClientProjectionExpression, ClientProjectionPartition,
-        ClientProjectionValue,
     };
 
     let fixture = modeled_fixture(
@@ -2484,10 +2483,8 @@ fn selected_manifest_exposes_partition_expression_and_projection_field_slots() {
     assert!(matches!(
         &arm.partition,
         ClientProjectionPartition::Expression {
-            expression: ClientProjectionExpression::Constant {
-                value: ClientProjectionValue::String(value)
-            }
-        } if value == "tenant-a"
+            expression: ClientProjectionExpression::Constant { value }
+        } if value == &crate::ProjectionValue::string("tenant-a")
     ));
 
     let operation = &arm.operations[0];

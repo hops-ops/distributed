@@ -17,7 +17,7 @@ pub const MAX_PROJECTION_PATH_SEGMENTS: usize = 32;
 ///
 /// Delivery metadata, clocks, tracing, and workflow headers are intentionally
 /// excluded so retries and execution placement cannot change a result.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProjectionEnvelopeField {
     /// Canonical occurrence-envelope version.
@@ -50,6 +50,20 @@ pub enum ProjectionEnvelopeField {
     AggregateSequence,
     /// Publication position within the aggregate sequence.
     PublicationOrdinal,
+}
+
+impl ProjectionEnvelopeField {
+    /// Whether a client knows this field from the command alone (the
+    /// envelope version and the event's name and version), so a client
+    /// manifest may carry it as an envelope expression. Every other field is
+    /// known only once the server writes the event, and a manifest carries it
+    /// as an opaque typed slot.
+    pub fn is_client_intrinsic(self) -> bool {
+        matches!(
+            self,
+            Self::OccurrenceVersion | Self::EventName | Self::EventVersion
+        )
+    }
 }
 
 /// Version-one deterministic scalar transforms.
@@ -95,12 +109,22 @@ pub enum ProjectionValueType {
 }
 
 /// One canonical literal used by a portable projection expression.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+///
+/// Its serde form is the client wire's tagged value
+/// (`{"type":"u64","value":"7"}`). Deserializing accepts only canonical
+/// values: decimal numbers as Rust prints them, object members sorted and
+/// unique, nesting within [`MAX_PROJECTION_EXPRESSION_DEPTH`].
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 #[serde(transparent)]
 pub struct ProjectionValue(ProjectionValueKind);
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
-#[serde(tag = "type", content = "value", rename_all = "snake_case")]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(
+    tag = "type",
+    content = "value",
+    rename_all = "snake_case",
+    deny_unknown_fields
+)]
 enum ProjectionValueKind {
     Null,
     Boolean(bool),
@@ -114,7 +138,8 @@ enum ProjectionValueKind {
 }
 
 /// One canonical object member of a resolved portable value.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProjectionObjectValueField {
     name: String,
     value: ProjectionValue,
@@ -160,7 +185,52 @@ pub enum ProjectionValueRef<'a> {
     Object(&'a [ProjectionObjectValueField]),
 }
 
+impl<'de> Deserialize<'de> for ProjectionValue {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        // Children deserialize through this impl first, so each node checks
+        // only itself and the depth of the subtree below it.
+        let value = Self(ProjectionValueKind::deserialize(deserializer)?);
+        value
+            .validate_canonical()
+            .map_err(serde::de::Error::custom)?;
+        Ok(value)
+    }
+}
+
 impl ProjectionValue {
+    fn validate_canonical(&self) -> Result<(), ProjectionProgramError> {
+        let canonical = match &self.0 {
+            ProjectionValueKind::I64(text) => text
+                .parse::<i64>()
+                .is_ok_and(|value| value.to_string() == *text),
+            ProjectionValueKind::U64(text) => text
+                .parse::<u64>()
+                .is_ok_and(|value| value.to_string() == *text),
+            ProjectionValueKind::F64(text) => text.parse::<f64>().is_ok_and(|value| {
+                Self::try_float(value).is_ok_and(|canonical| canonical == *self)
+            }),
+            ProjectionValueKind::Object(fields) => {
+                fields.windows(2).all(|pair| pair[0].name < pair[1].name)
+            }
+            _ => true,
+        };
+        if !canonical {
+            return Err(ProjectionProgramError::CanonicalJson(
+                "projection value numbers must be canonical decimal text and object members \
+                 sorted and unique"
+                    .to_owned(),
+            ));
+        }
+        let depth = portable_value_depth(self, 1);
+        if depth > MAX_PROJECTION_EXPRESSION_DEPTH {
+            return Err(ProjectionProgramError::ExpressionTooDeep {
+                depth,
+                max: MAX_PROJECTION_EXPRESSION_DEPTH,
+            });
+        }
+        Ok(())
+    }
+
     /// Validate and construct a canonical JSON-compatible literal.
     ///
     /// # Errors
@@ -231,7 +301,9 @@ impl ProjectionValue {
         }
     }
 
-    pub(crate) fn valid_key_component(&self) -> bool {
+    /// Whether this value may be one component of a record key: a non-null
+    /// scalar.
+    pub fn valid_key_component(&self) -> bool {
         matches!(
             self.0,
             ProjectionValueKind::Boolean(_)
@@ -250,8 +322,12 @@ impl ProjectionValue {
         }
     }
 
-    fn enum_variant(enum_type: String, variant: String) -> Self {
-        Self(ProjectionValueKind::Enum { enum_type, variant })
+    /// Construct a typed enum literal.
+    pub fn enum_variant(enum_type: impl Into<String>, variant: impl Into<String>) -> Self {
+        Self(ProjectionValueKind::Enum {
+            enum_type: enum_type.into(),
+            variant: variant.into(),
+        })
     }
 
     fn list(values: Vec<Self>) -> Self {
@@ -1085,5 +1161,73 @@ mod borrowed_view_tests {
             fields[0].value().as_ref(),
             ProjectionExpressionRef::BodyPath { .. }
         ));
+    }
+}
+
+#[cfg(test)]
+mod value_wire_tests {
+    use super::*;
+
+    fn parse(json: &str) -> Result<ProjectionValue, serde_json::Error> {
+        serde_json::from_str(json)
+    }
+
+    #[test]
+    fn canonical_values_round_trip_through_the_wire_form() {
+        let value = ProjectionValue::try_from_json(serde_json::json!({
+            "b": [1, -2, 1.5, "x", null, true],
+            "a": {}
+        }))
+        .unwrap();
+        let wire = serde_json::to_string(&value).unwrap();
+        assert_eq!(parse(&wire).unwrap(), value);
+        assert_eq!(
+            parse(r#"{"type":"enum","value":{"enum_type":"Status","variant":"OPEN"}}"#).unwrap(),
+            ProjectionValue::enum_variant("Status", "OPEN")
+        );
+    }
+
+    #[test]
+    fn non_canonical_values_are_refused() {
+        for json in [
+            r#"{"type":"u64","value":"01"}"#,
+            r#"{"type":"u64","value":"-1"}"#,
+            r#"{"type":"i64","value":"+1"}"#,
+            r#"{"type":"f64","value":"1.50"}"#,
+            r#"{"type":"f64","value":"-0.0"}"#,
+            r#"{"type":"f64","value":"NaN"}"#,
+            r#"{"type":"object","value":[{"name":"b","value":{"type":"null"}},{"name":"a","value":{"type":"null"}}]}"#,
+            r#"{"type":"object","value":[{"name":"a","value":{"type":"null"}},{"name":"a","value":{"type":"null"}}]}"#,
+            r#"{"type":"null","extra":1}"#,
+        ] {
+            assert!(parse(json).is_err(), "{json} must be refused");
+        }
+    }
+
+    #[test]
+    fn value_depth_is_bounded() {
+        let nested = |depth: usize| {
+            let mut json = r#"{"type":"null"}"#.to_owned();
+            for _ in 1..depth {
+                json = format!(r#"{{"type":"list","value":[{json}]}}"#);
+            }
+            json
+        };
+        assert!(parse(&nested(MAX_PROJECTION_EXPRESSION_DEPTH)).is_ok());
+        assert!(parse(&nested(MAX_PROJECTION_EXPRESSION_DEPTH + 1)).is_err());
+    }
+
+    #[test]
+    fn only_command_known_envelope_fields_are_client_intrinsic() {
+        let intrinsic = [
+            ProjectionEnvelopeField::OccurrenceVersion,
+            ProjectionEnvelopeField::EventName,
+            ProjectionEnvelopeField::EventVersion,
+        ];
+        for field in intrinsic {
+            assert!(field.is_client_intrinsic());
+        }
+        assert!(!ProjectionEnvelopeField::OccurrenceId.is_client_intrinsic());
+        assert!(!ProjectionEnvelopeField::AggregateSequence.is_client_intrinsic());
     }
 }
