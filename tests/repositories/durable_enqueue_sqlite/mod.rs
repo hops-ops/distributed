@@ -80,7 +80,6 @@ async fn assert_published_and_drained(store: &impl OutboxStore, bus: &InMemoryBu
                 OutboxMessageStatus::Pending,
                 OutboxMessageStatus::InFlight,
                 OutboxMessageStatus::Failed,
-                OutboxMessageStatus::Published,
             ] {
                 remaining += store.messages_by_status(status, 8).await.unwrap().len();
             }

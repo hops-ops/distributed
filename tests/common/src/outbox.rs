@@ -11,7 +11,6 @@ where
     for status in [
         OutboxMessageStatus::Pending,
         OutboxMessageStatus::InFlight,
-        OutboxMessageStatus::Published,
         OutboxMessageStatus::Failed,
     ] {
         let messages = outbox

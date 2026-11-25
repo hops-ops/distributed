@@ -334,13 +334,9 @@ pub use saga::{
 pub use schedule::{Capabilities, Capability, Schedule, ScheduleWrite};
 
 // Outbox: commit concerns (aggregate + outbox in one commit).
-//
-// Low-level row plumbing (`outbox_message_insert_plan`, `outbox_message_row_values`)
-// stays reachable under `distributed::outbox::*` and is intentionally NOT re-exported
-// at the crate root — it is an adapter-authoring detail, not part of the quick-start API.
 pub use outbox::{
-    outbox_message_key, outbox_message_schema, AggregateCommit, CommitReceipt, OutboxMessage,
-    OutboxMessageStatus, OutboxPublisherConfig, OUTBOX_MESSAGES_TABLE,
+    outbox_message_schema, AggregateCommit, CommitReceipt, OutboxMessage, OutboxMessageStatus,
+    OutboxPublisherConfig, OUTBOX_MESSAGES_TABLE,
 };
 
 // Outbox Worker: drain and publish concerns.

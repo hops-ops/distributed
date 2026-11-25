@@ -176,7 +176,6 @@ mod tests {
                     OutboxMessageStatus::Pending,
                     OutboxMessageStatus::InFlight,
                     OutboxMessageStatus::Failed,
-                    OutboxMessageStatus::Published,
                 ] {
                     remaining += store.messages_by_status(status, 8).await.unwrap().len();
                 }

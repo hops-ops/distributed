@@ -71,7 +71,6 @@ async fn load_outbox_message(repo: &InMemoryRepository, id: &str) -> Option<Outb
     for status in [
         OutboxMessageStatus::Pending,
         OutboxMessageStatus::InFlight,
-        OutboxMessageStatus::Published,
         OutboxMessageStatus::Failed,
     ] {
         if let Some(message) = store

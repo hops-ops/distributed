@@ -7,6 +7,7 @@ mod bomberman;
 mod celld;
 mod e2e_ui_celld_nats_profile;
 mod microsvc;
+#[cfg(feature = "runtime-tokio")]
 mod saga_transfer;
 mod sagas;
 mod todos;

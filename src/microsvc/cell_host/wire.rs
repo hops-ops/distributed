@@ -269,7 +269,7 @@ mod tests {
         )
         .expect("selected");
         selected.set_causation_id("causation-1");
-        selected.status = crate::OutboxMessageStatus::Published;
+        selected.status = crate::OutboxMessageStatus::InFlight;
         selected.attempts = 7;
         selected.worker_id = Some("queue-worker".into());
 

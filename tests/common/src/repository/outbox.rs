@@ -1,5 +1,5 @@
 use std::sync::Mutex;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use distributed::bus::{Message, MessagePublisher, TransportError};
 use distributed::{
@@ -542,6 +542,11 @@ impl MessagePublisher for DownPublisher {
 
 /// With the broker down, a backlog stays pending however often it is tried,
 /// and each failure pushes the next attempt further out.
+///
+/// Every store claims and releases against the wall clock, recording the next
+/// attempt as release time plus `OUTBOX_RETRY.delay(attempts)`. The test
+/// checks that recorded instant against timestamps taken around each pass and
+/// waits for it, so no assertion depends on how long a pass takes.
 pub async fn broker_outage_keeps_the_backlog_pending_with_growing_delay<R, S>(repo: R, outbox: S)
 where
     R: GetStream + TransactionalCommit + Clone + Send + Sync + 'static,
@@ -562,30 +567,104 @@ where
         1,
     );
 
+    let before = SystemTime::now();
     let first = dispatcher.dispatch_ids(&ids).await.expect("first pass");
+    let after = SystemTime::now();
     assert_eq!((first.released, first.failed), (4, 0));
+    let first_retry = next_attempts(&outbox, &ids, 1, before, after).await;
 
-    // Released rows are not claimable until their backoff has passed, so an
-    // immediate second pass does not spin on them.
+    // Released rows are not claimable before their next attempt, so a pass
+    // right away does not spin on them: it may claim only rows that were
+    // already due when it returned (none, unless the pass itself was slow).
     let at_once = dispatcher.dispatch_ids(&ids).await.expect("immediate pass");
-    assert_eq!(at_once.claimed, 0, "released rows wait before the next try");
+    let probed_by = SystemTime::now();
+    let due = first_retry.iter().filter(|at| **at <= probed_by).count();
+    assert!(
+        at_once.claimed <= due,
+        "claimed {} rows before their next attempt ({due} were due)",
+        at_once.claimed
+    );
+    assert_eq!(at_once.released, at_once.claimed);
 
-    tokio::time::sleep(OUTBOX_RETRY.delay(1) + Duration::from_millis(30)).await;
-    let second = dispatcher.dispatch_ids(&ids).await.expect("second pass");
-    assert_eq!((second.released, second.failed), (4, 0));
-
-    // The second failure waits longer than the first did.
-    tokio::time::sleep(OUTBOX_RETRY.delay(1) + Duration::from_millis(30)).await;
-    let too_soon = dispatcher.dispatch_ids(&ids).await.expect("early pass");
-    assert_eq!(too_soon.claimed, 0, "the delay grows with each failure");
-
-    for id in &ids {
+    // The rows the immediate pass left alone (all of them, unless it was
+    // slow) are tried again once their next attempt has passed, and released
+    // with the next, longer delay.
+    let mut untouched = Vec::new();
+    for (id, at) in ids.iter().zip(&first_retry) {
         let row = find_outbox_by_id(&outbox, id)
             .await
             .expect("the row is still owed");
-        assert_eq!(row.status, OutboxMessageStatus::Pending);
-        assert_eq!(row.attempts, 2);
+        if row.attempts == 1 {
+            untouched.push((id.clone(), *at));
+        }
     }
+    assert_eq!(untouched.len(), ids.len() - at_once.claimed);
+    let retry_ids: Vec<String> = untouched.iter().map(|(id, _)| id.clone()).collect();
+    sleep_until(
+        untouched
+            .iter()
+            .map(|(_, at)| *at)
+            .max()
+            .unwrap_or(probed_by),
+    )
+    .await;
+    let before = SystemTime::now();
+    let second = dispatcher
+        .dispatch_ids(&retry_ids)
+        .await
+        .expect("second pass");
+    let after = SystemTime::now();
+    assert_eq!((second.released, second.failed), (retry_ids.len(), 0));
+    let second_retry = next_attempts(&outbox, &retry_ids, 2, before, after).await;
+    assert!(OUTBOX_RETRY.delay(2) > OUTBOX_RETRY.delay(1));
+    for ((_, first), second) in untouched.iter().zip(&second_retry) {
+        assert!(
+            *second >= *first + OUTBOX_RETRY.delay(2),
+            "the delay grows with each failure"
+        );
+    }
+}
+
+/// The recorded next attempt of each row, checked to be its release time
+/// (between `before` and `after`) plus the backoff for `attempts`.
+async fn next_attempts<S: OutboxStore>(
+    outbox: &S,
+    ids: &[String],
+    attempts: u32,
+    before: SystemTime,
+    after: SystemTime,
+) -> Vec<SystemTime> {
+    let mut next = Vec::new();
+    for id in ids {
+        let row = find_outbox_by_id(outbox, id)
+            .await
+            .expect("the row is still owed");
+        assert_eq!(row.status, OutboxMessageStatus::Pending);
+        assert_eq!(row.attempts, attempts);
+        let at = row
+            .available_at()
+            .expect("a released row records its next attempt");
+        assert_retry_between(at, attempts, before, after);
+        next.push(at);
+    }
+    next
+}
+
+fn assert_retry_between(at: SystemTime, attempts: u32, before: SystemTime, after: SystemTime) {
+    // Stores keep timestamps to the microsecond (Postgres) or as a float
+    // (SQLite): allow a millisecond of rounding either way.
+    let slack = Duration::from_millis(1);
+    let delay = OUTBOX_RETRY.delay(attempts);
+    assert!(
+        at + slack >= before + delay && at <= after + delay + slack,
+        "next attempt {at:?} is not release time + {delay:?} (released between {before:?} and {after:?})"
+    );
+}
+
+/// Sleep until the wall clock (what every store claims against) passes `at`.
+async fn sleep_until(at: SystemTime) {
+    let remaining = at.duration_since(SystemTime::now()).unwrap_or_default();
+    tokio::time::sleep(remaining + Duration::from_millis(5)).await;
 }
 
 /// A failed row goes back in the queue with a fresh attempt count, and only

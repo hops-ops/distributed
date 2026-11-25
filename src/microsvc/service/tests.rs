@@ -2066,13 +2066,8 @@ async fn causal_dispatch_uses_the_configured_immediate_outbox_publisher() {
     })
     .await
     .expect("immediate publish should settle the causal outbox row");
-    assert!(outbox.pending(usize::MAX).await.unwrap().is_empty());
-    let published = outbox
-        .messages_by_status(crate::outbox::OutboxMessageStatus::Published, usize::MAX)
-        .await
-        .unwrap();
     assert!(
-        published.is_empty(),
+        outbox.pending(usize::MAX).await.unwrap().is_empty(),
         "delivered messages are deleted, not retained as evidence"
     );
     let stream = repository

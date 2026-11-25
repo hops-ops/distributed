@@ -10,8 +10,6 @@ use crate::outbox::OutboxMessage;
 
 /// Message name of a participant's reply to a saga command.
 pub const SAGA_REPLY: &str = "saga-reply";
-/// Message name of a saga's own scheduled timeout.
-pub const SAGA_TIMEOUT: &str = "saga-timeout";
 
 /// Metadata key: saga aggregate type.
 pub const META_SAGA_TYPE: &str = "saga-type";
@@ -27,7 +25,7 @@ pub const META_ATTEMPT: &str = "saga-attempt";
 pub const META_MEMBER: &str = "saga-member";
 /// Metadata key: where replies must be sent.
 pub const META_REPLY_TO: &str = "saga-reply-to";
-/// Metadata key: id of the command a reply/timeout belongs to.
+/// Metadata key: id of the command a reply belongs to.
 pub const META_COMMAND_ID: &str = "saga-command-id";
 /// Metadata key on replies: `succeeded` / `failed`.
 pub const META_OUTCOME: &str = "saga-outcome";
@@ -50,7 +48,7 @@ impl SagaPhase {
         }
     }
 
-    fn parse(value: &str) -> Result<Self, SagaError> {
+    pub(super) fn parse(value: &str) -> Result<Self, SagaError> {
         match value {
             "action" => Ok(SagaPhase::Action),
             "compensation" => Ok(SagaPhase::Compensation),
@@ -61,18 +59,17 @@ impl SagaPhase {
     }
 }
 
-/// What an inbound saga message reports.
+/// What a participant's reply reports.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SagaSignal {
     /// The participant applied the command; `output` is its reply payload.
     Succeeded { output: Vec<u8> },
     /// The participant rejected the command (a definitive "did not apply").
     Failed { reason: String },
-    /// The saga's own timer fired before a reply arrived.
-    TimedOut,
 }
 
-/// An inbound message addressed to a saga (a reply or a timeout).
+/// A participant's reply addressed to a saga. Timeouts are not messages:
+/// they fire through the saga's schedule ([`SagaTimeouts`](super::SagaTimeouts)).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SagaMessage {
     /// Transport message id — the dedupe key.
@@ -90,7 +87,7 @@ pub struct SagaMessage {
 impl SagaMessage {
     /// Whether a message name is one a saga consumes.
     pub fn is_saga_message(name: &str) -> bool {
-        name == SAGA_REPLY || name == SAGA_TIMEOUT
+        name == SAGA_REPLY
     }
 
     /// Parse from transport parts (works for outbox rows and bus messages).
@@ -111,7 +108,6 @@ impl SagaMessage {
             return Err(SagaError::Malformed("saga message has no id".into()));
         }
         let signal = match name {
-            SAGA_TIMEOUT => SagaSignal::TimedOut,
             SAGA_REPLY => match get(META_OUTCOME)? {
                 OUTCOME_SUCCEEDED => SagaSignal::Succeeded {
                     output: payload.to_vec(),

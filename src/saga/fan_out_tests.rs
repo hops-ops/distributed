@@ -1,5 +1,6 @@
-//! Fan-out steps: N commands to N cells decided at run time, per-member
-//! timeouts, compensation of only the applied members, and replay.
+//! Fan-out steps: N commands to N cells decided at run time, one deadline
+//! that times out every unanswered member, compensation of only the applied
+//! members, and replay.
 
 use std::collections::BTreeMap;
 use std::time::{Duration, SystemTime};
@@ -8,10 +9,12 @@ use serde::{Deserialize, Serialize};
 
 use super::{
     Saga, SagaAction, SagaCommand, SagaDefinition, SagaError, SagaMessage, SagaOutcome, SagaPhase,
-    SagaReply, SagaRunner, SagaStatus, SagaStep, MAX_SAGA_FAN_OUT, META_MEMBER, SAGA_TIMEOUT,
+    SagaReply, SagaRunner, SagaStatus, SagaStep, SagaTimeout, SagaTransition, MAX_SAGA_FAN_OUT,
+    META_MEMBER, SAGA_TIMEOUT_SCHEDULE,
 };
 use crate::outbox::OutboxMessage;
-use crate::{InMemoryRepository, ManualClock};
+use crate::schedule::ScheduleWrite;
+use crate::{InMemoryRepository, ManualClock, StreamIdentity};
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 struct MatchStart {
@@ -26,6 +29,7 @@ struct StartMatch;
 impl SagaDefinition for StartMatch {
     const SAGA_TYPE: &'static str = "test.match_start";
     const REPLY_TO: &'static str = "match-start-saga";
+    const TIMEOUT_COMMAND: &'static str = "test.match_start.timeout";
     type Data = MatchStart;
 
     fn steps() -> &'static [SagaStep] {
@@ -94,17 +98,20 @@ fn data(n: usize) -> MatchStart {
 }
 
 fn commands(messages: &[OutboxMessage]) -> Vec<&OutboxMessage> {
-    messages
-        .iter()
-        .filter(|message| message.event_type != SAGA_TIMEOUT)
-        .collect()
+    messages.iter().collect()
 }
 
-fn timers(messages: &[OutboxMessage]) -> Vec<&OutboxMessage> {
-    messages
-        .iter()
-        .filter(|message| message.event_type == SAGA_TIMEOUT)
-        .collect()
+/// The timeout a transition armed, as its schedule will fire it.
+fn armed(transition: &SagaTransition) -> (SystemTime, SagaTimeout) {
+    let Some(ScheduleWrite::Arm(schedule)) = &transition.timer else {
+        panic!("expected an armed timeout, got {:?}", transition.timer);
+    };
+    assert_eq!(schedule.name(), SAGA_TIMEOUT_SCHEDULE);
+    assert_eq!(schedule.command(), StartMatch::TIMEOUT_COMMAND);
+    (
+        schedule.due().unwrap(),
+        serde_json::from_value(schedule.input().clone()).unwrap(),
+    )
 }
 
 fn succeeded(command: &OutboxMessage, output: &str) -> SagaMessage {
@@ -121,10 +128,6 @@ fn failed(command: &OutboxMessage, reason: &str) -> SagaMessage {
         .failed(reason)
         .unwrap();
     SagaMessage::from_outbox(&reply).unwrap()
-}
-
-fn timed_out(timer: &OutboxMessage) -> SagaMessage {
-    SagaMessage::from_outbox(timer).unwrap()
 }
 
 fn member(message: &OutboxMessage) -> usize {
@@ -156,7 +159,12 @@ fn fan_out_of_one_to_sixteen_members_completes() {
         let started = saga.start("m1", data(n), now()).unwrap();
         let sent = commands(&started.messages);
         assert_eq!(sent.len(), n, "n={n}");
-        assert_eq!(timers(&started.messages).len(), n, "one timer per member");
+        let (due, _) = armed(&started);
+        assert_eq!(
+            due,
+            now() + Duration::from_secs(5),
+            "one deadline for every member"
+        );
         let cursor = saga.cursor().unwrap();
         assert_eq!(cursor.fan_out, n as u32);
         for (index, command) in sent.iter().enumerate() {
@@ -186,10 +194,16 @@ fn fan_out_of_one_to_sixteen_members_completes() {
         }
         let confirm = commands(&next);
         assert_eq!(confirm.len(), 1);
+        assert!(saga.cursor().is_some_and(|c| c.step == 1));
         assert_eq!(confirm[0].event_type, "match.confirm");
         assert!(!confirm[0].metadata.contains_key(META_MEMBER));
-        saga.handle(&succeeded(confirm[0], "ok"), now()).unwrap();
+        let completed = saga.handle(&succeeded(confirm[0], "ok"), now()).unwrap();
         assert_eq!(saga.status(), SagaStatus::Completed);
+        assert_eq!(
+            completed.timer,
+            Some(ScheduleWrite::Cancel(SAGA_TIMEOUT_SCHEDULE.into())),
+            "a finished saga cancels its timeout"
+        );
         assert_eq!(saga.data().reserved.len(), n);
         assert_eq!(saga.data().reserved[&0], "ticket-0");
         assert!(saga.data().confirmed);
@@ -204,6 +218,7 @@ fn one_rejection_compensates_only_the_applied_members() {
     for index in [0, 1] {
         let transition = saga.handle(&succeeded(&sent[index], "t"), now()).unwrap();
         assert!(transition.messages.is_empty());
+        assert_eq!(transition.timer, None, "the deadline stays armed");
     }
     // A rejection does not settle the step while member 3 and 4 are pending:
     // their outcome must be known before choosing what to compensate.
@@ -232,45 +247,43 @@ fn one_rejection_compensates_only_the_applied_members() {
 }
 
 #[test]
-fn members_time_out_individually_and_late_replies_are_ignored() {
+fn the_deadline_times_out_every_unanswered_member_and_late_replies_are_ignored() {
     let mut saga = Saga::<StartMatch>::new();
     let started = saga.start("m3", data(3), now()).unwrap();
     let sent: Vec<OutboxMessage> = commands(&started.messages).into_iter().cloned().collect();
-    let member_timers: Vec<OutboxMessage> =
-        timers(&started.messages).into_iter().cloned().collect();
-    assert_eq!(member(&member_timers[1]), 1);
+    let (due, timeout) = armed(&started);
+    assert_eq!(due, now() + Duration::from_secs(5));
     assert_eq!(
-        member_timers[1].deliver_at,
-        Some(now() + Duration::from_secs(5))
+        (
+            timeout.saga_id.as_str(),
+            timeout.step.as_str(),
+            timeout.attempt
+        ),
+        ("m3", "reserve", 1)
     );
 
     saga.handle(&succeeded(&sent[0], "t"), now()).unwrap();
-    let timeout = timed_out(&member_timers[1]);
+    saga.handle(&succeeded(&sent[2], "t"), now()).unwrap();
+    // Member 1 never answered: the deadline times it out and settles the step.
+    let settled = saga.time_out(&timeout, due).unwrap();
+    assert_eq!(settled.outcome, SagaOutcome::Applied);
+    let failure = saga.failure().unwrap().clone();
+    assert!(failure.timed_out);
+    assert!(failure.reason.contains("1 member(s) timed out"));
+    let (_, compensation) = armed(&settled);
+    assert_eq!(compensation.phase, SagaPhase::Compensation.as_str());
+    // The same timeout fired again (a replayed schedule) changes nothing.
     assert_eq!(
-        saga.handle(&timeout, now()).unwrap().outcome,
-        SagaOutcome::Applied
+        saga.time_out(&timeout, due).unwrap().outcome,
+        SagaOutcome::Ignored
     );
-    assert_eq!(
-        saga.handle(&timeout, now()).unwrap().outcome,
-        SagaOutcome::Duplicate
-    );
-    // The participant answers after its timer fired: ignored.
+    // The participant answers after its deadline: ignored.
     assert_eq!(
         saga.handle(&succeeded(&sent[1], "late"), now())
             .unwrap()
             .outcome,
         SagaOutcome::Ignored
     );
-    // Member 0's timer after its reply: ignored.
-    assert_eq!(
-        saga.handle(&timed_out(&member_timers[0]), now())
-            .unwrap()
-            .outcome,
-        SagaOutcome::Ignored
-    );
-    let settled = saga.handle(&succeeded(&sent[2], "t"), now()).unwrap();
-    let failure = saga.failure().unwrap();
-    assert!(failure.timed_out);
     // The timed-out member may have applied: it is compensated too.
     assert_eq!(drain_compensations(&mut saga, settled.messages), [2, 1, 0]);
     assert_eq!(saga.status(), SagaStatus::Compensated);
@@ -286,6 +299,30 @@ fn members_time_out_individually_and_late_replies_are_ignored() {
             .outcome,
         SagaOutcome::Ignored,
         "a terminal saga ignores stragglers"
+    );
+}
+
+#[test]
+fn a_compensation_deadline_retries_then_marks_the_saga_stuck() {
+    let mut saga = Saga::<StartMatch>::new();
+    let started = saga.start("m11", data(1), now()).unwrap();
+    let sent = commands(&started.messages)[0].clone();
+    let settled = saga.handle(&succeeded(&sent, "t"), now()).unwrap();
+    let confirm = commands(&settled.messages)[0].clone();
+    let mut transition = saga.handle(&failed(&confirm, "zone full"), now()).unwrap();
+    for attempt in 1..=StartMatch::MAX_COMPENSATION_ATTEMPTS {
+        let (due, timeout) = armed(&transition);
+        assert_eq!(
+            (timeout.phase.as_str(), timeout.attempt),
+            ("compensation", attempt)
+        );
+        transition = saga.time_out(&timeout, due).unwrap();
+        assert_eq!(transition.outcome, SagaOutcome::Applied);
+    }
+    assert_eq!(saga.status(), SagaStatus::Stuck);
+    assert_eq!(
+        transition.timer,
+        Some(ScheduleWrite::Cancel(SAGA_TIMEOUT_SCHEDULE.into()))
     );
 }
 
@@ -377,33 +414,52 @@ async fn replaying_the_saga_stream_reproduces_fan_out_state() {
     let started = runner.start("m10", data(4)).await.unwrap();
     live.start("m10", data(4), now()).unwrap();
     let sent: Vec<OutboxMessage> = commands(&started.messages).into_iter().cloned().collect();
-    let member_timers: Vec<OutboxMessage> =
-        timers(&started.messages).into_iter().cloned().collect();
+    let (_, timeout) = armed(&started);
+    let owner = StreamIdentity::new(StartMatch::SAGA_TYPE, "m10").unwrap();
+    let repo = runner.repository().repo().clone();
+    assert_eq!(repo.armed_schedules(&owner).unwrap().len(), 1);
+
+    enum Inbound {
+        Reply(SagaMessage),
+        Timeout(SagaTimeout),
+    }
     let mut inbound = vec![
-        succeeded(&sent[0], "a"),
-        failed(&sent[1], "left"),
-        timed_out(&member_timers[2]),
-        succeeded(&sent[2], "late"),
-        succeeded(&sent[3], "d"),
+        Inbound::Reply(succeeded(&sent[0], "a")),
+        Inbound::Reply(failed(&sent[1], "left")),
+        Inbound::Reply(succeeded(&sent[3], "d")),
+        Inbound::Timeout(timeout),
+        Inbound::Reply(succeeded(&sent[2], "late")),
     ];
     let mut checkpoints = 0;
     while !inbound.is_empty() {
-        let message = inbound.remove(0);
-        let committed = runner.handle(&message).await.unwrap();
-        let expected = live.handle(&message, now()).unwrap();
+        let (committed, expected, message_id) = match inbound.remove(0) {
+            Inbound::Reply(message) => (
+                runner.handle(&message).await.unwrap(),
+                live.handle(&message, now()).unwrap(),
+                Some(message.message_id),
+            ),
+            Inbound::Timeout(timeout) => {
+                let mut saga = runner.get("m10").await.unwrap().unwrap();
+                let committed = saga.time_out(&timeout, now()).unwrap();
+                runner.commit(&mut saga, &committed).await.unwrap();
+                (committed, live.time_out(&timeout, now()).unwrap(), None)
+            }
+        };
         assert_eq!(committed.outcome, expected.outcome);
+        assert_eq!(committed.timer, expected.timer);
         for command in commands(&committed.messages) {
-            inbound.push(succeeded(command, "released"));
+            inbound.push(Inbound::Reply(succeeded(command, "released")));
         }
         let replayed = runner.get("m10").await.unwrap().unwrap();
         assert_eq!(format!("{replayed:?}"), format!("{live:?}"));
         assert_eq!(replayed.data(), live.data());
         assert_eq!(replayed.fan_out(), live.fan_out());
         assert_eq!(replayed.cursor(), live.cursor());
-        assert!(
-            replayed.has_processed(&message.message_id)
-                || committed.outcome != SagaOutcome::Applied
-        );
+        if let Some(message_id) = message_id {
+            assert!(
+                replayed.has_processed(&message_id) || committed.outcome != SagaOutcome::Applied
+            );
+        }
         checkpoints += 1;
     }
     let replayed = runner.get("m10").await.unwrap().unwrap();
@@ -413,4 +469,8 @@ async fn replaying_the_saga_stream_reproduces_fan_out_state() {
         [0, 3]
     );
     assert!(checkpoints >= 8);
+    assert!(
+        repo.armed_schedules(&owner).unwrap().is_empty(),
+        "the compensated saga cancelled its timeout"
+    );
 }
