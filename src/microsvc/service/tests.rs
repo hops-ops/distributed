@@ -4760,3 +4760,68 @@ async fn a_closed_lifecycle_gate_refuses_writes_on_every_transport() {
         crate::microsvc::GraphqlServiceBindError::LifecycleMismatch
     );
 }
+
+#[derive(Debug, Deserialize, crate::CommandInput)]
+struct StampedInput {
+    id: String,
+    at: String,
+}
+
+#[derive(Serialize, crate::CommandOutput)]
+struct StampedOutput {
+    id: String,
+    at: String,
+}
+
+#[tokio::test]
+async fn now_input_default_is_the_host_clock_never_the_callers_value() {
+    use std::time::{Duration, UNIX_EPOCH};
+
+    let clock = crate::ManualClock::new(UNIX_EPOCH + Duration::from_millis(1_700_000_000_123));
+    let repository = InMemoryRepository::new().with_clock(clock.clone());
+    let routes = Routes::for_stores(repository.clone(), repository)
+        .typed_command(
+            typed_command::<StampedInput, Succeeded<StampedOutput>>("stamp.now").input_defaults(
+                crate::command::__command_input_defaults(vec![
+                    crate::command::__input_default_now::<
+                        StampedInput,
+                        __DistributedStampedInputEffectInputField_at,
+                    >(),
+                ]),
+            ),
+        )
+        .handle(
+            |_context: &CausalCommandContext<'_, ()>, input: StampedInput| async move {
+                Ok(PreparedCommand::prepare(StampedOutput {
+                    id: input.id,
+                    at: input.at,
+                })
+                .unwrap())
+            },
+        );
+    let service = command_service(routes);
+    let command_id = causal_test_command_id();
+    let dispatch = |at: &'static str| {
+        service.dispatch_causal(
+            "stamp.now",
+            &command_id,
+            json!({ "id": "a", "at": at }),
+            Session::new(),
+            causal_test_principal(),
+        )
+    };
+
+    let first = dispatch("1").await.unwrap();
+    assert_eq!(first, json!({ "id": "a", "at": "1700000000123" }));
+
+    // A retry of the same command carries the same preview value: it replays
+    // the stored outcome even though the clock moved, never a new stamp or a
+    // command-id conflict.
+    clock.advance(Duration::from_secs(60));
+    assert_eq!(dispatch("1").await.unwrap(), first);
+    // A different submitted input under the same id is still a conflict.
+    assert!(matches!(
+        dispatch("2").await,
+        Err(CausalDispatchError::CommandIdReuse)
+    ));
+}

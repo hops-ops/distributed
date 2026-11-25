@@ -51,13 +51,13 @@ import {
 	requireCommandRejectionEnvelope
 } from './lib/transport.js';
 import { defineBoundCommand, freezeCommandTree } from './lib/binding.js';
+import { sendCommand } from './lib/sent.js';
 import { requireStatusEnvelope, validateStatusProgression } from './lib/status.js';
 import { ReplicaCommandRuntimeError } from './errors.js';
 import {
 	replicaCommandAuthority,
 	replicaCommandFreshness,
 	replicaCommandProjectionDelta,
-	replicaCommandProjectedLifecycle,
 	replicaCommandReadRecord,
 	replicaResultObservation
 } from './symbols.js';
@@ -1491,9 +1491,6 @@ export function createReplicaCommandRuntime<
 		let projected:
 			| Promise<ReplicaCommandProjectedOutcome<TOutput>>
 			| undefined;
-		let projectionLifecycle:
-			| Promise<ReplicaCommandProjectedOutcome<TOutput>>
-			| undefined;
 		if (prepared.consistency === 'atomic') {
 			if (metadata.state !== 'atomic') {
 				statusTracker.state = metadata.state;
@@ -1574,10 +1571,6 @@ export function createReplicaCommandRuntime<
 						);
 					}
 				}
-				projectionLifecycle =
-					controller.promise as Promise<
-						ReplicaCommandProjectedOutcome<TOutput>
-					>;
 				projected = callerProjectedPromise(
 					controller,
 					callOptions.signal
@@ -1597,14 +1590,6 @@ export function createReplicaCommandRuntime<
 			status: readStatus,
 			...(projected === undefined ? {} : { projected })
 		};
-		if (projectionLifecycle !== undefined) {
-			Object.defineProperty(receiptValue, replicaCommandProjectedLifecycle, {
-				value: projectionLifecycle,
-				enumerable: false,
-				configurable: false,
-				writable: false
-			});
-		}
 		const receipt = Object.freeze(
 			receiptValue
 		) as ReplicaCommandReceipt<TOutput>;
@@ -1621,16 +1606,28 @@ export function createReplicaCommandRuntime<
 		unknown
 	>;
 	for (const { key, artifact } of inventory) {
+		const defaults = artifact.inputDefaults?.defaults;
+		const send = (
+			input: unknown,
+			callOptions: ReplicaCommandCallOptions<unknown>
+		) =>
+			sendCommand(
+				defaults,
+				artifact.input.kind !== 'none',
+				input,
+				callOptions,
+				(sent, options) => invoke(artifact, sent, options)
+			);
 		defineBoundCommand(
 			commands,
 			key,
 			artifact.input.kind === 'none'
 				? (callOptions: ReplicaCommandCallOptions<unknown> = {}) =>
-						invoke(artifact, undefined, callOptions)
+						send(undefined, callOptions)
 				: (
 						input: unknown,
 						callOptions: ReplicaCommandCallOptions<unknown> = {}
-					) => invoke(artifact, input, callOptions)
+					) => send(input, callOptions)
 		);
 	}
 	freezeCommandTree(commands);

@@ -74,6 +74,50 @@ impl CanonicalCommandInput {
         format!("sha256:{}", hex_digest(&self.digest))
     }
 
+    /// Overwrite every `now()` input default with the host clock, as canonical
+    /// unix milliseconds.
+    ///
+    /// The digest keeps identifying the input the caller submitted: a retry of
+    /// the same command id carries the same client preview value and must not
+    /// look like a different command because the server clock moved. Every
+    /// other consumer (decode, effects, the command message) sees the stamped
+    /// value, so the caller's clock never reaches stored state.
+    pub(crate) fn stamp_now(
+        mut self,
+        defaults: &[super::CommandInputDefault],
+        now: Option<std::time::SystemTime>,
+    ) -> Result<Self, CommandInputError> {
+        let mut stamped = false;
+        for default in defaults {
+            if default.generator != super::InputDefaultGenerator::Now {
+                continue;
+            }
+            let [field] = default.path.as_slice() else {
+                return Err(CommandInputError::configuration(
+                    "now() default must target one top-level field",
+                ));
+            };
+            let now = now.ok_or_else(|| {
+                CommandInputError::configuration("now() default requires the host clock")
+            })?;
+            let millis = now
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_err(|_| CommandInputError::configuration("host clock is before 1970"))?
+                .as_millis();
+            let Value::Object(object) = &mut self.wire else {
+                return Err(CommandInputError::at("$", "must be an object"));
+            };
+            object.insert(field.clone(), Value::String(millis.to_string()));
+            stamped = true;
+        }
+        if stamped {
+            self.bytes = serde_json::to_vec(&self.wire).map_err(|error| {
+                CommandInputError::at("$", format!("cannot be canonically encoded: {error}"))
+            })?;
+        }
+        Ok(self)
+    }
+
     /// Decode the retained wire value exactly once into the route's registered
     /// Rust input type while keeping that same wire/hash for effects and ledger
     /// completion. This intentionally never serializes `I` back to JSON.

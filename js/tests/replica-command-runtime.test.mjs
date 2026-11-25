@@ -1447,6 +1447,11 @@ test('draining lifecycle live frames keep polling while pending and retire only 
 			},
 			status(request) {
 				statusCalls += 1;
+				// Status is durable and monotonic: a poll issued after the terminal
+				// frame can never report the earlier state. Polls back off on a
+				// timer (25 ms, then 75 ms, ...), so one may land while this test
+				// drives the live frames; hold it so it cannot race them.
+				if (terminalObserved) return new Promise(() => undefined);
 				return Promise.resolve(
 					statusEnvelope(
 						request,
@@ -3447,4 +3452,119 @@ test('offline outbox: optimistic command waits offline, drains in order and surf
 	assert.equal(factory.store('runtime-outbox', 'command-outbox').size, 0);
 	runtime.dispose();
 	persistence.close();
+});
+
+const ID_DEFAULT = Object.freeze({
+	version: 1,
+	defaults: Object.freeze([
+		Object.freeze({ path: Object.freeze(['id']), generator: 'uuid_v7' })
+	])
+});
+const UUID_V7 = /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+
+test('a command call holds its command id and generated input before dispatch settles', async () => {
+	const replica = new TestReplica();
+	const requests = [];
+	const runtime = createReplicaCommandRuntime(
+		replica,
+		{ dispatch: async (request) => (requests.push(request), envelope(request)) },
+		{ change: Object.freeze({ ...artifact(), inputDefaults: ID_DEFAULT }) }
+	);
+	const call = runtime.commands.change({ title: 'drafted' });
+	assert.match(call.commandId, UUID_V7);
+	assert.match(call.input.id, UUID_V7);
+	assert.equal(call.input.title, 'drafted');
+	assert.ok(Object.isFrozen(call));
+	// The preview row is keyed by the id the caller already holds.
+	assert.equal(replica.record(call.input.id).fields.title, 'drafted');
+	const receipt = await call;
+	assert.equal(receipt.commandId, call.commandId);
+	assert.equal(requests[0].variables.commandId, call.commandId);
+	assert.equal(requests[0].variables.input.id, call.input.id);
+
+	// An explicit value is sent as given and never regenerated.
+	const explicit = runtime.commands.change(
+		{ id: 'todo-9', title: 'mine' },
+		{ commandId: COMMAND_B }
+	);
+	assert.equal(explicit.commandId, COMMAND_B);
+	assert.equal(explicit.input.id, 'todo-9');
+	await explicit;
+	assert.equal(requests[1].variables.input.id, 'todo-9');
+	runtime.dispose();
+});
+
+test('a failed call rejects and leaves no provisional row behind', async () => {
+	const replica = new TestReplica();
+	const runtime = createReplicaCommandRuntime(
+		replica,
+		{ dispatch: async () => ({ status: 503, errors: [{ message: 'down' }] }) },
+		{ change: Object.freeze({ ...artifact(), inputDefaults: ID_DEFAULT }) }
+	);
+	const call = runtime.commands.change({ title: 'doomed' });
+	assert.ok(replica.layer(call.commandId), 'the preview exists while in flight');
+	await assert.rejects(call);
+	assert.equal(replica.layer(call.commandId), undefined);
+	assert.equal(replica.record(call.input.id), undefined);
+	runtime.dispose();
+});
+
+test('lazy commands generate catalog defaults before their code loads', async () => {
+	const replica = new TestReplica();
+	const gate = deferred();
+	const requests = [];
+	const runtime = createLazyReplicaCommandRuntime(
+		replica,
+		{
+			dispatch: async (request) => (requests.push(request), envelope(request)),
+			status: async () => { throw new Error('not requested'); }
+		},
+		{
+			commands: {
+				'todo.upsert': {
+					operationHash: HASH_A,
+					hasInput: true,
+					inputDefaults: ID_DEFAULT.defaults
+				}
+			},
+			status: STATUS
+		},
+		() => gate.promise
+	);
+	const call = runtime.commands.todo.upsert({ title: 'early' });
+	assert.match(call.commandId, UUID_V7);
+	assert.match(call.input.id, UUID_V7);
+	gate.resolve({
+		entries: {
+			'todo.upsert': Object.freeze({ ...artifact(), inputDefaults: ID_DEFAULT })
+		}
+	});
+	await call;
+	assert.equal(requests[0].variables.commandId, call.commandId);
+	assert.equal(requests[0].variables.input.id, call.input.id);
+	runtime.dispose();
+});
+
+test('lazy catalog defaults must match the loaded command', async () => {
+	const replica = new TestReplica();
+	const runtime = createLazyReplicaCommandRuntime(
+		replica,
+		{
+			dispatch: async () => { throw new Error('not dispatched'); },
+			status: async () => { throw new Error('not requested'); }
+		},
+		{
+			commands: {
+				'todo.upsert': {
+					operationHash: HASH_A,
+					hasInput: true,
+					inputDefaults: ID_DEFAULT.defaults
+				}
+			},
+			status: STATUS
+		},
+		async () => ({ entries: { 'todo.upsert': artifact() } })
+	);
+	await assert.rejects(runtime.preload(), /does not match its catalog/);
+	runtime.dispose();
 });

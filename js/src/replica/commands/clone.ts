@@ -308,17 +308,24 @@ export function generateDefault(
 	path: string
 ): string {
 	switch (entry.generator) {
-			case 'uuid_v7':
-				return validateUuidV7(
-					(generators?.uuidV7 ?? createReplicaCommandId)(),
-					path,
-					'REPLICA_COMMAND_INPUT_INVALID'
-				);
+		case 'uuid_v7':
+			return validateUuidV7(
+				(generators?.uuidV7 ?? createReplicaCommandId)(),
+				path,
+				'REPLICA_COMMAND_INPUT_INVALID'
+			);
 		case 'ulid':
 			return validateUlid(
 				(generators?.ulid ?? createUlid)(),
 				path
 			);
+		case 'now': {
+			const millis = (generators?.now ?? Date.now)();
+			if (!Number.isSafeInteger(millis) || millis < 0) {
+				inputInvalid(path);
+			}
+			return String(millis);
+		}
 		default:
 			artifactInvalid(`${path}.generator`);
 	}

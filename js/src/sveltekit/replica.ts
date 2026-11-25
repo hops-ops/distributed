@@ -1,6 +1,5 @@
 import {
 	createDistributedClient,
-	PendingReceiptStore,
 	prefetchReplicaOperation,
 	type CreateDistributedClientOptions,
 	type SveltekitReplicaAuthority,
@@ -9,8 +8,8 @@ import {
 } from '../client.js';
 import type {
 	DistributedReplica,
-	ReplicaCommandReceipt,
 	ReplicaGraphqlTransport,
+	ReplicaPendingRows,
 	ReplicaOperationArtifact,
 	ReplicaSnapshot,
 	ReplicaWatch,
@@ -72,8 +71,6 @@ export type SveltekitQuerySnapshot<TData> = ReplicaSnapshot<TData> &
 	Readonly<{
 	loading: boolean;
 	error?: GqlError;
-	/** Successful causal commands still waiting for projection visibility. */
-	pending: readonly ReplicaCommandReceipt<unknown>[];
 	refetch(): Promise<void>;
 }>;
 
@@ -93,7 +90,8 @@ export interface SveltekitQueryStore<TData> {
 	readonly live: ReplicaSnapshot<TData>['live'];
 	readonly errors: readonly GqlError[];
 	readonly error: GqlError | undefined;
-	readonly pending: readonly ReplicaCommandReceipt<unknown>[];
+	/** `$query.pending.has(row)`: the row shows an unsettled command. */
+	readonly pending: ReplicaPendingRows;
 }
 
 export type UseSveltekitOperationOptions = Readonly<{
@@ -242,7 +240,7 @@ export function createDistributedSvelteKit<TCommands = Readonly<Record<never, ne
 	const operation = <TData, TVariables extends GraphqlVariables>(
 		artifact: ReplicaOperationArtifact<TData, TVariables>
 	): SveltekitBoundOperation<TData, TVariables> =>
-		bindOperation(client.replica, artifact, client.pending, lifecycle);
+		bindOperation(client.replica, artifact, lifecycle);
 	const boundary = <
 		TData,
 		TVariables extends GraphqlVariables,
@@ -312,7 +310,6 @@ export function bindSveltekitOperation<
 	return bindOperation(
 		replica,
 		artifact,
-		new PendingReceiptStore(),
 		{
 			isAlive: () => true,
 			activateWatches: () => true,
@@ -380,7 +377,6 @@ export function createPageDataSessionSource<TData extends PageGraphqlData>(
 function bindOperation<TData, TVariables extends GraphqlVariables>(
 	replica: DistributedReplica,
 	artifact: ReplicaOperationArtifact<TData, TVariables>,
-	pending: PendingReceiptStore,
 	lifecycle: SveltekitStoreLifecycle
 ): SveltekitBoundOperation<TData, TVariables> {
 	const use = (
@@ -395,7 +391,6 @@ function bindOperation<TData, TVariables extends GraphqlVariables>(
 			Object.freeze({
 				live: useOptions?.live ?? artifact.live !== undefined
 			}),
-			pending,
 			lifecycle
 		);
 		return store;
@@ -436,14 +431,12 @@ class SveltekitQueryStoreImpl<TData> implements SveltekitQueryStore<TData> {
 	readonly #artifact: ReplicaOperationArtifact<TData, GraphqlVariables>;
 	readonly #variables: GraphqlVariables;
 	readonly #options: WatchReplicaOptions;
-	readonly #pending: PendingReceiptStore;
 	readonly #lifecycle: SveltekitStoreLifecycle;
 	readonly #listeners = new Set<
 		(snapshot: SveltekitQuerySnapshot<TData>) => void
 	>();
 	#watch: ReplicaWatch<TData> | undefined;
 	#unsubscribeWatch: (() => void) | undefined;
-	#unsubscribePending: (() => void) | undefined;
 	#snapshot: SveltekitQuerySnapshot<TData>;
 	#destroyed = false;
 
@@ -452,19 +445,15 @@ class SveltekitQueryStoreImpl<TData> implements SveltekitQueryStore<TData> {
 		artifact: ReplicaOperationArtifact<TData, GraphqlVariables>,
 		variables: GraphqlVariables,
 		options: WatchReplicaOptions,
-		pending: PendingReceiptStore,
 		lifecycle: SveltekitStoreLifecycle
 	) {
 		this.#replica = replica;
 		this.#artifact = artifact;
 		this.#variables = variables;
 		this.#options = options;
-		this.#pending = pending;
 		this.#lifecycle = lifecycle;
-		this.#snapshot = querySnapshot(
-			replica.read(artifact, variables),
-			pending.get(),
-			() => this.refetch()
+		this.#snapshot = querySnapshot(replica.read(artifact, variables), () =>
+			this.refetch()
 		);
 	}
 
@@ -472,7 +461,6 @@ class SveltekitQueryStoreImpl<TData> implements SveltekitQueryStore<TData> {
 		if (!this.#destroyed && this.#watch === undefined) {
 			this.#snapshot = querySnapshot(
 				this.#replica.read(this.#artifact, this.#variables),
-				this.#pending.get(),
 				() => this.refetch()
 			);
 		}
@@ -526,11 +514,7 @@ class SveltekitQueryStoreImpl<TData> implements SveltekitQueryStore<TData> {
 		);
 		try {
 			await temporary.refresh();
-			this.#snapshot = querySnapshot(
-				temporary.get(),
-				this.#pending.get(),
-				() => this.refetch()
-			);
+			this.#snapshot = querySnapshot(temporary.get(), () => this.refetch());
 		} finally {
 			temporary.destroy();
 		}
@@ -570,7 +554,7 @@ class SveltekitQueryStoreImpl<TData> implements SveltekitQueryStore<TData> {
 	get error(): GqlError | undefined {
 		return this.#snapshot.error;
 	}
-	get pending(): readonly ReplicaCommandReceipt<unknown>[] {
+	get pending(): ReplicaPendingRows {
 		return this.#snapshot.pending;
 	}
 
@@ -583,26 +567,16 @@ class SveltekitQueryStoreImpl<TData> implements SveltekitQueryStore<TData> {
 				this.#options
 			);
 			this.#watch = watch;
-			this.#snapshot = querySnapshot(
-				watch.get(),
-				this.#pending.get(),
-				() => this.refetch()
-			);
+			this.#snapshot = querySnapshot(watch.get(), () => this.refetch());
 			this.#unsubscribeWatch = watch.subscribe((snapshot) => {
-				this.#publish(snapshot, this.#pending.get());
-			});
-			this.#unsubscribePending = this.#pending.subscribe((receipts) => {
-				const current = this.#watch;
-				if (current !== undefined) this.#publish(current.get(), receipts);
+				this.#publish(snapshot);
 			});
 			this.#lifecycle.active(this);
 		} catch (error) {
 			this.#unsubscribeWatch?.();
-			this.#unsubscribePending?.();
 			watch?.destroy();
 			this.#watch = undefined;
 			this.#unsubscribeWatch = undefined;
-			this.#unsubscribePending = undefined;
 			throw error;
 		}
 	}
@@ -610,20 +584,15 @@ class SveltekitQueryStoreImpl<TData> implements SveltekitQueryStore<TData> {
 	#deactivate(): void {
 		if (this.#watch === undefined) return;
 		this.#unsubscribeWatch?.();
-		this.#unsubscribePending?.();
 		this.#watch.destroy();
 		this.#watch = undefined;
 		this.#unsubscribeWatch = undefined;
-		this.#unsubscribePending = undefined;
 		this.#lifecycle.idle(this);
 	}
 
-	#publish(
-		replicaSnapshot: ReplicaSnapshot<TData>,
-		receipts: readonly ReplicaCommandReceipt<unknown>[]
-	): void {
+	#publish(replicaSnapshot: ReplicaSnapshot<TData>): void {
 		if (this.#destroyed) return;
-		const next = querySnapshot(replicaSnapshot, receipts, () => this.refetch());
+		const next = querySnapshot(replicaSnapshot, () => this.refetch());
 		if (sameQuerySnapshot(this.#snapshot, next)) return;
 		this.#snapshot = next;
 		for (const listener of [...this.#listeners]) listener(next);
@@ -632,7 +601,6 @@ class SveltekitQueryStoreImpl<TData> implements SveltekitQueryStore<TData> {
 
 function querySnapshot<TData>(
 	snapshot: ReplicaSnapshot<TData>,
-	pending: readonly ReplicaCommandReceipt<unknown>[],
 	refetch: () => Promise<void>
 ): SveltekitQuerySnapshot<TData> {
 	return Object.freeze({
@@ -641,7 +609,6 @@ function querySnapshot<TData>(
 		...(snapshot.errors[0] === undefined
 			? {}
 			: { error: snapshot.errors[0] }),
-		pending,
 		refetch
 	}) as SveltekitQuerySnapshot<TData>;
 }

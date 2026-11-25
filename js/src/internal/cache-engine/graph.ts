@@ -103,6 +103,8 @@ export class Overlay implements CacheGraph {
 	/** Keys the replay read or wrote; `undefined` is "absent". */
 	readonly records = new Map<RecordKey, VisibleRecord | undefined>();
 	readonly indexes = new Map<IndexKey, VisibleIndex | undefined>();
+	/** Records an optimistic layer still writes or tombstones. */
+	readonly #pending = new Set<RecordKey>();
 	readonly #base: CacheGraph;
 	readonly #floors: ReadonlyMap<string, number>;
 
@@ -136,6 +138,10 @@ export class Overlay implements CacheGraph {
 
 	index(key: IndexKey): VisibleIndex | undefined {
 		return this.indexes.has(key) ? this.indexes.get(key) : this.#base.index(key);
+	}
+
+	pending(key: RecordKey): boolean {
+		return this.#pending.has(key);
 	}
 
 	*indexKeys(): Iterable<IndexKey> {
@@ -190,6 +196,7 @@ export class Overlay implements CacheGraph {
 				(nextFields ??= new Map(record?.fields)).delete(name);
 			}
 			if (nextFields === undefined && nextLinks === undefined) return;
+			this.#pending.add(key);
 			this.records.set(key, {
 				revision: record?.revision ?? 0n,
 				incarnation: record?.incarnation ?? 0n,
@@ -203,6 +210,7 @@ export class Overlay implements CacheGraph {
 		if (operation.kind === 'tombstone-record') {
 			if (sequence <= this.#floor(recordSeenDependency(operation.key))) return;
 			const record = this.#record(operation.key);
+			this.#pending.add(operation.key);
 			this.records.set(operation.key, {
 				revision: record?.revision ?? 0n,
 				incarnation: record?.incarnation ?? 0n,
@@ -332,6 +340,12 @@ export function graphReader(
 			const record = graph.record(key);
 			if (!record || record.tombstoned || !record.links.has(name)) return ABSENT;
 			return Object.freeze({ present: true, value: record.links.get(name)! });
+		},
+		pending(key: RecordKey): boolean {
+			// Creating, replacing, confirming or rejecting a layer marks every
+			// record it writes changed under this dependency.
+			dependencies?.add(recordWildcardDependency(key));
+			return graph.pending?.(key) ?? false;
 		},
 		record(key: RecordKey): SparseRecord | undefined {
 			dependencies?.add(recordWildcardDependency(key));

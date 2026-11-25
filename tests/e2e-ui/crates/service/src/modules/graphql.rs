@@ -472,13 +472,17 @@ mod client_surface_tests {
             )),
             "chat body from input: {post_sources:?}"
         );
-        assert!(
-            post_sources.iter().any(|source| matches!(
-                source,
-                ClientProjectionPreviewSource::Input { path } if path == &["message_id"]
-            )),
-            "chat message_id from input: {post_sources:?}"
-        );
+        // The id and timestamp are command input defaults (`uuid_v7()`,
+        // `now()`): the client generates them, the server stamps `created_at`.
+        for field in ["message_id", "created_at"] {
+            assert!(
+                post_sources.iter().any(|source| matches!(
+                    source,
+                    ClientProjectionPreviewSource::GeneratedDefault { path } if path == &[field]
+                )),
+                "chat {field} from a generated default: {post_sources:?}"
+            );
+        }
         assert!(
             post_sources.iter().any(|source| matches!(
                 source,

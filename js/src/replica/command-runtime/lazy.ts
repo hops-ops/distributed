@@ -3,6 +3,7 @@ import { sameScope } from '../distributed-replica/hydration.js';
 import { SHA256 } from './constants.js';
 import { ReplicaCommandRuntimeError } from './errors.js';
 import { defineBoundCommand, freezeCommandTree } from './lib/binding.js';
+import { sendCommand } from './lib/sent.js';
 import {
 	commandStatusArtifact,
 	commandSurfaceContract,
@@ -16,6 +17,7 @@ import {
 } from './lib/util.js';
 import { replicaCommandAuthority } from './symbols.js';
 import type { ReplicaResultEnvelope } from '../types.js';
+import type { ReplicaCommandInputDefault } from '../commands/types.js';
 import type {
 	CommandEntry,
 	ReplicaBoundCommands,
@@ -31,7 +33,15 @@ import type {
 /** Small compiler-owned inventory; definitions and pure implementations stay in the lazy chunk. */
 export type ReplicaLazyCommandCatalog = Readonly<{
 	commands: Readonly<
-		Record<string, Readonly<{ operationHash: string; hasInput: boolean }>>
+		Record<
+			string,
+			Readonly<{
+				operationHash: string;
+				hasInput: boolean;
+				/** Generated before the command code loads, so calls return them synchronously. */
+				inputDefaults?: readonly ReplicaCommandInputDefault[];
+			}>
+		>
 	>;
 	status: ReplicaCommandStatusArtifact;
 }>;
@@ -94,12 +104,38 @@ export function createLazyReplicaCommandRuntime<
 			!SHA256.test(descriptor.operationHash)
 		)
 			throw new TypeError('invalid lazy command operation hash');
+		// The loaded artifact validates its defaults fully and must match these.
+		if (
+			descriptor.inputDefaults !== undefined &&
+			(!descriptor.hasInput ||
+				!Array.isArray(descriptor.inputDefaults) ||
+				descriptor.inputDefaults.some(
+					(entry) =>
+						!Array.isArray(entry?.path) ||
+						entry.path.some((segment: unknown) => typeof segment !== 'string') ||
+						(entry.generator !== 'uuid_v7' &&
+							entry.generator !== 'ulid' &&
+							entry.generator !== 'now')
+				))
+		)
+			throw new TypeError('invalid lazy command input defaults');
+		const send = (
+			input: unknown,
+			callOptions: ReplicaCommandCallOptions<unknown>
+		) =>
+			sendCommand(
+				descriptor.inputDefaults,
+				descriptor.hasInput,
+				input,
+				callOptions,
+				(sent, options) => invoke(name, sent, options)
+			);
 		defineBoundCommand(
 			commands,
 			name,
 			descriptor.hasInput
-				? (input: unknown, callOptions = {}) => invoke(name, input, callOptions)
-				: (callOptions = {}) => invoke(name, undefined, callOptions)
+				? (input: unknown, callOptions = {}) => send(input, callOptions)
+				: (callOptions = {}) => send(undefined, callOptions)
 		);
 	}
 	freezeCommandTree(commands);
@@ -159,7 +195,11 @@ export function createLazyReplicaCommandRuntime<
 							!Object.hasOwn(hashes, key) ||
 							artifact.name !== key ||
 							artifact.operationHash !== hashes[key].operationHash ||
-							(artifact.input.kind !== 'none') !== hashes[key].hasInput
+							(artifact.input.kind !== 'none') !== hashes[key].hasInput ||
+							!sameInputDefaults(
+								artifact.inputDefaults?.defaults,
+								hashes[key].inputDefaults
+							)
 					)
 				)
 					throw new TypeError(
@@ -327,4 +367,21 @@ function waitForLoad(
 			.then(resolve, reject)
 			.finally(() => signal.removeEventListener('abort', abort));
 	});
+}
+
+function sameInputDefaults(
+	left: readonly ReplicaCommandInputDefault[] | undefined,
+	right: readonly ReplicaCommandInputDefault[] | undefined
+): boolean {
+	const a = left ?? [];
+	const b = right ?? [];
+	return (
+		a.length === b.length &&
+		a.every(
+			(entry, index) =>
+				entry.generator === b[index]!.generator &&
+				entry.path.length === b[index]!.path.length &&
+				entry.path.every((segment, at) => segment === b[index]!.path[at])
+		)
+	);
 }

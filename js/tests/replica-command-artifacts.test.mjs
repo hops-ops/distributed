@@ -518,6 +518,44 @@ test('real default generators produce canonical values', () => {
 	assert.match(prepared.input.code, /^[0-7][0-9A-HJKMNP-TV-Z]{25}$/);
 });
 
+test('now() previews unix milliseconds as a canonical decimal string', () => {
+	const artifact = baseArtifact({
+		inputDefaults: {
+			version: 1,
+			defaults: [
+				{ path: ['code'], generator: 'now' },
+				{ path: ['id'], generator: 'uuid_v7' }
+			]
+		}
+	});
+	const prepared = prepareReplicaCommand(
+		artifact,
+		{ meta: { count: 1 }, title: 'Stamped' },
+		{ commandId: COMMAND_ID, generators: { now: () => 1700000000123 } }
+	);
+	assert.equal(prepared.input.code, '1700000000123');
+	const real = prepareReplicaCommand(
+		artifact,
+		{ meta: { count: 1 }, title: 'Stamped' },
+		{ commandId: COMMAND_ID }
+	);
+	assert.match(real.input.code, /^[1-9][0-9]{12,}$/);
+	for (const bad of [-1, 1.5, Number.NaN, 2 ** 53]) {
+		assert.throws(
+			() =>
+				prepareReplicaCommand(
+					artifact,
+					{ meta: { count: 1 }, title: 'Bad clock' },
+					{ commandId: COMMAND_ID, generators: { now: () => bad } }
+				),
+			(error) =>
+				error instanceof ReplicaCommandContractError &&
+				error.code === 'REPLICA_COMMAND_INPUT_INVALID' &&
+				error.path === 'input.code'
+		);
+	}
+});
+
 test('public UUIDv7 generation supports caller-correlated optimistic record ids', () => {
 	const id = createReplicaUuidV7();
 	assert.match(

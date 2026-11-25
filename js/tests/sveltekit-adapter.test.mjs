@@ -17,6 +17,7 @@ import {
 	assertReplicaAdapterConformance,
 	ControlledReplicaTransport,
 	REACT_FIXTURE_SCHEMA,
+	TodoModel,
 	TodosArtifact,
 	todoFrame
 } from './fixtures/adapter-conformance.mjs';
@@ -25,7 +26,6 @@ import {
 	createReplicaCommandRuntime,
 	createReplicaDiagnostics
 } from '../dist/replica/index.js';
-import { replicaCommandProjectedLifecycle } from '../dist/replica/command-runtime/symbols.js';
 
 async function flushMicrotasks() {
 	for (let iteration = 0; iteration < 12; iteration += 1) {
@@ -236,69 +236,31 @@ test('component SSR subscriptions stay transport-free when browser is false', as
 	client.destroy();
 });
 
-test('caller projection cancellation does not hide a globally pending command', async () => {
-	let resolveGlobal;
-	let rejectCaller;
-	const globallyProjected = new Promise((resolve) => {
-		resolveGlobal = resolve;
-	});
-	const callerProjected = new Promise((_resolve, reject) => {
-		rejectCaller = reject;
-	});
-	const receiptValue = {
-		commandId: 'command-pending-after-caller-deadline',
-		state: 'succeeded_pending_projection',
-		result: { accepted: true },
-		metadata: {},
-		status: () => Promise.resolve({ state: 'succeeded_pending_projection' }),
-		projected: callerProjected
-	};
-	Object.defineProperty(receiptValue, replicaCommandProjectedLifecycle, {
-		value: globallyProjected
-	});
-	const receipt = Object.freeze(receiptValue);
-	const client = createDistributedSvelteKit({
-		boundaries: [],
-		session: { getAuth: () => ({ accessToken: 'token' }) },
-		browser: false,
-		createCommands() {
-			return {
-				commands: {
-					save: () => Promise.resolve(receipt)
-				},
-				dispose() {}
-			};
-		}
-	});
-	const query = client.operation(TodosArtifact).use();
-	const unsubscribe = query.subscribe(() => undefined);
-
-	const returned = await client.commands.save();
-	assert.equal(returned, receipt);
-	assert.deepEqual(query.get().pending, [receipt]);
-
-	const callerOutcome = assert.rejects(
-		callerProjected,
-		/caller deadline/
+test('$query.pending marks the rows an unsettled command writes', () => {
+	const replica = createDistributedReplica();
+	const store = bindSveltekitOperation(replica, TodosArtifact).use();
+	const unsubscribe = store.subscribe(() => undefined);
+	replica.writeResult(
+		TodosArtifact,
+		{},
+		todoFrame(TodosArtifact, [{ id: 'todo-1', title: 'saved', status: 'open' }]),
+		'network'
 	);
-	rejectCaller(new Error('caller deadline'));
-	await callerOutcome;
-	await flushMicrotasks();
-	assert.deepEqual(
-		query.get().pending,
-		[receipt],
-		'the adapter must observe the command-wide causal lifecycle'
-	);
-
-	resolveGlobal({
-		commandId: receipt.commandId,
-		state: 'atomic'
+	replica.createOptimisticLayer('command-rename', (writer) => {
+		writer.writeRecord(TodoModel, 'todo-1', { fields: { title: 'renaming' } });
 	});
-	await flushMicrotasks();
-	assert.deepEqual(query.get().pending, []);
+	const [row] = store.get().data.todos;
+	assert.equal(row.title, 'renaming');
+	assert.equal(store.get().pending.has(row), true);
+	assert.equal(store.pending.has(row), true);
+
+	replica.rejectOptimisticLayer('command-rename');
+	const [restored] = store.get().data.todos;
+	assert.equal(restored.title, 'saved');
+	assert.equal(store.get().pending.size, 0);
+	assert.equal(store.get().pending.has(restored), false);
 	unsubscribe();
-	query.destroy();
-	client.destroy();
+	store.destroy();
 });
 
 test('pre-subscribe refetch uses one temporary HTTP watch and never opens live', async () => {

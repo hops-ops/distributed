@@ -19,13 +19,15 @@ pub(super) fn render_lazy_commands(
         .commands
         .iter()
         .map(|command| {
-            (
-                command.name.clone(),
-                serde_json::json!({
-                    "operationHash": command.operation_hash,
-                    "hasInput": !matches!(command.input, ClientCommandShape::None),
-                }),
-            )
+            let mut entry = serde_json::json!({
+                "operationHash": command.operation_hash,
+                "hasInput": !matches!(command.input, ClientCommandShape::None),
+            });
+            // Calls return generated ids before the command code loads.
+            if let Some(defaults) = &command.extensions.input_defaults {
+                entry["inputDefaults"] = serde_json::json!(defaults.defaults);
+            }
+            (command.name.clone(), canonical_json_value(entry))
         })
         .collect::<serde_json::Map<_, _>>();
     let catalog = serde_json::to_string_pretty(&catalog).map_err(|error| {

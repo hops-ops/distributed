@@ -320,7 +320,7 @@ test.describe('todos (alice)', () => {
 		await expect(openItem.locator('.pending-state')).toHaveText('Saving…');
 		expect(
 			await openItem.locator('button:disabled').count(),
-			'a newly created optimistic Todo must not expose actions before its receipt'
+			'a pending optimistic Todo must not expose actions before the server row replaces it'
 		).toBe(3);
 		await expectTodoCommandSuccess(await createResponse, 'ordered todos_create');
 		await expect(openItem).toBeVisible();
@@ -328,7 +328,7 @@ test.describe('todos (alice)', () => {
 		await expect(openItem.locator('.pending-state')).toHaveCount(0);
 		expect(
 			await page.locator('.board button:disabled').count(),
-			'Todo controls must unlock after its durable create receipt'
+			'Todo controls must unlock once the projected row replaces the preview'
 		).toBe(0);
 		expectBinarySorted(await visibleTodoOrders(page));
 		const todoId = await openItem.getAttribute('data-todo-id');

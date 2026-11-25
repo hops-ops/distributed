@@ -448,7 +448,28 @@ const todos = $derived($query.complete ? $query.data.todos : []);
 await commands.todo.create({ title: text });
 await commands.todo.complete({ todo_id });
 // Replica applies SaveTodo (upsert_todos) to the cache. Page does not.
+
+// A row a command has not settled yet is pending: no hand-kept id sets.
+{@const saving = $query.pending.has(todo)}
 ```
+
+Ids and timestamps are command input defaults, declared next to the
+command in Rust:
+
+```rust,ignore
+defaults: command_input_defaults! {
+    input: ChatPostInput;
+    default input.message_id = uuid_v7(); // client-generated, kept
+    default input.created_at = now();     // client previews, server stamps
+},
+```
+
+The generated call fills them, and returns them synchronously
+(`commands.chat.post(input).input.message_id`) before the server answers.
+A `now()` value only previews the row: the server overwrites it with its
+host clock before the handler runs, so the client's clock is never the
+stored ordering key. The server's row then replaces the preview. A failed
+command rolls its preview back, so its row leaves `pending` too.
 
 ```rust,ignore
 // Advanced optimism: same domain pure, shipped as WASM

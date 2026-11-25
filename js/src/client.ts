@@ -1,9 +1,7 @@
 import { sameAuthCredential, snapshotAuthCredential } from './identity.js';
 import { createDistributedReplica } from './replica/distributed-replica/index.js';
 import { createReplicaGraphqlTransport, type ReplicaGraphqlTransport } from './replica/graphql-transport.js';
-import { replicaCommandProjectedLifecycleOf } from './replica/command-runtime/lifecycle.js';
 import type {
-	ReplicaCommandReceipt,
 	ReplicaCommandRuntime,
 	ReplicaCommandRuntimeOptions
 } from './replica/command-runtime/types.js';
@@ -135,9 +133,7 @@ export type CreateDistributedClientOptions<TCommands> = Readonly<{
 export type DistributedClient<TCommands> = Readonly<{
 	replica: DistributedReplica;
 	transport: ReplicaGraphqlTransport;
-	/** Command tree whose causal receipts are tracked in `pending`. */
 	commands: TCommands;
-	pending: PendingReceiptStore;
 	alive(): boolean;
 	/** Ensure a generated boundary operation was registered with this client. */
 	accepts(operation: Readonly<{ binding: Readonly<{ id: string }> }>): boolean;
@@ -245,7 +241,6 @@ export function createDistributedClient<TCommands>(
 	);
 
 	const observers = new Set<Readonly<{ destroy(): void }>>();
-	const pending = new PendingReceiptStore();
 	let destroyed = false;
 	const hydrate = (
 		hydration: SveltekitReplicaHydration,
@@ -317,7 +312,7 @@ export function createDistributedClient<TCommands>(
 	const commands =
 		commandRuntime === undefined
 			? (Object.freeze({}) as TCommands)
-			: wrapCommandTree(commandRuntime.commands, pending);
+			: commandRuntime.commands;
 	const assertAlive = (): void => {
 		if (destroyed) throw new Error('Distributed SvelteKit client is destroyed');
 	};
@@ -326,7 +321,6 @@ export function createDistributedClient<TCommands>(
 		replica,
 		transport,
 		commands,
-		pending,
 		alive: () => !destroyed,
 		accepts: (operation) => boundaryIds.includes(operation.binding.id),
 		track(observer) {
@@ -372,7 +366,6 @@ export function createDistributedClient<TCommands>(
 			boundaryController!.destroy();
 			for (const observer of [...observers]) observer.destroy();
 			observers.clear();
-			pending.clear();
 			unregister?.();
 			commandRuntime?.dispose();
 		}
@@ -389,104 +382,6 @@ export function prefetchReplicaOperation<TData, TVariables extends GraphqlVariab
 	if (snapshot.complete && !snapshot.stale) return Promise.resolve();
 	const watch = replica.watch(artifact, variables, { live: false });
 	return watch.refresh().finally(() => watch.destroy());
-}
-
-/** Successful causal command receipts still waiting for projection visibility. */
-export class PendingReceiptStore {
-	readonly #receipts = new Map<string, ReplicaCommandReceipt<unknown>>();
-	readonly #listeners = new Set<
-		(receipts: readonly ReplicaCommandReceipt<unknown>[]) => void
-	>();
-	#snapshot: readonly ReplicaCommandReceipt<unknown>[] = Object.freeze([]);
-
-	get(): readonly ReplicaCommandReceipt<unknown>[] {
-		return this.#snapshot;
-	}
-
-	subscribe(
-		listener: (receipts: readonly ReplicaCommandReceipt<unknown>[]) => void
-	): () => void {
-		this.#listeners.add(listener);
-		return () => this.#listeners.delete(listener);
-	}
-
-	track(receipt: ReplicaCommandReceipt<unknown>): void {
-		const lifecycle =
-			replicaCommandProjectedLifecycleOf(receipt) ?? receipt.projected;
-		if (lifecycle === undefined || this.#receipts.has(receipt.commandId)) {
-			return;
-		}
-		this.#receipts.set(receipt.commandId, receipt);
-		this.#publish();
-		void lifecycle.then(
-			() => this.#remove(receipt.commandId),
-			() => this.#remove(receipt.commandId)
-		);
-	}
-
-	clear(): void {
-		if (this.#receipts.size === 0) return;
-		this.#receipts.clear();
-		this.#publish();
-		this.#listeners.clear();
-	}
-
-	#remove(commandId: string): void {
-		if (!this.#receipts.delete(commandId)) return;
-		this.#publish();
-	}
-
-	#publish(): void {
-		this.#snapshot = Object.freeze([...this.#receipts.values()]);
-		for (const listener of [...this.#listeners]) listener(this.#snapshot);
-	}
-}
-
-function wrapCommandTree<TCommands>(
-	value: TCommands,
-	pending: PendingReceiptStore
-): TCommands {
-	if (typeof value === 'function') {
-		const command = value as (...args: unknown[]) => unknown;
-		return ((...args: unknown[]) => {
-			const result = command(...args);
-			if (isPromiseLike(result)) {
-				return result.then((receipt: unknown) => {
-					if (isCommandReceipt(receipt)) pending.track(receipt);
-					return receipt;
-				});
-			}
-			return result;
-		}) as TCommands;
-	}
-	if (value === null || typeof value !== 'object') return value;
-	const output = Object.create(null) as Record<string, unknown>;
-	for (const key of Object.keys(value)) {
-		output[key] = wrapCommandTree(
-			(value as Record<string, unknown>)[key],
-			pending
-		);
-	}
-	return Object.freeze(output) as TCommands;
-}
-
-function isCommandReceipt(
-	value: unknown
-): value is ReplicaCommandReceipt<unknown> {
-	return (
-		value !== null &&
-		typeof value === 'object' &&
-		typeof (value as { commandId?: unknown }).commandId === 'string' &&
-		typeof (value as { status?: unknown }).status === 'function'
-	);
-}
-
-function isPromiseLike(value: unknown): value is Promise<unknown> {
-	return (
-		value !== null &&
-		(typeof value === 'object' || typeof value === 'function') &&
-		typeof (value as { then?: unknown }).then === 'function'
-	);
 }
 
 function createAuthorizationFence(

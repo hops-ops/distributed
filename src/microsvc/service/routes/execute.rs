@@ -313,8 +313,19 @@ where
 
         let canonical = canonicalize_command_input(&self.contract.input, input)
             .map_err(|error| CausalDispatchError::BadRequest(error.to_string()))?;
+        let aggregate_repository = dependencies.__causal_aggregate_repository();
+        let repository = aggregate_repository.repo();
+        let session = stamped_session(self.requires_clock, repository, session)
+            .await
+            .map_err(|error| CausalDispatchError::Internal(error.to_string()))?;
+        // `now()` defaults are the server's: the caller's preview value is
+        // replaced before anything decodes or stores the input.
         let typed = canonical
-            .decode::<I>()
+            .stamp_now(
+                &self.contract.input_defaults,
+                crate::microsvc::schedule::host_now(&session),
+            )
+            .and_then(|canonical| canonical.decode::<I>())
             .map_err(|error| CausalDispatchError::BadRequest(error.to_string()))?;
         let (input, wire, payload, input_digest) = typed.into_parts();
         let direct_projection_target = self
@@ -325,12 +336,6 @@ where
             self.fingerprint,
             CanonicalInputHash::new(input_digest),
         )?;
-
-        let aggregate_repository = dependencies.__causal_aggregate_repository();
-        let repository = aggregate_repository.repo();
-        let session = stamped_session(self.requires_clock, repository, session)
-            .await
-            .map_err(|error| CausalDispatchError::Internal(error.to_string()))?;
         #[cfg(feature = "graphql")]
         if let Some(target) = direct_projection_target.as_ref() {
             let (topology, ownership) = target.registration();

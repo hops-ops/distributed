@@ -112,6 +112,11 @@ export type BaseRecordClock = {
 
 export interface CacheReader {
 	recordMeta(key: RecordKey): SparseRecordMeta | undefined;
+	/**
+	 * Whether an optimistic layer (a command not yet confirmed or rejected)
+	 * still writes this record: the visible value is provisional.
+	 */
+	pending(key: RecordKey): boolean;
 	field(key: RecordKey, name: string): CachePresence<CacheValue>;
 	link(key: RecordKey, name: string): CachePresence<RecordLink>;
 	record(key: RecordKey): SparseRecord | undefined;
@@ -352,6 +357,8 @@ export type CacheGraph = {
 	record(key: RecordKey): VisibleRecord | undefined;
 	index(key: IndexKey): VisibleIndex | undefined;
 	indexKeys(): Iterable<IndexKey>;
+	/** Only an optimistic overlay holds provisional records. */
+	pending?(key: RecordKey): boolean;
 };
 
 export type Watcher<T = unknown> = {

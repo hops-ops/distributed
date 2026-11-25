@@ -430,6 +430,16 @@ impl<D: Send + Sync + 'static> Routes<D> {
             route_name, contract.name,
             "typed command route and contract ids must match"
         );
+        // A `now()` input default is stamped from the host clock.
+        let mut requires = requires;
+        if contract
+            .input_defaults
+            .iter()
+            .any(|default| default.generator == crate::command::InputDefaultGenerator::Now)
+            && !requires.contains(&crate::schedule::Capability::Clock)
+        {
+            requires.push(crate::schedule::Capability::Clock);
+        }
         let capabilities = crate::schedule::BackendHost::capabilities(
             self.dependencies.__causal_aggregate_repository().repo(),
         );

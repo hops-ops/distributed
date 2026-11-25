@@ -687,10 +687,26 @@ export type ReplicaSparse<T> = T extends readonly (infer TItem)[]
 		? { readonly [K in keyof T]?: ReplicaSparse<T[K]> }
 		: T;
 
+/**
+ * The rows of one snapshot whose visible values come from a command that is
+ * not settled yet: dispatched, or accepted and waiting for its projection.
+ *
+ * `has(row)` takes an object from the same snapshot's `data`. A row leaves
+ * the set when the authoritative row replaces the preview or the command
+ * fails and its preview is rolled back, so a page never tracks command
+ * lifecycles itself.
+ */
+export type ReplicaPendingRows = Readonly<{
+	has(row: unknown): boolean;
+	/** How many result objects are provisional. */
+	size: number;
+}>;
+
 type ReplicaSnapshotState = {
 	readonly fetching: boolean;
 	readonly errors: readonly GqlError[];
 	readonly live: ReplicaLiveState;
+	readonly pending: ReplicaPendingRows;
 };
 
 /**

@@ -29,7 +29,6 @@ import {
 	replicaCommandFreshness,
 	replicaCommandDirectProjection,
 	replicaCommandProjectionDelta,
-	replicaCommandProjectedLifecycle,
 	replicaCommandReadRecord,
 	replicaResultObservation
 } from './symbols.js';
@@ -180,23 +179,6 @@ export type ReplicaCommandReceipt<TOutput> = Readonly<{
 	projected?: Promise<ReplicaCommandProjectedOutcome<TOutput>>;
 }>;
 
-export type ReplicaCommandReceiptWithLifecycle = ReplicaCommandReceipt<unknown> &
-	Readonly<{
-		[replicaCommandProjectedLifecycle]?: Promise<
-			ReplicaCommandProjectedOutcome<unknown>
-		>;
-	}>;
-
-/**
- * Package-private causal lifecycle used by framework adapters.
- *
- * A caller-scoped `receipt.projected` can reject when its AbortSignal fires
- * after acceptance. The underlying command remains globally pending until
- * canonical projection evidence settles this independent promise.
- *
- * @internal
- */
-
 /**
  * Stable recovery handle attached to an ambiguous dispatch error.
  *
@@ -265,14 +247,40 @@ export type OutputOf<TEntry> =
 		? TOutput
 		: never;
 
+/**
+ * The input a call sends: generated defaults are always present. Generated
+ * input types mark a field optional when it is nullable or has a declared
+ * default, and defaults never target nullable fields.
+ */
+export type ReplicaCommandSentInput<TInput> = {
+	readonly [TKey in keyof TInput as null extends TInput[TKey]
+		? TKey
+		: never]?: TInput[TKey];
+} & {
+	readonly [TKey in keyof TInput as null extends TInput[TKey]
+		? never
+		: TKey]-?: Exclude<TInput[TKey], undefined>;
+};
+
+/**
+ * One command call. Awaiting it yields the receipt; its command id and the
+ * input it sends (generated ids included) are known synchronously, so a page
+ * can tell which optimistic row is its own before the server answers.
+ */
+export type ReplicaCommandCall<TInput, TOutput> = Promise<
+	ReplicaCommandReceipt<TOutput>
+> &
+	Readonly<{
+		commandId: string;
+		input: [TInput] extends [void] ? undefined : ReplicaCommandSentInput<TInput>;
+	}>;
+
 export type ReplicaBoundCommand<TInput, TOutput> = [TInput] extends [void]
-	? (
-			options?: ReplicaCommandCallOptions<TOutput>
-		) => Promise<ReplicaCommandReceipt<TOutput>>
+	? (options?: ReplicaCommandCallOptions<TOutput>) => ReplicaCommandCall<TInput, TOutput>
 	: (
 			input: TInput,
 			options?: ReplicaCommandCallOptions<TOutput>
-		) => Promise<ReplicaCommandReceipt<TOutput>>;
+		) => ReplicaCommandCall<TInput, TOutput>;
 
 export type ReplicaBoundCommandPath<
 	TPath extends string,

@@ -34,10 +34,6 @@ export const replicaCommandDirectProjection = Symbol(
 export const replicaCommandProjectionDelta = Symbol(
 	'distributed.replica.command-projection-delta'
 );
-/** @internal Package-private; intentionally absent from the public barrel. */
-export const replicaCommandProjectedLifecycle = Symbol(
-	'distributed.replica.command-projected-lifecycle'
-);
 /**
  * Package-private live-record field read for pure reduce optimism.
  * Returns undefined when the record is not present (fail closed).

@@ -208,6 +208,11 @@ pub trait EffectRelationshipMarker {
 pub enum InputDefaultGenerator {
     UuidV7,
     Ulid,
+    /// Unix milliseconds as a canonical decimal string. The client fills it
+    /// for the optimistic preview; the server always overwrites it with its
+    /// host clock before the handler runs, so the stored value is never the
+    /// caller's.
+    Now,
 }
 
 /// One generated default of a command's canonical input.
@@ -253,6 +258,21 @@ where
         CommandInputDefault {
             path: F::path().into_iter().map(str::to_string).collect(),
             generator: InputDefaultGenerator::Ulid,
+        },
+        PhantomData,
+    )
+}
+
+#[doc(hidden)]
+pub fn __input_default_now<I, F>() -> CompiledInputDefault<I>
+where
+    I: 'static,
+    F: EffectInputFieldMarker<Input = I, Value = String>,
+{
+    CompiledInputDefault(
+        CommandInputDefault {
+            path: F::path().into_iter().map(str::to_string).collect(),
+            generator: InputDefaultGenerator::Now,
         },
         PhantomData,
     )

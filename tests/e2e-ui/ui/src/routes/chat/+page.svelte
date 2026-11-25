@@ -47,8 +47,6 @@
 	let logEl: HTMLDivElement | undefined = $state();
 	let draft = $state('');
 	let busy = $state(false);
-	/** Local send lifecycle for this session's own messages. */
-	let deliveryById = $state<Record<string, 'sent' | 'delivered'>>({});
 	/** Older pages loaded on scroll-up (already reversed to ascending). */
 	let history = $state<ChatMsg[]>([]);
 	let historyOffset = $state(PAGE_SIZE);
@@ -104,13 +102,7 @@
 			const snap = chat.read({ limit: PAGE_SIZE, offset });
 			const pageMessages = snap.data?.chat_messages;
 			if (!snap.complete || !Array.isArray(pageMessages) || pageMessages.length === 0) break;
-			const page = pageMessages.filter(
-				(m): m is ChatMsg =>
-					typeof m?.message_id === 'string' &&
-					typeof m?.body === 'string' &&
-					typeof m?.created_at === 'string'
-			);
-			if (page.length === 0) break;
+			const page: readonly ChatMsg[] = pageMessages;
 			collected.push(...[...page].reverse());
 			offset += PAGE_SIZE;
 			if (page.length < PAGE_SIZE) {
@@ -234,8 +226,12 @@
 		return next === undefined || !messageIsMine(next);
 	}
 
-	function deliveryLabel(messageId: string): 'sent' | 'delivered' | null {
-		return deliveryById[messageId] ?? null;
+	/**
+	 * Sent while the row is still this client's preview; Delivered once the
+	 * server's row replaced it. A failed send rolls the row back entirely.
+	 */
+	function deliveryLabel(m: ChatMsg): 'sent' | 'delivered' {
+		return $lobby.pending.has(m) ? 'sent' : 'delivered';
 	}
 
 	function onLogScroll() {
@@ -267,13 +263,7 @@
 				if (!snap.complete) {
 					return;
 				}
-				// Sparse incomplete rows are possible mid-flight; only keep shaped ones.
-				const page = (snap.data?.chat_messages ?? []).filter(
-					(m): m is ChatMsg =>
-						typeof m?.message_id === 'string' &&
-						typeof m?.body === 'string' &&
-						typeof m?.created_at === 'string'
-				);
+				const page = snap.data.chat_messages;
 				const known = new Set([
 					...history.map((m) => m.message_id),
 					...livePage.map((m) => m.message_id)
@@ -309,34 +299,19 @@
 		e.preventDefault();
 		const body = draft.trim();
 		if (!body || busy || !commands) return;
-		const now = Date.now();
-		const message_id = `m-${now.toString(16)}`;
 		sendError = null;
 		busy = true;
 		// Clear only the submitted draft. Anything typed while this command is
 		// pending belongs to the next message and must survive its completion.
 		draft = '';
-		// Optimistic: show Sent as soon as the local row appears.
-		deliveryById = { ...deliveryById, [message_id]: 'sent' };
 		// Own sends should land in view.
 		stickToBottom = true;
 		try {
-			const receipt = await commands.chat.post({
-				message_id,
-				body,
-				room_id: LOBBY_ROOM,
-				created_at: String(now)
-			});
-			// Wait for causal projection when the runtime provides it; otherwise
-			// the command receipt itself is the server confirmation.
-			if (receipt.projected !== undefined) {
-				await receipt.projected;
-			}
-			deliveryById = { ...deliveryById, [message_id]: 'delivered' };
+			// `message_id` (uuid_v7) and `created_at` (now) are command defaults:
+			// the preview row shows this client's clock until the server's row,
+			// stamped with the host clock, replaces it and the order settles.
+			await commands.chat.post({ body, room_id: LOBBY_ROOM });
 		} catch (error) {
-			const next = { ...deliveryById };
-			delete next[message_id];
-			deliveryById = next;
 			if (!draft.trim()) draft = body;
 			sendError = error instanceof Error ? error.message : 'send failed';
 		} finally {
@@ -434,7 +409,7 @@
 						{@const mine = messageIsMine(m)}
 						{@const authorLabel = mine ? 'You' : authorName(m)}
 						{@const showStatus = isStatusFooterMessage(i)}
-						{@const delivery = showStatus ? deliveryLabel(m.message_id) : null}
+						{@const delivery = showStatus ? deliveryLabel(m) : null}
 						<div class="ch-msg-block" class:mine style="--i: {i}">
 							<article class="ch-msg" class:mine>
 								<header class="ch-msg-meta">
@@ -444,14 +419,9 @@
 								<p class="ch-body">{m.body}</p>
 							</article>
 							{#if showStatus}
-								{#if delivery === 'sent'}
-									<p class="ch-status-footer" data-state="sent">Sent</p>
-								{:else if delivery === 'delivered'}
-									<p class="ch-status-footer" data-state="delivered">Delivered</p>
-								{:else}
-									<!-- Own last bubble with no tracked session state (e.g. reload). -->
-									<p class="ch-status-footer" data-state="delivered">Delivered</p>
-								{/if}
+								<p class="ch-status-footer" data-state={delivery}>
+									{delivery === 'sent' ? 'Sent' : 'Delivered'}
+								</p>
 							{/if}
 						</div>
 					{/each}

@@ -21,9 +21,9 @@
 
 	let { data } = $props();
 	let actionError = $state<string | null>(null);
-	let pendingCommandCount = $state(0);
+	/** A new game has no row to mark pending until its atomic row lands. */
+	let starting = $state(false);
 	let hydrated = $state(false);
-	const commandPending = $derived(pendingCommandCount > 0);
 
 	const routeGameId = $derived(page.params.gameId ?? null);
 
@@ -58,14 +58,8 @@
 	const levelComplete = $derived(!!selected?.current_level_completed);
 	const currentLevel = $derived(Number(selected?.current_level ?? 0));
 	const status = $derived(selected?.status ?? 'active');
-
-	function newGameId() {
-		const rand =
-			typeof crypto !== 'undefined' && 'randomUUID' in crypto
-				? crypto.randomUUID().replace(/-/g, '').slice(0, 12)
-				: `${Date.now().toString(16)}${Math.random().toString(16).slice(2, 8)}`;
-		return `blob-${rand}`;
-	}
+	/** The selected game shows a move or level the server has not sealed yet. */
+	const selectedPending = $derived(selected !== null && $query.pending.has(selected));
 
 	function tileClass(t: number): string {
 		switch (t) {
@@ -93,18 +87,19 @@
 	}
 
 	async function startGame() {
-		if (commandPending) return;
-		pendingCommandCount += 1;
+		if (starting) return;
+		starting = true;
 		actionError = null;
-		const game_id = newGameId();
 		try {
-			const receipt = await commands.blob.start({ game_id });
+			// `game_id` is the command's `uuid_v7()` default.
+			const call = commands.blob.start({});
+			await call;
 			// Atomic response row is already in the replica before resolve.
-			await navigateToGame(receipt.result.game_id, true);
+			await navigateToGame(call.input.game_id, true);
 		} catch (e) {
 			actionError = e instanceof Error ? e.message : 'Start failed';
 		} finally {
-			pendingCommandCount = Math.max(0, pendingCommandCount - 1);
+			starting = false;
 		}
 	}
 
@@ -135,7 +130,6 @@
 			actionError = null;
 			return;
 		}
-		pendingCommandCount += 1;
 		actionError = null;
 		try {
 			await commands.blob.move({
@@ -144,21 +138,16 @@
 			});
 		} catch (error) {
 			actionError = error instanceof Error ? error.message : 'Move failed';
-		} finally {
-			pendingCommandCount = Math.max(0, pendingCommandCount - 1);
 		}
 	}
 
 	async function nextLevel() {
-		if (!selected || playerDead || !levelComplete || commandPending) return;
-		pendingCommandCount += 1;
+		if (!selected || playerDead || !levelComplete || selectedPending) return;
 		actionError = null;
 		try {
 			await commands.blob.start_level({ game_id: selected.game_id });
 		} catch (error) {
 			actionError = error instanceof Error ? error.message : 'Next level failed';
-		} finally {
-			pendingCommandCount = Math.max(0, pendingCommandCount - 1);
 		}
 	}
 
@@ -265,7 +254,7 @@
 					variant="ink"
 					data-testid="blob-start-game"
 					onclick={() => void startGame()}
-					disabled={commandPending || !hydrated}
+					disabled={starting || !hydrated}
 				>
 					Start game
 				</Button>
@@ -293,7 +282,7 @@
 							type="button"
 							variant="ink"
 							onclick={() => void nextLevel()}
-							disabled={commandPending}
+							disabled={selectedPending}
 						>
 							Next level
 						</Button>
