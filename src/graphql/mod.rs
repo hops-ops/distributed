@@ -41,7 +41,7 @@ pub use surface::{
 pub use filter::{
     claim, col, lit, rel, ClaimRef, CmpOp, ColRef, FilterExpr, LitValue, Operand, Truth,
 };
-pub use permissions::{read, ModelPermissions, ReadPermission};
+pub use permissions::{read, AuthorizedReadModel, ModelPermissions, ReadModels, ReadPermission};
 
 #[cfg(feature = "graphql")]
 mod compile;

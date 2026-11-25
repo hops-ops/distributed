@@ -106,8 +106,8 @@ pub struct Todos {
     pub status: String,
 }
 
-impl Todos {
-    pub fn permissions() -> ModelPermissions<Self> {
+impl AuthorizedReadModel for Todos {
+    fn permissions() -> ModelPermissions<Self> {
         ModelPermissions::new()
             .grant(
                 "user",
@@ -117,6 +117,15 @@ impl Todos {
             )
             .grant("admin", read().all_columns())
     }
+}
+
+// One list feeds schema bootstrap, the GraphQL engine and client export.
+pub fn read_models() -> ReadModels {
+    ReadModels::new("e2e-ui")
+        .model::<Todos>()
+        .model::<ChatMessages>()
+        .model::<BlobGames>()
+        .model::<AuthUsers>()
 }
 ```
 
@@ -361,17 +370,41 @@ split. Topology is explicit composition — not a hidden matrix.
 [`tests/e2e-ui/crates/service/src/modules/compose.rs`](tests/e2e-ui/crates/service/src/modules/compose.rs)
 
 ```rust,ignore
-// compose.rs (trimmed). Each routes(...) takes repo, locks, read models,
-// and the projection owner for that module.
-pub const MODULE_IDS: &[&str] = &[
-    todo::MODULE_ID, chat::MODULE_ID, blob::MODULE_ID, "identity",
-];
+// todo.rs: one bound for every store; the projection comes from its descriptor.
+pub fn routes<St: ServiceStores>(
+    stores: &St,
+    projections: &LocalProjectionMounts,
+) -> Routes<AggregateDependencies<St, Todo>> {
+    Routes::for_aggregate(stores)
+        .mount(todo_domain::commands::create())
+        // …
+        .consume_projection(projections.projector(TODOS))
+}
 
-Service::new()
-    .named("e2e-ui")
-    .routes(todo::routes(repo.clone(), locks.clone(), read_models.clone(), projections.todo))
-    .routes(chat::routes(repo.clone(), locks.clone(), read_models.clone(), projections.chat))
-    .routes(blob::routes(repo, locks, read_models, projections.blob))
+// compose.rs (trimmed). The modules are the command namespaces; the
+// application manifest is derived from this Service.
+pub fn build_service<St: ServiceStores>(stores: &St) -> Service {
+    let projections = LocalProjectionMounts::builder("e2e-ui", "ordered-domain-events")
+        .eventual(TODOS)
+        .eventual(CHAT_MESSAGES)
+        .direct(BLOB_GAMES)
+        .eventual(AUTH_USERS)
+        .build()
+        .expect("e2e-ui projection catalog");
+    Service::new()
+        .named("e2e-ui")
+        .routes(todo::routes(stores, &projections))
+        .routes(chat::routes(stores, &projections))
+        .routes(blob::routes(stores))
+        .routes(identity::routes(stores, &projections))
+}
+
+// host.rs: one host for SQLite and Postgres.
+async fn host<St: SqlStores>(stores: St, options: HostOptions) -> Result<(), BoxError> {
+    stores.bootstrap_read_models(read_models().catalog()).await?;
+    let service = build_service(&stores).with_bus(stores.bus("e2e-ui"));
+    // … GraphQL engine over stores.graphql_pool(), serve
+}
 
 // Another crate can list the same modules, or only Eventual projectors.
 // You write that Service. You do not flip a Runtime::role flag.

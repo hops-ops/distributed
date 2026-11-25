@@ -33,6 +33,13 @@ pub struct GraphqlPoolSource {
     pub(crate) causal_storage_identity: Option<crate::command_ledger::CausalStorageIdentity>,
 }
 
+impl GraphqlPoolSource {
+    /// The pool queries read through.
+    pub fn pool(&self) -> &GraphqlPool {
+        &self.pool
+    }
+}
+
 impl From<GraphqlPool> for GraphqlPoolSource {
     fn from(pool: GraphqlPool) -> Self {
         Self {

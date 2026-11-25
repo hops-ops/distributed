@@ -4,25 +4,26 @@
 //! add extra e2e-ui process topologies here. Optional celld+NATS is
 //! `tests/e2e-ui/celld-nats-profile/` (`DCS-DEC-001`).
 //!
-//! Dialect selection and identity remain here. Outbox/consumer loops use
-//! framework worker helpers.
+//! Backend selection and identity remain here; the host body is written once
+//! against [`SqlStores`]. The consumer loop is a framework worker helper.
 
 use std::sync::Arc;
-use std::time::Duration;
 
-use distributed::bus::{PostgresBus, SqliteBus};
+use distributed::gateway::DeliveryCapabilities;
+use distributed::graphql::delivery::GatewayVersionStore;
 use distributed::graphql::IdentityConfig;
 use distributed::microsvc::{
-    spawn_outbox_publish_loop, spawn_service_consumer_loop, LifecycleGate, Service,
+    spawn_service_consumer_loop, LifecycleGate, PostgresStores, Service, SqlStores, SqliteStores,
 };
-use distributed::{PostgresLockManager, PostgresRepository, SqliteLockManager, SqliteRepository};
 
+use crate::modules::graphql::build_graphql_engine_with_delivery;
 use crate::{
-    build_service, distributed_manifest, serve, spawn_scrape_loop, ZitadelScrapeConfig,
-    E2E_UI_APPLICATION,
+    build_service, read_models, serve, spawn_scrape_loop, ZitadelScrapeConfig, E2E_UI_APPLICATION,
 };
 
 const BUS_GROUP: &str = "e2e-ui";
+
+type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
 /// Bind address and identity for one local process host.
 pub struct HostOptions {
@@ -30,63 +31,48 @@ pub struct HostOptions {
     pub identity: IdentityConfig,
     pub public_origin: String,
     pub ui_origin: String,
-    pub delivery: distributed::gateway::DeliveryCapabilities,
+    pub delivery: DeliveryCapabilities,
 }
 
 /// Start the e2e-ui full-local process for SQLite or Postgres from `DATABASE_URL`.
-pub async fn run(
-    database_url: &str,
-    options: HostOptions,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+pub async fn run(database_url: &str, options: HostOptions) -> Result<(), BoxError> {
     eprintln!(
         "e2e-ui host application=`{}` bind={}",
         E2E_UI_APPLICATION, options.bind
     );
     if database_url.starts_with("postgres://") || database_url.starts_with("postgresql://") {
-        run_postgres(database_url, options).await
+        host(PostgresStores::connect(database_url).await?, options).await
     } else {
-        run_sqlite(database_url, options).await
+        host(SqliteStores::connect(database_url).await?, options).await
     }
 }
 
-async fn run_sqlite(
-    database_url: &str,
-    options: HostOptions,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let repo = SqliteRepository::connect_and_migrate(database_url).await?;
-    let registry = distributed_manifest()
-        .table_registry()
-        .map_err(|e| format!("manifest: {e}"))?;
-    repo.bootstrap_table_schema_for_dev(&registry).await?;
-    let locks = SqliteLockManager::new(repo.pool().clone());
-    let bus = SqliteBus::new(repo.pool().clone()).group(BUS_GROUP);
-    bus.ensure_tables().await?;
+/// One host path for every SQL backend: the stores, the bus and the GraphQL
+/// pool all come from the one database.
+async fn host<St: SqlStores>(stores: St, options: HostOptions) -> Result<(), BoxError> {
+    let read_models = read_models();
+    stores.bootstrap_read_models(read_models.catalog()).await?;
 
-    let change_rx = repo.read_model_changes();
+    let change_rx = stores.read_model_changes();
     // Under `distributed dev`, only the active generation may write.
     let lifecycle = LifecycleGate::from_env();
-    let service = build_service(repo.clone(), locks.clone(), repo.clone())
+    let service = build_service(&stores)
         .with_lifecycle(lifecycle.clone())
-        .with_bus(SqliteBus::new(repo.pool().clone()).group(BUS_GROUP));
-    let versions = if options.delivery != distributed::gateway::DeliveryCapabilities::default() {
+        .with_bus(stores.bus(BUS_GROUP));
+    let versions = if options.delivery != DeliveryCapabilities::default() {
         Some(
-            distributed::graphql::delivery::GatewayVersionStore::install(
-                &distributed::graphql::GraphqlPool::from(repo.pool().clone()),
+            GatewayVersionStore::install(
+                stores.graphql_pool().pool(),
                 "e2e-ui-gateway-v1",
-                [
-                    "todos".into(),
-                    "chat_messages".into(),
-                    "blob_games".into(),
-                    "auth_users".into(),
-                ],
+                read_models.table_names(),
             )
             .await?,
         )
     } else {
         None
     };
-    let gql = crate::modules::graphql::build_graphql_engine_with_delivery(
-        &repo,
+    let gql = build_graphql_engine_with_delivery(
+        stores.graphql_pool(),
         &service,
         options.identity.clone(),
         Some(change_rx),
@@ -94,95 +80,15 @@ async fn run_sqlite(
     )?;
     let service = Arc::new(service.try_with_graphql(gql)?);
 
-    spawn_outbox_publish_loop(
-        repo.outbox_store(),
-        Arc::new(SqliteBus::new(repo.pool().clone()).group(BUS_GROUP)),
-        "e2e-ui",
-        Duration::from_secs(30),
-        5,
-    );
-    {
-        let repo = repo.clone();
-        let locks = locks.clone();
-        spawn_service_consumer_loop(move || {
-            let bus = SqliteBus::new(repo.pool().clone()).group(BUS_GROUP);
-            build_service(repo.clone(), locks.clone(), repo.clone())
-                .with_lifecycle(lifecycle.clone())
-                .with_bus(bus)
-        });
-    }
+    // `with_bus` also drains the outbox, so the consumer is the only loop.
+    spawn_service_consumer_loop(move || {
+        build_service(&stores)
+            .with_lifecycle(lifecycle.clone())
+            .with_bus(stores.bus(BUS_GROUP))
+    });
     spawn_zitadel_scrape(service.clone());
 
-    eprintln!("e2e-ui (sqlite) listening on http://{}", options.bind);
-    serve(service, &options).await?;
-    Ok(())
-}
-
-async fn run_postgres(
-    database_url: &str,
-    options: HostOptions,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let repo = PostgresRepository::connect_and_migrate(database_url).await?;
-    let registry = distributed_manifest()
-        .table_registry()
-        .map_err(|e| format!("manifest: {e}"))?;
-    repo.bootstrap_table_schema_for_dev(&registry).await?;
-    let locks = PostgresLockManager::new(repo.pool().clone());
-    let bus = PostgresBus::new(repo.pool().clone()).group(BUS_GROUP);
-    bus.ensure_tables().await?;
-
-    let change_rx = repo.read_model_changes();
-    // Under `distributed dev`, only the active generation may write.
-    let lifecycle = LifecycleGate::from_env();
-    let service = build_service(repo.clone(), locks.clone(), repo.clone())
-        .with_lifecycle(lifecycle.clone())
-        .with_bus(PostgresBus::new(repo.pool().clone()).group(BUS_GROUP));
-    let versions = if options.delivery != distributed::gateway::DeliveryCapabilities::default() {
-        Some(
-            distributed::graphql::delivery::GatewayVersionStore::install(
-                &distributed::graphql::GraphqlPool::from(repo.pool().clone()),
-                "e2e-ui-gateway-v1",
-                [
-                    "todos".into(),
-                    "chat_messages".into(),
-                    "blob_games".into(),
-                    "auth_users".into(),
-                ],
-            )
-            .await?,
-        )
-    } else {
-        None
-    };
-    let gql = crate::modules::graphql::build_graphql_engine_with_delivery(
-        &repo,
-        &service,
-        options.identity.clone(),
-        Some(change_rx),
-        versions,
-    )?;
-    let service = Arc::new(service.try_with_graphql(gql)?);
-
-    spawn_outbox_publish_loop(
-        repo.outbox_store(),
-        Arc::new(PostgresBus::new(repo.pool().clone()).group(BUS_GROUP)),
-        "e2e-ui",
-        Duration::from_secs(30),
-        5,
-    );
-    {
-        let repo = repo.clone();
-        let locks = locks.clone();
-        spawn_service_consumer_loop(move || {
-            let bus = PostgresBus::new(repo.pool().clone()).group(BUS_GROUP);
-            build_service(repo.clone(), locks.clone(), repo.clone())
-                .with_lifecycle(lifecycle.clone())
-                .with_bus(bus)
-        });
-    }
-    spawn_zitadel_scrape(service.clone());
-
-    eprintln!("e2e-ui (postgres) listening on http://{}", options.bind);
+    eprintln!("e2e-ui listening on http://{}", options.bind);
     serve(service, &options).await?;
     Ok(())
 }

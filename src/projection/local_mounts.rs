@@ -17,8 +17,6 @@ use crate::projection::placement::{
     PROJECTION_PARTITION_CODEC_VERSION,
 };
 use crate::projection_protocol::ProjectorTopologyId;
-use crate::table::TableSchema;
-use crate::RelationalReadModel;
 use sha2::{Digest, Sha256};
 
 const LOCAL_TOPOLOGY_DIGEST_DOMAIN: &[u8] = b"distributed.local-projection-topology\0";
@@ -45,20 +43,36 @@ pub struct LocalProjectionMounts {
 }
 
 impl LocalProjectionMounts {
-    pub fn projector(&self, owner: &str) -> Option<SurfaceProjector> {
+    /// Start mounting projection descriptors for `service_id`, consuming the
+    /// stable domain event stream `domain_source` (e.g. `ordered-domain-events`).
+    pub fn builder(
+        service_id: impl Into<String>,
+        domain_source: impl Into<String>,
+    ) -> LocalProjectionMountsBuilder {
+        LocalProjectionMountsBuilder::new(service_id, domain_source)
+    }
+
+    /// The eventual projector compiled from `descriptor`.
+    ///
+    /// # Panics
+    ///
+    /// When `descriptor` was not mounted with
+    /// [`eventual`](LocalProjectionMountsBuilder::eventual): a composition
+    /// mistake, reported at startup with the projection's name.
+    pub fn projector<D>(&self, descriptor: ProjectionDescriptor<D>) -> SurfaceProjector {
         self.eventual
             .iter()
-            .find(|mount| mount.owner == owner)
+            .find(|mount| mount.owner == descriptor.name())
             .map(|mount| mount.projector.clone())
+            .unwrap_or_else(|| {
+                panic!(
+                    "projection `{}` is not mounted eventually; add `.eventual(..)` for it to the LocalProjectionMountsBuilder",
+                    descriptor.name()
+                )
+            })
     }
 
-    pub fn direct_projection(&self, owner: &str) -> Option<SurfaceDirectProjection> {
-        self.direct
-            .iter()
-            .find(|mount| mount.owner == owner)
-            .map(|mount| mount.projection.clone())
-    }
-
+    /// Every mounted projection as a Surface owner, eventual then direct.
     pub fn all_owners(&self) -> Vec<crate::graphql::SurfaceProjectionOwner> {
         let mut owners = Vec::new();
         for mount in &self.eventual {
@@ -71,159 +85,167 @@ impl LocalProjectionMounts {
     }
 }
 
-struct PendingEventual {
+type ModeledFactory = Box<
+    dyn Fn(
+            &ProjectionCatalog,
+            &ActiveProjectionBindings,
+            &ProjectionBinding,
+        ) -> Result<SurfaceModeledProjection, String>
+        + Send
+        + Sync,
+>;
+
+struct Pending {
     owner: String,
     epoch: String,
     binding: ProjectionBinding,
-    modeled_factory: Box<
-        dyn Fn(
-                &ProjectionCatalog,
-                &ActiveProjectionBindings,
-                &ProjectionBinding,
-            ) -> Result<SurfaceModeledProjection, String>
-            + Send
-            + Sync,
-    >,
+    modeled_factory: ModeledFactory,
 }
 
-struct PendingDirect {
-    owner: String,
-    epoch: String,
-    binding: ProjectionBinding,
-    modeled_factory: Box<
-        dyn Fn(
-                &ProjectionCatalog,
-                &ActiveProjectionBindings,
-                &ProjectionBinding,
-            ) -> Result<SurfaceModeledProjection, String>
-            + Send
-            + Sync,
-    >,
-}
-
-/// Builder that materializes a shared catalog and Surface mounts for local hosting.
+/// Builder that materializes a shared catalog and Surface mounts for local
+/// hosting.
+///
+/// Each projection is mounted from its `projection!` descriptor alone: the
+/// owner is the descriptor's `name`, the binding epoch its `epoch` and the
+/// outputs its `model`, so no identity is restated. Errors are kept until
+/// [`build`](Self::build).
 pub struct LocalProjectionMountsBuilder {
     service_id: String,
-    source: ProjectionSourceBinding,
-    eventual: Vec<PendingEventual>,
-    direct: Vec<PendingDirect>,
+    source: Result<ProjectionSourceBinding, String>,
+    eventual: Vec<Pending>,
+    direct: Vec<Pending>,
+    errors: Vec<String>,
 }
 
 impl LocalProjectionMountsBuilder {
     /// `domain_source` is a stable domain event stream name (e.g. `ordered-domain-events`).
-    pub fn new(
-        service_id: impl Into<String>,
-        domain_source: impl Into<String>,
-    ) -> Result<Self, String> {
+    pub fn new(service_id: impl Into<String>, domain_source: impl Into<String>) -> Self {
         let service_id = service_id.into();
         let source =
             ProjectionSourceBinding::try_new(format!("{service_id}-domain"), domain_source, 1)
-                .map_err(|error| error.to_string())?;
-        Ok(Self {
+                .map_err(|error| error.to_string());
+        Self {
             service_id,
             source,
             eventual: Vec::new(),
             direct: Vec::new(),
+            errors: Vec::new(),
+        }
+    }
+
+    /// Mount `descriptor` as an eventual projection (ordered domain-event
+    /// delivery).
+    pub fn eventual<D>(mut self, descriptor: ProjectionDescriptor<D>) -> Self
+    where
+        D: Copy + 'static,
+    {
+        let pending = self.pending(descriptor, |source, owner, outputs, topology| {
+            ProjectionBinding::materialize_eventual(
+                descriptor.eventual(),
+                source,
+                owner,
+                "distributed-projection-partition",
+                PROJECTION_PARTITION_CODEC_VERSION,
+                outputs,
+                Vec::new(),
+                Some(topology),
+            )
+            .map_err(|error| error.to_string())
+        });
+        match pending {
+            Ok(pending) => self.eventual.push(pending),
+            Err(error) => self.errors.push(error),
+        }
+        self
+    }
+
+    /// Mount `descriptor` as a direct projection, sealed in the command's own
+    /// transaction.
+    pub fn direct(
+        mut self,
+        descriptor: ProjectionDescriptor<crate::projection::lower::DirectCandidate>,
+    ) -> Self {
+        let pending = self.pending(descriptor, |source, owner, outputs, topology| {
+            ProjectionBinding::materialize_direct(
+                descriptor.direct(),
+                source,
+                owner,
+                "distributed-projection-partition",
+                PROJECTION_PARTITION_CODEC_VERSION,
+                outputs,
+                Vec::new(),
+                Some(topology),
+            )
+            .map_err(|error| error.to_string())
+        });
+        match pending {
+            Ok(pending) => self.direct.push(pending),
+            Err(error) => self.errors.push(error),
+        }
+        self
+    }
+
+    fn pending<D: Copy + 'static>(
+        &self,
+        descriptor: ProjectionDescriptor<D>,
+        materialize: impl FnOnce(
+            ProjectionSourceBinding,
+            ProjectionOwner,
+            Vec<ProjectionOutput>,
+            ProjectionPhysicalTopology,
+        ) -> Result<ProjectionBinding, String>,
+    ) -> Result<Pending, String> {
+        let owner = descriptor.name().to_string();
+        let source = self.source.clone()?;
+        let outputs = descriptor
+            .output_inventory()
+            .map_err(|error| format!("projection `{owner}` outputs: {error}"))?
+            .models
+            .into_iter()
+            .map(|output| {
+                ProjectionOutput::try_new(output.model, output.storage, output.schema)
+                    .map_err(|error| format!("projection `{owner}` output: {error}"))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let binding = materialize(
+            source,
+            ProjectionOwner::try_new(owner.clone()).map_err(|e| e.to_string())?,
+            outputs,
+            physical_topology(&owner, stable_topology_digest(&owner)),
+        )
+        .map_err(|error| format!("projection `{owner}`: {error}"))?;
+        Ok(Pending {
+            owner,
+            epoch: descriptor.epoch().to_string(),
+            binding,
+            modeled_factory: Box::new(move |catalog, active, binding| {
+                SurfaceModeledProjection::try_from_descriptor(
+                    descriptor,
+                    catalog,
+                    active,
+                    binding.id(),
+                )
+            }),
         })
     }
 
-    /// Register an eventual projection program targeting model `M`.
-    pub fn eventual_model<M, D>(
-        mut self,
-        owner: impl Into<String>,
-        descriptor: ProjectionDescriptor<D>,
-        epoch: impl Into<String>,
-    ) -> Result<Self, String>
-    where
-        M: RelationalReadModel,
-        D: Copy + 'static,
-    {
-        let owner = owner.into();
-        let epoch = epoch.into();
-        let digest = stable_topology_digest(&owner);
-        let binding = ProjectionBinding::materialize_eventual(
-            descriptor.eventual(),
-            self.source.clone(),
-            ProjectionOwner::try_new(owner.clone()).map_err(|e| e.to_string())?,
-            "distributed-projection-partition",
-            PROJECTION_PARTITION_CODEC_VERSION,
-            vec![projection_output_for::<M>()?],
-            Vec::new(),
-            Some(physical_topology(&owner, digest)),
-        )
-        .map_err(|error| error.to_string())?;
-        self.eventual.push(PendingEventual {
-            owner,
-            epoch,
-            binding,
-            modeled_factory: Box::new(move |catalog, active, binding| {
-                SurfaceModeledProjection::try_from_descriptor(
-                    descriptor,
-                    catalog,
-                    active,
-                    binding.id(),
-                )
-            }),
-        });
-        Ok(self)
-    }
-
-    /// Register a direct projection program targeting model `M`.
-    pub fn direct_model<M>(
-        mut self,
-        owner: impl Into<String>,
-        descriptor: ProjectionDescriptor<crate::projection::lower::DirectCandidate>,
-        epoch: impl Into<String>,
-    ) -> Result<Self, String>
-    where
-        M: RelationalReadModel,
-    {
-        let owner = owner.into();
-        let epoch = epoch.into();
-        let digest = stable_topology_digest(&owner);
-        let binding = ProjectionBinding::materialize_direct(
-            descriptor.direct(),
-            self.source.clone(),
-            ProjectionOwner::try_new(owner.clone()).map_err(|e| e.to_string())?,
-            "distributed-projection-partition",
-            PROJECTION_PARTITION_CODEC_VERSION,
-            vec![projection_output_for::<M>()?],
-            Vec::new(),
-            Some(physical_topology(&owner, digest)),
-        )
-        .map_err(|error| error.to_string())?;
-        self.direct.push(PendingDirect {
-            owner,
-            epoch,
-            binding,
-            modeled_factory: Box::new(move |catalog, active, binding| {
-                SurfaceModeledProjection::try_from_descriptor(
-                    descriptor,
-                    catalog,
-                    active,
-                    binding.id(),
-                )
-            }),
-        });
-        Ok(self)
-    }
-
+    /// Compile every mounted projection into one catalog with its epochs
+    /// active, then package the Surface mounts.
+    ///
+    /// # Errors
+    ///
+    /// The first mount or catalog error, naming its projection.
     pub fn build(self) -> Result<LocalProjectionMounts, String> {
-        let mut bindings = Vec::new();
-        for entry in &self.eventual {
-            bindings.push(entry.binding.clone());
+        if let Some(error) = self.errors.into_iter().next() {
+            return Err(error);
         }
-        for entry in &self.direct {
-            bindings.push(entry.binding.clone());
-        }
-        let catalog = ProjectionCatalog::try_new(bindings).map_err(|e| e.to_string())?;
-        let mut activations = Vec::new();
-        for entry in &self.eventual {
-            activations.push(activation(&entry.binding, &entry.epoch, &self.service_id)?);
-        }
-        for entry in &self.direct {
-            activations.push(activation(&entry.binding, &entry.epoch, &self.service_id)?);
-        }
+        let pending = || self.eventual.iter().chain(&self.direct);
+        let catalog =
+            ProjectionCatalog::try_new(pending().map(|entry| entry.binding.clone()).collect())
+                .map_err(|e| e.to_string())?;
+        let activations = pending()
+            .map(|entry| activation(&entry.binding, &entry.epoch, &self.service_id))
+            .collect::<Result<Vec<_>, _>>()?;
         let active = catalog
             .activate(activations, None)
             .map_err(|e| e.to_string())?;
@@ -259,12 +281,6 @@ fn activation(
         ProjectionBindingState::Active,
         Some(ProjectionExecutorRoute::local(service_id).map_err(|e| e.to_string())?),
     ))
-}
-
-fn projection_output_for<M: RelationalReadModel>() -> Result<ProjectionOutput, String> {
-    let schema: TableSchema = M::schema().clone();
-    ProjectionOutput::try_new(schema.model_name.clone(), schema.table_name.clone(), schema)
-        .map_err(|e| e.to_string())
 }
 
 fn physical_topology(name: &str, digest: [u8; 32]) -> ProjectionPhysicalTopology {

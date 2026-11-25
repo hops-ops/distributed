@@ -4,48 +4,32 @@
 //! No aggregate: the commands publish user profiles as external facts, which
 //! commit with their ledger receipts; the `AUTH_USERS` projection writes them.
 
-use distributed::graphql::SurfaceProjector;
-use distributed::microsvc::{ConfigurableOutboxPublisher, HasOutboxStore, HasRepo, Routes};
-use distributed::AggregateRepository;
+use distributed::microsvc::{Routes, ServiceStores, StoreDependencies};
+use distributed::LocalProjectionMounts;
+use e2e_projections::AUTH_USERS;
 
-use crate::bounds::{EventStore, ReadStore};
-use crate::deps::AuthDeps;
 use crate::handlers::ingestors::{zitadel, zitadel_scrape};
-
-/// Logical module id for composition inventories.
-pub const MODULE_ID: &str = "identity";
-
-/// Prefix of this module's command names (they are named for the provider).
-pub const COMMAND_PREFIX: &str = "zitadel.";
 
 /// Mount the Zitadel ingress and scrape commands and the auth_users
 /// projection.
-pub fn routes<R, S>(
-    repo: R,
-    read_models: S,
-    auth_projector: SurfaceProjector,
-) -> Routes<AuthDeps<R, S>>
-where
-    R: EventStore,
-    S: ReadStore,
-    AggregateRepository<R, ()>:
-        HasRepo + HasOutboxStore + ConfigurableOutboxPublisher + Send + Sync + 'static,
-{
-    let scrape = zitadel_scrape::Scrape(read_models.clone());
-    Routes::for_stores(repo, read_models)
+pub fn routes<St: ServiceStores>(
+    stores: &St,
+    projections: &LocalProjectionMounts,
+) -> Routes<StoreDependencies<St>> {
+    let scrape = zitadel_scrape::Scrape(stores.read_models().clone());
+    Routes::for_stores(stores.events().clone(), stores.read_models().clone())
         .typed_command(zitadel::command())
         .handle(zitadel::handle)
         .typed_command(zitadel_scrape::command())
         .handle(scrape)
-        .consume_projection(auth_projector)
+        .consume_projection(projections.projector(AUTH_USERS))
 }
 
 #[cfg(test)]
 mod tests {
     use distributed::bus::{InMemoryBus, RunOptions};
-    use distributed::{
-        ReadModelWorkspaceExt, RowKey, RowValue, SqliteLockManager, SqliteRepository,
-    };
+    use distributed::microsvc::{SqlStores, SqliteStores};
+    use distributed::{ReadModelWorkspaceExt, RowKey, RowValue};
     use e2e_readmodels::AuthUsers;
     use serde_json::json;
 
@@ -56,17 +40,13 @@ mod tests {
 
     #[tokio::test]
     async fn an_ingested_profile_reaches_auth_users_through_the_projection() {
-        let repo = SqliteRepository::connect_and_migrate("sqlite::memory:")
+        let stores = SqliteStores::connect("sqlite::memory:").await.unwrap();
+        stores
+            .bootstrap_read_models(e2e_readmodels::read_models().catalog())
             .await
             .unwrap();
-        let registry = crate::distributed_manifest().table_registry().unwrap();
-        repo.bootstrap_table_schema_for_dev(&registry)
-            .await
-            .unwrap();
-        let locks = SqliteLockManager::new(repo.pool().clone());
         let bus = InMemoryBus::new();
-        let service =
-            || build_service(repo.clone(), locks.clone(), repo.clone()).with_bus(bus.clone());
+        let service = || build_service(&stores).with_bus(bus.clone());
 
         let input = normalize_ingress_body(&json!({
             "event_id": "evt-1",
@@ -86,7 +66,8 @@ mod tests {
             .unwrap();
         service().run(RunOptions::until_idle()).await.unwrap();
 
-        let row = repo
+        let row = stores
+            .read_models
             .workspace()
             .load::<AuthUsers>(RowKey::new([("user_id", RowValue::String("sub-1".into()))]))
             .one()

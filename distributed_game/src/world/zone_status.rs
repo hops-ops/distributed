@@ -26,7 +26,7 @@
 use distributed::graphql::SurfaceProjector;
 use distributed::projection::lower::{EventualOnly, ProjectionDescriptor};
 use distributed::{
-    mutation_file, LocalProjectionMountsBuilder, Mutation, ReadModel, ReadModelCatalog,
+    mutation_file, LocalProjectionMounts, Mutation, ReadModel, ReadModelCatalog,
     RelationalReadModel,
 };
 use serde::{Deserialize, Serialize};
@@ -43,19 +43,6 @@ use super::zone_state::{ZoneStateDeletedDomainEvent, ZoneStateSavedDomainEvent};
 /// Application of the read model (catalog and projector owner; the
 /// consumer service is named after it).
 pub const APPLICATION: &str = "zone-status";
-/// Projector of [`ZoneLeases`].
-pub const LEASES_PROJECTOR: &str = "project_zone_leases";
-/// Projector of [`ZoneSnapshots`].
-pub const SNAPSHOTS_PROJECTOR: &str = "project_zone_snapshots";
-/// Epoch of [`ZONE_LEASES`] (bump to rebuild from the bus log).
-pub const LEASES_EPOCH: &str = "zone-leases-v1";
-/// Epoch of [`ZONE_SNAPSHOTS`].
-pub const SNAPSHOTS_EPOCH: &str = "zone-snapshots-v1";
-/// Projector of [`ZoneActivities`].
-pub const ACTIVITIES_PROJECTOR: &str = "project_zone_activities";
-/// Epoch of [`ZONE_ACTIVITIES`].
-pub const ACTIVITIES_EPOCH: &str = "zone-activities-v1";
-
 /// One `zone_leases` row: the last lease transition of a zone
 /// ([`ZoneLeaseStatus`](super::zone_lease::ZoneLeaseStatus); the type is
 /// named after its table, as `mutation_file!` requires).
@@ -202,39 +189,25 @@ pub fn activity_projector() -> SurfaceProjector {
 /// [`activity_projector`] owned by `application` (when the consumer service
 /// is not named [`APPLICATION`]).
 pub fn activity_projector_for(application: &str) -> SurfaceProjector {
-    LocalProjectionMountsBuilder::new(application, "ordered-domain-events")
-        .expect("projection source")
-        .eventual_model::<ZoneActivities, _>(
-            ACTIVITIES_PROJECTOR,
-            ZONE_ACTIVITIES,
-            ACTIVITIES_EPOCH,
-        )
-        .expect("zone activities mount")
+    LocalProjectionMounts::builder(application, "ordered-domain-events")
+        .eventual(ZONE_ACTIVITIES)
         .build()
-        .expect("projection catalog")
-        .projector(ACTIVITIES_PROJECTOR)
-        .expect("zone activities projector")
+        .expect("zone activities projection")
+        .projector(ZONE_ACTIVITIES)
 }
 
 /// The modeled projector mounts `(leases, snapshots)`: mount both on one
 /// consumer service named [`APPLICATION`], applying [`ZONE_LEASES`] and
 /// [`ZONE_SNAPSHOTS`] respectively.
 pub fn projectors() -> (SurfaceProjector, SurfaceProjector) {
-    let mounts = LocalProjectionMountsBuilder::new(APPLICATION, "ordered-domain-events")
-        .expect("projection source")
-        .eventual_model::<ZoneLeases, _>(LEASES_PROJECTOR, ZONE_LEASES, LEASES_EPOCH)
-        .expect("zone leases mount")
-        .eventual_model::<ZoneSnapshots, _>(SNAPSHOTS_PROJECTOR, ZONE_SNAPSHOTS, SNAPSHOTS_EPOCH)
-        .expect("zone snapshots mount")
+    let mounts = LocalProjectionMounts::builder(APPLICATION, "ordered-domain-events")
+        .eventual(ZONE_LEASES)
+        .eventual(ZONE_SNAPSHOTS)
         .build()
-        .expect("projection catalog");
+        .expect("zone status projections");
     (
-        mounts
-            .projector(LEASES_PROJECTOR)
-            .expect("zone leases projector"),
-        mounts
-            .projector(SNAPSHOTS_PROJECTOR)
-            .expect("zone snapshots projector"),
+        mounts.projector(ZONE_LEASES),
+        mounts.projector(ZONE_SNAPSHOTS),
     )
 }
 

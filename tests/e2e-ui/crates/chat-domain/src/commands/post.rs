@@ -1,21 +1,9 @@
 use distributed::command;
 use distributed::command::{Eventual, PreparedCommand};
-use distributed::microsvc::{CausalCommandContext, HandlerError};
+use distributed::microsvc::{guards, CausalCommandContext, HandlerError};
 use serde::{Deserialize, Serialize};
 
 use crate::{domain_commands, ChatMessage, ChatMessagePostedDomainEvent, ChatMessageState};
-
-fn rejected(err: impl std::fmt::Display) -> HandlerError {
-    HandlerError::Rejected(err.to_string())
-}
-
-fn principal(ctx: &CausalCommandContext<'_, ChatMessage>) -> Result<String, HandlerError> {
-    ctx.user_id().map(str::to_string)
-}
-
-fn authenticated_user(ctx: &CausalCommandContext<'_, ChatMessage>) -> bool {
-    ctx.session().user_id().is_some_and(|id| !id.is_empty())
-}
 
 #[derive(Debug, Deserialize, distributed::CommandInput)]
 pub struct ChatPostInput {
@@ -40,7 +28,7 @@ pub async fn handle_post(
     ctx: &CausalCommandContext<'_, ChatMessage>,
     input: ChatPostInput,
 ) -> Result<PreparedCommand<Eventual<ChatPostPayload>>, HandlerError> {
-    let author = principal(ctx)?;
+    let author = ctx.user_id()?.to_string();
     let created_at = canonical_near_unix_millis(&input.created_at)?;
     let repo = ctx.repo();
 
@@ -60,7 +48,7 @@ pub async fn handle_post(
             &input.body,
             &created_at,
         )
-        .map_err(rejected)?;
+        .map_err(HandlerError::rejected)?;
 
     let state = ChatMessageState::from(&*message);
     repo.publish_events()
@@ -83,9 +71,9 @@ pub async fn handle_post(
 pub fn canonical_near_unix_millis(value: &str) -> Result<String, HandlerError> {
     let millis = value
         .parse::<u128>()
-        .map_err(|_| rejected("created_at must be canonical unix milliseconds"))?;
+        .map_err(|_| HandlerError::rejected("created_at must be canonical unix milliseconds"))?;
     if millis.to_string() != value {
-        return Err(rejected(
+        return Err(HandlerError::rejected(
             "created_at must be canonical unix milliseconds within five minutes of server time",
         ));
     }
@@ -97,7 +85,7 @@ pub fn canonical_near_unix_millis(value: &str) -> Result<String, HandlerError> {
             .unwrap_or_default()
             .as_millis();
         if millis.abs_diff(now) > 300_000 {
-            return Err(rejected(
+            return Err(HandlerError::rejected(
                 "created_at must be canonical unix milliseconds within five minutes of server time",
             ));
         }
@@ -119,7 +107,7 @@ command! {
         ChatMessageState,
         "author_id"
     ),
-    guard: authenticated_user,
+    guard: guards::authenticated,
     handle: handle_post,
 }
 

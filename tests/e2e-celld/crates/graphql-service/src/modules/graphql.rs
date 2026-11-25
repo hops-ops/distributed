@@ -1,37 +1,24 @@
-use std::sync::Arc;
-
-use distributed::application::CommandDefinition;
 use distributed::graphql::{
     build_surface, surface_for_application, DistributedClientSurfaceExport, GraphqlEngine,
     GraphqlPoolSource, IdentityConfig, OidcConfig, Surface, SurfaceOptions,
 };
-use distributed::microsvc::Service;
+use distributed::microsvc::{Service, Stores};
 use distributed::{
-    Application, ApplicationManifest, InMemoryLockManager, InMemoryRepository, LockError,
-    LockManager, Module, SurfaceSpec,
+    Application, ApplicationError, ApplicationManifest, InMemoryLockManager, InMemoryRepository,
+    SurfaceSpec,
 };
-use e2e_readmodels::{AuthUsers, BlobGames, ChatMessages, Todos};
+use e2e_readmodels::read_models;
 
 use crate::application::{
-    DISTRIBUTED_ADMIN_CLIENT_SURFACE, DISTRIBUTED_CLIENT_SURFACE,
-    DISTRIBUTED_PUBLIC_CLIENT_SURFACE, E2E_UI_APPLICATION, E2E_UI_MODULE_IDS,
+    ClientSurface, ADMIN_CLIENT_SURFACE, CLIENT_SURFACE, CLIENT_SURFACES, E2E_UI_APPLICATION,
+    PUBLIC_CLIENT_SURFACE,
 };
-use crate::modules::projections;
+use crate::modules::compose::build_service;
+use crate::modules::projections::projections;
 
 // Stable only for this local copyable fixture. Real deployments must inject
 // their own per-deployment key rather than copying this development value.
 const E2E_PROTOCOL_TOKEN_KEY: [u8; 32] = [0xe2; 32];
-
-#[derive(Clone, Default)]
-pub(crate) struct ClientSurfaceLocks(Arc<InMemoryLockManager>);
-
-impl LockManager for ClientSurfaceLocks {
-    type Lock = distributed::InMemoryLock;
-
-    fn get_lock(&self, id: &str) -> Result<Arc<Self::Lock>, LockError> {
-        self.0.get_lock(id)
-    }
-}
 
 /// GraphQL over todos + chat + blob + AuthUsers.
 pub fn build_graphql_engine(
@@ -50,151 +37,92 @@ pub(crate) fn build_graphql_engine_with_graphiql(
     change_rx: Option<tokio::sync::broadcast::Receiver<distributed::ReadModelChange>>,
     graphiql: bool,
 ) -> Result<GraphqlEngine, String> {
-    let projections = projections::projection_owners();
     let mut b = GraphqlEngine::builder(pool)
         .protocol_token_key(E2E_PROTOCOL_TOKEN_KEY)
         .roles(&["user", "admin", "anonymous"])
-        .client_application_surface(DISTRIBUTED_CLIENT_SURFACE, ["admin", "user"], ["user"])
-        .client_application_surface(DISTRIBUTED_ADMIN_CLIENT_SURFACE, ["admin"], ["admin"])
-        .client_application_surface(
-            DISTRIBUTED_PUBLIC_CLIENT_SURFACE,
-            ["anonymous"],
-            ["anonymous"],
-        )
-        .model::<Todos>(Todos::permissions())
-        .model::<ChatMessages>(ChatMessages::permissions())
-        .model::<BlobGames>(BlobGames::permissions())
-        .model::<AuthUsers>(AuthUsers::permissions())
+        .read_models(&read_models())
         .service(service)
-        .client_projection_owners([
-            projections.todo.into(),
-            projections.chat.into(),
-            projections.blob.into(),
-            projections.auth.into(),
-        ])
+        .client_projection_owners(projections().all_owners())
         .identity(identity)
         .graphiql(graphiql);
+    for surface in CLIENT_SURFACES {
+        b = b.client_application_surface(
+            surface.name,
+            surface.eligible_roles.iter().copied(),
+            surface.schema_roles.iter().copied(),
+        );
+    }
     if let Some(rx) = change_rx {
         b = b.change_stream(rx);
     }
     b.build().map_err(|e| e.to_string())
 }
 
-fn pool_free_client_surface(application: &str, roles: &[&str]) -> DistributedClientSurfaceExport {
-    pool_free_client_surface_contract(application, roles, roles)
+/// The application's full Surface: every read model, projection and command.
+fn full_surface(service: &Service) -> Result<Surface, ApplicationError> {
+    build_surface(&read_models().catalog().tables, &SurfaceOptions::sqlite())
+        .and_then(|surface| surface.with_projection_owners(projections().all_owners()))
+        .and_then(|surface| surface.with_service(service))
+        .map_err(ApplicationError::InvalidSpec)
 }
 
-fn pool_free_client_surface_contract(
-    application: &str,
-    eligible_roles: &[&str],
-    schema_roles: &[&str],
-) -> DistributedClientSurfaceExport {
-    let full = pool_free_full_surface();
-    let eligible = eligible_roles
-        .iter()
-        .map(|role| (*role).to_string())
-        .collect::<Vec<_>>();
-    let schema = schema_roles
-        .iter()
-        .map(|role| (*role).to_string())
-        .collect::<Vec<_>>();
-    let grants = e2e_readmodels::application_grants();
-    let selected = surface_for_application(&full, application, &eligible, &schema, &grants)
-        .expect("e2e-ui application Surface should select");
-    DistributedClientSurfaceExport::from_selected("e2e-ui", selected)
-        .expect("e2e-ui application Surface should export")
+/// The logical application: the Service's command namespaces as modules,
+/// bound to the full Surface.
+pub fn application(service: &Service) -> Result<Application, ApplicationError> {
+    let surface = SurfaceSpec::from_surface(E2E_UI_APPLICATION, &full_surface(service)?)?;
+    service.application(E2E_UI_APPLICATION, surface)
 }
 
-fn pool_free_full_surface() -> Surface {
-    let project = e2e_readmodels::distributed_manifest();
-    let service = pool_free_service();
-    let projections = projections::projection_owners();
-    build_surface(&project.tables, &SurfaceOptions::sqlite())
-        .expect("e2e-celld client Surface should build")
-        .with_projection_owners([
-            projections.todo.into(),
-            projections.chat.into(),
-            projections.blob.into(),
-            projections.auth.into(),
-        ])
-        .expect("e2e-celld projector topology should bind")
-        .with_service(&service)
-        .expect("e2e-celld typed Service inventory should bind")
-}
-
+/// A Service with in-memory stores: its command inventory without a database.
 fn pool_free_service() -> Service {
     let repository = InMemoryRepository::new();
-    crate::modules::compose::build_service(
+    build_service(&Stores::new(
         repository.clone(),
-        ClientSurfaceLocks::default(),
+        InMemoryLockManager::new(),
         repository,
-    )
+    ))
 }
 
-/// Logical application artifact consumed by `distributed build` and `dev`.
-/// Runtime repositories, celld transport, and NATS connections are erased.
+/// Logical application artifact consumed by `distributed describe` and the
+/// coherent lifecycle builder. Runtime handlers and repositories are erased.
 pub fn application_manifest() -> ApplicationManifest {
-    let surface = SurfaceSpec::from_surface(E2E_UI_APPLICATION, &pool_free_full_surface())
-        .expect("e2e-celld full Surface should compile into an application artifact");
-
-    let commands = pool_free_service()
-        .command_specs()
-        .expect("e2e-celld typed commands should compile into portable specs")
-        .into_iter()
-        .map(|command| {
-            let exposed = surface
-                .contract
-                .commands
-                .iter()
-                .find(|exposed| exposed.id == command.id)
-                .expect("full e2e-celld Surface should expose every application command");
-            command
-                .with_surface_binding(exposed)
-                .expect("e2e-celld Surface command should bind to its portable declaration")
-        })
-        .collect::<Vec<_>>();
-    let modules = E2E_UI_MODULE_IDS
-        .iter()
-        .map(|module_id| {
-            // A module's commands are named `{module}.…`; the identity
-            // module's are named for their provider.
-            let prefix = match *module_id {
-                e2e_celld_identity::MODULE_ID => e2e_celld_identity::COMMAND_PREFIX.to_string(),
-                module_id => format!("{module_id}."),
-            };
-            let definitions = commands
-                .iter()
-                .filter(|command| command.id.starts_with(&prefix))
-                .cloned()
-                .map(CommandDefinition::contract)
-                .collect::<Vec<_>>();
-            Module::new(*module_id)
-                .command_definitions(definitions)
-                .build()
-                .expect("e2e-celld application module should compile")
-        })
-        .collect::<Vec<_>>();
-
-    Application::new(E2E_UI_APPLICATION)
-        .modules(modules)
-        .surface(surface)
-        .build()
-        .expect("e2e-celld application manifest should compile")
+    application(&pool_free_service())
+        .expect("e2e-ui application manifest should compile")
         .manifest()
         .clone()
 }
 
+fn client_surface(surface: ClientSurface) -> DistributedClientSurfaceExport {
+    let full = full_surface(&pool_free_service()).expect("e2e-ui client Surface should build");
+    let roles = |roles: &[&str]| {
+        roles
+            .iter()
+            .map(|role| (*role).to_string())
+            .collect::<Vec<_>>()
+    };
+    let selected = surface_for_application(
+        &full,
+        surface.name,
+        &roles(surface.eligible_roles),
+        &roles(surface.schema_roles),
+        &read_models().grants(),
+    )
+    .expect("e2e-ui application Surface should select");
+    DistributedClientSurfaceExport::from_selected(E2E_UI_APPLICATION, selected)
+        .expect("e2e-ui application Surface should export")
+}
+
 /// Pool-free normal application export consumed by `distributed client-manifest`.
 pub fn distributed_client_surface() -> DistributedClientSurfaceExport {
-    pool_free_client_surface_contract(DISTRIBUTED_CLIENT_SURFACE, &["admin", "user"], &["user"])
+    client_surface(CLIENT_SURFACE)
 }
 
 pub fn distributed_admin_client_surface() -> DistributedClientSurfaceExport {
-    pool_free_client_surface(DISTRIBUTED_ADMIN_CLIENT_SURFACE, &["admin"])
+    client_surface(ADMIN_CLIENT_SURFACE)
 }
 
 pub fn distributed_public_client_surface() -> DistributedClientSurfaceExport {
-    pool_free_client_surface(DISTRIBUTED_PUBLIC_CLIENT_SURFACE, &["anonymous"])
+    client_surface(PUBLIC_CLIENT_SURFACE)
 }
 
 pub fn dev_identity() -> IdentityConfig {
@@ -274,9 +202,6 @@ pub fn oidc_bearer_config(
 #[cfg(test)]
 mod client_surface_tests {
     use super::*;
-    use crate::application::{DISTRIBUTED_CLIENT_SURFACE, DISTRIBUTED_PUBLIC_CLIENT_SURFACE};
-    use crate::modules::compose::build_service;
-    use distributed::InMemoryRepository;
 
     #[test]
     fn application_manifest_compiles_real_modules_and_surfaces() {
@@ -287,7 +212,7 @@ mod client_surface_tests {
         assert_eq!(manifest.name, "e2e-ui");
         assert_eq!(
             manifest.module_ids(),
-            vec!["blob", "chat", "identity", "todo"]
+            vec!["blob", "chat", "todo", "zitadel"]
         );
         assert_eq!(manifest.surfaces.len(), 1);
         assert!(!manifest.commands.is_empty());
@@ -593,13 +518,7 @@ mod client_surface_tests {
             .expect("Blob direct owner should be exported");
         assert!(owner.facts.is_empty());
 
-        let repository = InMemoryRepository::new();
-        let service = build_service(
-            repository.clone(),
-            crate::modules::graphql::ClientSurfaceLocks::default(),
-            repository,
-        );
-        let plan = service.subscription_plan();
+        let plan = pool_free_service().subscription_plan();
         for event in [
             "todo.created",
             "todo.renamed",
@@ -635,11 +554,11 @@ mod client_surface_tests {
             .connect_lazy("postgres://postgres:postgres@localhost/distributed")
             .unwrap();
         let repository = distributed::PostgresRepository::new(pool.clone());
-        let service = build_service(
+        let service = build_service(&Stores::new(
             repository.clone(),
             distributed::PostgresLockManager::new(pool),
             repository.clone(),
-        );
+        ));
         let engine = crate::modules::graphql::build_graphql_engine_with_graphiql(
             &repository,
             &service,
@@ -650,9 +569,9 @@ mod client_surface_tests {
         .expect("engine");
         let runtime = engine
             .client_manifest_for_application(
-                DISTRIBUTED_CLIENT_SURFACE,
-                &["admin", "user"],
-                &["user"],
+                CLIENT_SURFACE.name,
+                CLIENT_SURFACE.eligible_roles,
+                CLIENT_SURFACE.schema_roles,
             )
             .unwrap();
 
@@ -666,9 +585,9 @@ mod client_surface_tests {
                         "client": {
                             "surface": {
                                 "kind": "application",
-                                "name": DISTRIBUTED_CLIENT_SURFACE,
-                                "eligible_roles": ["admin", "user"],
-                                "schema_roles": ["user"]
+                                "name": CLIENT_SURFACE.name,
+                                "eligible_roles": CLIENT_SURFACE.eligible_roles,
+                                "schema_roles": CLIENT_SURFACE.schema_roles
                             },
                             "schemaHash": generated.schema_fingerprint
                         }
@@ -716,28 +635,23 @@ mod client_surface_tests {
         assert_eq!(
             generated.surface,
             distributed::graphql::ClientSurfaceIdentity::application(
-                DISTRIBUTED_PUBLIC_CLIENT_SURFACE,
-                ["anonymous"],
-                ["anonymous"],
+                PUBLIC_CLIENT_SURFACE.name,
+                PUBLIC_CLIENT_SURFACE.eligible_roles.iter().copied(),
+                PUBLIC_CLIENT_SURFACE.schema_roles.iter().copied(),
             )
         );
-        let repository = distributed::SqliteRepository::connect_and_migrate("sqlite::memory:")
+        use distributed::microsvc::{SqlStores, SqliteStores};
+
+        let stores = SqliteStores::connect("sqlite::memory:")
             .await
-            .expect("sqlite memory repo");
-        let registry = e2e_readmodels::distributed_manifest()
-            .table_registry()
-            .expect("registry");
-        repository
-            .bootstrap_table_schema_for_dev(&registry)
+            .expect("sqlite memory stores");
+        stores
+            .bootstrap_read_models(read_models().catalog())
             .await
             .expect("bootstrap tables");
-        let service = build_service(
-            repository.clone(),
-            crate::modules::graphql::ClientSurfaceLocks::default(),
-            repository.clone(),
-        );
+        let service = build_service(&stores);
         let engine = crate::modules::graphql::build_graphql_engine_with_graphiql(
-            &repository,
+            stores.graphql_pool(),
             &service,
             dev_identity(),
             None,
@@ -746,9 +660,9 @@ mod client_surface_tests {
         .expect("engine");
         let runtime = engine
             .client_manifest_for_application(
-                DISTRIBUTED_PUBLIC_CLIENT_SURFACE,
-                &["anonymous"],
-                &["anonymous"],
+                PUBLIC_CLIENT_SURFACE.name,
+                PUBLIC_CLIENT_SURFACE.eligible_roles,
+                PUBLIC_CLIENT_SURFACE.schema_roles,
             )
             .expect("public surface registered");
         assert_eq!(generated.schema_fingerprint, runtime.schema_fingerprint);
@@ -760,9 +674,9 @@ mod client_surface_tests {
                     "client": {
                         "surface": {
                             "kind": "application",
-                            "name": DISTRIBUTED_PUBLIC_CLIENT_SURFACE,
-                            "eligible_roles": ["anonymous"],
-                            "schema_roles": ["anonymous"]
+                            "name": PUBLIC_CLIENT_SURFACE.name,
+                            "eligible_roles": PUBLIC_CLIENT_SURFACE.eligible_roles,
+                            "schema_roles": PUBLIC_CLIENT_SURFACE.schema_roles
                         },
                         "schemaHash": generated.schema_fingerprint
                     }
@@ -792,14 +706,5 @@ mod client_surface_tests {
             .expect("distributed protocol envelope");
         let envelope = serde_json::to_value(envelope).expect("serialized protocol envelope");
         assert_eq!(envelope["schemaHash"], generated.schema_fingerprint);
-    }
-
-    #[test]
-    fn module_inventory_lists_todo_chat_blob_identity() {
-        assert_eq!(
-            crate::E2E_UI_MODULE_IDS,
-            &["todo", "chat", "blob", "identity"]
-        );
-        assert_eq!(crate::application::MODULE_DECLARATIONS.len(), 4);
     }
 }

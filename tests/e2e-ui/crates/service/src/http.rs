@@ -66,14 +66,8 @@ pub fn gateway_router(
     }
     .build()
     .map_err(std::io::Error::other)?;
-    let surface = crate::application_manifest()
-        .surfaces
-        .into_iter()
-        .next()
-        .ok_or_else(|| std::io::Error::other("application surface missing"))?;
     // The application declares the public gateway it is served through.
-    service
-        .application(crate::E2E_UI_APPLICATION, surface)
+    crate::application(&service)
         .map_err(std::io::Error::other)?
         .with_gateway("public", &gateway)
         .map_err(std::io::Error::other)?;

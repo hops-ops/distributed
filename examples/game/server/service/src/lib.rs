@@ -56,7 +56,7 @@ use distributed_leaderboard::{
 pub use distributed_game::world::zone_status::{ZoneActivities, ZONE_ACTIVITIES};
 /// The read model and its projection (shared with the zone server).
 pub use mobpit_crawler::stats::{
-    projector, PlayerStats, SavePlayerStats, APPLICATION, EPOCH, PLAYER_STATS, PROJECTOR,
+    projector, PlayerStats, SavePlayerStats, APPLICATION, PLAYER_STATS,
 };
 
 /// The boroughs (bosses down, weather, the world event running) and their

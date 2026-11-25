@@ -7,7 +7,7 @@
 use distributed::graphql::SurfaceProjector;
 use distributed::projection::lower::{EventualOnly, ProjectionDescriptor};
 use distributed::{
-    mutation_file, LocalProjectionMountsBuilder, Mutation, ReadModel, ReadModelCatalog,
+    mutation_file, LocalProjectionMounts, Mutation, ReadModel, ReadModelCatalog,
     RelationalReadModel,
 };
 use serde::{Deserialize, Serialize};
@@ -17,11 +17,6 @@ use crate::BoroughState;
 use crate::{
     BoroughChangedDomainEvent, BoroughEventEndedDomainEvent, BoroughEventStartedDomainEvent,
 };
-
-/// Projection name.
-pub const PROJECTOR: &str = "project_boroughs";
-/// Projection epoch: bump to rebuild the table from the bus log.
-pub const EPOCH: &str = "mobpit-boroughs-v1";
 
 /// One borough as its cell last published it.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, ReadModel)]
@@ -73,12 +68,9 @@ pub fn read_model_catalog(application: &str) -> ReadModelCatalog {
 
 /// The modeled projector mount for [`BOROUGHS`], owned by `application`.
 pub fn projector(application: &str) -> SurfaceProjector {
-    LocalProjectionMountsBuilder::new(application, "ordered-domain-events")
-        .expect("projection source")
-        .eventual_model::<Boroughs, _>(PROJECTOR, BOROUGHS, EPOCH)
-        .expect("boroughs mount")
+    LocalProjectionMounts::builder(application, "ordered-domain-events")
+        .eventual(BOROUGHS)
         .build()
-        .expect("projection catalog")
-        .projector(PROJECTOR)
-        .expect("boroughs projector")
+        .expect("boroughs projection")
+        .projector(BOROUGHS)
 }

@@ -16,7 +16,7 @@ import type { DemoWalkthrough, WalkthroughSample } from './types';
  * Query tabs must include the read-model struct, not only permissions or GraphQL.
  *
  * Service tab must always show:
- * - this demo modules/*.rs slice (MODULE_ID + routes)
+ * - this demo modules/*.rs slice (routes)
  * - compose.build_service (how modules join one Service)
  * - host.run (database, bus, workers, GraphQL serve)
  * - runner main (environment → run)
@@ -40,17 +40,20 @@ pub async fn run(
   database_url: &str,
   options: HostOptions, // bind, identity, origins, gateway delivery
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
-  // postgres:// → run_postgres, else run_sqlite. Each one:
-  // connect, create tables, open the bus.
-  let service = build_service(repo.clone(), locks.clone(), repo.clone())
-    .with_bus(bus);
+  // postgres:// → PostgresStores, else SqliteStores; one host for both.
+  host(SqliteStores::connect(database_url).await?, options).await
+}
+
+async fn host<St: SqlStores>(stores: St, options: HostOptions) -> Result<(), BoxError> {
+  stores.bootstrap_read_models(read_models().catalog()).await?;
+  // with_bus also drains the outbox to the bus.
+  let service = build_service(&stores).with_bus(stores.bus("e2e-ui"));
   let gql = build_graphql_engine_with_delivery(
-    &repo, &service, options.identity.clone(), Some(change_rx), versions,
+    stores.graphql_pool(), &service, options.identity.clone(), Some(change_rx), versions,
   )?;
   let service = Arc::new(service.try_with_graphql(gql)?);
 
-  spawn_outbox_publish_loop(/* outbox → bus */);
-  spawn_service_consumer_loop(move || build_service(/* … */).with_bus(bus));
+  spawn_service_consumer_loop(move || build_service(&stores).with_bus(stores.bus("e2e-ui")));
   spawn_zitadel_scrape(service.clone()); // only when Zitadel env is set
 
   serve(service, &options).await
@@ -128,8 +131,8 @@ pub struct Todos {
 				{
 					file: 'readmodels/models/todos.rs · permissions',
 					caption: 'A user can read only the rows that the user owns. An admin can read all rows.',
-					code: `impl Todos {
-  pub fn permissions() -> ModelPermissions<Self> {
+					code: `impl AuthorizedReadModel for Todos {
+  fn permissions() -> ModelPermissions<Self> {
     ModelPermissions::new()
       .grant(
         "user",
@@ -185,7 +188,7 @@ await commands.todo.complete({ todo_id });`
 				{
 					file: 'modules/todo.rs · mount',
 					caption: 'The service (or cell) mounts the same domain values. Roles and handlers live in todo-domain.',
-					code: `Routes::for_aggregate::<R, L, Todo, S>(repo, locks, read_models)
+					code: `Routes::for_aggregate(stores)
   .mount(todo_domain::commands::create())
   .mount(todo_domain::commands::complete())
   .mount(todo_domain::commands::force_archive())`
@@ -350,38 +353,37 @@ mutation DeleteTodo {
 			principle: 'Compose modules into one Service. Let the host start the process. Keep the runner small.',
 			samples: [
 				{
-					file: 'modules/todo.rs · MODULE_ID + routes()',
-					caption: 'This module lists the Todo commands and the Eventual projector. Both hosts call the same mounts.',
-					code: `pub const MODULE_ID: &str = "todo";
-
-pub fn routes<R, L, S>(...) -> TodoRoutes<R, L, S> {
-  Routes::for_aggregate::<R, L, Todo, S>(repo, locks, read_models)
+					file: 'modules/todo.rs · routes()',
+					caption: 'This module lists the Todo commands and the Eventual projection. Both hosts call the same mounts.',
+					code: `pub fn routes<St: ServiceStores>(
+  stores: &St,
+  projections: &LocalProjectionMounts,
+) -> Routes<AggregateDependencies<St, Todo>> {
+  Routes::for_aggregate(stores)
     .mount(todo_domain::commands::create())
     .mount(todo_domain::commands::complete())
     // … rename, reopen, archive, force_archive, purge …
-    .modeled_projector(todo_projector)
-    .handle(handlers::events::project_todos::handle)
+    .consume_projection(projections.projector(TODOS))
 }`
 				},
 				{
 					file: 'modules/compose.rs · build_service',
 					caption: 'List each module here. Do not hide composition in infrastructure code.',
-					code: `let todos = todo::routes(repo.clone(), locks.clone(), read_models.clone(), projections.todo);
-let chat = chat::routes(/* … */);
-let blob = blob::routes(/* … */);
-
-Service::new()
+					code: `Service::new()
   .named("e2e-ui")
-  .routes(todos)
-  .routes(chat)
-  .routes(blob)`
+  .routes(todo::routes(stores, &projections))
+  .routes(chat::routes(stores, &projections))
+  .routes(blob::routes(stores))
+  .routes(identity::routes(stores, &projections))`
 				},
 				{
-					file: 'application.rs · inventory',
-					caption: 'The surface names and the module list live at the service root.',
-					code: `pub const E2E_UI_APPLICATION: &str = "e2e-ui";
-pub const E2E_UI_MODULE_IDS: &[&str] = compose::MODULE_IDS;
-// todo | chat | blob | identity`
+					file: 'graphql.rs · application',
+					caption: 'The application manifest is derived from the Service. Its modules are the command namespaces. Do not list them by hand.',
+					code: `pub fn application(service: &Service) -> Result<Application, ApplicationError> {
+  let surface = SurfaceSpec::from_surface(E2E_UI_APPLICATION, &full_surface(service)?)?;
+  service.application(E2E_UI_APPLICATION, surface)
+}
+// modules: blob | chat | todo | zitadel`
 				},
 				...hostAndRunnerSamples,
 				{
@@ -461,8 +463,8 @@ pub struct ChatMessages {
 				{
 					file: 'readmodels/models/chat_messages.rs · permissions',
 					caption: 'Users, admins, and anonymous guests can read all columns.',
-					code: `impl ChatMessages {
-  pub fn permissions() -> ModelPermissions<Self> {
+					code: `impl AuthorizedReadModel for ChatMessages {
+  fn permissions() -> ModelPermissions<Self> {
     ModelPermissions::new()
       .grant("user", read().all_columns())
       .grant("admin", read().all_columns())
@@ -681,23 +683,19 @@ mutation SaveChatMessage {
 				{
 					file: 'modules/chat.rs · routes()',
 					caption: 'This module mounts ChatMessage commands and the chat projector.',
-					code: `pub const MODULE_ID: &str = "chat";
-
-pub fn routes<R, L, S>(...) -> ChatRoutes<R, L, S> {
-  Routes::for_aggregate::<R, L, ChatMessage, S>(repo, locks, read_models)
+					code: `pub fn routes<St: ServiceStores>(
+  stores: &St,
+  projections: &LocalProjectionMounts,
+) -> Routes<AggregateDependencies<St, ChatMessage>> {
+  Routes::for_aggregate(stores)
     .mount(chat_domain::commands::post())
-    .modeled_projector(chat_projector)
-    .handle(project_chat_messages::handle)
+    .consume_projection(projections.projector(CHAT_MESSAGES))
 }`
 				},
 				{
-					file: 'modules/compose.rs · MODULE_IDS + build_service',
+					file: 'modules/compose.rs · build_service',
 					caption: 'The module list is explicit: todo, chat, blob, and identity.',
-					code: `pub const MODULE_IDS: &[&str] = &[
-  todo::MODULE_ID, chat::MODULE_ID, blob::MODULE_ID, identity::MODULE_ID,
-];
-
-Service::new()
+					code: `Service::new()
   .named("e2e-ui")
   .routes(todo::routes(/* … */))
   .routes(chat::routes(/* … */))  // ← this module
@@ -772,8 +770,8 @@ pub struct BlobGames {
 				{
 					file: 'readmodels/models/blob_games.rs · permissions',
 					caption: 'A user can read only owned rows. An admin can read all rows. This is the same claim pattern as todos.',
-					code: `impl BlobGames {
-  pub fn permissions() -> ModelPermissions<Self> {
+					code: `impl AuthorizedReadModel for BlobGames {
+  fn permissions() -> ModelPermissions<Self> {
     ModelPermissions::new()
       .grant(
         "user",
@@ -1027,12 +1025,10 @@ mutation SaveBlobGame {
 			principle: 'Compose modules into one Service. Let the host start the process. Keep the runner small.',
 			samples: [
 				{
-					file: 'modules/blob.rs · MODULE_ID + routes()',
+					file: 'modules/blob.rs · routes()',
 					caption: 'This module mounts start, move, and start_level. All three are Atomic. Move declares the WASM pure function.',
-					code: `pub const MODULE_ID: &str = "blob";
-
-pub fn routes<R, L, S>(...) -> BlobRoutes<R, L, S> {
-  Routes::for_aggregate::<R, L, BlobGame, S>(repo, locks, read_models)
+					code: `pub fn routes<St: ServiceStores>(stores: &St) -> Routes<AggregateDependencies<St, BlobGame>> {
+  Routes::for_aggregate(stores)
     .mount(blob_domain::commands::start())
     .mount(blob_domain::commands::move_dir())
     .mount(blob_domain::commands::start_level())
@@ -1041,13 +1037,12 @@ pub fn routes<R, L, S>(...) -> BlobRoutes<R, L, S> {
 				{
 					file: 'modules/compose.rs · blob routes',
 					caption: 'This is the same Service composition as todos and chat.',
-					code: `let blob = blob::routes(repo, locks, read_models, projections.blob);
-
-Service::new()
+					code: `Service::new()
   .named("e2e-ui")
-  .routes(todos)
-  .routes(chat)
-  .routes(blob)  // ← this module`
+  .routes(todo::routes(stores, &projections))
+  .routes(chat::routes(stores, &projections))
+  .routes(blob::routes(stores))  // ← this module
+  .routes(identity::routes(stores, &projections))`
 				},
 				...hostAndRunnerSamples
 			]
@@ -1097,8 +1092,8 @@ pub struct Todos {
 				{
 					file: 'readmodels/models/todos.rs · admin grant',
 					caption: 'The `e2e-ui-admin` privilege pack uses the admin grant. That grant reads all rows.',
-					code: `impl Todos {
-  pub fn permissions() -> ModelPermissions<Self> {
+					code: `impl AuthorizedReadModel for Todos {
+  fn permissions() -> ModelPermissions<Self> {
     ModelPermissions::new()
       .grant(
         "user",
@@ -1112,18 +1107,14 @@ pub struct Todos {
 				},
 				{
 					file: 'modules/graphql.rs · build_engine surfaces',
-					caption: 'One engine opens three surfaces: user, admin, and public. Each surface names its eligible roles and its privilege pack.',
-					code: `.client_application_surface(
-  DISTRIBUTED_CLIENT_SURFACE,         // "e2e-ui"
-  ["admin", "user"],                  // eligible
-  ["user"],                           // portable privilege pack
-)
-.client_application_surface(DISTRIBUTED_ADMIN_CLIENT_SURFACE, ["admin"], ["admin"])
-.client_application_surface(
-  DISTRIBUTED_PUBLIC_CLIENT_SURFACE,  // "e2e-ui-public"
-  ["anonymous"],
-  ["anonymous"],
-)`
+					caption: 'One engine opens three surfaces: user, admin, and public. Each surface names its eligible roles and its privilege pack. Client export reads the same table.',
+					code: `for surface in CLIENT_SURFACES {
+  b = b.client_application_surface(
+    surface.name,                       // "e2e-ui" | "e2e-ui-admin" | "e2e-ui-public"
+    surface.eligible_roles.iter().copied(),
+    surface.schema_roles.iter().copied(), // portable privilege pack
+  );
+}`
 				}
 			]
 		},
@@ -1323,11 +1314,17 @@ mutation DeleteTodo {
 .client_application_surface("e2e-ui-public", ["anonymous"])`
 				},
 				{
-					file: 'application.rs · surface constants',
-					caption: 'These names are stable. Client generation and host identity use them.',
-					code: `pub const DISTRIBUTED_CLIENT_SURFACE: &str = "e2e-ui";
-pub const DISTRIBUTED_ADMIN_CLIENT_SURFACE: &str = "e2e-ui-admin";
-pub const DISTRIBUTED_PUBLIC_CLIENT_SURFACE: &str = "e2e-ui-public";`
+					file: 'application.rs · client surfaces',
+					caption: 'Each surface is declared once. The engine, client generation and host identity use it.',
+					code: `pub const CLIENT_SURFACE: ClientSurface = ClientSurface {
+  name: "e2e-ui", eligible_roles: &["admin", "user"], schema_roles: &["user"],
+};
+pub const ADMIN_CLIENT_SURFACE: ClientSurface = ClientSurface {
+  name: "e2e-ui-admin", eligible_roles: &["admin"], schema_roles: &["admin"],
+};
+pub const PUBLIC_CLIENT_SURFACE: ClientSurface = ClientSurface {
+  name: "e2e-ui-public", eligible_roles: &["anonymous"], schema_roles: &["anonymous"],
+};`
 				},
 				...hostAndRunnerSamples
 			]
@@ -1478,28 +1475,28 @@ IdentityConfig::oidc_bearer(oidc)`
 		{
 			id: 'service',
 			label: '5 · Service + host',
-			lede: 'Identity is not a domain aggregate. Identity is service-crate wiring. That wiring includes OIDC or dev headers, claim maps, and the identity module Zitadel ingress. The ingress fills `AuthUsers`. The host starts the Service. The host also starts the scrape, outbox, and consumer loops. The runner only supplies `DATABASE_URL`, `BIND`, and OIDC environment variables.',
+			lede: 'Identity is not a domain aggregate. Identity is service-crate wiring. That wiring includes OIDC or dev headers, claim maps, and the identity module Zitadel ingress. The ingress fills `AuthUsers`. The host starts the Service. The host also starts the scrape and consumer loops; the bus drains the outbox. The runner only supplies `DATABASE_URL`, `BIND`, and OIDC environment variables.',
 			principle: 'Keep identity on the transport. Compose modules. Keep domain crates pure.',
 			samples: [
 				{
-					file: 'modules/compose.rs · MODULE_IDS',
-					caption: 'Identity is a module with no aggregate. It mounts the Zitadel commands and the `AuthUsers` projection.',
-					code: `pub const MODULE_IDS: &[&str] = &[
-  todo::MODULE_ID,
-  chat::MODULE_ID,
-  blob::MODULE_ID,
-  identity::MODULE_ID,
-];`
+					file: 'modules/compose.rs · build_service',
+					caption: 'Identity is a module with no aggregate. It mounts the Zitadel commands and the `AuthUsers` projection. Its commands are `zitadel.*`, so the derived manifest names that module `zitadel`.',
+					code: `Service::new()
+  .named("e2e-ui")
+  .routes(todo::routes(stores, &projections))
+  .routes(chat::routes(stores, &projections))
+  .routes(blob::routes(stores))
+  .routes(identity::routes(stores, &projections))`
 				},
 				{
 					file: 'modules/identity.rs · Zitadel ingress',
 					caption: 'These are typed commands with no aggregate. Each user profile they publish commits with its command ledger receipt. Each command has its own HTTP edge: it checks the shared secret and dispatches as the ingestor. No user role can call them, and every other command path stays closed.',
-					code: `Routes::for_stores(repo, read_models)
+					code: `Routes::for_stores(stores.events().clone(), stores.read_models().clone())
   .typed_command(zitadel::command())
   .handle(zitadel::handle)
   .typed_command(zitadel_scrape::command())
-  .handle(zitadel_scrape::Scrape(read_models.clone()))
-  .consume_projection(auth_projector)
+  .handle(zitadel_scrape::Scrape(stores.read_models().clone()))
+  .consume_projection(projections.projector(AUTH_USERS))
 
 // compose.rs
 Service::new()

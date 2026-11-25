@@ -134,6 +134,12 @@ impl From<PayloadDecodeError> for HandlerError {
 }
 
 impl HandlerError {
+    /// The command was refused by a rule: `reason` is reported to the caller
+    /// (HTTP 422).
+    pub fn rejected(reason: impl fmt::Display) -> Self {
+        Self::Rejected(reason.to_string())
+    }
+
     /// Return the opaque operator repair handle carried by a durably recorded
     /// terminal projector failure.
     pub fn projection_repair_handle(&self) -> Option<&ProjectionRepairHandle> {

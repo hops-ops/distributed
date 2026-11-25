@@ -3,8 +3,8 @@ use distributed::command::Eventual;
 use distributed::command_input_defaults;
 use serde::{Deserialize, Serialize};
 
-use super::support::authenticated_user;
 use crate::{domain_commands, Todo, TodoState};
+use distributed::microsvc::guards;
 
 #[derive(Debug, Deserialize, distributed::CommandInput)]
 pub struct TodoCreateInput {
@@ -30,7 +30,7 @@ command! {
     roles: ["user", "admin"],
     field: "todos_create",
     load: create,
-    guard: authenticated_user,
+    guard: guards::authenticated,
     invoke: |todo, input, principal| todo.create(&input.todo_id, principal, &input.title),
     payload: |todo, _principal| {
         let state = TodoState::from(&**todo);

@@ -4,7 +4,7 @@
 **Goal:** Make the same packages easy to run as a monolith or as microservices, with persistence/locks/transports as a separate, boring plane.  
 **Non-goal:** Back-compat aliases or dual public APIs for the same concept.
 
-Motivating pain (now resolved): e2e-ui once had a single `service.rs` holding the projection catalog, surfaces and command walls, and a runner that hand-wired SQLite/Postgres × API/outbox/consumer. Today the composition root is `tests/e2e-ui/crates/service/src/application.rs` (surfaces, module inventory), infrastructure is `host.rs`, each bounded context is a module under `modules/` (listed by `modules/compose.rs`), and `crates/runner/src/main.rs` is a short entrypoint.
+Motivating pain (now resolved): e2e-ui once had a single `service.rs` holding the projection catalog, surfaces and command walls, and a runner that hand-wired SQLite/Postgres × API/outbox/consumer. Today the composition root is `tests/e2e-ui/crates/service/src/application.rs` (application name and client surfaces), infrastructure is `host.rs` (one path for SQLite and Postgres), each bounded context is a module under `modules/` (listed by `modules/compose.rs`), the application manifest is derived from the composed `Service`, and `crates/runner/src/main.rs` is a short entrypoint.
 
 ---
 
@@ -44,16 +44,39 @@ readmodels/     schemas + grants
 
 ### Mounts (compose)
 
+Each fact is stated once. A projection's name, epoch and model come from its
+`projection!` descriptor; a read model's permissions live next to it
+(`impl AuthorizedReadModel`); a module is generic over one `ServiceStores`
+bound; the application's modules are the Service's command namespaces.
+
 ```rust
-// Sketch — names may evolve; intent is stable.
-app.projection(TODOS).eventual().epoch("todos-v2");
-app.projection(BLOB_GAMES).atomic().epoch("blob-v2"); // collocated with blob commands
+// modules/projections.rs
+LocalProjectionMounts::builder("e2e-ui", "ordered-domain-events")
+    .eventual(TODOS)
+    .eventual(CHAT_MESSAGES)
+    .direct(BLOB_GAMES) // sealed by blob commands in their own transaction
+    .eventual(AUTH_USERS)
+    .build()?;
 
-app.command(todo_create::def());
-app.command(blob_move::def());
+// modules/todo.rs
+pub fn routes<St: ServiceStores>(stores: &St, projections: &LocalProjectionMounts)
+    -> Routes<AggregateDependencies<St, Todo>>
+{
+    Routes::for_aggregate(stores)
+        .mount(todo_domain::commands::create())
+        .consume_projection(projections.projector(TODOS))
+}
 
-app.surface("e2e-ui").eligible(["user", "admin"]).schema(["user"]);
-app.surface("e2e-ui-admin").roles(["admin"]);
+// readmodels: one list for schema bootstrap, the engine and client export
+ReadModels::new("e2e-ui").model::<Todos>().model::<ChatMessages>()…;
+
+// application.rs: each client surface declared once
+pub const CLIENT_SURFACE: ClientSurface = ClientSurface {
+    name: "e2e-ui", eligible_roles: &["admin", "user"], schema_roles: &["user"],
+};
+
+// the manifest: derived, never listed by hand
+service.application("e2e-ui", SurfaceSpec::from_surface("e2e-ui", &surface)?)?;
 ```
 
 ### Command defs co-located with handlers
@@ -102,9 +125,21 @@ Application::new("e2e-ui").include(todo_system()).include(chat_system())… // F
 ### One dialect choice pairs store + locks + bus
 
 ```rust
-let runtime = Runtime::sqlite(database_url).await?;
-// Runtime::postgres(database_url).await?
-// Runtime::in_memory()  // client-manifest / unit tests
+// host.rs: written once against SqlStores
+if postgres_url {
+    host(PostgresStores::connect(database_url).await?, options).await
+} else {
+    host(SqliteStores::connect(database_url).await?, options).await
+}
+
+async fn host<St: SqlStores>(stores: St, options: HostOptions) -> Result<(), BoxError> {
+    stores.bootstrap_read_models(read_models().catalog()).await?;
+    let service = build_service(&stores).with_bus(stores.bus("e2e-ui")); // also drains the outbox
+    // GraphQL over stores.graphql_pool(), spawn_service_consumer_loop, serve
+}
+
+// client-manifest / unit tests
+build_service(&Stores::new(InMemoryRepository::new(), InMemoryLockManager::new(), repo));
 ```
 
 Defaults from the same pool (e2e today):
@@ -171,10 +206,10 @@ Primary write path for apps remains GraphQL commands. HTTP command routes stay o
 
 | Today | Target |
 |--------|--------|
-| `projection_owners()` catalog ceremony | `projection_inventory!` / `ProjectionMount` defaults |
-| 15-line `typed_command` walls in `build_service` | `.register(todo_create::def())` |
-| Three surface helpers rebuilding InMemory | `app.surface(...).export()` |
-| Runner: sqlite/postgres forks × outbox/consumer | `Runtime::from_env().role(Full).app(...).run()` |
+| Done: projection mounts read name, epoch and model from the descriptor | `LocalProjectionMounts::builder(..).eventual(TODOS)` |
+| Done: commands are `command!` declarations mounted with `.mount(..)` | — |
+| Done: one `ReadModels` list and one `ClientSurface` table feed engine and export | — |
+| Done: one host path over `SqlStores`; `with_bus` drains the outbox | `Runtime::from_env().role(Full).app(...).run()` (process roles) |
 
 Rough size: **~100–150 lines of product wiring** for logical app + a tiny deployable main — not ~950 lines of framework internals.
 
@@ -182,9 +217,9 @@ Rough size: **~100–150 lines of product wiring** for logical app + a tiny depl
 
 ## Implementation order
 
-1. **Projection mount / inventory** — hide catalog, topology digests, activation.  
+1. **Projection mount / inventory** — hide catalog, topology digests, activation. Done: `LocalProjectionMounts::builder`.  
 2. **CommandDef + `.register()`** — co-locate transitions/handlers with command modules.
-3. **Runtime::{sqlite, postgres, in_memory}** — pair repo + locks + bus.  
+3. **Pair repo + locks + bus** — done: `Stores`, `SqliteStores`, `PostgresStores` (`SqlStores`).  
 4. **ProcessRole** — Full / CommandWriter / EventualProjector / QueryApi spawn policy.  
 5. **Atomic mount checks** — fail closed if Atomic is mounted without write path.  
 6. **Collapse e2e-ui `service.rs` + `runner`** onto the new APIs (no dual/legacy surface). Done: see `application.rs`, `host.rs` and `modules/` in `tests/e2e-ui/crates/service/src/`.
@@ -198,7 +233,7 @@ of cache effects.
 
 - [ ] e2e-ui logical app does not mention partition codec, topology digests, or manual catalog activate.  
 - [ ] Adding a command is “def next to handler + one register line,” not a 12-line block in a central file.  
-- [ ] Runner has one path for sqlite/postgres selected by URL/env.  
+- [x] Runner has one path for sqlite/postgres selected by URL/env.  
 - [ ] A dual-process smoke (command writer + eventual projector) can share packages with Full e2e.  
 - [ ] Atomic blob commands refuse projector-only process configuration.  
 - [ ] Client gen still works from logical app (preview IR) without a live pool.

@@ -2,8 +2,8 @@ use distributed::command;
 use distributed::command::Eventual;
 use serde::{Deserialize, Serialize};
 
-use super::support::admin_user;
 use crate::{domain_commands, Todo, TodoState};
+use distributed::microsvc::guards;
 
 #[derive(Debug, Deserialize, distributed::CommandInput)]
 pub struct TodoForceArchiveInput {
@@ -28,7 +28,7 @@ command! {
     roles: ["admin"],
     field: "todos_force_archive",
     load: required,
-    guard: admin_user,
+    guard: guards::role("admin"),
     invoke: |todo, _input, _principal| todo.force_archive(),
     payload: |todo, principal| {
         let state = TodoState::from(&**todo);
