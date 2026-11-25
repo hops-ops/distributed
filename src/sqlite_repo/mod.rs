@@ -24,7 +24,7 @@ use crate::outbox_worker::ClaimOutboxMessages;
 use crate::repository::RepositoryError;
 use crate::sqlx_repo::read_model::quote_identifier;
 use crate::sqlx_repo::repo::{
-    embedded_migrator, SqlxOutboxStore, SqlxRepository, SQLITE_MIGRATIONS,
+    embedded_migrator, system_time_epoch_secs, SqlxOutboxStore, SqlxRepository, SQLITE_MIGRATIONS,
 };
 use crate::sqlx_repo::{
     self, is_sqlite_unique_constraint, read_model_i64_from_u64 as sqlx_read_model_i64_from_u64,
@@ -109,14 +109,15 @@ impl crate::sqlx_repo::repo::SqlxRepoBackend for Sqlite {
         builder: &mut QueryBuilder<Sqlite>,
         column: &'static str,
         op: &'static str,
-        epoch_secs: f64,
-    ) {
+        value: SystemTime,
+    ) -> Result<(), RepositoryError> {
         builder.push("CAST(");
         builder.push(column);
         builder.push(" AS REAL) ");
         builder.push(op);
         builder.push(" ");
-        builder.push_bind(epoch_secs);
+        builder.push_bind(system_time_epoch_secs::<Sqlite>(value)?);
+        Ok(())
     }
 
     fn push_command_ledger_now(builder: &mut QueryBuilder<Sqlite>) {

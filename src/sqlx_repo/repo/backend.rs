@@ -343,8 +343,8 @@ pub trait SqlxRepoBackend: SqlxReadModelBackend {
     /// Encode a [`SystemTime`] into this backend's stored representation.
     fn timestamp_value(timestamp: SystemTime) -> Result<Self::TimestampValue, RepositoryError>;
 
-    /// Push a timestamp value into a separated bind list (Postgres wraps the
-    /// bind in `to_timestamp(...)`).
+    /// Push a timestamp value into a separated bind list (Postgres turns the
+    /// microsecond bind into a `timestamptz`).
     fn push_timestamp(sep: &mut Separated<'_, Self, &'static str>, value: &Self::TimestampValue);
 
     /// Push an optional timestamp value into a separated bind list, binding a
@@ -357,15 +357,15 @@ pub trait SqlxRepoBackend: SqlxReadModelBackend {
     /// Push `<assignment target> = <timestamp>` right-hand side into a builder.
     fn push_timestamp_assign(builder: &mut QueryBuilder<Self>, value: &Self::TimestampValue);
 
-    /// Push `<column> <op> <now>` comparing a stored timestamp column against
-    /// epoch seconds (Postgres: `column op to_timestamp($n)`; SQLite:
-    /// `CAST(column AS REAL) op ?`).
+    /// Push `<column> <op> <timestamp>` comparing a stored timestamp column
+    /// against `value` in the backend's exact encoding (Postgres: integer
+    /// microseconds into `timestamptz`; SQLite: `CAST(column AS REAL) op ?`).
     fn push_timestamp_cmp(
         builder: &mut QueryBuilder<Self>,
         column: &'static str,
         op: &'static str,
-        epoch_secs: f64,
-    );
+        value: SystemTime,
+    ) -> Result<(), RepositoryError>;
 
     /// Push a non-transaction-start database clock expression. PostgreSQL uses
     /// `clock_timestamp()` so time spent waiting for a row lock counts against
@@ -375,7 +375,8 @@ pub trait SqlxRepoBackend: SqlxReadModelBackend {
     /// Push the same database clock as epoch seconds for decoding into
     /// [`SystemTime`]. This is distinct from [`Self::push_command_ledger_now`]
     /// because PostgreSQL write/comparison expressions require `timestamptz`
-    /// while this framework's portable timestamp decoder consumes `f64`.
+    /// while the decoder reads the backend's encoded value (Postgres: integer
+    /// microseconds).
     fn push_command_ledger_now_epoch(builder: &mut QueryBuilder<Self>);
 
     /// Push database-now plus a caller-validated positive duration.

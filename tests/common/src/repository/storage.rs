@@ -460,6 +460,12 @@ where
     assert_eq!(claimed, ["immediate", "past"]);
 }
 
+/// `at` truncated to a whole millisecond, which every backend round-trips.
+fn whole_millis(at: SystemTime) -> SystemTime {
+    let since = at.duration_since(SystemTime::UNIX_EPOCH).unwrap();
+    SystemTime::UNIX_EPOCH + Duration::from_millis(since.as_millis() as u64)
+}
+
 /// A scheduled row outlives the process that wrote it and fires once due; a
 /// row released with no delay is claimable again at once.
 pub async fn scheduled_message_survives_restart_and_fires_when_due<B: Durable>(backend: &B)
@@ -472,7 +478,7 @@ where
     let timer_id = unique_id("timer");
     let timer = OutboxMessage::create_to(&timer_id, "Timeout", "saga", b"t".to_vec())
         .unwrap()
-        .deliver_after(SystemTime::now(), delay);
+        .deliver_after(whole_millis(SystemTime::now()), delay);
     let due_at = timer.deliver_at.unwrap();
     backend
         .repository()
@@ -484,16 +490,9 @@ where
     let outbox = B::outbox_store(&reopened);
     let pending = outbox.pending(10).await.unwrap();
     assert_eq!(pending.len(), 1);
-    // To the millisecond: Postgres reads the timestamp back through a float
-    // and loses sub-microsecond precision.
-    let persisted = pending[0].deliver_at.expect("schedule persisted");
-    let skew = persisted
-        .duration_since(due_at)
-        .unwrap_or_else(|error| error.duration());
-    assert!(
-        skew < Duration::from_millis(1),
-        "schedule persisted: {persisted:?} vs {due_at:?}"
-    );
+    // Exact: every backend stores at least microsecond resolution, and the
+    // schedule above is a whole millisecond.
+    assert_eq!(pending[0].deliver_at, Some(due_at), "schedule persisted");
     let early = outbox
         .claim(ClaimOutboxMessages::new("w", 10, LEASE))
         .await
