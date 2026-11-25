@@ -203,4 +203,16 @@ impl GraphqlEngine {
     pub fn change_hub(&self) -> &crate::graphql::subscribe::ChangeHub {
         &self.inner.change_hub
     }
+
+    /// Active live producers: one per distinct shared live read, however
+    /// many subscribers follow it.
+    pub fn live_producer_count(&self) -> usize {
+        self.inner.change_hub.subscriber_count()
+    }
+
+    /// Active live subscription streams. Identical reads share one producer
+    /// ([`live_producer_count`](Self::live_producer_count)).
+    pub fn live_subscriber_count(&self) -> usize {
+        self.inner.live.subscriber_count()
+    }
 }

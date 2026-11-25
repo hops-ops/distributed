@@ -302,10 +302,7 @@ pub fn build_role_schema(
                                 recorder.record(plan),
                             );
                         }
-                        let stream =
-                            super::subscribe::live_query_stream(inner, role, plan, protocol)
-                                .await?;
-                        Ok(stream)
+                        super::subscribe::live_query_stream(&inner, role, plan, protocol)
                     })
                 },
             ),

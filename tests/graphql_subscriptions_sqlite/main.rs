@@ -349,3 +349,84 @@ async fn subscription_claim_isolation_across_tenants() {
         assert_eq!(notes_b2[0]["owner_id"], "tenant-b");
     }
 }
+
+/// Live sharing keys on the compiled SQL and every bind: two sessions whose
+/// claims compile to different row-policy binds get separate producers, and
+/// two sessions with the same claims share one.
+#[tokio::test]
+async fn sessions_share_a_live_producer_only_when_their_binds_match() {
+    use distributed::ReadModel;
+    use serde::{Deserialize, Serialize};
+
+    #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, ReadModel)]
+    #[table("notes")]
+    struct NoteView {
+        #[id("note_id")]
+        note_id: String,
+        owner_id: String,
+        body: String,
+    }
+
+    let repo = distributed::SqliteRepository::connect_and_migrate("sqlite::memory:")
+        .await
+        .unwrap();
+    Db::Sqlite(repo.clone())
+        .seed(
+            [("n-a1", "tenant-a", "a1"), ("n-b1", "tenant-b", "b1")].map(
+                |(note_id, owner_id, body)| NoteView {
+                    note_id: note_id.into(),
+                    owner_id: owner_id.into(),
+                    body: body.into(),
+                },
+            ),
+        )
+        .await;
+    let engine = GraphqlEngine::builder(repo.pool().clone())
+        .identity(IdentityConfig::dev_headers())
+        .roles(&["user"])
+        .model::<NoteView>(
+            ModelPermissions::new().grant(
+                "user",
+                read()
+                    .all_columns()
+                    .rows(col("owner_id").eq(claim("x-user-id"))),
+            ),
+        )
+        .change_stream(repo.read_model_changes())
+        .build()
+        .expect("build");
+    let tenant = |tenant: &str| {
+        let mut session = Session::new();
+        session.set(ROLE_KEY, "user");
+        session.set(USER_ID_KEY, tenant);
+        session
+    };
+    let document = r#"subscription { notes { note_id owner_id body } }"#;
+    let open = |tenant: Session| {
+        let mut stream = Box::pin(engine.execute_stream(&tenant, Request::new(document)));
+        async move {
+            let first = stream.next().await.expect("first frame");
+            assert!(!first.is_err(), "{:?}", first.errors);
+            (stream, serde_json::to_value(&first.data).unwrap())
+        }
+    };
+
+    let (_a, data_a) = open(tenant("tenant-a")).await;
+    let (_b, data_b) = open(tenant("tenant-b")).await;
+    assert_eq!(data_a["notes"][0]["owner_id"], "tenant-a");
+    assert_eq!(data_b["notes"][0]["owner_id"], "tenant-b");
+    assert_eq!(
+        engine.live_producer_count(),
+        2,
+        "different claim binds must never share a producer"
+    );
+
+    let (_a2, data_a2) = open(tenant("tenant-a")).await;
+    assert_eq!(data_a2, data_a);
+    assert_eq!(
+        engine.live_producer_count(),
+        2,
+        "identical SQL and binds share the tenant's producer"
+    );
+    assert_eq!(engine.live_subscriber_count(), 3, "every stream is counted");
+}

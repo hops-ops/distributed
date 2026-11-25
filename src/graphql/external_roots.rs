@@ -7,28 +7,27 @@
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use std::time::Duration;
 
 use async_graphql::dynamic::{
     Field, FieldFuture, InputValue, Object, ResolverContext, Subscription, SubscriptionField,
     SubscriptionFieldFuture, TypeRef,
 };
 use async_graphql::Value;
-use futures_util::Stream;
-use tokio::sync::{broadcast, mpsc};
 
 use super::engine::{EngineInner, ExecutionAuthority};
 use super::protocol::{
     DistributedLiveMetadata, DistributedLiveMode, DistributedQuerySnapshot,
-    ProtocolResponseAccumulator,
+    ProtocolResponseAccumulator, RequestedLiveResume,
 };
 use super::schema::{client_error, execution_privilege};
+use super::subscribe::{response_hash, LiveFrame, LiveQueryStream, LiveRead, LiveResult, Record};
 use super::surface::external::external_types;
 use super::surface::{
     ExternalField, ExternalReadError, ExternalReadExecutor, ExternalReadResult, ExternalRoot,
     Surface,
 };
 use crate::microsvc::Session;
+use crate::read_model::ReadModelChange;
 
 fn type_ref(type_name: &str, nullable: bool) -> TypeRef {
     if nullable {
@@ -117,13 +116,7 @@ pub(crate) fn add_subscription_roots(
             let name = root.name.clone();
             let field = SubscriptionField::new(root.name.clone(), result_type(&root), move |ctx| {
                 let request = Request::from_context(&ctx, &key, &name);
-                SubscriptionFieldFuture::new(async move {
-                    let request = request?;
-                    // Subscribe before the first read so no change slips between.
-                    let changes = request.inner.change_hub.subscribe();
-                    let first = request.execute().await?;
-                    Ok(live_stream(request, first, changes))
-                })
+                SubscriptionFieldFuture::new(async move { Ok(request?.live()) })
             });
             subscription = subscription.field(with_arguments(
                 field,
@@ -139,6 +132,7 @@ pub(crate) fn add_subscription_roots(
 struct Request {
     inner: Arc<EngineInner>,
     executor: Arc<dyn ExternalReadExecutor>,
+    role: String,
     key: (String, String),
     root: String,
     arguments: BTreeMap<String, serde_json::Value>,
@@ -192,6 +186,7 @@ impl Request {
             protocol: ctx.data_opt::<ProtocolResponseAccumulator>().cloned(),
             inner,
             executor,
+            role,
             key: key.clone(),
             root: root.to_string(),
             arguments,
@@ -210,7 +205,7 @@ impl Request {
     /// envelope marks it incomplete and, live, as snapshot mode.
     fn record_protocol(
         &self,
-        result: &ExternalReadResult,
+        scope: &serde_json::Value,
         live: bool,
     ) -> Result<(), async_graphql::Error> {
         let Some(protocol) = &self.protocol else {
@@ -222,7 +217,7 @@ impl Request {
                 "section": self.key.0,
                 "source": self.key.1,
                 "root": self.root,
-                "scope": result.scope,
+                "scope": scope,
             }))
             .map_err(encoding)?;
         let snapshot = DistributedQuerySnapshot {
@@ -255,96 +250,106 @@ async fn resolve(
 ) -> Result<Option<Value>, async_graphql::Error> {
     let request = Request::from_context(ctx, key, root)?;
     let result = request.execute().await?;
-    request.record_protocol(&result, false)?;
+    request.record_protocol(&result.scope, false)?;
     Ok(match graphql_value(result.value)? {
         Value::Null => None,
         value => Some(value),
     })
 }
 
-type LiveItem = Result<Value, async_graphql::Error>;
-
-struct ExternalLiveStream {
-    rx: mpsc::Receiver<LiveItem>,
-}
-
-impl Stream for ExternalLiveStream {
-    type Item = LiveItem;
-
-    fn poll_next(
-        mut self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Option<Self::Item>> {
-        self.rx.poll_recv(cx)
+impl Request {
+    /// Follow this read live, sharing one producer with every subscriber
+    /// whose read is identical: same role, root, arguments and session (the
+    /// executor sees nothing else, so their results are the same).
+    fn live(self) -> LiveQueryStream {
+        let key = ExternalKey {
+            role: self.role.clone(),
+            section: self.key.0.clone(),
+            source: self.key.1.clone(),
+            root: self.root.clone(),
+            arguments: self.arguments.clone(),
+            session: self
+                .session
+                .variables()
+                .iter()
+                .map(|(name, value)| (name.clone(), value.clone()))
+                .collect(),
+        };
+        let inner = Arc::clone(&self.inner);
+        let read = ExternalRead {
+            executor: Arc::clone(&self.executor),
+            root: self.root.clone(),
+            arguments: self.arguments.clone(),
+            session: self.session.clone(),
+        };
+        let record: Record<ExternalMeta> =
+            Box::new(move |meta: &ExternalMeta| self.record_protocol(&meta.scope, true));
+        inner.live.external.subscribe(
+            &inner.change_hub,
+            key,
+            RequestedLiveResume::Absent,
+            || read,
+            record,
+        )
     }
 }
 
-/// `first`, then a re-execution (debounced, hash-gated) whenever one of the
-/// read's change keys is published. A failed execution is terminal.
-fn live_stream(
-    request: Request,
-    first: ExternalReadResult,
-    mut changes: broadcast::Receiver<crate::read_model::ReadModelChange>,
-) -> ExternalLiveStream {
-    let (tx, rx) = mpsc::channel::<LiveItem>(8);
-    tokio::spawn(async move {
-        let mut last_hash = None;
-        let mut executed = Ok(first);
-        loop {
-            let result = match executed {
-                Ok(result) => result,
-                Err(error) => {
-                    let _ = tx.send(Err(error)).await;
-                    return;
-                }
-            };
-            let keys = result.change_keys.clone();
-            let value = match graphql_value(result.value.clone()) {
-                Ok(value) => value,
-                Err(error) => {
-                    let _ = tx.send(Err(error)).await;
-                    return;
-                }
-            };
-            let hash = super::subscribe::response_hash(&value);
-            if last_hash != Some(hash) {
-                if let Err(error) = request.record_protocol(&result, true) {
-                    let _ = tx.send(Err(error)).await;
-                    return;
-                }
-                last_hash = Some(hash);
-                if tx.send(Ok(value)).await.is_err() {
-                    return;
-                }
-            }
-            // Wait for a change to one of the keys (an empty set means "all").
-            loop {
-                let change = tokio::select! {
-                    _ = tx.closed() => return,
-                    change = changes.recv() => change,
-                };
-                match change {
-                    Ok(change)
-                        if change.tables.is_empty()
-                            || keys.iter().any(|key| change.tables.contains(key)) =>
-                    {
-                        break
-                    }
-                    Ok(_) => continue,
-                    Err(broadcast::error::RecvError::Lagged(_)) => break,
-                    Err(broadcast::error::RecvError::Closed) => return,
-                }
-            }
-            tokio::select! {
-                _ = tx.closed() => return,
-                _ = tokio::time::sleep(Duration::from_millis(100)) => {}
-            }
-            while let Ok(_) | Err(broadcast::error::TryRecvError::Lagged(_)) = changes.try_recv() {}
-            executed = tokio::select! {
-                _ = tx.closed() => return,
-                executed = request.execute() => executed,
-            };
-        }
-    });
-    ExternalLiveStream { rx }
+/// What makes two external live subscriptions one read.
+#[derive(Clone, PartialEq, Eq, Hash)]
+pub(crate) struct ExternalKey {
+    role: String,
+    section: String,
+    source: String,
+    root: String,
+    arguments: BTreeMap<String, serde_json::Value>,
+    session: BTreeMap<String, String>,
+}
+
+/// An external root, re-executed live by its executor.
+pub(crate) struct ExternalRead {
+    executor: Arc<dyn ExternalReadExecutor>,
+    root: String,
+    arguments: BTreeMap<String, serde_json::Value>,
+    session: Session,
+}
+
+/// What an external frame carries besides its value.
+pub(crate) struct ExternalMeta {
+    /// What was read (bound into the protocol scope token).
+    scope: serde_json::Value,
+    /// The change keys after which the read re-executes.
+    change_keys: Vec<String>,
+}
+
+impl LiveRead for ExternalRead {
+    type Meta = ExternalMeta;
+
+    async fn execute(&self, _resume: RequestedLiveResume) -> LiveResult<ExternalMeta> {
+        let result = self
+            .executor
+            .execute(&self.root, &self.arguments, &self.session)
+            .await
+            .map_err(|error: ExternalReadError| client_error(error.code(), error.message))?;
+        let value = graphql_value(result.value)?;
+        Ok(LiveFrame {
+            hash: response_hash(&value),
+            value,
+            // An external result is snapshot mode: nothing to resume.
+            next: RequestedLiveResume::Absent,
+            meta: ExternalMeta {
+                scope: result.scope,
+                change_keys: result.change_keys,
+            },
+        })
+    }
+
+    /// A change to one of the last read's keys; an empty set means "all".
+    fn touched_by(&self, last: &LiveFrame<ExternalMeta>, change: &ReadModelChange) -> bool {
+        change.tables.is_empty()
+            || last
+                .meta
+                .change_keys
+                .iter()
+                .any(|key| change.tables.contains(key))
+    }
 }

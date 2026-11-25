@@ -40,6 +40,7 @@ impl GraphqlEngineBuilder {
             pending_errors: Vec::new(),
             identity: None,
             websocket: WebsocketLimits::default(),
+            live_concurrency: crate::graphql::subscribe::DEFAULT_LIVE_CONCURRENCY,
             read_stores: BTreeMap::new(),
             external: Vec::new(),
         }
@@ -628,6 +629,20 @@ impl GraphqlEngineBuilder {
         self.websocket = limits;
         self
     }
+    /// Run at most `n` live executions at once (default
+    /// [`DEFAULT_LIVE_CONCURRENCY`](crate::graphql::subscribe::DEFAULT_LIVE_CONCURRENCY)).
+    /// Subscribers to the same read share one execution per change; this
+    /// bounds how many distinct reads (first reads, refreshes and catch-ups
+    /// together) hold a pool connection at a time, so a write burst cannot
+    /// starve one-shot queries. Must be at least 1.
+    pub fn live_concurrency(mut self, n: usize) -> Self {
+        if n == 0 {
+            self.pending_errors
+                .push("live_concurrency must be at least 1".into());
+        }
+        self.live_concurrency = n;
+        self
+    }
     /// Serve an external read source's roots (queries, `@live`
     /// subscriptions, the client manifest); see
     /// [`ExternalReadSource`](crate::graphql::surface::ExternalReadSource).
@@ -1112,6 +1127,7 @@ impl GraphqlEngineBuilder {
             schemas,
             graphiql_schemas,
             change_hub,
+            live: crate::graphql::subscribe::LiveRegistries::new(self.live_concurrency),
             dialect,
             identity: IdentityResolver::new(identity),
             websocket: self.websocket,

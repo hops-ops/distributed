@@ -116,6 +116,27 @@ impl ProtocolResponseAccumulator {
         }
     }
 
+    /// What every token this accumulator issues is bound to besides its own
+    /// material: the cache scope (itself a MAC over every authorization input
+    /// of the request) and the schema hash. Two accumulators with the same
+    /// scope and codec issue identical query and live tokens.
+    pub(crate) fn token_scope(&self) -> Result<(String, String), ProtocolAccumulatorError> {
+        self.with_envelope(|envelope| {
+            (
+                envelope.cache_scope.as_str().to_owned(),
+                envelope.schema_hash.clone(),
+            )
+        })
+    }
+
+    /// A fresh accumulator that issues exactly this one's tokens and shares
+    /// none of its response state: what a shared live execution evidences
+    /// with, so no subscriber's accumulator is touched by another's frame.
+    pub(crate) fn issuer(&self) -> Result<Self, ProtocolAccumulatorError> {
+        let envelope = self.with_envelope(Clone::clone)?;
+        Ok(Self::new(envelope, self.inner.codec.clone()))
+    }
+
     pub(crate) fn bind_projection_request(
         &self,
         request: crate::graphql::projection_delta::runtime::ProtocolProjectionRequestSeed,

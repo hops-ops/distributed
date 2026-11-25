@@ -260,6 +260,8 @@ pub(crate) struct EngineInner {
     /// manifest-fingerprinted execution limits.
     pub graphiql_schemas: HashMap<String, async_graphql::dynamic::Schema>,
     pub change_hub: crate::graphql::subscribe::ChangeHub,
+    /// Shared live reads ([`crate::graphql::subscribe`]).
+    pub(crate) live: crate::graphql::subscribe::LiveRegistries,
     pub dialect: SqlDialect,
     /// How HTTP and WebSocket requests become sessions (see `identity` module).
     pub(crate) identity: IdentityResolver,
@@ -350,6 +352,7 @@ pub struct GraphqlEngineBuilder {
     pub(crate) pending_errors: Vec<String>,
     pub(crate) identity: Option<IdentityConfig>,
     pub(crate) websocket: WebsocketLimits,
+    pub(crate) live_concurrency: usize,
     pub(crate) read_stores: BTreeMap<String, crate::graphql::read_store::ReadStore>,
     pub(crate) external: Vec<Arc<dyn crate::graphql::surface::ExternalReadExecutor>>,
 }

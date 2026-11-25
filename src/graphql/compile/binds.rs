@@ -18,6 +18,46 @@ pub enum BindValue {
     Json(JsonValue),
 }
 
+/// Two binds are equal exactly when the driver receives the same value: an
+/// `F64` by its bits, a `Json` by the text it is bound as. Live sharing keys
+/// on this, so equal binds must never be told apart by SQL.
+impl PartialEq for BindValue {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Null, Self::Null) => true,
+            (Self::Bool(a), Self::Bool(b)) => a == b,
+            (Self::I64(a), Self::I64(b)) => a == b,
+            (Self::F64(a), Self::F64(b)) => a.to_bits() == b.to_bits(),
+            (Self::Text(a), Self::Text(b)) => a == b,
+            (Self::Bytes(a), Self::Bytes(b)) => a == b,
+            (Self::Json(a), Self::Json(b)) => bound_text(a) == bound_text(b),
+            _ => false,
+        }
+    }
+}
+
+impl Eq for BindValue {}
+
+/// The text a `Json` bind is sent as (see `apply_binds!`).
+fn bound_text(value: &JsonValue) -> String {
+    value.to_string()
+}
+
+impl std::hash::Hash for BindValue {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        std::mem::discriminant(self).hash(state);
+        match self {
+            Self::Null => {}
+            Self::Bool(value) => value.hash(state),
+            Self::I64(value) => value.hash(state),
+            Self::F64(value) => value.to_bits().hash(state),
+            Self::Text(value) => value.hash(state),
+            Self::Bytes(value) => value.hash(state),
+            Self::Json(value) => bound_text(value).hash(state),
+        }
+    }
+}
+
 /// Give a numeric column one bind type.
 ///
 /// The Postgres driver prepares a statement once per connection and reuses

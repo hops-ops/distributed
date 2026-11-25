@@ -15,13 +15,35 @@ Every live response declares `extensions.distributed.live.mode`:
 A failed execution has no result and therefore no `live` metadata. It is sent
 as the terminal failure frame described below.
 
+## Shared execution at the origin
+
+Subscribers whose live roots are the same read share one producer. A catalog
+root is the same read when its role, compiled SQL and every bind (row policies
+and claim values included) match and, with the causal protocol on, its cache
+scope does too; an external root when its role, root, arguments and session
+match. The first subscriber's frame is the producer's first execution; a later
+one opens with its own read, which honours its own resume cursors. After that,
+each change that touches the read is debounced (100ms) and executed once, and
+the frame goes to every subscriber, each with its own hash gate and envelope.
+A subscriber whose cursors are not where a frame replays from (it joined
+between frames, or skipped one while slow) catches up with one read of its
+own, so replay stays exact. The producer keeps only the latest frame, so a
+slow subscriber never holds the others back.
+
+At most `GraphqlEngineBuilder::live_concurrency` live executions (default
+8) run at once per engine: first reads, refreshes and catch-ups together.
+When the last subscriber of a read leaves, its producer stops.
+`GraphqlEngine::live_producer_count()` counts producers (distinct reads);
+`GraphqlEngine::live_subscriber_count()` counts subscription streams.
+
 ## Failed live executions
 
 A live execution that fails (for example a storage error or statement timeout)
 has no result. The server sends exactly one **failure frame** and then completes
 the operation. The failure ends that subscription: the server sends no more
 frames for it and never attaches a later execution's metadata to the failure
-frame. A failure frame has:
+frame. A failed shared execution ends every subscription that shares it. A
+failure frame has:
 
 - `data` that is `null` or absent;
 - a nonempty `errors` array, where each entry is an object with a string
