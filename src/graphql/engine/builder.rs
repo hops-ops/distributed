@@ -20,12 +20,13 @@ impl GraphqlEngineBuilder {
             permissions: BTreeMap::new(),
             roles: None,
             anonymous_role: "anonymous".into(),
-            default_limit: 100,
-            max_limit: 1000,
-            max_depth: crate::graphql::complexity::DEFAULT_MAX_DEPTH,
-            max_complexity: crate::graphql::complexity::DEFAULT_MAX_COMPLEXITY,
-            max_in_list: 1000,
-            max_bool_width: 256,
+            default_limit: cost::DEFAULT_LIMIT,
+            max_limit: cost::DEFAULT_MAX_LIMIT,
+            max_depth: cost::DEFAULT_MAX_DEPTH,
+            max_fields: cost::DEFAULT_MAX_FIELDS,
+            max_rows: cost::DEFAULT_MAX_ROWS,
+            max_in_list: cost::DEFAULT_MAX_IN_LIST,
+            max_bool_width: cost::DEFAULT_MAX_BOOL_WIDTH,
             // Fail-closed by default for unshipped GA: unknown/ungranted filter
             // and order keys must not silently no-op.
             strict_where: true,
@@ -86,9 +87,7 @@ impl GraphqlEngineBuilder {
                 Ok(target) => {
                     if let Err(e) = self.insert_catalog(target.clone(), false) {
                         // Shadow insert conflict only if different schema.
-                        if !e.0.contains("identical") {
-                            self.pending_errors.push(e.0);
-                        }
+                        self.pending_errors.push(e.0);
                     }
                 }
                 Err(err) => {
@@ -356,21 +355,9 @@ impl GraphqlEngineBuilder {
         self
     }
 
-    /// Register one exact named application surface for generated clients.
-    /// Both role sets are required: eligible principals may open the surface,
-    /// while schema roles determine its portable privilege intersection.
-    ///
-    /// The server still authorizes every request as its verified concrete role.
-    pub fn client_application_surface(
-        self,
-        application: impl Into<String>,
-        eligible_roles: impl IntoIterator<Item = impl Into<String>>,
-        schema_roles: impl IntoIterator<Item = impl Into<String>>,
-    ) -> Self {
-        self.client_application_surface_with_schema_roles(application, eligible_roles, schema_roles)
-    }
-
-    /// Register an application surface with distinct eligible and schema roles.
+    /// Register one exact named application surface for generated clients,
+    /// with distinct eligible and schema roles. The server still authorizes
+    /// every request as its verified concrete role.
     ///
     /// - `eligible_roles`: wire/protocol role list; multi-role principals may
     ///   open the surface when any asserted role is in this set.
@@ -378,7 +365,7 @@ impl GraphqlEngineBuilder {
     ///   non-empty subset of `eligible_roles`). Use e.g. eligible
     ///   `{admin,user}` + schema `{user}` so portable owner policies survive
     ///   without collapsing model permission definitions.
-    pub fn client_application_surface_with_schema_roles(
+    pub fn client_application_surface(
         mut self,
         application: impl Into<String>,
         eligible_roles: impl IntoIterator<Item = impl Into<String>>,
@@ -539,32 +526,49 @@ impl GraphqlEngineBuilder {
         self
     }
 
+    // Query cost knobs. Each has one unit; `docs/graphql-query-cost.md`
+    // describes the model.
+
+    /// Page size of a list whose request gives no `limit` (default 100).
     pub fn default_limit(mut self, n: u64) -> Self {
         self.default_limit = n;
         self
     }
+    /// Largest page size any list resolves to (default 1000). A role's
+    /// `limit` may lower it further for that role's models.
     pub fn max_limit(mut self, n: u64) -> Self {
         self.max_limit = n;
         self
     }
+    /// Nesting levels: fields in the document, and relationships and `where`
+    /// filters in the compiled statement (default 8).
     pub fn max_depth(mut self, n: usize) -> Self {
         self.max_depth = n;
         self
     }
-    /// Maximum nested-selection complexity budget (default
-    /// [`crate::graphql::complexity::DEFAULT_MAX_COMPLEXITY`]).
-    ///
-    /// Cost uses relationship-aware weights (see `complexity` module), not only
-    /// flat GraphQL field counts, so multi-level `has_many` trees are bounded.
-    pub fn max_complexity(mut self, n: usize) -> Self {
-        self.max_complexity = n;
+    /// Selected fields in one document, every field once at every level
+    /// (default 500).
+    pub fn max_fields(mut self, n: usize) -> Self {
+        self.max_fields = n;
         self
     }
+    /// Model rows one root field's statement may produce (default 200,000).
+    ///
+    /// Every list counts its resolved limit: a page of `limit` rows costs
+    /// `limit × (1 + rows nested under one row)` and one object costs
+    /// `1 + rows nested under it`, so nested lists cost about the product of
+    /// their limits. A root field over budget fails with `BAD_REQUEST`
+    /// `row budget exceeded` before any SQL runs.
+    pub fn max_rows(mut self, n: u64) -> Self {
+        self.max_rows = n;
+        self
+    }
+    /// Entries in one `_in` / `_nin` list (default 1000).
     pub fn max_in_list(mut self, n: usize) -> Self {
         self.max_in_list = n;
         self
     }
-    /// Cap width of a single `_and` / `_or` list in client `where` (default 256).
+    /// Entries in one `_and` / `_or` list in client `where` (default 256).
     pub fn max_bool_width(mut self, n: usize) -> Self {
         self.max_bool_width = n;
         self
@@ -806,6 +810,14 @@ impl GraphqlEngineBuilder {
             }
         };
 
+        let client_execution = ClientExecutionLimits::from_runtime(
+            self.max_depth,
+            self.max_fields,
+            self.max_rows,
+            self.max_bool_width,
+            self.max_in_list,
+        )
+        .map_err(|error| GraphqlBuildError(error.to_string()))?;
         let tables: Vec<TableSchema> = self
             .catalog
             .values()
@@ -869,7 +881,7 @@ impl GraphqlEngineBuilder {
             let schema = dyn_schema::build_role_schema(
                 &role_surface,
                 self.max_depth,
-                self.max_complexity,
+                self.max_fields,
                 role == &anonymous && !self.introspection_for_anonymous,
             )
             .map_err(GraphqlBuildError)?;
@@ -877,8 +889,7 @@ impl GraphqlEngineBuilder {
                 let graphiql_schema = dyn_schema::build_role_schema(
                     &role_surface,
                     self.max_depth.max(GRAPHIQL_INTROSPECTION_MAX_DEPTH_FLOOR),
-                    self.max_complexity
-                        .max(GRAPHIQL_INTROSPECTION_MAX_COMPLEXITY_FLOOR),
+                    self.max_fields.max(GRAPHIQL_INTROSPECTION_MAX_FIELDS_FLOOR),
                     role == &anonymous && !self.introspection_for_anonymous,
                 )
                 .map_err(GraphqlBuildError)?;
@@ -894,13 +905,7 @@ impl GraphqlEngineBuilder {
                 let export = DistributedClientSurfaceExport::from_selected_with_execution(
                     service_id,
                     Arc::clone(&role_surface),
-                    ClientExecutionLimits::from_runtime(
-                        self.max_depth,
-                        self.max_complexity,
-                        self.max_bool_width,
-                        self.max_in_list,
-                    )
-                    .map_err(|error| GraphqlBuildError(error.to_string()))?,
+                    client_execution.clone(),
                 )
                 .map_err(|error| {
                     GraphqlBuildError(format!(
@@ -952,7 +957,7 @@ impl GraphqlEngineBuilder {
                 }
             }
             let application_surface = Arc::new(
-                surface_for_application_contract(
+                surface_for_application(
                     &full_surface,
                     application,
                     &registration.eligible_roles,
@@ -969,13 +974,7 @@ impl GraphqlEngineBuilder {
                 let export = DistributedClientSurfaceExport::from_selected_with_execution(
                     service_id,
                     Arc::clone(&application_surface),
-                    ClientExecutionLimits::from_runtime(
-                        self.max_depth,
-                        self.max_complexity,
-                        self.max_bool_width,
-                        self.max_in_list,
-                    )
-                    .map_err(|error| GraphqlBuildError(error.to_string()))?,
+                    client_execution.clone(),
                 )
                 .map_err(|error| GraphqlBuildError(format!(
                     "failed to derive GraphQL protocol surface for application `{application}`: {error}"
@@ -1017,7 +1016,7 @@ impl GraphqlEngineBuilder {
                     let app_schema = dyn_schema::build_role_schema(
                         &application_surface,
                         self.max_depth,
-                        self.max_complexity,
+                        self.max_fields,
                         false,
                     )
                     .map_err(GraphqlBuildError)?;
@@ -1026,8 +1025,7 @@ impl GraphqlEngineBuilder {
                         let graphiql_schema = dyn_schema::build_role_schema(
                             &application_surface,
                             self.max_depth.max(GRAPHIQL_INTROSPECTION_MAX_DEPTH_FLOOR),
-                            self.max_complexity
-                                .max(GRAPHIQL_INTROSPECTION_MAX_COMPLEXITY_FLOOR),
+                            self.max_fields.max(GRAPHIQL_INTROSPECTION_MAX_FIELDS_FLOOR),
                             false,
                         )
                         .map_err(GraphqlBuildError)?;
@@ -1097,16 +1095,15 @@ impl GraphqlEngineBuilder {
             gateway_versions: self.gateway_versions,
             catalog: self.catalog,
             by_table: self.by_table,
-            roles,
             anonymous_role: anonymous,
             default_limit: self.default_limit,
             max_limit: self.max_limit,
             max_depth: self.max_depth,
-            max_complexity: self.max_complexity,
+            max_rows: self.max_rows,
             max_in_list: self.max_in_list,
             max_bool_width: self.max_bool_width,
+            client_execution,
             strict_where: self.strict_where,
-            introspection_for_anonymous: self.introspection_for_anonymous,
             statement_timeout: self.statement_timeout,
             graphiql: self.graphiql,
             typed_commands: self.typed_commands,

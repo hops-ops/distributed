@@ -28,14 +28,3 @@ pub(crate) fn validate_generated_names(
     }
     Ok(())
 }
-
-/// Execute a compiled plan against the engine pool (used by root resolvers).
-pub(crate) async fn execute_plan(inner: &EngineInner, plan: &SqlPlan) -> Result<Value, String> {
-    execute::execute_sql(inner, plan).await
-}
-
-/// Public helper for tests: compile + naming surface.
-pub fn core_sdl_for_catalog(tables: &[TableSchema]) -> Result<String, String> {
-    // Dialect-independent / SQLite-default SDL (no PG JSON ops).
-    graphql_sdl_for_tables_with_options(tables, &SdlOptions::sqlite())
-}

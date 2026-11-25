@@ -223,7 +223,7 @@ pub async fn d7_concurrent_with_timeout_bound_terminates(db: Db) {
 
 /// Nested has_many fan-out exceeds relationship-aware complexity budget while
 /// staying under max_depth (proves weights, not only depth).
-pub async fn d8_nested_has_many_exceeds_complexity_budget(db: Db) {
+pub async fn d8_two_level_default_nest_exceeds_row_budget(db: Db) {
     use distributed::graphql::{read, GraphqlEngine};
     use distributed::ReadModel;
     use distributed::{ReadModelCatalog, RelationalReadModel, RelationshipDef, RelationshipKind};
@@ -289,7 +289,7 @@ pub async fn d8_nested_has_many_exceeds_complexity_budget(db: Db) {
         .table_schema(child)
         .table_schema(grand);
 
-    // Default max_complexity (500) + max_depth high enough that depth is not the limit.
+    // Default max_rows (200,000) + max_depth high enough that depth is not the limit.
     let engine = GraphqlEngine::from_schema_catalog(&manifest, pool)
         .unwrap()
         .identity(IdentityConfig::dev_headers())
@@ -302,7 +302,7 @@ pub async fn d8_nested_has_many_exceeds_complexity_budget(db: Db) {
         .expect("build");
 
     let s = session("user", "u");
-    // 3-level has_many: relationship weights push estimated cost above 500.
+    // Three default pages nested: 100 × (1 + 100 × (1 + 100)) = 1,010,100 rows.
     let q = r#"{
       parents {
         parent_id
@@ -319,17 +319,17 @@ pub async fn d8_nested_has_many_exceeds_complexity_budget(db: Db) {
     let resp = engine.execute(&s, Request::new(q)).await;
     assert!(
         !resp.errors.is_empty(),
-        "3-level nested has_many must exceed complexity budget"
+        "3-level nested has_many must exceed the row budget"
     );
     assert_no_sql_leak(&resp);
     let msgs = error_messages(&resp);
     assert!(
-        msgs.contains("complex") || msgs.contains("bad request"),
-        "expected complexity client error, got {msgs}"
+        msgs.contains("row budget exceeded"),
+        "expected row budget client error, got {msgs}"
     );
 }
 
-/// Shallow nest stays under default complexity budget.
+/// One default nest stays under the default row budget (100 × 101 = 10,100).
 pub async fn d8_shallow_nested_has_many_within_budget(db: Db) {
     use distributed::graphql::{read, GraphqlEngine};
     use distributed::ReadModel;
@@ -393,8 +393,8 @@ pub async fn d8_shallow_nested_has_many_within_budget(db: Db) {
     );
 }
 
-/// Explicit low max_complexity rejects modest nests (budget knob works).
-pub async fn d8_low_max_complexity_rejects_single_nest(db: Db) {
+/// Explicit low max_rows rejects modest nests (budget knob works).
+pub async fn d8_low_max_rows_rejects_single_nest(db: Db) {
     use distributed::graphql::{read, GraphqlEngine};
     use distributed::ReadModel;
     use distributed::{ReadModelCatalog, RelationalReadModel, RelationshipDef, RelationshipKind};
@@ -438,7 +438,7 @@ pub async fn d8_low_max_complexity_rejects_single_nest(db: Db) {
         .unwrap()
         .identity(IdentityConfig::dev_headers())
         .roles(&["user"])
-        .max_complexity(20)
+        .max_rows(10_099)
         .max_depth(8)
         .permission::<ParentView>("user", read().all_columns())
         .permission::<ChildView>("user", read().all_columns())
@@ -458,8 +458,90 @@ pub async fn d8_low_max_complexity_rejects_single_nest(db: Db) {
     );
     assert_no_sql_leak(&resp);
     let msgs = error_messages(&resp);
+    assert!(msgs.contains("row budget exceeded"), "{msgs}");
+}
+
+/// Regression: the row budget counts each list's resolved `limit`.
+///
+/// The old weighted complexity estimate ignored `limit` entirely, so this
+/// request (a shape `d8_shallow_nested_has_many_within_budget` shows the
+/// defaults admit) was accepted although it can return 1000 × (1 + 1000) =
+/// 1,001,000 rows, five times the default `max_rows`. Lowering the limits
+/// to a product within budget is accepted.
+pub async fn d8_explicit_limits_multiply_into_the_row_budget(db: Db) {
+    use distributed::graphql::{read, GraphqlEngine};
+    use distributed::ReadModel;
+    use distributed::{ReadModelCatalog, RelationalReadModel, RelationshipDef, RelationshipKind};
+    use serde::{Deserialize, Serialize};
+
+    #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, ReadModel)]
+    #[table("parents")]
+    struct ParentView {
+        #[id("parent_id")]
+        parent_id: String,
+        name: String,
+    }
+    #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, ReadModel)]
+    #[table("children")]
+    struct ChildView {
+        #[id("child_id")]
+        child_id: String,
+        parent_id: String,
+        name: String,
+    }
+
+    db.seed([parent("p1", "P")]).await;
+    db.seed([child("c1", "p1", "C")]).await;
+    let pool = db.pool();
+
+    let mut parent = ParentView::schema().clone();
+    parent.relationships = vec![RelationshipDef {
+        references: None,
+        field_name: "children".into(),
+        kind: RelationshipKind::HasMany,
+        target_model: "ChildView".into(),
+        foreign_key: Some("parent_id".into()),
+        through: None,
+        target_foreign_key: None,
+    }];
+    let manifest = ReadModelCatalog::new("cx4")
+        .table_schema(parent)
+        .table_schema(ChildView::schema().clone());
+    let engine = GraphqlEngine::from_schema_catalog(&manifest, pool)
+        .unwrap()
+        .identity(IdentityConfig::dev_headers())
+        .roles(&["user"])
+        .permission::<ParentView>("user", read().all_columns())
+        .permission::<ChildView>("user", read().all_columns())
+        .build()
+        .expect("build");
+
+    let s = session("user", "u");
+    let resp = engine
+        .execute(
+            &s,
+            Request::new(
+                "{ parents(limit: 1000) { parent_id children(limit: 1000) { child_id } } }",
+            ),
+        )
+        .await;
+    assert_no_sql_leak(&resp);
     assert!(
-        msgs.contains("complex") || msgs.contains("bad request"),
-        "{msgs}"
+        error_messages(&resp).contains("row budget exceeded"),
+        "1,001,000 rows must exceed the default row budget: {:?}",
+        resp.errors
     );
+
+    // 1000 × (1 + 199) = 200,000: exactly the default budget.
+    let resp = engine
+        .execute(
+            &s,
+            Request::new(
+                "{ parents(limit: 1000) { parent_id children(limit: 199) { child_id } } }",
+            ),
+        )
+        .await;
+    assert!(resp.errors.is_empty(), "{:?}", resp.errors);
+    let data = resp.data.into_json().unwrap();
+    assert_eq!(data["parents"][0]["children"][0]["child_id"], "c1");
 }

@@ -35,7 +35,7 @@ use super::{
 /// context, or projection source from different authorization selections.
 pub(crate) struct ProjectionDeltaAuthority<'a, R> {
     surface: &'a crate::graphql::surface::Surface,
-    manifest: crate::graphql::client_manifest::DistributedClientManifest,
+    manifest: &'a crate::graphql::client_manifest::DistributedClientManifest,
     context: ProjectionDeltaContext,
     authorization: SelectedSurfaceAuthorization<'a, R, R>,
 }
@@ -64,10 +64,10 @@ where
         request: &'a R,
     ) -> Result<Self, ProjectionDeltaError> {
         let manifest = export
-            .manifest()
+            .manifest_ref()
             .map_err(|_| ProjectionDeltaError::ProjectionIdentityMismatch)?;
         let context = ProjectionDeltaContext::from_manifest(
-            &manifest,
+            manifest,
             request.authorization_generation(),
             request.cache_scope(),
             request.command_causation_id(),
@@ -107,7 +107,7 @@ where
             .ok_or(ProjectionDeltaError::ProjectionIdentityMismatch)?;
         ProjectionDeltaSource::try_from_export(
             selected_projection,
-            &self.manifest,
+            self.manifest,
             self.context.wire_identity(),
         )
     }

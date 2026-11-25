@@ -6,7 +6,7 @@ use std::collections::{btree_map::Entry, BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 use std::time::Duration;
 
-use async_graphql::{Request, Response, ServerError, Value};
+use async_graphql::{Request, Response, ServerError};
 use futures_util::stream::{self, BoxStream};
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
@@ -24,8 +24,8 @@ use super::client_manifest::{
     ClientTrustedPresetDescriptor, DistributedClientManifest, DistributedClientSurfaceExport,
 };
 use super::commands::TypedCommandInventory;
-use super::compile::{SqlDialect, SqlPlan};
-use super::execute;
+use super::compile::SqlDialect;
+use super::cost;
 use super::filter::FilterExpr;
 use super::identity::{IdentityConfig, IdentityResolver};
 use super::naming::{
@@ -39,18 +39,41 @@ use super::protocol::{
 };
 use super::query_protocol::QueryProtocolRuntime;
 use super::schema as dyn_schema;
-use super::sdl::{graphql_sdl_for_tables_with_options, graphql_sdl_from_surface, SdlOptions};
+use super::sdl::graphql_sdl_from_surface;
 use super::surface::{
-    build_surface, surface_for_application_contract, surface_for_role, Surface, SurfaceDialect,
+    build_surface, surface_for_application, surface_for_role, Surface, SurfaceDialect,
     SurfaceOptions, SurfaceProjectionOwner, SurfaceProjector, SurfaceSelection,
 };
 use crate::command::TypedServiceCommandBinding;
 use crate::command_dispatch::VerifiedPrincipal;
 
 const GRAPHIQL_INTROSPECTION_MAX_DEPTH_FLOOR: usize = 15;
-const GRAPHIQL_INTROSPECTION_MAX_COMPLEXITY_FLOOR: usize = 10_000;
+const GRAPHIQL_INTROSPECTION_MAX_FIELDS_FLOOR: usize = 10_000;
 const REQUEST_ANALYSIS_MAX_DEPTH: usize = 128;
 const REQUEST_ANALYSIS_MAX_SELECTIONS: usize = 4_096;
+
+/// The operation a request runs: the named one, else the only one.
+pub(crate) fn selected_operation<'d>(
+    document: &'d async_graphql::parser::types::ExecutableDocument,
+    name: Option<&str>,
+) -> Option<&'d async_graphql::parser::types::OperationDefinition> {
+    let mut operations = document.operations.iter();
+    let operation = match name {
+        Some(name) => {
+            operations
+                .find(|(candidate, _)| candidate.map(|candidate| candidate.as_str()) == Some(name))?
+                .1
+        }
+        None => {
+            let operation = operations.next()?.1;
+            if operations.next().is_some() {
+                return None;
+            }
+            operation
+        }
+    };
+    Some(&operation.node)
+}
 
 mod auth;
 mod builder;
@@ -90,13 +113,7 @@ pub(crate) use protocol::{
     protocol_trusted_presets, resolve_execution_authority, resolve_protocol_preset,
     select_protocol_surface,
 };
-pub(crate) use validation::{execute_plan, validate_generated_names};
-
-/// Public helper for tests: compile + naming surface.
-#[allow(dead_code)]
-pub fn core_sdl_for_catalog(tables: &[TableSchema]) -> Result<String, String> {
-    validation::core_sdl_for_catalog(tables)
-}
+pub(crate) use validation::validate_generated_names;
 
 #[cfg(feature = "gateway")]
 pub(crate) mod read_routing;

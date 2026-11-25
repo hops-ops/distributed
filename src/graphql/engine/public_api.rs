@@ -23,9 +23,6 @@ impl GraphqlEngine {
     }
 
     pub fn sdl_for_role(&self, role: &str) -> Option<String> {
-        if !self.inner.roles.contains(role) && role != self.inner.anonymous_role {
-            // Still allow any role that has a built schema.
-        }
         self.inner.schemas.get(role).map(|s| s.sdl())
     }
 
@@ -93,12 +90,7 @@ impl GraphqlEngine {
         DistributedClientSurfaceExport::from_selected_with_execution(
             service_id,
             surface,
-            ClientExecutionLimits::from_runtime(
-                self.inner.max_depth,
-                self.inner.max_complexity,
-                self.inner.max_bool_width,
-                self.inner.max_in_list,
-            )?,
+            self.inner.client_execution.clone(),
         )
     }
 
@@ -160,12 +152,7 @@ impl GraphqlEngine {
         DistributedClientSurfaceExport::from_selected_with_execution(
             service_id,
             surface,
-            ClientExecutionLimits::from_runtime(
-                self.inner.max_depth,
-                self.inner.max_complexity,
-                self.inner.max_bool_width,
-                self.inner.max_in_list,
-            )?,
+            self.inner.client_execution.clone(),
         )
     }
 

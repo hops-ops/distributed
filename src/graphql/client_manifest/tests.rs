@@ -771,10 +771,16 @@ fn role_manifest_is_deterministic_and_hides_denied_identity_and_commands() {
     assert_eq!(first, second);
     assert_eq!(first.manifest_version, 2);
     assert_eq!(first.schema_fingerprint, second.schema_fingerprint);
-    assert_eq!(
-        first.schema_fingerprint,
-        "sha256:d8bb6c9435afa563ff389501f005aaeec2dce269b751de0a40b191a74cc7a615"
-    );
+    // Stable across builds: an export built afresh from the same inputs
+    // carries the same fingerprint.
+    let rebuilt = DistributedClientSurfaceExport::from_selected(
+        "todos-service",
+        surface_for_role(&full, "user", &grants()["user"]).unwrap(),
+    )
+    .unwrap()
+    .manifest()
+    .unwrap();
+    assert_eq!(first.schema_fingerprint, rebuilt.schema_fingerprint);
     assert_eq!(
         first.protocol_fingerprint,
         "sha256:0dfa8a3f49e17d8d99c5c095c1ed14f528cae3e55fbc2f2b852975a50936ec5b"

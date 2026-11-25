@@ -27,7 +27,10 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use super::complexity_contract::{DEFAULT_MAX_COMPLEXITY, DEFAULT_MAX_DEPTH};
+use super::cost::{
+    DEFAULT_MAX_BOOL_WIDTH, DEFAULT_MAX_DEPTH, DEFAULT_MAX_FIELDS, DEFAULT_MAX_IN_LIST,
+    DEFAULT_MAX_ROWS,
+};
 use super::filter::{FilterExpr, Operand};
 use super::naming::{aggregate_fields_type_name, aggregate_type_name};
 use super::surface::{
@@ -56,7 +59,7 @@ pub use commands::{command_operation, command_status_operation};
 pub use error::ClientManifestError;
 pub use export::{prune_client_manifest, DistributedClientSurfaceExport};
 pub use identity::ClientSurfaceIdentity;
-pub use limits::{ClientComplexityWeights, ClientExecutionLimits};
+pub use limits::{row_cost, ClientExecutionLimits};
 pub use projections::{
     CLIENT_PROJECTION_BINDING_VERSION, CLIENT_PROJECTION_PROGRAM_VERSION,
     COMMAND_PROJECTION_EXTENSION_VERSION,
@@ -93,7 +96,4 @@ const COMMAND_EXTENSION_SLOTS_VERSION: u32 = 2;
 const PROJECTOR_ENTRY_VERSION: u32 = 1;
 const PROTOCOL_OPERATIONS_VERSION: u32 = 1;
 const QUERY_CAPABILITIES_VERSION: u32 = 1;
-const QUERY_COMPLEXITY_VERSION: u32 = 1;
 const KEY_ENCODING: &str = "canonical_json_tuple_v1";
-const DEFAULT_MAX_BOOL_WIDTH: u64 = 256;
-const DEFAULT_MAX_IN_LIST: u64 = 1_000;

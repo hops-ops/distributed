@@ -197,6 +197,8 @@ pub(crate) fn validate_execution_limits(
     const JS_MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
     for (name, value) in [
         ("max_depth", execution.max_depth),
+        ("max_fields", execution.max_fields),
+        ("max_rows", execution.max_rows),
         ("max_bool_width", execution.max_bool_width),
         ("max_in_list", execution.max_in_list),
     ] {
@@ -206,31 +208,6 @@ pub(crate) fn validate_execution_limits(
                 format!("execution.{name} `{value}` exceeds JavaScript's exact integer range"),
             ));
         }
-    }
-    if execution.complexity.version != 1 {
-        return Err(ClientCompileError::manifest(
-            "client.manifest.complexity_version",
-            format!(
-                "unsupported query complexity contract version {}; distributed requires version 1",
-                execution.complexity.version
-            ),
-        ));
-    }
-    let weights = [
-        ("scalar", execution.complexity.scalar),
-        ("belongs_to", execution.complexity.belongs_to),
-        ("has_many", execution.complexity.has_many),
-        ("m2m", execution.complexity.m2m),
-        ("aggregate", execution.complexity.aggregate),
-        ("list_root", execution.complexity.list_root),
-        ("by_pk", execution.complexity.by_pk),
-        ("list_fanout", execution.complexity.list_fanout),
-    ];
-    if let Some((name, _)) = weights.into_iter().find(|(_, value)| *value == 0) {
-        return Err(ClientCompileError::manifest(
-            "client.manifest.complexity_weight",
-            format!("query complexity weight `{name}` must be greater than zero"),
-        ));
     }
     Ok(())
 }

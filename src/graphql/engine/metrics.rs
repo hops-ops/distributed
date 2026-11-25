@@ -29,16 +29,6 @@ pub(crate) fn attach_protocol_response(
     }
 }
 
-/// First asserted role, else anonymous — prefer [`ExecutionAuthority::privilege_role`].
-#[allow(dead_code)]
-pub(crate) fn resolve_role(session: &Session, anonymous: &str) -> String {
-    session
-        .roles()
-        .first()
-        .map(|role| (*role).to_string())
-        .unwrap_or_else(|| anonymous.to_string())
-}
-
 /// Map GraphQL response errors to coarse metric `status` labels.
 ///
 /// Privacy: only stable class names (`ok`, `timeout`, `bad_request`,
@@ -76,13 +66,7 @@ pub(crate) fn metrics_status_for_response(response: &Response) -> &'static str {
     "error"
 }
 
-pub(crate) fn record_metrics(
-    session: &Session,
-    root_field: &str,
-    status: &str,
-    duration: Duration,
-) {
-    let _ = session;
+pub(crate) fn record_metrics(root_field: &str, status: &str, duration: Duration) {
     #[cfg(feature = "metrics")]
     crate::metrics::record_graphql_request(None, root_field, status, duration);
     #[cfg(not(feature = "metrics"))]

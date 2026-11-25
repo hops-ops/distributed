@@ -20,14 +20,13 @@ pub(super) fn validate_execution_limits(
         ));
     }
 
-    let weights = &execution.complexity;
-    let complexity = weights.root(kind, compiled_object_complexity(&root.selection, weights));
-    if complexity > execution.max_complexity {
+    let rows = compiled_root_rows(root, kind);
+    if rows > execution.max_rows {
         return Err(source_error(
-            "client.operation.complexity_limit",
+            "client.operation.row_limit",
             format!(
-                "compiled operation complexity {complexity} exceeds the selected service max_complexity {}",
-                execution.max_complexity
+                "compiled operation may return {rows} rows, exceeding the selected service max_rows {}",
+                execution.max_rows
             ),
             document,
             position,
@@ -53,31 +52,74 @@ pub(super) fn compiled_object_depth(selection: &CompiledObject, parent_depth: u6
         .unwrap_or(parent_depth)
 }
 
-/// The service's own cost formula ([`ClientComplexityWeights`]) over the
-/// compiled selection, with the weights the selected service advertises.
-pub(super) fn compiled_object_complexity(
-    selection: &CompiledObject,
-    weights: &ClientComplexityWeights,
-) -> u64 {
-    weights.object(selection.members.iter().map(|member| match member {
-        CompiledMember::Scalar(_) => weights.scalar,
-        CompiledMember::Branch(branch) => {
-            let child = compiled_object_complexity(&branch.selection, weights);
-            match branch.semantic {
-                CompiledBranchSemantic::Relationship => weights.relationship(
-                    branch
-                        .relationship
-                        .as_ref()
-                        .expect("relationship branches retain their compiled descriptor")
-                        .kind,
-                    child,
-                ),
-                CompiledBranchSemantic::Aggregate => weights.aggregate(child),
-                CompiledBranchSemantic::AggregateFields => weights.scalar,
-                CompiledBranchSemantic::AggregateNodes => weights.aggregate_nodes(child),
+/// The service's row cost ([`row_cost`]) of a compiled root: every list
+/// counts its page size, so nested lists cost about the product of their
+/// limits.
+///
+/// A literal `limit` counts as given (capped by the field's `max_limit`); an
+/// absent one, or a variable whose value is unknown until run time, counts as
+/// the field's `default_limit`. The service checks the actual values again
+/// for every request, so this build-time check refuses only what the defaults
+/// already put over budget.
+pub(super) fn compiled_root_rows(root: &CompiledRoot, kind: ClientRootKind) -> u64 {
+    let limit = page_limit(&root.arguments, root.coverage.as_ref());
+    match kind {
+        ClientRootKind::List => row_cost::page(limit, compiled_object_rows(&root.selection, limit)),
+        ClientRootKind::ByPk => row_cost::one(compiled_object_rows(&root.selection, limit)),
+        ClientRootKind::Aggregate => compiled_object_rows(&root.selection, limit),
+    }
+}
+
+/// Rows nested under one object. `nodes_limit` is the page size of an
+/// aggregate's `nodes`, which take their arguments from the aggregate field.
+fn compiled_object_rows(selection: &CompiledObject, nodes_limit: u64) -> u64 {
+    selection
+        .members
+        .iter()
+        .map(|member| match member {
+            CompiledMember::Scalar(_) => 0,
+            CompiledMember::Branch(branch) => {
+                let limit = page_limit(&branch.arguments, branch.coverage.as_ref());
+                match branch.semantic {
+                    CompiledBranchSemantic::Relationship => {
+                        let nested = compiled_object_rows(&branch.selection, limit);
+                        match branch.cardinality {
+                            Cardinality::Many => row_cost::page(limit, nested),
+                            Cardinality::One => row_cost::one(nested),
+                        }
+                    }
+                    CompiledBranchSemantic::Aggregate => {
+                        compiled_object_rows(&branch.selection, limit)
+                    }
+                    CompiledBranchSemantic::AggregateFields => 0,
+                    CompiledBranchSemantic::AggregateNodes => row_cost::page(
+                        nodes_limit,
+                        compiled_object_rows(&branch.selection, nodes_limit),
+                    ),
+                }
             }
-        }
-    }))
+        })
+        .fold(0, u64::saturating_add)
+}
+
+fn page_limit(
+    arguments: &BTreeMap<String, CompiledArgument>,
+    coverage: Option<&CompiledCoverage>,
+) -> u64 {
+    let Some(coverage) = coverage else {
+        return 1;
+    };
+    let default = coverage.default_limit.unwrap_or(1);
+    let literal = coverage
+        .limit_argument
+        .as_ref()
+        .and_then(|name| arguments.get(name))
+        .and_then(|argument| match argument {
+            CompiledArgument::Literal { value, .. } => value.as_u64(),
+            _ => None,
+        });
+    let limit = literal.unwrap_or(default);
+    coverage.max_limit.map_or(limit, |max| limit.min(max))
 }
 
 pub(super) fn filter_depth_from_selection(selection_depth: usize, root_offset: usize) -> u64 {
@@ -1194,20 +1236,105 @@ pub(super) fn validate_order_entry_source(
 mod tests {
     use super::*;
 
-    /// The service charges one scalar for a selection with nothing costed in
-    /// it; a compiler that charged zero would accept an operation the service
-    /// then rejects at its `max_complexity`.
-    #[test]
-    fn an_empty_selection_costs_what_the_service_charges() {
-        let weights = ClientComplexityWeights {
-            scalar: 4,
-            ..ClientComplexityWeights::current()
-        };
-        let empty = CompiledObject {
+    fn object(members: Vec<CompiledMember>) -> CompiledObject {
+        CompiledObject {
             typename: "todo".into(),
             storage: CompiledStorage::Embedded,
-            members: Vec::new(),
+            members,
+        }
+    }
+
+    fn branch(
+        semantic: CompiledBranchSemantic,
+        cardinality: Cardinality,
+        limit: Option<u64>,
+        selection: CompiledObject,
+    ) -> CompiledMember {
+        let mut arguments = BTreeMap::new();
+        if let Some(limit) = limit {
+            arguments.insert(
+                "limit".to_owned(),
+                CompiledArgument::Literal {
+                    value: JsonValue::from(limit),
+                    wire: limit.to_string(),
+                },
+            );
+        }
+        CompiledMember::Branch(Box::new(CompiledBranch {
+            semantic,
+            response_key: "items".into(),
+            field: "items".into(),
+            cardinality,
+            nullable: false,
+            arguments,
+            dependencies: Vec::new(),
+            coverage: Some(CompiledCoverage {
+                kind: "offset".into(),
+                offset_argument: None,
+                limit_argument: Some("limit".into()),
+                default_limit: Some(100),
+                max_limit: Some(1000),
+            }),
+            filter: None,
+            order: None,
+            pagination: None,
+            relationship: None,
+            selection,
+        }))
+    }
+
+    /// The compiler's arithmetic is the service's: nested lists multiply,
+    /// one-to-one relationships add one row, aggregates count their nodes.
+    #[test]
+    fn row_cost_matches_the_service() {
+        let many = |limit, selection| {
+            branch(
+                CompiledBranchSemantic::Relationship,
+                Cardinality::Many,
+                limit,
+                selection,
+            )
         };
-        assert_eq!(compiled_object_complexity(&empty, &weights), 4);
+        // orders(limit: 1000) { items(limit: 1000) { id } }
+        let nested = object(vec![many(Some(1000), object(Vec::new()))]);
+        assert_eq!(compiled_object_rows(&nested, 1), 1000);
+        assert_eq!(
+            row_cost::page(1000, compiled_object_rows(&nested, 1)),
+            1_001_000
+        );
+        // An absent limit is the default page.
+        assert_eq!(
+            compiled_object_rows(&object(vec![many(None, object(Vec::new()))]), 1),
+            100
+        );
+        // A belongs-to costs one row plus what it carries.
+        let one = branch(
+            CompiledBranchSemantic::Relationship,
+            Cardinality::One,
+            None,
+            object(Vec::new()),
+        );
+        assert_eq!(compiled_object_rows(&object(vec![one]), 1), 1);
+        // items_aggregate(limit: 7) { aggregate { count } nodes { id } }
+        let aggregate = branch(
+            CompiledBranchSemantic::Aggregate,
+            Cardinality::One,
+            Some(7),
+            object(vec![
+                branch(
+                    CompiledBranchSemantic::AggregateFields,
+                    Cardinality::One,
+                    None,
+                    object(Vec::new()),
+                ),
+                branch(
+                    CompiledBranchSemantic::AggregateNodes,
+                    Cardinality::Many,
+                    None,
+                    object(Vec::new()),
+                ),
+            ]),
+        );
+        assert_eq!(compiled_object_rows(&object(vec![aggregate]), 1), 7);
     }
 }

@@ -8,6 +8,7 @@ use super::super::engine::EngineInner;
 use super::binds::{operand_to_bind, value_to_bind, BindValue};
 use super::dialect::{comparison_operand, placeholder, text_pattern, SqlDialect};
 use super::scan::{relationship_link, ModelScan, ScanLink};
+use super::CompileError;
 
 impl ModelScan<'_> {
     /// `FROM "table" alias [JOIN …] WHERE [link AND] (row policy AND where)`.
@@ -23,9 +24,9 @@ impl ModelScan<'_> {
         binds: &mut Vec<BindValue>,
         tables: &mut Vec<String>,
         depth: usize,
-    ) -> Result<String, String> {
+    ) -> Result<String, CompileError> {
         if depth > self.inner.max_depth {
-            return Err("max depth exceeded".into());
+            return Err(CompileError::TooDeep);
         }
         let mut preds = Vec::new();
         if let Some(policy) = self.grant.row_policy.filter() {
@@ -41,7 +42,7 @@ impl ModelScan<'_> {
             )?);
         }
         if let Some(client_where) = client_where {
-            preds.push(compile_client_where(
+            preds.extend(compile_client_where(
                 *self,
                 client_where,
                 alias,
@@ -76,7 +77,7 @@ fn compile_filter_expr(
     binds: &mut Vec<BindValue>,
     tables: &mut Vec<String>,
     depth: usize,
-) -> Result<String, String> {
+) -> Result<String, CompileError> {
     match expr {
         FilterExpr::And(xs) => {
             if xs.is_empty() {
@@ -116,7 +117,9 @@ fn compile_filter_expr(
             let col_ref = format!("{alias}.\"{column}\"");
             if matches!(op, CmpOp::Like | CmpOp::Ilike) {
                 let BindValue::Text(pattern) = bind else {
-                    return Err("a pattern comparison requires a string".into());
+                    return Err(CompileError::BadRequest(
+                        "a pattern comparison requires a string".into(),
+                    ));
                 };
                 return compile_text_pattern(
                     inner.dialect,
@@ -174,11 +177,11 @@ fn compile_filter_expr(
                 });
             }
             if values.len() > inner.max_in_list {
-                return Err(format!(
+                return Err(CompileError::ListTooLong(format!(
                     "_in list length {} exceeds max_in_list {}",
                     values.len(),
                     inner.max_in_list
-                ));
+                )));
             }
             let col = schema
                 .columns
@@ -244,6 +247,8 @@ fn compile_filter_expr(
     }
 }
 
+/// The predicate a client `where` adds, or `None` when it adds nothing (an
+/// empty object, or only soft-skipped keys).
 fn compile_client_where(
     scan: ModelScan<'_>,
     value: &Value,
@@ -251,28 +256,32 @@ fn compile_client_where(
     binds: &mut Vec<BindValue>,
     tables: &mut Vec<String>,
     depth: usize,
-) -> Result<String, String> {
-    let (inner, session, schema) = (scan.inner, scan.session, scan.schema);
+) -> Result<Option<String>, CompileError> {
+    let (inner, schema) = (scan.inner, scan.schema);
     if depth > inner.max_depth {
-        return Err("max depth exceeded".into());
+        return Err(CompileError::TooDeep);
     }
     let Value::Object(map) = value else {
-        return Ok("TRUE".into());
+        return Ok(None);
+    };
+    let bool_list = |key: &str, items: &Vec<Value>| -> Result<(), CompileError> {
+        if items.len() > inner.max_bool_width {
+            return Err(CompileError::ListTooLong(format!(
+                "{key} list length {} exceeds max_bool_width {}",
+                items.len(),
+                inner.max_bool_width
+            )));
+        }
+        Ok(())
     };
     let mut preds = Vec::new();
     for (key, val) in map {
         match key.as_str() {
             "_and" => {
                 if let Value::List(items) = val {
-                    if items.len() > inner.max_bool_width {
-                        return Err(format!(
-                            "_and list length {} exceeds max_bool_width {}",
-                            items.len(),
-                            inner.max_bool_width
-                        ));
-                    }
+                    bool_list("_and", items)?;
                     for item in items {
-                        preds.push(compile_client_where(
+                        preds.extend(compile_client_where(
                             scan,
                             item,
                             alias,
@@ -285,23 +294,15 @@ fn compile_client_where(
             }
             "_or" => {
                 if let Value::List(items) = val {
-                    if items.len() > inner.max_bool_width {
-                        return Err(format!(
-                            "_or list length {} exceeds max_bool_width {}",
-                            items.len(),
-                            inner.max_bool_width
-                        ));
-                    }
+                    bool_list("_or", items)?;
                     let mut parts = Vec::new();
                     for item in items {
-                        parts.push(compile_client_where(
-                            scan,
-                            item,
-                            alias,
-                            binds,
-                            tables,
-                            depth + 1,
-                        )?);
+                        // An empty disjunct matches every row, so the whole
+                        // `_or` does.
+                        match compile_client_where(scan, item, alias, binds, tables, depth + 1)? {
+                            Some(part) => parts.push(part),
+                            None => parts.push("TRUE".into()),
+                        }
                     }
                     if !parts.is_empty() {
                         preds.push(format!("({})", parts.join(" OR ")));
@@ -309,16 +310,22 @@ fn compile_client_where(
                 }
             }
             "_not" => {
-                preds.push(format!(
-                    "NOT ({})",
-                    compile_client_where(scan, val, alias, binds, tables, depth + 1,)?
-                ));
+                if let Some(inner_pred) =
+                    compile_client_where(scan, val, alias, binds, tables, depth + 1)?
+                {
+                    preds.push(format!("NOT ({inner_pred})"));
+                } else {
+                    // `NOT (TRUE)`: an empty `_not` matches no row.
+                    preds.push("FALSE".into());
+                }
             }
             col_name => {
                 if let Some(col) = schema.columns.iter().find(|c| c.column_name == *col_name) {
                     if !scan.allows_column(col_name) {
                         if inner.strict_where {
-                            return Err(format!("ungranted where column `{col_name}`"));
+                            return Err(CompileError::InvalidFilter(format!(
+                                "ungranted where column `{col_name}`"
+                            )));
                         }
                         continue;
                     }
@@ -326,7 +333,6 @@ fn compile_client_where(
                         for (op, rhs) in ops {
                             preds.push(compile_client_op(
                                 inner,
-                                session,
                                 col_name,
                                 &col.column_type,
                                 op,
@@ -346,7 +352,9 @@ fn compile_client_where(
                     // bypassed by a source-model predicate.
                     let Some(target) = scan.target(rel) else {
                         if inner.strict_where {
-                            return Err(format!("ungranted where relationship `{col_name}`"));
+                            return Err(CompileError::InvalidFilter(format!(
+                                "ungranted where relationship `{col_name}`"
+                            )));
                         }
                         continue;
                     };
@@ -373,34 +381,33 @@ fn compile_client_where(
                         )?
                     ));
                 } else if inner.strict_where {
-                    return Err(format!("unknown where field `{col_name}`"));
+                    return Err(CompileError::InvalidFilter(format!(
+                        "unknown where field `{col_name}`"
+                    )));
                 }
                 // soft-skip: ignore unknown keys when strict_where is false
             }
         }
     }
-    if preds.is_empty() {
-        Ok("TRUE".into())
-    } else {
-        Ok(format!("({})", preds.join(" AND ")))
-    }
+    Ok((!preds.is_empty()).then(|| format!("({})", preds.join(" AND "))))
 }
 
 fn compile_client_op(
     inner: &EngineInner,
-    _session: &Session,
     column: &str,
     column_type: &ColumnType,
     op: &str,
     rhs: &Value,
     alias: &str,
     binds: &mut Vec<BindValue>,
-) -> Result<String, String> {
+) -> Result<String, CompileError> {
     let col_ref = format!("{alias}.\"{column}\"");
     match op {
         "_icontains" => {
             let Value::String(text) = rhs else {
-                return Err("_icontains requires a string".into());
+                return Err(CompileError::BadRequest(
+                    "_icontains requires a string".into(),
+                ));
             };
             // Use an explicit escape character on both dialects. The operand
             // stays a bind parameter; user text never becomes SQL or a wildcard.
@@ -416,7 +423,7 @@ fn compile_client_op(
         }
         "_like" | "_ilike" => {
             let Value::String(pattern) = rhs else {
-                return Err(format!("{op} requires a string"));
+                return Err(CompileError::BadRequest(format!("{op} requires a string")));
             };
             compile_text_pattern(inner.dialect, &col_ref, pattern, '\\', op == "_like", binds)
         }
@@ -430,7 +437,7 @@ fn compile_client_op(
         }
         "_in" | "_nin" => {
             let Value::List(items) = rhs else {
-                return Err(format!("{op} requires a list"));
+                return Err(CompileError::BadRequest(format!("{op} requires a list")));
             };
             if items.is_empty() {
                 return Ok(if op == "_in" {
@@ -440,11 +447,11 @@ fn compile_client_op(
                 });
             }
             if items.len() > inner.max_in_list {
-                return Err(format!(
+                return Err(CompileError::ListTooLong(format!(
                     "{op} list length {} exceeds max_in_list {}",
                     items.len(),
                     inner.max_in_list
-                ));
+                )));
             }
             let mut phs = Vec::new();
             for item in items {
@@ -478,7 +485,11 @@ fn compile_client_op(
                     require_postgres_json_op(inner.dialect, "_has_key")?;
                     "?"
                 }
-                _ => return Err(format!("unknown comparison op `{other}`")),
+                _ => {
+                    return Err(CompileError::InvalidFilter(format!(
+                        "unknown comparison op `{other}`"
+                    )))
+                }
             };
             let ph = comparand(inner.dialect, value_to_bind(rhs, column_type)?, binds);
             let cast_ph = cast_placeholder(inner.dialect, column_type, &ph);
@@ -495,14 +506,13 @@ fn compile_client_op(
 }
 
 /// Postgres jsonb operators are not emitted on SQLite (would confuse the driver
-/// and risk opaque execute errors). Message must stay free of SQL fragments so
-/// [`super::schema::sanitize_compile_error`] maps to a stable client code.
-fn require_postgres_json_op(dialect: SqlDialect, op: &str) -> Result<(), String> {
+/// and risk opaque execute errors).
+fn require_postgres_json_op(dialect: SqlDialect, op: &str) -> Result<(), CompileError> {
     match dialect {
         SqlDialect::Postgres => Ok(()),
-        SqlDialect::Sqlite => Err(format!(
-            "unknown comparison op `{op}` is not supported on sqlite"
-        )),
+        SqlDialect::Sqlite => Err(CompileError::InvalidFilter(format!(
+            "comparison op `{op}` is not supported on sqlite"
+        ))),
     }
 }
 
@@ -514,7 +524,7 @@ fn compile_text_pattern(
     escape: char,
     case_sensitive: bool,
     binds: &mut Vec<BindValue>,
-) -> Result<String, String> {
+) -> Result<String, CompileError> {
     let ph = placeholder(dialect, binds.len() + 1);
     let (sql, bind) = text_pattern(dialect, col_ref, &ph, pattern, escape, case_sensitive)?;
     binds.push(BindValue::Text(bind));

@@ -3,9 +3,10 @@ use crate::table::{RelationshipDef, RelationshipKind};
 use super::binds::BindValue;
 use super::evidence::QueryEvidenceNode;
 use super::projection::{
-    compile_aggregate, compile_object_projection, compile_page, SelectionNode,
+    compile_aggregate, compile_object_projection, compile_page, Rows, SelectionNode,
 };
 use super::scan::ModelScan;
+use super::CompileError;
 
 /// `<rel>_aggregate { aggregate { count } nodes { … } }` under `source`'s row.
 pub(super) fn compile_relationship_aggregate_subquery(
@@ -18,9 +19,11 @@ pub(super) fn compile_relationship_aggregate_subquery(
     tables: &mut Vec<String>,
     path_prefix: &str,
     depth: usize,
-) -> Result<(String, QueryEvidenceNode), String> {
+) -> Result<(String, QueryEvidenceNode, Rows), CompileError> {
     if matches!(rel.kind, RelationshipKind::BelongsTo) {
-        return Err("belongs_to aggregate is not supported".into());
+        return Err(CompileError::BadRequest(
+            "belongs_to aggregate is not supported".into(),
+        ));
     }
     let alias = format!("ta{depth}");
     let (target, link) =
@@ -50,11 +53,11 @@ pub(super) fn compile_relationship_subquery(
     tables: &mut Vec<String>,
     path_prefix: &str,
     depth: usize,
-) -> Result<(String, QueryEvidenceNode), String> {
+) -> Result<(String, QueryEvidenceNode, Rows), CompileError> {
     let alias = format!("t{depth}");
     let (target, link) = source.related(rel, source_alias, &alias, &format!("j{depth}"), tables)?;
     if matches!(rel.kind, RelationshipKind::BelongsTo) {
-        let (projection, evidence) = compile_object_projection(
+        let (projection, evidence, nested) = compile_object_projection(
             target,
             selection,
             &alias,
@@ -75,9 +78,10 @@ pub(super) fn compile_relationship_subquery(
         return Ok((
             format!("(SELECT {projection} {rows} LIMIT 1)"),
             QueryEvidenceNode::Object(evidence),
+            Rows::one(nested),
         ));
     }
-    let (page, evidence) = compile_page(
+    let (page, evidence, rows) = compile_page(
         target,
         selection,
         &selection.args,
@@ -92,5 +96,6 @@ pub(super) fn compile_relationship_subquery(
     Ok((
         format!("({page})"),
         QueryEvidenceNode::List(Box::new(QueryEvidenceNode::Object(evidence))),
+        rows,
     ))
 }

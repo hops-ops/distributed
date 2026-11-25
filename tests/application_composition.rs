@@ -8,8 +8,8 @@ use distributed::application::{
 };
 use distributed::command::{typed_command, CommandConsistency, Succeeded};
 use distributed::graphql::{
-    build_surface, col, prune_client_manifest, read, surface_for_application_contract,
-    surface_for_role, ClientCommandPureReduce, ClientProjectionArm, ClientProjectionEventRef,
+    build_surface, col, prune_client_manifest, read, surface_for_application, surface_for_role,
+    ClientCommandPureReduce, ClientProjectionArm, ClientProjectionEventRef,
     ClientProjectionFallback, ClientProjectionMutationKind, ClientProjectionOperation,
     ClientProjectionPartition, ClientProjectionProgram, ClientSurfaceIdentity,
     CommandProjectionArmRef, CommandProjectionExtension, CommandProjectionPreviewOccurrence,
@@ -345,7 +345,7 @@ fn selected_surface() -> Surface {
                 .rows(col("status").eq("open")),
         )]),
     )]);
-    surface_for_application_contract(&full, "web", &["user".into()], &["user".into()], &grants)
+    surface_for_application(&full, "web", &["user".into()], &["user".into()], &grants)
         .expect("role/application-selected Surface should compile")
 }
 
@@ -356,7 +356,7 @@ fn explicit_module_commands_filter_allowed_and_forbidden_role_application_invent
     let role = surface_for_role(&catalog, "user", &user_grants).unwrap();
     assert_eq!(command_names(&role), vec!["todo.allowed"]);
 
-    let application = surface_for_application_contract(
+    let application = surface_for_application(
         &catalog,
         "web",
         &["admin".into(), "user".into()],
@@ -401,7 +401,7 @@ fn role_and_application_command_closure_rejects_missing_unauthorized_and_tampere
     let module = command_module();
     let catalog = command_catalog();
     let user_grants = grants_for("user");
-    let selected = surface_for_application_contract(
+    let selected = surface_for_application(
         &catalog,
         "web",
         &["admin".into(), "user".into()],
@@ -431,7 +431,7 @@ fn role_and_application_command_closure_rejects_missing_unauthorized_and_tampere
         .expect_err("tampered selected command must fail closed");
     assert!(error.to_string().contains("not compatible"));
 
-    let admin = surface_for_application_contract(
+    let admin = surface_for_application(
         &catalog,
         "admin-web",
         &["admin".into()],
@@ -877,8 +877,7 @@ fn contract_export_prunes_unselected_read_models() {
         ]),
     )]);
     let selected =
-        surface_for_application_contract(&full, "web", &["user".into()], &["user".into()], &grants)
-            .unwrap();
+        surface_for_application(&full, "web", &["user".into()], &["user".into()], &grants).unwrap();
     let export = DistributedClientSurfaceExport::from_contract("todo-app", selected).unwrap();
     let todos_only = prune_client_manifest(export.manifest().unwrap(), ["TodoView"]).unwrap();
     assert!(todos_only
@@ -912,14 +911,9 @@ fn prune_drops_unselected_command_optimism_and_causal_slots() {
         ]),
     )]);
     let catalog = full.with_module(&command_module()).unwrap();
-    let selected = surface_for_application_contract(
-        &catalog,
-        "web",
-        &["user".into()],
-        &["user".into()],
-        &grants,
-    )
-    .unwrap();
+    let selected =
+        surface_for_application(&catalog, "web", &["user".into()], &["user".into()], &grants)
+            .unwrap();
     let export = DistributedClientSurfaceExport::from_contract("todo-app", selected).unwrap();
     let mut manifest = export.manifest().unwrap();
     attach_todo_and_chat_command_optimism(&mut manifest);

@@ -90,7 +90,7 @@ struct QueryEvidenceExtraction {
 
 impl QueryEvidencePlan {
     pub(super) fn new(root_response_key: String, root: QueryEvidenceNode) -> Result<Self, String> {
-        validate_response_key(&root_response_key)?;
+        validate_response_key(&root_response_key).map_err(|e| e.to_string())?;
         let mut size = QueryEvidencePlanSize::default();
         root.validate(&mut size)?;
         Ok(Self {
@@ -173,8 +173,8 @@ impl QueryEvidenceNode {
 
                 let mut response_keys = std::collections::BTreeSet::new();
                 for field in &object.fields {
-                    validate_response_key(&field.storage_key)?;
-                    validate_response_key(&field.response_key)?;
+                    validate_response_key(&field.storage_key).map_err(|e| e.to_string())?;
+                    validate_response_key(&field.response_key).map_err(|e| e.to_string())?;
                     if !response_keys.insert(field.response_key.as_str()) {
                         return Err(format!(
                             "query causal-evidence object repeats response key `{}`",
@@ -646,13 +646,11 @@ mod query_evidence_tests {
             relationships: Vec::new(),
             kind: TableKind::ReadModel,
         };
-        let mut binds = Vec::new();
         let mut bytes_paths = Vec::new();
         let (pairs, record) = record_identity_projection(
             SqlDialect::Sqlite,
             &schema,
             "t7",
-            &mut binds,
             &mut bytes_paths,
             "childrenAlias",
         )
@@ -671,15 +669,9 @@ mod query_evidence_tests {
         assert!(sql.contains(QUERY_EVIDENCE_HIDDEN_PREFIX), "{sql}");
         assert!(!sql.contains("'visible'"), "{sql}");
 
-        let (postgres_pairs, _) = record_identity_projection(
-            SqlDialect::Postgres,
-            &schema,
-            "t7",
-            &mut Vec::new(),
-            &mut Vec::new(),
-            "",
-        )
-        .unwrap();
+        let (postgres_pairs, _) =
+            record_identity_projection(SqlDialect::Postgres, &schema, "t7", &mut Vec::new(), "")
+                .unwrap();
         assert_eq!(postgres_pairs[0].1, "t7.\"sequence_id\"");
         assert!(
             postgres_pairs[1].1.contains("replace(encode(")

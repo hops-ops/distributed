@@ -480,33 +480,6 @@ pub(in crate::graphql::surface) fn validate_surface_filter(
     Ok(())
 }
 
-/// Build an explicit named application surface as the structural intersection
-/// of its declared schema roles, with a separate eligible opener set.
-///
-/// A missing role declaration is an error rather than an accidental empty or
-/// admin surface. Commands must be granted to every schema role. Differing row
-/// predicates are all enforced (their conjunction) and exported as
-/// `ServerOnly`, so the client revalidates membership without learning another
-/// role's policy.
-///
-/// Prefer [`surface_for_application_contract`] when eligible principals are a
-/// superset of the schema privilege set (portable multi-role principals).
-pub fn surface_for_application(
-    surface: &Surface,
-    application: &str,
-    eligible_roles: &[String],
-    schema_roles: &[String],
-    grants_by_role: &BTreeMap<String, BTreeMap<String, ReadPermission>>,
-) -> Result<Surface, String> {
-    surface_for_application_contract(
-        surface,
-        application,
-        eligible_roles,
-        schema_roles,
-        grants_by_role,
-    )
-}
-
 /// Build an application surface with distinct **eligible** and **schema** roles.
 ///
 /// - `eligible_roles`: protocol identity — who may open this client contract
@@ -517,7 +490,13 @@ pub fn surface_for_application(
 ///
 /// Example: eligible `{admin,user}` + schema `{user}` keeps owner-portable
 /// optimism while multi-role admin principals may open the surface.
-pub fn surface_for_application_contract(
+///
+/// A missing role declaration is an error rather than an accidental empty or
+/// admin surface. Commands must be granted to every schema role. Differing row
+/// predicates are all enforced (their conjunction) and exported as
+/// `ServerOnly`, so the client revalidates membership without learning another
+/// role's policy.
+pub fn surface_for_application(
     surface: &Surface,
     application: &str,
     eligible_roles: &[String],

@@ -237,7 +237,7 @@
   "protocol": {
     "operation": "sha256:9b2ba78faeaad3b384d74519aff78252c2f7f0305db1ac0dda9833ba25af58e5",
     "protocolHash": "sha256:0dfa8a3f49e17d8d99c5c095c1ed14f528cae3e55fbc2f2b852975a50936ec5b",
-    "schemaHash": "sha256:abffec6f97f863711fa415bc7f913369ec634ad19ddb680735b520f5064a00f2",
+    "schemaHash": "sha256:63964e9d521d18982b4653331f5967d1066abf09792d2c49c0aab177cd7de4fd",
     "surface": {
       "kind": "role",
       "name": "user"

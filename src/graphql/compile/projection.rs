@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use async_graphql::Value;
 use serde_json::Value as JsonValue;
@@ -18,10 +19,12 @@ use super::evidence::{
 };
 use super::relationship::{compile_relationship_aggregate_subquery, compile_relationship_subquery};
 use super::scan::{value_as_u64, ModelScan, ScanLink};
+use super::CompileError;
 
 #[derive(Clone, Debug)]
 pub struct SqlPlan {
-    pub sql: String,
+    /// Shared with every execution, so running the plan copies no SQL.
+    pub sql: Arc<str>,
     pub binds: Vec<BindValue>,
     /// JSON paths (dot-separated response keys) that need hex→base64 rewrite (SQLite Bytes).
     pub bytes_hex_paths: Vec<String>,
@@ -44,6 +47,26 @@ impl SqlPlan {
     ) -> Result<ExtractedQueryEvidence, String> {
         self.evidence.extract_and_strip(value)
     }
+
+    /// What makes two executions comparable snapshots of one query: the same
+    /// statement over the same binds and tables.
+    pub(crate) fn snapshot_scope(&self) -> impl serde::Serialize + '_ {
+        #[derive(serde::Serialize)]
+        struct QueryPlanInstance<'a> {
+            domain: &'static str,
+            version: u32,
+            sql: &'a str,
+            binds: &'a [BindValue],
+            tables: &'a [String],
+        }
+        QueryPlanInstance {
+            domain: "distributed.graphql.query-plan-instance",
+            version: 1,
+            sql: &self.sql,
+            binds: &self.binds,
+            tables: &self.tables_touched,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -59,7 +82,9 @@ type RecordEvidenceProjection = (Vec<(String, String)>, Option<QueryEvidenceReco
 /// Compiled GraphQL read: SQL scan or cell GET-by-pk.
 #[derive(Clone, Debug)]
 pub enum QueryPlan {
-    Sql(SqlPlan),
+    /// Shared: a live query re-executes, and gateway delivery hands on, the
+    /// same plan without copying its SQL and binds.
+    Sql(Arc<SqlPlan>),
     CellByKey {
         model: String,
         pk: BTreeMap<String, String>,
@@ -76,16 +101,16 @@ pub fn compile_query(
     model_name: &str,
     kind: RootKind,
     selection: &SelectionNode,
-) -> Result<QueryPlan, String> {
+) -> Result<QueryPlan, CompileError> {
     let store = inner
         .read_stores
         .get(model_name)
         .copied()
         .unwrap_or(crate::graphql::read_store::ReadStoreKind::SqlScan);
     match store {
-        crate::graphql::read_store::ReadStoreKind::SqlScan => Ok(QueryPlan::Sql(compile_root(
-            inner, session, role, model_name, kind, selection,
-        )?)),
+        crate::graphql::read_store::ReadStoreKind::SqlScan => Ok(QueryPlan::Sql(Arc::new(
+            compile_root(inner, session, role, model_name, kind, selection)?,
+        ))),
         crate::graphql::read_store::ReadStoreKind::CellByKey => {
             compile_cell_by_key(inner, session, role, model_name, kind, selection)
         }
@@ -99,29 +124,28 @@ fn compile_cell_by_key(
     model_name: &str,
     kind: RootKind,
     selection: &SelectionNode,
-) -> Result<QueryPlan, String> {
+) -> Result<QueryPlan, CompileError> {
+    let unsupported = |detail: &str| Err(CompileError::UnsupportedOnCellStore(detail.into()));
     let scan = ModelScan::open(inner, session, role, model_name)?;
     let schema = scan.schema;
     match kind {
         RootKind::List => {
-            return Err(
-                "cell-by-key store does not support list queries (would fan out to N cells); declare a SQL index read model"
-                    .into(),
+            return unsupported(
+                "cell-by-key store does not support list queries (would fan out to N cells); declare a SQL index read model",
             );
         }
         RootKind::Aggregate => {
-            return Err(
-                "cell-by-key store does not support aggregate queries; declare a SQL index read model"
-                    .into(),
+            return unsupported(
+                "cell-by-key store does not support aggregate queries; declare a SQL index read model",
             );
         }
         RootKind::ByPk => {}
     }
     if selection.args.contains_key("where") {
-        return Err("cell-by-key store does not support filter".into());
+        return unsupported("cell-by-key store does not support filter");
     }
     if selection.args.contains_key("order_by") {
-        return Err("cell-by-key store does not support sort".into());
+        return unsupported("cell-by-key store does not support sort");
     }
     for child in &selection.children {
         let is_join = schema.relationships.iter().any(|rel| {
@@ -129,18 +153,17 @@ fn compile_cell_by_key(
                 || child.field_name == format!("{}_aggregate", rel.field_name)
         });
         if is_join {
-            return Err(
-                "cell-by-key store does not support SQL joins; declare a SQL index read model"
-                    .into(),
+            return unsupported(
+                "cell-by-key store does not support SQL joins; declare a SQL index read model",
             );
         }
         // The cell resolver returns stored fields by name: nothing else
         // stands between a selection and an ungranted column.
         if child.field_name != "__typename" && !scan.allows_column(&child.field_name) {
-            return Err(format!(
-                "internal: selection reached ungranted field `{}` on `{model_name}`",
+            return Err(CompileError::internal(format!(
+                "selection reached ungranted field `{}` on `{model_name}`",
                 child.field_name
-            ));
+            )));
         }
     }
     let row_filter = scan
@@ -159,9 +182,9 @@ fn compile_cell_by_key(
             Value::String(s) => s.clone(),
             Value::Number(n) => n.to_string(),
             other => {
-                return Err(format!(
+                return Err(CompileError::UnsupportedOnCellStore(format!(
                     "cell-by-key primary key `{column}` must be a scalar, got {other:?}"
-                ));
+                )));
             }
         };
         pk.insert(column.clone(), key);
@@ -179,7 +202,7 @@ fn resolve_cell_row_filter(
     schema: &TableSchema,
     session: &Session,
     filter: &FilterExpr,
-) -> Result<FilterExpr, String> {
+) -> Result<FilterExpr, CompileError> {
     Ok(match filter {
         FilterExpr::And(items) => FilterExpr::And(
             items
@@ -215,9 +238,9 @@ fn resolve_cell_row_filter(
                         ColumnType::Integer | ColumnType::UnsignedInteger | ColumnType::Float
                     ) => {}
                 _ => {
-                    return Err(format!(
+                    return Err(CompileError::UnsupportedOnCellStore(format!(
                         "cell-by-key row policy operator `{op:?}` is unsupported for column `{column}`"
-                    ));
+                    )));
                 }
             }
             FilterExpr::Cmp {
@@ -241,9 +264,9 @@ fn resolve_cell_row_filter(
                     | ColumnType::UnsignedInteger
                     | ColumnType::Float
             ) {
-                return Err(format!(
+                return Err(CompileError::UnsupportedOnCellStore(format!(
                     "cell-by-key row policy IN is unsupported for column `{column}`"
-                ));
+                )));
             }
             FilterExpr::In {
                 column: column.clone(),
@@ -262,9 +285,9 @@ fn resolve_cell_row_filter(
             }
         }
         FilterExpr::Rel { field, .. } => {
-            return Err(format!(
+            return Err(CompileError::UnsupportedOnCellStore(format!(
                 "cell-by-key row policy cannot traverse relationship `{field}`"
-            ));
+            )));
         }
     })
 }
@@ -284,21 +307,23 @@ fn resolve_cell_operand(
     operand: &Operand,
     session: &Session,
     column_type: &ColumnType,
-) -> Result<Operand, String> {
+) -> Result<Operand, CompileError> {
     let literal = match operand_to_bind(operand, session, column_type)? {
         BindValue::Null => LitValue::Null,
         BindValue::Bool(value) => LitValue::Bool(value),
         BindValue::I64(value) => LitValue::I64(value),
         BindValue::F64(value) if value.is_finite() => LitValue::F64(value),
         BindValue::F64(value) => {
-            return Err(format!(
+            return Err(CompileError::UnsupportedOnCellStore(format!(
                 "cell-by-key row-policy float `{value}` must be finite"
-            ));
+            )));
         }
         BindValue::Text(value) => LitValue::String(value),
         BindValue::Json(value) => LitValue::Json(value),
         BindValue::Bytes(_) => {
-            return Err("cell-by-key row policies do not support byte operands".into());
+            return Err(CompileError::UnsupportedOnCellStore(
+                "cell-by-key row policies do not support byte operands".into(),
+            ));
         }
     };
     Ok(Operand::Lit(literal))
@@ -316,6 +341,9 @@ pub(crate) fn cell_row_matches(schema: &TableSchema, filter: &FilterExpr, row: &
 }
 
 /// Compile a root field selection into one SQL statement.
+///
+/// Refuses a statement that could produce more than `max_rows` rows: see
+/// [`Rows`] for how they are counted.
 pub fn compile_root(
     inner: &EngineInner,
     session: &Session,
@@ -323,17 +351,7 @@ pub fn compile_root(
     model_name: &str,
     kind: RootKind,
     selection: &SelectionNode,
-) -> Result<SqlPlan, String> {
-    // Relationship-aware complexity before SQL (covers query + subscription paths).
-    let cost =
-        super::super::complexity::estimate_root_complexity(inner, model_name, kind, selection)?;
-    if super::super::complexity::exceeds_budget(cost, inner.max_complexity) {
-        return Err(format!(
-            "query too complex (estimated {cost}, max {})",
-            inner.max_complexity
-        ));
-    }
-
+) -> Result<SqlPlan, CompileError> {
     let scan = ModelScan::open(inner, session, role, model_name)?;
     let mut binds = Vec::new();
     let mut bytes_paths = Vec::new();
@@ -341,9 +359,9 @@ pub fn compile_root(
     let alias = "t0";
     let root = ScanLink::default();
 
-    let (sql, evidence_root) = match kind {
+    let (sql, evidence_root, rows) = match kind {
         RootKind::List => {
-            let (page, evidence) = compile_page(
+            let (page, evidence, rows) = compile_page(
                 scan,
                 selection,
                 &selection.args,
@@ -358,12 +376,13 @@ pub fn compile_root(
             (
                 page,
                 QueryEvidenceNode::List(Box::new(QueryEvidenceNode::Object(evidence))),
+                rows,
             )
         }
         RootKind::ByPk => {
             // Binds are positional: the projection's (nested LIMIT/OFFSET)
             // come first in the statement text, then the key, then the WHERE.
-            let (projection, evidence) = compile_object_projection(
+            let (projection, evidence, nested) = compile_object_projection(
                 scan,
                 selection,
                 alias,
@@ -384,7 +403,7 @@ pub fn compile_root(
                     .columns
                     .iter()
                     .find(|c| c.column_name == *pk)
-                    .ok_or_else(|| format!("pk column `{pk}` missing"))?;
+                    .ok_or_else(|| CompileError::internal(format!("pk column `{pk}` missing")))?;
                 binds.push(value_to_bind(value, &column.column_type)?);
                 let ph = placeholder(inner.dialect, binds.len());
                 key.push(format!("{alias}.\"{pk}\" = {ph}"));
@@ -404,10 +423,11 @@ pub fn compile_root(
             (
                 format!("SELECT {projection} {rows} LIMIT 1"),
                 QueryEvidenceNode::Object(evidence),
+                Rows::one(nested),
             )
         }
         RootKind::Aggregate => {
-            let (object, evidence) = compile_aggregate(
+            let (object, evidence, rows) = compile_aggregate(
                 scan,
                 selection,
                 alias,
@@ -418,18 +438,47 @@ pub fn compile_root(
                 "",
                 0,
             )?;
-            (format!("SELECT {object}"), evidence)
+            (format!("SELECT {object}"), evidence, rows)
         }
     };
-    let evidence = QueryEvidencePlan::new(selection.response_key.clone(), evidence_root)?;
+    if rows.0 > inner.max_rows {
+        return Err(CompileError::TooManyRows {
+            rows: rows.0,
+            max_rows: inner.max_rows,
+        });
+    }
+    let evidence = QueryEvidencePlan::new(selection.response_key.clone(), evidence_root)
+        .map_err(CompileError::Internal)?;
 
     Ok(SqlPlan {
-        sql,
+        sql: sql.into(),
         binds,
         bytes_hex_paths: bytes_paths,
         tables_touched: tables,
         evidence,
     })
+}
+
+/// The most model rows one evaluation of a compiled expression can produce:
+/// the query cost the engine bounds by `max_rows`, counted with
+/// [`row_cost`](crate::graphql::row_cost) from each list's resolved limit.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) struct Rows(u64);
+
+impl Rows {
+    /// A page of up to `limit` rows, each carrying `nested`.
+    fn page(limit: u64, nested: Rows) -> Rows {
+        Rows(crate::graphql::row_cost::page(limit, nested.0))
+    }
+
+    /// One row carrying `nested`.
+    pub(super) fn one(nested: Rows) -> Rows {
+        Rows(crate::graphql::row_cost::one(nested.0))
+    }
+
+    fn add(self, other: Rows) -> Rows {
+        Rows(self.0.saturating_add(other.0))
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -439,11 +488,13 @@ pub enum RootKind {
     Aggregate,
 }
 
-pub(super) fn validate_response_key(key: &str) -> Result<(), String> {
+pub(super) fn validate_response_key(key: &str) -> Result<(), CompileError> {
     if is_valid_graphql_name(key) {
         Ok(())
     } else {
-        Err(format!("invalid GraphQL response key `{key}`"))
+        Err(CompileError::InvalidResponseKey(format!(
+            "invalid GraphQL response key `{key}`"
+        )))
     }
 }
 
@@ -460,11 +511,11 @@ pub(super) fn compile_page(
     tables: &mut Vec<String>,
     path_prefix: &str,
     depth: usize,
-) -> Result<(String, QueryEvidenceObjectPlan), String> {
+) -> Result<(String, QueryEvidenceObjectPlan, Rows), CompileError> {
     let dialect = scan.inner.dialect;
     let ops = dialect.ops();
     let order_sql = scan.order_by(args.get("order_by"), alias)?;
-    let (projection, evidence) = compile_object_projection(
+    let (projection, evidence, nested) = compile_object_projection(
         scan,
         fields,
         alias,
@@ -475,8 +526,9 @@ pub(super) fn compile_page(
         depth,
     )?;
     let rows = scan.visible_rows(alias, link, args.get("where"), binds, tables, depth)?;
-    binds.push(BindValue::I64(scan.limit(args.get("limit")) as i64));
-    let limit = placeholder(dialect, binds.len());
+    let limit = scan.limit(args.get("limit"));
+    binds.push(BindValue::I64(i64::try_from(limit).unwrap_or(i64::MAX)));
+    let limit_ph = placeholder(dialect, binds.len());
     binds.push(BindValue::I64(
         args.get("offset").and_then(value_as_u64).unwrap_or(0) as i64,
     ));
@@ -487,10 +539,11 @@ pub(super) fn compile_page(
     };
     Ok((
         format!(
-            "SELECT coalesce({}({row}), {}) FROM (\n  SELECT {projection} AS r\n  {rows}\n  {order_sql}\n  LIMIT {limit} OFFSET {offset}\n) page",
+            "SELECT coalesce({}({row}), {}) FROM (\n  SELECT {projection} AS r\n  {rows}\n  {order_sql}\n  LIMIT {limit_ph} OFFSET {offset}\n) page",
             ops.json_agg, ops.empty_array
         ),
         evidence,
+        Rows::page(limit, nested),
     ))
 }
 
@@ -505,16 +558,17 @@ pub(super) fn compile_aggregate(
     tables: &mut Vec<String>,
     path_prefix: &str,
     depth: usize,
-) -> Result<(String, QueryEvidenceNode), String> {
+) -> Result<(String, QueryEvidenceNode, Rows), CompileError> {
     if !scan.aggregations() {
-        return Err(format!(
-            "internal: aggregate reached `{}` without an aggregations grant",
+        return Err(CompileError::internal(format!(
+            "aggregate reached `{}` without an aggregations grant",
             scan.schema.model_name
-        ));
+        )));
     }
     let dialect = scan.inner.dialect;
     let mut pairs = Vec::new();
     let mut evidence_fields = Vec::new();
+    let mut rows = Rows::default();
     for member in &selection.children {
         match member.field_name.as_str() {
             "__typename" => {}
@@ -540,9 +594,9 @@ pub(super) fn compile_aggregate(
                             ));
                         }
                         _ => {
-                            return Err(
+                            return Err(CompileError::BadRequest(
                                 "aggregate fields selection contains an unsupported member".into(),
-                            );
+                            ));
                         }
                     }
                 }
@@ -558,7 +612,7 @@ pub(super) fn compile_aggregate(
                 } else {
                     format!("{path_prefix}.{}", member.response_key)
                 };
-                let (page, evidence) = compile_page(
+                let (page, evidence, page_rows) = compile_page(
                     scan,
                     member,
                     &selection.args,
@@ -570,6 +624,7 @@ pub(super) fn compile_aggregate(
                     &nodes_path,
                     depth,
                 )?;
+                rows = rows.add(page_rows);
                 pairs.push((
                     member.response_key.clone(),
                     dialect.ops().nested_json(format!("({page})")),
@@ -583,7 +638,9 @@ pub(super) fn compile_aggregate(
                 });
             }
             _ => {
-                return Err("aggregate selection contains an unsupported member".into());
+                return Err(CompileError::BadRequest(
+                    "aggregate selection contains an unsupported member".into(),
+                ));
             }
         }
     }
@@ -593,11 +650,13 @@ pub(super) fn compile_aggregate(
             record: None,
             fields: evidence_fields,
         }),
+        rows,
     ))
 }
 
 /// The JSON object for one row of `scan`: its selected columns and nested
-/// relationships, plus the hidden identity the causal evidence needs.
+/// relationships, plus the hidden identity the causal evidence needs. Also
+/// returns the rows nested under that one row.
 pub(super) fn compile_object_projection(
     scan: ModelScan<'_>,
     selection: &SelectionNode,
@@ -607,14 +666,15 @@ pub(super) fn compile_object_projection(
     tables: &mut Vec<String>,
     path_prefix: &str,
     depth: usize,
-) -> Result<(String, QueryEvidenceObjectPlan), String> {
+) -> Result<(String, QueryEvidenceObjectPlan, Rows), CompileError> {
     let (inner, schema) = (scan.inner, scan.schema);
     if depth > inner.max_depth {
-        return Err("max depth exceeded".into());
+        return Err(CompileError::TooDeep);
     }
     let (mut pairs, record) =
-        compile_record_evidence_projection(scan, alias, binds, bytes_paths, path_prefix)?;
+        compile_record_evidence_projection(scan, alias, bytes_paths, path_prefix)?;
     let mut evidence_fields = Vec::new();
+    let mut nested = Rows::default();
     let path = |response_key: &str| {
         if path_prefix.is_empty() {
             response_key.to_string()
@@ -624,10 +684,9 @@ pub(super) fn compile_object_projection(
     };
     let column_pair = |column: &crate::table::TableColumn,
                        response_key: &str,
-                       binds: &mut Vec<BindValue>,
                        bytes_paths: &mut Vec<String>|
-     -> Result<(String, String), String> {
-        let expr = column_json_expr(inner.dialect, alias, column, binds)?;
+     -> Result<(String, String), CompileError> {
+        let expr = column_json_expr(inner.dialect, alias, column);
         if matches!(column.column_type, ColumnType::Bytes)
             && matches!(inner.dialect, SqlDialect::Sqlite)
         {
@@ -641,12 +700,7 @@ pub(super) fn compile_object_projection(
     if selection.children.is_empty() {
         for column in schema.columns.iter().filter(|c| !c.skipped) {
             if scan.allows_column(&column.column_name) {
-                pairs.push(column_pair(
-                    column,
-                    &column.column_name,
-                    binds,
-                    bytes_paths,
-                )?);
+                pairs.push(column_pair(column, &column.column_name, bytes_paths)?);
             }
         }
     }
@@ -661,21 +715,16 @@ pub(super) fn compile_object_projection(
         {
             // The per-privilege schema never offers an ungranted column.
             if !scan.allows_column(&column.column_name) {
-                return Err(format!(
-                    "internal: selection reached ungranted column `{}` on `{}`",
+                return Err(CompileError::internal(format!(
+                    "selection reached ungranted column `{}` on `{}`",
                     column.column_name, schema.model_name
-                ));
+                )));
             }
-            pairs.push(column_pair(
-                column,
-                &child.response_key,
-                binds,
-                bytes_paths,
-            )?);
+            pairs.push(column_pair(column, &child.response_key, bytes_paths)?);
             continue;
         }
         let relationship = |name: &str| schema.relationships.iter().find(|r| r.field_name == name);
-        let (sub, evidence) = if let Some(rel) = relationship(&child.field_name) {
+        let (sub, evidence, rows) = if let Some(rel) = relationship(&child.field_name) {
             compile_relationship_subquery(
                 scan,
                 alias,
@@ -704,12 +753,13 @@ pub(super) fn compile_object_projection(
                 depth + 1,
             )?
         } else {
-            return Err(format!(
-                "internal: selection reached unknown field `{}` on `{}`",
+            return Err(CompileError::internal(format!(
+                "selection reached unknown field `{}` on `{}`",
                 child.field_name, schema.model_name
-            ));
+            )));
         };
         validate_response_key(&child.response_key)?;
+        nested = nested.add(rows);
         pairs.push((
             child.response_key.clone(),
             inner.dialect.ops().nested_json(sub),
@@ -727,31 +777,33 @@ pub(super) fn compile_object_projection(
             record,
             fields: evidence_fields,
         },
+        nested,
     ))
 }
 
 pub(super) fn compile_record_evidence_projection(
     scan: ModelScan<'_>,
     alias: &str,
-    binds: &mut Vec<BindValue>,
     bytes_paths: &mut Vec<String>,
     path_prefix: &str,
-) -> Result<RecordEvidenceProjection, String> {
+) -> Result<RecordEvidenceProjection, CompileError> {
+    // Evidence is read only by the causal protocol: without it, the hidden
+    // identity columns would be selected only to be stripped again.
     // Embedded client models deliberately have no stable normalized identity.
     // Do not manufacture per-record evidence that the client cannot address;
     // table/projector dependencies still flow through `tables_touched` and
     // produce conservative index evidence.
-    if !scan.has_client_normalized_identity() {
+    if scan.inner.protocol.is_none() || !scan.has_client_normalized_identity() {
         return Ok((Vec::new(), None));
     }
     record_identity_projection(
         scan.inner.dialect,
         scan.schema,
         alias,
-        binds,
         bytes_paths,
         path_prefix,
     )
+    .map_err(CompileError::Internal)
 }
 
 /// The hidden primary-key copy that names one row in causal evidence.
@@ -759,7 +811,6 @@ pub(super) fn record_identity_projection(
     dialect: SqlDialect,
     schema: &TableSchema,
     alias: &str,
-    binds: &mut Vec<BindValue>,
     bytes_paths: &mut Vec<String>,
     path_prefix: &str,
 ) -> Result<RecordEvidenceProjection, String> {
@@ -798,7 +849,7 @@ pub(super) fn record_identity_projection(
                 "replace(encode({alias}.\"{}\", 'base64'), E'\\n', '')",
                 column.column_name
             ),
-            _ => column_json_expr(dialect, alias, column, binds)?,
+            _ => column_json_expr(dialect, alias, column),
         };
         if matches!(column.column_type, ColumnType::Bytes) && matches!(dialect, SqlDialect::Sqlite)
         {
@@ -828,10 +879,9 @@ pub(super) fn column_json_expr(
     dialect: SqlDialect,
     alias: &str,
     col: &crate::table::TableColumn,
-    _binds: &mut Vec<BindValue>,
-) -> Result<String, String> {
+) -> String {
     let q = format!("{alias}.\"{}\"", col.column_name);
-    Ok(match (&col.column_type, dialect) {
+    match (&col.column_type, dialect) {
         (ColumnType::Timestamp, SqlDialect::Postgres) => format!("{q}::text"),
         (ColumnType::Bytes, SqlDialect::Postgres) => format!("encode({q}, 'base64')"),
         (ColumnType::Bytes, SqlDialect::Sqlite) => format!("hex({q})"),
@@ -839,7 +889,7 @@ pub(super) fn column_json_expr(
         // so the enclosing object embeds it as JSON, not as a string.
         (ColumnType::Json, SqlDialect::Sqlite) => format!("json({q})"),
         _ => q,
-    })
+    }
 }
 
 pub(super) fn chunked_json_object(dialect: SqlDialect, pairs: &[(String, String)]) -> String {

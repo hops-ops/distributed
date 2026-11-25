@@ -10,24 +10,32 @@ use std::{
 };
 
 const MAX_TABLES: usize = 128;
-// The cached envelope includes projection evidence as well as model data.
-// Version all persisted evidence dependencies, including no-op/empty commits.
-const PROOF_TABLES: &[&str] = &[
-    "projection_partitions",
-    "projection_generations",
-    "projection_source_capabilities",
-    "projection_input_identities",
-    "projection_input_cursors",
-    "projection_input_receipts",
-    "projection_table_ownership_fences",
-    "projection_causal_tables",
-    "projection_registered_models",
-    "projection_model_ownership",
-    "projection_records",
-    "projection_observations",
-    "projection_failures",
-    "projection_changes",
-];
+// The cached envelope includes projection evidence as well as model data, so
+// every persisted evidence dependency is versioned, no-op commits included.
+use crate::projection_protocol::PROOF_TABLES;
+
+/// Why dependency versions could not be read.
+#[derive(Debug)]
+pub(crate) enum VersionError {
+    /// The store does not version every table the query reads, or a trigger
+    /// is missing or disabled: the query is not cacheable.
+    Uncovered(&'static str),
+    /// The database could not answer: try again later.
+    Storage(String),
+}
+
+impl std::fmt::Display for VersionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Uncovered(reason) => f.write_str(reason),
+            Self::Storage(detail) => write!(f, "dependency version read failed: {detail}"),
+        }
+    }
+}
+
+fn storage(error: impl std::fmt::Display) -> VersionError {
+    VersionError::Storage(error.to_string())
+}
 
 /// Installed transactional dependency coverage for one origin database. Create
 /// after application migrations, before enabling gateway caching. Every covered
@@ -198,11 +206,12 @@ impl GatewayVersionStore {
         Ok(store)
     }
     fn install_sql(&self, epoch: &str, postgres: bool) -> Vec<String> {
-        let mut sql =
-            vec![
-                include_str!("../../../migrations/postgres/0006_gateway_dependency_versions.sql")
-                    .to_owned(),
-            ];
+        let migration = if postgres {
+            include_str!("../../../migrations/postgres/0006_gateway_dependency_versions.sql")
+        } else {
+            include_str!("../../../migrations/sqlite/0006_gateway_dependency_versions.sql")
+        };
+        let mut sql = vec![migration.to_owned()];
         for table in self.tables.union(&self.proof_tables) {
             let ns = literal(&self.namespace);
             let table_literal = literal(table);
@@ -252,29 +261,37 @@ impl GatewayVersionStore {
         &self,
         pool: &GraphqlPool,
         tables: &[String],
-    ) -> Result<VersionVector, String> {
+    ) -> Result<VersionVector, VersionError> {
+        #[cfg(any(feature = "sqlite", feature = "postgres"))]
+        use crate::sqlx_repo::repo::SqlxRepoBackend;
         match pool {
             #[cfg(feature = "sqlite")]
             GraphqlPool::Sqlite(pool) => {
-                let mut tx = pool.begin().await.map_err(|e| e.to_string())?;
+                let mut tx = pool
+                    .begin_with(sqlx::Sqlite::BEGIN_READ_SNAPSHOT)
+                    .await
+                    .map_err(storage)?;
                 let result = self.sqlite(&mut tx, tables).await?;
-                tx.commit().await.map_err(|e| e.to_string())?;
+                tx.commit().await.map_err(storage)?;
                 Ok(result)
             }
             #[cfg(feature = "postgres")]
             GraphqlPool::Postgres(pool) => {
-                let mut tx = pool.begin().await.map_err(|e| e.to_string())?;
-                sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
-                    .execute(&mut *tx)
+                let mut tx = pool
+                    .begin_with(sqlx::Postgres::BEGIN_READ_SNAPSHOT)
                     .await
-                    .map_err(|e| e.to_string())?;
-                super::super::execute::ensure_primary_backend(&mut tx, true).await?;
+                    .map_err(storage)?;
+                super::super::execute::ensure_primary_backend(&mut tx, true)
+                    .await
+                    .map_err(VersionError::Storage)?;
                 let result = self.postgres(&mut tx, tables).await?;
-                tx.commit().await.map_err(|e| e.to_string())?;
+                tx.commit().await.map_err(storage)?;
                 Ok(result)
             }
             #[allow(unreachable_patterns)]
-            _ => Err("dependency versions require a SQL adapter".into()),
+            _ => Err(VersionError::Uncovered(
+                "dependency versions require a SQL adapter",
+            )),
         }
     }
     /// Activate a new explicit epoch after a rebuild or writer-coverage change.
@@ -313,18 +330,18 @@ impl GatewayVersionStore {
 macro_rules! version_reader {
     ($method:ident, $connection:ty, $coverage:expr) => {
         impl GatewayVersionStore {
-            pub(crate) async fn $method(&self, connection: &mut $connection, tables: &[String]) -> Result<VersionVector, String> {
-                if !self.covers(tables) { return Err("query dependency coverage is incomplete".into()); }
+            pub(crate) async fn $method(&self, connection: &mut $connection, tables: &[String]) -> Result<VersionVector, VersionError> {
+                if !self.covers(tables) { return Err(VersionError::Uncovered("query dependency coverage is incomplete")); }
                 let selected: BTreeSet<_> = tables.iter().chain(self.proof_tables.iter()).collect();
                 let queries = selected.iter().map(|table| {
                     let coverage_sql: String = ($coverage)(self, table);
                     format!("SELECT table_name, epoch, version, ({coverage_sql}) AS covered FROM distributed_gateway_versions WHERE namespace={} AND table_name={}",literal(&self.namespace),literal(table))
                 }).collect::<Vec<_>>().join(" UNION ALL ");
-                let rows: Vec<(String,String,i64,i64)> = sqlx::query_as(sqlx::AssertSqlSafe(queries)).fetch_all(&mut *connection).await.map_err(|e| e.to_string())?;
-                if rows.len() != selected.len() { return Err("dependency version coverage is unavailable".into()); }
+                let rows: Vec<(String,String,i64,i64)> = sqlx::query_as(sqlx::AssertSqlSafe(queries)).fetch_all(&mut *connection).await.map_err(storage)?;
+                if rows.len() != selected.len() { return Err(VersionError::Uncovered("dependency version coverage is unavailable")); }
                 let mut result = BTreeMap::new();
                 for (table, epoch, version, covered) in rows {
-                    if covered != 1 || version < 0 { return Err("dependency invalidation coverage is unavailable".into()); }
+                    if covered != 1 || version < 0 { return Err(VersionError::Uncovered("dependency invalidation coverage is unavailable")); }
                     result.insert(table, DependencyVersion { epoch, version: version.to_string() });
                 }
                 Ok(result)
