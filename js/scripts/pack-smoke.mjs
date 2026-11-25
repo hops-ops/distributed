@@ -604,6 +604,7 @@ assert.deepEqual(Object.keys(sveltekitSurface).sort(), [
   'sessionClaim',
   'sessionSourceFromPageData',
   'useDistributedLeaderboard',
+  'useDistributedLiveConnection',
   'useDistributedSvelteKitClient',
   'useDistributedSvelteKitCommands',
   'validateDistributedReloadLocation',
