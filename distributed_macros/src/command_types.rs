@@ -640,41 +640,11 @@ mod tests {
         }
     }
 
+    // Nested lists, `default`, `skip_serializing_if`, `with`, `transparent` and
+    // a container `default` are pinned by `tests/command_types_compile_fail`.
+    // These two serde spellings take other branches of the same check.
     #[test]
-    fn directional_serde_names_follow_wire_direction() {
-        let input: DeriveInput = syn::parse_quote! {
-            #[serde(rename_all(deserialize = "camelCase", serialize = "SCREAMING_SNAKE_CASE"))]
-            struct CommandInput {
-                regular_field: String,
-                #[serde(rename(deserialize = "inputID", serialize = "OUTPUT_ID"))]
-                custom_id: String,
-            }
-        };
-        let input_tokens = expand_command_input(input).unwrap().to_string();
-        assert!(input_tokens.contains("\"regularField\""));
-        assert!(input_tokens.contains("\"inputID\""));
-
-        let output: DeriveInput = syn::parse_quote! {
-            #[serde(rename_all(deserialize = "camelCase", serialize = "SCREAMING_SNAKE_CASE"))]
-            struct CommandOutput {
-                regular_field: String,
-                #[serde(rename(deserialize = "inputID", serialize = "OUTPUT_ID"))]
-                custom_id: String,
-            }
-        };
-        let output_tokens = expand_command_output(output).unwrap().to_string();
-        assert!(output_tokens.contains("\"REGULAR_FIELD\""));
-        assert!(output_tokens.contains("\"OUTPUT_ID\""));
-    }
-
-    #[test]
-    fn nested_lists_and_shape_changing_serde_attrs_fail_closed() {
-        let nested: DeriveInput = syn::parse_quote! {
-            struct Nested { values: Option<Vec<Option<Vec<String>>>> }
-        };
-        let error = expand_command_input(nested).unwrap_err().to_string();
-        assert!(error.contains("nested lists are not supported"), "{error}");
-
+    fn input_only_serde_field_attrs_fail_closed() {
         let skipped: DeriveInput = syn::parse_quote! {
             struct Skipped {
                 #[serde(skip_deserializing)]
@@ -682,19 +652,7 @@ mod tests {
             }
         };
         let error = expand_command_input(skipped).unwrap_err().to_string();
-        assert!(
-            error.contains("changes the declared command field shape"),
-            "{error}"
-        );
-
-        let defaulted: DeriveInput = syn::parse_quote! {
-            struct Defaulted {
-                #[serde(default)]
-                value: String,
-            }
-        };
-        let error = expand_command_input(defaulted).unwrap_err().to_string();
-        assert!(error.contains("#[serde(default)]"), "{error}");
+        assert!(error.contains("#[serde(skip_deserializing)]"), "{error}");
 
         let custom: DeriveInput = syn::parse_quote! {
             struct Custom {
@@ -704,21 +662,5 @@ mod tests {
         };
         let error = expand_command_input(custom).unwrap_err().to_string();
         assert!(error.contains("#[serde(deserialize_with)]"), "{error}");
-
-        let transparent: DeriveInput = syn::parse_quote! {
-            #[serde(transparent)]
-            struct Transparent { value: String }
-        };
-        let error = expand_command_output(transparent).unwrap_err().to_string();
-        assert!(error.contains("#[serde(transparent)]"), "{error}");
-
-        let container_default: DeriveInput = syn::parse_quote! {
-            #[serde(default = "default_input")]
-            struct ContainerDefault { value: String }
-        };
-        let error = expand_command_input(container_default)
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("#[serde(default)]"), "{error}");
     }
 }

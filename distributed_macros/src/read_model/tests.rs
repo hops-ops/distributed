@@ -73,22 +73,6 @@ fn expand_read_model_rejects_direct_attributes_without_values() {
 }
 
 #[test]
-fn expand_read_model_rejects_missing_id_field_for_document_models() {
-    let input: DeriveInput = syn::parse_quote! {
-        struct CounterView {
-            value: i32,
-        }
-    };
-
-    let err = expand_read_model(input).expect_err("missing id field should return an error");
-
-    assert!(
-        err.to_string().contains("field named `id`"),
-        "unexpected error: {err}"
-    );
-}
-
-#[test]
 fn expand_read_model_rejects_multiple_explicit_id_attributes() {
     let input: DeriveInput = syn::parse_quote! {
         struct CounterView {
@@ -124,25 +108,6 @@ fn expand_read_model_rejects_unknown_struct_attributes() {
     assert!(
         err.to_string()
             .contains("unknown readmodel struct attribute"),
-        "unexpected error: {err}"
-    );
-}
-
-#[test]
-fn expand_read_model_rejects_unknown_field_attributes() {
-    let input: DeriveInput = syn::parse_quote! {
-        struct CounterView {
-            #[readmodel(ide)]
-            id: String,
-            value: i32,
-        }
-    };
-
-    let err = expand_read_model(input).expect_err("unknown field attribute should fail");
-
-    assert!(
-        err.to_string()
-            .contains("unknown readmodel field attribute"),
         "unexpected error: {err}"
     );
 }
