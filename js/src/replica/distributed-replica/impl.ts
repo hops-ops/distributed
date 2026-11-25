@@ -79,7 +79,8 @@ import type {
 	ReplicaValue,
 	ReplicaWatch,
 	ReplicaWriteSource,
-	WatchReplicaOptions
+	WatchReplicaOptions,
+	ReplicaLiveConnection
 } from '../types.js';
 import {
 	EMPTY_CACHE_SNAPSHOT,
@@ -235,6 +236,16 @@ export class DistributedReplicaImpl implements DistributedReplicaApi {
 
 	get authorizationGeneration(): number {
 		return this.#authority.sequence;
+	}
+
+	get liveConnection(): ReplicaLiveConnection {
+		return this.#live.connection;
+	}
+
+	subscribeLiveConnection(
+		listener: (connection: ReplicaLiveConnection) => void
+	): () => void {
+		return this.#live.subscribeConnection(listener);
 	}
 
 	[replicaCommandAuthority](

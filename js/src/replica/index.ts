@@ -168,6 +168,7 @@ export type {
 	ReplicaIslandOperation,
 	ReplicaListValue,
 	ReplicaLiveObserver,
+	ReplicaLiveConnection,
 	ReplicaLiveState,
 	ReplicaLiteralValue,
 	ReplicaModelArtifact,

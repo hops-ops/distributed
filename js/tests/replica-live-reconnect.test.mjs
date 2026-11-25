@@ -28,6 +28,8 @@ test('a lost live stream reopens with its cursors and an HTTP refresh, without t
 	const watch = replica.watch(Todos, {}, { live: true });
 	const seen = [];
 	watch.subscribe((snapshot) => seen.push(snapshot.live));
+	const connection = [];
+	const stopConnection = replica.subscribeLiveConnection((state) => connection.push(state));
 	await flush();
 	fetches[0].resolve(wireFrame({ position: '1', rows: row('first') }));
 	await flush();
@@ -36,9 +38,12 @@ test('a lost live stream reopens with its cursors and an HTTP refresh, without t
 	const fetchesBefore = fetches.length;
 
 	subscriptions[0].observer.error(lost());
-	assert.equal(watch.get().live, 'error');
-	assert.equal(watch.get().errors[0].message, 'socket lost');
+	assert.equal(watch.get().live, 'reconnecting');
+	assert.deepEqual(watch.get().errors, [], 'a lost stream is not a query error');
+	assert.equal(watch.get().status, 'ready');
 	assert.deepEqual(watch.get().data.todos, row('before'), 'admitted data stays readable');
+	assert.equal(replica.liveConnection, 'reconnecting');
+	assert.deepEqual(connection, ['reconnecting']);
 	assert.equal(subscriptions[0].closed, true);
 	// The transport's trailing completion is ignored, as after a failure frame.
 	subscriptions[0].observer.complete();
@@ -50,13 +55,21 @@ test('a lost live stream reopens with its cursors and an HTTP refresh, without t
 	assert.equal(subscriptions.length, 2);
 	assert.deepEqual(subscriptions[1].request.resume, resumeAt('2'));
 	assert.equal(fetches.length, fetchesBefore + 1, 'the reopen refreshes over HTTP');
+	assert.equal(watch.get().live, 'reconnecting', 'reopened, not yet delivering');
+	fetches.at(-1).reject(new TypeError('fetch failed'));
+	await flush();
+	assert.deepEqual(watch.get().errors, [], 'a refresh failing while reconnecting is not a query error');
 
 	subscriptions[1].observer.next(liveFrame('3', 'after'));
 	assert.deepEqual(watch.get().data.todos, row('after'));
 	assert.equal(watch.get().live, 'active');
 	assert.deepEqual(watch.get().errors, []);
-	assert.equal(seen.includes('error'), true);
+	assert.equal(seen.includes('error'), false);
+	assert.equal(seen.includes('reconnecting'), true);
 	assert.equal(seen.at(-1), 'active');
+	assert.equal(replica.liveConnection, 'online');
+	assert.deepEqual(connection, ['reconnecting', 'online']);
+	stopConnection();
 
 	// The admitted frame reset the backoff.
 	subscriptions[1].observer.error(lost());
@@ -112,7 +125,9 @@ test('a pending reopen ends with the last watch and with the authorization gener
 	await scheduler.advance(1000);
 	assert.equal(subscriptions.length, 2, 'a remaining watch keeps the reopen');
 	subscriptions[1].observer.error(lost());
+	assert.equal(replica.liveConnection, 'reconnecting');
 	second.destroy();
+	assert.equal(replica.liveConnection, 'online', 'an unwatched operation is not reconnecting');
 	await scheduler.advance(120_000);
 	assert.equal(subscriptions.length, 2, 'no watch, no reopen');
 
@@ -120,6 +135,7 @@ test('a pending reopen ends with the last watch and with the authorization gener
 	assert.equal(subscriptions.length, 3);
 	subscriptions[2].observer.error(lost());
 	replica.invalidateAuthorization();
+	assert.equal(replica.liveConnection, 'online');
 	await scheduler.advance(120_000);
 	assert.equal(subscriptions.length, 3);
 	third.destroy();
@@ -237,8 +253,9 @@ test('a server restart resumes live updates over a real WebSocket without a manu
 
 	// The server process dies: no close frame, nothing listening.
 	await server.stop();
-	await until(() => watch.get().live === 'error');
+	await until(() => watch.get().live === 'reconnecting');
 	assert.deepEqual(watch.get().data.todos, row('three'));
+	assert.deepEqual(watch.get().errors, []);
 
 	// First reopen: still down. The dial and the refresh fail; the backoff doubles.
 	const before = snapshots.length;
@@ -246,10 +263,11 @@ test('a server restart resumes live updates over a real WebSocket without a manu
 	await until(
 		() =>
 			snapshots.length > before &&
-			watch.get().live === 'error' &&
+			watch.get().live === 'reconnecting' &&
 			!watch.get().fetching
 	);
 	assert.deepEqual(watch.get().data.todos, row('three'));
+	assert.deepEqual(watch.get().errors, [], 'the failed dial and refresh are not query errors');
 
 	// The server is back with changes the client missed. Its HTTP answer is
 	// held until the resubscription arrived, so the order is the test's.
