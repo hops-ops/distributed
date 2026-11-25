@@ -18,21 +18,21 @@ serde_json = "1"
 
 [[test]]
 name = "gateway_routing"
-path = "../gateway_routing.rs"
+path = "../gateway/gateway_routing.rs"
 
 [[test]]
 name = "gateway_extensions"
-path = "../gateway_extensions.rs"
+path = "../gateway/gateway_extensions.rs"
 
 [[test]]
 name = "gateway_auth"
-path = "../gateway_auth.rs"
+path = "../gateway/gateway_auth.rs"
 
 [[test]]
 name = "gateway_graphql_operation"
-path = "../gateway_graphql_operation.rs"
+path = "../gateway/gateway_graphql_operation.rs"
 
 [[test]]
 name = "edge_query_delivery"
-path = "../edge_query_delivery.rs"
+path = "../gateway/edge_query_delivery.rs"
 

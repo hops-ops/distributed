@@ -41,7 +41,7 @@
 //!   compensated *as well*. Compensations therefore must be idempotent and
 //!   must tolerate arriving before (or instead of) their action — the
 //!   participant records a tombstone keyed by saga id so a late action is
-//!   rejected. The worked example in `tests/saga_transfer` shows this.
+//!   rejected. The worked example in `tests/services/saga_transfer` shows this.
 //! - **Compensation retries**: a failed/timed-out compensation is
 //!   re-dispatched (new attempt, new timer) up to
 //!   [`SagaDefinition::MAX_COMPENSATION_ATTEMPTS`], then the saga is

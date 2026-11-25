@@ -34,7 +34,7 @@
 //! cleanly. sqlxmq remains a viable future backend for its mature NOTIFY/backoff;
 //! revisit if those are needed. See [[tasks/build-transport-bus-facade]].
 //!
-//! Requires the `postgres` feature. Integration-tested in `tests/postgres_transport`.
+//! Requires the `postgres` feature. Integration-tested in `tests/transports/postgres_transport`.
 //!
 //! [`Bus`]: super::Bus
 //! [`BusConsumer`]: super::BusConsumer

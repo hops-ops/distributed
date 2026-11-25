@@ -7,13 +7,13 @@
 # (each integration test skips when its env var is unset):
 #
 #   DATABASE_URL=postgres://sourced:sourced@localhost:5432/distributed \
-#     cargo test --test postgres_transport --features postgres
+#     cargo test --test transports --features postgres postgres_transport::
 #   AMQP_URL=amqp://guest:guest@localhost:5672/%2f \
-#     cargo test --test rabbitmq_transport --features rabbitmq
+#     cargo test --test transports --features rabbitmq rabbitmq_transport::
 #   KAFKA_BROKERS=127.0.0.1:9092 \
-#     cargo test --test kafka_transport --features kafka
+#     cargo test --test transports --features kafka kafka_transport::
 #   NATS_URL=nats://localhost:4222 \
-#     cargo test --test nats_transport --features nats
+#     cargo test --test transports --features nats nats_transport::
 #   REDIS_URL=redis://127.0.0.1:6379 \
 #     cargo test -p distributed_leaderboard --features redis,graphql --test redis
 services:

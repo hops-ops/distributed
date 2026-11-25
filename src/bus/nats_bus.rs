@@ -20,7 +20,7 @@
 //! the same subscription inventory. Adding a filter does not replay messages
 //! previously skipped by that consumer; historical catch-up is explicit.
 //!
-//! Requires the `nats` feature. Integration-tested in `tests/nats_transport`.
+//! Requires the `nats` feature. Integration-tested in `tests/transports/nats_transport`.
 
 use std::future::{Future, IntoFuture};
 use std::pin::Pin;

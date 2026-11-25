@@ -46,8 +46,8 @@ graphql-oidc.env
 graphql-oidc.env
 graphql-oidc-keycloak.env
 graphql-oidc-authentik.env
-tests/graphql_oidc_zitadel/machinekey/**
-!tests/graphql_oidc_zitadel/machinekey/.gitignore
+tests/graphql/graphql_oidc_zitadel/machinekey/**
+!tests/graphql/graphql_oidc_zitadel/machinekey/.gitignore
 tests/workshop-service/ui/node_modules/
 tests/workshop-service/ui/build/
 tests/workshop-service/ui/.svelte-kit/

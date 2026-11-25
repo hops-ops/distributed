@@ -193,9 +193,8 @@ jobs:
           cargo build -p distributed_cli --bin distributed
           target/debug/distributed build tests/e2e-ui --output json
           target/debug/distributed build tests/e2e-celld --output json
-          cargo test --test celld --no-run
-          cargo test --test e2e_ui_celld_nats_profile \
-            --features graphql,http,sqlite --no-run
+          cargo test --test services --no-run
+          cargo test --test services --features graphql,http,sqlite --no-run
           npm install --prefix tests/e2e-ui
 
       # celld dev watches its project for rebuilds. Complete browser/toolchain

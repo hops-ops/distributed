@@ -3,7 +3,7 @@
 # Pattern: compose up → wait healthy → docker exec bootstrap → write env.
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-COMPOSE="$ROOT/tests/graphql_oidc_authentik/docker-compose.yml"
+COMPOSE="$ROOT/tests/graphql/graphql_oidc_authentik/docker-compose.yml"
 OUT="${GRAPHQL_OIDC_AUTHENTIK_ENV:-$ROOT/graphql-oidc-authentik.env}"
 BASE="${AUTHENTIK_URL:-http://localhost:9000}"
 AK_EMAIL="${AUTHENTIK_BOOTSTRAP_EMAIL:-akadmin@localhost}"
@@ -340,4 +340,4 @@ EOF
 
 echo "==> Wrote $OUT"
 cat "$OUT"
-echo "==> Done. source $OUT && cargo test --test graphql_oidc_authentik --features graphql,sqlite,metrics"
+echo "==> Done. source $OUT && cargo test --test graphql --features graphql,sqlite,metrics graphql_oidc_authentik::"

@@ -222,7 +222,7 @@ ctx.outbox(reply).commit(aggregate)?.succeeded(payload)
 ```
 
 (`rejected` maps a `SagaError` to `HandlerError::Rejected`;
-`tests/saga_transfer/main.rs` is the complete participant.)
+`tests/services/saga_transfer/mod.rs` is the complete participant.)
 
 `from_session` reads the saga headers, which arrive as session claims, and
 the saga command id, which the transport puts in `TRANSPORT_MESSAGE_ID_CLAIM`.
@@ -315,7 +315,7 @@ bounds, and replay from a repository).
 
 ### Worked example
 
-`tests/saga_transfer/main.rs` moves value between wallets in two separate
+`tests/services/saga_transfer/mod.rs` moves value between wallets in two separate
 cells. The `debit` step goes to the source cell (compensated by `refund`) and
 the `credit` step goes to the target cell (compensated by `reverse_credit`).
 A test network delivers outbox rows whose `deliver_at` is due on a
@@ -335,7 +335,7 @@ A test network delivers outbox rows whose `deliver_at` is due on a
 ## Tests
 
 ```sh
-cargo test --features sqlite,postgres --test saga_transfer --test coordination_lease --test scheduled_outbox
+cargo test --features sqlite,postgres --test services --test repositories -- saga_transfer:: coordination_lease:: scheduled_outbox::
 cargo test --features sqlite --lib -- outbox lease clock
 cargo test --features cloudflare-workers --lib cell_host
 (cd tests/celld/alarm-worker && worker-build --release) && node tests/celld/alarms.mjs

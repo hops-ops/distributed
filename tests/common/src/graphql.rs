@@ -30,7 +30,9 @@ macro_rules! with_repository {
 
 /// One case list, instantiated per dialect as `sqlite::<case>` and
 /// `postgres::<case>`. A case is an `async fn(Db)`; `module::{..}` groups
-/// name cases in `crate::module`, bare names are cases at the crate root.
+/// name cases in `<invoking module>::module`, bare names are cases of the
+/// invoking module itself (each test binary groups former targets as modules,
+/// so this is not the crate root).
 #[macro_export]
 macro_rules! on_each_dialect {
     (@cases $($(#[$meta:meta])* $case:ident),* $(,)?) => {
@@ -47,13 +49,13 @@ macro_rules! on_each_dialect {
         $(mod $module {
             #[allow(unused_imports)]
             use super::db;
-            use crate::$module as scenarios;
+            use super::super::$module as scenarios;
             $crate::on_each_dialect!(@cases $($cases)*);
         })*
         #[allow(unused_imports)]
         mod root {
             use super::db;
-            use crate as scenarios;
+            use super::super as scenarios;
             $crate::on_each_dialect!(@cases $($root)*);
         }
     };

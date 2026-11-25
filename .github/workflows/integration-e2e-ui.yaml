@@ -155,7 +155,7 @@ jobs:
           npx playwright install chromium --with-deps
 
       - name: Verify candidate-key SSR and live delivery end to end
-        run: cargo test --manifest-path ../../Cargo.toml --features graphql,sqlite --test graphql_unique_key_live projected_candidate_keys_reach_chromium_over_http_and_websocket -- --ignored --exact --nocapture
+        run: 'cargo test --manifest-path ../../Cargo.toml --features graphql,sqlite --test graphql graphql_unique_key_live::projected_candidate_keys_reach_chromium_over_http_and_websocket -- --ignored --exact --nocapture'
 
       - name: Run browser e2e
         run: |

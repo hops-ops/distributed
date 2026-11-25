@@ -178,7 +178,7 @@ then delivered to the e2e-celld native host, accepted by NATS JetStream, and
 applied by the normal Todo projection. A deployed fleet can keep the producer
 and consumer deployments as separate scripts without changing the relay code.
 
-Without `CELLD_URL`, `cargo test --test celld` checks the fixtures and skips the
+Without `CELLD_URL`, `cargo test --test services celld::` checks the fixtures and skips the
 live HTTP round trips.
 
 The independent storage proof owns a temporary celld fleet and deliberately

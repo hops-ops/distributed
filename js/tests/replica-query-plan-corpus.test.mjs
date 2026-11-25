@@ -8,7 +8,7 @@ import {
 } from '../dist/replica/index.js';
 
 // The shared statement of what a `where`, a row policy and an `order_by`
-// mean. `tests/graphql_compile/main.rs` holds SQLite, Postgres and the Rust
+// mean. `tests/graphql/graphql_compile/mod.rs` holds SQLite, Postgres and the Rust
 // evaluator to the same file, and checks `fields` against the manifest.
 const corpus = JSON.parse(
 	await readFile(

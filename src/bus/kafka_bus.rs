@@ -16,7 +16,7 @@
 //! prefix stripped. `{ns}` (namespace) scopes topics and groups so runs/apps
 //! don't collide.
 //!
-//! Requires the `kafka` feature. Integration-tested in `tests/kafka_transport`.
+//! Requires the `kafka` feature. Integration-tested in `tests/transports/kafka_transport`.
 
 use std::future::{Future, IntoFuture};
 use std::pin::Pin;

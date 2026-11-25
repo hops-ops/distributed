@@ -20,7 +20,7 @@
 //! queues. `{ns}` (namespace) scopes queue and exchange names so multiple apps can
 //! share a broker.
 //!
-//! Requires the `rabbitmq` feature. Integration-tested in `tests/rabbitmq_transport`.
+//! Requires the `rabbitmq` feature. Integration-tested in `tests/transports/rabbitmq_transport`.
 
 use std::collections::HashSet;
 use std::future::{Future, IntoFuture};

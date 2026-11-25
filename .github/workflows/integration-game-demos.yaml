@@ -83,7 +83,7 @@ jobs:
       - name: Redis Streams publisher against real Redis
         env:
           REDIS_URL: redis://127.0.0.1:6379
-        run: cargo test --features redis-streams --test redis_streams -- --nocapture
+        run: 'cargo test --features redis-streams --test transports redis_streams:: -- --nocapture'
       - name: Ticket rate limiter against real Redis
         working-directory: js
         env:
