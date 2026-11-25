@@ -5,11 +5,9 @@
 #![cfg(feature = "sqlite")]
 
 // Shared broker-test helpers (recording_for, message fixtures, bus scenarios).
-#[path = "../transport_conformance/mod.rs"]
-mod conformance;
+use common::sqlite as sqlite_support;
+use common::transport as conformance;
 use conformance::{command, event, recorded_ids, recording_for, COMMAND_NAME, EVENT_NAME, PAYLOAD};
-#[path = "../support/sqlite.rs"]
-mod sqlite_support;
 use sqlite_support::TempDb;
 
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -63,7 +61,7 @@ impl conformance::bus::BusHarness for Sqlite {
     }
 }
 
-conformance::bus::bus_conformance_tests!(Sqlite);
+common::bus_conformance_tests!(Sqlite);
 
 #[derive(Default)]
 struct OrderedEvidenceRecorder {

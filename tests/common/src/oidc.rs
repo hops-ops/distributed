@@ -1,7 +1,5 @@
-//! Shared helpers for multi-provider GraphQL OIDC live e2e (E1–E8).
-//! Included via `#[path = "../graphql_oidc_common/mod.rs"] mod common;`
-
-#![allow(dead_code)]
+//! The multi-provider GraphQL OIDC live e2e (E1–E8), written once; each
+//! provider's test target only mints its tokens.
 
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -21,9 +19,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tower::util::ServiceExt;
 
-#[path = "../support/graphql.rs"]
-mod graphql_support;
-use graphql_support::Db;
+use crate::graphql::Db;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, ReadModel)]
 #[table("oidc_e2e_items")]

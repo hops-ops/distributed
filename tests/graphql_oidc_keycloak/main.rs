@@ -3,14 +3,13 @@
 
 #![cfg(all(feature = "graphql", feature = "sqlite"))]
 
-#[path = "../graphql_oidc_common/mod.rs"]
-mod common;
+use common::oidc;
 
 use distributed::graphql::OidcConfig;
 use serde_json::Value;
 
 fn e2e_enabled() -> bool {
-    common::gate_enabled("KEYCLOAK_E2E")
+    oidc::gate_enabled("KEYCLOAK_E2E")
 }
 
 #[tokio::test]
@@ -21,7 +20,7 @@ async fn e1_through_e8_live() {
     }
     let iss = std::env::var("OIDC_ISSUER").expect("OIDC_ISSUER");
     assert!(
-        common::discovery_ready(&iss).await,
+        oidc::discovery_ready(&iss).await,
         "Keycloak discovery not ready at {iss}"
     );
     let audience = std::env::var("OIDC_AUDIENCE").expect("OIDC_AUDIENCE");
@@ -39,7 +38,7 @@ async fn e1_through_e8_live() {
     }
     oidc.claim_map.role_claims = vec!["realm_access.roles".into(), "groups".into(), "roles".into()];
 
-    common::run_e1_through_e8(
+    oidc::run_e1_through_e8(
         oidc,
         async {
             let (t, sub) = mint_client_credentials(&iss, &cust_id, &cust_sec).await?;

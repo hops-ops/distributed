@@ -1,9 +1,8 @@
-mod aggregate;
 mod custom_body_helpers;
 mod domain_events;
 mod flat_preview;
 
-use aggregate::{Todo, TodoEvent};
+use common::todo::{Todo, TodoEvent};
 use distributed::{
     AggregateBuilder, Entity, EventRecord, EventRecordError, InMemoryRepository, Queueable,
 };
@@ -177,10 +176,10 @@ async fn aggregate_hydration_roundtrip() {
     repo.commit(&mut todo).await.unwrap();
 
     let loaded = repo.get("t1").await.unwrap().unwrap();
-    assert_eq!(loaded.snapshot().id, "t1");
-    assert_eq!(loaded.snapshot().user_id, "alice");
-    assert_eq!(loaded.snapshot().task, "Buy milk");
-    assert!(loaded.snapshot().completed);
+    assert_eq!(loaded.state().id, "t1");
+    assert_eq!(loaded.state().user_id, "alice");
+    assert_eq!(loaded.state().task, "Buy milk");
+    assert!(loaded.state().completed);
 }
 
 #[test]
@@ -200,7 +199,7 @@ fn non_event_methods_pass_through() {
     let mut todo = Todo::default();
     todo.initialize("t1".into(), "alice".into(), "Test".into())
         .unwrap();
-    let snap = todo.snapshot();
+    let snap = todo.state();
     assert_eq!(snap.id, "t1");
     assert_eq!(snap.user_id, "alice");
 }

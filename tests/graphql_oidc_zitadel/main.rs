@@ -3,8 +3,7 @@
 
 #![cfg(all(feature = "graphql", feature = "sqlite"))]
 
-#[path = "../graphql_oidc_common/mod.rs"]
-mod common;
+use common::oidc;
 
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -13,7 +12,7 @@ use distributed::graphql::OidcConfig;
 use serde_json::{json, Value};
 
 fn e2e_enabled() -> bool {
-    common::gate_enabled("ZITADEL_E2E")
+    oidc::gate_enabled("ZITADEL_E2E")
 }
 
 /// Live E1–E8 against real Zitadel issuer + shipped OidcBearer HTTP path.
@@ -25,7 +24,7 @@ async fn e1_through_e8_live() {
     }
     let iss = std::env::var("OIDC_ISSUER").expect("OIDC_ISSUER");
     assert!(
-        common::discovery_ready(&iss).await || issuer_ready_debug(&iss).await,
+        oidc::discovery_ready(&iss).await || issuer_ready_debug(&iss).await,
         "issuer not ready: {iss}"
     );
     let audience = std::env::var("OIDC_AUDIENCE")
@@ -38,7 +37,7 @@ async fn e1_through_e8_live() {
     let admin_uid = std::env::var("GRAPHQL_E2E_ADMIN_USER_ID").expect("ADMIN_USER_ID");
 
     let oidc = OidcConfig::new(&iss, &audience);
-    common::run_e1_through_e8(
+    oidc::run_e1_through_e8(
         oidc,
         async {
             let t = mint_jwt_bearer(&iss, &customer_key, &customer_uid).await?;

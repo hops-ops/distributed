@@ -8,7 +8,7 @@ name: Workspace Tests Against Real Services
 #
 # `make test-local` sets DISTRIBUTED_REQUIRE_SERVICES, so a test that cannot
 # reach its service fails here instead of returning early and reporting a
-# pass (tests/support/env.rs). There is no list of test targets to maintain:
+# pass (tests/common/src/env.rs). There is no list of test targets to maintain:
 # a new service-backed test runs here as soon as it exists.
 on:
   workflow_call:

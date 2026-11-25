@@ -10,7 +10,7 @@ use super::checkout::{CHECKOUT_SEAT_RESERVED_STATUS, SEAT_RESERVED_STATUS};
 use super::checkout_saga::CheckoutSaga;
 use super::seat::Seat;
 
-pub use super::ids::unique_id;
+pub use crate::ids::unique_id;
 
 pub async fn aggregate_checkout_flow_persists_reloaded_state<R>(repo: R)
 where

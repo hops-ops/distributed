@@ -3,8 +3,7 @@
 //! Runs the bus contract against `InMemoryBus` and the outbox dispatcher
 //! contract against adapter-neutral fakes, with no external broker.
 
-#[path = "../transport_conformance/mod.rs"]
-mod conformance;
+use common::transport as conformance;
 
 use distributed::bus::InMemoryBus;
 
@@ -23,7 +22,7 @@ impl conformance::bus::BusHarness for InMemory {
     }
 }
 
-conformance::bus::bus_conformance_tests!(InMemory);
+common::bus_conformance_tests!(InMemory);
 
 // --- publisher / outbox dispatcher contract ---------------------------------
 

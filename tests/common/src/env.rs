@@ -1,6 +1,5 @@
-//! Service env-var guard, shared across test targets via
-//! `#[path = "../support/env.rs"]` and by the crate's own unit tests.
-#![allow(dead_code)] // not every including target consumes it under all features
+//! The service guard: every test that needs an external service reads its
+//! address through [`require_service`]. The crate's own unit tests use it too.
 
 /// Names the services a run must have. `1`, `true` or `all` requires every
 /// service a test asks for; otherwise a comma-separated list of the env vars
@@ -34,4 +33,28 @@ pub fn is_required(required: &str, var: &str) -> bool {
         .split(',')
         .map(str::trim)
         .any(|entry| matches!(entry, "1" | "true" | "all") || entry == var)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_required;
+
+    #[test]
+    fn unset_or_empty_requires_nothing() {
+        assert!(!is_required("", "DATABASE_URL"));
+        assert!(!is_required("0", "DATABASE_URL"));
+    }
+
+    #[test]
+    fn all_requires_every_service() {
+        for value in ["1", "true", "all"] {
+            assert!(is_required(value, "DATABASE_URL"));
+        }
+    }
+
+    #[test]
+    fn a_list_requires_only_the_named_services() {
+        assert!(is_required("DATABASE_URL, NATS_URL", "NATS_URL"));
+        assert!(!is_required("DATABASE_URL,NATS_URL", "CELLD_URL"));
+    }
 }

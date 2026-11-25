@@ -641,12 +641,81 @@ impl CausalCommandPublicStatus {
 /// storage cannot prove the identity required by a `Projected` command.
 #[cfg(feature = "graphql")]
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct GraphqlServiceBindError(pub String);
+pub enum GraphqlServiceBindError {
+    /// The service has no `Service::named` identity.
+    UnnamedService,
+    /// The engine was built without a validated service ID.
+    EngineWithoutServiceId,
+    /// The executable service and the engine name different services.
+    ServiceIdMismatch { executable: String, engine: String },
+    /// The service already registers a command named `graphql`.
+    GraphqlCommandTaken,
+    /// The engine and the service hold different lifecycle gates.
+    LifecycleMismatch,
+    /// The service has typed commands but the engine has no typed inventory.
+    EngineNotDerivedFromService,
+    /// The engine lacks a typed command the executable service routes.
+    MissingTypedCommand { command: String },
+    /// A typed command's canonical structure differs between the executable
+    /// service and the engine; the detail names the command or fingerprints.
+    StructuralFingerprintMismatch(String),
+    /// Structurally identical typed commands bind different Rust input or
+    /// output types.
+    TypeIdMismatch,
+    /// Typed causal commands are served without a protocol token key.
+    MissingProtocolTokenKey,
+    /// An `Atomic` command's engine pool is not derived from a repository.
+    AtomicPoolNotFromRepository,
+    /// An `Atomic` command's repository and the engine pool are different
+    /// storages.
+    AtomicStorageIdentityMismatch,
+    /// A typed command inventory could not be derived.
+    InvalidInventory(String),
+}
 
 #[cfg(feature = "graphql")]
 impl std::fmt::Display for GraphqlServiceBindError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(&self.0)
+        match self {
+            Self::UnnamedService => {
+                formatter.write_str("GraphQL attachment requires a stable Service::named identity")
+            }
+            Self::EngineWithoutServiceId => formatter
+                .write_str("GraphQL attachment requires an engine with a validated service ID"),
+            Self::ServiceIdMismatch { executable, engine } => write!(
+                formatter,
+                "service ID mismatch: executable service `{executable}` vs GraphQL engine `{engine}`"
+            ),
+            Self::GraphqlCommandTaken => {
+                formatter.write_str("a command named `graphql` is already registered")
+            }
+            Self::LifecycleMismatch => formatter.write_str(
+                "GraphQL engine and service have different lifecycle gates; call Service::with_lifecycle before building the engine from the service",
+            ),
+            Self::EngineNotDerivedFromService => formatter.write_str(
+                "GraphQL engine was not derived from this service's typed command inventory",
+            ),
+            Self::MissingTypedCommand { command } => write!(
+                formatter,
+                "GraphQL engine is missing typed command `{command}` from the executable service"
+            ),
+            Self::StructuralFingerprintMismatch(detail) => {
+                write!(formatter, "typed command structural fingerprint mismatch: {detail}")
+            }
+            Self::TypeIdMismatch => {
+                formatter.write_str("typed command Rust input/output TypeId mismatch")
+            }
+            Self::MissingProtocolTokenKey => formatter.write_str(
+                "typed causal commands require a configured GraphQL protocol token key",
+            ),
+            Self::AtomicPoolNotFromRepository => formatter.write_str(
+                "Atomic commands require a GraphQL pool derived from the same repository handle",
+            ),
+            Self::AtomicStorageIdentityMismatch => formatter.write_str(
+                "Atomic command repository and GraphQL query pool storage identities differ",
+            ),
+            Self::InvalidInventory(detail) => formatter.write_str(detail),
+        }
     }
 }
 

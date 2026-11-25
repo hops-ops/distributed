@@ -1,0 +1,33 @@
+[package]
+name = "common"
+description = "Shared fixtures and conformance suites for the `distributed` integration tests."
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+publish = false
+
+# `distributed` dev-depends on this crate and forwards its backend features
+# here (`sqlite = [..., "common/sqlite"]`), so a test binary built with
+# `--no-default-features --features sqlite` sees exactly the modules it can
+# compile. Integration tests link the same `distributed` this crate links, so
+# its types flow between the two unchanged.
+[features]
+sqlite = ["distributed/sqlite", "dep:sqlx", "sqlx/sqlite"]
+postgres = ["distributed/postgres", "dep:sqlx", "sqlx/postgres"]
+graphql = ["distributed/graphql", "dep:async-graphql", "dep:axum", "dep:jsonwebtoken", "dep:reqwest", "dep:rand", "dep:rsa", "dep:tower"]
+
+[dependencies]
+distributed = { path = "../..", default-features = false }
+async-graphql = { version = "7", optional = true }
+axum = { version = "0.8", optional = true }
+base64 = "0.23.0"
+jsonwebtoken = { version = "9", optional = true }
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"], optional = true }
+rand = { version = "0.8", optional = true }
+rsa = { version = "0.9", optional = true }
+serde = { version = "1.0.210", features = ["derive"] }
+serde_json = "1.0.128"
+bitcode = { version = "0.6.9", features = ["serde"] }
+sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "migrate", "json"], optional = true }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync", "time"] }
+tower = { version = "0.5", features = ["util"], optional = true }

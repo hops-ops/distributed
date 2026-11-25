@@ -1,7 +1,6 @@
 //! microsvc integration tests.
 
-#[path = "../support/commands.rs"]
-mod commands;
+use common::commands;
 
 mod basic;
 mod convention;

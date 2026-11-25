@@ -8,8 +8,7 @@
 
 use distributed::bus::{Message, MessageKind, MessagePublisher, RedisStreamPublisher};
 
-#[path = "../support/env.rs"]
-mod env_support;
+use common::env as env_support;
 
 /// `XRANGE` reply row: entry id and field/value pairs.
 type StreamEntry = (String, Vec<(String, Vec<u8>)>);

@@ -18,11 +18,9 @@ use serde_json::json;
 // Shared broker-test helpers (recording_for, bus scenarios). `unique` mixes
 // wall-clock nanos into every name, so a fresh topic/group never reads stale
 // messages from a previous run's same-named topic (Kafka persists topics).
-#[path = "../transport_conformance/mod.rs"]
-mod conformance;
+use common::env as env_support;
+use common::transport as conformance;
 use conformance::{recording_for, unique};
-#[path = "../support/env.rs"]
-mod env_support;
 
 fn brokers() -> Option<String> {
     env_support::require_service("KAFKA_BROKERS", "kafka transport test")
@@ -200,7 +198,7 @@ impl conformance::bus::BusHarness for Kafka {
     }
 }
 
-conformance::bus::bus_conformance_tests!(Kafka);
+common::bus_conformance_tests!(Kafka);
 
 /// `publish` + `subscribe`: each `group` is a distinct Kafka consumer group, and
 /// Kafka delivers every record to every group — so each group reads every event

@@ -7,9 +7,6 @@
 //! Concrete adapters reuse the pieces here: a real *source* adapter can be
 //! exercised against [`FakePublisher`], a real *publisher* adapter against
 //! [`FakeSource`], and any [`OutboxStore`] against the dispatcher contract.
-//! Other test targets include this module with
-//! `#[path = "../transport_conformance/mod.rs"] mod conformance;`.
-#![allow(dead_code)]
 
 pub mod bus;
 
@@ -529,13 +526,8 @@ pub async fn publish_then_crash_republishes_and_consumer_inbox_dedupes() {
 // per-transport scenarios stay in their own files — only the genuinely
 // identical scaffolding lives here.
 
-#[path = "../support/ids.rs"]
-mod ids;
-#[path = "../support/outbox.rs"]
-pub mod outbox_support;
-
-#[allow(unused_imports)] // each including target uses a subset
-pub use ids::{run_token, unique};
+pub use crate::ids::{run_token, unique};
+use crate::outbox as outbox_support;
 
 /// A `Service` whose single handler records each message's id into `rec`;
 /// `kind` selects command vs event registration.

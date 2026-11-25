@@ -1,42 +1,37 @@
-//! Shared GraphQL test helpers for integration crates via
-//! `#[path = "../support/graphql.rs"]`.
+//! GraphQL fixtures: the [`Db`] a scenario runs against on each dialect, and
+//! engines over the shared read models.
 //!
 //! Prefer driving shipped `GraphqlEngine` / HTTP only — no SQL reimplementation.
-#![allow(dead_code)] // each including target uses a subset
 
 use async_graphql::Request;
 use distributed::graphql::IdentityConfig;
 use distributed::graphql::{read, GraphqlEngine, GraphqlPool, GraphqlPoolSource, ModelPermissions};
-use distributed::microsvc::{Session, ROLE_KEY, USER_ID_KEY};
+use distributed::microsvc::Session;
 use distributed::projection_protocol::ProjectionChangeRetention;
 use distributed::read_model::ReadModelWritePlanBuilder;
 use distributed::{
-    ReadModel, ReadModelChange, RelationalReadModel, SqliteRepository, TableSchema,
-    TableSchemaRegistry,
+    ReadModelChange, RelationalReadModel, SqliteRepository, TableSchema, TableSchemaRegistry,
 };
-use serde::{Deserialize, Serialize};
 
-#[cfg(feature = "postgres")]
-#[path = "postgres.rs"]
-pub mod postgres;
+pub use crate::read_models::{child, order, parent, ChildView, OrderView, ParentView};
+pub use crate::session::session;
 
 /// Run `$body` with `$repository` bound to the concrete repository in `$db`.
+#[macro_export]
 macro_rules! with_repository {
     ($db:expr, $repository:ident => $body:expr) => {
         match $db {
-            Db::Sqlite($repository) => $body,
+            $crate::graphql::Db::Sqlite($repository) => $body,
             #[cfg(feature = "postgres")]
-            Db::Postgres($repository, _) => $body,
+            $crate::graphql::Db::Postgres($repository, _) => $body,
         }
     };
 }
-#[allow(unused_imports)]
-pub(crate) use with_repository;
 
 /// One case list, instantiated per dialect as `sqlite::<case>` and
 /// `postgres::<case>`. A case is an `async fn(Db)`; `module::{..}` groups
 /// name cases in `crate::module`, bare names are cases at the crate root.
-#[allow(unused_macros)]
+#[macro_export]
 macro_rules! on_each_dialect {
     (@cases $($(#[$meta:meta])* $case:ident),* $(,)?) => {
         $($(#[$meta])*
@@ -53,34 +48,32 @@ macro_rules! on_each_dialect {
             #[allow(unused_imports)]
             use super::db;
             use crate::$module as scenarios;
-            $crate::common::on_each_dialect!(@cases $($cases)*);
+            $crate::on_each_dialect!(@cases $($cases)*);
         })*
         #[allow(unused_imports)]
         mod root {
             use super::db;
             use crate as scenarios;
-            $crate::common::on_each_dialect!(@cases $($root)*);
+            $crate::on_each_dialect!(@cases $($root)*);
         }
     };
     ($($module:ident::{ $($cases:tt)* })* $(; $($root:tt)*)?) => {
         mod sqlite {
-            async fn db(_case: &str) -> Option<$crate::common::Db> {
-                Some($crate::common::Db::sqlite().await)
+            async fn db(_case: &str) -> Option<$crate::graphql::Db> {
+                Some($crate::graphql::Db::sqlite().await)
             }
-            $crate::common::on_each_dialect!(@dialect $($module::{ $($cases)* })* ; $($($root)*)?);
+            $crate::on_each_dialect!(@dialect $($module::{ $($cases)* })* ; $($($root)*)?);
         }
 
         #[cfg(feature = "postgres")]
         mod postgres {
-            async fn db(case: &str) -> Option<$crate::common::Db> {
-                $crate::common::Db::postgres(case).await
+            async fn db(case: &str) -> Option<$crate::graphql::Db> {
+                $crate::graphql::Db::postgres(case).await
             }
-            $crate::common::on_each_dialect!(@dialect $($module::{ $($cases)* })* ; $($($root)*)?);
+            $crate::on_each_dialect!(@dialect $($module::{ $($cases)* })* ; $($($root)*)?);
         }
     };
 }
-#[allow(unused_imports)]
-pub(crate) use on_each_dialect;
 
 /// The database a GraphQL scenario runs against. Scenarios take a `Db` and
 /// are instantiated once per dialect, so they prove the same behaviour on
@@ -92,7 +85,7 @@ pub enum Db {
     #[cfg(feature = "postgres")]
     Postgres(
         distributed::PostgresRepository,
-        std::sync::Arc<postgres::PostgresTestSchema>,
+        std::sync::Arc<crate::postgres::PostgresTestSchema>,
     ),
 }
 
@@ -114,7 +107,7 @@ impl Db {
     /// service is absent and not required (see `env.rs`).
     #[cfg(feature = "postgres")]
     pub async fn postgres(what: &str) -> Option<Self> {
-        let schema = postgres::PostgresTestSchema::create_from_env("graphql", what).await?;
+        let schema = crate::postgres::PostgresTestSchema::create_from_env("graphql", what).await?;
         let repository = schema.repository().await;
         Some(Db::Postgres(repository, std::sync::Arc::new(schema)))
     }
@@ -283,73 +276,6 @@ impl Db {
         with_repository!(self, repository => {
             plan.commit(repository).await.expect("seed read-model rows");
         })
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, ReadModel)]
-#[table("orders")]
-pub struct OrderView {
-    #[id("order_id")]
-    pub order_id: String,
-    pub customer_id: String,
-    pub status: String,
-    pub total_cents: i64,
-    /// May look like JSON; must remain a GraphQL String.
-    pub note: String,
-}
-
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, ReadModel)]
-#[table("parents")]
-pub struct ParentView {
-    #[id("parent_id")]
-    pub parent_id: String,
-    pub name: String,
-}
-
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, ReadModel)]
-#[table("children")]
-pub struct ChildView {
-    #[id("child_id")]
-    pub child_id: String,
-    pub parent_id: String,
-    pub name: String,
-}
-
-pub fn session(role: &str, user: &str) -> Session {
-    let mut s = Session::new();
-    s.set(ROLE_KEY, role);
-    s.set(USER_ID_KEY, user);
-    s
-}
-
-pub fn order(
-    order_id: &str,
-    customer_id: &str,
-    status: &str,
-    total_cents: i64,
-    note: &str,
-) -> OrderView {
-    OrderView {
-        order_id: order_id.into(),
-        customer_id: customer_id.into(),
-        status: status.into(),
-        total_cents,
-        note: note.into(),
-    }
-}
-
-pub fn parent(parent_id: &str, name: &str) -> ParentView {
-    ParentView {
-        parent_id: parent_id.into(),
-        name: name.into(),
-    }
-}
-
-pub fn child(child_id: &str, parent_id: &str, name: &str) -> ChildView {
-    ChildView {
-        child_id: child_id.into(),
-        parent_id: parent_id.into(),
-        name: name.into(),
     }
 }
 

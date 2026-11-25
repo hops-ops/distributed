@@ -16,8 +16,7 @@ use distributed::{
 use futures_util::StreamExt;
 use sqlx::sqlite::SqlitePoolOptions;
 
-#[path = "../support/graphql.rs"]
-mod graphql_support;
+use common::graphql as graphql_support;
 use graphql_support::Db;
 
 fn items_schema() -> TableSchema {

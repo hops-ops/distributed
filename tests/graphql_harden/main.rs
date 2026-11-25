@@ -25,7 +25,6 @@
 
 mod access_paths;
 mod authz;
-mod common;
 mod dialect;
 mod dos;
 mod errors;

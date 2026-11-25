@@ -1,6 +1,4 @@
-mod aggregate;
-
-use aggregate::Todo;
+use common::todo::Todo;
 use distributed::{
     sourced, Aggregate, AggregateBuilder, Entity, InMemoryRepository, Queueable, SnapshotRecord,
     SnapshotStore, Snapshottable, StreamIdentity,

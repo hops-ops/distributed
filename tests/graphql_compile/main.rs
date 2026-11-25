@@ -12,9 +12,8 @@ use distributed::{ReadModel, RelationalReadModel};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 
-#[path = "../support/graphql.rs"]
-mod common;
-use common::{on_each_dialect, Db};
+use common::graphql::Db;
+use common::on_each_dialect;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, ReadModel)]
 #[table("items")]

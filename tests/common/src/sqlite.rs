@@ -1,8 +1,6 @@
 //! A temp-file SQLite database for tests that need one database shared by
 //! several pools (cross-"process" visibility) — `:memory:` cannot be shared
-//! across pools, so a file is required. Shared across test targets via
-//! `#[path = "../support/sqlite.rs"]`.
-#![allow(dead_code)] // each including target uses a subset
+//! across pools, so a file is required.
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};

@@ -278,12 +278,13 @@ pub async fn quiet_consumer_runs_until_shutdown<H: BusHarness>(harness: &H, kind
 }
 
 /// Instantiate the bus contract for one [`BusHarness`].
+#[macro_export]
 macro_rules! bus_conformance_tests {
     ($harness:ty) => {
         mod bus_conformance {
             use super::*;
             use distributed::microsvc::MessageKind;
-            use $crate::conformance::bus::{self as suite, BusHarness};
+            use $crate::transport::bus::{self as suite, BusHarness};
 
             macro_rules! scenario {
                 ($name:ident, $scenario:ident, $kind:ident) => {
@@ -340,4 +341,3 @@ macro_rules! bus_conformance_tests {
         }
     };
 }
-pub(crate) use bus_conformance_tests;

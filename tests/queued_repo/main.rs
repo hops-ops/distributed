@@ -324,8 +324,7 @@ async fn get_all_holds_only_the_streams_it_returned() {
 // ===========================================================================
 
 #[cfg(feature = "sqlite")]
-#[path = "../support/sqlite.rs"]
-mod sqlite_support;
+use common::sqlite as sqlite_support;
 
 #[cfg(feature = "sqlite")]
 mod stale_lease {

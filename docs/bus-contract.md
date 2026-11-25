@@ -1,7 +1,7 @@
 # Bus contract
 
 What every `Bus + BusConsumer` promises, and where a transport differs. The
-promises are tested by one suite, `tests/transport_conformance/bus.rs`, which
+promises are tested by one suite, `tests/common/src/transport/bus.rs`, which
 the in-memory, SQLite, Postgres, NATS, Kafka and RabbitMQ buses all run.
 
 ## What every bus does

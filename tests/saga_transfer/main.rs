@@ -19,8 +19,7 @@
 //! own. The wallet still keeps its tombstones: those are domain state.
 
 #[cfg(feature = "sqlite")]
-#[path = "../support/sqlite.rs"]
-mod sqlite_support;
+use common::sqlite as sqlite_support;
 
 use std::collections::{BTreeSet, HashSet};
 use std::sync::Mutex;

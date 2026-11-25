@@ -476,8 +476,7 @@ fn extract_bearer_empty_is_invalid() {
 
 // ── HTTP 401 on real GraphQL router (OidcBearer) ─────────────────────────────
 
-#[path = "../support/graphql.rs"]
-mod graphql_support;
+use common::graphql as graphql_support;
 use graphql_support::Db;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, ReadModel)]

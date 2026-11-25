@@ -6,8 +6,8 @@ use distributed::{
     TransactionalCommit,
 };
 
-use super::outbox_support::find_outbox_by_id;
 use super::scenario::unique_id;
+use crate::outbox::find_outbox_by_id;
 
 fn batch_with(outbox: Vec<OutboxMessage>, receipts: Vec<InboxReceipt>) -> CommitBatch<'static> {
     let mut batch = CommitBatch::new(Vec::new());

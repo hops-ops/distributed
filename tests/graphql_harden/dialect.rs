@@ -13,7 +13,7 @@ use distributed::graphql::{
 use distributed::ReadModel;
 use serde::{Deserialize, Serialize};
 
-use super::common::{assert_no_sql_leak, error_messages, session, Db};
+use common::graphql::{assert_no_sql_leak, error_messages, session, Db};
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, ReadModel)]
 #[table("docs")]

@@ -11,8 +11,7 @@ use distributed::ReadModel;
 use serde::{Deserialize, Serialize};
 use tower::util::ServiceExt;
 
-#[path = "../support/graphql.rs"]
-mod graphql_support;
+use common::graphql as graphql_support;
 use graphql_support::Db;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, ReadModel)]

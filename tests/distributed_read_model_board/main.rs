@@ -10,8 +10,7 @@
 //!   its board (`belongs_to`).
 
 mod board_service;
-#[path = "../support/commands.rs"]
-mod commands;
+use common::commands;
 mod projections_service;
 mod query_service;
 mod read_models;

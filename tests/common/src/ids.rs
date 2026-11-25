@@ -1,6 +1,4 @@
-//! Unique test-identifier helpers, shared across test targets via
-//! `#[path = "../support/ids.rs"]`.
-#![allow(dead_code)] // each including target uses a subset
+//! Unique test identifiers.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};

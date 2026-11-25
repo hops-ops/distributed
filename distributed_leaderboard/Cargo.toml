@@ -29,6 +29,8 @@ uuid = { version = "1", features = ["v7"] }
 
 [dev-dependencies]
 async-graphql = "7"
+# The service guard (`common::env`) shared with the workspace integration tests.
+common = { path = "../tests/common" }
 distributed = { path = "..", features = ["graphql", "sqlite"] }
 distributed_cli = { path = "../distributed_cli" }
 futures-util = { version = "0.3", default-features = false, features = ["std"] }

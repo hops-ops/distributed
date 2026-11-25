@@ -1,8 +1,7 @@
 //! Real-database coverage for literal search through the generated GraphQL API.
 #![cfg(all(feature = "graphql", any(feature = "sqlite", feature = "postgres")))]
 
-#[path = "../support/env.rs"]
-mod env_support;
+use common::env as env_support;
 
 use async_graphql::{Request, Variables};
 use distributed::graphql::IdentityConfig;
