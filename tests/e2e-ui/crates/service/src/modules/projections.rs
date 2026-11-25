@@ -5,8 +5,8 @@
 
 use distributed::graphql::{SurfaceDirectProjection, SurfaceProjector};
 use distributed::LocalProjectionMountsBuilder;
-use e2e_projections::{BLOB_GAMES, CHAT_MESSAGES, TODOS};
-use e2e_readmodels::{BlobGames, ChatMessages, Todos};
+use e2e_projections::{AUTH_USERS, BLOB_GAMES, CHAT_MESSAGES, TODOS};
+use e2e_readmodels::{AuthUsers, BlobGames, ChatMessages, Todos};
 
 /// Projection surface mounts used by compose + GraphQL.
 #[derive(Clone)]
@@ -14,6 +14,7 @@ pub struct ProjectionOwners {
     pub todo: SurfaceProjector,
     pub chat: SurfaceProjector,
     pub blob: SurfaceDirectProjection,
+    pub auth: SurfaceProjector,
 }
 
 /// Compile local projection mounts for the e2e-ui application.
@@ -26,18 +27,21 @@ pub fn projection_owners() -> ProjectionOwners {
         .expect("chat mount")
         .direct_model::<BlobGames>("project_blob", BLOB_GAMES, "e2e-ui-blob-v2")
         .expect("blob mount")
+        .eventual_model::<AuthUsers, _>("project_auth_users", AUTH_USERS, "e2e-ui-auth-users-v1")
+        .expect("auth users mount")
         .build()
         .expect("projection catalog");
 
     ProjectionOwners {
-        todo: mounts
-            .projector("project_todos")
-            .expect("todo projector"),
+        todo: mounts.projector("project_todos").expect("todo projector"),
         chat: mounts
             .projector("project_chat_messages")
             .expect("chat projector"),
         blob: mounts
             .direct_projection("project_blob")
             .expect("blob direct"),
+        auth: mounts
+            .projector("project_auth_users")
+            .expect("auth users projector"),
     }
 }

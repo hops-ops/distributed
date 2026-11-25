@@ -113,7 +113,7 @@ fn reject_duplicate_outbox_messages(messages: &[OutboxMessage]) -> Result<(), Re
             )));
         }
         if !seen.insert(id.to_string()) {
-            return Err(RepositoryError::DuplicateOutboxMessageInBatch { id: id.into() });
+            return Err(RepositoryError::DuplicateOutboxMessage { id: id.into() });
         }
     }
     Ok(())

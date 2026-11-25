@@ -9,14 +9,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use distributed::microsvc::Service;
-use e2e_projections::{
-    map_zitadel_user_status, map_zitadel_user_upsert, ZitadelEmail, ZitadelUserPayload,
-};
-use e2e_readmodels::AuthUsers;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use super::map::{MappedDelivery, HUMAN_DEACTIVATED, HUMAN_UPDATED, MACHINE_CREATED};
+use super::map::{user_profile, MappedDelivery, HUMAN_DEACTIVATED, HUMAN_UPDATED, MACHINE_CREATED};
 
 /// Env: Management API base (no trailing slash). Falls back to `OIDC_ISSUER`.
 pub const API_URL_ENV: &str = "ZITADEL_API_URL";
@@ -99,17 +95,6 @@ pub async fn list_mapped_users(
     ))
 }
 
-/// The `auth_users` row of a listed user: what the projector writes for the
-/// same provider message.
-pub fn auth_user_row(mapped: &MappedDelivery) -> AuthUsers {
-    let name = mapped.message_name.as_str();
-    if name.contains("deactivated") || name.contains("reactivated") {
-        map_zitadel_user_status(name, &mapped.payload)
-    } else {
-        map_zitadel_user_upsert(name, &mapped.payload)
-    }
-}
-
 #[derive(Debug, Clone, Deserialize)]
 struct SearchResponse {
     #[serde(default)]
@@ -161,8 +146,6 @@ struct MgmtProfile {
 struct MgmtEmail {
     #[serde(default)]
     email: Option<String>,
-    #[serde(default, rename = "isEmailVerified")]
-    is_email_verified: Option<bool>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -291,39 +274,20 @@ fn map_mgmt_user(user: &MgmtUser) -> Option<MappedDelivery> {
     let fingerprint = simple_fingerprint(&[&email, &display_name, state, &user_kind, &change]);
     let delivery_id = format!("zitadel-scrape:{id}:{fingerprint}");
 
-    let emails = if email.is_empty() {
-        Vec::new()
-    } else {
-        vec![ZitadelEmail {
-            address: email,
-            primary: true,
-            verified: user
-                .human
-                .as_ref()
-                .and_then(|h| h.email.as_ref())
-                .and_then(|e| e.is_email_verified)
-                .unwrap_or(true),
-        }]
-    };
-
-    let payload = ZitadelUserPayload {
-        schema_version: 1,
-        source: "zitadel-scrape".into(),
-        delivery_id: delivery_id.clone(),
-        provider: "zitadel".into(),
-        provider_subject: id.to_string(),
+    let profile = user_profile(
+        message_name,
+        id,
         user_kind,
-        emails,
-        display_name: Some(display_name),
+        email,
+        Some(display_name),
         // Scrape treats every listed identity as a directory member.
-        approval_status: "approved".into(),
-        ingested_at: now_ms(),
-    };
+        "approved".into(),
+    );
 
     Some(MappedDelivery {
         message_name: message_name.to_string(),
         delivery_id,
-        payload,
+        profile,
     })
 }
 
@@ -339,14 +303,6 @@ fn simple_fingerprint(parts: &[&str]) -> String {
         hash = hash.wrapping_mul(0x100000001b3);
     }
     format!("{hash:016x}")
-}
-
-fn now_ms() -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let d = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default();
-    format!("{}", d.as_millis())
 }
 
 /// Background loop: optional immediate scrape, then every `cfg.interval`.
@@ -395,9 +351,10 @@ mod tests {
         });
         let m = map_management_user(&raw).expect("mapped");
         assert_eq!(m.message_name, HUMAN_UPDATED);
-        assert_eq!(m.payload.provider_subject, "user-1");
-        assert_eq!(m.payload.display_name.as_deref(), Some("Alice"));
-        assert_eq!(m.payload.emails[0].address, "alice@e2e.local");
+        assert_eq!(m.profile.user_id, "user-1");
+        assert_eq!(m.profile.display_name, "Alice");
+        assert_eq!(m.profile.email, "alice@e2e.local");
+        assert_eq!(m.profile.approval_status, "approved");
         assert!(m.delivery_id.starts_with("zitadel-scrape:user-1:"));
     }
 
@@ -413,6 +370,7 @@ mod tests {
         });
         let m = map_management_user(&raw).unwrap();
         assert_eq!(m.message_name, HUMAN_DEACTIVATED);
+        assert_eq!(m.profile.status, "deactivated");
     }
 
     #[test]
@@ -424,7 +382,7 @@ mod tests {
         });
         let m = map_management_user(&raw).unwrap();
         assert_eq!(m.message_name, MACHINE_CREATED);
-        assert_eq!(m.payload.user_kind, "machine");
+        assert_eq!(m.profile.user_kind, "machine");
     }
 
     #[test]

@@ -176,6 +176,7 @@ pub struct CausalCommitBuilder<
     context: &'context CausalCommandContext<'route, A>,
     publish_captured_events: bool,
     explicit_events: Vec<PreparedDomainEvent>,
+    external_events: Vec<crate::DomainEventOccurrence>,
     outbox_messages: Vec<OutboxMessage>,
     read_model_plans: Vec<ReadModelWritePlanBuilder>,
     error: Option<HandlerError>,
@@ -191,6 +192,7 @@ impl<'context, 'route, A>
             context,
             publish_captured_events: false,
             explicit_events: Vec::new(),
+            external_events: Vec::new(),
             outbox_messages: Vec::new(),
             read_model_plans: Vec::new(),
             error: None,
@@ -216,6 +218,40 @@ impl<'context, 'route, A, Publication, Projection>
             context: self.context,
             publish_captured_events: self.publish_captured_events,
             explicit_events: self.explicit_events,
+            external_events: self.external_events,
+            outbox_messages: self.outbox_messages,
+            read_model_plans: self.read_model_plans,
+            error: self.error,
+            projection: self.projection,
+            _publication: PhantomData,
+        }
+    }
+
+    /// Publish one typed fact from an external source: a provider webhook, a
+    /// reconciliation, anything that is not an aggregate transition.
+    ///
+    /// The fact becomes a [`DomainEventOccurrence`](crate::DomainEventOccurrence)
+    /// whose identity is `source` alone, so the same source position published
+    /// twice is one outbox message id (the second commit fails with
+    /// [`RepositoryError::DuplicateOutboxMessage`](crate::RepositoryError::DuplicateOutboxMessage)).
+    /// It commits with the command's ledger receipt and carries its causation,
+    /// so a `projection!` over `E` projects it like an aggregate's event.
+    pub fn publish_external<E: DomainEvent>(
+        mut self,
+        source: crate::ExternalEventSource,
+        event: E,
+    ) -> CausalCommitBuilder<'context, 'route, A, WithPublication, Projection> {
+        if self.error.is_none() {
+            match self.context.capture_external(source, &event) {
+                Ok(occurrence) => self.external_events.push(occurrence),
+                Err(error) => self.error = Some(HandlerError::Other(Box::new(error))),
+            }
+        }
+        CausalCommitBuilder {
+            context: self.context,
+            publish_captured_events: self.publish_captured_events,
+            explicit_events: self.explicit_events,
+            external_events: self.external_events,
             outbox_messages: self.outbox_messages,
             read_model_plans: self.read_model_plans,
             error: self.error,
@@ -240,6 +276,12 @@ impl<'context, 'route, A, Publication, Projection>
     {
         if let Some(error) = self.error.take() {
             return Err(error);
+        }
+        for occurrence in self.external_events {
+            self.context
+                .workspace
+                .stage_external_event(occurrence)
+                .map_err(workspace_handler_error)?;
         }
         for message in self.outbox_messages {
             self.context
@@ -293,6 +335,7 @@ where
             context: self.context,
             publish_captured_events: true,
             explicit_events: self.explicit_events,
+            external_events: self.external_events,
             outbox_messages: self.outbox_messages,
             read_model_plans: self.read_model_plans,
             error: self.error,
@@ -321,6 +364,7 @@ where
             context: self.context,
             publish_captured_events: self.publish_captured_events,
             explicit_events: self.explicit_events,
+            external_events: self.external_events,
             outbox_messages: self.outbox_messages,
             read_model_plans: self.read_model_plans,
             error: self.error,
@@ -344,6 +388,7 @@ where
             context: self.context,
             publish_captured_events: self.publish_captured_events,
             explicit_events: self.explicit_events,
+            external_events: self.external_events,
             outbox_messages: self.outbox_messages,
             read_model_plans: self.read_model_plans,
             error: self.error,
@@ -529,6 +574,39 @@ impl<'a, A> CausalCommandContext<'a, A> {
         message: OutboxMessage,
     ) -> CausalCommitBuilder<'_, 'a, A, WithPublication, NoDirectProjection> {
         CausalCommitBuilder::empty(self).outbox(message)
+    }
+
+    /// Start a unit of work that publishes one typed fact from an external
+    /// source. See [`CausalCommitBuilder::publish_external`].
+    pub fn publish_external<E: DomainEvent>(
+        &self,
+        source: crate::ExternalEventSource,
+        event: E,
+    ) -> CausalCommitBuilder<'_, 'a, A, WithPublication, NoDirectProjection> {
+        CausalCommitBuilder::empty(self).publish_external(source, event)
+    }
+
+    /// Capture `event` from `source` with this command's correlation and
+    /// trace context. Causation is the ledger's, applied when it commits.
+    fn capture_external<E: DomainEvent>(
+        &self,
+        source: crate::ExternalEventSource,
+        event: &E,
+    ) -> Result<crate::DomainEventOccurrence, crate::DomainEventCaptureError> {
+        let mut metadata = std::collections::HashMap::new();
+        self.trace_context().inject_map(&mut metadata);
+        if let Some(correlation_id) = self.correlation_id() {
+            metadata.insert(
+                crate::trace_context::CORRELATION_ID.to_string(),
+                correlation_id.to_string(),
+            );
+        }
+        crate::DomainEventOccurrence::capture_external(
+            source,
+            crate::time::now(),
+            metadata.into_iter().collect(),
+            event,
+        )
     }
 
     /// The host clock when this command was dispatched: the Durable Object

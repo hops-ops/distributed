@@ -7,6 +7,7 @@ use distributed::{AggregateBuilder, AggregateRepository, QueuedRepository};
 use todo_domain::Todo;
 
 use crate::bounds::{EventStore, Locks, ReadStore};
+use crate::handlers::ingestors::{zitadel, zitadel_scrape};
 use crate::modules::{blob, chat, identity, projections, todo};
 
 /// Explicit module inventory for the e2e-ui application.
@@ -56,15 +57,17 @@ where
         projections.chat,
     );
     let blob = blob::routes(repo.clone(), locks, read_models.clone(), projections.blob);
-    let identity = identity::routes(repo, read_models);
+    let identity = identity::routes(repo, read_models, projections.auth);
 
     // GraphQL-only public write surface. POST /todo.* stays 404 (suite T0).
-    // Zitadel Action ingress still needs HTTP: the identity module's commands
-    // get an authenticating edge in `http::gateway_router`.
+    // Zitadel Action ingress still needs HTTP: its two commands are exposed
+    // through edges that check the shared secret and run as the ingestor.
     Service::new()
         .named("e2e-ui")
         .routes(todos)
         .routes(chat)
         .routes(blob)
         .routes(identity)
+        .with_http_command(zitadel::COMMAND, zitadel::http_edge)
+        .with_http_command(zitadel_scrape::COMMAND, zitadel_scrape::http_edge)
 }

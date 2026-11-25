@@ -147,7 +147,7 @@ Outbox dispatcher and eventual consumer are **role-selected**, not copy-pasted p
 | HTTP command routes | Optional / ingress only (e.g. Zitadel) |
 | OIDC / identity | API-facing processes |
 
-Primary write path for apps remains GraphQL commands. HTTP command routes stay off unless a process calls `with_http_command_routes`.
+Primary write path for apps remains GraphQL commands. HTTP command routes stay off: a process exposes one command with `with_http_command(command, edge)` (the edge authenticates the request), or every command with `with_http_command_routes` behind a trusted proxy. `command_gateway_routes` keeps every command path on the service binding of a gateway.
 
 ---
 

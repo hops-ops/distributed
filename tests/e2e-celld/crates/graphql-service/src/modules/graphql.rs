@@ -70,6 +70,7 @@ pub(crate) fn build_graphql_engine_with_graphiql(
             projections.todo.into(),
             projections.chat.into(),
             projections.blob.into(),
+            projections.auth.into(),
         ])
         .identity(identity)
         .graphiql(graphiql);
@@ -114,6 +115,7 @@ fn pool_free_full_surface() -> Surface {
             projections.todo.into(),
             projections.chat.into(),
             projections.blob.into(),
+            projections.auth.into(),
         ])
         .expect("e2e-celld projector topology should bind")
         .with_service(&service)

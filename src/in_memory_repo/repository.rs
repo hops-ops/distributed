@@ -402,7 +402,7 @@ impl InMemoryRepository {
 
         for message in &batch.outbox_messages {
             if outbox_storage.contains_key(message.id()) {
-                return Err(RepositoryError::DuplicateOutboxMessageInBatch {
+                return Err(RepositoryError::DuplicateOutboxMessage {
                     id: message.id().to_string(),
                 }
                 .into());

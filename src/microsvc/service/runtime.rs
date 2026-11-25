@@ -72,6 +72,10 @@ pub struct Service {
     /// When true, HTTP mounts `POST /{command}`. Off by default — GraphQL,
     /// health, and in-process `dispatch` stay available without this.
     http_command_routes: bool,
+    /// Commands exposed one at a time at `POST /{command}`, each through
+    /// its own HTTP edge.
+    #[cfg(feature = "http")]
+    http_commands: BTreeMap<String, crate::microsvc::http::HttpCommandEdge>,
     #[cfg(feature = "graphql")]
     graphql: Option<std::sync::Arc<crate::graphql::GraphqlEngine>>,
     /// Started by `with_bus`; stops when the service is dropped.
@@ -94,6 +98,8 @@ impl Service {
             registered_command_mounts: Vec::new(),
             lifecycle: LifecycleGate::always_open(),
             http_command_routes: false,
+            #[cfg(feature = "http")]
+            http_commands: BTreeMap::new(),
             #[cfg(feature = "graphql")]
             graphql: None,
             #[cfg(feature = "runtime-tokio")]
@@ -139,6 +145,74 @@ impl Service {
     /// Whether the HTTP router mounts per-command `POST /{name}` routes.
     pub fn http_command_routes_enabled(&self) -> bool {
         self.http_command_routes
+    }
+
+    /// Expose one command at `POST /{command}` through `edge`.
+    ///
+    /// The edge authenticates the request from its headers and JSON body
+    /// (`null` when the body is empty) and returns what to dispatch: the
+    /// command ID, the input, and the session and principal the command runs
+    /// as. Only that command runs, through the same ledgered path as every
+    /// other dispatch, and no request header reaches it unless the edge puts
+    /// it in the returned session. The answer is the wait-path response
+    /// (`{ "payload", "receipt" }`, or `{ "code", "error" }` with its status).
+    ///
+    /// Use it for an ingress that cannot speak the GraphQL edge, such as a
+    /// provider webhook signed with a shared secret. Every other command path
+    /// stays closed; route all of them to the service with
+    /// [`command_gateway_routes`](Self::command_gateway_routes) so none falls
+    /// through to a UI.
+    ///
+    /// # Panics
+    /// When `command` already has an edge.
+    #[cfg(feature = "http")]
+    pub fn with_http_command<F>(mut self, command: impl Into<String>, edge: F) -> Self
+    where
+        F: Fn(
+                &axum::http::HeaderMap,
+                Value,
+            ) -> Result<crate::microsvc::HttpCommandDispatch, CausalDispatchError>
+            + Send
+            + Sync
+            + 'static,
+    {
+        let command = command.into();
+        assert!(
+            !self.http_commands.contains_key(&command),
+            "command `{command}` already has an HTTP edge"
+        );
+        self.http_commands.insert(command, Arc::new(edge));
+        self
+    }
+
+    /// The commands [`with_http_command`](Self::with_http_command) exposes,
+    /// with their edges.
+    #[cfg(feature = "http")]
+    pub(crate) fn http_commands(
+        &self,
+    ) -> impl Iterator<Item = (&str, &crate::microsvc::http::HttpCommandEdge)> {
+        self.http_commands
+            .iter()
+            .map(|(command, edge)| (command.as_str(), edge))
+    }
+
+    /// Gateway routes that give `binding` (the binding serving
+    /// [`router`](crate::microsvc::router)) every command path, `/{command}`
+    /// exactly, so none falls through to a UI or another prefix owner. The
+    /// service answers only the commands it exposes; every other command path
+    /// is a 404 there.
+    #[cfg(feature = "gateway")]
+    pub fn command_gateway_routes(&self, binding: &str) -> Vec<crate::gateway::Route> {
+        self.command_names()
+            .into_iter()
+            .map(|command| {
+                crate::gateway::Route::new(
+                    format!("command:{command}"),
+                    crate::gateway::RoutePath::exact(format!("/{command}")),
+                    binding,
+                )
+            })
+            .collect()
     }
 
     /// Configure the durable command attempt lease and replay retention.

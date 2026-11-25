@@ -66,9 +66,12 @@ let service = service.try_with_graphql(engine)?;
 // GET  /graphql  — GraphiQL IDE when `.graphiql(true)`
 ```
 
-`POST /{command}` stays off unless you call `with_http_command_routes()`.
-Call that only for an intentional, independently authenticated ingress.
-GraphQL mutations do not need it.
+`POST /{command}` stays off. For an intentional, independently authenticated
+ingress, expose that one command with `with_http_command(command, edge)`: the
+edge checks the request and returns the dispatch (command ID, input, session,
+principal). `with_http_command_routes()` opens every command to trusted-proxy
+headers. Behind a gateway, `command_gateway_routes(binding)` keeps every
+command path on the service. GraphQL mutations need none of these.
 
 Build the executable `Service` first and pass that exact instance to
 `GraphqlEngineBuilder::service`. For `Atomic<M>`, pass the repository handle

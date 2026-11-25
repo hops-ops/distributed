@@ -1483,7 +1483,7 @@ IdentityConfig::oidc_bearer(oidc)`
 			samples: [
 				{
 					file: 'modules/compose.rs · MODULE_IDS',
-					caption: 'Identity is a module with no aggregate. It mounts the Zitadel commands and the `AuthUsers` projector.',
+					caption: 'Identity is a module with no aggregate. It mounts the Zitadel commands and the `AuthUsers` projection.',
 					code: `pub const MODULE_IDS: &[&str] = &[
   todo::MODULE_ID,
   chat::MODULE_ID,
@@ -1493,14 +1493,19 @@ IdentityConfig::oidc_bearer(oidc)`
 				},
 				{
 					file: 'modules/identity.rs · Zitadel ingress',
-					caption: 'These are typed commands with no aggregate. Each provider message commits with its command ledger receipt. The HTTP edge checks the shared secret and dispatches them as the ingestor. No user role can call them.',
+					caption: 'These are typed commands with no aggregate. Each user profile they publish commits with its command ledger receipt. Each command has its own HTTP edge: it checks the shared secret and dispatches as the ingestor. No user role can call them, and every other command path stays closed.',
 					code: `Routes::for_stores(repo, read_models)
   .typed_command(zitadel::command())
   .handle(zitadel::handle)
   .typed_command(zitadel_scrape::command())
   .handle(zitadel_scrape::Scrape(read_models.clone()))
-  .events(project_auth_user::EVENTS)
-  .guarded(project_auth_user::guard, project_auth_user::handle)`
+  .consume_projection(auth_projector)
+
+// compose.rs
+Service::new()
+  // ...
+  .with_http_command(zitadel::COMMAND, zitadel::http_edge)
+  .with_http_command(zitadel_scrape::COMMAND, zitadel_scrape::http_edge)`
 				},
 				{
 					file: 'modules/graphql.rs · identity_from_env',
@@ -1514,7 +1519,7 @@ IdentityConfig::oidc_bearer(oidc)`
 		{
 			id: 'events',
 			label: '6 · Directory',
-			lede: 'People appear as `AuthUsers` rows. Zitadel ingest and scrape emit domain events that fill those rows. Chat author and blob owner join this directory. Do not store a second display name.',
+			lede: 'People appear as `AuthUsers` rows. Zitadel ingest and scrape publish user profiles as external facts, and a projection fills those rows. Chat author and blob owner join this directory. Do not store a second display name.',
 			principle: 'Fill `AuthUsers` from identity events. Do not fill it from user commands.',
 			samples: [
 				{
@@ -1537,38 +1542,24 @@ pub struct AuthUsers {
 }`
 				},
 				{
-					file: 'handlers/events/project_auth_user.rs',
-					caption: 'These Zitadel events upsert or update status on `AuthUsers`.',
-					code: `pub const EVENTS: &[&str] = &[
-  "zitadel.user.human.created.v1",
-  "zitadel.user.human.updated.v1",
-  "zitadel.user.human.deactivated.v1",
-  "zitadel.user.human.reactivated.v1",
-  "zitadel.user.machine.created.v1",
-];
+					file: 'projections/auth_users.rs · AUTH_USERS',
+					caption: 'The ingestor publishes a `ZitadelUserProfile` with `publish_external`, identified by the delivery it came from. The projection writes it to `AuthUsers` as it is.',
+					code: `#[derive(Serialize, Deserialize, distributed::DomainEvent)]
+#[domain_event(name = "zitadel.user_profile", version = 1)]
+pub struct ZitadelUserProfile { /* the AuthUsers columns */ }
 
-pub async fn handle<R, L, S>(
-  ctx: &Context<'_, AuthDeps<R, S>>,
-) -> Result<Value, HandlerError> {
-  let payload: ZitadelUserPayload = decode_payload(ctx.message())?;
-  let name = ctx.message().name();
-  let row = if name.contains("deactivated")
-    || name.contains("reactivated")
-  {
-    map_zitadel_user_status(name, &payload)
-  } else {
-    map_zitadel_user_upsert(name, &payload)
+distributed::projection! {
+  pub const AUTH_USERS: ProjectionDescriptor<EventualOnly> = {
+    name: "project_auth_users",
+    version: 1,
+    epoch: "e2e-ui-auth-users-v1",
+    model: AuthUsers,
+    on {
+      events: [ZitadelUserProfile],
+      mutation: SaveAuthUser,
+      input: { user: body },
+    },
   };
-  let store = ctx.read_model_store();
-  let mut plan = ReadModelWritePlanBuilder::new();
-  plan.upsert(&row).map_err(read_model_error)?;
-  plan.commit(store).await.map_err(read_model_error)?;
-  Ok(json!({
-    "event": name,
-    "user_id": row.user_id,
-    "status": row.status,
-    "display_name": row.display_name,
-  }))
 }`
 				}
 			]

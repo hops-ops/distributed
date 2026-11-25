@@ -1,33 +1,30 @@
 //! Command: `zitadel.scrape.v1` — reconcile from the Management API.
 //!
-//! Lists every user and publishes the ones whose `auth_users` row differs
-//! from the listed profile: one commit holds a provider message and the row
-//! per changed user, with the command's receipt. No aggregate. Requires
+//! Lists every user and publishes the profiles that differ from their
+//! `auth_users` row, in one commit with the command's receipt; the
+//! `auth_users` projection writes them. No aggregate. Requires
 //! `ZITADEL_SERVICE_USER_TOKEN` + `ZITADEL_API_URL` / `OIDC_ISSUER` in env.
 
-use distributed::command::{typed_command, PreparedCommand, Succeeded, TypedCommand};
 use std::future::Future;
 use std::pin::Pin;
 
+use axum::http::HeaderMap;
+use distributed::command::{typed_command, PreparedCommand, Succeeded, TypedCommand};
 use distributed::microsvc::{
-    CausalCommandContext, CausalDispatchError, HandlerError, PreparedCommandHandler, Service,
-    Session,
+    CausalCommandContext, CausalDispatchError, HandlerError, HttpCommandDispatch,
+    PreparedCommandHandler, Service,
 };
-use distributed::read_model::ReadModelWritePlanBuilder;
 use distributed::{
-    ReadModelWorkspaceExt, ReadModelWritePlanStore, RelationalReadModelQueryStore, RowKey, RowValue,
+    ExternalEventSource, ReadModelWorkspaceExt, ReadModelWritePlanStore,
+    RelationalReadModelQueryStore, RowKey, RowValue,
 };
 use e2e_readmodels::AuthUsers;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-use super::zitadel::scrape::{
-    auth_user_row, list_mapped_users, ZitadelScrapeConfig, API_URL_ENV, TOKEN_ENV,
-};
+use super::zitadel::scrape::{list_mapped_users, ZitadelScrapeConfig, API_URL_ENV, TOKEN_ENV};
 use super::zitadel::MappedDelivery;
-use super::zitadel::{
-    ingestor_principal, ingestor_session, provider_message, verify_authenticity, INGESTOR_ROLE,
-};
+use super::zitadel::{ingestor_principal, ingestor_session, verify_authenticity, INGESTOR_ROLE};
 
 pub const COMMAND: &str = "zitadel.scrape.v1";
 
@@ -41,7 +38,7 @@ pub struct ZitadelScrapeInput {
 pub struct ZitadelScrapePayload {
     /// Users the Management API listed.
     pub listed: u32,
-    /// Provider messages published: one per user whose profile changed.
+    /// Profiles published: one per user whose profile changed.
     pub published: u32,
     /// Listed users not published: unchanged, or with no usable id.
     pub skipped: u32,
@@ -86,23 +83,10 @@ where
     }
 }
 
-/// Whether a listed profile must be published: its row is missing or differs.
-///
-/// A scrape commits a user's row with that user's message, so an equal row
-/// means the profile was already published. `updated_at` is when a profile was
-/// ingested, not part of it.
-pub fn profile_changed(listed: &AuthUsers, stored: Option<&AuthUsers>) -> bool {
-    stored.is_none_or(|stored| {
-        AuthUsers {
-            updated_at: listed.updated_at.clone(),
-            ..stored.clone()
-        } != *listed
-    })
-}
-
-/// Publish the `users` (of `listed`) whose profile changed, each with its
-/// `auth_users` row. Directory joins (chat author, blob owner) do not wait for
-/// the bus: the row commits here, with the message.
+/// Publish the `users` (of `listed`) whose profile differs from their
+/// `auth_users` row. A row equal to the listed profile means it was already
+/// published and projected; a profile published but not yet projected is
+/// published again, and the projection writes the same row twice.
 async fn reconcile<S>(
     ctx: &CausalCommandContext<'_, ()>,
     read_models: &S,
@@ -112,41 +96,47 @@ async fn reconcile<S>(
 where
     S: ReadModelWritePlanStore + RelationalReadModelQueryStore,
 {
-    // Message ids come from this command's id, so a scrape never meets an id
-    // an earlier one committed.
+    // Each profile is identified by this command and its place in the
+    // listing, so a scrape never publishes a fact an earlier one did.
     let command_id = ctx.message_id().unwrap_or_default();
-    let mut messages = Vec::new();
-    let mut rows = ReadModelWritePlanBuilder::new();
+    let mut changed = Vec::new();
     for user in users {
-        let row = auth_user_row(user);
-        let key = RowKey::new([("user_id", RowValue::String(row.user_id.clone()))]);
+        let key = RowKey::new([("user_id", RowValue::String(user.profile.user_id.clone()))]);
         let stored = read_models
             .workspace()
             .load::<AuthUsers>(key)
             .one()
             .await
             .map_err(|error| HandlerError::Other(Box::new(error)))?;
-        if !profile_changed(&row, stored.as_ref().map(|stored| &stored.data)) {
-            continue;
+        if user
+            .profile
+            .differs_from(stored.as_ref().map(|stored| &stored.data))
+        {
+            changed.push(user.profile.clone());
         }
-        let id = format!("{COMMAND}:{command_id}:{}", messages.len());
-        messages.push(provider_message(id, user)?);
-        rows.upsert(&row)
-            .map_err(|error| HandlerError::Other(Box::new(error)))?;
     }
     let payload = ZitadelScrapePayload {
         listed: listed as u32,
-        published: messages.len() as u32,
-        skipped: listed.saturating_sub(messages.len()) as u32,
+        published: changed.len() as u32,
+        skipped: listed.saturating_sub(changed.len()) as u32,
     };
-    let mut messages = messages.into_iter();
-    let Some(first) = messages.next() else {
+    let source =
+        |position: usize, profile: &e2e_projections::ZitadelUserProfile| ExternalEventSource {
+            producer: COMMAND.into(),
+            stream: command_id.into(),
+            position: position as u64 + 1,
+            key: profile.user_id.clone(),
+        };
+    let mut changed = changed.into_iter().enumerate();
+    let Some((position, first)) = changed.next() else {
         return PreparedCommand::prepare(payload)
             .map_err(|error| HandlerError::Other(Box::new(error)));
     };
-    messages
-        .fold(ctx.outbox(first), |unit, message| unit.outbox(message))
-        .read_models(rows)
+    changed
+        .fold(
+            ctx.publish_external(source(position, &first), first),
+            |unit, (position, profile)| unit.publish_external(source(position, &profile), profile),
+        )
         .commit()?
         .succeeded(payload)
 }
@@ -165,65 +155,43 @@ pub async fn scrape(service: &Service, trigger: &str) -> Result<Value, CausalDis
         .await
 }
 
-/// HTTP edge of [`COMMAND`]: the shared secret, then [`scrape`]. `caller` is
-/// the request's headers; none of them reaches the command.
-pub async fn receive(service: &Service, caller: &Session) -> Result<Value, CausalDispatchError> {
-    verify_authenticity(caller, false).map_err(CausalDispatchError::Handler)?;
-    scrape(service, "http").await
+/// HTTP edge of [`COMMAND`] (`Service::with_http_command`): the shared
+/// secret, then a scrape as the ingestor with a fresh id, like [`scrape`].
+/// The body is ignored and no request header reaches the command.
+pub fn http_edge(
+    headers: &HeaderMap,
+    _body: Value,
+) -> Result<HttpCommandDispatch, CausalDispatchError> {
+    verify_authenticity(headers, false).map_err(CausalDispatchError::Handler)?;
+    Ok(HttpCommandDispatch {
+        command_id: uuid::Uuid::now_v7().to_string(),
+        input: json!({ "trigger": "http" }),
+        session: ingestor_session(),
+        principal: ingestor_principal(),
+    })
 }
 
 #[cfg(test)]
 mod tests {
-    use super::super::zitadel::{HUMAN_UPDATED, MACHINE_CREATED};
+    use super::super::zitadel::{user_profile, HUMAN_UPDATED};
     use super::*;
     use distributed::microsvc::Routes;
     use distributed::{InMemoryRepository, OutboxStore};
-    use e2e_projections::{ZitadelEmail, ZitadelUserPayload};
+    use e2e_projections::{ZitadelUserProfile, AUTH_USERS};
 
-    fn listed_user(subject: &str, display_name: &str, ingested_at: &str) -> MappedDelivery {
+    fn listed_user(subject: &str, display_name: &str) -> MappedDelivery {
         MappedDelivery {
             message_name: HUMAN_UPDATED.into(),
             delivery_id: format!("zitadel-scrape:{subject}"),
-            payload: ZitadelUserPayload {
-                schema_version: 1,
-                source: "zitadel-scrape".into(),
-                delivery_id: format!("zitadel-scrape:{subject}"),
-                provider: "zitadel".into(),
-                provider_subject: subject.into(),
-                user_kind: "human".into(),
-                emails: vec![ZitadelEmail {
-                    address: format!("{subject}@example.com"),
-                    primary: true,
-                    verified: true,
-                }],
-                display_name: Some(display_name.into()),
-                approval_status: "approved".into(),
-                ingested_at: ingested_at.into(),
-            },
+            profile: user_profile(
+                HUMAN_UPDATED,
+                subject,
+                "human".into(),
+                format!("{subject}@example.com"),
+                Some(display_name.into()),
+                "approved".into(),
+            ),
         }
-    }
-
-    #[test]
-    fn a_profile_is_published_when_its_row_is_missing_or_differs() {
-        let listed = auth_user_row(&listed_user("ada", "Ada", "2"));
-        assert!(profile_changed(&listed, None));
-
-        // Only the ingestion time differs: the same profile.
-        let stored = auth_user_row(&listed_user("ada", "Ada", "1"));
-        assert!(!profile_changed(&listed, Some(&stored)));
-
-        let renamed = auth_user_row(&listed_user("ada", "Ada L.", "1"));
-        assert!(profile_changed(&listed, Some(&renamed)));
-        let deactivated = AuthUsers {
-            status: "deactivated".into(),
-            ..stored.clone()
-        };
-        assert!(profile_changed(&listed, Some(&deactivated)));
-        let pending = AuthUsers {
-            approval_status: "pending".into(),
-            ..stored
-        };
-        assert!(profile_changed(&listed, Some(&pending)));
     }
 
     /// [`Scrape`] with the listing given, not fetched from Zitadel.
@@ -245,7 +213,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_second_scrape_of_an_unchanged_listing_stages_nothing() {
+    async fn a_scrape_publishes_only_the_profiles_that_differ_from_their_rows() {
         let repo = InMemoryRepository::new();
         let service_listing = |users: Vec<MappedDelivery>| {
             Service::new().named("identity").routes(
@@ -254,39 +222,61 @@ mod tests {
                     .handle(Listed(repo.clone(), users)),
             )
         };
-        let staged = || async {
+        let published = || async {
             repo.outbox_store()
                 .pending(usize::MAX)
                 .await
                 .unwrap()
-                .into_iter()
-                .map(|message| message.event_type)
+                .iter()
+                .map(|message| {
+                    let occurrence = message.domain_event_occurrence().unwrap();
+                    assert_eq!(message.id(), occurrence.id());
+                    occurrence.decode_body::<ZitadelUserProfile>().unwrap()
+                })
+                .map(|profile| (profile.user_id, profile.display_name))
                 .collect::<Vec<_>>()
         };
-        let users = vec![
-            listed_user("ada", "Ada", "1"),
-            listed_user("grace", "Grace", "1"),
-        ];
+        // Run the `auth_users` projection over everything published.
+        let project = || async {
+            for message in repo.outbox_store().pending(usize::MAX).await.unwrap() {
+                let occurrence = message.domain_event_occurrence().unwrap();
+                let lowered = AUTH_USERS
+                    .server_executor()
+                    .unwrap()
+                    .plan(&occurrence)
+                    .unwrap();
+                repo.commit_write_plan(lowered.write_plan).await.unwrap();
+            }
+        };
+        let users = vec![listed_user("ada", "Ada"), listed_user("grace", "Grace")];
 
         // The listing also held one user with no usable id.
         let first = scrape(&service_listing(users.clone()), "start")
             .await
             .unwrap();
         assert_eq!(first, json!({ "listed": 3, "published": 2, "skipped": 1 }));
-        assert_eq!(staged().await, [HUMAN_UPDATED, HUMAN_UPDATED]);
+        assert_eq!(
+            published().await,
+            [
+                ("ada".into(), "Ada".into()),
+                ("grace".into(), "Grace".into())
+            ]
+        );
+        project().await;
 
         let unchanged = scrape(&service_listing(users), "interval").await.unwrap();
         assert_eq!(
             unchanged,
             json!({ "listed": 3, "published": 0, "skipped": 3 })
         );
-        assert_eq!(staged().await.len(), 2);
+        assert_eq!(published().await.len(), 2);
 
         // One profile changed: that one alone is published.
-        let mut renamed = listed_user("grace", "Grace H.", "2");
-        renamed.message_name = MACHINE_CREATED.into();
         let changed = scrape(
-            &service_listing(vec![listed_user("ada", "Ada", "2"), renamed]),
+            &service_listing(vec![
+                listed_user("ada", "Ada"),
+                listed_user("grace", "Grace H."),
+            ]),
             "interval",
         )
         .await
@@ -295,9 +285,6 @@ mod tests {
             changed,
             json!({ "listed": 3, "published": 1, "skipped": 2 })
         );
-        assert_eq!(
-            staged().await,
-            [HUMAN_UPDATED, HUMAN_UPDATED, MACHINE_CREATED]
-        );
+        assert_eq!(published().await[2], ("grace".into(), "Grace H.".into()));
     }
 }

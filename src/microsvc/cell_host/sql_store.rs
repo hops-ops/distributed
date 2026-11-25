@@ -165,7 +165,7 @@ impl CellSqlRepository {
                         )
                         .await?;
                     if !existing.is_empty() {
-                        return Err(RepositoryError::DuplicateOutboxMessageInBatch {
+                        return Err(RepositoryError::DuplicateOutboxMessage {
                             id: message.id().into(),
                         }
                         .into());

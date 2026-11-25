@@ -120,7 +120,7 @@ where
 
     assert!(matches!(
         err,
-        RepositoryError::DuplicateOutboxMessageInBatch { .. }
+        RepositoryError::DuplicateOutboxMessage { .. }
     ));
     assert!(repo
         .get_stream(&rollback_identity)
