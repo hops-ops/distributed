@@ -85,10 +85,24 @@ pub(crate) type LedgerCompaction = Arc<
         + Sync,
 >;
 
+/// A command's declared shard over its wire input: the input is validated
+/// and decoded as the command's own input type first.
+#[cfg(feature = "graphql")]
+pub(crate) type ErasedCommandShard =
+    Arc<dyn Fn(&Value) -> Result<String, CausalDispatchError> + Send + Sync>;
+
 pub(in crate::microsvc::service) trait ErasedCausalHandler<D>:
     Send + Sync
 {
     fn contract(&self) -> &TypedCommandContract;
+
+    /// The aggregate type the command commits to.
+    #[cfg(feature = "graphql")]
+    fn aggregate(&self) -> std::any::TypeId;
+
+    /// The declared shard, when the command declares one.
+    #[cfg(feature = "graphql")]
+    fn shard(&self) -> Option<ErasedCommandShard>;
 
     /// The ledger fingerprint of [`Self::contract`].
     #[cfg(feature = "graphql")]
@@ -192,6 +206,14 @@ pub(in crate::microsvc::service) trait ErasedRoutes:
     /// The contract of `command`, when this bundle registers it as a typed
     /// command.
     fn typed_command_contract(&self, command: &str) -> Option<&TypedCommandContract>;
+
+    /// Every typed command of this bundle that commits to `aggregate`, with
+    /// its declared shard.
+    #[cfg(feature = "graphql")]
+    fn aggregate_command_shards(
+        &self,
+        aggregate: std::any::TypeId,
+    ) -> Vec<(&str, Option<ErasedCommandShard>)>;
 
     fn projector_registrations(&self) -> Vec<ProjectorRegistration>;
 

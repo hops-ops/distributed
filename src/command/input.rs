@@ -17,26 +17,38 @@ use super::{CommandTypeDef, CommandTypeField};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct CommandInputError {
-    message: String,
+    /// The offending value; `None` for a definition error.
+    path: Option<String>,
+    detail: String,
 }
 
 impl CommandInputError {
-    fn at(path: &str, message: impl Into<String>) -> Self {
+    fn at(path: &str, detail: impl Into<String>) -> Self {
         Self {
-            message: format!("command input `{path}` {}", message.into()),
+            path: Some(path.to_string()),
+            detail: detail.into(),
         }
     }
 
-    fn configuration(message: impl Into<String>) -> Self {
+    fn configuration(detail: impl Into<String>) -> Self {
         Self {
-            message: format!("command input definition {}", message.into()),
+            path: None,
+            detail: detail.into(),
+        }
+    }
+
+    /// The error about a value of `subject` (`command input`, `command output`).
+    fn describe(&self, subject: &str) -> String {
+        match &self.path {
+            Some(path) => format!("{subject} `{path}` {}", self.detail),
+            None => format!("{subject} definition {}", self.detail),
         }
     }
 }
 
 impl std::fmt::Display for CommandInputError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(&self.message)
+        formatter.write_str(&self.describe("command input"))
     }
 }
 
@@ -128,6 +140,19 @@ pub(crate) fn canonicalize_command_input(
         bytes,
         digest,
     })
+}
+
+#[cfg(feature = "graphql")]
+/// Check a command payload produced elsewhere (an aggregate cell) against
+/// the command's declared output type, by the input rules: every required
+/// field present, no undeclared field, every value of its declared type.
+pub(crate) fn validate_command_output(
+    definition: &CommandTypeDef,
+    output: &Value,
+) -> Result<(), String> {
+    canonicalize_object(definition, output.clone(), "$")
+        .map(|_| ())
+        .map_err(|error| error.describe("command output"))
 }
 
 #[cfg(test)]

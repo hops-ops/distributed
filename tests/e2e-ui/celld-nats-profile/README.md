@@ -23,12 +23,13 @@ make down-celld-nats   # NATS only
 make down-celld        # celld; local state is preserved
 
 cd ../e2e-celld
-make run               # new GraphQL service crates + the Svelte UI
+make run               # this service on celld cells + the Svelte UI
 ```
 
 `tests/e2e-ui/crates/service/src/host.rs` stays a single backend process.
-The playground UI against celld is the sibling example `tests/e2e-celld/`
-(new service crates; same domain crates). Do not add that topology here.
+The playground UI against celld is the sibling example `tests/e2e-celld/`:
+one runner crate over this `e2e-service`, with a celld command host and a
+NATS bus. Do not add that topology here.
 
 ## What this profile is
 

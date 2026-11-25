@@ -1,19 +1,12 @@
-# Sibling of tests/e2e-ui. Same domain crates; new service crates.
-# GraphQL wait-dispatches Todo create/complete and chat.post to celld.
-# Cell outbox drains onto NATS; @live and Eventual projectors stay here.
+# The e2e-ui application on another command host: one runner crate over
+# e2e-ui's `e2e-service`. Todo and Chat commands wait-dispatch to celld cells;
+# the cells' outbox drains onto NATS; @live and Eventual projectors stay here.
 [workspace]
 resolver = "2"
-members = [
-    "crates/todo-service",
-    "crates/chat-service",
-    "crates/blob-service",
-    "crates/identity-service",
-    "crates/graphql-service",
-    "crates/runner",
-]
+members = ["crates/runner"]
 
 [workspace.metadata.distributed.application]
-package = "e2e-celld-graphql"
+package = "e2e-celld-runner"
 entrypoint = "application_manifest"
 
 [workspace.metadata.distributed.runtime]
@@ -35,16 +28,9 @@ AUTH_SECRET = "distributed-local-development-only-secret"
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-license = "MIT"
-publish = false
 
 [workspace.dependencies]
 distributed = { path = "../..", features = ["sqlite", "postgres", "http", "graphql", "gateway-graphql-native", "metrics", "nats"] }
-serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync"] }
-thiserror = "1"
 axum = "0.8"
-reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
-sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "sqlite", "postgres"] }
-async-trait = "0.1"

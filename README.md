@@ -357,10 +357,13 @@ calls `run`. You do not set a runtime role flag.
 
 Todo commands are `command!` declarations in `todo-domain`. This
 playground mounts them on a local Service. The sibling example
-[`tests/e2e-celld`](tests/e2e-celld) mounts the same declarations and
-wait-dispatches create, complete, and `chat.post` to a **cell** (one private
-SQLite per todo or message). GraphQL `@live` and Eventual projectors stay
-off the cell.
+[`tests/e2e-celld`](tests/e2e-celld) is one runner crate over the same
+service crate: the same `build_service`, another command host. Every Todo
+command and `chat.post` wait-dispatches to a **cell** (one private SQLite per
+todo or message), routed by `CelldCommandHost::route_aggregate::<Todo>()` from
+the mounted declarations: the cell kind is the aggregate type, the shard is
+each declaration's `shard:`. GraphQL `@live` and Eventual projectors stay off
+the cell.
 
 The same packages can back a different `Service` later: all modules in one
 binary, or commands here and Eventual projectors there. **Atomic** work
@@ -553,7 +556,7 @@ distributed dev            # prepares JS/WASM + clients; starts Rust + SvelteKit
 
 distributed build          # typed manifest + Rust build + Vite build
 
-# Optional: same UI, Todo create/complete on celld
+# Optional: same application, Todo and chat.post on celld cells
 cd tests/e2e-ui && make up && make up-celld-nats
 cd ../e2e-celld && make run
 ```
@@ -564,7 +567,7 @@ Full celld runbook: **[`tests/e2e-celld/README.md`](tests/e2e-celld/README.md)**
 Small apps, full patterns. Each screen has **How it is built**: query,
 then command, then handler, then domain, then events, then service and
 host. Todos also run against celld from [`tests/e2e-celld`](tests/e2e-celld)
-with the same domain crate.
+with the same service crate.
 
 | Demo | Tag | What it shows |
 |---|---|---|
@@ -2758,7 +2761,7 @@ distributed_leaderboard/ # Sorted-set leaderboards as a rebuildable projection t
 js/                   # @hops-ops/distributed JS/TS client, command runtime, SvelteKit adapter, game SDK
 examples/             # graphiql.rs, and examples/game (game demos + SvelteKit Mob Pit; own workspace)
 tests/e2e-ui/         # Full-stack CQRS + GraphQL + SvelteKit template (nested workspace)
-tests/e2e-celld/      # The same UI with commands on celld cells and NATS (nested workspace)
+tests/e2e-celld/      # The e2e-ui service on celld cells and NATS: one runner crate (nested workspace)
 migrations/           # Explicit SQLite and Postgres migrations
 compose.yaml          # Local postgres / rabbitmq / kafka / nats / redis for integration tests
 ```
@@ -2818,7 +2821,7 @@ e2e-celld (`tests/e2e-celld`), Blob game, live chat, GraphiQL.
 | Path | What it showcases |
 |---|---|
 | [`tests/e2e-ui/`](tests/e2e-ui/) | Full-stack CQRS + GraphQL + OIDC + SvelteKit (todos, chat, blob) |
-| [`tests/e2e-celld/`](tests/e2e-celld/) | Same UI; Todo + `chat.post` wait-dispatch to celld; `@live` stays on GraphQL |
+| [`tests/e2e-celld/`](tests/e2e-celld/) | Same application and UI on another command host: Todo + `chat.post` wait-dispatch to celld; `@live` stays on GraphQL |
 | [`js/`](js/) | `@hops-ops/distributed` — transport, causal replica, SvelteKit/React |
 | [`examples/graphiql.rs`](examples/graphiql.rs) | Seeded GraphQL playground (`--features "graphql,sqlite"`) |
 | `tests/graphql/` | Engine, HTTP/WS, harden, identity, multi-IdP OIDC |

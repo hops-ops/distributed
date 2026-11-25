@@ -14,6 +14,8 @@ pub use builder::{
     EventRouteBuilder, PortableCommand, ThinCommandBuilder, ThinCommandInvoked, ThinCommandLoaded,
     TypedRouteBuilder,
 };
+#[cfg(feature = "graphql")]
+pub(crate) use erased::ErasedCommandShard;
 #[cfg(any(feature = "graphql", feature = "runtime-tokio"))]
 pub(crate) use erased::LedgerCompaction;
 pub(super) use erased::{CausalCommandPolicy, ErasedRoutes};

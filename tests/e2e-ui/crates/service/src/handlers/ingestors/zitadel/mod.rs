@@ -30,5 +30,6 @@ pub use map::{
     HUMAN_REACTIVATED, HUMAN_UPDATED, MACHINE_CREATED,
 };
 pub use scrape::{
-    spawn_scrape_loop, ZitadelScrapeConfig, API_URL_ENV, INTERVAL_ENV, ON_START_ENV, TOKEN_ENV,
+    spawn_scrape_from_env, spawn_scrape_loop, ZitadelScrapeConfig, API_URL_ENV, INTERVAL_ENV,
+    ON_START_ENV, TOKEN_ENV,
 };

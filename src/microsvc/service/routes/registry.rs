@@ -8,7 +8,9 @@ use super::super::causal::{CausalDispatchError, CausalDispatchResult, SealModele
 use super::super::handlers::{
     CausalGuardFn, GuardFn, HandlerFn, HandlerFuture, PreparedHandlerFn, ProjectorBootstrapFuture,
 };
-use super::builder::{EventRouteBuilder, PortableCommand, TypedRouteBuilder};
+use super::builder::{CommandShard, EventRouteBuilder, PortableCommand, TypedRouteBuilder};
+#[cfg(feature = "graphql")]
+use super::erased::ErasedCommandShard;
 #[cfg(any(feature = "graphql", feature = "runtime-tokio"))]
 use super::erased::LedgerCompaction;
 use super::erased::{CausalCommandPolicy, CausalHandlerFuture, ErasedCausalHandler, ErasedRoutes};
@@ -183,6 +185,7 @@ impl<D: Send + Sync + 'static> Routes<D> {
             contract,
             mount: None,
             requires: Vec::new(),
+            shard: None,
             _types: std::marker::PhantomData,
         }
     }
@@ -416,6 +419,7 @@ impl<D: Send + Sync + 'static> Routes<D> {
         guard: Option<Arc<CausalGuardFn<D::Aggregate>>>,
         handle: Arc<PreparedHandlerFn<D::Aggregate, I, K>>,
         requires: Vec<crate::schedule::Capability>,
+        shard: Option<CommandShard<I>>,
     ) -> Self
     where
         D: CausalRouteDependencies,
@@ -471,6 +475,7 @@ impl<D: Send + Sync + 'static> Routes<D> {
                     handle,
                     requires_clock,
                     requires.contains(&crate::schedule::Capability::Scheduling),
+                    shard,
                 )
                 .unwrap_or_else(|error| panic!("typed command contract cannot compile: {error}")),
             )),
@@ -691,6 +696,17 @@ where
         self.causal_handler(command)
             .ok()
             .map(|handler| handler.contract())
+    }
+
+    #[cfg(feature = "graphql")]
+    fn aggregate_command_shards(
+        &self,
+        aggregate: std::any::TypeId,
+    ) -> Vec<(&str, Option<ErasedCommandShard>)> {
+        self.causal_handlers()
+            .filter(|handler| handler.aggregate() == aggregate)
+            .map(|handler| (handler.contract().name.as_str(), handler.shard()))
+            .collect()
     }
 
     fn projector_registrations(&self) -> Vec<ProjectorRegistration> {

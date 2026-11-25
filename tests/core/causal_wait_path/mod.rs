@@ -6,7 +6,7 @@ use std::sync::Arc;
 use axum::http::StatusCode;
 use distributed::bus::{Bus, BusConsumer, InMemoryBus, TransportError};
 use distributed::cell_host::{
-    AggregateCell, CellCommandIdentity, CelldCommandHost, CelldRoute, InternalHttpSecret,
+    AggregateCell, CellCommandIdentity, CelldCommandHost, InternalHttpSecret,
     CELL_CAUSATION_ID_HEADER, CELL_INTERNAL_SECRET_HEADER, CELL_PRINCIPAL_PARTITION_HEADER,
     CELL_SERVICE_ID_HEADER,
 };
@@ -850,12 +850,9 @@ async fn celld_host_completes_remote_commit_once_and_rejects_changed_shard() {
         InternalHttpSecret::new("test-only-internal-secret-32-bytes").unwrap(),
     )
     .unwrap()
-    .route(CelldRoute::new(
-        &["todo.create"],
-        "todo",
-        |input| input.get("id").and_then(Value::as_str).map(str::to_owned),
-        |_command, _input, remote, _session| remote.clone(),
-    ));
+    .cell_route("todo.create", "todo", |input, _session| {
+        input.get("id").and_then(Value::as_str).map(str::to_owned)
+    });
     let mut session = distributed::microsvc::Session::new();
     session.set(USER_ID_KEY, "alice");
     session.set(ROLE_KEY, "user");
@@ -885,12 +882,9 @@ async fn celld_host_completes_remote_commit_once_and_rejects_changed_shard() {
         InternalHttpSecret::new("test-only-internal-secret-32-bytes").unwrap(),
     )
     .unwrap()
-    .route(CelldRoute::new(
-        &["todo.create"],
-        "todo",
-        |input| input.get("id").and_then(Value::as_str).map(str::to_owned),
-        |_command, _input, remote, _session| remote.clone(),
-    ));
+    .cell_route("todo.create", "todo", |input, _session| {
+        input.get("id").and_then(Value::as_str).map(str::to_owned)
+    });
     let replay = restarted_host
         .invoke(
             "todo.create",
@@ -929,12 +923,9 @@ async fn celld_host_completes_remote_commit_once_and_rejects_changed_shard() {
         InternalHttpSecret::new("test-only-internal-secret-32-bytes").unwrap(),
     )
     .unwrap()
-    .route(CelldRoute::new(
-        &["todo.create"],
-        "todo",
-        |_input| Some("todo-different-cell".into()),
-        |_command, _input, remote, _session| remote.clone(),
-    ));
+    .cell_route("todo.create", "todo", |_input, _session| {
+        Some("todo-different-cell".into())
+    });
     let mut binding_session = distributed::microsvc::Session::new();
     binding_session.set(USER_ID_KEY, "alice");
     binding_session.set(ROLE_KEY, "user");
@@ -1014,12 +1005,9 @@ async fn celld_host_reclaims_an_ambiguous_receipt_with_the_same_causation() {
         InternalHttpSecret::new("test-only-internal-secret-32-bytes").unwrap(),
     )
     .unwrap()
-    .route(CelldRoute::new(
-        &["todo.create"],
-        "todo",
-        |input| input.get("id").and_then(Value::as_str).map(str::to_owned),
-        |_command, _input, remote, _session| remote.clone(),
-    ));
+    .cell_route("todo.create", "todo", |input, _session| {
+        input.get("id").and_then(Value::as_str).map(str::to_owned)
+    });
     let mut session = distributed::microsvc::Session::new();
     session.set(USER_ID_KEY, "alice");
     session.set(ROLE_KEY, "user");
@@ -1055,6 +1043,186 @@ async fn celld_host_reclaims_an_ambiguous_receipt_with_the_same_causation() {
         .expect("retry should reclaim the durable reservation");
     assert_eq!(retry.state(), "succeeded");
     assert_eq!(state.0.load(Ordering::SeqCst), 2);
+}
+
+/// A service whose `todo.create` declares its shard: the id it creates.
+fn sharded_wait_service() -> Arc<Service> {
+    let causal = Routes::new()
+        .with_repo(InMemoryRepository::new().aggregate::<WaitAgg>())
+        .typed_command(
+            typed_command::<IdInput, Succeeded<IdPayload>>("todo.create").roles(["user"]),
+        )
+        .create_by(|input: &IdInput| input.id.clone())
+        .invoke(|aggregate, input, _owner| {
+            aggregate.record(input.id.clone())?;
+            Ok::<_, distributed::EventRecordError>(())
+        })
+        .succeeded(|aggregate, _principal| IdPayload {
+            id: aggregate.entity().id().to_string(),
+        });
+    Arc::new(Service::new().named("causal-wait-path").routes(causal))
+}
+
+/// A cell that records each request path and answers `payload(input)`.
+async fn recording_cell(
+    payload: fn(&Value) -> Value,
+) -> (String, Arc<std::sync::Mutex<Vec<String>>>) {
+    use axum::{extract::State, http::HeaderMap, http::StatusCode, http::Uri, Json, Router};
+
+    type CellState = (Arc<std::sync::Mutex<Vec<String>>>, fn(&Value) -> Value);
+
+    async fn command(
+        State((paths, payload)): State<CellState>,
+        uri: Uri,
+        headers: HeaderMap,
+        Json(body): Json<Value>,
+    ) -> (StatusCode, Json<Value>) {
+        paths.lock().unwrap().push(uri.path().to_string());
+        let causation_id = headers
+            .get(CELL_CAUSATION_ID_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .expect("gateway must bind the cell request to its reserved causation")
+            .to_string();
+        (
+            StatusCode::CREATED,
+            Json(json!({
+                "payload": payload(&body["input"]),
+                "receipt": {
+                    "commandId": body["commandId"],
+                    "causationId": causation_id,
+                    "state": "succeeded",
+                    "replayed": false
+                },
+                "events": []
+            })),
+        )
+    }
+
+    let paths = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let app = Router::new()
+        .fallback(axum::routing::post(command))
+        .with_state((Arc::clone(&paths), payload));
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    (format!("http://{addr}"), paths)
+}
+
+fn user_session() -> (Session, VerifiedPrincipal) {
+    let mut session = Session::new();
+    session.set(USER_ID_KEY, "alice");
+    session.set(ROLE_KEY, "user");
+    (session, VerifiedPrincipal::internal("alice").unwrap())
+}
+
+fn aggregate_host(url: String, service: Arc<Service>) -> CelldCommandHost {
+    CelldCommandHost::new(
+        url,
+        service,
+        InternalHttpSecret::new("test-only-internal-secret-32-bytes").unwrap(),
+    )
+    .unwrap()
+    .route_aggregate::<WaitAgg>()
+    .expect("todo.create declares its shard")
+}
+
+#[tokio::test]
+async fn route_aggregate_addresses_the_aggregate_type_and_declared_shard() {
+    let (url, paths) = recording_cell(|input| json!({ "id": input["id"] })).await;
+    let host = aggregate_host(url, sharded_wait_service());
+    let (session, principal) = user_session();
+
+    let result = host
+        .invoke(
+            "todo.create",
+            "0190a000-0000-7000-8000-000000000120",
+            json!({ "id": "todo-routed" }),
+            session,
+            principal,
+            None,
+        )
+        .await
+        .expect("a declared-shard command reaches its cell");
+
+    assert_eq!(
+        paths.lock().unwrap().as_slice(),
+        ["/causal-wait-path/todo-routed/todo.create"]
+    );
+    assert_eq!(result.payload(), &json!({ "id": "todo-routed" }));
+}
+
+#[tokio::test]
+async fn route_aggregate_fails_a_cell_payload_missing_a_declared_field() {
+    let (url, paths) = recording_cell(|_input| json!({})).await;
+    let host = aggregate_host(url, sharded_wait_service());
+    let (session, principal) = user_session();
+    let invoke = || {
+        host.invoke(
+            "todo.create",
+            "0190a000-0000-7000-8000-000000000121",
+            json!({ "id": "todo-missing" }),
+            session.clone(),
+            principal.clone(),
+            None,
+        )
+    };
+
+    let error = invoke()
+        .await
+        .expect_err("a payload without `id` is never completed");
+    let distributed::microsvc::CausalDispatchError::Internal(message) = &error else {
+        panic!("expected an internal error, got {error:?}");
+    };
+    assert!(
+        message.contains("command output `$.id` is required"),
+        "{message}"
+    );
+    // Nothing was completed: a retry asks the cell again instead of
+    // replaying a receipt, and fails the same way.
+    invoke().await.expect_err("still not the declared output");
+    assert_eq!(paths.lock().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn route_aggregate_fails_a_cell_payload_with_an_undeclared_field() {
+    let (url, _) =
+        recording_cell(|input| json!({ "id": input["id"], "owner_id": "fabricated" })).await;
+    let host = aggregate_host(url, sharded_wait_service());
+    let (session, principal) = user_session();
+
+    let error = host
+        .invoke(
+            "todo.create",
+            "0190a000-0000-7000-8000-000000000122",
+            json!({ "id": "todo-extra" }),
+            session,
+            principal,
+            None,
+        )
+        .await
+        .expect_err("a payload is the declared output, nothing more");
+    assert!(
+        error.to_string().contains("`$.owner_id` is not declared"),
+        "{error}"
+    );
+}
+
+#[test]
+fn route_aggregate_refuses_a_command_without_a_declared_shard() {
+    let error = match CelldCommandHost::new(
+        "http://127.0.0.1:1",
+        wait_service(),
+        InternalHttpSecret::new("test-only-internal-secret-32-bytes").unwrap(),
+    )
+    .unwrap()
+    .route_aggregate::<WaitAgg>()
+    {
+        Ok(_) => panic!("`.create()` declares no shard, so it has no cell"),
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("declares no shard"), "{error}");
 }
 
 #[cfg(feature = "sqlite")]
@@ -1113,12 +1281,9 @@ async fn celld_host_replays_external_completion_after_sqlite_reopen() {
         InternalHttpSecret::new("test-only-internal-secret-32-bytes").unwrap(),
     )
     .unwrap()
-    .route(CelldRoute::new(
-        &["todo.create"],
-        "todo",
-        |input| input.get("id").and_then(Value::as_str).map(str::to_owned),
-        |_command, _input, remote, _session| remote.clone(),
-    ));
+    .cell_route("todo.create", "todo", |input, _session| {
+        input.get("id").and_then(Value::as_str).map(str::to_owned)
+    });
     let mut session = distributed::microsvc::Session::new();
     session.set(USER_ID_KEY, "alice");
     session.set(ROLE_KEY, "user");
@@ -1150,12 +1315,9 @@ async fn celld_host_replays_external_completion_after_sqlite_reopen() {
         InternalHttpSecret::new("test-only-internal-secret-32-bytes").unwrap(),
     )
     .unwrap()
-    .route(CelldRoute::new(
-        &["todo.create"],
-        "todo",
-        |input| input.get("id").and_then(Value::as_str).map(str::to_owned),
-        |_command, _input, remote, _session| remote.clone(),
-    ));
+    .cell_route("todo.create", "todo", |input, _session| {
+        input.get("id").and_then(Value::as_str).map(str::to_owned)
+    });
     let replay = reopened_host
         .invoke("todo.create", command_id, input, session, principal, None)
         .await

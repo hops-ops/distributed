@@ -325,6 +325,32 @@ pub fn spawn_scrape_loop(service: Arc<Service>, cfg: ZitadelScrapeConfig) {
     });
 }
 
+/// The scrape loop configured from the environment, or a note saying why
+/// there is none. Every host of this application starts it the same way.
+pub fn spawn_scrape_from_env(service: Arc<Service>) {
+    match ZitadelScrapeConfig::from_env() {
+        Some(cfg) if cfg.background_enabled() || cfg.on_start => {
+            eprintln!(
+                "zitadel scrape: enabled (api={}, interval={}s, on_start={})",
+                cfg.api_base,
+                cfg.interval.as_secs(),
+                cfg.on_start
+            );
+            spawn_scrape_loop(service, cfg);
+        }
+        Some(_) => {
+            eprintln!(
+                "zitadel scrape: credentials present, background off (interval=0); use POST /zitadel.scrape.v1"
+            );
+        }
+        None => {
+            eprintln!(
+                "zitadel scrape: disabled (set ZITADEL_SERVICE_USER_TOKEN + OIDC_ISSUER/ZITADEL_API_URL)"
+            );
+        }
+    }
+}
+
 async fn scrape_once(service: &Service, trigger: &str) {
     match crate::handlers::ingestors::zitadel_scrape::scrape(service, trigger).await {
         Ok(report) => eprintln!("zitadel scrape ({trigger}): {report}"),

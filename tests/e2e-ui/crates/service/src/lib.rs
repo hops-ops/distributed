@@ -4,7 +4,9 @@
 //!
 //! - [`application`] — application name and client surfaces
 //! - [`modules`] — todo / chat / blob / identity mounts + compose + GraphQL
-//! - [`host`] — one-screen process bootstrap (`run`)
+//! - [`host`] — one-screen process bootstrap (`run`): SQL stores, their bus,
+//!   the local command host. Another host (`tests/e2e-celld`: celld cells
+//!   over NATS) mounts the same modules through `build_service`.
 //! - [`handlers`] — command bodies of the Zitadel ingress (domain-adjacent)
 //!
 //! Domain crates stay pure aggregates; read models live in `e2e-readmodels`;
@@ -21,7 +23,7 @@ pub use application::{
     PUBLIC_CLIENT_SURFACE,
 };
 pub use e2e_readmodels::read_models;
-pub use handlers::ingestors::zitadel::{spawn_scrape_loop, ZitadelScrapeConfig};
+pub use handlers::ingestors::zitadel::spawn_scrape_from_env;
 pub use host::{run, HostOptions};
 pub use http::{gateway_router, serve};
 pub use modules::compose::build_service;

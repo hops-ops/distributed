@@ -13,8 +13,7 @@ mod live {
 
     use async_graphql::Request;
     use distributed::cell_host::{
-        CelldCommandHost, CelldRoute, InternalHttpSecret, CELL_INTERNAL_SECRET_ENV,
-        CELL_INTERNAL_SECRET_HEADER,
+        CelldCommandHost, InternalHttpSecret, CELL_INTERNAL_SECRET_ENV, CELL_INTERNAL_SECRET_HEADER,
     };
     use distributed::command::{
         typed_command, CommandInputType, CommandOutputType, CommandTypeDef, CommandTypeField,
@@ -27,28 +26,6 @@ mod live {
         Aggregate, AggregateBuilder, Entity, InMemoryRepository, ReadModel, Snapshot,
     };
     use serde::{Deserialize, Serialize};
-    use serde_json::{json, Value};
-
-    const OPTIONAL_TODO_COMMANDS: &[&str] = &["todo.create"];
-
-    fn optional_todo_shard(input: &Value) -> Option<String> {
-        input.get("id").and_then(Value::as_str).map(str::to_owned)
-    }
-
-    fn optional_todo_payload(
-        _command: &str,
-        input: &Value,
-        remote: &Value,
-        _session: &Session,
-    ) -> Value {
-        json!({
-            "id": remote
-                .get("id")
-                .or_else(|| input.get("id"))
-                .cloned()
-                .unwrap_or(Value::Null)
-        })
-    }
 
     #[derive(Default, Snapshot)]
     struct SchemaAgg {
@@ -64,8 +41,9 @@ mod live {
 
     impl Aggregate for SchemaAgg {
         type ReplayError = std::convert::Infallible;
+        /// The TodoCell kind: `route_aggregate` addresses `/todo/{todo_id}`.
         fn aggregate_type() -> &'static str {
-            "optional-profile-todo"
+            "todo"
         }
         fn entity(&self) -> &Entity {
             &self.entity
@@ -92,7 +70,7 @@ mod live {
     #[derive(Deserialize)]
     #[allow(dead_code)]
     struct CreateInput {
-        id: String,
+        todo_id: String,
         title: String,
     }
 
@@ -101,15 +79,7 @@ mod live {
             CommandTypeDef::new(
                 "CreateInput",
                 vec![
-                    CommandTypeField {
-                        unsigned_integer: None,
-                        name: "id".into(),
-                        type_name: "String".into(),
-                        nullable: false,
-                        list: false,
-                        item_nullable: false,
-                        nested: None,
-                    },
+                    string_field("todo_id"),
                     CommandTypeField {
                         unsigned_integer: None,
                         name: "title".into(),
@@ -125,24 +95,35 @@ mod live {
         }
     }
 
-    #[derive(Serialize)]
-    struct IdPayload {
-        id: String,
+    fn string_field(name: &str) -> CommandTypeField {
+        CommandTypeField {
+            unsigned_integer: None,
+            name: name.into(),
+            type_name: "String".into(),
+            nullable: false,
+            list: false,
+            item_nullable: false,
+            nested: None,
+        }
     }
 
-    impl CommandOutputType for IdPayload {
+    /// The TodoCell's `todo.create` answer, field for field.
+    #[derive(Serialize)]
+    struct CreatePayload {
+        todo_id: String,
+        owner_id: String,
+        title: String,
+        status: String,
+    }
+
+    impl CommandOutputType for CreatePayload {
         fn command_type() -> CommandTypeDef {
             CommandTypeDef::new(
-                "IdPayload",
-                vec![CommandTypeField {
-                    unsigned_integer: None,
-                    name: "id".into(),
-                    type_name: "String".into(),
-                    nullable: false,
-                    list: false,
-                    item_nullable: false,
-                    nested: None,
-                }],
+                "CreatePayload",
+                ["todo_id", "owner_id", "title", "status"]
+                    .into_iter()
+                    .map(string_field)
+                    .collect(),
             )
             .with_type_id(std::any::TypeId::of::<Self>())
         }
@@ -155,16 +136,19 @@ mod live {
                 distributed::microsvc::Routes::new()
                     .with_repo(InMemoryRepository::new().aggregate::<SchemaAgg>())
                     .typed_command(
-                        typed_command::<CreateInput, Succeeded<IdPayload>>("todo.create")
+                        typed_command::<CreateInput, Succeeded<CreatePayload>>("todo.create")
                             .roles(["user"]),
                     )
-                    .create()
+                    .create_by(|input: &CreateInput| input.todo_id.clone())
                     .invoke(|aggregate, input, _owner| {
-                        aggregate.record(input.id.clone())?;
+                        aggregate.record(input.todo_id.clone())?;
                         Ok::<_, distributed::EventRecordError>(())
                     })
-                    .succeeded(|aggregate, _principal| IdPayload {
-                        id: aggregate.entity().id().to_string(),
+                    .succeeded(|aggregate, principal| CreatePayload {
+                        todo_id: aggregate.entity().id().to_string(),
+                        owner_id: principal.to_string(),
+                        title: String::new(),
+                        status: "open".into(),
                     }),
             )
     }
@@ -215,12 +199,8 @@ mod live {
         let host: SharedCommandHost = Arc::new(
             CelldCommandHost::new(celld, Arc::clone(&schema), secret)
                 .expect("valid celld host")
-                .route(CelldRoute::new(
-                    OPTIONAL_TODO_COMMANDS,
-                    "todo",
-                    optional_todo_shard,
-                    optional_todo_payload,
-                )),
+                .route_aggregate::<SchemaAgg>()
+                .expect("todo.create declares its shard"),
         );
         let engine = GraphqlEngine::builder(pool)
             .identity(distributed::graphql::IdentityConfig::dev_headers())
@@ -240,7 +220,7 @@ mod live {
             .execute(
                 &session,
                 Request::new(format!(
-                    r#"mutation {{ todo_create(commandId: "{command_id}", input: {{ id: "{todo_id}", title: "dcs6" }}) {{ id }} }}"#
+                    r#"mutation {{ todo_create(commandId: "{command_id}", input: {{ todo_id: "{todo_id}", title: "dcs6" }}) {{ todo_id title }} }}"#
                 ))
                 .data(Arc::clone(&host))
                 .data(principal),
@@ -250,6 +230,10 @@ mod live {
             mutation.errors.is_empty(),
             "GraphQL wait-path to cell: {mutation:?}"
         );
+        // The cell's own answer, as-is.
+        let data = mutation.data.into_json().unwrap();
+        assert_eq!(data["todo_create"]["todo_id"], todo_id.as_str());
+        assert_eq!(data["todo_create"]["title"], "dcs6");
 
         let list = engine
             .execute(&session, Request::new("{ todos { id title } }"))

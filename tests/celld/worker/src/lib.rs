@@ -1,7 +1,9 @@
 //! Todo and Chat Durable Object classes backed by `AggregateCell`.
 //!
-//! HTTP is command-named wait-path (`POST /{command}` with
-//! `{ commandId, input }`) plus GET of the aggregate state. GraphQL and
+//! HTTP is command-named wait-path (`POST /{kind}/{id}/{command}` with
+//! `{ commandId, input }`) plus GET of the aggregate state. `kind` is the
+//! aggregate's `aggregate_type()`, the address `CelldCommandHost::route_aggregate`
+//! derives; the response payload is the command's typed payload as-is. GraphQL and
 //! projectors are not methods on this class (`PCH-REQ-005`). Chat `@live`
 //! stays on the GraphQL host.
 
@@ -13,6 +15,7 @@ use distributed::cell_host::{
     CELL_SERVICE_ID_HEADER,
 };
 use distributed::microsvc::{Session, ROLE_KEY, USER_ID_KEY};
+use distributed::Aggregate;
 use serde::de::DeserializeOwned;
 use serde_json::{json, Value};
 use todo_domain::{
@@ -142,7 +145,9 @@ impl DurableObject for TodoCell {
             .map(str::to_string)
             .collect();
         let id = match parts.get(1) {
-            Some(id) if parts.first().map(String::as_str) == Some("todo") => id.clone(),
+            Some(id) if parts.first().map(String::as_str) == Some(Todo::aggregate_type()) => {
+                id.clone()
+            }
             _ => return json_status(json!({ "error": "missing todo id" }), 400),
         };
 
@@ -160,13 +165,11 @@ impl DurableObject for TodoCell {
             (Method::Post, Some("todo.test_batch")) => {
                 transition_todo(&self.env, &self.cell, &id, "todo.test_batch", &mut req).await
             }
-            (Method::Post, Some("todo.create")) => {
-                create_todo(&self.env, &self.cell, &id, &mut req).await
-            }
             (Method::Post, Some(command))
                 if matches!(
                     command,
-                    "todo.rename"
+                    "todo.create"
+                        | "todo.rename"
                         | "todo.complete"
                         | "todo.reopen"
                         | "todo.archive"
@@ -215,7 +218,11 @@ impl DurableObject for ChatCell {
             .map(str::to_string)
             .collect();
         let id = match parts.get(1) {
-            Some(id) if parts.first().map(String::as_str) == Some("chat") => id.clone(),
+            Some(id)
+                if parts.first().map(String::as_str) == Some(ChatMessage::aggregate_type()) =>
+            {
+                id.clone()
+            }
             _ => return json_status(json!({ "error": "missing chat id" }), 400),
         };
 
@@ -247,8 +254,8 @@ async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
     }
     let parts: Vec<&str> = path.split('/').filter(|part| !part.is_empty()).collect();
     let (binding, id) = match (parts.first().copied(), parts.get(1).copied()) {
-        (Some("todo"), Some(id)) => ("TODO", id),
-        (Some("chat"), Some(id)) => ("CHAT", id),
+        (Some(kind), Some(id)) if kind == Todo::aggregate_type() => ("TODO", id),
+        (Some(kind), Some(id)) if kind == ChatMessage::aggregate_type() => ("CHAT", id),
         _ => {
             return Response::error("cells: authenticated internal command/read routes\n", 404);
         }
@@ -460,55 +467,6 @@ fn wait_path_ok(
     )
 }
 
-async fn create_todo(
-    env: &Env,
-    cell: &AggregateCell<Todo>,
-    id: &str,
-    req: &mut Request,
-) -> Result<Response> {
-    let body = match bounded_json::<Value>(req).await {
-        Ok(body) => body,
-        Err(error) => return map_cell_error(CausalDispatchError::BadRequest(error.into()), cell),
-    };
-    let (command_id, input) = match wait_path_parts(&body) {
-        Ok(parts) => parts,
-        Err(error) => return map_cell_error(error, cell),
-    };
-    let identity = match request_cell_identity(req, &command_id) {
-        Ok(identity) => identity,
-        Err(error) => return map_cell_error(error, cell),
-    };
-    let title = input
-        .get("title")
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .to_string();
-    match cell
-        .dispatch_idempotent(
-            "todo.create",
-            &identity,
-            json!({ "todo_id": id, "title": title }),
-            request_session(req),
-        )
-        .await
-    {
-        Ok(dispatch) => {
-            drain_after_command(env, cell, req).await;
-            let events = serde_json::to_value(dispatch.projection_events())?;
-            wait_path_ok(
-                http_from_command(id, dispatch.payload(), &title),
-                &dispatch,
-                201,
-                events,
-            )
-        }
-        Err(error) => {
-            drain_after_command(env, cell, req).await;
-            map_cell_error(error, cell)
-        }
-    }
-}
-
 async fn transition_todo(
     env: &Env,
     cell: &AggregateCell<Todo>,
@@ -544,19 +502,8 @@ async fn transition_todo(
         Ok(dispatch) => {
             drain_after_command(env, cell, req).await;
             let events = serde_json::to_value(dispatch.projection_events())?;
-            let title = cell
-                .load()
-                .await
-                .ok()
-                .flatten()
-                .map(|todo| TodoState::from(&todo).title)
-                .unwrap_or_default();
-            wait_path_ok(
-                http_from_command(id, dispatch.payload(), &title),
-                &dispatch,
-                200,
-                events,
-            )
+            let status = if command == "todo.create" { 201 } else { 200 };
+            wait_path_ok(dispatch.payload().clone(), &dispatch, status, events)
         }
         Err(error) => {
             drain_after_command(env, cell, req).await;
@@ -571,20 +518,6 @@ fn http_todo(state: &TodoState) -> Value {
         "title": state.title,
         "status": state.status,
     })
-}
-
-fn http_from_command(id: &str, payload: &Value, fallback_title: &str) -> Value {
-    let mut body = payload.as_object().cloned().unwrap_or_default();
-    body.entry("id".to_string()).or_insert_with(|| json!(id));
-    body.entry("todo_id".to_string())
-        .or_insert_with(|| json!(id));
-    body.entry("owner_id".to_string())
-        .or_insert_with(|| json!(""));
-    body.entry("title".to_string())
-        .or_insert_with(|| json!(fallback_title));
-    body.entry("status".to_string())
-        .or_insert_with(|| json!("open"));
-    Value::Object(body)
 }
 
 fn map_cell_error<A>(error: CausalDispatchError, _cell: &AggregateCell<A>) -> Result<Response>

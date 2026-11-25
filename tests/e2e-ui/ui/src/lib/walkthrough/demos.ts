@@ -387,19 +387,13 @@ mutation DeleteTodo {
 				},
 				...hostAndRunnerSamples,
 				{
-					file: 'e2e-celld · graphql-service/host.rs · celld_command_host',
-					caption: 'The celld example GraphQL process uses the framework `CelldCommandHost`. Each aggregate crate supplies a `CelldRoute`: its commands, the cell kind, the shard, and the GraphQL payload. Every Todo transition goes to POST {CELLD_URL}/todo/{todo_id}/{command}. Commands with no route run on the local Service. The cell outbox reaches the projectors through the celld Queue relay and NATS. There is no dual write.',
-					code: `// tests/e2e-celld/crates/graphql-service/src/host.rs
+					file: 'e2e-celld · runner/src/host.rs · route_aggregate',
+					caption: 'The celld example is one runner crate over this service crate: the same `build_service`, another command host. `route_aggregate::<Todo>()` routes every mounted Todo command to POST {CELLD_URL}/todo/{todo_id}/{command}: the cell kind is the aggregate type, the shard each declaration\'s `shard:`. The cell answers with the command\'s typed payload, returned as-is; a payload that is not the declared output fails the command. Commands with no route run on the local Service. The cell outbox reaches the projectors through the celld Queue relay and NATS. There is no dual write.',
+					code: `// tests/e2e-celld/crates/runner/src/host.rs
+let service = build_service(&stores).with_bus(nats);  // e2e-service, unchanged
 CelldCommandHost::new(celld_url, service, internal_secret)?
-  .route(e2e_celld_todo::celld_route())
-  .route(e2e_celld_chat::celld_route())
-
-// tests/e2e-celld/crates/todo-service/src/host.rs
-pub fn celld_route() -> CelldRoute {
-  CelldRoute::new(TODO_CELL_COMMANDS, "todo", todo_shard, graphql_todo_payload)
-}
-// TODO_CELL_COMMANDS: create, rename, complete, reopen,
-// archive, force_archive, purge
+  .route_aggregate::<Todo>()?         // kind "todo", shard input.todo_id
+  .route_aggregate::<ChatMessage>()?  // kind "chat_message", shard input.message_id
 
 // cell class (tests/celld/worker): command HTTP + sealed GET only
 POST /todo/:id/todo.create   { commandId, input }
@@ -704,16 +698,15 @@ mutation SaveChatMessage {
 				},
 				...hostAndRunnerSamples,
 				{
-					file: 'e2e-celld · chat-service/host.rs · celld_route',
-					caption: 'The celld example routes chat.post to POST {CELLD_URL}/chat/{message_id}/chat.post through the same `CelldCommandHost`. The cell outbox reaches the chat projector through the celld Queue relay and NATS, so SQL updates and GraphQL @live fires. GraphQL is not a cell method.',
-					code: `// tests/e2e-celld/crates/chat-service/src/host.rs
-pub fn celld_route() -> CelldRoute {
-  CelldRoute::new(&["chat.post"], "chat", chat_shard, graphql_chat_payload)
-}
+					file: 'e2e-celld · runner/src/host.rs · route_aggregate',
+					caption: 'The celld example routes chat.post to POST {CELLD_URL}/chat_message/{message_id}/chat.post through the same `CelldCommandHost`, derived from the mounted declaration. The cell outbox reaches the chat projector through the celld Queue relay and NATS, so SQL updates and GraphQL @live fires. GraphQL is not a cell method.',
+					code: `// tests/e2e-celld/crates/runner/src/host.rs
+CelldCommandHost::new(celld_url, service, internal_secret)?
+  .route_aggregate::<ChatMessage>()?  // shard: |input| input.message_id.clone()
 
 // cell class (tests/celld/worker): command HTTP + sealed GET only
-POST /chat/:id/chat.post   { commandId, input }
-GET  /chat/:id             // sealed row
+POST /chat_message/:id/chat.post   { commandId, input }
+GET  /chat_message/:id             // sealed row
 // cell outbox → celld Queue → relay → NATS → chat projector → @live`
 				}
 			]
