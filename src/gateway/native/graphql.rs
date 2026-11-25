@@ -4,7 +4,11 @@ use super::{
 };
 use crate::command_dispatch::SharedCommandHost;
 use crate::gateway::{
-    graphql::{admit_operation, admit_request, remove_client_control, OperationError},
+    graphql::{
+        admit_operation, admit_request, remove_client_control,
+        ws::{self, ClientFrame, Operations, ServerFrame, WsProtocol},
+        OperationError,
+    },
     BindingKind, DeliveryCapabilities, Forwarding, GraphqlCapabilities, GraphqlExecutor,
 };
 use crate::graphql::{graphql_router_composed, GraphqlEngine, GraphqlOperationFilter};
@@ -17,7 +21,7 @@ use axum::{
     response::IntoResponse,
 };
 use futures_util::{SinkExt, StreamExt};
-use std::{collections::BTreeSet, sync::Arc, time::Duration};
+use std::{collections::BTreeSet, sync::Arc};
 use tokio_tungstenite::{
     tungstenite::{protocol::Role, Message as UpstreamMessage},
     WebSocketStream,
@@ -237,18 +241,8 @@ impl GraphqlBinding {
                         Ok(permit) => permit,
                         Err(_) => return response(StatusCode::SERVICE_UNAVAILABLE),
                     };
-                    let lifetime =
-                        context
-                            .identity()
-                            .map_or(inner.options.limits.upgrade_lifetime, |id| {
-                                inner
-                                    .options
-                                    .limits
-                                    .upgrade_lifetime
-                                    .min(Duration::from_secs(
-                                        id.expires_at().saturating_sub(super::now()),
-                                    ))
-                            });
+                    let lifetime = context
+                        .connection_lifetime(inner.options.limits.upgrade_lifetime, super::now());
                     request.extensions_mut().insert(Arc::new(
                         crate::graphql::http::GraphqlConnectionGuard {
                             lifetime,
@@ -486,14 +480,7 @@ async fn remote_websocket(
         .get(header::SEC_WEBSOCKET_PROTOCOL)
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
-    let protocol = if offered
-        .split(',')
-        .any(|p| p.trim() == "graphql-transport-ws")
-    {
-        "graphql-transport-ws"
-    } else if offered.split(',').any(|p| p.trim() == "graphql-ws") {
-        "graphql-ws"
-    } else {
+    let Some(protocol) = WsProtocol::negotiate(offered) else {
         return response(StatusCode::BAD_REQUEST);
     };
     let upgrade = match WebSocketUpgrade::from_request_parts(&mut parts, &()).await {
@@ -520,7 +507,7 @@ async fn remote_websocket(
     });
     parts.headers.insert(
         header::SEC_WEBSOCKET_PROTOCOL,
-        HeaderValue::from_static(protocol),
+        HeaderValue::from_static(protocol.name()),
     );
     let Some(key) = parts.headers.get(header::SEC_WEBSOCKET_KEY) else {
         return response(StatusCode::BAD_REQUEST);
@@ -564,7 +551,7 @@ async fn remote_websocket(
             .headers()
             .get(header::SEC_WEBSOCKET_PROTOCOL)
             .and_then(|v| v.to_str().ok())
-            != Some(protocol)
+            != Some(protocol.name())
     {
         return response(StatusCode::BAD_GATEWAY);
     }
@@ -578,20 +565,10 @@ async fn remote_websocket(
     ] {
         headers.remove(name);
     }
-    let lifetime = context
-        .identity()
-        .map_or(inner.options.limits.upgrade_lifetime, |id| {
-            inner
-                .options
-                .limits
-                .upgrade_lifetime
-                .min(Duration::from_secs(
-                    id.expires_at().saturating_sub(super::now()),
-                ))
-        });
+    let lifetime = context.connection_lifetime(inner.options.limits.upgrade_lifetime, super::now());
     let max_message = inner.options.limits.request_body_bytes;
     let mut response = upgrade
-        .protocols([protocol])
+        .protocols([protocol.name()])
         .max_message_size(max_message)
         .on_upgrade(move |socket| async move {
             let _permit = permit;
@@ -635,55 +612,56 @@ async fn bridge(
     mut client: WebSocket,
     mut origin: WebSocketStream<reqwest::Upgraded>,
     capabilities: GraphqlCapabilities,
-    protocol: &str,
+    protocol: WsProtocol,
 ) {
     let mut admitted = false;
-    let mut active = BTreeSet::new();
+    let mut active = Operations::<()>::default();
     loop {
         tokio::select! {
             message = client.recv() => {
                 let Some(Ok(message)) = message else { break };
-                match message {
+                let upstream = match message {
                     Message::Text(text) => {
-                        let mut forwarded = text.to_string();
-                        if let Ok(mut value) = serde_json::from_str::<serde_json::Value>(&text) {
-                            match value["type"].as_str() {
-                                Some("subscribe" | "start") => {
-                                    let Some(id) = value["id"].as_str() else { break };
-                                    if !admitted || id.len() > 256 || active.len() >= 128 || active.contains(id) { break; }
-                                    if let Err(error) = admit_request(&value["payload"], capabilities) {
-                                        let payload = serde_json::json!({ "id": id, "type": if protocol == "graphql-ws" { "data" } else { "next" }, "payload": error.envelope() });
-                                        if client.send(Message::Text(payload.to_string().into())).await.is_err() { break; }
-                                        if client.send(Message::Text(serde_json::json!({ "id": id, "type": "complete" }).to_string().into())).await.is_err() { break; }
-                                        continue;
-                                    }
-                                    active.insert(id.to_owned());
-                                    remove_client_control(&mut value["payload"]);
-                                    forwarded = value.to_string();
+                        let frame = match protocol.decode_client_text(&text) {
+                            Ok(ClientFrame::Subscribe { id, mut payload }) => {
+                                if !admitted || active.admit(&id).is_err() { break; }
+                                if let Err(error) = admit_request(&payload, capabilities) {
+                                    if client.send(Message::Text(protocol.next(&id, error.envelope()).to_string().into())).await.is_err() { break; }
+                                    if client.send(Message::Text(ws::complete(&id).to_string().into())).await.is_err() { break; }
+                                    continue;
                                 }
-                                Some("complete" | "stop") => { if let Some(id) = value["id"].as_str() { active.remove(id); } }
-                                _ => {}
+                                remove_client_control(&mut payload);
+                                let _ = active.open(id.clone(), ());
+                                ClientFrame::Subscribe { id, payload }
                             }
-                        }
-                        if origin.send(UpstreamMessage::Text(forwarded.into())).await.is_err() { break; }
+                            Ok(ClientFrame::Complete { id }) => {
+                                active.close(&id);
+                                ClientFrame::Complete { id }
+                            }
+                            Ok(frame) => frame,
+                            // Never bypass operation admission with a frame it cannot read.
+                            Err(_) => break,
+                        };
+                        UpstreamMessage::Text(protocol.encode_client(&frame).to_string().into())
                     }
                     Message::Binary(_) => break, // GraphQL WS uses JSON text; never bypass operation admission.
-                    Message::Ping(bytes) => { if origin.send(UpstreamMessage::Ping(bytes)).await.is_err() { break; } }
-                    Message::Pong(bytes) => { if origin.send(UpstreamMessage::Pong(bytes)).await.is_err() { break; } }
+                    Message::Ping(bytes) => UpstreamMessage::Ping(bytes),
+                    Message::Pong(bytes) => UpstreamMessage::Pong(bytes),
                     Message::Close(frame) => {
                         let frame = frame.map(|frame| tokio_tungstenite::tungstenite::protocol::CloseFrame { code: frame.code.into(), reason: frame.reason.to_string().into() });
                         let _ = origin.send(UpstreamMessage::Close(frame)).await;
                         break;
                     },
-                }
+                };
+                if origin.send(upstream).await.is_err() { break; }
             }
             message = origin.next() => {
                 let Some(Ok(message)) = message else { break };
                 let downstream = match message {
                     UpstreamMessage::Text(text) => {
                         if let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) {
-                            if value["type"] == "connection_ack" { admitted = true; }
-                            if matches!(value["type"].as_str(), Some("complete" | "error")) { if let Some(id) = value["id"].as_str() { active.remove(id); } }
+                            if let Some(id) = ws::ended_operation(&value) { active.close(id); }
+                            if ws::decode_server(value) == ServerFrame::Ack { admitted = true; }
                         }
                         Message::Text(text.to_string().into())
                     }

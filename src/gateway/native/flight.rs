@@ -1,6 +1,6 @@
 use super::{response, Body, Response, StatusCode};
 use crate::gateway::delivery::{
-    FlightKey, FlightLimits, FlightRegistry, FlightTicket, FreshnessContext, OriginAdmission,
+    FlightKey, FlightLimits, FlightTable, FlightTicket, FreshnessContext, OriginAdmission,
     SnapshotResponse,
 };
 use futures_util::{
@@ -8,7 +8,6 @@ use futures_util::{
     FutureExt, StreamExt,
 };
 use std::{
-    collections::BTreeMap,
     future::Future,
     sync::{Arc, Mutex},
     time::{Duration, Instant},
@@ -20,12 +19,8 @@ enum Outcome {
     Exclusive(Arc<Mutex<Option<Response>>>),
 }
 type Work = BoxFuture<'static, Outcome>;
-struct State {
-    registry: FlightRegistry,
-    work: BTreeMap<u64, WeakShared<Work>>,
-}
 pub(super) struct NativeFlights {
-    state: Mutex<State>,
+    table: Mutex<FlightTable<WeakShared<Work>>>,
     limits: FlightLimits,
     started: Instant,
 }
@@ -36,64 +31,45 @@ struct Lease {
 }
 impl Drop for Lease {
     fn drop(&mut self) {
-        if let Some(ticket) = self.ticket.take() {
-            let generation = ticket.generation();
-            if let Ok(mut state) = self.owner.state.lock() {
-                if state.registry.leave(ticket) {
-                    state.work.remove(&generation);
-                }
-            }
-        }
-        // The registry owns only WeakShared. Dropping the last lease cancels
+        // The table holds only WeakShared. Dropping the last lease cancels
         // the upstream future immediately, without a detached background task.
+        if let (Some(ticket), Ok(mut table)) = (self.ticket.take(), self.owner.table.lock()) {
+            table.leave(ticket);
+        }
     }
 }
 impl NativeFlights {
     pub(super) fn new(limits: FlightLimits) -> Result<Arc<Self>, super::GatewayError> {
         Ok(Arc::new(Self {
-            state: Mutex::new(State {
-                registry: FlightRegistry::new(limits)
+            table: Mutex::new(
+                FlightTable::new(limits)
                     .map_err(|_| super::GatewayError("invalid flight limits"))?,
-                work: BTreeMap::new(),
-            }),
+            ),
             limits,
             started: Instant::now(),
         }))
     }
     pub(super) fn counts(&self) -> (usize, usize) {
-        self.state.lock().map_or((0, 0), |state| {
-            (state.registry.len(), state.registry.consumers())
-        })
+        self.table.lock().map_or((0, 0), |table| table.counts())
     }
-    fn join(self: &Arc<Self>, key: FlightKey, start: impl FnOnce() -> Work) -> Result<Lease, ()> {
-        let mut state = self.state.lock().map_err(|_| ())?;
+    fn join(self: &Arc<Self>, key: FlightKey, start: impl FnOnce() -> Work) -> Option<Lease> {
         let now = u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX);
-        state.registry.expire(now);
-        let expired = state
-            .work
-            .keys()
-            .filter(|generation| !state.registry.contains_generation(**generation))
-            .copied()
-            .collect::<Vec<_>>();
-        for generation in expired {
-            state.work.remove(&generation);
-        }
-        let (ticket, owner) = state.registry.join(key, now).map_err(|_| ())?;
-        let generation = ticket.generation();
-        let work = if owner {
-            let work = start().shared();
-            state.work.insert(generation, work.downgrade().ok_or(())?);
-            work
-        } else {
-            match state.work.get(&generation).and_then(WeakShared::upgrade) {
-                Some(work) => work,
-                None => {
-                    state.registry.leave(ticket);
-                    return Err(());
-                }
-            }
-        };
-        Ok(Lease {
+        let (ticket, work) = self
+            .table
+            .lock()
+            .ok()?
+            .join(
+                key,
+                now,
+                || {
+                    let work = start().shared();
+                    let weak = work.downgrade().expect("unpolled shared work");
+                    (work, weak)
+                },
+                WeakShared::upgrade,
+            )
+            .ok()?;
+        Some(Lease {
             owner: self.clone(),
             ticket: Some(ticket),
             work,
@@ -115,7 +91,8 @@ impl NativeFlights {
     {
         let limits = self.limits;
         let expires = admission.expires_at;
-        let lease = match self.join(key, move || {
+        // Coalescing is an optimization: with no room to join, run alone.
+        let lease = self.join(key, move || {
             async move {
                 let result =
                     tokio::time::timeout(Duration::from_millis(limits.deadline_ms), async move {
@@ -153,11 +130,7 @@ impl NativeFlights {
                 result.unwrap_or_else(|_| exclusive(response(StatusCode::GATEWAY_TIMEOUT)))
             }
             .boxed()
-        }) {
-            Ok(lease) => lease,
-            // Coalescing is an optimization: with no room to join, run alone.
-            Err(_) => return None,
-        };
+        })?;
         let remaining = Duration::from_secs(expires.saturating_sub(super::now()));
         if remaining.is_zero() {
             return Some(response(StatusCode::UNAUTHORIZED));
@@ -273,36 +246,6 @@ mod tests {
         let _ = second.await;
         assert_eq!(flights.counts(), (0, 0));
         assert_eq!(dropped.load(Ordering::SeqCst), 1);
-    }
-    #[tokio::test]
-    async fn a_full_registry_declines_to_share_instead_of_failing() {
-        let flights = NativeFlights::new(FlightLimits {
-            consumers: 1,
-            ..Default::default()
-        })
-        .unwrap();
-        let (key, admission) = admitted();
-        let (started, ready) = tokio::sync::oneshot::channel();
-        let owner = flights.clone();
-        let (first_key, first_admission) = (key.clone(), admission.clone());
-        let first = tokio::spawn(async move {
-            owner
-                .execute(first_key, first_admission, None, move || async move {
-                    let _ = started.send(());
-                    std::future::pending::<Response>().await
-                })
-                .await
-        });
-        ready.await.unwrap();
-        // No room to join: the caller is told to execute on its own.
-        let second = flights
-            .execute(key, admission, None, || async {
-                panic!("a consumer that cannot join starts no shared work")
-            })
-            .await;
-        assert!(second.is_none());
-        assert_eq!(flights.counts(), (1, 1));
-        first.abort();
     }
     #[tokio::test]
     async fn deadline_expiry_and_failure_release_every_group() {

@@ -8,6 +8,8 @@ use async_graphql_parser::{
 };
 use serde_json::Value;
 
+pub mod ws;
+
 /// Maximum portable operation document size accepted before parsing.
 pub const MAX_DOCUMENT_BYTES: usize = 256 * 1024;
 

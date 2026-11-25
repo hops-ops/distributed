@@ -290,16 +290,9 @@ impl NativeGateway {
     }
 
     async fn handle(State(this): State<Self>, request: Request<Body>) -> Response {
-        if let Some(hops) = request.headers().get("x-distributed-gateway-hops") {
-            let Ok(hops) = hops.to_str() else {
-                return response(StatusCode::BAD_REQUEST);
-            };
-            if hops.len() > 512
-                || hops.split(',').count() >= 8
-                || hops.split(',').any(|hop| hop.trim() == this.0.hop_id)
-            {
-                return response(StatusCode::LOOP_DETECTED);
-            }
+        // The same chain rule every forward applies, checked at ingress.
+        if proxy::hop_chain(request.headers(), &this.0.hop_id).is_err() {
+            return response(StatusCode::LOOP_DETECTED);
         }
         this.0.gateway.dispatch(&this, request).await
     }
@@ -325,35 +318,15 @@ fn auth_response(error: AuthError) -> Response {
 }
 
 fn credentials(headers: &HeaderMap) -> Result<Credentials, AuthError> {
-    let mut authorization = headers.get_all(header::AUTHORIZATION).iter();
-    let authorization_value = authorization
-        .next()
-        .map(|v| v.to_str().map(str::to_owned))
-        .transpose()
-        .map_err(|_| AuthError::Unauthorized)?;
-    if authorization.next().is_some() {
-        return Err(AuthError::Unauthorized);
-    }
-    let cookies = headers
-        .get_all(header::COOKIE)
-        .iter()
-        .map(|v| v.to_str())
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|_| AuthError::Unauthorized)?;
-    if authorization_value.as_ref().map_or(0, String::len)
-        + cookies.iter().map(|v| v.len()).sum::<usize>()
-        > 32768
-    {
-        return Err(AuthError::Unauthorized);
-    }
-    Ok(Credentials {
-        authorization: authorization_value,
-        cookie: if cookies.is_empty() {
-            None
-        } else {
-            Some(cookies.join("; "))
-        },
-    })
+    let text = |name| {
+        headers
+            .get_all(name)
+            .iter()
+            .map(|v| v.to_str())
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| AuthError::Unauthorized)
+    };
+    Credentials::from_fields(&text(header::AUTHORIZATION)?, &text(header::COOKIE)?)
 }
 
 impl GatewayAdapter for NativeGateway {

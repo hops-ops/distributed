@@ -733,3 +733,44 @@ fn zones_origin_cannot_be_the_gateway() {
     };
     assert!(invalid.build().is_err());
 }
+
+// The Worker adapter applies the same two rules through the same portable
+// functions (`Credentials::from_fields`, `append_hop`).
+#[tokio::test]
+async fn duplicate_authorization_and_long_hop_chains_fail_closed() {
+    let router = gateway(
+        "https://gateway.test",
+        "http://127.0.0.1:9",
+        ProxyLimits::default(),
+    )
+    .router();
+    let status = |request: Request<Body>| {
+        let router = router.clone();
+        async move { router.oneshot(request).await.unwrap().status() }
+    };
+    let private = || Request::builder().uri("/private/file");
+    // Two fields natively; one comma-folded field as a Fetch runtime sees it.
+    let duplicate = private()
+        .header("authorization", "Bearer valid")
+        .header("authorization", "Bearer valid");
+    assert_eq!(
+        status(duplicate.body(Body::empty()).unwrap()).await,
+        StatusCode::UNAUTHORIZED
+    );
+    let folded = private().header("authorization", "Bearer valid, Bearer valid");
+    assert_eq!(
+        status(folded.body(Body::empty()).unwrap()).await,
+        StatusCode::UNAUTHORIZED
+    );
+    let chain = |hops: usize| {
+        let chain = vec!["upstream-gateway"; hops].join(",");
+        Request::builder()
+            .uri("/")
+            .header(HOPS_HEADER, chain)
+            .body(Body::empty())
+            .unwrap()
+    };
+    let full = MAX_HOPS;
+    assert_ne!(status(chain(full - 1)).await, StatusCode::LOOP_DETECTED);
+    assert_eq!(status(chain(full)).await, StatusCode::LOOP_DETECTED);
+}

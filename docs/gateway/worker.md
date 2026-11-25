@@ -9,7 +9,9 @@ continue to execute at the configured backend; the Worker is ingress.
 An application constructs `WorkerGateway` with its portable `GatewayConfig`,
 explicit `WorkerBinding` resources, `WorkerOptions` and `WorkerAuth`. Mount
 `gateway.fetch(request, env)` from the Worker fetch entrypoint. Bind handlers,
-an asset service, UI/auth reverse proxies, or a whole remote GraphQL endpoint.
+an asset service, UI/auth reverse proxies, zone hosts, or a whole remote GraphQL
+endpoint. `WorkerGateway` implements `GatewayAdapter`, so dispatch is the same
+`Gateway::dispatch` the native adapter and custom adapters use.
 Routes use the same exact/longest-segment ownership as native ingress. A selected
 handler's error is terminal. The public origin is configured, never taken from
 incoming forwarding headers. The adapter retains Origin and duplicate cookies,

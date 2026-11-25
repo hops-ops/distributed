@@ -48,6 +48,11 @@ credential and the last proven resume cursor. Normal GraphQL completion drains
 queued frames; unexpected transport loss requires reset. Reconnect authenticates
 again. Shared outbound sockets do not hibernate for free.
 
+These rules live once, in the sans-IO `delivery::LiveCoordinator` (and
+`FlightTable` for query coalescing). Native and Worker adapters supply only
+channels, tasks, timers and locks; both speak GraphQL-WS through one codec,
+`graphql::ws`.
+
 `NativeDelivery::live_counts()` reports active groups, consumers, cumulative source
 attempts, resets, upstream frames, exact duplicate frames and safe handoffs. Source
 attempts include credential reconnects; they are not a count of active producers.

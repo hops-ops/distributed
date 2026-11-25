@@ -31,10 +31,10 @@ pub use extension::{GatewayAdapter, Rejection};
 pub use route::{Methods, Route, RoutePath, SelectedRoute, MAX_ADMISSIONS, MAX_PATH_BYTES};
 
 pub use auth::{
-    is_untrusted_identity_header, Admission, AuthError, AuthProvider, Forwarding,
-    GRAPHQL_REQUEST_HEADERS,
+    append_hop, is_untrusted_identity_header, Admission, AuthError, AuthProvider, Forwarding,
+    GRAPHQL_REQUEST_HEADERS, HOPS_HEADER, MAX_HOPS, MAX_HOPS_BYTES,
 };
-pub use context::{BackendCredential, Credentials, Identity, RequestContext};
+pub use context::{BackendCredential, Credentials, Identity, RequestContext, MAX_CREDENTIAL_BYTES};
 
 /// Native HTTP routing, streaming proxy and static asset adapter.
 #[cfg(feature = "gateway-native")]

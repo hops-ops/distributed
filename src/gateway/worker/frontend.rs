@@ -5,7 +5,12 @@ use super::{
     WorkerGateway,
 };
 use crate::gateway::{
-    graphql::{admit_request, operation_kind, OperationKind},
+    delivery::{mark_connection, LiveEnd},
+    graphql::{
+        admit_request, operation_kind, remove_client_control,
+        ws::{self, ClientFrame, Operations, WsProtocol},
+        OperationKind,
+    },
     GraphqlCapabilities,
 };
 use futures_channel::mpsc;
@@ -13,7 +18,7 @@ use futures_util::{
     future::{select, AbortHandle, Abortable, Either},
     SinkExt, StreamExt,
 };
-use std::{collections::BTreeMap, time::Duration};
+use std::time::Duration;
 use worker::{Env, Request, RequestInit, RequestRedirect, Response, Result, WebSocketPair};
 
 #[allow(clippy::too_many_arguments)]
@@ -34,14 +39,7 @@ pub(super) async fn upgrade(
         .headers()
         .get("sec-websocket-protocol")?
         .unwrap_or_default();
-    let protocol = if offered
-        .split(',')
-        .any(|p| p.trim() == "graphql-transport-ws")
-    {
-        "graphql-transport-ws"
-    } else if offered.split(',').any(|p| p.trim() == "graphql-ws") {
-        "graphql-ws"
-    } else {
+    let Some(protocol) = WsProtocol::negotiate(&offered) else {
         return Response::error("unsupported GraphQL protocol", 400);
     };
     let mut origin = match live_transport::handshake(&input, &live_path, protocol).await {
@@ -50,34 +48,26 @@ pub(super) async fn upgrade(
     };
     let pair = WebSocketPair::new()?;
     let mut client = Socket::new(pair.server, input.options.limits.websocket_buffer_bytes, 32)?;
-    let lifetime =
-        input
-            .context
-            .identity()
-            .map_or(input.options.limits.websocket_lifetime_ms, |identity| {
-                input
-                    .options
-                    .limits
-                    .websocket_lifetime_ms
-                    .min(identity.expires_at().saturating_sub(super::now()) * 1000)
-            });
+    let lifetime = input.context.connection_lifetime(
+        Duration::from_millis(input.options.limits.websocket_lifetime_ms),
+        super::now(),
+    );
     worker::wasm_bindgen_futures::spawn_local(async move {
         let run = async {
-            let first = match super::timer::deadline(
+            let first = super::timer::deadline(
                 Duration::from_millis(input.options.limits.header_timeout_ms),
                 client.next(),
             )
-            .await
-            {
-                Ok(Ok(value)) if value["type"] == "connection_init" => value,
-                _ => return,
+            .await;
+            let Ok(Ok(first)) = first else {
+                return;
             };
-            let init = first
-                .get("payload")
-                .cloned()
-                .unwrap_or_else(|| serde_json::json!({}));
+            let Ok(ClientFrame::Init(init)) = protocol.decode_client(first) else {
+                return;
+            };
             let ack = match live_transport::initialize(
                 &mut origin,
+                protocol,
                 init.clone(),
                 input.options.limits.header_timeout_ms,
             )
@@ -92,7 +82,7 @@ pub(super) async fn upgrade(
             if client.send(&ack).is_err() {
                 return;
             }
-            if protocol == "graphql-ws" || delivery.is_none() {
+            if protocol == WsProtocol::LegacyWs || delivery.is_none() {
                 independent(
                     &mut client,
                     &mut origin,
@@ -117,10 +107,12 @@ pub(super) async fn upgrade(
             )
             .await;
         };
-        let _ = super::timer::deadline(Duration::from_millis(lifetime), run).await;
+        let _ = super::timer::deadline(lifetime, run).await;
     });
     let response = Response::from_websocket(pair.client)?;
-    response.headers().set("sec-websocket-protocol", protocol)?;
+    response
+        .headers()
+        .set("sec-websocket-protocol", protocol.name())?;
     Ok(response)
 }
 struct Operation {
@@ -145,7 +137,8 @@ async fn modern(
     init: serde_json::Value,
 ) {
     let (out, mut outgoing) = mpsc::channel::<serde_json::Value>(32);
-    let mut operations = BTreeMap::<String, Operation>::new();
+    let mut operations = Operations::<Operation>::default();
+    let protocol = WsProtocol::TransportWs;
     loop {
         enum Event {
             Client(std::result::Result<serde_json::Value, String>),
@@ -155,101 +148,86 @@ async fn modern(
             Either::Left((value, _)) => Event::Client(value),
             Either::Right((value, _)) => Event::Output(value),
         };
-        match event {
-            Event::Client(Ok(value)) => {
-                match value["type"].as_str() {
-                    Some("subscribe") => {
-                        let Some(id) = value["id"]
-                            .as_str()
-                            .filter(|id| !id.is_empty() && id.len() <= 256)
-                        else {
-                            break;
-                        };
-                        if operations.len() >= 128 || operations.contains_key(id) {
-                            let _ = client
-                                .ws
-                                .close(Some(4409), Some("duplicate or excessive operation ID"));
-                            break;
-                        }
-                        if let Err(error) = admit_request(&value["payload"], capabilities) {
-                            let _=client.send(&serde_json::json!({"id":id,"type":"next","payload":error.envelope()}));
-                            let _ = client.send(&serde_json::json!({"id":id,"type":"complete"}));
-                            continue;
-                        }
-                        let (abort, registration) = AbortHandle::new_pair();
-                        let (ack, acks) = mpsc::channel(1);
-                        operations.insert(id.to_owned(), Operation { abort, ack });
-                        let id = id.to_owned();
-                        let value = value["payload"].clone();
-                        let gateway = gateway.clone();
-                        let env = env.clone();
-                        let input = input.clone();
-                        let path = live_path.clone();
-                        let delivery = delivery.clone();
-                        let binding = binding.clone();
-                        let init = init.clone();
-                        let mut out = out.clone();
-                        worker::wasm_bindgen_futures::spawn_local(async move {
-                            let task = async {
-                                if let Err(reason) = operation(
-                                    &id, value, gateway, env, input, path, delivery, binding, init,
-                                    &mut out, acks,
-                                )
-                                .await
-                                {
-                                    let code = match reason.as_str() {
-                                        "AUTH_EXPIRED" => "AUTH_EXPIRED",
-                                        "FRESHNESS_PENDING" => "FRESHNESS_PENDING",
-                                        "FRESHNESS_SCOPE_CHANGED" => "FRESHNESS_SCOPE_CHANGED",
-                                        _ => "LIVE_RESET_REQUIRED",
-                                    };
-                                    let _=out.send(serde_json::json!({"id":id,"type":"error","payload":[{"message":code,"extensions":{"code":code}}]})).await;
-                                }
-                            };
-                            let _ = Abortable::new(task, registration).await;
-                        });
-                    }
-                    Some("complete") => {
-                        if let Some(id) = value["id"].as_str() {
-                            operations.remove(id);
-                        }
-                    }
-                    Some("ping") => {
-                        if client
-                            .send(&serde_json::json!({"type":"pong","payload":value["payload"]}))
-                            .is_err()
-                        {
-                            break;
-                        }
-                    }
-                    Some("pong") => {
-                        if let Some(operation) = value["payload"]["gatewayOperation"]
-                            .as_str()
-                            .and_then(|id| operations.get_mut(id))
-                        {
-                            let mut value = value;
-                            value["payload"]
-                                .as_object_mut()
-                                .map(|payload| payload.remove("gatewayOperation"));
-                            if operation.ack.try_send(value).is_err() {
-                                break;
-                            }
-                        }
-                    }
-                    _ => break,
-                }
-            }
+        let value = match event {
+            Event::Client(Ok(value)) => value,
             Event::Output(Some(value)) => {
                 if client.send(&value).is_err() {
                     break;
                 }
-                if matches!(value["type"].as_str(), Some("complete" | "error")) {
-                    if let Some(id) = value["id"].as_str() {
-                        operations.remove(id);
+                if let Some(id) = ws::ended_operation(&value) {
+                    operations.close(id);
+                }
+                continue;
+            }
+            _ => break,
+        };
+        match protocol.decode_client(value) {
+            Ok(ClientFrame::Subscribe { id, payload }) => {
+                if operations.admit(&id).is_err() {
+                    let _ = client
+                        .ws
+                        .close(Some(4409), Some("duplicate or excessive operation ID"));
+                    break;
+                }
+                if let Err(error) = admit_request(&payload, capabilities) {
+                    let _ = client.send(&protocol.next(&id, error.envelope()));
+                    let _ = client.send(&ws::complete(&id));
+                    continue;
+                }
+                let (abort, registration) = AbortHandle::new_pair();
+                let (ack, acks) = mpsc::channel(1);
+                let _ = operations.open(id.clone(), Operation { abort, ack });
+                let gateway = gateway.clone();
+                let env = env.clone();
+                let input = input.clone();
+                let path = live_path.clone();
+                let delivery = delivery.clone();
+                let binding = binding.clone();
+                let init = init.clone();
+                let mut out = out.clone();
+                worker::wasm_bindgen_futures::spawn_local(async move {
+                    let task = async {
+                        if let Err(reason) = operation(
+                            &id, payload, gateway, env, input, path, delivery, binding, init,
+                            &mut out, acks,
+                        )
+                        .await
+                        {
+                            let code = match reason.as_str() {
+                                "AUTH_EXPIRED"
+                                | "FRESHNESS_PENDING"
+                                | "FRESHNESS_SCOPE_CHANGED" => reason.as_str(),
+                                _ => LiveEnd::ResetRequired.code(),
+                            };
+                            let _ = out.send(ws::error(&id, code)).await;
+                        }
+                    };
+                    let _ = Abortable::new(task, registration).await;
+                });
+            }
+            Ok(ClientFrame::Complete { id }) => {
+                operations.close(&id);
+            }
+            Ok(ClientFrame::Ping(payload)) => {
+                if client.send(&ws::pong(payload)).is_err() {
+                    break;
+                }
+            }
+            // A delivery credit the gateway asked for on an operation's behalf.
+            Ok(ClientFrame::Pong(mut payload)) => {
+                let Some(id) = payload["gatewayOperation"].as_str().map(str::to_owned) else {
+                    continue;
+                };
+                if let Some(operation) = operations.get_mut(&id) {
+                    if let Some(payload) = payload.as_object_mut() {
+                        payload.remove("gatewayOperation");
+                    }
+                    if operation.ack.try_send(ws::pong(payload)).is_err() {
+                        break;
                     }
                 }
             }
-            _ => break,
+            Ok(ClientFrame::Init(_) | ClientFrame::Terminate) | Err(_) => break,
         }
     }
 }
@@ -302,12 +280,8 @@ async fn operation(
     out: &mut mpsc::Sender<serde_json::Value>,
     mut acks: mpsc::Receiver<serde_json::Value>,
 ) -> std::result::Result<(), String> {
-    if !value["extensions"].is_object() {
-        value["extensions"] = serde_json::json!({});
-    }
-    value["extensions"]["gatewayDelivery"] =
-        serde_json::json!({"action":"execute","connectionInit":init});
-    let send = |payload| serde_json::json!({"id":id,"type":"next","payload":payload});
+    mark_connection(&mut value, init.clone());
+    let send = |payload| WsProtocol::TransportWs.next(id, payload);
     let kind = operation_kind(
         value["query"].as_str().unwrap_or(""),
         value["operationName"].as_str(),
@@ -370,7 +344,12 @@ async fn operation(
             32,
         )
         .map_err(|_| "invalid coordinator socket")?;
-        socket.send(&serde_json::json!({"type":"subscribe","payload":value}))?;
+        socket.send(
+            &WsProtocol::TransportWs.encode_client(&ClientFrame::Subscribe {
+                id: id.to_owned(),
+                payload: value,
+            }),
+        )?;
         loop {
             enum Event {
                 Frame(std::result::Result<serde_json::Value, String>),
@@ -394,13 +373,13 @@ async fn operation(
                     Some("error") => {
                         return Err(value["payload"]
                             .as_str()
-                            .unwrap_or("LIVE_RESET_REQUIRED")
+                            .unwrap_or(LiveEnd::ResetRequired.code())
                             .into())
                     }
-                    _ => return Err("LIVE_RESET_REQUIRED".into()),
+                    _ => return Err(LiveEnd::ResetRequired.code().into()),
                 },
                 Event::Ack(Some(value)) => socket.send(&value)?,
-                _ => return Err("LIVE_RESET_REQUIRED".into()),
+                _ => return Err(LiveEnd::ResetRequired.code().into()),
             }
         }
     } else {
@@ -408,7 +387,11 @@ async fn operation(
         while let Some(frame) = stream.next().await {
             out.send(send(frame?)).await.map_err(|_| "consumer left")?;
             let nonce = uuid::Uuid::now_v7().to_string();
-            out.send(serde_json::json!({"type":"ping","payload":{"gatewayOperation":id,"gatewayDeliveryAck":nonce}})).await.map_err(|_|"consumer left")?;
+            out.send(ws::ping(
+                serde_json::json!({"gatewayOperation":id,"gatewayDeliveryAck":nonce}),
+            ))
+            .await
+            .map_err(|_| "consumer left")?;
             let ack = super::timer::deadline(
                 Duration::from_millis(input.options.limits.read_timeout_ms),
                 acks.next(),
@@ -421,7 +404,7 @@ async fn operation(
             }
         }
     }
-    out.send(serde_json::json!({"id":id,"type":"complete"}))
+    out.send(ws::complete(id))
         .await
         .map_err(|_| "consumer left".into())
 }
@@ -433,9 +416,9 @@ async fn independent(
     origin: &mut Socket,
     capabilities: GraphqlCapabilities,
     max_bytes: usize,
-    protocol: &str,
+    protocol: WsProtocol,
 ) {
-    let mut ids = std::collections::BTreeSet::new();
+    let mut ids = Operations::<()>::default();
     let mut bytes = 0usize;
     loop {
         let (value, from_client) =
@@ -443,67 +426,44 @@ async fn independent(
                 Either::Left((value, _)) => (value, true),
                 Either::Right((value, _)) => (value, false),
             };
-        let Ok(mut value) = value else {
+        let Ok(value) = value else {
             return;
         };
         if from_client {
-            match value["type"].as_str() {
-                Some(kind @ ("start" | "subscribe"))
-                    if kind
-                        == if protocol == "graphql-ws" {
-                            "start"
-                        } else {
-                            "subscribe"
-                        } =>
-                {
-                    let Some(id) = value["id"]
-                        .as_str()
-                        .filter(|id| !id.is_empty() && id.len() <= 256)
-                    else {
-                        return;
-                    };
-                    if ids.len() >= 128 || !ids.insert(id.to_owned()) {
+            let frame = match protocol.decode_client(value) {
+                Ok(ClientFrame::Subscribe { id, mut payload }) => {
+                    if ids.admit(&id).is_err() {
                         return;
                     }
-                    if let Err(error) = admit_request(&value["payload"], capabilities) {
-                        let _ = client.send(
-                            &serde_json::json!({"id":id,"type":if protocol=="graphql-ws"{"data"}else{"next"},"payload":error.envelope()}),
-                        );
-                        let _ = client.send(&serde_json::json!({"id":id,"type":"complete"}));
-                        ids.remove(id);
+                    if let Err(error) = admit_request(&payload, capabilities) {
+                        let _ = client.send(&protocol.next(&id, error.envelope()));
+                        let _ = client.send(&ws::complete(&id));
                         continue;
                     }
-                    super::super::graphql::remove_client_control(&mut value["payload"]);
+                    remove_client_control(&mut payload);
+                    let _ = ids.open(id.clone(), ());
+                    ClientFrame::Subscribe { id, payload }
                 }
-                Some(kind @ ("stop" | "complete"))
-                    if kind
-                        == if protocol == "graphql-ws" {
-                            "stop"
-                        } else {
-                            "complete"
-                        } =>
-                {
-                    if let Some(id) = value["id"].as_str() {
-                        ids.remove(id);
-                    }
+                Ok(ClientFrame::Complete { id }) => {
+                    ids.close(&id);
+                    ClientFrame::Complete { id }
                 }
-                Some("connection_terminate") if protocol == "graphql-ws" => return,
-                Some("ping" | "pong") if protocol == "graphql-transport-ws" => {}
-                _ => return,
-            }
-            if origin.send(&value).is_err() {
+                Ok(frame @ (ClientFrame::Ping(_) | ClientFrame::Pong(_))) => frame,
+                Ok(ClientFrame::Init(_) | ClientFrame::Terminate) | Err(_) => return,
+            };
+            if origin.send(&protocol.encode_client(&frame)).is_err() {
                 return;
             }
         } else {
             bytes = bytes.saturating_add(value.to_string().len());
             if bytes > max_bytes {
-                let _ = client.ws.close(Some(1013), Some("LIVE_RESET_REQUIRED"));
+                let _ = client
+                    .ws
+                    .close(Some(1013), Some(LiveEnd::ResetRequired.code()));
                 return;
             }
-            if matches!(value["type"].as_str(), Some("complete" | "error")) {
-                if let Some(id) = value["id"].as_str() {
-                    ids.remove(id);
-                }
+            if let Some(id) = ws::ended_operation(&value) {
+                ids.close(id);
             }
             if client.send(&value).is_err() {
                 return;

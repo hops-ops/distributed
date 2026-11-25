@@ -1,10 +1,14 @@
 use super::{proxy, RequestContext, WorkerOptions};
-use crate::gateway::{delivery::*, DeliveryCapabilities, GatewayError};
+use crate::gateway::{
+    delivery::*,
+    graphql::ws::{self, ClientFrame, WsProtocol},
+    DeliveryCapabilities, GatewayError,
+};
 use futures_util::{
     future::{LocalBoxFuture, Shared, WeakShared},
     FutureExt, StreamExt,
 };
-use std::{cell::RefCell, collections::BTreeMap, rc::Rc};
+use std::{cell::RefCell, rc::Rc};
 use worker::{Headers, Request, RequestInit, RequestRedirect, Response, Result};
 
 /// Optional delivery resources, allocated inside a Durable Object only.
@@ -162,10 +166,10 @@ impl WorkerCoordinator {
     }
     /// Current cache entries, active query groups and query consumers; no identity values.
     pub fn counts(&self) -> (usize, usize, usize) {
-        let (groups, consumers) = self.flights.as_ref().map_or((0, 0), |flights| {
-            let state = flights.state.borrow();
-            (state.registry.len(), state.registry.consumers())
-        });
+        let (groups, consumers) = self
+            .flights
+            .as_ref()
+            .map_or((0, 0), |flights| flights.table.borrow().counts());
         (
             self.cache.as_ref().map_or(0, |cache| cache.borrow().len()),
             groups,
@@ -174,9 +178,20 @@ impl WorkerCoordinator {
     }
     /// Active live groups and consumers, followed by source/reset/frame counters.
     pub fn live_counts(&self) -> (usize, usize, u64, u64, u64, u64, u64) {
-        self.live
+        let c = self
+            .live
             .as_ref()
-            .map_or((0, 0, 0, 0, 0, 0, 0), |live| live.counts())
+            .map(|live| live.counts())
+            .unwrap_or_default();
+        (
+            c.groups,
+            c.consumers,
+            c.upstreams,
+            c.resets,
+            c.frames,
+            c.deduplicated,
+            c.handoffs,
+        )
     }
     pub(super) fn upgrade(
         self: &Rc<Self>,
@@ -200,9 +215,13 @@ impl WorkerCoordinator {
             let Ok(Ok(first)) = first else {
                 return;
             };
-            let value = first["payload"].clone();
-            if first["type"] != "subscribe"
-                || crate::gateway::graphql::admit_request(&value, capabilities).is_err()
+            // The ingress's own subscribe frame: one operation per socket.
+            let Ok(ClientFrame::Subscribe { payload: value, .. }) =
+                WsProtocol::TransportWs.decode_client(first)
+            else {
+                return;
+            };
+            if crate::gateway::graphql::admit_request(&value, capabilities).is_err()
                 || crate::gateway::graphql::operation_kind(
                     value["query"].as_str().unwrap_or(""),
                     value["operationName"].as_str(),
@@ -226,6 +245,7 @@ impl WorkerCoordinator {
             .map(FreshnessContext::parse)
             .transpose()
             .map_err(delivery_error)?;
+        // The ingress recorded this consumer's connection_init here.
         let init = value["extensions"]["gatewayDelivery"]
             .get("connectionInit")
             .cloned()
@@ -247,7 +267,7 @@ impl WorkerCoordinator {
             }
             Admitted::Bypass => None,
             Admitted::Error(mut response) => {
-                let bytes = read_response(&mut response, 65536).await?;
+                let bytes = read_response(&mut response, MAX_VALIDATION_BYTES).await?;
                 let payload = serde_json::from_slice::<serde_json::Value>(&bytes).unwrap_or_else(
                     |_| serde_json::json!({"errors":[{"message":"origin admission failed"}]}),
                 );
@@ -265,7 +285,7 @@ impl WorkerCoordinator {
                                 Frame(
                                     std::result::Result<
                                         Option<Rc<super::live::WorkerFrame>>,
-                                        &'static str,
+                                        LiveEnd,
                                     >,
                                 ),
                                 Client(std::result::Result<serde_json::Value, String>),
@@ -285,11 +305,16 @@ impl WorkerCoordinator {
                             };
                             let frame = match event {
                                 Event::Frame(frame) => frame,
-                                Event::Client(Ok(value)) if value["type"] == "ping" => {
-                                    let _=socket.send(&serde_json::json!({"type":"pong","payload":value["payload"]}));
-                                    continue;
+                                Event::Client(Ok(value)) => {
+                                    match WsProtocol::TransportWs.decode_client(value) {
+                                        Ok(ClientFrame::Ping(payload)) => {
+                                            let _ = socket.send(&ws::pong(payload));
+                                            continue;
+                                        }
+                                        _ => return,
+                                    }
                                 }
-                                _ => return,
+                                Event::Client(Err(_)) => return,
                             };
                             let frame = match frame {
                                 Ok(Some(frame)) => frame,
@@ -297,9 +322,9 @@ impl WorkerCoordinator {
                                     let _ = socket.send(&serde_json::json!({"type":"complete"}));
                                     return;
                                 }
-                                Err(reason) => {
+                                Err(end) => {
                                     let _ = socket.send(
-                                        &serde_json::json!({"type":"error","payload":reason}),
+                                        &serde_json::json!({"type":"error","payload":end.code()}),
                                     );
                                     return;
                                 }
@@ -313,7 +338,12 @@ impl WorkerCoordinator {
                             // Standard GraphQL ping/pong provides a delivery credit on
                             // workerd, whose WebSocket API has no bufferedAmount.
                             let nonce = uuid::Uuid::now_v7().to_string();
-                            if socket.send(&serde_json::json!({"type":"ping","payload":{"gatewayDeliveryAck":nonce}})).is_err(){return;}
+                            if socket
+                                .send(&ws::ping(serde_json::json!({"gatewayDeliveryAck":nonce})))
+                                .is_err()
+                            {
+                                return;
+                            }
                             let acknowledged = {
                                 let ack = wait_ack(&mut socket, &nonce, ack_timeout);
                                 matches!(
@@ -326,7 +356,9 @@ impl WorkerCoordinator {
                                 )
                             };
                             if !acknowledged {
-                                let _ = socket.ws.close(Some(1013), Some("LIVE_RESET_REQUIRED"));
+                                let _ = socket
+                                    .ws
+                                    .close(Some(1013), Some(LiveEnd::ResetRequired.code()));
                                 return;
                             }
                         }
@@ -357,7 +389,9 @@ impl WorkerCoordinator {
                                 break;
                             };
                             let Ok(frame) = frame else {
-                                let _ = socket.ws.close(Some(1013), Some("LIVE_RESET_REQUIRED"));
+                                let _ = socket
+                                    .ws
+                                    .close(Some(1013), Some(LiveEnd::ResetRequired.code()));
                                 return;
                             };
                             if socket
@@ -367,7 +401,13 @@ impl WorkerCoordinator {
                                 return;
                             }
                             let nonce = uuid::Uuid::now_v7().to_string();
-                            if socket.send(&serde_json::json!({"type":"ping","payload":{"gatewayDeliveryAck":nonce}})).is_err()||wait_ack(&mut socket,&nonce,ack_timeout).await.is_err(){return;}
+                            if socket
+                                .send(&ws::ping(serde_json::json!({"gatewayDeliveryAck":nonce})))
+                                .is_err()
+                                || wait_ack(&mut socket, &nonce, ack_timeout).await.is_err()
+                            {
+                                return;
+                            }
                         }
                         let _ = socket.send(&serde_json::json!({"type":"complete"}));
                     };
@@ -453,7 +493,7 @@ impl WorkerCoordinator {
                 .boxed_local()
             });
             // Coalescing is an optimization: with no room to join, run alone.
-            let Ok(lease) = lease else {
+            let Some(lease) = lease else {
                 return origin.execute(value).await;
             };
             let outcome = proxy::timeout(expires.saturating_sub(super::now()) * 1000, async {
@@ -499,7 +539,7 @@ impl WorkerCoordinator {
         if snapshot.shareable(&admission, freshness.as_ref()) {
             match origin.validate(&value).await? {
                 Admitted::Eligible(current) => {
-                    if current.identity != admission.identity || current.key != admission.key {
+                    if admission.same_scope(&current).is_err() {
                         return Response::error("origin scope changed", 409);
                     }
                     if let (Some(cache), Some(ticket)) = (&self.cache, ticket) {
@@ -560,53 +600,41 @@ impl OriginRequest {
         let mut marked = value.clone();
         mark(&mut marked, "validate");
         let result = self.execute(marked).await?;
-        let Captured::Bytes(snapshot) = capture(result, 65536).await? else {
-            return Err(worker::Error::RustError(
-                "oversized origin admission".into(),
-            ));
+        let Captured::Bytes(snapshot) = capture(result, MAX_VALIDATION_BYTES).await? else {
+            return Ok(Admitted::Error(Response::error(
+                "oversized origin admission",
+                502,
+            )?));
         };
-        if snapshot.status != 200 {
-            return Ok(Admitted::Error(render(snapshot)?));
-        }
-        let parsed: serde_json::Value = serde_json::from_slice(&snapshot.body)?;
-        if parsed
-            .get("errors")
-            .is_some_and(|v| v.as_array().is_none_or(|v| !v.is_empty()))
-        {
-            return Ok(Admitted::Error(render(snapshot)?));
-        }
-        let delivery = &parsed["extensions"]["gatewayDelivery"];
-        if delivery["eligible"] != true
-            || snapshot
-                .headers
-                .iter()
-                .any(|(name, _)| name.eq_ignore_ascii_case("set-cookie"))
-        {
-            return Ok(Admitted::Bypass);
-        }
-        let admission: OriginAdmission = serde_json::from_value(delivery["admission"].clone())?;
-        admission
-            .bind(value, super::now())
-            .map_err(delivery_error)?;
-        Ok(Admitted::Eligible(admission))
+        let sets_cookie = snapshot
+            .headers
+            .iter()
+            .any(|(name, _)| name.eq_ignore_ascii_case("set-cookie"));
+        Ok(
+            match verdict(
+                snapshot.status,
+                sets_cookie,
+                &snapshot.body,
+                value,
+                super::now(),
+            ) {
+                OriginVerdict::Eligible(admission) => Admitted::Eligible(admission),
+                OriginVerdict::Bypass => Admitted::Bypass,
+                OriginVerdict::Reject => Admitted::Error(render(snapshot)?),
+                OriginVerdict::Malformed => {
+                    Admitted::Error(Response::error("invalid origin admission", 502)?)
+                }
+                OriginVerdict::Unbound(_) => {
+                    Admitted::Error(Response::error("origin admission unavailable", 503)?)
+                }
+            },
+        )
     }
 }
 pub(super) enum Admitted {
     Eligible(OriginAdmission),
     Bypass,
     Error(Response),
-}
-pub(super) fn mark(value: &mut serde_json::Value, action: &str) {
-    if !value["extensions"].is_object() {
-        value["extensions"] = serde_json::json!({});
-    }
-    let init = value["extensions"]["gatewayDelivery"]
-        .get("connectionInit")
-        .cloned();
-    value["extensions"]["gatewayDelivery"] = serde_json::json!({"action":action});
-    if let Some(init) = init {
-        value["extensions"]["gatewayDelivery"]["connectionInit"] = init;
-    }
 }
 fn delivery_error(_: DeliveryError) -> worker::Error {
     worker::Error::RustError("delivery unavailable".into())
@@ -684,12 +712,8 @@ fn exclusive(response: Response) -> Outcome {
     Outcome::Exclusive(Rc::new(RefCell::new(Some(response))))
 }
 type Work = LocalBoxFuture<'static, Outcome>;
-struct FlightState {
-    registry: FlightRegistry,
-    work: BTreeMap<u64, WeakShared<Work>>,
-}
 struct Flights {
-    state: RefCell<FlightState>,
+    table: RefCell<FlightTable<WeakShared<Work>>>,
     limits: FlightLimits,
 }
 struct Lease {
@@ -700,58 +724,35 @@ struct Lease {
 impl Drop for Lease {
     fn drop(&mut self) {
         if let Some(ticket) = self.ticket.take() {
-            let generation = ticket.generation();
-            let mut state = self.owner.state.borrow_mut();
-            if state.registry.leave(ticket) {
-                state.work.remove(&generation);
-            }
+            self.owner.table.borrow_mut().leave(ticket);
         }
     }
 }
 impl Flights {
     fn new(limits: FlightLimits) -> std::result::Result<Rc<Self>, GatewayError> {
         Ok(Rc::new(Self {
-            state: RefCell::new(FlightState {
-                registry: FlightRegistry::new(limits)
-                    .map_err(|_| GatewayError("invalid flight limits"))?,
-                work: BTreeMap::new(),
-            }),
+            table: RefCell::new(
+                FlightTable::new(limits).map_err(|_| GatewayError("invalid flight limits"))?,
+            ),
             limits,
         }))
     }
-    fn join(
-        self: &Rc<Self>,
-        key: FlightKey,
-        start: impl FnOnce() -> Work,
-    ) -> std::result::Result<Lease, DeliveryError> {
-        let mut state = self.state.borrow_mut();
-        state.registry.expire(worker::Date::now().as_millis());
-        let expired = state
-            .work
-            .keys()
-            .filter(|generation| !state.registry.contains_generation(**generation))
-            .copied()
-            .collect::<Vec<_>>();
-        for generation in expired {
-            state.work.remove(&generation);
-        }
-        let (ticket, owner) = state.registry.join(key, worker::Date::now().as_millis())?;
-        let generation = ticket.generation();
-        let work = if owner {
-            let work = start().shared();
-            state.work.insert(
-                generation,
-                work.downgrade().ok_or(DeliveryError::Unavailable)?,
-            );
-            work
-        } else {
-            state
-                .work
-                .get(&generation)
-                .and_then(WeakShared::upgrade)
-                .ok_or(DeliveryError::Unavailable)?
-        };
-        Ok(Lease {
+    fn join(self: &Rc<Self>, key: FlightKey, start: impl FnOnce() -> Work) -> Option<Lease> {
+        let (ticket, work) = self
+            .table
+            .borrow_mut()
+            .join(
+                key,
+                worker::Date::now().as_millis(),
+                || {
+                    let work = start().shared();
+                    let weak = work.downgrade().expect("unpolled shared work");
+                    (work, weak)
+                },
+                WeakShared::upgrade,
+            )
+            .ok()?;
+        Some(Lease {
             owner: self.clone(),
             ticket: Some(ticket),
             work,
@@ -766,12 +767,11 @@ async fn wait_ack(
 ) -> std::result::Result<(), String> {
     super::timer::deadline(std::time::Duration::from_millis(milliseconds), async {
         loop {
-            let value = socket.next().await?;
-            match value["type"].as_str() {
-                Some("pong") if value["payload"]["gatewayDeliveryAck"] == nonce => return Ok(()),
-                Some("ping") => {
-                    socket.send(&serde_json::json!({"type":"pong","payload":value["payload"]}))?
+            match WsProtocol::TransportWs.decode_client(socket.next().await?) {
+                Ok(ClientFrame::Pong(payload)) if payload["gatewayDeliveryAck"] == nonce => {
+                    return Ok(())
                 }
+                Ok(ClientFrame::Ping(payload)) => socket.send(&ws::pong(payload))?,
                 _ => return Err("invalid delivery acknowledgement".into()),
             }
         }

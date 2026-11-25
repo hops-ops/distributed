@@ -38,5 +38,11 @@ pub use coordinator::*;
 mod live;
 pub use live::*;
 
+mod live_coordinator;
+pub use live_coordinator::*;
+
+mod origin;
+pub use origin::*;
+
 mod metrics;
 pub use metrics::*;

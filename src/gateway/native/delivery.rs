@@ -105,9 +105,20 @@ impl NativeDelivery {
     /// Active live groups/consumers and cumulative source attempts, resets,
     /// upstream frames, duplicate frames and safe consumer handoffs.
     pub fn live_counts(&self) -> (usize, usize, u64, u64, u64, u64, u64) {
-        self.live
+        let c = self
+            .live
             .as_ref()
-            .map_or((0, 0, 0, 0, 0, 0, 0), |live| live.counts())
+            .map(|live| live.counts())
+            .unwrap_or_default();
+        (
+            c.groups,
+            c.consumers,
+            c.upstreams,
+            c.resets,
+            c.frames,
+            c.deduplicated,
+            c.handoffs,
+        )
     }
     pub(super) fn capabilities(&self) -> DeliveryCapabilities {
         DeliveryCapabilities {
@@ -284,7 +295,7 @@ impl NativeDelivery {
         // after the result too, including when only coalescing is selected.
         match validate(&binding, &inner, &executor, &context, &parts, &value).await {
             AdmissionResult::Eligible(current) => {
-                if current.identity != admission.identity || current.key != admission.key {
+                if admission.same_scope(&current).is_err() {
                     return response(StatusCode::CONFLICT);
                 }
                 if let (Some(ticket), Some(cache)) = (ticket, &self.snapshots) {
@@ -336,7 +347,7 @@ pub(super) async fn validate(
     let (parts, body) = result.into_parts();
     let body = match tokio::time::timeout(
         inner.options.limits.read_timeout,
-        axum::body::to_bytes(body, 65536),
+        axum::body::to_bytes(body, MAX_VALIDATION_BYTES),
     )
     .await
     {
@@ -344,46 +355,22 @@ pub(super) async fn validate(
         Ok(Err(_)) => return AdmissionResult::Error(response(StatusCode::BAD_GATEWAY)),
         Err(_) => return AdmissionResult::Error(response(StatusCode::GATEWAY_TIMEOUT)),
     };
-    if parts.status != StatusCode::OK {
-        return AdmissionResult::Error(Response::from_parts(parts, Body::from(body)));
-    }
-    let parsed: serde_json::Value = match serde_json::from_slice(&body) {
-        Ok(value) => value,
-        Err(_) => return AdmissionResult::Error(response(StatusCode::BAD_GATEWAY)),
-    };
-    if parsed
-        .get("errors")
-        .is_some_and(|e| e.as_array().is_none_or(|e| !e.is_empty()))
-    {
-        return AdmissionResult::Error(Response::from_parts(parts, Body::from(body)));
-    }
-    let delivery = &parsed["extensions"]["gatewayDelivery"];
-    if delivery["eligible"] != true {
-        return AdmissionResult::Bypass;
-    }
-    // Cookie-bearing validation is never a reusable authorization grant.
-    if parts.headers.contains_key(header::SET_COOKIE) {
-        return AdmissionResult::Bypass;
-    }
-    let admission: OriginAdmission = match serde_json::from_value(delivery["admission"].clone()) {
-        Ok(value) => value,
-        Err(_) => return AdmissionResult::Error(response(StatusCode::BAD_GATEWAY)),
-    };
-    if admission.bind(value, super::now()).is_err() {
-        return AdmissionResult::Error(response(StatusCode::SERVICE_UNAVAILABLE));
-    }
-    AdmissionResult::Eligible(admission)
-}
-fn mark(value: &mut serde_json::Value, action: &str) {
-    if !value["extensions"].is_object() {
-        value["extensions"] = serde_json::json!({});
-    }
-    let init = value["extensions"]["gatewayDelivery"]
-        .get("connectionInit")
-        .cloned();
-    value["extensions"]["gatewayDelivery"] = serde_json::json!({"action":action});
-    if let Some(init) = init {
-        value["extensions"]["gatewayDelivery"]["connectionInit"] = init;
+    match verdict(
+        parts.status.as_u16(),
+        parts.headers.contains_key(header::SET_COOKIE),
+        &body,
+        value,
+        super::now(),
+    ) {
+        OriginVerdict::Eligible(admission) => AdmissionResult::Eligible(admission),
+        OriginVerdict::Bypass => AdmissionResult::Bypass,
+        OriginVerdict::Reject => {
+            AdmissionResult::Error(Response::from_parts(parts, Body::from(body)))
+        }
+        OriginVerdict::Malformed => AdmissionResult::Error(response(StatusCode::BAD_GATEWAY)),
+        OriginVerdict::Unbound(_) => {
+            AdmissionResult::Error(response(StatusCode::SERVICE_UNAVAILABLE))
+        }
     }
 }
 pub(super) fn cached_response(snapshot: SnapshotResponse) -> Response {

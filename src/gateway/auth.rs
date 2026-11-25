@@ -1,4 +1,4 @@
-use super::{Credentials, RequestContext};
+use super::{Credentials, GatewayError, RequestContext};
 use std::future::Future;
 
 /// Authentication/admission failures carry no credentials or provider internals.
@@ -89,6 +89,37 @@ pub fn is_untrusted_identity_header(name: &str) -> bool {
             | "x-role"
             | "x-roles"
     ) || name.starts_with("x-hasura-")
+}
+
+/// Header carrying the chain of gateways a request has crossed.
+pub const HOPS_HEADER: &str = "x-distributed-gateway-hops";
+/// Most gateways one request may cross, this one included.
+pub const MAX_HOPS: usize = 8;
+/// Largest hop chain accepted or produced, in bytes.
+pub const MAX_HOPS_BYTES: usize = 1024;
+
+/// The hop chain after this gateway, given the incoming one. Fails on a
+/// loop (this gateway is already in the chain) or a chain that would exceed
+/// [`MAX_HOPS`] entries or [`MAX_HOPS_BYTES`]. Every adapter checks the
+/// incoming chain with this at ingress and writes its result on every
+/// forwarded request.
+pub fn append_hop(previous: Option<&str>, hop_id: &str) -> Result<String, GatewayError> {
+    let previous = previous.filter(|chain| !chain.trim().is_empty());
+    let Some(previous) = previous else {
+        return Ok(hop_id.to_owned());
+    };
+    let mut count = 0;
+    for hop in previous.split(',') {
+        count += 1;
+        if hop.trim() == hop_id || count >= MAX_HOPS {
+            return Err(GatewayError("gateway loop"));
+        }
+    }
+    let chain = format!("{previous},{hop_id}");
+    if chain.len() > MAX_HOPS_BYTES {
+        return Err(GatewayError("gateway loop"));
+    }
+    Ok(chain)
 }
 
 /// What a binding's backend receives from the client request. One rule for
@@ -191,6 +222,30 @@ mod tests {
             assert!(rule.forwards("Content-Type", &[]), "{rule:?}");
             assert!(rule.forwards("x-distributed-gateway-hops", &[]), "{rule:?}");
         }
+    }
+
+    #[test]
+    fn the_hop_chain_has_one_limit_on_every_adapter() {
+        assert_eq!(append_hop(None, "me").unwrap(), "me");
+        assert_eq!(append_hop(Some(" "), "me").unwrap(), "me");
+        assert_eq!(append_hop(Some("a, b"), "me").unwrap(), "a, b,me");
+        assert!(append_hop(Some("a, me"), "me").is_err(), "loop");
+        let seven = ["h"; MAX_HOPS - 1].join(",");
+        assert_eq!(
+            append_hop(Some(&seven), "me").unwrap().split(',').count(),
+            MAX_HOPS
+        );
+        let eight = ["h"; MAX_HOPS].join(",");
+        assert!(append_hop(Some(&eight), "me").is_err(), "a ninth hop");
+        let long = "x".repeat(MAX_HOPS_BYTES - 2);
+        assert!(
+            append_hop(Some(&long), "me").is_err(),
+            "over the byte bound"
+        );
+        assert_eq!(
+            append_hop(Some(&long[1..]), "me").unwrap().len(),
+            MAX_HOPS_BYTES
+        );
     }
 
     #[test]

@@ -12,11 +12,11 @@ pub use coordinator::{WorkerCoordinator, WorkerDeliveryBinding, WorkerDeliveryOp
 
 use super::{
     Admission, AuthError, BackendCredential, BindingKind, Credentials, Forwarding, Gateway,
-    GatewayError, GraphqlExecutor, RequestContext,
+    GatewayAdapter, GatewayError, GraphqlExecutor, Rejection, RequestContext, SelectedRoute,
 };
 use futures_util::future::LocalBoxFuture;
 use std::{collections::BTreeMap, future::Future, rc::Rc};
-use worker::{Env, Request, Response, Result};
+use worker::{Env, Headers, Request, Response, Result};
 
 /// Local-future provider; every consumer authenticates before route admission.
 #[derive(Clone)]
@@ -124,6 +124,9 @@ pub enum WorkerBinding {
         /// Allow transparent WebSocket upgrades to this UI target.
         websocket: bool,
     },
+    /// Configured zone host; WebSocket upgrades are always allowed. Zones
+    /// verify their own join tickets, so no credential or cookie is forwarded.
+    Zones,
     /// Named portable admission policy.
     Admission(Admission),
     /// Whole remote GraphQL endpoint; embedded executors are rejected.
@@ -191,7 +194,8 @@ impl WorkerGateway {
                 (BindingKind::Handler, WorkerBinding::Handler(_))
                 | (BindingKind::Admission, WorkerBinding::Admission(_))
                 | (BindingKind::Assets, WorkerBinding::Assets(_)) => true,
-                (BindingKind::UiProxy { origin }, WorkerBinding::UiProxy { .. }) => {
+                (BindingKind::UiProxy { origin }, WorkerBinding::UiProxy { .. })
+                | (BindingKind::Zones { origin }, WorkerBinding::Zones) => {
                     origin.trim_end_matches('/') != options.public_origin.trim_end_matches('/')
                 }
                 (
@@ -246,7 +250,7 @@ impl WorkerGateway {
     }
     /// Select one owner, authenticate, admit and execute exactly once.
     pub async fn fetch(&self, request: Request, env: Env) -> Result<Response> {
-        cancellation::run(request.inner().signal(), self.dispatch(request, env, None)).await
+        cancellation::run(request.inner().signal(), self.serve(request, env, None)).await
     }
     /// Execute inside the selected Durable Object, repeating provider and origin admission.
     /// This entrypoint is an in-process mount, never a client header or URL flag.
@@ -258,44 +262,97 @@ impl WorkerGateway {
     ) -> Result<Response> {
         cancellation::run(
             request.inner().signal(),
-            self.dispatch(request, env, Some(coordinator)),
+            self.serve(request, env, Some(coordinator)),
         )
         .await
     }
-    async fn dispatch(
+    async fn serve(
         &self,
-        mut request: Request,
+        request: Request,
         env: Env,
         coordinator: Option<Rc<WorkerCoordinator>>,
     ) -> Result<Response> {
-        let url = request.url()?;
-        let selected = match self.0.gateway.select(request.method().as_ref(), url.path()) {
-            Ok(Some(selected)) => selected,
-            Ok(None) => return Response::error("not found", 404),
-            Err(_) => return Response::error("invalid route", 400),
-        };
-        let credentials = Credentials {
-            authorization: request.headers().get("authorization")?,
-            cookie: request.headers().get("cookie")?,
-        };
-        let context = match (self.0.auth.0)(credentials).await {
-            Ok(context) => context,
-            Err(error) => return auth_error(error),
-        };
-        if let Err(error) = Admission::Public.check(&context, now()) {
-            return auth_error(error);
+        // The same chain rule every forward applies, checked at ingress.
+        if proxy::hop_chain(request.headers(), &self.0.options).is_err() {
+            return Response::error("gateway loop", 508);
         }
-        for id in &selected.route().admission {
-            let Some(WorkerBinding::Admission(policy)) = self.0.bindings.get(id) else {
-                return Response::error("invalid admission", 503);
+        let method = request.method().to_string();
+        let path = request.url()?.path().to_owned();
+        let request = WorkerRequest {
+            request,
+            env,
+            coordinator,
+            method,
+            path,
+        };
+        self.0.gateway.dispatch(self, request).await
+    }
+}
+
+/// One request in the Worker adapter: the platform request and what
+/// executing its route needs.
+pub struct WorkerRequest {
+    request: Request,
+    env: Env,
+    coordinator: Option<Rc<WorkerCoordinator>>,
+    method: String,
+    path: String,
+}
+
+impl GatewayAdapter for WorkerGateway {
+    type Request = WorkerRequest;
+    type Context = RequestContext;
+    type Response = Result<Response>;
+    fn method<'a>(&self, request: &'a WorkerRequest) -> &'a str {
+        &request.method
+    }
+    fn target<'a>(&self, request: &'a WorkerRequest) -> &'a str {
+        &request.path
+    }
+    fn admit(
+        &self,
+        selected: SelectedRoute<'_>,
+        request: &WorkerRequest,
+    ) -> impl Future<Output = std::result::Result<RequestContext, Result<Response>>> {
+        let credentials = credentials(request.request.headers());
+        let auth = self.0.auth.clone();
+        let policies: Option<Vec<Admission>> = selected
+            .route()
+            .admission
+            .iter()
+            .map(|id| match self.0.bindings.get(id) {
+                Some(WorkerBinding::Admission(policy)) => Some(policy.clone()),
+                _ => None,
+            })
+            .collect();
+        async move {
+            let context = (auth.0)(credentials.map_err(auth_error)?)
+                .await
+                .map_err(auth_error)?;
+            Admission::Public
+                .check(&context, now())
+                .map_err(auth_error)?;
+            let Some(policies) = policies else {
+                return Err(Response::error("invalid admission", 503));
             };
-            if let Err(error) = policy.check(&context, now()) {
-                return auth_error(error);
+            for policy in policies {
+                policy.check(&context, now()).map_err(auth_error)?;
             }
+            Ok(context)
         }
-        if !selected.method_allowed() {
-            return Response::error("method not allowed", 405);
-        }
+    }
+    async fn execute(
+        &self,
+        selected: SelectedRoute<'_>,
+        context: RequestContext,
+        request: WorkerRequest,
+    ) -> Result<Response> {
+        let WorkerRequest {
+            mut request,
+            env,
+            coordinator,
+            ..
+        } = request;
         let binding = &self.0.bindings[&selected.binding().id];
         match (binding, &selected.binding().kind) {
             (WorkerBinding::Handler(handler), kind) => {
@@ -316,6 +373,18 @@ impl WorkerGateway {
                     return Response::error("invalid request", 400);
                 };
                 env.service(binding)?.fetch_request(request).await
+            }
+            (WorkerBinding::Zones, BindingKind::Zones { origin }) => {
+                proxy::forward(
+                    request,
+                    origin,
+                    None,
+                    true,
+                    Forwarding::Zones,
+                    &self.0.options,
+                    &context,
+                )
+                .await
             }
             (WorkerBinding::UiProxy { websocket }, BindingKind::UiProxy { origin }) => {
                 proxy::forward(
@@ -463,6 +532,29 @@ impl WorkerGateway {
             _ => Response::error("invalid execution binding", 503),
         }
     }
+    fn reject(&self, rejection: Rejection<'_>) -> Result<Response> {
+        match rejection {
+            Rejection::BadRequest => Response::error("invalid route", 400),
+            Rejection::NotFound => Response::error("not found", 404),
+            Rejection::MethodNotAllowed(selected) => {
+                let response = Response::error("method not allowed", 405)?;
+                if let super::Methods::Only(methods) = &selected.route().methods {
+                    response.headers().set("allow", &methods.join(", "))?;
+                }
+                Ok(response)
+            }
+        }
+    }
+}
+fn credentials(headers: &Headers) -> std::result::Result<Credentials, AuthError> {
+    // The Fetch API folds repeated fields into one comma-joined value.
+    let field = |name| headers.get(name).map_err(|_| AuthError::Unauthorized);
+    let authorization = field("authorization")?;
+    let cookie = field("cookie")?;
+    Credentials::from_fields(
+        authorization.as_deref().as_slice(),
+        cookie.as_deref().as_slice(),
+    )
 }
 fn auth_error(error: AuthError) -> Result<Response> {
     Response::error(
@@ -476,4 +568,41 @@ fn auth_error(error: AuthError) -> Result<Response> {
 }
 fn now() -> u64 {
     worker::Date::now().as_millis() / 1000
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::gateway::{Binding, GatewayConfig, Route, RoutePath};
+
+    fn zones(origin: &str) -> Gateway {
+        GatewayConfig {
+            bindings: vec![Binding::new(
+                "zones",
+                BindingKind::Zones {
+                    origin: origin.into(),
+                },
+            )],
+            routes: vec![Route::new("zones", RoutePath::prefix("/zones"), "zones")],
+        }
+        .build()
+        .unwrap()
+    }
+    fn mount(gateway: Gateway) -> std::result::Result<WorkerGateway, GatewayError> {
+        WorkerGateway::new(
+            gateway,
+            WorkerOptions::new("https://app.test"),
+            [("zones".to_owned(), WorkerBinding::Zones)],
+            WorkerAuth::anonymous(),
+        )
+    }
+
+    #[test]
+    fn a_zones_binding_mounts_like_the_native_adapter() {
+        assert!(mount(zones("https://zones.internal")).is_ok());
+        assert!(
+            mount(zones("https://app.test/")).is_err(),
+            "a zone host cannot be the gateway itself"
+        );
+    }
 }
