@@ -48,18 +48,23 @@ impl TypedCommandContract {
     /// deployment may add unrelated routes without invalidating safe retries
     /// for this command. The explicit domain/version prevents this byte digest
     /// from aliasing any other SHA-256 use in the framework.
-    pub(crate) fn fingerprint_bytes(&self) -> [u8; 32] {
+    ///
+    /// Fails when the contract's domain-event projections are invalid.
+    pub(crate) fn fingerprint_bytes(&self) -> Result<[u8; 32], String> {
         let mut digest = Sha256::new();
         digest.update(b"distributed.typed-command-contract.v1");
         digest.update([0]);
         digest.update(
-            serde_json::to_vec(&self.canonical_value())
-                .expect("canonical typed command contract serialization cannot fail"),
+            serde_json::to_vec(&self.canonical_value()?)
+                .expect("serializing a JSON value cannot fail"),
         );
-        digest.finalize().into()
+        Ok(digest.finalize().into())
     }
 
-    pub(crate) fn canonical_value(&self) -> serde_json::Value {
+    /// The contract's canonical JSON. Fails when its domain-event
+    /// projections are invalid, which a hand-built or deserialized contract
+    /// can be.
+    pub(crate) fn canonical_value(&self) -> Result<serde_json::Value, String> {
         let mut roles = self.roles.clone();
         roles.sort();
         roles.dedup();
@@ -74,10 +79,8 @@ impl TypedCommandContract {
             .as_ref()
             .map(CommandProjectedModel::canonical_value);
         let mut projections = self.projections.clone();
-        projections
-            .canonicalize_and_validate(&self.name)
-            .expect("validated command projection declarations are canonical");
-        canonical_json(&serde_json::json!({
+        projections.canonicalize_and_validate(&self.name)?;
+        Ok(canonical_json(&serde_json::json!({
             "name": self.name,
             "field_name": self.field_name,
             "roles": roles,
@@ -88,7 +91,7 @@ impl TypedCommandContract {
             "projected_model": projected_model,
             "direct_projection": direct_projection,
             "projections": projections,
-        }))
+        })))
     }
 
     pub(crate) fn resolve_direct_projection_target_from_session(
@@ -257,7 +260,7 @@ impl TypedServiceCommandBinding {
                 contract.name.clone(),
                 (contract.input_type_id, contract.output_type_id),
             );
-            canonical.push(contract.canonical_value());
+            canonical.push(contract.canonical_value()?);
         }
 
         let material = canonical_json(&serde_json::json!({

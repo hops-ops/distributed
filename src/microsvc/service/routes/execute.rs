@@ -84,9 +84,9 @@ where
         handle: Arc<PreparedHandlerFn<A, I, K>>,
         requires_clock: bool,
         requires_scheduling: bool,
-    ) -> Self {
-        Self {
-            fingerprint: CommandContractFingerprint::new(contract.fingerprint_bytes()),
+    ) -> Result<Self, String> {
+        Ok(Self {
+            fingerprint: CommandContractFingerprint::new(contract.fingerprint_bytes()?),
             contract,
             guard,
             handle,
@@ -95,7 +95,7 @@ where
             #[cfg(feature = "graphql")]
             direct_projection_bootstrap: tokio::sync::OnceCell::new(),
             _types: std::marker::PhantomData,
-        }
+        })
     }
 }
 
@@ -623,9 +623,12 @@ where
     fn bind_direct_projection(
         &mut self,
         direct_projection: Option<crate::command::CommandDirectProjectionTarget>,
-    ) {
-        self.contract.direct_projection = direct_projection;
-        self.fingerprint = CommandContractFingerprint::new(self.contract.fingerprint_bytes());
+    ) -> Result<(), String> {
+        let mut contract = self.contract.clone();
+        contract.direct_projection = direct_projection;
+        self.fingerprint = CommandContractFingerprint::new(contract.fingerprint_bytes()?);
+        self.contract = contract;
+        Ok(())
     }
 
     #[cfg(any(feature = "graphql", feature = "runtime-tokio"))]
