@@ -30,40 +30,7 @@ jobs:
   # is already testing, with the same jobs, and those results show on that
   # pull request. Running it twice would take every hosted runner slot the
   # organization has (20) for the length of a run. Fork heads still run.
-  contracts:
-    name: Run fail-fast contract lifecycle check
-    if: ${{ !(github.event_name == 'pull_request' && github.head_ref == 'v5' && !github.event.pull_request.head.repo.fork) }}
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    # The same CARGO_* values as integration-distributed-cli.yaml: rust-cache
-    # hashes them into the key, and this job restores that job's cache.
-    env:
-      CARGO_TERM_COLOR: always
-      CARGO_PROFILE_DEV_DEBUG: line-tables-only
-      CARGO_INCREMENTAL: "0"
-    steps:
-      - uses: actions/checkout@v7
-        with:
-          fetch-depth: 0
-      - name: Resolve PR merge-base
-        id: base
-        # Only a pull request has a base ref.
-        if: github.event_name == 'pull_request'
-        run: |
-          git fetch origin "${{ github.base_ref }}" --depth=1
-          base=$(git merge-base HEAD "origin/${{ github.base_ref }}" || true)
-          echo "sha=${base}" >> "$GITHUB_OUTPUT"
-          echo "merge-base=${base}"
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-      # Restores what the distributed_cli job writes on the base branch.
-      - uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: cli
-          save-if: false
-      - name: Run contracts check
-        run: cargo run -p distributed_cli --quiet -- contracts check --root . --catalog distributed.contracts.json --output json
-
+  #
   # Framework monorepo keeps its existing quality provider. The reusable
   # quality.yaml in this directory is the contract for *consumers* (domain
   # crates / Distributed libraries), not for this workspace's entry pipeline.

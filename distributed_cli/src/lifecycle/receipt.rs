@@ -275,7 +275,6 @@ mod tests {
             provenance: ArtifactProvenance {
                 sources: ["src/lib.rs".into()].into_iter().collect(),
                 generator: "generator.application".into(),
-                source_revision: None,
                 glob_limit: None,
             },
             predecessor: None,
@@ -283,7 +282,6 @@ mod tests {
                 .into_iter()
                 .collect(),
             lifecycle: ["build".into()].into_iter().collect(),
-            environment_policy: None,
         };
         let plan = ContractEntry {
             id: "plan".into(),
@@ -294,7 +292,6 @@ mod tests {
             provenance: ArtifactProvenance {
                 sources: ["generated/application.json".into()].into_iter().collect(),
                 generator: "generator.plan".into(),
-                source_revision: None,
                 glob_limit: None,
             },
             predecessor: Some(ArtifactPredecessor {
@@ -308,7 +305,6 @@ mod tests {
                 .into_iter()
                 .collect(),
             lifecycle: ["build".into()].into_iter().collect(),
-            environment_policy: None,
         };
         let catalog = ContractCatalog {
             schema_version: CONTRACT_CATALOG_SCHEMA_VERSION,

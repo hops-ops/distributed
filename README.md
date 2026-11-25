@@ -2804,8 +2804,8 @@ src/
   lib.rs              # Public exports
 distributed_macros/   # Proc macros: sourced, command!, mutation!, ReadModel, Snapshot, DomainState,
                       #   DomainEvent, CommandInput, CommandOutput (projection! is in src/lib.rs)
-distributed_cli/      # The `distributed` CLI (build/dev lifecycle, client codegen, contracts
-                      #   check/accept, game-manifest/game-client/game-wasm); also a library
+distributed_cli/      # The `distributed` CLI (build/dev lifecycle, client codegen,
+                      #   game-manifest/game-client/game-wasm); also a library
 distributed_game/     # Authoritative multiplayer zone runtime: fixed tick, facts, replication,
                       #   WebSocket net, celld cells (zone lease/state, fact sink)
 distributed_game_macros/ # Derives for distributed_game: Replicated, GameInput, GameEvent, …

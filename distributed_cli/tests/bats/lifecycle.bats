@@ -75,7 +75,6 @@ SCRIPT
   grep -F "$PROJECT/ui:run build" "$ROOT/npm.log"
   [ -f "$DISTRIBUTED_ROOT/js/dist/index.js" ]
   [ "$(find "$PROJECT/.distributed/javascript" -name '*.json' -type f | wc -l | tr -d ' ')" -eq 1 ]
-  [ ! -e "$PROJECT/distributed.contracts.json" ]
   [ ! -e "$PROJECT/distributed.lifecycle.json" ]
   manifest_count="$(find "$PROJECT/.distributed/lifecycle/generations" \
     -path '*/artifacts/application-manifest.json' -type f | wc -l | tr -d ' ')"
