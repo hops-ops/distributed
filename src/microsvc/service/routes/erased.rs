@@ -95,12 +95,12 @@ pub(in crate::microsvc::service) trait ErasedCausalHandler<D>:
     fn contract_fingerprint(&self) -> &CommandContractFingerprint;
 
     /// Bind the Surface-resolved owner of an `Atomic` command's projection.
-    /// The only way a registered contract changes.
+    /// The only way a registered contract changes; on error it is unchanged.
     #[cfg(feature = "graphql")]
     fn bind_direct_projection(
         &mut self,
         direct_projection: Option<crate::command::CommandDirectProjectionTarget>,
-    );
+    ) -> Result<(), String>;
 
     #[cfg(any(feature = "graphql", feature = "runtime-tokio"))]
     fn storage_identity(&self, dependencies: &D) -> CausalStorageIdentity;

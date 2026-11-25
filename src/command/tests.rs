@@ -9,7 +9,7 @@ fn command_ledger_fingerprint_preserves_the_v1_canonical_contract() {
     // The v1 digest includes historical field/scalar names. Module ownership
     // must not change the identity used to recognize a command retry.
     let (_, contract) = typed_command::<Input, Succeeded<Payload>>("core.fingerprint").into_parts();
-    let digest = contract.fingerprint_bytes();
+    let digest = contract.fingerprint_bytes().unwrap();
     let hex: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
     assert_eq!(
         hex,
@@ -23,10 +23,16 @@ fn unsigned_range_is_part_of_command_retry_identity() {
     signed.input.fields[0].type_name = "BigInt".into();
     let mut unsigned = signed.clone();
     unsigned.input.fields[0].unsigned_integer = Some(CommandUnsignedInteger::U64);
-    assert_ne!(signed.fingerprint_bytes(), unsigned.fingerprint_bytes());
+    assert_ne!(
+        signed.fingerprint_bytes().unwrap(),
+        unsigned.fingerprint_bytes().unwrap()
+    );
     let mut narrower = unsigned.clone();
     narrower.input.fields[0].unsigned_integer = Some(CommandUnsignedInteger::U32);
-    assert_ne!(unsigned.fingerprint_bytes(), narrower.fingerprint_bytes());
+    assert_ne!(
+        unsigned.fingerprint_bytes().unwrap(),
+        narrower.fingerprint_bytes().unwrap()
+    );
 }
 
 #[allow(dead_code)]
@@ -561,8 +567,14 @@ fn per_route_fingerprint_is_stable_and_contract_sensitive() {
         .roles(["admin", "writer"])
         .into_contract();
 
-    assert_eq!(first.fingerprint_bytes(), reordered.fingerprint_bytes());
-    assert_ne!(first.fingerprint_bytes(), renamed.fingerprint_bytes());
+    assert_eq!(
+        first.fingerprint_bytes().unwrap(),
+        reordered.fingerprint_bytes().unwrap()
+    );
+    assert_ne!(
+        first.fingerprint_bytes().unwrap(),
+        renamed.fingerprint_bytes().unwrap()
+    );
 }
 
 #[test]
@@ -594,4 +606,21 @@ fn binding_canonicalizes_fields_and_roles() {
     let first = TypedServiceCommandBinding::from_contracts("todos", &[first]).unwrap();
     let second = TypedServiceCommandBinding::from_contracts("todos", &[second]).unwrap();
     assert_eq!(first, second);
+}
+
+#[test]
+fn invalid_projection_declaration_is_an_error_not_a_panic() {
+    // A hand-built or deserialized contract can carry declaration errors that
+    // never went through validation; fingerprinting reports them.
+    let mut contract =
+        typed_command::<Input, Succeeded<Payload>>("core.invalid-projection").into_contract();
+    contract
+        .projections
+        .declaration_errors
+        .push("bad declaration".into());
+    let error = contract.fingerprint_bytes().unwrap_err();
+    assert!(error.contains("core.invalid-projection"), "{error}");
+    assert!(error.contains("bad declaration"), "{error}");
+    assert!(contract.canonical_value().is_err());
+    assert!(crate::application::CommandSpec::from_contract(&contract).is_err());
 }

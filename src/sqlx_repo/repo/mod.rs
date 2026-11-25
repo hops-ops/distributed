@@ -5,7 +5,7 @@
 //! pattern to the whole repository surface: the SQL statements and row codecs
 //! are identical across the two backends because `QueryBuilder<DB>` renders the
 //! right placeholder dialect. What genuinely differs — schema SQL, bind-param
-//! chunking, the timestamp codec (Postgres epoch-`f64`/`to_timestamp()` vs
+//! chunking, the timestamp codec (Postgres integer-microsecond `timestamptz` vs
 //! SQLite `"secs.nanos"` text), the unique-violation predicate, conflict
 //! recovery (SQLite can re-read in the failed transaction; a failed Postgres
 //! statement aborts it), and the outbox `claim` strategy — lives behind the

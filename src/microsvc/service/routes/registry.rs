@@ -471,7 +471,8 @@ impl<D: Send + Sync + 'static> Routes<D> {
                     handle,
                     requires_clock,
                     requires.contains(&crate::schedule::Capability::Scheduling),
-                ),
+                )
+                .unwrap_or_else(|error| panic!("typed command contract cannot compile: {error}")),
             )),
         );
         mount
@@ -804,16 +805,23 @@ where
                 {
                     return Err(GraphqlServiceBindError::TypeIdMismatch);
                 }
+                let current_canonical = current_without_owner
+                    .canonical_value()
+                    .map_err(GraphqlServiceBindError::InvalidInventory)?;
+                let bound_canonical = bound_without_owner
+                    .canonical_value()
+                    .map_err(GraphqlServiceBindError::InvalidInventory)?;
                 if current.consistency != bound.consistency
                     || current.projected_model != bound.projected_model
-                    || current_without_owner.canonical_value()
-                        != bound_without_owner.canonical_value()
+                    || current_canonical != bound_canonical
                 {
                     return Err(GraphqlServiceBindError::StructuralFingerprintMismatch(
                         format!("executable route `{}`", current.name),
                     ));
                 }
-                handler.bind_direct_projection(bound.direct_projection.clone());
+                handler
+                    .bind_direct_projection(bound.direct_projection.clone())
+                    .map_err(GraphqlServiceBindError::InvalidInventory)?;
             }
         }
         Ok(())

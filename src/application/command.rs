@@ -352,6 +352,11 @@ impl CommandSpec {
     pub(crate) fn from_contract(
         contract: &crate::command::TypedCommandContract,
     ) -> ApplicationResult<Self> {
+        contract
+            .projections
+            .clone()
+            .canonicalize_and_validate(&contract.name)
+            .map_err(ApplicationError::InvalidSpec)?;
         let projection_contract = serde_json::to_value(&contract.projections)?;
         let applies = serde_json::to_value(&contract.projections.previews)?;
         let direct_projection = contract

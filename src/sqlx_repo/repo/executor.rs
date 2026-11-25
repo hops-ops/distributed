@@ -65,12 +65,7 @@ where
                 operator,
                 value,
             } => {
-                DB::push_timestamp_cmp(
-                    &mut builder,
-                    column,
-                    operator,
-                    system_time_epoch_secs::<DB>(*value)?,
-                );
+                DB::push_timestamp_cmp(&mut builder, column, operator, *value)?;
             }
             SqlPart::LedgerNow => DB::push_command_ledger_now(&mut builder),
             SqlPart::LedgerNowEpoch => DB::push_command_ledger_now_epoch(&mut builder),

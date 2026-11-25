@@ -2,7 +2,7 @@
 //!
 //! The event-store/snapshot/outbox/inbox logic lives once in
 //! [`crate::sqlx_repo::repo`]; this module carries only what is genuinely
-//! Postgres-specific: the schema SQL, the epoch-`f64`/`to_timestamp()`
+//! Postgres-specific: the schema SQL, the integer-microsecond `timestamptz`
 //! timestamp codec, the unique-violation predicate, and the CTE +
 //! `FOR UPDATE SKIP LOCKED` outbox claim. It is feature-gated behind
 //! `postgres` and async-only.
@@ -19,8 +19,8 @@ use crate::outbox_worker::ClaimOutboxMessages;
 use crate::repository::RepositoryError;
 use crate::sqlx_repo::read_model::quote_identifier;
 use crate::sqlx_repo::repo::{
-    embedded_migrator, outbox_message_from_row, system_time_epoch_secs, SqlxOutboxStore,
-    SqlxRepository, POSTGRES_MIGRATIONS,
+    embedded_migrator, outbox_message_from_row, SqlxOutboxStore, SqlxRepository,
+    POSTGRES_MIGRATIONS,
 };
 use crate::sqlx_repo::{
     self, is_postgres_unique_violation, read_model_i64_from_u64 as sqlx_read_model_i64_from_u64,
@@ -60,13 +60,13 @@ impl crate::sqlx_repo::repo::SqlxRepoBackend for Postgres {
     const OWNERSHIP_FENCE_REGISTRATION_LOCK: &'static str = " FOR UPDATE";
     const COMMAND_LEDGER_SELECT: &'static str = "command_name, command_contract_hash, \
          input_hash, state, causation_id, attempt_token, attempt_number, external_binding, \
-         EXTRACT(EPOCH FROM lease_expires_at)::double precision AS lease_expires_at, \
+         (EXTRACT(EPOCH FROM lease_expires_at) * 1000000)::bigint AS lease_expires_at, \
          outcome::text AS outcome, \
-         EXTRACT(EPOCH FROM created_at)::double precision AS created_at, \
-         EXTRACT(EPOCH FROM updated_at)::double precision AS updated_at, \
-         EXTRACT(EPOCH FROM completed_at)::double precision AS completed_at, \
-         EXTRACT(EPOCH FROM retention_expires_at)::double precision AS retention_expires_at, \
-         EXTRACT(EPOCH FROM compacted_at)::double precision AS compacted_at";
+         (EXTRACT(EPOCH FROM created_at) * 1000000)::bigint AS created_at, \
+         (EXTRACT(EPOCH FROM updated_at) * 1000000)::bigint AS updated_at, \
+         (EXTRACT(EPOCH FROM completed_at) * 1000000)::bigint AS completed_at, \
+         (EXTRACT(EPOCH FROM retention_expires_at) * 1000000)::bigint AS retention_expires_at, \
+         (EXTRACT(EPOCH FROM compacted_at) * 1000000)::bigint AS compacted_at";
     const COMMAND_LEDGER_LOCK_SUFFIX: &'static str = " FOR UPDATE";
     const SCHEDULE_CLAIM_LOCK_SUFFIX: &'static str = " FOR UPDATE SKIP LOCKED";
     const COMMAND_LEDGER_COMPACTION_LOCK_SUFFIX: &'static str = " FOR UPDATE SKIP LOCKED";
@@ -77,7 +77,7 @@ impl crate::sqlx_repo::repo::SqlxRepoBackend for Postgres {
          payload_codec_version, \
          metadata::text AS metadata, \
          sequence, \
-         EXTRACT(EPOCH FROM recorded_at)::double precision AS recorded_at";
+         (EXTRACT(EPOCH FROM recorded_at) * 1000000)::bigint AS recorded_at";
     const SNAPSHOT_SELECT: &'static str = "aggregate_type, \
          aggregate_id, \
          version, \
@@ -86,7 +86,7 @@ impl crate::sqlx_repo::repo::SqlxRepoBackend for Postgres {
          payload_codec, \
          payload_codec_version, \
          metadata::text AS metadata, \
-         EXTRACT(EPOCH FROM recorded_at)::double precision AS recorded_at";
+         (EXTRACT(EPOCH FROM recorded_at) * 1000000)::bigint AS recorded_at";
     const OUTBOX_SELECT: &'static str = "message_id, \
          event_type, \
          payload, \
@@ -94,9 +94,9 @@ impl crate::sqlx_repo::repo::SqlxRepoBackend for Postgres {
          payload_codec_version, \
          metadata::text AS metadata, \
          status, \
-         EXTRACT(EPOCH FROM created_at)::double precision AS created_at, \
+         (EXTRACT(EPOCH FROM created_at) * 1000000)::bigint AS created_at, \
          claimed_by, \
-         EXTRACT(EPOCH FROM claimed_until)::double precision AS claimed_until, \
+         (EXTRACT(EPOCH FROM claimed_until) * 1000000)::bigint AS claimed_until, \
          attempts, \
          last_error, \
          destination, \
@@ -105,14 +105,16 @@ impl crate::sqlx_repo::repo::SqlxRepoBackend for Postgres {
          source_sequence, \
          correlation_id, \
          causation_id, \
-         EXTRACT(EPOCH FROM next_available_at)::double precision AS next_available_at";
+         (EXTRACT(EPOCH FROM next_available_at) * 1000000)::bigint AS next_available_at";
     const ORDER_BY_CREATED_AT: &'static str = "created_at";
     const OUTBOX_OLDEST_CREATED_AT_SELECT: &'static str =
-        "EXTRACT(EPOCH FROM MIN(created_at))::double precision AS oldest_created_at";
+        "(EXTRACT(EPOCH FROM MIN(created_at)) * 1000000)::bigint AS oldest_created_at";
     const TABLE_DIALECT: TableSqlDialect = TableSqlDialect::Postgres;
 
-    /// Epoch seconds; stored via `to_timestamp(...)` into `timestamptz`.
-    type TimestampValue = f64;
+    /// Microseconds since the UNIX epoch, `timestamptz`'s own resolution.
+    /// Integer microseconds round-trip exactly; `f64` epoch seconds lose
+    /// about 240 ns at present-day magnitudes.
+    type TimestampValue = i64;
 
     /// sqlx 0.9.0 does not undo a `BEGIN` whose future is dropped before the
     /// server answers: `transaction_depth` is still zero, so its drop guard
@@ -143,44 +145,43 @@ impl crate::sqlx_repo::repo::SqlxRepoBackend for Postgres {
         is_postgres_unique_violation(err)
     }
 
-    fn timestamp_value(timestamp: SystemTime) -> Result<f64, RepositoryError> {
-        system_time_epoch_secs::<Postgres>(timestamp)
+    fn timestamp_value(timestamp: SystemTime) -> Result<i64, RepositoryError> {
+        system_time_epoch_micros(timestamp)
     }
 
-    fn push_timestamp(sep: &mut Separated<'_, Postgres, &'static str>, value: &f64) {
-        sep.push("to_timestamp(")
+    fn push_timestamp(sep: &mut Separated<'_, Postgres, &'static str>, value: &i64) {
+        sep.push(EPOCH_PLUS)
             .push_bind_unseparated(*value)
-            .push_unseparated(")");
+            .push_unseparated(MICROSECONDS);
     }
 
     fn push_optional_timestamp(
         sep: &mut Separated<'_, Postgres, &'static str>,
-        value: Option<&f64>,
+        value: Option<&i64>,
     ) {
-        // NULL stays NULL through to_timestamp; the cast keeps `$n` typed.
-        sep.push("to_timestamp(")
+        // NULL stays NULL through the interval product; the cast keeps `$n` typed.
+        sep.push(EPOCH_PLUS)
             .push_bind_unseparated(value.copied())
-            .push_unseparated("::double precision)");
+            .push_unseparated("::bigint")
+            .push_unseparated(MICROSECONDS);
     }
 
-    fn push_timestamp_assign(builder: &mut QueryBuilder<Postgres>, value: &f64) {
-        builder.push("to_timestamp(");
-        builder.push_bind(*value);
-        builder.push(")");
+    fn push_timestamp_assign(builder: &mut QueryBuilder<Postgres>, value: &i64) {
+        push_micros(builder, *value);
     }
 
     fn push_timestamp_cmp(
         builder: &mut QueryBuilder<Postgres>,
         column: &'static str,
         op: &'static str,
-        epoch_secs: f64,
-    ) {
+        value: SystemTime,
+    ) -> Result<(), RepositoryError> {
         builder.push(column);
         builder.push(" ");
         builder.push(op);
-        builder.push(" to_timestamp(");
-        builder.push_bind(epoch_secs);
-        builder.push(")");
+        builder.push(" ");
+        push_micros(builder, system_time_epoch_micros(value)?);
+        Ok(())
     }
 
     fn push_command_ledger_now(builder: &mut QueryBuilder<Postgres>) {
@@ -188,19 +189,20 @@ impl crate::sqlx_repo::repo::SqlxRepoBackend for Postgres {
     }
 
     fn push_command_ledger_now_epoch(builder: &mut QueryBuilder<Postgres>) {
-        builder.push("EXTRACT(EPOCH FROM clock_timestamp())::double precision");
+        builder.push("(EXTRACT(EPOCH FROM clock_timestamp()) * 1000000)::bigint");
     }
 
     fn push_command_ledger_deadline(builder: &mut QueryBuilder<Postgres>, duration: Duration) {
-        builder.push("(clock_timestamp() + make_interval(secs => ");
-        builder.push_bind(duration.as_secs_f64());
-        builder.push("))");
+        let micros = i64::try_from(duration.as_micros()).unwrap_or(i64::MAX);
+        builder.push("(clock_timestamp() + (");
+        builder.push_bind(micros);
+        builder.push(MICROSECONDS);
+        builder.push(")");
     }
 
-    fn push_command_ledger_deadline_is_live(builder: &mut QueryBuilder<Postgres>, deadline: &f64) {
-        builder.push("to_timestamp(");
-        builder.push_bind(*deadline);
-        builder.push(") > clock_timestamp()");
+    fn push_command_ledger_deadline_is_live(builder: &mut QueryBuilder<Postgres>, deadline: &i64) {
+        push_micros(builder, *deadline);
+        builder.push(" > clock_timestamp()");
     }
 
     fn push_command_ledger_json(builder: &mut QueryBuilder<Postgres>, json: &str) {
@@ -212,7 +214,7 @@ impl crate::sqlx_repo::repo::SqlxRepoBackend for Postgres {
         row: &sqlx::postgres::PgRow,
         column: &'static str,
     ) -> Result<SystemTime, RepositoryError> {
-        system_time_from_epoch_secs(row.try_get(column).map_err(|err| {
+        system_time_from_epoch_micros(row.try_get(column).map_err(|err| {
             repository_storage_error(&format!("decode {column} timestamp row"), err)
         })?)
     }
@@ -221,11 +223,11 @@ impl crate::sqlx_repo::repo::SqlxRepoBackend for Postgres {
         row: &sqlx::postgres::PgRow,
         column: &'static str,
     ) -> Result<Option<SystemTime>, RepositoryError> {
-        row.try_get::<Option<f64>, _>(column)
+        row.try_get::<Option<i64>, _>(column)
             .map_err(|err| {
                 repository_storage_error(&format!("decode {column} timestamp row"), err)
             })?
-            .map(system_time_from_epoch_secs)
+            .map(system_time_from_epoch_micros)
             .transpose()
     }
 
@@ -259,11 +261,11 @@ impl crate::sqlx_repo::repo::SqlxRepoBackend for Postgres {
             }
 
             let now = SystemTime::now();
-            let now_epoch = system_time_epoch_secs::<Postgres>(now)?;
+            let now_epoch = system_time_epoch_micros(now)?;
             let claimed_until = now.checked_add(request.lease).ok_or_else(|| {
                 RepositoryError::Model("failed to compute outbox lease deadline".into())
             })?;
-            let claimed_until_epoch = system_time_epoch_secs::<Postgres>(claimed_until)?;
+            let claimed_until_epoch = system_time_epoch_micros(claimed_until)?;
             let limit = sqlx_repository_i64_from_u64(
                 POSTGRES_BACKEND,
                 request.batch_size as u64,
@@ -282,8 +284,8 @@ impl crate::sqlx_repo::repo::SqlxRepoBackend for Postgres {
                   SELECT message_id
                   FROM outbox_messages
                   WHERE (
-                    (status = $1 AND next_available_at <= to_timestamp($2))
-                    OR (status = $3 AND (claimed_until IS NULL OR claimed_until <= to_timestamp($2)))
+                    (status = $1 AND next_available_at <= TIMESTAMPTZ 'epoch' + $2 * INTERVAL '1 microsecond')
+                    OR (status = $3 AND (claimed_until IS NULL OR claimed_until <= TIMESTAMPTZ 'epoch' + $2 * INTERVAL '1 microsecond'))
                   )
                     AND ($4::text IS NULL OR destination = $4)
                     AND ($9::text[] IS NULL OR message_id = ANY($9::text[]))
@@ -294,7 +296,7 @@ impl crate::sqlx_repo::repo::SqlxRepoBackend for Postgres {
                 UPDATE outbox_messages AS message
                 SET status = $6,
                     claimed_by = $7,
-                    claimed_until = to_timestamp($8),
+                    claimed_until = TIMESTAMPTZ 'epoch' + $8 * INTERVAL '1 microsecond',
                     attempts = attempts + 1,
                     updated_at = now()
                 FROM candidates
@@ -306,9 +308,9 @@ impl crate::sqlx_repo::repo::SqlxRepoBackend for Postgres {
                           message.payload_codec_version,
                           message.metadata::text AS metadata,
                           message.status,
-                          EXTRACT(EPOCH FROM message.created_at)::double precision AS created_at,
+                          (EXTRACT(EPOCH FROM message.created_at) * 1000000)::bigint AS created_at,
                           message.claimed_by,
-                          EXTRACT(EPOCH FROM message.claimed_until)::double precision AS claimed_until,
+                          (EXTRACT(EPOCH FROM message.claimed_until) * 1000000)::bigint AS claimed_until,
                           message.attempts,
                           message.last_error,
                           message.destination,
@@ -317,7 +319,7 @@ impl crate::sqlx_repo::repo::SqlxRepoBackend for Postgres {
                           message.source_sequence,
                           message.correlation_id,
                           message.causation_id,
-                          EXTRACT(EPOCH FROM message.next_available_at)::double precision AS next_available_at
+                          (EXTRACT(EPOCH FROM message.next_available_at) * 1000000)::bigint AS next_available_at
                 "#,
             )
             .bind(OutboxMessageStatus::Pending.as_str())
@@ -537,13 +539,41 @@ fn push_postgres_type_cast(builder: &mut QueryBuilder<Postgres>, column: &TableC
     }
 }
 
-fn system_time_from_epoch_secs(value: f64) -> Result<SystemTime, RepositoryError> {
-    if !value.is_finite() || value < 0.0 {
-        return Err(RepositoryError::Model(format!(
-            "postgres recorded_at epoch value {value} is invalid"
-        )));
-    }
-    Ok(UNIX_EPOCH + Duration::from_secs_f64(value))
+/// `timestamptz` written from integer microseconds: `EPOCH_PLUS $n MICROSECONDS`.
+const EPOCH_PLUS: &str = "(TIMESTAMPTZ 'epoch' + ";
+const MICROSECONDS: &str = " * INTERVAL '1 microsecond')";
+
+fn push_micros(builder: &mut QueryBuilder<Postgres>, micros: i64) {
+    builder.push(EPOCH_PLUS);
+    builder.push_bind(micros);
+    builder.push(MICROSECONDS);
+}
+
+/// Microseconds since the UNIX epoch, truncating sub-microsecond precision
+/// that `timestamptz` cannot store.
+fn system_time_epoch_micros(timestamp: SystemTime) -> Result<i64, RepositoryError> {
+    let micros = timestamp
+        .duration_since(UNIX_EPOCH)
+        .map_err(|err| {
+            RepositoryError::Model(format!(
+                "timestamp before UNIX epoch cannot be stored in postgres: {err}"
+            ))
+        })?
+        .as_micros();
+    i64::try_from(micros).map_err(|_| {
+        RepositoryError::Model(format!(
+            "timestamp {micros} us after the UNIX epoch does not fit postgres timestamptz"
+        ))
+    })
+}
+
+fn system_time_from_epoch_micros(micros: i64) -> Result<SystemTime, RepositoryError> {
+    let micros = u64::try_from(micros).map_err(|_| {
+        RepositoryError::Model(format!(
+            "postgres timestamp {micros} us is before the UNIX epoch"
+        ))
+    })?;
+    Ok(UNIX_EPOCH + Duration::from_micros(micros))
 }
 
 fn repository_storage_error(operation: &str, err: sqlx::Error) -> RepositoryError {
