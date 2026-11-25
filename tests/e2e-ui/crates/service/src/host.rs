@@ -41,15 +41,30 @@ pub async fn run(database_url: &str, options: HostOptions) -> Result<(), BoxErro
         E2E_UI_APPLICATION, options.bind
     );
     if database_url.starts_with("postgres://") || database_url.starts_with("postgresql://") {
-        host(PostgresStores::connect(database_url).await?, options).await
+        host(
+            "postgres",
+            PostgresStores::connect(database_url).await?,
+            options,
+        )
+        .await
     } else {
-        host(SqliteStores::connect(database_url).await?, options).await
+        host(
+            "sqlite",
+            SqliteStores::connect(database_url).await?,
+            options,
+        )
+        .await
     }
 }
 
 /// One host path for every SQL backend: the stores, the bus and the GraphQL
-/// pool all come from the one database.
-async fn host<St: SqlStores>(stores: St, options: HostOptions) -> Result<(), BoxError> {
+/// pool all come from the one database. `backend` names it in the listening
+/// line, which CI waits for.
+async fn host<St: SqlStores>(
+    backend: &str,
+    stores: St,
+    options: HostOptions,
+) -> Result<(), BoxError> {
     let read_models = read_models();
     stores.bootstrap_read_models(read_models.catalog()).await?;
 
@@ -88,7 +103,7 @@ async fn host<St: SqlStores>(stores: St, options: HostOptions) -> Result<(), Box
     });
     spawn_zitadel_scrape(service.clone());
 
-    eprintln!("e2e-ui listening on http://{}", options.bind);
+    eprintln!("e2e-ui ({backend}) listening on http://{}", options.bind);
     serve(service, &options).await?;
     Ok(())
 }
