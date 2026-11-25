@@ -1,0 +1,18 @@
+# Keycloak for GraphQL OIDC e2e (local + CI).
+#   ./scripts/oidc-keycloak-up.sh
+#   set -a && source graphql-oidc-keycloak.env && set +a
+#   cargo test --test graphql --features graphql,sqlite,metrics graphql_oidc_keycloak::
+services:
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.0
+    command: ["start-dev", "--import-realm", "--http-port=8080"]
+    environment:
+      KEYCLOAK_ADMIN: admin
+      KEYCLOAK_ADMIN_PASSWORD: admin
+      KC_HTTP_ENABLED: "true"
+      KC_HOSTNAME_STRICT: "false"
+      KC_HEALTH_ENABLED: "true"
+    ports:
+      - "8081:8080"
+    volumes:
+      - ./realm-export.json:/opt/keycloak/data/import/realm-export.json:ro

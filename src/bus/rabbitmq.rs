@@ -8,7 +8,7 @@
 //! exchange when one is configured on the queue).
 //!
 //! Requires the `rabbitmq` feature. Integration-tested in
-//! `tests/rabbitmq_transport` against a broker (see `compose.yaml`).
+//! `tests/transports/rabbitmq_transport` against a broker (see `compose.yaml`).
 
 use std::time::Duration;
 

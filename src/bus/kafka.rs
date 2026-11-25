@@ -11,7 +11,7 @@
 //! the record, so consumers must tolerate duplicates.
 //!
 //! Requires the `kafka` feature (builds `librdkafka` via cmake). Integration-
-//! tested in `tests/kafka_transport` against a broker (see `compose.yaml`).
+//! tested in `tests/transports/kafka_transport` against a broker (see `compose.yaml`).
 
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};

@@ -60,7 +60,7 @@ jobs:
         run: |
           mkdir -p target/otel-out && chmod 777 target/otel-out
           docker run -d --user 0 --name otelcol -p 4318:4318 -p 4317:4317 \
-            -v "$PWD/tests/otel_export/collector-config.yaml:/etc/otelcol/config.yaml:ro" \
+            -v "$PWD/tests/observability/otel_export/collector-config.yaml:/etc/otelcol/config.yaml:ro" \
             -v "$PWD/target/otel-out:/out" \
             otel/opentelemetry-collector:0.116.1 --config /etc/otelcol/config.yaml
           for i in $(seq 1 30); do
@@ -76,14 +76,14 @@ jobs:
         env:
           PROMTOOL: /usr/local/bin/promtool
           DISTRIBUTED_REQUIRE_SERVICES: PROMTOOL
-        run: cargo test --test metrics_exposition --features http,metrics --verbose
+        run: 'cargo test --test observability --features http,metrics --verbose metrics_exposition::'
       - name: Run OTLP export tests
         if: ${{ !cancelled() }}
         env:
           OTEL_EXPORTER_OTLP_TRACES_ENDPOINT: http://localhost:4318/v1/traces
           OTEL_COLLECTOR_TRACES_FILE: ${{ github.workspace }}/target/otel-out/traces.json
           DISTRIBUTED_REQUIRE_SERVICES: OTEL_EXPORTER_OTLP_TRACES_ENDPOINT,OTEL_COLLECTOR_TRACES_FILE
-        run: cargo test --test otel_export --features http,otel --verbose
+        run: 'cargo test --test observability --features http,otel --verbose otel_export::'
       - name: Scaffold service with metrics and tracing
         if: ${{ !cancelled() }}
         run: |

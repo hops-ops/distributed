@@ -5,12 +5,12 @@
 #   1) Ensure writable dirs/volumes for IdP-generated secrets
 #   2) docker compose up -d --wait (or health probe)
 #   3) Run provider bootstrap → export GATE + OIDC_* + mint credentials
-#   4) cargo test --test graphql_oidc_<provider> with GATE=1
+#   4) cargo test --test graphql graphql_oidc_<provider>:: with GATE=1
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-COMPOSE_FILE="$ROOT/tests/graphql_oidc_zitadel/docker-compose.yml"
-MACHINEKEY_DIR="$ROOT/tests/graphql_oidc_zitadel/machinekey"
+COMPOSE_FILE="$ROOT/tests/graphql/graphql_oidc_zitadel/docker-compose.yml"
+MACHINEKEY_DIR="$ROOT/tests/graphql/graphql_oidc_zitadel/machinekey"
 ZITADEL_HOST="${ZITADEL_HOST:-http://localhost:8080}"
 
 cd "$ROOT"
@@ -99,4 +99,4 @@ chmod +x "$ROOT/scripts/ci-bootstrap-graphql-oidc.sh"
 
 echo "==> Done. Source env and run tests:"
 echo "    set -a && source $ROOT/graphql-oidc.env && set +a"
-echo "    cargo test --test graphql_oidc_zitadel --features graphql,sqlite,metrics"
+echo "    cargo test --test graphql --features graphql,sqlite,metrics graphql_oidc_zitadel::"

@@ -220,14 +220,14 @@ test-celld-http:
 	cd $(REPO_ROOT) && \
 	  CELLD_URL="$(CELLD_URL)" \
 	  DISTRIBUTED_INTERNAL_SECRET="$(DISTRIBUTED_INTERNAL_SECRET)" \
-	  cargo test --test celld -- --nocapture
+	  cargo test --test services celld:: -- --nocapture
 
 test-celld-nats:
 	@echo "optional profile smoke — default make test / make run unchanged"
 	cd $(REPO_ROOT) && \
 	  CELLD_URL="$(CELLD_URL)" NATS_URL="$(NATS_URL)" \
 	  DISTRIBUTED_INTERNAL_SECRET="$(DISTRIBUTED_INTERNAL_SECRET)" \
-	  cargo test --test e2e_ui_celld_nats_profile --features graphql,http,sqlite -- --nocapture
+	  cargo test --test services --features graphql,http,sqlite e2e_ui_celld_nats_profile:: -- --nocapture
 
 application-build:
 	$(DISTRIBUTED) build .
@@ -305,8 +305,8 @@ help:
 	@echo "  make up-celld-nats    optional celld+NATS profile (not make run)"
 	@echo "                        celld :18880, version in /.celld-version; CELLD_BIN=<path>"
 	@echo "  rebuild/restart with make up-celld-nats after Worker source changes"
-	@echo "  make test-celld      live --test celld + e2e_ui_celld_nats_profile (CI)"
-	@echo "  make test-celld-nats  cargo test --test e2e_ui_celld_nats_profile"
+	@echo "  make test-celld      live services celld:: + e2e_ui_celld_nats_profile:: (CI)"
+	@echo "  make test-celld-nats  cargo test --test services e2e_ui_celld_nats_profile::"
 	@echo "  make down-celld-nats  stop NATS profile only"
 	@echo "  make down-celld       stop celld and preserve its local dev store"
 	@echo "  GRAPHIQL=0      disable GraphiQL when running the API"

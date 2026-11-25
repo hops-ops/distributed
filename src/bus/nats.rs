@@ -8,7 +8,7 @@
 //! retain their logical source identity separately; their broker dedup ID also
 //! binds content so altered retries reach the durable conflict fence.
 //!
-//! Requires the `nats` feature. Integration-tested in `tests/nats_transport`
+//! Requires the `nats` feature. Integration-tested in `tests/transports/nats_transport`
 //! against a JetStream-enabled server (see `compose.yaml`).
 
 use std::time::Duration;

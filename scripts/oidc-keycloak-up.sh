@@ -2,7 +2,7 @@
 # Start Keycloak + write graphql-oidc-keycloak.env for e2e (local + CI).
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-COMPOSE="$ROOT/tests/graphql_oidc_keycloak/docker-compose.yml"
+COMPOSE="$ROOT/tests/graphql/graphql_oidc_keycloak/docker-compose.yml"
 OUT="${GRAPHQL_OIDC_KEYCLOAK_ENV:-$ROOT/graphql-oidc-keycloak.env}"
 ISSUER_HOST="${KEYCLOAK_ISSUER:-http://localhost:8081}"
 REALM=graphql
@@ -96,4 +96,4 @@ KEYCLOAK_E2E_ADMIN_CLIENT_SECRET=admin-secret-e2e
 EOF
 echo "==> Wrote $OUT"
 cat "$OUT"
-echo "==> Done. source $OUT && cargo test --test graphql_oidc_keycloak --features graphql,sqlite,metrics"
+echo "==> Done. source $OUT && cargo test --test graphql --features graphql,sqlite,metrics graphql_oidc_keycloak::"

@@ -65,7 +65,7 @@ try:
     ready(standby)
     print("Fixture PostgreSQL " + docker("exec", primary, "postgres", "--version"), flush=True)
     env = {**os.environ, "GATEWAY_TEST_PRIMARY_URL": url(primary), "GATEWAY_TEST_REPLICA_URL": url(standby), "GATEWAY_TEST_PRIMARY_CONTAINER": primary}
-    subprocess.run(["cargo", "test", "-p", "distributed", "--no-default-features", "--features", "gateway,graphql,postgres", "--test", "edge_query_delivery_postgres", "--", "--ignored", "--nocapture"], cwd=ROOT, env=env, check=True)
+    subprocess.run(["cargo", "test", "-p", "distributed", "--no-default-features", "--features", "gateway,graphql,postgres", "--test", "gateway", "edge_query_delivery_postgres::", "--", "--ignored", "--nocapture"], cwd=ROOT, env=env, check=True)
     ready(primary)  # The standby proof deliberately stops and restarts the primary.
     subprocess.run(["cargo", "test", "-p", "distributed", "--no-default-features", "--features", "gateway,graphql,postgres", "--lib", "graphql::delivery::versions::tests::postgres_transactional_coverage_and_snapshot_race", "--", "--ignored", "--nocapture"], cwd=ROOT, env=env, check=True)
 finally:

@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # Bootstrap live Zitadel for GraphQL OIDC e2e (D11 JWT-bearer mint).
-# Expects Zitadel from tests/graphql_oidc_zitadel/docker-compose.yml.
+# Expects Zitadel from tests/graphql/graphql_oidc_zitadel/docker-compose.yml.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-COMPOSE_DIR="$ROOT/tests/graphql_oidc_zitadel"
+COMPOSE_DIR="$ROOT/tests/graphql/graphql_oidc_zitadel"
 MACHINEKEY_DIR="$COMPOSE_DIR/machinekey"
 ZITADEL_HOST="${ZITADEL_HOST:-http://localhost:8080}"
 OUT="${GRAPHQL_OIDC_ENV:-$ROOT/graphql-oidc.env}"

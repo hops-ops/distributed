@@ -42,7 +42,7 @@ jobs:
           save-if: ${{ github.event_name != 'pull_request' }}
       - name: Format contract and fixture sources
         if: ${{ !cancelled() }}
-        run: rustfmt --edition 2021 --check src/gateway/mod.rs tests/gateway_routing.rs tests/gateway_extensions.rs tests/gateway-portable/src/lib.rs
+        run: rustfmt --edition 2021 --check src/gateway/mod.rs tests/gateway/gateway_routing.rs tests/gateway/gateway_extensions.rs tests/gateway-portable/src/lib.rs
       - name: Test portable routing and adapter contracts
         if: ${{ !cancelled() }}
         run: cargo test --manifest-path tests/gateway-portable/Cargo.toml --locked
@@ -84,7 +84,7 @@ jobs:
           shared-key: graphql
           save-if: false
       - name: Verify gateway and backend identity
-        run: cargo test -p distributed --no-default-features --features gateway,graphql,sqlite --test graphql_identity
+        run: 'cargo test -p distributed --no-default-features --features gateway,graphql,sqlite --test graphql graphql_identity::'
       - name: Install pinned auth fixture dependencies
         working-directory: tests/gateway-auth
         run: npm ci
@@ -113,7 +113,7 @@ jobs:
           shared-key: gateway-graphql
           save-if: false
       - name: Verify embedded and remote GraphQL protocols
-        run: cargo test -p distributed --no-default-features --features gateway-graphql-native,sqlite --test gateway_graphql --test gateway_graphql_operation --test graphql_causal_transport --test graphql_query_protocol --test graphql_identity --test graphql_sqlite --test sqlite_repository
+        run: 'cargo test -p distributed --no-default-features --features gateway-graphql-native,sqlite --test gateway --test graphql --test repositories -- gateway_graphql:: gateway_graphql_operation:: graphql_causal_transport:: graphql_query_protocol:: graphql_identity:: graphql_sqlite:: sqlite_repository::'
 
       - name: Verify the portable delivery state machines and WS codec
         run: 'cargo test -p distributed --no-default-features --features gateway --lib gateway::'
@@ -193,14 +193,14 @@ jobs:
           node tests/gateway-worker/proxy-runtime.mjs
           node tests/gateway-worker/run.mjs
       - name: Measure actual native and workerd origin/client savings
-        run: cargo test --no-default-features --features gateway-graphql-native,sqlite --test graphql_query_protocol separate_origin_and_client_savings -- --ignored --nocapture
+        run: 'cargo test --no-default-features --features gateway-graphql-native,sqlite --test graphql graphql_query_protocol::load::separate_origin_and_client_savings -- --ignored --nocapture'
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: gateway-delivery-load
           path: tests/gateway-worker/artifacts/load-report.json
       - name: Prove actual DO coordination, SQL reduction, restart and cancellation
-        run: cargo test --no-default-features --features gateway-graphql-native,sqlite --test graphql_query_protocol worker_ -- --ignored --nocapture --test-threads=1
+        run: 'cargo test --no-default-features --features gateway-graphql-native,sqlite --test graphql graphql_query_protocol::worker_ -- --ignored --nocapture --test-threads=1'
 
   application:
     runs-on: ubuntu-latest
@@ -234,7 +234,7 @@ jobs:
           cd tests/gateway-auth
           npx playwright install --with-deps chromium
       - name: Verify application composition
-        run: cargo test --no-default-features --features graphql,sqlite,gateway --test application_composition
+        run: 'cargo test --no-default-features --features graphql,sqlite,gateway --test core application_composition::'
       - name: Build coherent application and run public-origin browser flows
         run: node tests/e2e-ui/gateway/run.mjs
       - name: Verify dev lifecycle and browser flows through the gateway

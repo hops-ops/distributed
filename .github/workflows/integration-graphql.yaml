@@ -10,7 +10,7 @@ name: GraphQL Identity / OIDC Integration Tests
 # Local parity:
 #   ./scripts/oidc-{zitadel,keycloak,authentik}-up.sh
 #   set -a && source graphql-oidc[-keycloak|-authentik].env && set +a
-#   cargo test --test graphql_oidc_<provider> --features graphql,sqlite,metrics
+#   cargo test --test graphql --features graphql,sqlite,metrics graphql_oidc_<provider>::
 on:
   workflow_call:
 
@@ -44,7 +44,7 @@ jobs:
           save-if: ${{ github.event_name != 'pull_request' }}
       - name: Always-on identity suite (no IdP)
         run: |
-          cargo test --test graphql_identity --features graphql,sqlite,metrics --verbose
+          cargo test --test graphql --features graphql,sqlite,metrics --verbose graphql_identity::
 
   oidc-zitadel-e2e:
     name: GraphQL OIDC Zitadel e2e (live)
@@ -79,16 +79,16 @@ jobs:
           test -n "${OIDC_ISSUER:-}"
           test -n "${GRAPHQL_E2E_CUSTOMER_KEY:-}"
           echo "ZITADEL_E2E=$ZITADEL_E2E OIDC_ISSUER=$OIDC_ISSUER"
-          cargo test --test graphql_oidc_zitadel --features graphql,sqlite,metrics --verbose -- --nocapture
+          cargo test --test graphql --features graphql,sqlite,metrics --verbose graphql_oidc_zitadel:: -- --nocapture
       - name: Dump Zitadel logs on failure
         if: failure()
         run: |
-          docker compose -f tests/graphql_oidc_zitadel/docker-compose.yml ps -a || true
-          docker compose -f tests/graphql_oidc_zitadel/docker-compose.yml logs --tail=200 || true
-          ls -la tests/graphql_oidc_zitadel/machinekey || true
+          docker compose -f tests/graphql/graphql_oidc_zitadel/docker-compose.yml ps -a || true
+          docker compose -f tests/graphql/graphql_oidc_zitadel/docker-compose.yml logs --tail=200 || true
+          ls -la tests/graphql/graphql_oidc_zitadel/machinekey || true
       - name: Tear down
         if: always()
-        run: docker compose -f tests/graphql_oidc_zitadel/docker-compose.yml down -v || true
+        run: docker compose -f tests/graphql/graphql_oidc_zitadel/docker-compose.yml down -v || true
 
   oidc-keycloak-e2e:
     name: GraphQL OIDC Keycloak e2e (live)
@@ -120,15 +120,15 @@ jobs:
           test -n "${KEYCLOAK_E2E:-}"
           test -n "${OIDC_ISSUER:-}"
           echo "KEYCLOAK_E2E=$KEYCLOAK_E2E OIDC_ISSUER=$OIDC_ISSUER OIDC_AUDIENCE=$OIDC_AUDIENCE"
-          cargo test --test graphql_oidc_keycloak --features graphql,sqlite,metrics --verbose -- --nocapture
+          cargo test --test graphql --features graphql,sqlite,metrics --verbose graphql_oidc_keycloak:: -- --nocapture
       - name: Dump Keycloak logs on failure
         if: failure()
         run: |
-          docker compose -f tests/graphql_oidc_keycloak/docker-compose.yml ps -a || true
-          docker compose -f tests/graphql_oidc_keycloak/docker-compose.yml logs --tail=200 || true
+          docker compose -f tests/graphql/graphql_oidc_keycloak/docker-compose.yml ps -a || true
+          docker compose -f tests/graphql/graphql_oidc_keycloak/docker-compose.yml logs --tail=200 || true
       - name: Tear down
         if: always()
-        run: docker compose -f tests/graphql_oidc_keycloak/docker-compose.yml down -v || true
+        run: docker compose -f tests/graphql/graphql_oidc_keycloak/docker-compose.yml down -v || true
 
   oidc-authentik-e2e:
     name: GraphQL OIDC Authentik e2e (live)
@@ -161,12 +161,12 @@ jobs:
           test -n "${OIDC_ISSUER:-}"
           test -n "${OIDC_JWKS_URI:-}"
           echo "AUTHENTIK_E2E=$AUTHENTIK_E2E OIDC_ISSUER=$OIDC_ISSUER"
-          cargo test --test graphql_oidc_authentik --features graphql,sqlite,metrics --verbose -- --nocapture
+          cargo test --test graphql --features graphql,sqlite,metrics --verbose graphql_oidc_authentik:: -- --nocapture
       - name: Dump Authentik logs on failure
         if: failure()
         run: |
-          docker compose -f tests/graphql_oidc_authentik/docker-compose.yml ps -a || true
-          docker compose -f tests/graphql_oidc_authentik/docker-compose.yml logs --tail=200 || true
+          docker compose -f tests/graphql/graphql_oidc_authentik/docker-compose.yml ps -a || true
+          docker compose -f tests/graphql/graphql_oidc_authentik/docker-compose.yml logs --tail=200 || true
       - name: Tear down
         if: always()
-        run: docker compose -f tests/graphql_oidc_authentik/docker-compose.yml down -v || true
+        run: docker compose -f tests/graphql/graphql_oidc_authentik/docker-compose.yml down -v || true

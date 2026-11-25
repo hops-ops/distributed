@@ -567,13 +567,13 @@ claim → role/session). Live against three local IdPs — not mocks only:
 
 | Provider | Compose + bootstrap | Live test | Gate |
 |---|---|---|---|
-| **[Zitadel](tests/graphql_oidc_zitadel/)** (reference) | `./scripts/oidc-zitadel-up.sh` | `cargo test --test graphql_oidc_zitadel --features graphql,sqlite` | `ZITADEL_E2E=1` |
-| **[Keycloak](tests/graphql_oidc_keycloak/)** | `./scripts/oidc-keycloak-up.sh` | `cargo test --test graphql_oidc_keycloak --features graphql,sqlite` | `KEYCLOAK_E2E=1` |
-| **[Authentik](tests/graphql_oidc_authentik/)** | `./scripts/oidc-authentik-up.sh` | `cargo test --test graphql_oidc_authentik --features graphql,sqlite` | `AUTHENTIK_E2E=1` |
+| **[Zitadel](tests/graphql/graphql_oidc_zitadel/)** (reference) | `./scripts/oidc-zitadel-up.sh` | `cargo test --test graphql --features graphql,sqlite graphql_oidc_zitadel::` | `ZITADEL_E2E=1` |
+| **[Keycloak](tests/graphql/graphql_oidc_keycloak/)** | `./scripts/oidc-keycloak-up.sh` | `cargo test --test graphql --features graphql,sqlite graphql_oidc_keycloak::` | `KEYCLOAK_E2E=1` |
+| **[Authentik](tests/graphql/graphql_oidc_authentik/)** | `./scripts/oidc-authentik-up.sh` | `cargo test --test graphql --features graphql,sqlite graphql_oidc_authentik::` | `AUTHENTIK_E2E=1` |
 
 Shared **E1–E8** in [`tests/common/src/oidc.rs`](tests/common/src/oidc.rs).
 Gated binaries skip cleanly when unset. Offline:
-`cargo test --test graphql_identity --features graphql,sqlite`.
+`cargo test --test graphql --features graphql,sqlite graphql_identity::`.
 
 e2e-ui boots **Zitadel** for the browser path; the three stacks prove the
 same `OidcBearer` edge is not vendor-locked.
@@ -899,7 +899,7 @@ renames. The handler must still obtain the principal from its authenticated
 session and enforce membership rules; this declaration only supplies the
 generated preview's provenance.
 
-See [the executable contract tests](tests/sourced/flat_preview.rs), including
+See [the executable contract tests](tests/core/sourced/flat_preview.rs), including
 the generated delete-projection client, helper replay and conflicting/dynamic-value cases.
 
 ### Durable Stream Identity
@@ -1477,7 +1477,7 @@ impl Crawler {
 The generated registration is exactly the hand-written one
 (`command_transition::<domain_commands::X, I, K>(name)` + `field_name`,
 `roles`, `guarded`/`handle`): the command specs, GraphQL SDL and client
-manifest are identical (`tests/aggregate_command`). For unusual bodies write
+manifest are identical (`tests/core/aggregate_command`). For unusual bodies write
 the handler and register it with `command! { .., handle: f }` or
 the builder below.
 
@@ -2137,9 +2137,9 @@ Scaffolds prefer **`OidcBearer`** whenever OIDC env is set — not DevHeaders.
 
 **Provider-portable by design.** Live compose + bootstrap + e2e binaries ship for:
 
-- **Zitadel** — `tests/graphql_oidc_zitadel` + `scripts/oidc-zitadel-up.sh` (JWT-bearer mint; also powers e2e-ui login)
-- **Keycloak** — `tests/graphql_oidc_keycloak` + `scripts/oidc-keycloak-up.sh` (client_credentials + realm roles)
-- **Authentik** — `tests/graphql_oidc_authentik` + `scripts/oidc-authentik-up.sh` (client_credentials + groups)
+- **Zitadel** — `tests/graphql/graphql_oidc_zitadel` + `scripts/oidc-zitadel-up.sh` (JWT-bearer mint; also powers e2e-ui login)
+- **Keycloak** — `tests/graphql/graphql_oidc_keycloak` + `scripts/oidc-keycloak-up.sh` (client_credentials + realm roles)
+- **Authentik** — `tests/graphql/graphql_oidc_authentik` + `scripts/oidc-authentik-up.sh` (client_credentials + groups)
 
 Shared assertions (E1–E8): discovery/JWKS, happy path, role isolation, multi-audience / `azp`, expired and forged tokens, etc. Generic OIDC also works for SaaS IdPs (e.g. Okta) without a dedicated compose stack.
 
@@ -2283,22 +2283,22 @@ See [`js/README.md`](js/README.md) for package API and packaging.
 
 | Suite | Focus |
 |---|---|
-| `tests/graphql_*` | Engine, HTTP, SDL, dialects, harden (authz/DoS/inject), causal transport |
-| `tests/graphql_identity` | Always-on OIDC/JWT matrix (mock JWKS; no Docker) |
-| `tests/graphql_oidc_{zitadel,keycloak,authentik}` | **Live** multi-IdP e2e (compose + real JWKS; gated) |
-| `tests/typed_commands` | Eventual / Atomic / Succeeded command registration |
+| `tests/graphql/` | Engine, HTTP, SDL, dialects, harden (authz/DoS/inject), causal transport |
+| `tests/graphql/graphql_identity` | Always-on OIDC/JWT matrix (mock JWKS; no Docker) |
+| `tests/graphql/graphql_oidc_{zitadel,keycloak,authentik}` | **Live** multi-IdP e2e (compose + real JWKS; gated) |
+| `tests/core/typed_commands` | Eventual / Atomic / Succeeded command registration |
 | `tests/e2e-ui` | Multi-crate product template + SvelteKit + Zitadel UI login + Playwright |
 | `js/tests` | Replica, command runtime, adapters |
 | `examples/graphiql.rs` | Seeded local playground |
 
 ```bash
-cargo test --test graphql_engine --features "graphql,sqlite"
-cargo test --test graphql_identity --features "graphql,sqlite"
-cargo test --test graphql_harden --features "graphql,sqlite"
+cargo test --test graphql --features "graphql,sqlite" graphql_engine::
+cargo test --test graphql --features "graphql,sqlite" graphql_identity::
+cargo test --test graphql --features "graphql,sqlite" graphql_harden::
 cd js && npm run quality
 # Live IdPs (optional):
 #   ./scripts/oidc-zitadel-up.sh && set -a && source graphql-oidc.env && set +a
-#   cargo test --test graphql_oidc_zitadel --features graphql,sqlite
+#   cargo test --test graphql --features graphql,sqlite graphql_oidc_zitadel::
 # Full UI matrix: cd tests/e2e-ui && make test
 ```
 
@@ -2723,14 +2723,14 @@ unset**; SQLite uses a temporary database file and needs no Docker service.
 docker compose up -d   # postgres, rabbitmq, kafka, nats (see compose.yaml)
 
 DATABASE_URL=postgres://sourced:sourced@localhost:5432/distributed \
-  cargo test --test postgres_transport --features postgres
-cargo test --test sqlite_transport --features sqlite
+  cargo test --test transports --features postgres postgres_transport::
+cargo test --test transports --features sqlite sqlite_transport::
 NATS_URL=nats://localhost:4222 \
-  cargo test --test nats_transport --features nats
+  cargo test --test transports --features nats nats_transport::
 AMQP_URL=amqp://guest:guest@localhost:5672/%2f \
-  cargo test --test rabbitmq_transport --features rabbitmq
+  cargo test --test transports --features rabbitmq rabbitmq_transport::
 KAFKA_BROKERS=127.0.0.1:9092 \
-  cargo test --test kafka_transport --features kafka
+  cargo test --test transports --features kafka kafka_transport::
 ```
 
 Each external broker has a matching reusable GitHub Actions job
@@ -2761,13 +2761,13 @@ e2e-celld (`tests/e2e-celld`), Blob game, live chat, GraphiQL.
 | [`tests/e2e-celld/`](tests/e2e-celld/) | Same UI; Todo + `chat.post` wait-dispatch to celld; `@live` stays on GraphQL |
 | [`js/`](js/) | `@hops-ops/distributed` — transport, causal replica, SvelteKit/React |
 | [`examples/graphiql.rs`](examples/graphiql.rs) | Seeded GraphQL playground (`--features "graphql,sqlite"`) |
-| `tests/graphql_*` | Engine, HTTP/WS, harden, identity, multi-IdP OIDC |
-| `tests/typed_commands/` | Eventual / `Atomic` / `Succeeded` command registration |
-| `tests/microsvc/` | Handlers on HTTP, gRPC, bus, session |
-| `tests/read_model_*/`, `tests/distributed_read_model/` | Read models: commit bridge, keyset scans, relationships, sessions, Atomic vs eventual projections |
-| `tests/sourced*` / `tests/snapshots/` / `tests/upcasting/` | Macros, snapshots, event versioning |
-| `tests/sagas/` | Orchestration + choreography with the outbox |
-| `tests/*_transport/`, `tests/knative_cloudevents/` | Broker adapters + conformance |
+| `tests/graphql/` | Engine, HTTP/WS, harden, identity, multi-IdP OIDC |
+| `tests/core/typed_commands/` | Eventual / `Atomic` / `Succeeded` command registration |
+| `tests/services/microsvc/` | Handlers on HTTP, gRPC, bus, session |
+| `tests/read_models/` | Read models: commit bridge, keyset scans, relationships, sessions, Atomic vs eventual projections |
+| `tests/core/sourced*` / `tests/core/snapshots/` / `tests/core/upcasting/` | Macros, snapshots, event versioning |
+| `tests/services/sagas/` | Orchestration + choreography with the outbox |
+| `tests/transports/` | Broker adapters + conformance |
 
 ## License
 

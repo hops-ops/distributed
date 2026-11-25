@@ -17,7 +17,7 @@ Optional profile:
 ```sh
 cd tests/e2e-ui
 make up-celld-nats     # celld local store + Queue relay + NATS
-make test-celld        # live --test celld + GraphQL wait-path smoke (CI)
+make test-celld        # live `services` celld:: + GraphQL wait-path smoke (CI)
 make test-celld-nats   # GraphQL wait-path smoke + SQL list only
 make down-celld-nats   # NATS only
 make down-celld        # celld; local state is preserved
@@ -85,7 +85,7 @@ docker compose -f tests/e2e-ui/celld-nats-profile/docker-compose.yml up -d
 export CELLD_URL=http://127.0.0.1:${CELLD_HTTP_PORT:-18880}
 export NATS_URL=nats://127.0.0.1:${NATS_PORT:-14222}
 
-cargo test --test e2e_ui_celld_nats_profile --features graphql,http,sqlite
+cargo test --test services --features graphql,http,sqlite e2e_ui_celld_nats_profile::
 ```
 
 Without `CELLD_URL` **and** `NATS_URL`, the test still checks that the

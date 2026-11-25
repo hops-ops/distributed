@@ -21,7 +21,7 @@
 //! This is a no-extra-process transport for local development, tests, demos, and
 //! small single-node deployments. It is not a high-throughput broker replacement.
 //!
-//! Requires the `sqlite` feature. Integration-tested in `tests/sqlite_transport`.
+//! Requires the `sqlite` feature. Integration-tested in `tests/transports/sqlite_transport`.
 //!
 //! [`Bus`]: super::Bus
 //! [`BusConsumer`]: super::BusConsumer
