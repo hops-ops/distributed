@@ -416,7 +416,7 @@ async fn sessions_share_a_live_producer_only_when_their_binds_match() {
     assert_eq!(data_a["notes"][0]["owner_id"], "tenant-a");
     assert_eq!(data_b["notes"][0]["owner_id"], "tenant-b");
     assert_eq!(
-        engine.live_subscriber_count(),
+        engine.live_producer_count(),
         2,
         "different claim binds must never share a producer"
     );
@@ -424,8 +424,9 @@ async fn sessions_share_a_live_producer_only_when_their_binds_match() {
     let (_a2, data_a2) = open(tenant("tenant-a")).await;
     assert_eq!(data_a2, data_a);
     assert_eq!(
-        engine.live_subscriber_count(),
+        engine.live_producer_count(),
         2,
         "identical SQL and binds share the tenant's producer"
     );
+    assert_eq!(engine.live_subscriber_count(), 3, "every stream is counted");
 }

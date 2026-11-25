@@ -113,21 +113,23 @@ async function modeRun(host,mode,runtime){
   }
   try{
     const consumers=[];
-    // Sequential admission makes steady-state producer count deterministic;
-    // all100 remain concurrently subscribed during the measured commit fanout.
+    // Sequential admission makes the steady-state upstream count deterministic;
+    // all 100 remain concurrently subscribed during the measured commit fanout.
+    // Gateway live sharing decides how many subscriptions reach the origin; the
+    // origin then shares identical reads, so it runs one producer either way.
     for(let index=0;index<100;index++)consumers.push(await connect(String(index)));
-    const producerCount=(await metrics()).producers;
-    assert.equal(producerCount,mode==='live'?1:100);
+    const {subscribers:upstreamCount,producers:producerCount}=await metrics();
+    assert.equal(upstreamCount,mode==='live'?1:100);assert.equal(producerCount,1);
     const initial=consumers[0].frames[0];for(const consumer of consumers)assert.deepEqual(consumer.frames[0],initial);
     const commitStart=performance.now(),title=await advance();
     await until(()=>consumers.every(consumer=>consumer.frames.some(frame=>frame.data?.causal_query_views?.[0]?.title.startsWith(title))),'100 commit deliveries');
     const fanoutMs=performance.now()-commitStart;
-    const liveReport={logicalSubscriptions:100,upstreamProducers:producerCount,origin:difference(await metrics(),liveBefore),wire:difference(snapshots(),liveBytes),clientFrameBytes:receivedBytes,initialLatencyMs:latency(consumers.map(consumer=>consumer.ms)),commitFanoutMs:fanoutMs};
+    const liveReport={logicalSubscriptions:100,upstreamSubscriptions:upstreamCount,originProducers:producerCount,origin:difference(await metrics(),liveBefore),wire:difference(snapshots(),liveBytes),clientFrameBytes:receivedBytes,initialLatencyMs:latency(consumers.map(consumer=>consumer.ms)),commitFanoutMs:fanoutMs};
     const bob=await connect('bob','bob');assert.notEqual(bob.frames[0].extensions.distributed.cacheScope,initial.extensions.distributed.cacheScope);
-    assert.equal((await metrics()).producers,producerCount+1);bob.cancel();
-    await until(async()=>(await metrics()).producers===producerCount,'subject control teardown');
+    const withBob=await metrics();assert.equal(withBob.subscribers,upstreamCount+1);assert.equal(withBob.producers,producerCount+1);bob.cancel();
+    await until(async()=>(await metrics()).subscribers===upstreamCount,'subject control teardown');
     for(const consumer of consumers)consumer.cancel();
-    await until(async()=>(await metrics()).producers===0,'last subscriber teardown');
+    await until(async()=>{const m=await metrics();return m.subscribers===0&&m.producers===0;},'last subscriber teardown');
     const recoveryBefore=await metrics(),recoveryBytes=snapshots(),recoveryClientBytes=receivedBytes;
     let recovery;
     if(mode==='live'){
@@ -147,7 +149,7 @@ async function modeRun(host,mode,runtime){
       recovery={origin:difference(await metrics(),recoveryBefore),wire:difference(snapshots(),recoveryBytes),clientFrameBytes:receivedBytes-recoveryClientBytes,cursorResets:1,slowClientResets:host==='workerd'?1:0};
     }
     report.rows.push({host,mode,recovery,query:queryReport,live:liveReport,decisions:await counts(),subjectControls:'query and live scope differ; separate producer',invalidation:'new projection returned; old cache envelope rejected'});
-    console.log(`PASS ${host}/${mode}: 100 queries -> ${queryWork.resultExecutions} result SQL; 100 live -> ${producerCount} producers; measured origin and client bytes`);
+    console.log(`PASS ${host}/${mode}: 100 queries -> ${queryWork.resultExecutions} result SQL; 100 live -> ${upstreamCount} origin subscriptions, ${producerCount} producer; measured origin and client bytes`);
   }finally{for(const socket of clients)socket.terminate();}
 }
 try{

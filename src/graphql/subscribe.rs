@@ -176,6 +176,11 @@ impl LiveRegistries {
             external: LiveRegistry::new(permits),
         }
     }
+
+    /// Live subscription streams across every shared read.
+    pub(crate) fn subscriber_count(&self) -> usize {
+        self.plans.subscriber_count() + self.external.subscriber_count()
+    }
 }
 
 /// Shared live reads by key.
@@ -285,6 +290,17 @@ where
                 },
             )),
         }
+    }
+
+    /// Subscription streams following this registry's reads (each holds one
+    /// receiver of its read's frame channel).
+    fn subscriber_count(&self) -> usize {
+        let entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+        entries
+            .values()
+            .filter_map(|entry| entry.frames.upgrade())
+            .map(|frames| frames.receiver_count())
+            .sum()
     }
 
     #[cfg(test)]

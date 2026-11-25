@@ -88,7 +88,7 @@ async fn separate_origin_and_client_savings() {
     let repository = fixture.repository.clone();
     let bus = fixture.bus.clone();
     let control = Router::new()
-        .route("/__metrics", get(move || {let engine=observed.clone();let versions=counters.clone();async move {let m=versions.metrics();axum::Json(json!({"producers":engine.live_subscriber_count(),"validations":m.validations,"resultExecutions":m.result_executions}))}}))
+        .route("/__metrics", get(move || {let engine=observed.clone();let versions=counters.clone();async move {let m=versions.metrics();axum::Json(json!({"subscribers":engine.live_subscriber_count(),"producers":engine.live_producer_count(),"validations":m.validations,"resultExecutions":m.result_executions}))}}))
         .route("/__block", post(move || {let gate=gate.clone();async move {gate.forget_permits(gate.available_permits());"blocked"}}))
         .route("/__release", post(move || {let gate=release.clone();async move {gate.add_permits(10000);"released"}}))
         .route("/__next/{position}",post(move |axum::extract::Path(position):axum::extract::Path<u64>| {let repository=repository.clone();let bus=bus.clone();async move {project_item(&repository,&bus,position,&format!("load-{position}-{}","x".repeat(4096))).await;"committed"}}));
