@@ -274,8 +274,6 @@ export interface CacheEngine {
 	optimisticLayerState(id: string): OptimisticLayerState | undefined;
 	/** Whether this layer shows a record the base does not hold yet. */
 	optimisticLayerProvisional(id: string): boolean;
-	/** How many confirmed records are held, tombstones included. */
-	readonly recordCount: number;
 	extract(): CacheEngineSnapshot;
 	restore(snapshot: CacheEngineSnapshot): void;
 	/**
@@ -376,12 +374,6 @@ export type Watcher<T = unknown> = {
 
 /** What one transaction needs to put back if it fails. */
 export type TransactionUndo = {
-	/** The maps the transaction started with; `restore` may swap them out. */
-	readonly records: Map<RecordKey, StoredRecord>;
-	readonly indexes: Map<IndexKey, StoredIndex>;
-	/** The first value each written key had, `undefined` when it was absent. */
-	readonly recordLog: Map<RecordKey, StoredRecord | undefined>;
-	readonly indexLog: Map<IndexKey, StoredIndex | undefined>;
 	readonly layers: readonly OptimisticLayer[];
 	readonly derivedIndexOperations: readonly DerivedIndexOperation[];
 	readonly confirmedFloors: ReadonlyMap<string, number>;

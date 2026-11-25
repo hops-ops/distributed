@@ -151,7 +151,6 @@ export type ReplicaDiagnosticEventInput =
 			kind: 'normalization';
 			operation: string;
 			source: ReplicaWriteSource;
-			records: number;
 			indexes: number;
 			partial: boolean;
 	  }>

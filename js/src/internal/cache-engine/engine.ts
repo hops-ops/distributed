@@ -76,6 +76,7 @@ import type {
 	WatchOptions,
 	Watcher
 } from './types.js';
+import { TransactionalMap } from './transactional-map.js';
 import { cacheEngineWork } from './work.js';
 
 const byKey = <T>([left]: readonly [string, T], [right]: readonly [string, T]): number =>
@@ -90,16 +91,19 @@ const byKey = <T>([left]: readonly [string, T], [right]: readonly [string, T]): 
  * layer cannot become visible again after a newer command confirms.
  *
  * Cost model: stored records, indexes and layers are immutable values, and a
- * write replaces the value under its key. A transaction therefore costs what
- * it writes: rollback puts the replaced values back, the optimistic overlay
- * holds only the keys its operations touch, and a commit re-selects only the
+ * write replaces the value under its key. The committed state is a root that
+ * a transaction never writes: its writes go to a delta of the keys it touched
+ * (`TransactionalMap`), and every other key stays shared with the root. A
+ * transaction therefore costs what it writes: rollback drops the delta and
+ * keeps the old root, commit folds the delta in, the optimistic overlay holds
+ * only the keys its operations touch, and a commit re-selects only the
  * watchers that read a changed key.
  */
 export class PurposeBuiltCacheEngine implements CacheEngine {
-	#records = new Map<RecordKey, StoredRecord>();
-	#indexes = new Map<IndexKey, StoredIndex>();
+	readonly #records = new TransactionalMap<RecordKey, StoredRecord>();
+	readonly #indexes = new TransactionalMap<IndexKey, StoredIndex>();
 	/** Live base indexes holding each record as a member or as their parent. */
-	#indexReferences = new Map<RecordKey, Set<IndexKey>>();
+	readonly #indexReferences = new TransactionalMap<RecordKey, ReadonlySet<IndexKey>>();
 	#layers: readonly OptimisticLayer[] = [];
 	#derivedIndexOperations: readonly DerivedIndexOperation[] = [];
 	#derivedIndexReconciler: DerivedIndexReconciler | undefined;
@@ -420,10 +424,6 @@ export class PurposeBuiltCacheEngine implements CacheEngine {
 				operation.kind === 'write-record' &&
 				view.provisional?.(operation.write.key) === true
 		);
-	}
-
-	get recordCount(): number {
-		return this.#records.size;
 	}
 
 	extract(): CacheEngineSnapshot {
@@ -929,10 +929,6 @@ export class PurposeBuiltCacheEngine implements CacheEngine {
 	}
 
 	#putRecord(key: RecordKey, record: StoredRecord | undefined): void {
-		const undo = this.#undo!;
-		if (this.#records === undo.records && !undo.recordLog.has(key)) {
-			undo.recordLog.set(key, this.#records.get(key));
-		}
 		if (record === undefined) this.#records.delete(key);
 		else this.#records.set(key, record);
 		if (this.#overlay?.records.has(key)) this.#overlay = undefined;
@@ -940,12 +936,7 @@ export class PurposeBuiltCacheEngine implements CacheEngine {
 	}
 
 	#putIndex(key: IndexKey, index: StoredIndex | undefined): void {
-		const undo = this.#undo!;
-		const previous = this.#indexes.get(key);
-		if (this.#indexes === undo.indexes && !undo.indexLog.has(key)) {
-			undo.indexLog.set(key, previous);
-		}
-		this.#moveIndexReferences(key, previous, index);
+		this.#moveIndexReferences(key, this.#indexes.get(key), index);
 		if (index === undefined) this.#indexes.delete(key);
 		else this.#indexes.set(key, index);
 		if (this.#overlay?.indexes.has(key)) this.#overlay = undefined;
@@ -956,13 +947,19 @@ export class PurposeBuiltCacheEngine implements CacheEngine {
 		records: Map<RecordKey, StoredRecord>;
 		indexes: Map<IndexKey, StoredIndex>;
 	}): void {
-		this.#records = base.records;
-		this.#indexes = base.indexes;
+		this.#records.replace(base.records);
+		this.#indexes.replace(base.indexes);
 		this.#overlay = undefined;
-		this.#indexReferences = new Map();
-		for (const [key, index] of this.#indexes) {
-			this.#moveIndexReferences(key, undefined, index);
+		const references = new Map<RecordKey, Set<IndexKey>>();
+		for (const [key, index] of base.indexes) {
+			if (index.deleted) continue;
+			for (const record of indexReferences(index)) {
+				let keys = references.get(record);
+				if (keys === undefined) references.set(record, (keys = new Set()));
+				keys.add(key);
+			}
 		}
+		this.#indexReferences.replace(references);
 	}
 
 	#moveIndexReferences(
@@ -980,14 +977,27 @@ export class PurposeBuiltCacheEngine implements CacheEngine {
 		) {
 			return;
 		}
+		const references = this.#indexReferences;
+		// A set this transaction already wrote is its own; any other is shared
+		// with the committed root and is copied before it changes.
+		const own = (record: RecordKey): Set<IndexKey> => {
+			const keys = references.get(record);
+			if (keys !== undefined && references.written(record)) {
+				return keys as Set<IndexKey>;
+			}
+			const copy = new Set(keys);
+			references.set(record, copy);
+			return copy;
+		};
 		for (const record of indexReferences(before)) {
-			const keys = this.#indexReferences.get(record);
-			if (keys?.delete(key) && keys.size === 0) this.#indexReferences.delete(record);
+			if (!references.get(record)?.has(key)) continue;
+			const keys = own(record);
+			keys.delete(key);
+			if (keys.size === 0) references.delete(record);
 		}
 		for (const record of indexReferences(after)) {
-			let keys = this.#indexReferences.get(record);
-			if (keys === undefined) this.#indexReferences.set(record, (keys = new Set()));
-			keys.add(key);
+			if (references.get(record)?.has(key)) continue;
+			own(record).add(key);
 		}
 	}
 
@@ -1407,22 +1417,22 @@ export class PurposeBuiltCacheEngine implements CacheEngine {
 	}
 
 	/**
-	 * Run one all-or-nothing update. The outermost call owns the undo log;
-	 * a failure puts every replaced value back before it propagates.
+	 * Run one all-or-nothing update. The outermost call opens the stored maps'
+	 * transaction and keeps the previous layer state; a failure drops every
+	 * write and restores that state before it propagates, and success commits.
 	 */
 	#transaction<T>(update: () => T): T {
 		if (this.#undo !== undefined) return update();
 		const undo: TransactionUndo = (this.#undo = {
-			records: this.#records,
-			indexes: this.#indexes,
-			recordLog: new Map(),
-			indexLog: new Map(),
 			layers: this.#layers,
 			derivedIndexOperations: this.#derivedIndexOperations,
 			confirmedFloors: this.#confirmedFloors,
 			nextLayerSequence: this.#nextLayerSequence
 		});
 		this.#transactionLifecycleIndexes = new Set();
+		this.#records.begin();
+		this.#indexes.begin();
+		this.#indexReferences.begin();
 		let result: T;
 		try {
 			result = update();
@@ -1432,6 +1442,9 @@ export class PurposeBuiltCacheEngine implements CacheEngine {
 		} finally {
 			this.#undo = undefined;
 		}
+		this.#records.commit();
+		this.#indexes.commit();
+		this.#indexReferences.commit();
 		const shouldFlush = this.#dirty;
 		const changedDependencies = this.#changedDependencies;
 		this.#dirty = false;
@@ -1442,26 +1455,9 @@ export class PurposeBuiltCacheEngine implements CacheEngine {
 	}
 
 	#rollback(undo: TransactionUndo): void {
-		const replaced =
-			this.#records !== undo.records || this.#indexes !== undo.indexes;
-		this.#records = undo.records;
-		for (const [key, record] of undo.recordLog) {
-			if (record === undefined) this.#records.delete(key);
-			else this.#records.set(key, record);
-		}
-		if (replaced) {
-			for (const [key, index] of undo.indexLog) {
-				if (index === undefined) undo.indexes.delete(key);
-				else undo.indexes.set(key, index);
-			}
-			this.#replaceBase({ records: undo.records, indexes: undo.indexes });
-		} else {
-			for (const [key, index] of undo.indexLog) {
-				this.#moveIndexReferences(key, this.#indexes.get(key), index);
-				if (index === undefined) this.#indexes.delete(key);
-				else this.#indexes.set(key, index);
-			}
-		}
+		this.#records.rollback();
+		this.#indexes.rollback();
+		this.#indexReferences.rollback();
 		this.#layers = undo.layers;
 		this.#derivedIndexOperations = undo.derivedIndexOperations;
 		this.#confirmedFloors = undo.confirmedFloors;
