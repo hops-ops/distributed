@@ -1,35 +1,65 @@
-//! Commit-path subscription invalidation (live query refresh).
+//! Live queries: one shared producer per distinct read, fanned out.
 //!
-//! Each subscription field:
-//! 1. Executes the query once and yields the initial result.
-//! 2. Listens on [`ChangeHub`] (fed by `change_stream` / repo broadcast).
-//! 3. On dirty tables intersecting the plan footprint, debounces, re-executes,
-//!    and yields only when the response hash changes (hash-gated push).
+//! Every live root — a catalog plan or an external read — is a [`LiveRead`].
+//! Subscribers whose reads have the same key share one entry of a
+//! [`LiveRegistry`] and its one producer loop:
 //!
-//! A failed execution is terminal (`docs/live-query-delivery.md`): the producer
-//! yields one error and stops. GraphQL ends the subscription on that error, and
-//! the failure frame carries only the base protocol envelope. Protocol frame
-//! metadata is a FIFO consumed by each emitted response, so producing another
-//! frame after an error could let the error response take that later frame's
-//! snapshot/live metadata.
+//! 1. The first subscriber creates the entry; the producer's first execution
+//!    is that subscriber's first frame. A later subscriber opens with its own
+//!    execution (it may resume from its own cursors), then follows the entry.
+//! 2. The producer listens on [`ChangeHub`]. On a change that touches its last
+//!    result it debounces, executes once, and publishes the frame to every
+//!    subscriber.
+//! 3. Each subscriber keeps its own hash gate and protocol envelope. A frame
+//!    whose replay starts where the subscriber's last frame ended is taken as
+//!    is; otherwise (the subscriber joined between frames, or skipped one
+//!    while it was slow) the subscriber executes once from its own cursors.
+//!
+//! Publishing never waits on a subscriber: the entry holds only the latest
+//! frame, so a slow subscriber skips frames instead of stalling the others.
+//! The producer's executions are exclusive on the entry and a subscriber's own
+//! are shared, so a published frame is always newer than any own execution a
+//! subscriber delivered before it. At most `live_concurrency` live executions
+//! (first reads, refreshes and catch-ups) run at once per engine.
+//!
+//! A failed execution is terminal (`docs/live-query-delivery.md`): a failed
+//! shared execution ends every subscriber of the entry with that one error,
+//! and the entry is gone before anyone else can join it. Protocol frame
+//! metadata is a FIFO consumed by each emitted response, so it is recorded
+//! only at the moment its value is yielded. When the last subscriber leaves,
+//! the producer stops and the entry is removed.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
+use std::future::Future;
+use std::hash::Hash;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, Weak};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
 use async_graphql::Value;
+use futures_util::stream::BoxStream;
 use futures_util::Stream;
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::{broadcast, watch, RwLock, Semaphore};
 
 use crate::read_model::ReadModelChange;
 
-use super::compile::{QueryPlan, SqlPlan};
+use super::compile::{BindValue, QueryPlan, SqlPlan};
 use super::engine::EngineInner;
-use super::execute::{execute_plan, ProtocolRead};
+use super::execute::{execute_plan, ProtocolEvidence, ProtocolRead};
+use super::external_roots::{ExternalKey, ExternalRead};
 use super::protocol::{ProtocolResponseAccumulator, RequestedLiveResume};
 use super::schema::client_error;
+use super::surface::Surface;
+
+/// Live executions (first reads, refreshes, catch-ups) one engine runs at
+/// once unless [`GraphqlEngineBuilder::live_concurrency`] says otherwise.
+///
+/// [`GraphqlEngineBuilder::live_concurrency`]: super::GraphqlEngineBuilder::live_concurrency
+pub const DEFAULT_LIVE_CONCURRENCY: usize = 8;
+
+/// How long a producer waits after a change for more to coalesce.
+const DEBOUNCE: Duration = Duration::from_millis(100);
 
 /// Fan-out hub for read-model change notifications.
 #[derive(Clone, Debug)]
@@ -43,7 +73,7 @@ impl ChangeHub {
         Self { tx }
     }
 
-    /// Active origin live readers, excluding the external invalidation forwarder.
+    /// Active live producers (one per shared live read).
     pub fn subscriber_count(&self) -> usize {
         self.tx.receiver_count()
     }
@@ -52,11 +82,9 @@ impl ChangeHub {
         self.tx.subscribe()
     }
 
+    /// Publish a change. An empty table set means "everything changed" (the
+    /// lag signal the forwarder sends).
     pub fn publish(&self, change: ReadModelChange) {
-        if change.is_empty() {
-            // Empty set is reserved as the all-dirty lag signal; allow it only
-            // when explicitly published for that purpose (forwarder).
-        }
         let _ = self.tx.send(change);
     }
 
@@ -93,20 +121,449 @@ type LiveItem = Result<Value, async_graphql::Error>;
 
 /// Stream of GraphQL field values for one live subscription.
 pub struct LiveQueryStream {
-    rx: mpsc::Receiver<LiveItem>,
+    inner: BoxStream<'static, LiveItem>,
 }
 
 impl Stream for LiveQueryStream {
     type Item = LiveItem;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        self.rx.poll_recv(cx)
+        self.inner.as_mut().poll_next(cx)
+    }
+}
+
+/// One live execution's result, as every subscriber of its read sees it.
+pub(crate) struct LiveFrame<M> {
+    pub(crate) value: Value,
+    /// The hash gate's key: a frame equal to the last one is not pushed.
+    pub(crate) hash: u64,
+    /// Where the next execution resumes from.
+    pub(crate) next: RequestedLiveResume,
+    /// What each subscriber records with the value (protocol evidence).
+    pub(crate) meta: M,
+}
+
+pub(crate) type LiveResult<M> = Result<LiveFrame<M>, async_graphql::Error>;
+
+/// A read a live producer re-executes, independent of who subscribed to it.
+pub(crate) trait LiveRead: Send + Sync + 'static {
+    type Meta: Send + Sync + 'static;
+
+    /// Execute once, replaying from `resume`.
+    fn execute(
+        &self,
+        resume: RequestedLiveResume,
+    ) -> impl Future<Output = LiveResult<Self::Meta>> + Send + '_;
+
+    /// Whether `change` can alter the read whose last frame is `last`.
+    fn touched_by(&self, last: &LiveFrame<Self::Meta>, change: &ReadModelChange) -> bool;
+}
+
+/// Records a frame's metadata into one subscriber's response envelope.
+pub(crate) type Record<M> = Box<dyn FnMut(&M) -> Result<(), async_graphql::Error> + Send>;
+
+/// The live registries of one engine, sharing one execution bound.
+pub(crate) struct LiveRegistries {
+    pub(crate) plans: LiveRegistry<PlanKey, PlanRead>,
+    pub(crate) external: LiveRegistry<ExternalKey, ExternalRead>,
+}
+
+impl LiveRegistries {
+    pub(crate) fn new(concurrency: usize) -> Self {
+        let permits = Arc::new(Semaphore::new(concurrency));
+        Self {
+            plans: LiveRegistry::new(Arc::clone(&permits)),
+            external: LiveRegistry::new(permits),
+        }
+    }
+}
+
+/// Shared live reads by key.
+pub(crate) struct LiveRegistry<K, R: LiveRead> {
+    entries: Arc<Mutex<HashMap<K, Entry<R>>>>,
+    permits: Arc<Semaphore>,
+}
+
+struct Entry<R: LiveRead> {
+    frames: Weak<watch::Sender<Slot<R::Meta>>>,
+    shared: Weak<Shared<R>>,
+}
+
+/// The latest published frame, if any.
+type Slot<M> = Option<Arc<Published<M>>>;
+
+struct Published<M> {
+    /// Counts the entry's executions; a subscriber takes only newer frames.
+    version: u64,
+    /// Where this execution replayed from.
+    resumed: RequestedLiveResume,
+    result: LiveResult<M>,
+}
+
+/// What a producer and its subscribers share.
+struct Shared<R> {
+    read: R,
+    /// The producer's executions take it exclusively, a subscriber's own
+    /// executions shared, so a frame published after a subscriber's own
+    /// execution was read from a newer snapshot.
+    order: RwLock<()>,
+    permits: Arc<Semaphore>,
+}
+
+impl<K, R> LiveRegistry<K, R>
+where
+    K: Clone + Eq + Hash + Send + Sync + 'static,
+    R: LiveRead,
+{
+    fn new(permits: Arc<Semaphore>) -> Self {
+        Self {
+            entries: Arc::default(),
+            permits,
+        }
+    }
+
+    /// Follow the live read `key`, creating it from `read` when nobody does
+    /// yet. `resume` is where this subscriber's first frame replays from.
+    pub(crate) fn subscribe(
+        &self,
+        hub: &ChangeHub,
+        key: K,
+        resume: RequestedLiveResume,
+        read: impl FnOnce() -> R,
+        record: Record<R::Meta>,
+    ) -> LiveQueryStream {
+        let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+        let existing = entries
+            .get(&key)
+            .and_then(|entry| Some((entry.frames.upgrade()?, entry.shared.upgrade()?)));
+        let (frames, shared, joined) = match existing {
+            Some((sender, shared)) => (sender.subscribe(), shared, true),
+            None => {
+                let (sender, frames) = watch::channel(None);
+                let sender = Arc::new(sender);
+                let shared = Arc::new(Shared {
+                    read: read(),
+                    order: RwLock::new(()),
+                    permits: Arc::clone(&self.permits),
+                });
+                entries.insert(
+                    key.clone(),
+                    Entry {
+                        frames: Arc::downgrade(&sender),
+                        shared: Arc::downgrade(&shared),
+                    },
+                );
+                let producer = Producer {
+                    key,
+                    entries: Arc::clone(&self.entries),
+                    frames: sender,
+                    shared: Arc::clone(&shared),
+                };
+                // Subscribe before the first read so no change slips between.
+                tokio::spawn(producer.run(hub.subscribe(), resume.clone()));
+                (frames, shared, false)
+            }
+        };
+        let seen = frames.borrow().as_ref().map_or(0, |frame| frame.version);
+        drop(entries);
+        let subscriber = Subscriber {
+            shared,
+            frames,
+            seen,
+            resume,
+            own_first: joined,
+            last_hash: None,
+            record,
+            done: false,
+        };
+        LiveQueryStream {
+            inner: Box::pin(futures_util::stream::unfold(
+                subscriber,
+                |mut subscriber| async move {
+                    let item = subscriber.next().await?;
+                    Some((item, subscriber))
+                },
+            )),
+        }
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.entries.lock().unwrap().len()
+    }
+}
+
+struct Producer<K, R: LiveRead> {
+    key: K,
+    entries: Arc<Mutex<HashMap<K, Entry<R>>>>,
+    frames: Arc<watch::Sender<Slot<R::Meta>>>,
+    shared: Arc<Shared<R>>,
+}
+
+impl<K, R> Producer<K, R>
+where
+    K: Clone + Eq + Hash + Send + Sync + 'static,
+    R: LiveRead,
+{
+    async fn run(
+        self,
+        mut changes: broadcast::Receiver<ReadModelChange>,
+        first: RequestedLiveResume,
+    ) {
+        let shared = Arc::clone(&self.shared);
+        let mut resume = first;
+        let mut version = 0;
+        let mut last: Option<Arc<Published<R::Meta>>> = None;
+        loop {
+            if let Some(Ok(frame)) = last.as_ref().map(|published| &published.result) {
+                // Wait for a change to what the last frame read.
+                loop {
+                    let Some(change) = self.while_watched(changes.recv()).await else {
+                        return;
+                    };
+                    match change {
+                        Ok(change) if shared.read.touched_by(frame, &change) => break,
+                        Ok(_) => continue,
+                        Err(broadcast::error::RecvError::Lagged(_)) => break,
+                        Err(broadcast::error::RecvError::Closed) => return self.retire(None),
+                    }
+                }
+                if self
+                    .while_watched(tokio::time::sleep(DEBOUNCE))
+                    .await
+                    .is_none()
+                {
+                    return;
+                }
+                loop {
+                    match changes.try_recv() {
+                        Ok(_) | Err(broadcast::error::TryRecvError::Lagged(_)) => {}
+                        Err(broadcast::error::TryRecvError::Empty) => break,
+                        Err(broadcast::error::TryRecvError::Closed) => return self.retire(None),
+                    }
+                }
+            }
+            // Lock, then permit: whoever holds a permit is executing, never
+            // waiting, so the two cannot deadlock.
+            let Some(_order) = self.while_watched(shared.order.write()).await else {
+                return;
+            };
+            let Some(Ok(_permit)) = self.while_watched(shared.permits.acquire()).await else {
+                return;
+            };
+            let Some(result) = self
+                .while_watched(shared.read.execute(resume.clone()))
+                .await
+            else {
+                return;
+            };
+            version += 1;
+            let published = Arc::new(Published {
+                version,
+                resumed: std::mem::take(&mut resume),
+                result,
+            });
+            let Ok(frame) = &published.result else {
+                return self.retire(Some(published));
+            };
+            resume = frame.next.clone();
+            // Published while the order lock is held.
+            self.frames.send_replace(Some(Arc::clone(&published)));
+            last = Some(published);
+        }
+    }
+
+    /// Run `work` unless every subscriber leaves first (`None`: stop).
+    async fn while_watched<T>(&self, work: impl Future<Output = T>) -> Option<T> {
+        tokio::pin!(work);
+        loop {
+            tokio::select! {
+                output = &mut work => return Some(output),
+                _ = self.frames.closed() => {
+                    let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+                    // A subscriber may have joined since: joining holds this lock.
+                    if self.frames.receiver_count() == 0 {
+                        self.remove(&mut entries);
+                        return None;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Stop for good, publishing `last` (a failure) to every subscriber first.
+    /// Nobody can join between the two: joining holds the registry lock.
+    fn retire(self, last: Option<Arc<Published<R::Meta>>>) {
+        let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(last) = last {
+            self.frames.send_replace(Some(last));
+        }
+        self.remove(&mut entries);
+        // Dropping the sender ends every subscriber that has nothing left.
+    }
+
+    fn remove(&self, entries: &mut HashMap<K, Entry<R>>) {
+        let ours = entries
+            .get(&self.key)
+            .is_some_and(|entry| std::ptr::eq(entry.frames.as_ptr(), Arc::as_ptr(&self.frames)));
+        if ours {
+            entries.remove(&self.key);
+        }
+    }
+}
+
+struct Subscriber<R: LiveRead> {
+    shared: Arc<Shared<R>>,
+    frames: watch::Receiver<Slot<R::Meta>>,
+    /// The newest frame version this subscriber has taken or outrun.
+    seen: u64,
+    /// Where this subscriber's next frame must replay from.
+    resume: RequestedLiveResume,
+    /// Joined an existing entry: the first frame is its own execution.
+    own_first: bool,
+    last_hash: Option<u64>,
+    record: Record<R::Meta>,
+    done: bool,
+}
+
+impl<R: LiveRead> Subscriber<R> {
+    async fn next(&mut self) -> Option<LiveItem> {
+        if self.done {
+            return None;
+        }
+        loop {
+            let own;
+            let published;
+            let result = if std::mem::take(&mut self.own_first) {
+                own = self.execute_own().await;
+                &own
+            } else {
+                // The producer is gone with nothing new: the stream ends.
+                self.frames.changed().await.ok()?;
+                let Some(latest) = self.frames.borrow_and_update().clone() else {
+                    continue;
+                };
+                if latest.version <= self.seen {
+                    continue;
+                }
+                self.seen = latest.version;
+                published = latest;
+                if published.result.is_ok() && published.resumed != self.resume {
+                    // Joined between frames or skipped one: catch up exactly.
+                    own = self.execute_own().await;
+                    &own
+                } else {
+                    &published.result
+                }
+            };
+            let frame = match result {
+                Ok(frame) => frame,
+                Err(error) => {
+                    self.done = true;
+                    return Some(Err(error.clone()));
+                }
+            };
+            // Advance the replay cursor even when the frame is hash-gated.
+            self.resume = frame.next.clone();
+            if self.last_hash == Some(frame.hash) {
+                continue;
+            }
+            if let Err(error) = (self.record)(&frame.meta) {
+                self.done = true;
+                return Some(Err(error));
+            }
+            self.last_hash = Some(frame.hash);
+            return Some(Ok(frame.value.clone()));
+        }
+    }
+
+    /// Execute from this subscriber's own cursors, ordered against the
+    /// producer: every frame it publishes afterwards is newer.
+    async fn execute_own(&mut self) -> LiveResult<R::Meta> {
+        let shared = Arc::clone(&self.shared);
+        let _order = shared.order.read().await;
+        let _permit = shared.permits.acquire().await;
+        self.seen = self
+            .frames
+            .borrow()
+            .as_ref()
+            .map_or(0, |frame| frame.version);
+        shared.read.execute(self.resume.clone()).await
+    }
+}
+
+/// What makes two catalog live subscriptions one read.
+///
+/// The plan's SQL and binds carry every row policy and claim value; the
+/// role selects the surface its evidence is read under; protocol tokens are
+/// MACs over the cache scope (privilege, asserted roles, principal partition
+/// and every claim a policy reads) and schema hash. Live subscriptions never
+/// carry a gateway capture (`enable_delivery_capture` admits queries only).
+#[derive(Clone, PartialEq, Eq, Hash)]
+pub(crate) struct PlanKey {
+    role: String,
+    sql: Arc<str>,
+    binds: Vec<BindValue>,
+    tables: Vec<String>,
+    bytes_hex_paths: Vec<String>,
+    protocol: Option<(String, String)>,
+}
+
+/// A compiled catalog plan, re-executed live.
+pub(crate) struct PlanRead {
+    inner: Arc<EngineInner>,
+    plan: Arc<SqlPlan>,
+    footprint: BTreeSet<String>,
+    /// The role surface and a token issuer, under the causal protocol.
+    protocol: Option<(Arc<Surface>, ProtocolResponseAccumulator)>,
+}
+
+impl LiveRead for PlanRead {
+    type Meta = Option<ProtocolEvidence>;
+
+    async fn execute(&self, resume: RequestedLiveResume) -> LiveResult<Self::Meta> {
+        let read = self
+            .protocol
+            .as_ref()
+            .map(|(role_surface, issuer)| ProtocolRead {
+                role_surface: Arc::clone(role_surface),
+                accumulator: issuer.clone(),
+                live_resume: Some(resume),
+            });
+        let executed = execute_plan(&self.inner, &self.inner.pool, true, &self.plan, read)
+            .await
+            .map_err(|error| error.client_error())?;
+        let Some(evidence) = executed.protocol else {
+            return Ok(LiveFrame {
+                hash: response_hash(&executed.value),
+                value: executed.value,
+                next: RequestedLiveResume::Absent,
+                meta: None,
+            });
+        };
+        let hash = hash_json(&(&executed.value, &evidence.snapshot, &evidence.live));
+        let next = evidence
+            .live
+            .as_ref()
+            .filter(|live| live.mode == super::protocol::DistributedLiveMode::Resumable)
+            .map(|live| RequestedLiveResume::Cursors(live.cursors.clone()))
+            .unwrap_or(RequestedLiveResume::Absent);
+        Ok(LiveFrame {
+            value: executed.value,
+            hash,
+            next,
+            meta: Some(evidence),
+        })
+    }
+
+    fn touched_by(&self, _last: &LiveFrame<Self::Meta>, change: &ReadModelChange) -> bool {
+        footprint_hits(&self.footprint, change)
     }
 }
 
 /// Build a live-query stream for a subscription root field's compiled plan.
-pub(crate) async fn live_query_stream(
-    inner: Arc<EngineInner>,
+pub(crate) fn live_query_stream(
+    inner: &Arc<EngineInner>,
     role: String,
     plan: QueryPlan,
     protocol: Option<ProtocolResponseAccumulator>,
@@ -117,184 +574,59 @@ pub(crate) async fn live_query_stream(
             return Err(client_error("BAD_REQUEST", "unsupported on cell store"));
         }
     };
-    let footprint = footprint_from_tables(&plan.tables_touched);
-    let mut change_rx = inner.change_hub.subscribe();
-    let (tx, rx) = mpsc::channel::<LiveItem>(8);
-    let debounce = Duration::from_millis(100);
-    let requested_live_resume = protocol
+    let resume = protocol
         .as_ref()
         .map(ProtocolResponseAccumulator::requested_live_resume)
         .transpose()
         .map_err(|_| client_error("BAD_REQUEST", "invalid live resume"))?
         .unwrap_or(RequestedLiveResume::Absent);
-
-    tokio::spawn(async move {
-        // 1) Initial execution + yield
-        let initial_result = tokio::select! {
-            _ = tx.closed() => return,
-            result = execute_list(&inner, &role, &plan, protocol.as_ref(), requested_live_resume) => result,
+    let shared_protocol = match &protocol {
+        None => None,
+        Some(accumulator) => {
+            // Matching compiler plans share one comparable snapshot scope, so
+            // a lagging refresh is never authoritative over a newer frame.
+            accumulator
+                .bind_query_snapshot_scope(&plan.snapshot_scope())
+                .map_err(|_| evidence_failed())?;
+            let role_surface = inner.role_surfaces.get(&role).cloned().ok_or_else(|| {
+                client_error("INTERNAL", "authorized GraphQL role surface is unavailable")
+            })?;
+            let scope = accumulator.token_scope().map_err(|_| evidence_failed())?;
+            let issuer = accumulator.issuer().map_err(|_| evidence_failed())?;
+            Some((scope, role_surface, issuer))
+        }
+    };
+    let key = PlanKey {
+        role,
+        sql: Arc::clone(&plan.sql),
+        binds: plan.binds.clone(),
+        tables: plan.tables_touched.clone(),
+        bytes_hex_paths: plan.bytes_hex_paths.clone(),
+        protocol: shared_protocol.as_ref().map(|(scope, ..)| scope.clone()),
+    };
+    let record: Record<Option<ProtocolEvidence>> = Box::new(move |meta| {
+        let Some(protocol) = &protocol else {
+            return Ok(());
         };
-        let mut initial = match initial_result {
-            Ok(executed) => executed,
-            Err(error) => {
-                let _ = tx.send(Err(error)).await;
-                return;
-            }
-        };
-        if initial.record_protocol_metadata(protocol.as_ref()).is_err() {
-            let _ = tx.send(Err(evidence_failed())).await;
-            return;
-        }
-        let mut last_hash = Some(initial.hash);
-        let mut next_live_resume = initial.next_live_resume;
-        if tx.send(Ok(initial.value)).await.is_err() {
-            return;
-        }
-
-        // 2) Change loop: dirty → debounce → re-exec → hash-gate → yield
-        loop {
-            let change = match tokio::select! {
-                _ = tx.closed() => break,
-                change = change_rx.recv() => change,
-            } {
-                Ok(c) => c,
-                Err(broadcast::error::RecvError::Lagged(_)) => ReadModelChange {
-                    tables: BTreeSet::new(),
-                },
-                Err(broadcast::error::RecvError::Closed) => break,
-            };
-
-            if !footprint_hits(&footprint, &change) {
-                continue;
-            }
-
-            // Debounce / coalesce
-            tokio::select! {
-                _ = tx.closed() => break,
-                _ = tokio::time::sleep(debounce) => {},
-            }
-            loop {
-                match change_rx.try_recv() {
-                    Ok(more) => {
-                        // Keep waiting only if still relevant; either way we re-exec once.
-                        let _ = more;
-                    }
-                    Err(broadcast::error::TryRecvError::Empty) => break,
-                    Err(broadcast::error::TryRecvError::Lagged(_)) => break,
-                    Err(broadcast::error::TryRecvError::Closed) => return,
-                }
-            }
-
-            let refreshed = tokio::select! {
-                _ = tx.closed() => break,
-                result = execute_list(&inner, &role, &plan, protocol.as_ref(), next_live_resume.clone()) => result,
-            };
-            match refreshed {
-                Ok(mut executed) => {
-                    // Advance the private replay cursor even when a redundant
-                    // execution is hash-gated. Protocol frame metadata is
-                    // enqueued only when the matching GraphQL value is emitted,
-                    // preserving exact data/envelope FIFO ordering.
-                    next_live_resume = executed.next_live_resume.clone();
-                    if last_hash == Some(executed.hash) {
-                        continue; // hash gate: no push on no-change
-                    }
-                    if executed
-                        .record_protocol_metadata(protocol.as_ref())
-                        .is_err()
-                    {
-                        let _ = tx.send(Err(evidence_failed())).await;
-                        return;
-                    }
-                    last_hash = Some(executed.hash);
-                    if tx.send(Ok(executed.value)).await.is_err() {
-                        return;
-                    }
-                }
-                Err(error) => {
-                    let _ = tx.send(Err(error)).await;
-                    return;
-                }
-            }
-        }
+        let evidence = meta.as_ref().ok_or_else(evidence_failed)?;
+        protocol
+            .record_query_metadata(evidence.snapshot.clone(), evidence.live.clone())
+            .map_err(|_| evidence_failed())
     });
-
-    Ok(LiveQueryStream { rx })
+    let read = || PlanRead {
+        inner: Arc::clone(inner),
+        footprint: footprint_from_tables(&plan.tables_touched),
+        plan: Arc::clone(&plan),
+        protocol: shared_protocol.map(|(_, role_surface, issuer)| (role_surface, issuer)),
+    };
+    Ok(inner
+        .live
+        .plans
+        .subscribe(&inner.change_hub, key, resume, read, record))
 }
 
 fn evidence_failed() -> async_graphql::Error {
     client_error("INTERNAL", "query evidence encoding failed")
-}
-
-struct ExecutedLiveQuery {
-    value: Value,
-    hash: u64,
-    snapshot: Option<super::protocol::DistributedQuerySnapshot>,
-    live: Option<super::protocol::DistributedLiveMetadata>,
-    next_live_resume: RequestedLiveResume,
-}
-
-impl ExecutedLiveQuery {
-    fn record_protocol_metadata(
-        &mut self,
-        protocol: Option<&ProtocolResponseAccumulator>,
-    ) -> Result<(), String> {
-        let Some(protocol) = protocol else {
-            return Ok(());
-        };
-        let snapshot = self
-            .snapshot
-            .take()
-            .ok_or_else(|| "causal live query omitted its snapshot metadata".to_string())?;
-        protocol
-            .record_query_metadata(snapshot, self.live.take())
-            .map_err(|error| error.to_string())
-    }
-}
-
-async fn execute_list(
-    inner: &EngineInner,
-    role: &str,
-    plan: &SqlPlan,
-    protocol: Option<&ProtocolResponseAccumulator>,
-    requested_live_resume: RequestedLiveResume,
-) -> Result<ExecutedLiveQuery, async_graphql::Error> {
-    let read = match protocol {
-        None => None,
-        Some(accumulator) => Some(ProtocolRead {
-            role_surface: inner.role_surfaces.get(role).cloned().ok_or_else(|| {
-                client_error("INTERNAL", "authorized GraphQL role surface is unavailable")
-            })?,
-            accumulator: accumulator.clone(),
-            live_resume: Some(requested_live_resume),
-        }),
-    };
-    let executed = execute_plan(inner, &inner.pool, true, plan, read)
-        .await
-        .map_err(|error| error.client_error())?;
-    let Some(evidence) = executed.protocol else {
-        return Ok(ExecutedLiveQuery {
-            hash: response_hash(&executed.value),
-            value: executed.value,
-            snapshot: None,
-            live: None,
-            next_live_resume: RequestedLiveResume::Absent,
-        });
-    };
-    let hash = hash_json(&(&executed.value, &evidence.snapshot, &evidence.live));
-    let next_live_resume = evidence
-        .live
-        .as_ref()
-        .filter(|live| live.mode == super::protocol::DistributedLiveMode::Resumable)
-        .map(|live| RequestedLiveResume::Cursors(live.cursors.clone()))
-        .unwrap_or(RequestedLiveResume::Absent);
-    Ok(ExecutedLiveQuery {
-        value: executed.value,
-        hash,
-        snapshot: Some(evidence.snapshot),
-        live: evidence.live,
-        next_live_resume,
-    })
 }
 
 fn footprint_hits(footprint: &BTreeSet<String>, change: &ReadModelChange) -> bool {
@@ -342,3 +674,6 @@ fn hash_json(value: &impl serde::Serialize) -> u64 {
 pub fn spawn_change_forwarder(hub: ChangeHub, rx: broadcast::Receiver<ReadModelChange>) {
     hub.spawn_forward_from(rx);
 }
+
+#[cfg(test)]
+mod tests;

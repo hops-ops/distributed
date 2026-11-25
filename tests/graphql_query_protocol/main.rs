@@ -2227,6 +2227,73 @@ pub async fn hundred_reads_one_execution_with_cache_disabled(db: Db) {
     assert_eq!(delivery.flight_counts(), (0, 0));
 }
 
+/// A hundred origin subscribers to one query, with no gateway sharing in
+/// front: each opens with its own read, then every change costs the origin
+/// one execution, fanned out to all of them.
+#[cfg(feature = "gateway")]
+pub async fn hundred_origin_subscribers_share_one_execution_per_change(db: Db) {
+    use distributed::graphql::delivery::GatewayVersionStore;
+    let fixture = protocol_fixture_with_retention(db, 10).await;
+    // The store counts result executions; it changes nothing about them.
+    let versions = GatewayVersionStore::install(
+        &fixture.repository.graphql_pool(),
+        "live-sharing",
+        ["causal_query_views".into()],
+    )
+    .await
+    .unwrap();
+    let engine = GraphqlEngine::builder(fixture.repository.pool())
+        .identity(IdentityConfig::dev_headers())
+        .service_id(SERVICE_ID)
+        .protocol_token_key(TEST_PROTOCOL_TOKEN_KEY)
+        .roles(&["user"])
+        .model::<CausalQueryView>(ModelPermissions::new().grant("user", read().all_columns()))
+        .client_projectors([projector()])
+        .change_stream(fixture.repository.read_model_changes())
+        .gateway_versions(versions.clone())
+        .build()
+        .unwrap();
+    let mut streams = (0..100)
+        .map(|_| engine.execute_stream(&user_session(), Request::new(LIVE_SUBSCRIPTION)))
+        .collect::<Vec<_>>();
+    for stream in &mut streams {
+        let frame = next_wire_frame(stream).await;
+        assert_live_frame(&frame, "causal_query_views", "causal row", "1", false);
+    }
+    let opened = versions.metrics().result_executions;
+    let producers = engine.live_subscriber_count();
+
+    project_item(&fixture.repository, &fixture.bus, 2, "causal row 2").await;
+    let mut first = None;
+    for stream in &mut streams {
+        let frame = next_wire_frame(stream).await;
+        assert_live_frame(&frame, "causal_query_views", "causal row 2", "2", false);
+        match &first {
+            None => first = Some(frame),
+            Some(first) => assert_eq!(&frame, first, "one result, fanned out"),
+        }
+    }
+    let refreshed = versions.metrics().result_executions - opened;
+    eprintln!(
+        "100 origin subscribers: {producers} producers, {opened} executions to open, {refreshed} per change"
+    );
+    assert_eq!(producers, 1, "one shared producer");
+    assert_eq!(opened, 100, "each subscriber opens with its own read");
+    assert_eq!(
+        refreshed, 1,
+        "one execution per change, not one per subscriber"
+    );
+
+    drop(streams);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while engine.live_subscriber_count() != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the last subscriber tears the shared producer down");
+}
+
 #[cfg(feature = "gateway-graphql-native")]
 pub async fn hundred_subscribers_one_upstream_over_embedded_websockets(db: Db) {
     hundred_subscribers_one_upstream(db, false).await;
@@ -2744,6 +2811,8 @@ on_each_dialect! { ;
     native_snapshot_cache_revalidates_each_consumer_without_result_sql,
     #[cfg(feature = "gateway-graphql-native")]
     hundred_reads_one_execution_with_cache_disabled,
+    #[cfg(feature = "gateway")]
+    hundred_origin_subscribers_share_one_execution_per_change,
     #[cfg(feature = "gateway-graphql-native")]
     hundred_subscribers_one_upstream_over_embedded_websockets,
     #[cfg(feature = "gateway-graphql-native")]

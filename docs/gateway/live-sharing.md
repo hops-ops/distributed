@@ -56,8 +56,8 @@ channels, tasks, timers and locks; both speak GraphQL-WS through one codec,
 `NativeDelivery::live_counts()` reports active groups, consumers, cumulative source
 attempts, resets, upstream frames, exact duplicate frames and safe handoffs. Source
 attempts include credential reconnects; they are not a count of active producers.
-`GraphqlEngine::live_subscriber_count()` separately reports actual origin producer
-subscriptions. No credentials or subject identifiers appear in these counters.
+`GraphqlEngine::live_subscriber_count()` separately reports actual origin producers
+(one per distinct origin live read; see `docs/live-query-delivery.md`). No credentials or subject identifiers appear in these counters.
 
 Disable `live_sharing` and remove the live delivery resource to restore independent
 subscriptions. Existing client resume/reset and response-sealing behavior remains

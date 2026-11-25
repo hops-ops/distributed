@@ -31,11 +31,6 @@ fn ineligible() -> Response {
     )
 }
 impl GraphqlEngine {
-    /// Active origin live-query producers for delivery diagnostics.
-    pub fn live_subscriber_count(&self) -> usize {
-        self.inner.change_hub.subscriber_count()
-    }
-
     pub(super) fn enable_delivery_capture(
         &self,
         session: &Session,
