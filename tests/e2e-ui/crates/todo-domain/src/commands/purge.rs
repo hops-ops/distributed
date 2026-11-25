@@ -31,16 +31,3 @@ command! {
         purged: true,
     },
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn shard_is_todo_id() {
-        let input = TodoPurgeInput {
-            todo_id: "todo-1".into(),
-        };
-        assert_eq!(Purge::shard(&input), "todo-1");
-    }
-}

@@ -228,6 +228,19 @@ mod client_contract {
         };
     }
 
+    #[test]
+    fn mutation_file_and_inline_mutation_compile_to_the_same_program() {
+        let inline: Mutation<()> = distributed::mutation! {
+            mutation SaveFlatReview {
+                upsert_flat_reviews(object: $input.review)
+            }
+        };
+        assert_eq!(
+            SaveFlatReview().program().unwrap(),
+            inline.program().unwrap()
+        );
+    }
+
     #[allow(non_snake_case)]
     fn DeleteFlatMember() -> Mutation<()> {
         distributed::mutation_file!("tests/fixtures/flat_member_delete.graphql")
@@ -414,11 +427,13 @@ mod client_contract {
             .manifest()
             .unwrap();
         let projection = manifest.commands[0].extensions.projection.as_ref().unwrap();
-        assert!(projection.preview_occurrences.iter().any(|occurrence| occurrence
-            .values
+        assert!(projection
+            .preview_occurrences
             .iter()
-            .any(|field| matches!(&field.source, ClientProjectionPreviewSource::Constant {
-                value: ClientProjectionValue::String(status) } if status == "archived"))));
+            .any(|occurrence| occurrence.values.iter().any(
+                |field| matches!(&field.source, ClientProjectionPreviewSource::Constant {
+                value: ClientProjectionValue::String(status) } if status == "archived")
+            )));
     }
 
     #[test]

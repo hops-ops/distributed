@@ -527,7 +527,7 @@ async fn complete_many_rejects_stale_and_missing_claims() {
 }
 
 #[tokio::test]
-async fn already_published_message_is_not_completed_again() {
+async fn completing_an_already_completed_claim_reports_not_found() {
     let repo = InMemoryRepository::new();
     let message = OutboxMessage::create("msg-1", "Event", b"{}".to_vec()).unwrap();
     let _id = store_message(&repo, message).await;

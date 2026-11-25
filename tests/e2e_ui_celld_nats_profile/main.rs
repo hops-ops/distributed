@@ -1,77 +1,17 @@
-//! Optional celld+NATS e2e-ui profile.
-//!
-//! Fixture checks always run (default host stays one-process). Live smoke
-//! runs only when `CELLD_URL` and `NATS_URL` are set.
+//! Optional celld+NATS e2e-ui profile: a live smoke that runs only when
+//! `CELLD_URL` and `NATS_URL` are set.
 
-use std::path::Path;
-use std::sync::Arc;
-use std::time::Duration;
-
+#[cfg(all(feature = "graphql", feature = "http", feature = "sqlite"))]
 #[path = "../support/env.rs"]
 mod env_support;
 
-fn repo_root() -> &'static Path {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-}
-
-#[test]
-fn default_e2e_ui_host_stays_one_process() {
-    let host = std::fs::read_to_string(repo_root().join("tests/e2e-ui/crates/service/src/host.rs"))
-        .expect("host.rs");
-    assert!(
-        host.contains("single backend process"),
-        "default host.rs must remain the one-process playground"
-    );
-    assert!(
-        host.contains("celld-nats-profile"),
-        "host.rs should point at the optional profile, not implement it"
-    );
-    assert!(
-        !host.contains("NatsBus"),
-        "optional NATS profile must not replace SqliteBus/PostgresBus in host.rs"
-    );
-}
-
-#[test]
-fn optional_profile_is_named_and_not_the_playground() {
-    let readme =
-        std::fs::read_to_string(repo_root().join("tests/e2e-ui/celld-nats-profile/README.md"))
-            .expect("profile README");
-    assert!(readme.contains("optional"), "{readme}");
-    assert!(readme.contains("make run"), "{readme}");
-    assert!(readme.contains("make up-celld-nats"), "{readme}");
-    assert!(readme.contains("make test-celld-nats"), "{readme}");
-    assert!(readme.contains("CELLD_URL"), "{readme}");
-    assert!(readme.contains("NATS_URL"), "{readme}");
-    assert!(
-        readme.contains("not") && readme.contains("cell class"),
-        "projectors must stay off cells"
-    );
-
-    let compose = std::fs::read_to_string(
-        repo_root().join("tests/e2e-ui/celld-nats-profile/docker-compose.yml"),
-    )
-    .expect("profile compose");
-    assert!(compose.contains("e2e-ui-celld-nats-optional"), "{compose}");
-    assert!(compose.contains("nats:2-alpine"), "{compose}");
-    assert!(
-        !compose
-            .lines()
-            .any(|line| line.trim_start().starts_with("image:") && line.contains("minio")),
-        "do not run MinIO"
-    );
-
-    let worker = std::fs::read_to_string(repo_root().join("tests/celld/worker/src/lib.rs"))
-        .expect("todo cell worker");
-    assert!(
-        worker.contains("projectors are not methods on this class"),
-        "cells stay command-only"
-    );
-}
-
 #[cfg(all(feature = "graphql", feature = "http", feature = "sqlite"))]
 mod live {
-    use super::*;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use super::env_support;
+
     use async_graphql::Request;
     use distributed::cell_host::{
         CelldCommandHost, CelldRoute, InternalHttpSecret, CELL_INTERNAL_SECRET_ENV,

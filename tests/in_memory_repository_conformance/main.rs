@@ -3,8 +3,8 @@ mod conformance;
 
 use distributed::InMemoryRepository;
 
-async fn repository() -> Option<InMemoryRepository> {
-    Some(InMemoryRepository::new())
+async fn repository() -> Option<((), InMemoryRepository)> {
+    Some(((), InMemoryRepository::new()))
 }
 
 conformance::repository_conformance_tests!();

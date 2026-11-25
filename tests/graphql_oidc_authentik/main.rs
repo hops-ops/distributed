@@ -14,14 +14,6 @@ fn e2e_enabled() -> bool {
 }
 
 #[tokio::test]
-async fn e0_skips_when_not_gated() {
-    if e2e_enabled() {
-        return;
-    }
-    eprintln!("AUTHENTIK_E2E not set — skip live E1–E8");
-}
-
-#[tokio::test]
 async fn e1_through_e8_live() {
     if !e2e_enabled() {
         eprintln!("AUTHENTIK_E2E not set — skip");

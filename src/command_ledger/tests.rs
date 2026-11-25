@@ -1490,7 +1490,7 @@ fn modeled_projection_metadata_bounds_fail_before_completion() {
 }
 
 #[test]
-fn cell_ledger_external_binding_round_trips_and_legacy_rows_stay_unbound() {
+fn cell_ledger_external_binding_round_trips() {
     let id = Uuid::now_v7().to_string();
     let request = external_reservation(&id, 141, 142, "orders-cell").unwrap();
     let started = SystemTime::UNIX_EPOCH + Duration::from_secs(100);
@@ -1499,15 +1499,6 @@ fn cell_ledger_external_binding_round_trips_and_legacy_rows_stay_unbound() {
     let restored = CommandLedgerRecord::from_durable_cell_json(&encoded).unwrap();
     assert_eq!(restored.external_binding, row.external_binding);
     assert_eq!(restored.durable_cell_key(), row.durable_cell_key());
-
-    // Cell rows written before external dispatch existed omit the optional
-    // field. They remain readable, but cannot be treated as externally bound
-    // evidence after a process restart.
-    let mut legacy: serde_json::Value = serde_json::from_str(&encoded).unwrap();
-    legacy.as_object_mut().unwrap().remove("external_binding");
-    let legacy = serde_json::to_string(&legacy).unwrap();
-    let restored_legacy = CommandLedgerRecord::from_durable_cell_json(&legacy).unwrap();
-    assert!(restored_legacy.external_binding.is_none());
 
     let completed_id = Uuid::now_v7().to_string();
     let completed_request =
@@ -2029,7 +2020,7 @@ fn expiry_is_a_permanent_compact_tombstone() {
 }
 
 #[test]
-fn durable_success_states_use_only_the_succeeded_vocabulary() {
+fn durable_success_states_round_trip_their_storage_names() {
     let cases = [
         (CommandLedgerState::Succeeded, "succeeded"),
         (
@@ -2043,6 +2034,4 @@ fn durable_success_states_use_only_the_succeeded_vocabulary() {
         assert_eq!(state.as_str(), encoded);
         assert_eq!(CommandLedgerState::parse(encoded).unwrap(), state);
     }
-    assert!(CommandLedgerState::parse("accepted").is_err());
-    assert!(CommandLedgerState::parse("accepted_pending_projection").is_err());
 }

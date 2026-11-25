@@ -7,30 +7,6 @@ use distributed::{
 };
 
 #[test]
-fn v1_has_no_upcasters() {
-    assert!(TodoV1::upcasters().is_empty());
-}
-
-#[test]
-fn v2_has_one_upcaster() {
-    let upcasters = TodoV2::upcasters();
-    assert_eq!(upcasters.len(), 1);
-    assert_eq!(upcasters[0].event_type, "initialized");
-    assert_eq!(upcasters[0].from_version, 1);
-    assert_eq!(upcasters[0].to_version, 2);
-}
-
-#[test]
-fn v3_has_two_upcasters() {
-    let upcasters = TodoV3::upcasters();
-    assert_eq!(upcasters.len(), 2);
-    assert_eq!(upcasters[0].from_version, 1);
-    assert_eq!(upcasters[0].to_version, 2);
-    assert_eq!(upcasters[1].from_version, 2);
-    assert_eq!(upcasters[1].to_version, 3);
-}
-
-#[test]
 fn hydrate_v2_from_v1_events() {
     let mut v1 = TodoV1::default();
     v1.initialize("t1".into(), "alice".into(), "Buy milk".into())

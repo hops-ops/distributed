@@ -50,7 +50,10 @@ async fn seed(repo: &QueuedCounterRepo, id: &str) {
     repo.commit(&mut counter).await.unwrap();
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+// Paused time: the runtime advances the clock only once every task is idle,
+// so after the sleep task 2 has provably run as far as it can — it is parked
+// on the lock, not merely not yet scheduled.
+#[tokio::test(start_paused = true)]
 async fn second_load_waits_until_first_commits() {
     let repo = queued_repo();
     seed(&repo, "c1").await;
@@ -71,7 +74,7 @@ async fn second_load_waits_until_first_commits() {
 
     tokio::time::sleep(Duration::from_millis(50)).await;
     assert!(
-        !acquired.load(Ordering::SeqCst),
+        !acquired.load(Ordering::SeqCst) && !task2.is_finished(),
         "the second load must block while the first holds the lock"
     );
 

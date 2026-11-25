@@ -119,11 +119,11 @@ impl Counter {
 }
 
 // ============================================================================
-// Custom entity field name
+// Custom entity field name and snapshot version
 // ============================================================================
 
 #[derive(Default, Snapshot)]
-#[snapshot(entity = "my_entity")]
+#[snapshot(entity = "my_entity", version = 3)]
 pub struct Widget {
     pub my_entity: Entity,
     pub name: String,

@@ -661,17 +661,6 @@ mod tests {
     }
 
     #[test]
-    fn new() {
-        let entity = Entity::new();
-        assert_eq!(entity.id(), "");
-        assert_eq!(entity.version(), 0);
-        assert!(entity.events().is_empty());
-        assert!(!entity.is_replaying());
-        assert_eq!(entity.snapshot_version(), 0);
-        assert_eq!(entity.committed_version(), 0);
-    }
-
-    #[test]
     fn digest() {
         let mut entity = Entity::new();
         entity.digest("test_event", &("arg1", "arg2")).unwrap();
@@ -723,31 +712,6 @@ mod tests {
         assert!(result.is_ok());
         assert_eq!(replayed, vec!["test_event1", "test_event2"]);
         assert!(!entity.is_replaying());
-    }
-
-    #[test]
-    fn clone() {
-        let entity = Entity::new();
-        let cloned_entity = entity.clone();
-
-        assert_eq!(entity.id(), cloned_entity.id());
-        assert_eq!(entity.version(), cloned_entity.version());
-        assert_eq!(entity.events(), cloned_entity.events());
-        assert_eq!(entity.snapshot_version(), cloned_entity.snapshot_version());
-        assert_eq!(
-            entity.committed_version(),
-            cloned_entity.committed_version()
-        );
-    }
-
-    #[test]
-    fn debug() {
-        let entity = Entity::new();
-        let debug_str = format!("{:?}", entity);
-
-        assert!(debug_str.contains("Entity"));
-        assert!(debug_str.contains("id: \"\""));
-        assert!(debug_str.contains("version: 0"));
     }
 
     #[test]

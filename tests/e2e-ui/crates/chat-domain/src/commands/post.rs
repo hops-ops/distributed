@@ -1,6 +1,6 @@
+use distributed::command;
 use distributed::command::{Eventual, PreparedCommand};
 use distributed::microsvc::{CausalCommandContext, HandlerError};
-use distributed::command;
 use serde::{Deserialize, Serialize};
 
 use crate::{domain_commands, ChatMessage, ChatMessagePostedDomainEvent, ChatMessageState};
@@ -128,24 +128,6 @@ mod tests {
     use super::*;
     use distributed::microsvc::Routes;
     use distributed::{AggregateBuilder, InMemoryRepository};
-
-    #[test]
-    fn shard_is_message_id() {
-        let input = ChatPostInput {
-            message_id: "m1".into(),
-            body: "hi".into(),
-            room_id: "lobby".into(),
-            created_at: "1".into(),
-        };
-        assert_eq!(Post::shard(&input), "m1");
-    }
-
-    #[test]
-    fn post_uses_handle_escape_hatch() {
-        assert_eq!(Post::COMMAND, "chat.post");
-        let _ = handle_post;
-        let _ = canonical_near_unix_millis;
-    }
 
     #[test]
     fn created_at_rejects_non_canonical() {

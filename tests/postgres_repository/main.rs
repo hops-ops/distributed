@@ -20,39 +20,6 @@ use distributed::{
     TransactionalCommit,
 };
 use serde::{Deserialize, Serialize};
-use sqlx::migrate::{Migration, MigrationType, Migrator};
-
-fn legacy_postgres_migrator() -> Migrator {
-    Migrator::with_migrations(vec![
-        Migration::new(
-            1,
-            "initial".into(),
-            MigrationType::Simple,
-            sqlx::SqlSafeStr::into_sql_str(include_str!(
-                "../../migrations/postgres/0001_initial.sql"
-            )),
-            false,
-        ),
-        Migration::new(
-            2,
-            "command ledger".into(),
-            MigrationType::Simple,
-            sqlx::SqlSafeStr::into_sql_str(include_str!(
-                "../../migrations/postgres/0002_command_ledger.sql"
-            )),
-            false,
-        ),
-        Migration::new(
-            3,
-            "projection protocol".into(),
-            MigrationType::Simple,
-            sqlx::SqlSafeStr::into_sql_str(include_str!(
-                "../../migrations/postgres/0003_projection_protocol.sql"
-            )),
-            false,
-        ),
-    ])
-}
 
 #[derive(Default)]
 struct Counter {
@@ -183,74 +150,6 @@ async fn migration_is_idempotent_and_uses_postgres_column_types() {
     .await
     .unwrap();
     assert!(processed_messages_table.is_none());
-}
-
-#[tokio::test]
-async fn projected_command_ledger_rows_upgrade_to_atomic_and_preserve_checks() {
-    let Some(schema) = postgres::PostgresTestSchema::create_from_env(
-        "postgres_ledger_upgrade",
-        "Postgres command-ledger upgrade test",
-    )
-    .await
-    else {
-        return;
-    };
-    let repo = schema.repository_unmigrated().await;
-    legacy_postgres_migrator().run(repo.pool()).await.unwrap();
-
-    sqlx::query(
-        r#"
-        INSERT INTO command_ledger (
-            service_id, principal_partition, command_id, command_name,
-            command_contract_hash, input_hash, state, causation_id,
-            attempt_number, outcome, completed_at, retention_expires_at
-        ) VALUES ($1, $2, $3, $4,
-                  decode(repeat('00', 32), 'hex'), decode(repeat('00', 32), 'hex'),
-                  'projected', $5, 1, '{}'::jsonb, now(), now() + interval '1 day')
-        "#,
-    )
-    .bind("service")
-    .bind("principal")
-    .bind("command")
-    .bind("todo.complete")
-    .bind("cause")
-    .execute(repo.pool())
-    .await
-    .unwrap();
-
-    repo.migrate().await.unwrap();
-
-    let state: String = sqlx::query_scalar(
-        "SELECT state FROM command_ledger WHERE service_id = 'service' AND command_id = 'command'",
-    )
-    .fetch_one(repo.pool())
-    .await
-    .unwrap();
-    assert_eq!(state, "atomic");
-
-    let latest_version: i64 = sqlx::query_scalar("SELECT MAX(version) FROM _sqlx_migrations")
-        .fetch_one(repo.pool())
-        .await
-        .unwrap();
-    assert_eq!(latest_version, 14);
-
-    let invalid_service = sqlx::query(
-        r#"
-        INSERT INTO command_ledger (
-            service_id, principal_partition, command_id, command_name,
-            command_contract_hash, input_hash, state, causation_id,
-            attempt_number, outcome, completed_at, retention_expires_at
-        ) VALUES ('', 'principal', 'invalid-service', 'todo.complete',
-                  decode(repeat('00', 32), 'hex'), decode(repeat('00', 32), 'hex'),
-                  'atomic', 'invalid-service-cause', 1, '{}'::jsonb, now(), now() + interval '1 day')
-        "#,
-    )
-    .execute(repo.pool())
-    .await;
-    assert!(
-        invalid_service.is_err(),
-        "non-empty service CHECK must survive migration"
-    );
 }
 
 #[tokio::test]

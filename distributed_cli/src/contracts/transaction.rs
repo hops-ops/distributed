@@ -300,15 +300,4 @@ mod tests {
         assert!(contracts_accept(&root, ContractAcceptScope::Catalog, &bad).is_err());
         let _ = fs::remove_dir_all(root);
     }
-
-    #[test]
-    fn check_report_is_no_write() {
-        // Empty catalog check shape only — catalog construction is covered elsewhere.
-        let report = ContractsCheckReport {
-            ok: true,
-            result: ContractCheckResult::default(),
-            human: String::new(),
-        };
-        assert!(report.ok);
-    }
 }

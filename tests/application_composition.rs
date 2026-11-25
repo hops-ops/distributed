@@ -793,12 +793,6 @@ fn explicit_definition_mount_identity_and_missing_pairing_fail_closed() {
 }
 
 #[test]
-fn no_linker_inventory_is_needed_for_explicit_application_selection() {
-    let application = application_with_commands(&["todo.create"]);
-    assert_eq!(application.manifest().module_ids(), ["todo"]);
-}
-
-#[test]
 fn nested_fingerprints_and_projection_references_are_fail_closed() {
     let application = application_with_commands(&["todo.create"]);
     let bytes = application.manifest().canonical_bytes().unwrap();

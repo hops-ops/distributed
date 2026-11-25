@@ -39,16 +39,3 @@ command! {
     invoke: |todo, _input, principal| todo.complete(principal),
     payload: |todo, _principal| TodoStatusPayload::from_todo(&**todo),
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn shard_is_todo_id() {
-        let input = TodoCompleteInput {
-            todo_id: "todo-1".into(),
-        };
-        assert_eq!(Complete::shard(&input), "todo-1");
-    }
-}

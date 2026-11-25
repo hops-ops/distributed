@@ -287,35 +287,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn expand_snapshot_accepts_named_struct() {
-        let input: DeriveInput = syn::parse_quote! {
-            struct Todo {
-                entity: distributed::Entity,
-                task: String,
-            }
-        };
-
-        let expanded = expand_snapshot(input).unwrap().to_string();
-
-        assert!(expanded.contains("pub struct TodoSnapshot"));
-        assert!(expanded.contains("impl :: distributed :: Snapshottable for Todo"));
-    }
-
-    #[test]
-    fn expand_snapshot_rejects_tuple_structs() {
-        let input: DeriveInput = syn::parse_quote! {
-            struct Todo(String);
-        };
-
-        let err = expand_snapshot(input).expect_err("tuple struct should return an error");
-
-        assert!(
-            err.to_string().contains("requires named fields"),
-            "unexpected error: {err}"
-        );
-    }
-
-    #[test]
     fn expand_snapshot_rejects_enums() {
         let input: DeriveInput = syn::parse_quote! {
             enum Todo {
@@ -429,42 +400,6 @@ mod tests {
         assert!(
             err.to_string().contains("quantity"),
             "unexpected error: {err}"
-        );
-    }
-
-    #[test]
-    fn expand_snapshot_without_version_attr_inherits_default() {
-        let input: DeriveInput = syn::parse_quote! {
-            struct Todo {
-                entity: distributed::Entity,
-                task: String,
-            }
-        };
-
-        let expanded = expand_snapshot(input).unwrap().to_string();
-
-        // No explicit const is emitted; the trait default (1) is inherited.
-        assert!(
-            !expanded.contains("const SNAPSHOT_VERSION"),
-            "default case must not emit a SNAPSHOT_VERSION const: {expanded}"
-        );
-    }
-
-    #[test]
-    fn expand_snapshot_emits_version_const() {
-        let input: DeriveInput = syn::parse_quote! {
-            #[snapshot(version = 3)]
-            struct Todo {
-                entity: distributed::Entity,
-                task: String,
-            }
-        };
-
-        let expanded = expand_snapshot(input).unwrap().to_string();
-
-        assert!(
-            expanded.contains("const SNAPSHOT_VERSION : u64 = 3"),
-            "expected emitted version const: {expanded}"
         );
     }
 

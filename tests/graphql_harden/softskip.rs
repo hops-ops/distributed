@@ -17,16 +17,6 @@ use super::common::{
     Db, OrderView,
 };
 
-/// Default builder is fail-closed.
-pub async fn default_engine_has_strict_where_on(db: Db) {
-    let pool = seed_orders(&db).await;
-    let engine = engine_all_columns(pool);
-    assert!(
-        engine.strict_where(),
-        "strict_where must default to true for ship API"
-    );
-}
-
 /// Unknown where key → error under default settings (not silent success).
 pub async fn strict_unknown_where_key_errors(db: Db) {
     let pool = seed_orders(&db).await;

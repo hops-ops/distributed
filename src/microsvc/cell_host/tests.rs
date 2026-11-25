@@ -739,34 +739,6 @@ async fn parent_cells_are_isolated_and_have_no_cross_cell_commit() {
     assert!(GetStream::get_stream(&game_2, &player_id).await.is_err());
 }
 
-#[test]
-fn cargo_features_keep_sqlite_and_do_not_add_celld() {
-    let manifest = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml"));
-    assert!(
-        manifest
-            .lines()
-            .any(|line| line.trim_start().starts_with("sqlite =")),
-        "sqlite feature must remain next to postgres"
-    );
-    assert!(
-        manifest
-            .lines()
-            .any(|line| line.trim_start().starts_with("postgres =")),
-        "postgres feature must remain next to sqlite"
-    );
-    let features = manifest
-        .split("[features]")
-        .nth(1)
-        .and_then(|rest| rest.split("\n[").next())
-        .expect("features table");
-    assert!(
-        !features
-            .lines()
-            .any(|line| line.trim_start().starts_with("celld")),
-        "PCH-DEC-005: do not add a celld Cargo feature beside sqlite/postgres"
-    );
-}
-
 #[tokio::test]
 async fn reference_host_applies_the_sealed_row_reducer_on_commit() {
     let store = CellStreamStore::new("CellItem", "item-s")

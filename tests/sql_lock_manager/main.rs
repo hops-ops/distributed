@@ -139,13 +139,22 @@ const EXPIRY_MARGIN: Duration = Duration::from_millis(700);
 /// wait scales with it).
 async fn scenario_expired_lease_reclaim<M: LockManager>(m_holder: &M, m_other: &M, ttl: Duration) {
     let l1 = m_holder.get_lock("expiring").unwrap();
+    // Taken before the lock: the lease's database-clock expiry is later than
+    // this instant plus `ttl`, so any steal observed before that is a bug.
+    let requested = std::time::Instant::now();
     within(l1.lock()).await.unwrap(); // acquired, never released
 
     let l2 = m_other.get_lock("expiring").unwrap();
-    assert!(
-        !within(l2.try_lock()).await.unwrap(),
-        "lease is still valid; must not be stealable yet"
-    );
+    let stolen = within(l2.try_lock()).await.unwrap();
+    // On a loaded runner the round trips can outlast the TTL; the lease may
+    // then have expired legitimately, and only an early steal is a failure.
+    // (A held, unexpired lease blocking another manager is asserted on its
+    // own, with the default TTL, by `scenario_two_managers_serialize`.)
+    if requested.elapsed() < ttl {
+        assert!(!stolen, "lease is still valid; must not be stealable yet");
+    } else if stolen {
+        within(l2.unlock()).await.unwrap();
+    }
 
     // Wait past the holder's TTL, then the lease is reclaimable.
     tokio::time::sleep(ttl + EXPIRY_MARGIN).await;

@@ -13,6 +13,8 @@ use distributed::{sourced, DomainState, Entity};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
+mod thin;
+
 #[derive(Clone, Default, Serialize, Deserialize)]
 pub struct Hero {
     entity: Entity,

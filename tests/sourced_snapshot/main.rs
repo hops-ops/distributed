@@ -213,8 +213,14 @@ async fn sourced_attr_snapshot_roundtrip_via_repo() {
 }
 
 // ============================================================================
-// Custom entity field name
+// Custom entity field name and snapshot version
 // ============================================================================
+
+#[test]
+fn snapshot_version_is_declared_or_the_trait_default() {
+    assert_eq!(Widget::SNAPSHOT_VERSION, 3);
+    assert_eq!(Todo::SNAPSHOT_VERSION, 1);
+}
 
 #[test]
 fn custom_entity_field_snapshot() {

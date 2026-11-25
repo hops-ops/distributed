@@ -822,13 +822,4 @@ mod client_surface_tests {
         let envelope = serde_json::to_value(envelope).expect("serialized protocol envelope");
         assert_eq!(envelope["schemaHash"], generated.schema_fingerprint);
     }
-
-    #[test]
-    fn module_inventory_lists_todo_chat_blob_identity() {
-        assert_eq!(
-            crate::E2E_UI_MODULE_IDS,
-            &["todo", "chat", "blob", "identity"]
-        );
-        assert_eq!(crate::application::MODULE_DECLARATIONS.len(), 4);
-    }
 }

@@ -1,6 +1,6 @@
+use distributed::command;
 use distributed::command::{Atomic, PreparedCommand};
 use distributed::microsvc::{CausalCommandContext, HandlerError};
-use distributed::command;
 use e2e_readmodels::BlobGames;
 use serde::Deserialize;
 
@@ -42,17 +42,4 @@ command! {
     field: "blob_games_start",
     guard: authenticated_user,
     handle: handle_start,
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn shard_is_game_id() {
-        let input = BlobStartInput {
-            game_id: "g1".into(),
-        };
-        assert_eq!(Start::shard(&input), "g1");
-    }
 }

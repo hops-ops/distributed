@@ -60,26 +60,10 @@ distributed::projection! {
 mod tests {
     use distributed::domain_event::DomainEventContract;
     use distributed::projection::placement::ProjectionExecutionClass;
-    use distributed::{
-        DomainEventBodyKind, MutationKind, RelationalReadModel, RowValue, TableMutation,
-    };
+    use distributed::{DomainEventBodyKind, RelationalReadModel, RowValue, TableMutation};
 
     use super::*;
     use todo_domain::{Todo, TodoPurgedDomainEvent};
-
-    #[test]
-    fn todo_handlers_apply_save_and_delete_mutations() {
-        let program = TODOS.program().unwrap();
-        assert_eq!(program.arms().len(), 8);
-        assert_eq!(
-            SaveTodo().program().unwrap().operations()[0].kind(),
-            MutationKind::Upsert
-        );
-        assert_eq!(
-            DeleteTodo().program().unwrap().operations()[0].kind(),
-            MutationKind::Delete
-        );
-    }
 
     #[test]
     fn complete_lowers_to_full_row_upsert() {
@@ -133,23 +117,5 @@ mod tests {
             .unwrap()
             .to_string();
         assert!(!json.contains("event_name"));
-    }
-
-    #[test]
-    fn graphql_file_matches_inline_graphql_looking_form() {
-        use distributed::mutation;
-        assert_eq!(SaveTodo().program().unwrap().name(), "SaveTodo");
-        assert_eq!(DeleteTodo().program().unwrap().name(), "DeleteTodo");
-        let from_file = SaveTodo().program().unwrap();
-        let inline = mutation! {
-            mutation SaveTodo {
-                upsert_todos(object: $input.todo)
-            }
-        };
-        assert_eq!(
-            from_file,
-            inline.program().unwrap(),
-            "mutation_file! and inline GraphQL-looking mutation! must share IR"
-        );
     }
 }

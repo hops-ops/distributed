@@ -7,7 +7,7 @@ mod postgres;
 
 use distributed::PostgresRepository;
 
-async fn repository() -> Option<PostgresRepository> {
+async fn repository() -> Option<(postgres::PostgresTestSchema, PostgresRepository)> {
     let schema = postgres::PostgresTestSchema::create_from_env(
         "pg_conformance",
         "Postgres conformance test",
@@ -17,7 +17,7 @@ async fn repository() -> Option<PostgresRepository> {
     repo.bootstrap_table_schema_for_dev(&conformance::read_models::conformance_table_registry())
         .await
         .expect("read-model conformance table should bootstrap");
-    Some(repo)
+    Some((schema, repo))
 }
 
 conformance::repository_conformance_tests!();

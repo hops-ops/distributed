@@ -25,16 +25,3 @@ command! {
     invoke: |todo, _input, principal| todo.archive(principal),
     payload: |todo, _principal| TodoStatusPayload::from_todo(&**todo),
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn shard_is_todo_id() {
-        let input = TodoArchiveInput {
-            todo_id: "todo-1".into(),
-        };
-        assert_eq!(Archive::shard(&input), "todo-1");
-    }
-}

@@ -703,10 +703,6 @@ fn human_and_json_diagnostics_preserve_same_facts_and_redact_values() {
         .to_json()
         .expect("diagnostic JSON")
         .contains("postgres://"));
-    assert_eq!(
-        result.canonical_bytes().expect("canonical result"),
-        result.canonical_bytes().expect("second canonical result")
-    );
 
     let decoded: ContractDiagnostic = serde_json::from_value(serde_json::json!({
         "code": "CTL-SCHEMA-DRIFT",
@@ -1251,7 +1247,7 @@ fn write_json_value(path: &Path, value: &Value) {
 }
 
 #[test]
-fn migration_inventory_is_deterministic_and_preserves_runtime_order() {
+fn migration_inventory_preserves_runtime_order() {
     let inventory = MigrationInventory::from_repository_root(repository_root())
         .expect("repository migration inventory");
     let versions = inventory
@@ -1262,12 +1258,6 @@ fn migration_inventory_is_deterministic_and_preserves_runtime_order() {
     assert_eq!(
         versions,
         vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]
-    );
-    assert_eq!(
-        inventory.canonical_bytes().expect("canonical inventory"),
-        inventory
-            .canonical_bytes()
-            .expect("second canonical inventory")
     );
 }
 

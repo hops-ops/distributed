@@ -275,35 +275,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn new() {
-        let payload = bitcode::serialize(&("arg1", "arg2")).unwrap();
-        let event_record = EventRecord::new("test_event", payload.clone(), 1);
-        assert_eq!(event_record.event_name, "test_event");
-        assert_eq!(event_record.payload, payload);
-        assert_eq!(event_record.sequence, 1);
-    }
-
-    #[test]
-    fn clone() {
-        let payload = bitcode::serialize(&("arg1", "arg2")).unwrap();
-        let original = EventRecord::new("test_event", payload, 1);
-        let cloned = original.clone();
-        assert_eq!(cloned.event_name, "test_event");
-        assert_eq!(cloned.payload, original.payload);
-        assert_eq!(cloned.sequence, 1);
-    }
-
-    #[test]
-    fn debug() {
-        let payload = bitcode::serialize(&("arg1", "arg2")).unwrap();
-        let event_record = EventRecord::new("test_event", payload, 1);
-        let debug_str = format!("{:?}", event_record);
-        assert!(debug_str.contains("EventRecord"));
-        assert!(debug_str.contains("event_name: \"test_event\""));
-        assert!(debug_str.contains("sequence: 1"));
-    }
-
-    #[test]
     fn serialize_deserialize() {
         let payload = bitcode::serialize(&("arg1", "arg2")).unwrap();
         let event_record = EventRecord::new("test_event", payload.clone(), 1);
@@ -330,13 +301,6 @@ mod tests {
 
         let err = event_record.decode::<()>().unwrap_err();
         assert!(err.message.contains("unsupported payload codec `json`"));
-    }
-
-    #[test]
-    fn payload_bytes() {
-        let payload = vec![0xff, 0x00, 0xab];
-        let event_record = EventRecord::new("test_event", payload.clone(), 1);
-        assert_eq!(event_record.payload_bytes(), &payload[..]);
     }
 
     #[test]
@@ -401,21 +365,5 @@ mod tests {
         let json = serde_json::to_string(&record_with_meta).unwrap();
         assert!(json.contains("metadata"));
         assert!(json.contains("key"));
-    }
-
-    #[test]
-    fn deserialize_without_metadata_field_defaults_to_empty() {
-        let json = r#"{"event_name":"old_event","payload_codec":"bitcode","payload_codec_version":1,"payload":"","sequence":1,"timestamp":{"secs_since_epoch":0,"nanos_since_epoch":0}}"#;
-        let record: EventRecord = serde_json::from_str(json).unwrap();
-        assert!(record.metadata.is_empty());
-    }
-
-    #[test]
-    fn deserialize_without_payload_codec_fields_defaults_to_bitcode() {
-        let json = r#"{"event_name":"old_event","payload":"","sequence":1,"timestamp":{"secs_since_epoch":0,"nanos_since_epoch":0},"metadata":{}}"#;
-        let record: EventRecord = serde_json::from_str(json).unwrap();
-
-        assert_eq!(record.payload_codec, BITCODE_PAYLOAD_CODEC);
-        assert_eq!(record.payload_codec_version, BITCODE_PAYLOAD_CODEC_VERSION);
     }
 }

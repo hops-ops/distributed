@@ -918,12 +918,6 @@ mod tests {
         .await
     }
 
-    #[test]
-    fn new() {
-        let repo = InMemoryRepository::new();
-        assert!(repo.event_store.read().unwrap().is_empty());
-    }
-
     #[tokio::test]
     async fn single_entity_commit() {
         let repo = InMemoryRepository::new();

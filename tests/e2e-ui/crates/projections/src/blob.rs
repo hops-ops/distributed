@@ -41,222 +41,12 @@ distributed::projection! {
     };
 }
 
-/// Compile-time guards for removed authoring surfaces.
-///
-/// ```compile_fail
-/// const _GONE: () = projection! {};
-/// ```
-///
-/// ```compile_fail,E0599
-/// use blob_domain::BlobGame;
-/// use e2e_readmodels::BlobGames;
-/// use e2e_projections::BLOB_GAMES;
-/// use distributed::microsvc::{AggregateCheckout, CausalCommandContext};
-/// fn gone(ctx: &CausalCommandContext<'_, BlobGame>, game: AggregateCheckout<BlobGame>) {
-///     let _ = ctx.project(BLOB_GAMES).commit(game).unwrap().projected_many::<BlobGames>();
-/// }
-/// ```
-#[doc(hidden)]
-pub struct BlobDirectEligibilityGuards;
-
 #[cfg(test)]
 mod tests {
-    use distributed::mutation::{delete_by_pk_program_for_model, state_upsert_program_for_model};
-    use distributed::projection::lower::{
-        finish_lowering, lower_model_mutation, EventualOnly, ProjectionDescriptor,
-        ProjectionLoweringError, ProjectionOutputInventory, ProjectionOutputModel,
-        ProjectionProgramCell,
-    };
-    use distributed::projection::ProjectionEventSelector;
-    use distributed::{
-        body_field_binding, compile_projection, MutationColumn, MutationKind, MutationOperation,
-        MutationProgram, ProjectionHandler, ProjectionInputSource, ProjectionPartition,
-        ProjectionProgram, ProjectionProgramError, ProjectionTarget, ProjectionValueType,
-        RelationalReadModel, ResolvedProjectionPlan, RowValue, TableMutation,
-    };
-    use serde::{Deserialize, Serialize};
+    use distributed::{MutationKind, RowValue, TableMutation};
 
     use super::*;
-    use blob_domain::{test_map_no_holes, BlobGame, BlobGameState, Direction};
-
-    #[derive(Clone, Serialize, Deserialize, distributed::ReadModel)]
-    #[readmodel(primary_key = ["game_id"])]
-    struct BlobGameAudits {
-        #[readmodel(id)]
-        game_id: String,
-        owner_id: String,
-        score: i64,
-        player_dead: bool,
-        current_level: i64,
-        current_level_completed: bool,
-        map_json: String,
-        status: String,
-    }
-
-    fn blob_moved_selector() -> Result<ProjectionEventSelector, ProjectionProgramError> {
-        ProjectionEventSelector::try_from_descriptor(&distributed::DomainEventDescriptor::state::<
-            BlobGameState,
-        >("blob.moved", 1))
-    }
-
-    fn moved(
-        name: &str,
-        inputs: Vec<distributed::MutationInputBinding>,
-        mutation: MutationProgram,
-    ) -> Result<ProjectionProgram, ProjectionProgramError> {
-        compile_projection(
-            name,
-            1,
-            ProjectionPartition::Unit,
-            [ProjectionHandler::try_new(
-                "moved",
-                blob_moved_selector()?,
-                inputs,
-                mutation,
-            )?],
-        )
-    }
-
-    fn game_id() -> Result<distributed::MutationInputBinding, ProjectionProgramError> {
-        body_field_binding(["game_id"], ["game_id"], ProjectionValueType::String)
-    }
-
-    fn patch_blob_program() -> Result<ProjectionProgram, ProjectionProgramError> {
-        let schema = BlobGames::schema();
-        let column =
-            |name: &str| MutationColumn::try_new(name, ProjectionValueType::String, [name]);
-        let patch = MutationOperation::try_new(
-            "patch-status",
-            MutationKind::Patch,
-            ProjectionTarget::try_new(schema.model_name.clone(), schema.table_name.clone())?,
-            vec![column("game_id")?],
-            vec![column("status")?],
-        )?;
-        moved(
-            "blob_patch_fixture",
-            vec![
-                game_id()?,
-                body_field_binding(["status"], ["status"], ProjectionValueType::String)?,
-            ],
-            MutationProgram::try_new("patch_blob_games", 1, vec![patch])?,
-        )
-    }
-
-    distributed::projection! {
-        const PATCH_BLOB_GAMES: ProjectionDescriptor<EventualOnly> = {
-            name: "blob_patch_fixture",
-            version: 1,
-            epoch: "fixture",
-            model: BlobGames,
-            program: patch_blob_program,
-        };
-    }
-
-    fn delete_blob_program() -> Result<ProjectionProgram, ProjectionProgramError> {
-        moved(
-            "blob_delete_fixture",
-            vec![game_id()?],
-            delete_by_pk_program_for_model::<BlobGames>("delete_blob_games", 1, "delete-blob")?,
-        )
-    }
-
-    distributed::projection! {
-        const DELETE_BLOB_GAMES: ProjectionDescriptor<EventualOnly> = {
-            name: "blob_delete_fixture",
-            version: 1,
-            epoch: "fixture",
-            model: BlobGames,
-            program: delete_blob_program,
-        };
-    }
-
-    fn multi_row_blob_program() -> Result<ProjectionProgram, ProjectionProgramError> {
-        let games = state_upsert_program_for_model::<BlobGames>(
-            "save_blob_games_multi",
-            1,
-            "upsert-games",
-            "first",
-        )?;
-        let audits = state_upsert_program_for_model::<BlobGameAudits>(
-            "save_blob_audits_multi",
-            1,
-            "upsert-audits",
-            "second",
-        )?;
-        moved(
-            "blob_multi_row_fixture",
-            vec![
-                ProjectionInputSource::Body.binding("first")?,
-                ProjectionInputSource::Body.binding("second")?,
-            ],
-            MutationProgram::try_new(
-                "blob_multi_row_mutation",
-                1,
-                [games.operations(), audits.operations()].concat(),
-            )?,
-        )
-    }
-
-    fn multi_row_blob_lower(
-        plan: &ResolvedProjectionPlan,
-    ) -> Result<distributed::projection::lower::LoweredProjectionPlan, ProjectionLoweringError>
-    {
-        let mut builder = distributed::read_model::ReadModelWritePlanBuilder::new();
-        for mutation in plan.mutations() {
-            match mutation.target().model() {
-                "BlobGames" => lower_model_mutation::<BlobGames>(&mut builder, mutation)?,
-                "BlobGameAudits" => lower_model_mutation::<BlobGameAudits>(&mut builder, mutation)?,
-                other => {
-                    return Err(ProjectionLoweringError::Table(
-                        distributed::TableStoreError::Metadata(format!("unknown model `{other}`")),
-                    ));
-                }
-            }
-        }
-        finish_lowering(builder, plan)
-    }
-
-    fn multi_row_blob_inventory() -> Result<ProjectionOutputInventory, ProjectionLoweringError> {
-        Ok(ProjectionOutputInventory::new(
-            vec![
-                ProjectionOutputModel::of::<BlobGames>()?,
-                ProjectionOutputModel::of::<BlobGameAudits>()?,
-            ],
-            Vec::new(),
-        ))
-    }
-
-    const MULTI_ROW_BLOB_GAMES: ProjectionDescriptor<EventualOnly> = ProjectionDescriptor::new(
-        "blob_multi_row_fixture",
-        1,
-        "fixture",
-        || {
-            static PROGRAM: ProjectionProgramCell = ProjectionProgramCell::new();
-            PROGRAM.get_or_build(multi_row_blob_program)
-        },
-        multi_row_blob_lower,
-        multi_row_blob_inventory,
-    );
-
-    fn assert_eventual_only(_: ProjectionDescriptor<EventualOnly>) {}
-
-    #[test]
-    fn blob_program_is_built_from_save_blob_game_mutation() {
-        let program = BLOB_GAMES.program().unwrap();
-        let from_mutations = BLOB_GAMES.program().unwrap();
-        assert_eq!(
-            program.canonical_bytes().unwrap(),
-            from_mutations.canonical_bytes().unwrap()
-        );
-        assert_eq!(program.arms().len(), 4);
-        assert!(program.arms().iter().all(|arm| {
-            arm.operations().len() == 1 && arm.operations()[0].kind() == MutationKind::Upsert
-        }));
-        assert_eq!(
-            SaveBlobGame().program().unwrap().operations()[0].kind(),
-            MutationKind::Upsert
-        );
-    }
+    use blob_domain::{BlobGame, BlobGameState, Direction};
 
     #[test]
     fn from_state_materializes_blob_games_row_for_handler_owned_projected() {
@@ -363,8 +153,6 @@ mod tests {
     fn moved_state_is_one_complete_direct_upsert() {
         let mut game = BlobGame::default();
         game.start_with_demo("g1", "alice").unwrap();
-        let map = test_map_no_holes();
-        let _ = map;
         if game.move_dir("alice", Direction::Up).is_ok() {
             assert_direct_state_upsert(&game, "blob.moved");
         }
@@ -376,12 +164,5 @@ mod tests {
         assert_eq!(inventory.models.len(), 1);
         assert_eq!(inventory.models[0].model, "BlobGames");
         assert_eq!(BLOB_GAMES.program().unwrap().arms().len(), 4);
-    }
-
-    #[test]
-    fn patch_delete_and_multi_row_descriptors_are_not_direct_candidates() {
-        assert_eventual_only(PATCH_BLOB_GAMES);
-        assert_eventual_only(DELETE_BLOB_GAMES);
-        assert_eventual_only(MULTI_ROW_BLOB_GAMES);
     }
 }

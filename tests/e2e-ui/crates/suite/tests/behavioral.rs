@@ -515,7 +515,7 @@ async fn t5_unauthenticated_rejected() {
           }}
         }}"#
     );
-    // DevHeaders with no identity → command guard rejects (causal_has_user).
+    // DevHeaders with no identity → command guard rejects.
     let (status, body) = graphql_raw(&base, &doc).await.expect(cases::UNAUTH);
     // GuardRejected is client-facing (often GraphQL errors / 400); Unauthorized
     // remains 401 when identity is checked elsewhere.

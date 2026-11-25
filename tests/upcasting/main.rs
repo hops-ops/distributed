@@ -75,18 +75,12 @@ fn event_version_serializes_when_not_v1() {
 }
 
 #[test]
-fn old_events_without_event_version_deserialize_as_v1() {
-    let json = r#"{"event_name":"old_event","payload_codec":"bitcode","payload_codec_version":1,"payload":"","sequence":1,"timestamp":{"secs_since_epoch":0,"nanos_since_epoch":0},"metadata":{}}"#;
-    let record: EventRecord = serde_json::from_str(json).unwrap();
-    assert_eq!(record.event_version, 1);
-}
-
-#[test]
-fn old_events_without_metadata_deserialize_with_empty_metadata() {
-    let json = r#"{"event_name":"old_event","payload_codec":"bitcode","payload_codec_version":1,"payload":"","sequence":1,"timestamp":{"secs_since_epoch":0,"nanos_since_epoch":0}}"#;
-    let record: EventRecord = serde_json::from_str(json).unwrap();
-    assert_eq!(record.event_version, 1);
-    assert!(record.metadata.is_empty());
+fn v1_event_version_survives_a_round_trip_that_omits_it() {
+    let record = EventRecord::new("tested", vec![1, 2, 3], 1);
+    let json = serde_json::to_string(&record).unwrap();
+    let deserialized: EventRecord = serde_json::from_str(&json).unwrap();
+    assert_eq!(deserialized.event_version, 1);
+    assert_eq!(deserialized, record);
 }
 
 #[test]
@@ -150,21 +144,6 @@ fn hydrate_v2_from_v1_events() {
     assert!(v2.completed);
 }
 
-#[test]
-fn v2_aggregate_has_upcasters() {
-    let upcasters = TodoV2::upcasters();
-    assert_eq!(upcasters.len(), 1);
-    assert_eq!(upcasters[0].event_type, "initialized");
-    assert_eq!(upcasters[0].from_version, 1);
-    assert_eq!(upcasters[0].to_version, 2);
-}
-
-#[test]
-fn v1_aggregate_has_no_upcasters() {
-    let upcasters = TodoV1::upcasters();
-    assert!(upcasters.is_empty());
-}
-
 // =============================================================================
 // Chained upcasters: v1 → v2 → v3
 // =============================================================================
@@ -224,16 +203,6 @@ fn hydrate_v3_from_native_v3_events_no_upcasting_needed() {
     let loaded: TodoV3 = hydrate(entity).unwrap();
     assert_eq!(loaded.priority, 2);
     assert_eq!(loaded.due_date, "2025-12-31");
-}
-
-#[test]
-fn v3_aggregate_has_two_upcasters() {
-    let upcasters = TodoV3::upcasters();
-    assert_eq!(upcasters.len(), 2);
-    assert_eq!(upcasters[0].from_version, 1);
-    assert_eq!(upcasters[0].to_version, 2);
-    assert_eq!(upcasters[1].from_version, 2);
-    assert_eq!(upcasters[1].to_version, 3);
 }
 
 // =============================================================================

@@ -393,3 +393,77 @@ fn explicit_overrides_disambiguate_singular_names_ending_in_s() {
         ("statuses", "statuses", "buses", "buses")
     );
 }
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, ReadModel)]
+#[table("counter_views")]
+struct ExplicitIdView {
+    id: String,
+    #[readmodel(id)]
+    counter_id: String,
+    #[unique("uq_counter_views_slug")]
+    slug: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, ReadModel)]
+#[table("reordered_relationships")]
+struct ReorderedRelationships {
+    #[id]
+    id: String,
+    target_tenant: String,
+    target_slug: Option<String>,
+    #[readmodel(
+        references = "tenant_id,slug",
+        foreign_key = "target_tenant,target_slug",
+        belongs_to = "DirectTableView"
+    )]
+    target: Option<DirectTableView>,
+    #[readmodel(foreign_key = "player_id", has_many = "PlayerWeapon")]
+    weapons: Vec<PlayerWeapon>,
+    #[readmodel(through = "links", foreign_key = "id", many_to_many = "Player")]
+    players: Vec<Player>,
+}
+
+#[test]
+fn an_explicit_id_field_wins_over_a_field_named_id() {
+    let view = ExplicitIdView {
+        id: "row".into(),
+        counter_id: "counter-1".into(),
+        slug: "first".into(),
+    };
+    assert_eq!(view.id(), "counter-1");
+    assert_eq!(ExplicitIdView::schema().primary_key.columns, ["counter_id"]);
+    assert!(ExplicitIdView::schema().indexes.iter().any(|index| {
+        index.name.as_deref() == Some("uq_counter_views_slug")
+            && index.columns == ["slug"]
+            && index.unique
+    }));
+}
+
+#[test]
+fn relationship_attributes_mean_the_same_in_any_order() {
+    let schema = ReorderedRelationships::schema();
+    let relation = |field: &str| {
+        schema
+            .relationships
+            .iter()
+            .find(|relation| relation.field_name == field)
+            .unwrap_or_else(|| panic!("missing relationship {field}"))
+    };
+
+    let target = relation("target");
+    assert_eq!(target.kind, RelationshipKind::BelongsTo);
+    assert_eq!(target.references.as_deref(), Some("tenant_id,slug"));
+    assert_eq!(
+        target.foreign_key.as_deref(),
+        Some("target_tenant,target_slug")
+    );
+
+    let weapons = relation("weapons");
+    assert_eq!(weapons.kind, RelationshipKind::HasMany);
+    assert_eq!(weapons.foreign_key.as_deref(), Some("player_id"));
+
+    let players = relation("players");
+    assert_eq!(players.kind, RelationshipKind::ManyToMany);
+    assert_eq!(players.through.as_deref(), Some("links"));
+    assert_eq!(players.foreign_key.as_deref(), Some("id"));
+}

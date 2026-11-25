@@ -37,17 +37,3 @@ command! {
         }
     },
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn shard_is_todo_id() {
-        let input = TodoRenameInput {
-            todo_id: "todo-1".into(),
-            title: "renamed".into(),
-        };
-        assert_eq!(Rename::shard(&input), "todo-1");
-    }
-}

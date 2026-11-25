@@ -161,19 +161,6 @@ async fn duplicate_table_name_errors() {
 }
 
 #[tokio::test]
-async fn unknown_column_in_permission_via_grant_ok() {
-    // grant_all uses all_columns — valid
-    let schema = simple_schema("Item", "items");
-    let manifest = distributed::ReadModelCatalog::new("t").table_schema(schema);
-    GraphqlEngine::from_schema_catalog(&manifest, pool().await)
-        .unwrap()
-        .identity(IdentityConfig::dev_headers())
-        .grant_all("user")
-        .build()
-        .unwrap();
-}
-
-#[tokio::test]
 async fn build_handles_bidirectional_relationship_schemas() {
     let manifest = distributed::ReadModelCatalog::new("t")
         .table_schema(bidirectional_parent_schema())
@@ -187,13 +174,4 @@ async fn build_handles_bidirectional_relationship_schemas() {
     let sdl = engine.sdl_for_role("user").expect("role sdl");
     assert!(sdl.contains("children"));
     assert!(sdl.contains("parent"));
-}
-
-#[tokio::test]
-async fn pure_sql_compile_helper() {
-    use distributed::graphql::naming::root_list_field;
-    let schema = simple_schema("Item", "items");
-    assert_eq!(root_list_field(&schema), "items");
-    let sql = distributed::graphql::sdl::graphql_sdl_for_tables(&[schema]).unwrap();
-    assert!(sql.contains("type Item"));
 }
