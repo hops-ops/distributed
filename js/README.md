@@ -629,7 +629,9 @@ protocol state stay for `retentionGraceMs` (30 seconds by default), so a
 remount renders from the cache. After that they are collected, together with
 the records no other operation or pending command still reaches. A live
 stream that fails or loses its connection is reopened by the replica with a
-jittered backoff, resuming from its cursors. Cold `hydrate` seeds an empty
+jittered backoff, resuming from its cursors. A lost connection keeps the data
+and adds no error: the query's `live` is `reconnecting`, and
+`useDistributedLiveConnection()` is one store for an app-wide notice. Cold `hydrate` seeds an empty
 client; warm same-scope `hydrate` merges so soft navigation cannot discard
 confirmed session data the next boundary did not re-dehydrate. Layout
 retention survives child navigation, page retention is replaced on page exit,
