@@ -1,14 +1,14 @@
 <script lang="ts">
 	/**
-	 * Lobby chat — one generated `@load @live` operation.
+	 * Lobby chat — one generated `@load @live @window` operation.
 	 *
-	 * Newest page is live (`offset: 0`). Older history loads the same operation
-	 * with rising offset on scroll-up; rows merge by `message_id` and display
-	 * ascending. The log uses `column-reverse` so SSR/first paint already shows
-	 * the newest end (no JS scroll jump).
+	 * `useWindow()` keeps the newest page live and loads older pages by keyset
+	 * cursor on scroll-up; `rows` is already one ordered, de-duplicated list
+	 * (newest first), so the page only reverses it for display. The log uses
+	 * `column-reverse` so SSR/first paint already shows the newest end (no JS
+	 * scroll jump).
 	 */
 	import { tick, untrack } from 'svelte';
-	import { useDistributedSvelteKitClient } from '@hops-ops/distributed/sveltekit';
 
 	import {
 		ChatMessages as UserChatMessages,
@@ -17,9 +17,6 @@
 	} from '$distributed';
 	import { ChatMessages as PublicChatMessages } from '$distributed/public';
 	import {
-		CHAT_PAGE_SIZE,
-		liveWindowProvesHistoryExhausted,
-		mergeHistoryPage,
 		nearBottom,
 		nearTop,
 		needsHistoryFill,
@@ -35,7 +32,6 @@
 	type ChatMsg = Operation_ChatMessages_Data['chat_messages'][number];
 
 	const LOBBY_ROOM = 'lobby';
-	const PAGE_SIZE = CHAT_PAGE_SIZE;
 
 	let { data } = $props();
 	/** Guest uses e2e-ui-public; signed-in uses portable e2e-ui (root client). Fixed at mount. */
@@ -43,17 +39,9 @@
 	const ChatMessages = signedIn ? UserChatMessages : PublicChatMessages;
 
 	let sendError = $state<string | null>(null);
-	let historyError = $state<string | null>(null);
 	let logEl: HTMLDivElement | undefined = $state();
 	let draft = $state('');
 	let busy = $state(false);
-	/** Older pages loaded on scroll-up (already reversed to ascending). */
-	let history = $state<ChatMsg[]>([]);
-	let historyOffset = $state(PAGE_SIZE);
-	let hasMoreHistory = $state(true);
-	/** Newest live row when a complete history probe proved exhaustion. */
-	let historyExhaustedAtNewestId = $state<string | null>(null);
-	let loadingHistory = $state(false);
 	/** Auto-pin to bottom only while the user is already near the end. */
 	let stickToBottom = $state(true);
 
@@ -63,67 +51,12 @@
 	);
 	const displayName = $derived(sessionDisplayName(data.session));
 
-	/** Live newest page — same variables SSR seeded. */
-	const lobby = ChatMessages.use();
-	// Capture a bound op at init so scroll handlers can open history watches
-	// without re-entering Svelte context.
-	const chat = useDistributedSvelteKitClient().operation(ChatMessages.artifact);
+	/** The live head uses the variables SSR seeded, so mounting fetches nothing. */
+	const lobby = ChatMessages.useWindow();
+	const PAGE_SIZE = lobby.pageSize;
 	const commands = signedIn ? useCommands() : null;
-	// Live page arrives newest-first; reverse for chronological display.
-	const livePage = $derived.by(() => {
-		const pageMessages = Array.isArray($lobby.data?.chat_messages)
-			? $lobby.data.chat_messages
-			: [];
-		return [...pageMessages].reverse();
-	});
-	const liveNewestMessageId = $derived(livePage.at(-1)?.message_id ?? null);
-
-	/** History (older) + live (newest), de-duped by message_id. */
-	const messages = $derived.by(() => {
-		const byId = new Map<string, ChatMsg>();
-		for (const m of history) byId.set(m.message_id, m);
-		for (const m of livePage) byId.set(m.message_id, m);
-		return [...byId.values()].sort((a, b) => {
-			const ac = a.created_at ?? '';
-			const bc = b.created_at ?? '';
-			if (ac !== bc) return ac < bc ? -1 : 1;
-			return a.message_id < b.message_id ? -1 : a.message_id > b.message_id ? 1 : 0;
-		});
-	});
-
-	/**
-	 * Soft-nav may leave older offset pages in the replica. Rebuild local
-	 * history from complete cache windows without network.
-	 */
-	function absorbCachedHistory() {
-		let offset = PAGE_SIZE;
-		const collected: ChatMsg[] = [];
-		while (true) {
-			const snap = chat.read({ limit: PAGE_SIZE, offset });
-			const pageMessages = snap.data?.chat_messages;
-			if (!snap.complete || !Array.isArray(pageMessages) || pageMessages.length === 0) break;
-			const page: readonly ChatMsg[] = pageMessages;
-			collected.push(...[...page].reverse());
-			offset += PAGE_SIZE;
-			if (page.length < PAGE_SIZE) {
-				hasMoreHistory = false;
-				historyExhaustedAtNewestId = liveNewestMessageId;
-				break;
-			}
-		}
-		if (collected.length === 0) return;
-		const byId = new Map<string, ChatMsg>();
-		for (const m of collected) byId.set(m.message_id, m);
-		history = [...byId.values()].sort((a, b) => {
-			const ac = a.created_at ?? '';
-			const bc = b.created_at ?? '';
-			if (ac !== bc) return ac < bc ? -1 : 1;
-			return a.message_id < b.message_id ? -1 : a.message_id > b.message_id ? 1 : 0;
-		});
-		historyOffset = offset;
-	}
-
-	absorbCachedHistory();
+	/** Chronological for display; the window is newest first. */
+	const messages = $derived([...$lobby.rows].reverse());
 
 	function metricsOf(el: HTMLDivElement) {
 		return {
@@ -142,38 +75,14 @@
 		// Depend on message list + element bind so pin / fill run after DOM.
 		messages;
 		logEl;
-		/*
-		 * A complete short newest window already proves exhaustion; do not start
-		 * an offset request merely because a small lobby does not fill the panel.
-		 * If a full live window later advances, one of its previous rows became
-		 * history, so reopen the cursor for a new probe.
-		 */
-		if (
-			$lobby.complete &&
-			liveWindowProvesHistoryExhausted(livePage.length, PAGE_SIZE)
-		) {
-			hasMoreHistory = false;
-			historyExhaustedAtNewestId = liveNewestMessageId;
-		} else if (
-			$lobby.complete &&
-			!hasMoreHistory &&
-			historyExhaustedAtNewestId !== null &&
-			liveNewestMessageId !== historyExhaustedAtNewestId
-		) {
-			hasMoreHistory = true;
-			historyExhaustedAtNewestId = null;
-		}
 		if (stickToBottom) void scrollBottom();
-		// First page may not fill the panel — pull history until scrollable.
-		// Wait for the live window to be complete so an empty history page is
-		// not treated as end-of-history while projections are still catching up
-		// during rapid sends.
+		// The first page may not fill the panel — pull history until scrollable.
+		// A failed load waits for scroll or Retry instead of looping.
 		if (
 			logEl &&
-			hasMoreHistory &&
-			!loadingHistory &&
-			$lobby.complete &&
-			livePage.length > 0 &&
+			$lobby.hasMore &&
+			!$lobby.fetchingMore &&
+			$lobby.fetchMoreError === undefined &&
 			needsHistoryFill(metricsOf(logEl))
 		) {
 			void loadOlder();
@@ -244,55 +153,17 @@
 	}
 
 	async function loadOlder() {
-		if (loadingHistory || !hasMoreHistory) return;
-		loadingHistory = true;
-		historyError = null;
+		const current = lobby.get();
+		if (current.fetchingMore || !current.hasMore) return;
 		// Reading older history leaves the newest edge.
 		stickToBottom = false;
 		const el = logEl;
 		const prevTop = el?.scrollTop ?? 0;
 		const prevHeight = el?.scrollHeight ?? 0;
-		const offset = historyOffset;
-		try {
-			const store = chat.use({ limit: PAGE_SIZE, offset }, { live: false });
-			try {
-				await store.refetch();
-				const snap = store.get();
-				// Incomplete snapshots must not close the history cursor — empty
-				// mid-flight pages look like end-of-history under projection lag.
-				if (!snap.complete) {
-					return;
-				}
-				const page = snap.data.chat_messages;
-				const known = new Set([
-					...history.map((m) => m.message_id),
-					...livePage.map((m) => m.message_id)
-				]);
-				const merged = mergeHistoryPage(page, known, offset, PAGE_SIZE);
-				hasMoreHistory = merged.hasMore;
-				historyExhaustedAtNewestId = merged.hasMore
-					? null
-					: liveNewestMessageId;
-				historyOffset = merged.nextOffset;
-				if (merged.fresh.length === 0) return;
-				history = [...merged.fresh, ...history];
-				await tick();
-				if (el) {
-					// Content grew at the visual top; keep the same messages in view.
-					el.scrollTop = preserveScrollAfterPrepend(
-						prevTop,
-						prevHeight,
-						el.scrollHeight
-					);
-				}
-			} finally {
-				store.destroy();
-			}
-		} catch (error) {
-			historyError = error instanceof Error ? error.message : 'failed to load history';
-		} finally {
-			loadingHistory = false;
-		}
+		await lobby.fetchMore();
+		await tick();
+		// Content grew at the visual top; keep the same messages in view.
+		if (el) el.scrollTop = preserveScrollAfterPrepend(prevTop, prevHeight, el.scrollHeight);
 	}
 
 	async function onSend(e: Event) {
@@ -356,9 +227,9 @@
 			<button type="button" class="ch-link-btn" onclick={() => void lobby.refetch()}>Retry</button>
 		</InlineAlert>
 	{/if}
-	{#if historyError}
+	{#if $lobby.fetchMoreError}
 		<InlineAlert label="History">
-			{historyError}
+			{$lobby.fetchMoreError.message}
 			<button type="button" class="ch-link-btn" onclick={() => void loadOlder()}>Retry</button>
 		</InlineAlert>
 	{/if}
@@ -380,13 +251,13 @@
 			aria-live="polite"
 			aria-relevant="additions"
 			data-chat-page-size={PAGE_SIZE}
-			data-has-more-history={hasMoreHistory ? '1' : '0'}
-			data-loading-history={loadingHistory ? '1' : '0'}
+			data-has-more-history={$lobby.hasMore ? '1' : '0'}
+			data-loading-history={$lobby.fetchingMore ? '1' : '0'}
 		>
 			<div class="ch-log-stack">
-				{#if loadingHistory}
+				{#if $lobby.fetchingMore}
 					<div class="ch-history-hint" aria-live="polite">Loading earlier messages…</div>
-				{:else if hasMoreHistory && messages.length > 0}
+				{:else if $lobby.hasMore && messages.length > 0}
 					<button
 						type="button"
 						class="ch-history-hint ch-history-load"
@@ -395,7 +266,7 @@
 					>
 						Scroll up or click for earlier messages
 					</button>
-				{:else if !hasMoreHistory && messages.length > 0}
+				{:else if !$lobby.hasMore && messages.length > 0}
 					<div class="ch-history-hint">Beginning of lobby history</div>
 				{/if}
 

@@ -74,8 +74,14 @@ export {
 	type SveltekitPageDataSource,
 	type SveltekitQuerySnapshot,
 	type SveltekitQueryStore,
+	type SveltekitWindowOperation,
 	type UseSveltekitOperationOptions
 } from './replica.js';
+export type {
+	SveltekitWindowSnapshot,
+	SveltekitWindowStore,
+	UseSveltekitWindowOptions
+} from './window.js';
 export type {
 	SveltekitCommandRuntimeFactory,
 	SveltekitCommandRuntimeFactoryOptions,

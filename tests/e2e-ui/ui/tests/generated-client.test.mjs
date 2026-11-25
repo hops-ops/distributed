@@ -85,8 +85,9 @@ test('generated clients use one island boundary plan with no route registry', ()
 			.find((boundary) => boundary.id === 'layout:/chat')
 		.islands[0].binding.sources,
 		{
-			limit: { kind: 'omit' },
-			offset: { kind: 'omit' }
+			cursor_created_at: { kind: 'omit' },
+			cursor_message_id: { kind: 'omit' },
+			limit: { kind: 'omit' }
 		}
 	);
 

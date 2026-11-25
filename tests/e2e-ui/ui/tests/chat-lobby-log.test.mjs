@@ -1,5 +1,5 @@
 /**
- * Unit tests for lobby chat log geometry + history merge.
+ * Unit tests for lobby chat log geometry.
  * Exercises the real `$lib/chat/lobby-log` module used by `/chat`.
  */
 import { test } from 'node:test';
@@ -11,22 +11,15 @@ const uiRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const lobbyLogPath = path.join(uiRoot, 'src/lib/chat/lobby-log.ts');
 
 const {
-	CHAT_PAGE_SIZE,
 	nearBottom,
 	nearTop,
 	needsHistoryFill,
-	liveWindowProvesHistoryExhausted,
-	mergeHistoryPage,
 	pinScrollBottom,
 	preserveScrollAfterPrepend,
 	distanceFromBottom,
 	distanceFromTop,
 	scrollRange
 } = await import(pathToFileURL(lobbyLogPath).href);
-
-test('chat page size is 25 for SSR and client', () => {
-	assert.equal(CHAT_PAGE_SIZE, 25);
-});
 
 test('column-reverse positive model: scrollTop 0 is newest; max is oldest', () => {
 	assert.equal(pinScrollBottom(), 0);
@@ -72,43 +65,6 @@ test('no overflow is not nearTop (fill path uses needsHistoryFill instead)', () 
 		needsHistoryFill({ scrollTop: 0, scrollHeight: 800, clientHeight: 400 }),
 		false
 	);
-});
-
-test('a complete short live window proves there is no older page', () => {
-	assert.equal(liveWindowProvesHistoryExhausted(0, 25), true);
-	assert.equal(liveWindowProvesHistoryExhausted(24, 25), true);
-	assert.equal(liveWindowProvesHistoryExhausted(25, 25), false);
-});
-
-test('mergeHistoryPage reverses desc server pages and advances offset', () => {
-	const page = [
-		{ message_id: 'm3', body: 'new' },
-		{ message_id: 'm2', body: 'mid' },
-		{ message_id: 'm1', body: 'old' }
-	];
-	const known = new Set(['m3']);
-	const result = mergeHistoryPage(page, known, 25, 25);
-	assert.deepEqual(
-		result.fresh.map((m) => m.message_id),
-		['m1', 'm2']
-	);
-	assert.equal(result.nextOffset, 50);
-	assert.equal(result.hasMore, false);
-});
-
-test('mergeHistoryPage full window keeps hasMore true', () => {
-	const page = Array.from({ length: 25 }, (_, i) => ({ message_id: `h${i}` }));
-	const result = mergeHistoryPage(page, new Set(), 25, 25);
-	assert.equal(result.fresh.length, 25);
-	assert.equal(result.nextOffset, 50);
-	assert.equal(result.hasMore, true);
-});
-
-test('mergeHistoryPage empty page ends history', () => {
-	const result = mergeHistoryPage([], new Set(), 50, 25);
-	assert.equal(result.fresh.length, 0);
-	assert.equal(result.hasMore, false);
-	assert.equal(result.nextOffset, 75);
 });
 
 test('preserveScrollAfterPrepend: positive model adds delta; negative keeps bottom-relative', () => {

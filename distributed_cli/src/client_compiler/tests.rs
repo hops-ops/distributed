@@ -4672,3 +4672,181 @@ fn malformed_leaderboard_sections_are_refused() {
     let error = compile(input_with_manifest(tampered, LEADERBOARD_PAGE)).unwrap_err();
     assert_eq!(error.code, "client.manifest.schema_fingerprint");
 }
+
+/// The base manifest with the ordered comparisons a keyset needs on
+/// `priority` and the `(tenantId, id)` primary key.
+pub(super) fn window_manifest() -> JsonValue {
+    let mut value = manifest();
+    let operators = json!(["_eq", "_neq", "_gt", "_gte", "_lt", "_lte", "_in", "_nin"]);
+    let widen = |fields: &mut JsonValue| {
+        for field in fields.as_array_mut().expect("filter fields") {
+            if matches!(field["name"].as_str(), Some("priority" | "tenantId" | "id")) {
+                field["operators"] = operators.clone();
+            }
+        }
+    };
+    widen(&mut value["models"][0]["filter_input"]["fields"]);
+    for root in value["roots"].as_array_mut().expect("manifest roots") {
+        if !root["filter"].is_null() {
+            widen(&mut root["filter"]["fields"]);
+        }
+    }
+    refresh_schema_fingerprint(&mut value);
+    value
+}
+
+pub(super) const WINDOW_FEED: &str = r#"
+  query Feed($limit: Int! = 10) @live @window {
+    todos(where: {completed: {_eq: false}}, order_by: [{priority: desc}], limit: $limit) {
+      id
+      tenantId
+      rank: priority
+      title
+    }
+  }
+"#;
+
+#[test]
+fn window_lowers_its_keyset_into_the_where_and_the_artifact() {
+    let project = compile(input_with_manifest(window_manifest(), WINDOW_FEED)).expect("compile");
+    let operation = &project.operations[0];
+    let module = file(&project, &operation.module_path);
+    // The keyset is `order_by` then the primary key ascending, as the server
+    // orders; each column gets one nullable cursor variable.
+    assert!(
+        module.contains(
+            "query Feed($cursor_id: ID, $cursor_priority: Int, $cursor_tenantId: ID, $limit: Int! = 10)"
+        ),
+        "{module}"
+    );
+    assert!(
+        module.contains(
+            "where: {_and: [{completed: {_eq: false}}, {_or: [{priority: {_lt: $cursor_priority}}, {priority: {_eq: $cursor_priority}, tenantId: {_gt: $cursor_tenantId}}, {id: {_gt: $cursor_id}, priority: {_eq: $cursor_priority}, tenantId: {_eq: $cursor_tenantId}}]}]}"
+        ),
+        "{module}"
+    );
+    assert!(!module.contains("@window"), "{module}");
+    assert!(
+        module.contains(
+            "import type { ReplicaWindowOperationArtifact } from '@hops-ops/distributed/replica';"
+        ),
+        "{module}"
+    );
+    assert!(
+        module.contains("readonly \"cursor_priority\"?: number | null;"),
+        "{module}"
+    );
+    let artifact = operation_artifact(&project);
+    assert_eq!(
+        artifact["window"],
+        json!({
+            "limitVariable": "limit",
+            "pageSize": 10,
+            "maxLimit": 100,
+            "keys": [
+                {"field": "priority", "responseKey": "rank", "variable": "cursor_priority", "direction": "desc", "codec": "int32"},
+                {"field": "tenantId", "responseKey": "tenantId", "variable": "cursor_tenantId", "direction": "asc", "codec": "string"},
+                {"field": "id", "responseKey": "id", "variable": "cursor_id", "direction": "asc", "codec": "string"}
+            ]
+        })
+    );
+    // The live companion carries the same keyset `where`.
+    assert!(artifact["live"]["document"]
+        .as_str()
+        .unwrap()
+        .contains("$cursor_id: ID"));
+}
+
+#[test]
+fn window_without_a_where_adds_the_keyset_and_an_explicit_key_keeps_its_direction() {
+    let project = compile(input_with_manifest(
+        window_manifest(),
+        r#"
+          query Feed($limit: Int!) @window {
+            todos(order_by: [{priority: desc}, {id: desc}], limit: $limit) { id tenantId priority }
+          }
+        "#,
+    ))
+    .expect("compile");
+    let module = file(&project, &project.operations[0].module_path);
+    assert!(
+        module.contains("todos(limit: $limit, order_by: [{priority: desc}, {id: desc}], where: {_or: [{priority: {_lt: $cursor_priority}}, {id: {_lt: $cursor_id}, priority: {_eq: $cursor_priority}}, {id: {_eq: $cursor_id}, priority: {_eq: $cursor_priority}, tenantId: {_gt: $cursor_tenantId}}]})"),
+        "{module}"
+    );
+    // No limit default: the root's default limit is the page size.
+    assert_eq!(
+        operation_artifact(&project)["window"]["pageSize"],
+        json!(25)
+    );
+}
+
+#[test]
+fn window_rejects_documents_it_cannot_page_by_keyset() {
+    let cases = [
+        (
+            "offset",
+            "query F($limit: Int!) @window { todos(order_by: [{priority: desc}], limit: $limit, offset: 5) { id tenantId priority } }",
+            "client.window.offset",
+        ),
+        (
+            "literal limit",
+            "query F @window { todos(order_by: [{priority: desc}], limit: 5) { id tenantId priority } }",
+            "client.window.limit",
+        ),
+        (
+            "no order",
+            "query F($limit: Int!) @window { todos(limit: $limit) { id tenantId } }",
+            "client.window.order",
+        ),
+        (
+            "variable order",
+            "query F($limit: Int!, $order: [todo_order_by!]) @window { todos(order_by: $order, limit: $limit) { id tenantId } }",
+            "client.window.order",
+        ),
+        (
+            "nulls ordering",
+            "query F($limit: Int!) @window { todos(order_by: [{priority: desc_nulls_last}], limit: $limit) { id tenantId priority } }",
+            "client.window.order",
+        ),
+        (
+            "nullable key",
+            "query F($limit: Int!) @window { todos(order_by: [{title: asc}], limit: $limit) { id tenantId title } }",
+            "client.window.key",
+        ),
+        (
+            "boolean key",
+            "query F($limit: Int!) @window { todos(order_by: [{completed: asc}], limit: $limit) { id tenantId completed } }",
+            "client.window.key",
+        ),
+        (
+            "key not selected",
+            "query F($limit: Int!) @window { todos(order_by: [{priority: desc}], limit: $limit) { id tenantId } }",
+            "client.window.key_unselected",
+        ),
+        (
+            "cursor variable taken",
+            "query F($limit: Int!, $cursor_id: ID) @window { todos(where: {id: {_eq: $cursor_id}}, order_by: [{priority: desc}], limit: $limit) { id tenantId priority } }",
+            "client.window.variable",
+        ),
+        (
+            "two pages exceed the max limit",
+            "query F($limit: Int! = 51) @window { todos(order_by: [{priority: desc}], limit: $limit) { id tenantId priority } }",
+            "client.window.page_size",
+        ),
+        (
+            "by-pk root",
+            "query F($id: ID!, $tenantId: ID!) @window { todo(id: $id, tenantId: $tenantId) { id } }",
+            "client.window.root",
+        ),
+    ];
+    for (case, source, code) in cases {
+        let error = compile(input_with_manifest(window_manifest(), source)).expect_err(case);
+        assert_eq!(error.code, code, "{case}: {error}");
+    }
+    // A key needs the ordered comparison its direction uses.
+    let error = compile(input(
+        "query F($limit: Int!) @window { todos(order_by: [{priority: desc}], limit: $limit) { id tenantId priority } }",
+    ))
+    .expect_err("priority has no _lt in the base manifest");
+    assert_eq!(error.code, "client.window.key", "{error}");
+}

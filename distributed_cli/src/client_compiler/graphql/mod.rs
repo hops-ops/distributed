@@ -28,9 +28,11 @@ mod query_plan;
 mod types;
 mod validation;
 mod variables;
+mod window;
 
 pub(crate) use operation::{compile_document, typescript_scalar};
 pub(crate) use types::*;
+pub(crate) use window::CompiledWindow;
 
 use arguments::*;
 use fragments::*;
@@ -39,3 +41,4 @@ use operation::*;
 use query_plan::*;
 use validation::*;
 use variables::*;
+use window::*;

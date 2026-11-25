@@ -20,6 +20,8 @@ pub(crate) struct CompiledOperation {
     pub(crate) variables: Vec<CompiledVariable>,
     pub(crate) variable_codec: CompiledVariableCodec,
     pub(crate) root: CompiledRoot,
+    /// `@window`: the keyset contract the generated `useWindow` pages by.
+    pub(crate) window: Option<CompiledWindow>,
 }
 
 #[derive(Clone, Debug)]

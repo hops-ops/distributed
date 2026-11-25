@@ -3,7 +3,8 @@ import { getContext, setContext } from 'svelte';
 import type {
 	ReplicaLiveConnection,
 	ReplicaOperationArtifact,
-	ReplicaSnapshot
+	ReplicaSnapshot,
+	ReplicaWindowOperationArtifact
 } from '../replica/index.js';
 import type { GraphqlVariables } from '../types.js';
 import {
@@ -19,7 +20,8 @@ import type {
 } from '../boundary-lifecycle.js';
 import type {
 	DistributedSvelteKitClient,
-	SveltekitBoundOperation
+	SveltekitBoundOperation,
+	SveltekitWindowOperation
 } from './replica.js';
 
 const DISTRIBUTED_CLIENT_CONTEXT = Symbol(
@@ -118,6 +120,18 @@ export function defineDistributedSvelteKitOperation<
 	TData,
 	TVariables extends GraphqlVariables
 >(
+	artifact: ReplicaWindowOperationArtifact<TData, TVariables>
+): SveltekitWindowOperation<TData, TVariables>;
+export function defineDistributedSvelteKitOperation<
+	TData,
+	TVariables extends GraphqlVariables
+>(
+	artifact: ReplicaOperationArtifact<TData, TVariables>
+): SveltekitBoundOperation<TData, TVariables>;
+export function defineDistributedSvelteKitOperation<
+	TData,
+	TVariables extends GraphqlVariables
+>(
 	artifact: ReplicaOperationArtifact<TData, TVariables>
 ): SveltekitBoundOperation<TData, TVariables> {
 	const use = ((...args: unknown[]) => {
@@ -129,9 +143,20 @@ export function defineDistributedSvelteKitOperation<
 		return invoke(...args);
 	}) as SveltekitBoundOperation<TData, TVariables>['use'];
 
+	const useWindow =
+		artifact.window === undefined
+			? undefined
+			: (...args: unknown[]) => {
+					const operation = useDistributedSvelteKitClient<unknown>().operation(
+						artifact as ReplicaWindowOperationArtifact<TData, TVariables>
+					);
+					return (operation.useWindow as (...values: unknown[]) => unknown)(...args);
+				};
+
 	return Object.freeze({
 		artifact,
 		use,
+		...(useWindow === undefined ? {} : { useWindow }),
 		read(variables: TVariables): ReplicaSnapshot<TData> {
 			return useDistributedSvelteKitClient<unknown>()
 				.operation(artifact)

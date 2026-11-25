@@ -12,7 +12,7 @@ pub(crate) fn compile_document(
             Pos::default(),
         ));
     }
-    let parsed = parse_query(&document.source).map_err(|error| {
+    let mut parsed = parse_query(&document.source).map_err(|error| {
         let pos = error.positions().next().unwrap_or_default();
         source_error(
             "client.graphql.parse",
@@ -21,7 +21,7 @@ pub(crate) fn compile_document(
             pos,
         )
     })?;
-    let (name, operation) = match &parsed.operations {
+    let (name, operation) = match &mut parsed.operations {
         DocumentOperations::Single(operation) => {
             return Err(source_error(
                 "client.operation.named_required",
@@ -31,7 +31,7 @@ pub(crate) fn compile_document(
             ));
         }
         DocumentOperations::Multiple(operations) if operations.len() == 1 => {
-            let (name, operation) = operations.iter().next().expect("length checked");
+            let (name, operation) = operations.iter_mut().next().expect("length checked");
             (name.as_str().to_string(), operation)
         }
         DocumentOperations::Multiple(operations) => {
@@ -60,6 +60,17 @@ pub(crate) fn compile_document(
         ));
     }
     let compiler_directives = compiler_directives(&operation.node, document)?;
+    let mut window = if compiler_directives.window {
+        Some(apply_window(
+            &mut operation.node,
+            manifest,
+            document,
+            operation.pos,
+        )?)
+    } else {
+        None
+    };
+    let operation = &*operation;
     let variables = compile_variables(&operation.node, document)?;
     let mut expander = FragmentExpander::new(&parsed.fragments, document);
     let root_fields =
@@ -147,6 +158,9 @@ pub(crate) fn compile_document(
             document,
             root_field.first.pos,
         )?;
+    }
+    if let Some(window) = &mut window {
+        bind_window_keys(window, &selection, document, operation.pos)?;
     }
     validate_used_variables(&variables, &used_variables, document, operation.pos)?;
     expander.reject_unused_fragments()?;
@@ -236,6 +250,7 @@ pub(crate) fn compile_document(
         variables,
         variable_codec,
         root,
+        window,
     })
 }
 
@@ -243,6 +258,7 @@ pub(crate) fn compile_document(
 pub(super) struct CompilerDirectives {
     load: bool,
     live: bool,
+    window: bool,
 }
 
 pub(super) fn compiler_directives(
@@ -272,6 +288,7 @@ pub(super) fn compiler_directives(
         match name {
             "load" => result.load = true,
             "live" => result.live = true,
+            "window" => result.window = true,
             "skip" | "include" => {
                 return Err(source_error(
                     "client.directive.conditional_unsupported",

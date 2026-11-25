@@ -1,10 +1,10 @@
-# The nested chat layout owns the finite live lobby window across child pages.
-query ChatMessages($limit: Int! = 25, $offset: Int! = 0) @load @live {
+# The nested chat layout owns the lobby window across child pages: the newest
+# 25 messages stay live, and `@window` pages older ones by keyset cursor.
+query ChatMessages($limit: Int! = 25) @load @live @window {
   chat_messages(
     where: { room_id: { _eq: "lobby" } }
     limit: $limit
-    offset: $offset
-    order_by: [{ created_at: desc }]
+    order_by: [{ created_at: desc }, { message_id: desc }]
   ) {
     message_id
     room_id

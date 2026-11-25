@@ -119,10 +119,11 @@ is not limited to `+page.graphql`:
 - [`routes/todos/+page.graphql`](ui/src/routes/todos/+page.graphql) is
   page-owned SSR data.
 - [`routes/chat/+layout.graphql`](ui/src/routes/chat/+layout.graphql) owns the
-  finite `@load @live` lobby window across `/chat` and `/chat/about`; navigation
-  retains one normalized replica and live subscription. Its `limit` and
-  `offset` live as GraphQL defaults, so SSR and `ChatMessages.use()` share the
-  same canonical variables without application-level boundary constants.
+  `@load @live @window` lobby across `/chat` and `/chat/about`; navigation
+  retains one normalized replica and live subscription. Its `limit` lives as a
+  GraphQL default, so SSR and `ChatMessages.useWindow()`'s live head share the
+  same canonical variables without application-level boundary constants;
+  `fetchMore()` adds older keyset pages to the same ordered `rows`.
 - [`routes/chat/+layout.public.graphql`](ui/src/routes/chat/+layout.public.graphql)
   is the authorization-specific anonymous copy. Surface-qualified route
   documents are still discovered as layout-owned islands.

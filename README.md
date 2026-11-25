@@ -424,8 +424,9 @@ its edge authenticates the request and returns what to dispatch. Call
 Auto-optimism is a cache update.
 
 The generated client is a **replica cache** of the authorized read-model
-slice, plus typed commands. The page reads `query.use()` and calls
-`commands.todo…`. It does not patch arrays or write `setState` recipes.
+slice, plus typed commands. The page reads `query.use()` (or a `@window`
+operation's `useWindow()`) and calls `commands.todo…`. It does not patch
+arrays, merge pages or write `setState` recipes.
 
 When a command fires, the replica applies the **same projection mutation**
 to the cache immediately. The server later writes SQL with that program;
@@ -509,13 +510,13 @@ operation and does not duplicate that wiring.
 [`tests/e2e-ui/ui/src/routes/chat/+layout.graphql`](tests/e2e-ui/ui/src/routes/chat/+layout.graphql)
 
 ```graphql
-# This nested layout owns one finite live window across /chat child pages.
-query ChatMessages($limit: Int! = 25, $offset: Int! = 0) @load @live {
+# This nested layout owns the lobby across /chat child pages: the newest page
+# is live and `@window` pages older messages by keyset cursor.
+query ChatMessages($limit: Int! = 25) @load @live @window {
   chat_messages(
     where: { room_id: { _eq: "lobby" } }
     limit: $limit
-    offset: $offset
-    order_by: [{ created_at: desc }]
+    order_by: [{ created_at: desc }, { message_id: desc }]
   ) {
     message_id
     body
@@ -527,7 +528,18 @@ query ChatMessages($limit: Int! = 25, $offset: Int! = 0) @load @live {
 GraphQL defaults are the preferred home for stable island inputs. They become
 optional in the generated TypeScript API and are canonicalized before cache
 identity or transport, so SSR can load this query and the component can simply
-call `ChatMessages.use()`. Route parameters with matching variable names are
+call `ChatMessages.use()`, or `ChatMessages.useWindow()` for a `@window`
+operation.
+
+`@window` turns `order_by` into a keyset: the compiler adds a nullable cursor
+variable per order column (and per primary-key column, which breaks ties) and
+ANDs "after the cursor" into `where`, so authorization row filters still apply
+to every page. With the cursor omitted the document is the head page that SSR
+loads and `@live` keeps current. `useWindow()` returns one ordered,
+de-duplicated `rows` list: the live head plus every older page `fetchMore()`
+loaded, with `hasMore`, `fetchingMore` and `fetchMoreError`. Arrivals at the
+head never shift a loaded page, because pages are keyed by row values, not
+offsets. Route parameters with matching variable names are
 inferred. Exceptional values such as search parameters, trusted session claims,
 or forwarded props live beside the document in `<document>.bindings.js`, not in
 the application-wide build configuration.
@@ -612,7 +624,7 @@ Start here in the code:
 |---|---|
 | [`ui/src/routes/todos/+page.graphql`](tests/e2e-ui/ui/src/routes/todos/+page.graphql) | Co-located read. `@load` → SSR seed; no hand-written load function for the list. |
 | [`ui/src/routes/todos/+page.svelte`](tests/e2e-ui/ui/src/routes/todos/+page.svelte) | `Todos.use()` + `useCommands()` — page never invents a cache or optimistic recipe. |
-| [`ui/src/routes/chat/+layout.graphql`](tests/e2e-ui/ui/src/routes/chat/+layout.graphql) | Same document does layout-retained SSR **and** live: `@load @live`. |
+| [`ui/src/routes/chat/+layout.graphql`](tests/e2e-ui/ui/src/routes/chat/+layout.graphql) | Same document does layout-retained SSR, live **and** history: `@load @live @window`. |
 | [`ui/src/lib/components/blob/SelectedBlobGame.graphql`](tests/e2e-ui/ui/src/lib/components/blob/SelectedBlobGame.graphql) | Reusable component island promoted to the nearest static route boundary; one route-param binding drives SSR and component reads. |
 | [`ui/src/routes/blob/[[gameId]]/+page.svelte`](tests/e2e-ui/ui/src/routes/blob/[[gameId]]/+page.svelte) | Arrow keys → `commands.blob.move`; board from `BlobGames.use()`. |
 | [`crates/service/src/modules/compose.rs`](tests/e2e-ui/crates/service/src/modules/compose.rs) | One `Service` lists modules. No `Runtime::role`. |

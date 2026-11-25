@@ -221,6 +221,10 @@ export type {
 	ReplicaVariableScalarInputRef,
 	ReplicaValue,
 	ReplicaWatch,
+	ReplicaWindowArtifact,
+	ReplicaWindowKey,
+	ReplicaWindowOperationArtifact,
+	ReplicaWindowRow,
 	ReplicaWriteSource,
 	WatchReplicaOptions
 } from './types.js';

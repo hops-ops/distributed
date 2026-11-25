@@ -179,12 +179,11 @@ preview_reduce_known_record:
 // No TypeScript board rules.`;
 
 	const codeLive = `# The nested layout retains one live window across child pages.
-query ChatMessages($limit: Int!, $offset: Int!) @load @live {
+query ChatMessages($limit: Int! = 25) @load @live @window {
   chat_messages(
     where: { room_id: { _eq: "lobby" } }
     limit: $limit
-    offset: $offset
-    order_by: [{ created_at: desc }]
+    order_by: [{ created_at: desc }, { message_id: desc }]
   ) {
     message_id
     body

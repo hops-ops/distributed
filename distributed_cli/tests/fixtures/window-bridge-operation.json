@@ -1,0 +1,523 @@
+{
+  "id": "sha256:21c88949d1f8a6cbc87b37c7b67475098043567474998275e2859c56315718a3",
+  "document": "query Feed($cursor_id: ID, $cursor_priority: Int, $cursor_tenantId: ID, $limit: Int! = 10) {\n  todos(limit: $limit, order_by: [{priority: desc}], where: {_and: [{completed: {_eq: false}}, {_or: [{priority: {_lt: $cursor_priority}}, {priority: {_eq: $cursor_priority}, tenantId: {_gt: $cursor_tenantId}}, {id: {_gt: $cursor_id}, priority: {_eq: $cursor_priority}, tenantId: {_eq: $cursor_tenantId}}]}]}) {\n    id\n    tenantId\n    rank: priority\n    title\n    _distributed_typename: __typename\n    _distributed_completed: completed\n  }\n}\n",
+  "source": {
+    "path": "src/routes/feed/+page.graphql",
+    "line": 2,
+    "column": 3
+  },
+  "variableCodec": {
+    "version": 2,
+    "limits": {
+      "maxDepth": 8,
+      "maxBoolWidth": 256,
+      "maxInList": 1000
+    },
+    "variables": {
+      "cursor_id": {
+        "kind": "scalar",
+        "scalar": "ID",
+        "codec": "string",
+        "nullable": true
+      },
+      "cursor_priority": {
+        "kind": "scalar",
+        "scalar": "Int",
+        "codec": "int32",
+        "nullable": true
+      },
+      "cursor_tenantId": {
+        "kind": "scalar",
+        "scalar": "ID",
+        "codec": "string",
+        "nullable": true
+      },
+      "limit": {
+        "kind": "scalar",
+        "scalar": "Int",
+        "codec": "int32",
+        "nullable": false
+      }
+    },
+    "defaults": {
+      "limit": 10
+    },
+    "inputs": {}
+  },
+  "roots": [
+    {
+      "responseKey": "todos",
+      "field": "todos",
+      "cardinality": "many",
+      "nullable": false,
+      "arguments": {
+        "limit": {
+          "kind": "variable",
+          "name": "limit"
+        },
+        "order_by": {
+          "kind": "literal",
+          "value": [
+            {
+              "priority": "desc"
+            }
+          ]
+        },
+        "where": {
+          "kind": "object",
+          "fields": {
+            "_and": {
+              "kind": "list",
+              "items": [
+                {
+                  "kind": "literal",
+                  "value": {
+                    "completed": {
+                      "_eq": false
+                    }
+                  }
+                },
+                {
+                  "kind": "object",
+                  "fields": {
+                    "_or": {
+                      "kind": "list",
+                      "items": [
+                        {
+                          "kind": "object",
+                          "fields": {
+                            "priority": {
+                              "kind": "object",
+                              "fields": {
+                                "_lt": {
+                                  "kind": "variable",
+                                  "name": "cursor_priority"
+                                }
+                              }
+                            }
+                          }
+                        },
+                        {
+                          "kind": "object",
+                          "fields": {
+                            "priority": {
+                              "kind": "object",
+                              "fields": {
+                                "_eq": {
+                                  "kind": "variable",
+                                  "name": "cursor_priority"
+                                }
+                              }
+                            },
+                            "tenantId": {
+                              "kind": "object",
+                              "fields": {
+                                "_gt": {
+                                  "kind": "variable",
+                                  "name": "cursor_tenantId"
+                                }
+                              }
+                            }
+                          }
+                        },
+                        {
+                          "kind": "object",
+                          "fields": {
+                            "id": {
+                              "kind": "object",
+                              "fields": {
+                                "_gt": {
+                                  "kind": "variable",
+                                  "name": "cursor_id"
+                                }
+                              }
+                            },
+                            "priority": {
+                              "kind": "object",
+                              "fields": {
+                                "_eq": {
+                                  "kind": "variable",
+                                  "name": "cursor_priority"
+                                }
+                              }
+                            },
+                            "tenantId": {
+                              "kind": "object",
+                              "fields": {
+                                "_eq": {
+                                  "kind": "variable",
+                                  "name": "cursor_tenantId"
+                                }
+                              }
+                            }
+                          }
+                        }
+                      ]
+                    }
+                  }
+                }
+              ]
+            }
+          }
+        }
+      },
+      "dependencies": [
+        "todo_rows"
+      ],
+      "coverage": {
+        "kind": "offset",
+        "offsetArgument": "offset",
+        "limitArgument": "limit",
+        "defaultLimit": 25,
+        "maxLimit": 100
+      },
+      "filter": {
+        "input": {
+          "kind": "object",
+          "fields": {
+            "_and": {
+              "kind": "list",
+              "items": [
+                {
+                  "kind": "literal",
+                  "value": {
+                    "completed": {
+                      "_eq": false
+                    }
+                  }
+                },
+                {
+                  "kind": "object",
+                  "fields": {
+                    "_or": {
+                      "kind": "list",
+                      "items": [
+                        {
+                          "kind": "object",
+                          "fields": {
+                            "priority": {
+                              "kind": "object",
+                              "fields": {
+                                "_lt": {
+                                  "kind": "variable",
+                                  "name": "cursor_priority"
+                                }
+                              }
+                            }
+                          }
+                        },
+                        {
+                          "kind": "object",
+                          "fields": {
+                            "priority": {
+                              "kind": "object",
+                              "fields": {
+                                "_eq": {
+                                  "kind": "variable",
+                                  "name": "cursor_priority"
+                                }
+                              }
+                            },
+                            "tenantId": {
+                              "kind": "object",
+                              "fields": {
+                                "_gt": {
+                                  "kind": "variable",
+                                  "name": "cursor_tenantId"
+                                }
+                              }
+                            }
+                          }
+                        },
+                        {
+                          "kind": "object",
+                          "fields": {
+                            "id": {
+                              "kind": "object",
+                              "fields": {
+                                "_gt": {
+                                  "kind": "variable",
+                                  "name": "cursor_id"
+                                }
+                              }
+                            },
+                            "priority": {
+                              "kind": "object",
+                              "fields": {
+                                "_eq": {
+                                  "kind": "variable",
+                                  "name": "cursor_priority"
+                                }
+                              }
+                            },
+                            "tenantId": {
+                              "kind": "object",
+                              "fields": {
+                                "_eq": {
+                                  "kind": "variable",
+                                  "name": "cursor_tenantId"
+                                }
+                              }
+                            }
+                          }
+                        }
+                      ]
+                    }
+                  }
+                }
+              ]
+            }
+          }
+        },
+        "fields": [
+          {
+            "field": "completed",
+            "scalar": "Boolean",
+            "codec": "boolean",
+            "nullable": false,
+            "operators": [
+              "_eq"
+            ]
+          },
+          {
+            "field": "id",
+            "scalar": "ID",
+            "codec": "string",
+            "nullable": false,
+            "operators": [
+              "_eq",
+              "_gt",
+              "_gte",
+              "_in",
+              "_lt",
+              "_lte",
+              "_neq",
+              "_nin"
+            ]
+          },
+          {
+            "field": "priority",
+            "scalar": "Int",
+            "codec": "int32",
+            "nullable": false,
+            "operators": [
+              "_eq",
+              "_gt",
+              "_gte",
+              "_in",
+              "_lt",
+              "_lte",
+              "_neq",
+              "_nin"
+            ]
+          },
+          {
+            "field": "tenantId",
+            "scalar": "ID",
+            "codec": "string",
+            "nullable": false,
+            "operators": [
+              "_eq",
+              "_gt",
+              "_gte",
+              "_in",
+              "_lt",
+              "_lte",
+              "_neq",
+              "_nin"
+            ]
+          },
+          {
+            "field": "title",
+            "scalar": "String",
+            "codec": "string",
+            "nullable": true,
+            "operators": [
+              "_eq"
+            ]
+          }
+        ],
+        "relationships": [
+          {
+            "field": "owner",
+            "targetModel": "Todo",
+            "kind": "belongs_to",
+            "keyMapping": {
+              "kind": "embedded"
+            },
+            "maintenance": "revalidate",
+            "dependencies": [
+              "todo_rows"
+            ]
+          }
+        ],
+        "rowPolicy": {
+          "kind": "unrestricted"
+        }
+      },
+      "order": {
+        "input": {
+          "kind": "literal",
+          "value": [
+            {
+              "priority": "desc"
+            }
+          ]
+        },
+        "fields": [
+          {
+            "field": "completed",
+            "scalar": "Boolean",
+            "codec": "boolean",
+            "nullable": false
+          },
+          {
+            "field": "id",
+            "scalar": "ID",
+            "codec": "string",
+            "nullable": false
+          },
+          {
+            "field": "priority",
+            "scalar": "Int",
+            "codec": "int32",
+            "nullable": false
+          },
+          {
+            "field": "tenantId",
+            "scalar": "ID",
+            "codec": "string",
+            "nullable": false
+          },
+          {
+            "field": "title",
+            "scalar": "String",
+            "codec": "string",
+            "nullable": true
+          }
+        ],
+        "tieBreakers": [
+          {
+            "field": "tenantId",
+            "scalar": "ID",
+            "codec": "string",
+            "nullable": false
+          },
+          {
+            "field": "id",
+            "scalar": "ID",
+            "codec": "string",
+            "nullable": false
+          }
+        ]
+      },
+      "pagination": {
+        "kind": "offset",
+        "insert": "local",
+        "delete": "local",
+        "reorder": "local",
+        "stableUpdate": "local"
+      },
+      "selection": {
+        "typename": "todo",
+        "storage": {
+          "kind": "normalized",
+          "model": "Todo",
+          "identityFields": [
+            "tenantId",
+            "id"
+          ]
+        },
+        "members": [
+          {
+            "kind": "scalar",
+            "responseKey": "id",
+            "field": "id",
+            "codec": "string",
+            "nullable": false
+          },
+          {
+            "kind": "scalar",
+            "responseKey": "tenantId",
+            "field": "tenantId",
+            "codec": "string",
+            "nullable": false
+          },
+          {
+            "kind": "scalar",
+            "responseKey": "rank",
+            "field": "priority",
+            "codec": "int32",
+            "nullable": false
+          },
+          {
+            "kind": "scalar",
+            "responseKey": "title",
+            "field": "title",
+            "codec": "string",
+            "nullable": true
+          },
+          {
+            "kind": "scalar",
+            "responseKey": "_distributed_typename",
+            "field": "__typename",
+            "codec": "string",
+            "nullable": false,
+            "expose": false
+          },
+          {
+            "kind": "scalar",
+            "responseKey": "_distributed_completed",
+            "field": "completed",
+            "codec": "boolean",
+            "nullable": false,
+            "expose": false
+          }
+        ]
+      }
+    }
+  ],
+  "protocol": {
+    "version": 1,
+    "schemaHash": "sha256:27667306997e93238b5d79623e69c6277fe136d82d1cfbd2728234eb5f6d8d6d",
+    "protocolHash": "sha256:0dfa8a3f49e17d8d99c5c095c1ed14f528cae3e55fbc2f2b852975a50936ec5b",
+    "surface": {
+      "kind": "role",
+      "name": "user"
+    },
+    "operation": "sha256:21c88949d1f8a6cbc87b37c7b67475098043567474998275e2859c56315718a3",
+    "trustedPresets": []
+  },
+  "live": {
+    "id": "sha256:98055441aefa992fbb5f32e6139746325d8dbaecbd831555adc657b40f7d163a",
+    "document": "subscription Feed_Live($cursor_id: ID, $cursor_priority: Int, $cursor_tenantId: ID, $limit: Int! = 10) {\n  todos(limit: $limit, order_by: [{priority: desc}], where: {_and: [{completed: {_eq: false}}, {_or: [{priority: {_lt: $cursor_priority}}, {priority: {_eq: $cursor_priority}, tenantId: {_gt: $cursor_tenantId}}, {id: {_gt: $cursor_id}, priority: {_eq: $cursor_priority}, tenantId: {_eq: $cursor_tenantId}}]}]}) {\n    id\n    tenantId\n    rank: priority\n    title\n    _distributed_typename: __typename\n    _distributed_completed: completed\n  }\n}\n"
+  },
+  "window": {
+    "limitVariable": "limit",
+    "pageSize": 10,
+    "maxLimit": 100,
+    "keys": [
+      {
+        "field": "priority",
+        "responseKey": "rank",
+        "variable": "cursor_priority",
+        "direction": "desc",
+        "codec": "int32"
+      },
+      {
+        "field": "tenantId",
+        "responseKey": "tenantId",
+        "variable": "cursor_tenantId",
+        "direction": "asc",
+        "codec": "string"
+      },
+      {
+        "field": "id",
+        "responseKey": "id",
+        "variable": "cursor_id",
+        "direction": "asc",
+        "codec": "string"
+      }
+    ]
+  }
+}

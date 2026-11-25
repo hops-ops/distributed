@@ -423,13 +423,12 @@ export const chatWalkthrough: DemoWalkthrough = {
 			samples: [
 				{
 					file: 'routes/chat/+layout.graphql',
-					caption: '`@load` fills SSR. `@live` sends WebSocket frames for the same retained layout document.',
-					code: `query ChatMessages($limit: Int! = 25, $offset: Int! = 0) @load @live {
+					caption: '`@load` fills SSR. `@live` sends WebSocket frames for the same retained layout document. `@window` pages older rows by keyset cursor; `order_by` is the cursor.',
+					code: `query ChatMessages($limit: Int! = 25) @load @live @window {
   chat_messages(
     where: { room_id: { _eq: "lobby" } }
     limit: $limit
-    offset: $offset
-    order_by: [{ created_at: desc }]
+    order_by: [{ created_at: desc }, { message_id: desc }]
   ) {
     message_id
     room_id
@@ -470,14 +469,12 @@ pub struct ChatMessages {
 				},
 				{
 					file: 'routes/chat/+page.svelte',
-					caption: 'The hook binds the replica. The page reverses the list for display.',
-					code: `const lobby = ChatMessages.use();
-const livePage = $derived.by(() => {
-  const pageMessages = Array.isArray($lobby.data?.chat_messages)
-    ? $lobby.data.chat_messages
-    : [];
-  return [...pageMessages].reverse();
-});`
+					caption: 'The newest page stays live; `fetchMore()` adds older pages. `rows` is one ordered, de-duplicated list, so the page only reverses it for display.',
+					code: `const lobby = ChatMessages.useWindow();
+const messages = $derived([...$lobby.rows].reverse());
+
+// Scroll-up, or the "earlier messages" button:
+await lobby.fetchMore(); // $lobby.hasMore, .fetchingMore, .fetchMoreError`
 				}
 			]
 		},
