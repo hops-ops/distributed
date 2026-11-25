@@ -22,10 +22,6 @@ use crate::client_compiler::{
     check_client_project, compile_client, write_client_project, ClientCompileInput, ClientDocument,
     ClientSurfaceIdentity,
 };
-use crate::contracts::{
-    contracts_accept, contracts_check, unknown_scope_diagnostic, ContractAcceptScope,
-    ContractCatalog,
-};
 use crate::js_framework::watch_local_javascript;
 use crate::lifecycle::{
     activate_lifecycle_project_generation, discover_lifecycle_project, run_lifecycle_project_build,
@@ -59,8 +55,6 @@ pub enum DistributedCommands {
     Build(BuildArgs),
     /// Run one coherent local application supervisor
     Dev(DevArgs),
-    /// Aggregate contract lifecycle check and accept
-    Contracts(ContractsArgs),
     /// Scaffold a new Distributed microservice crate
     #[command(alias = "create")]
     Scaffold(ScaffoldArgs),
@@ -141,55 +135,6 @@ pub struct DevArgs {
     /// Maximum wait for another lifecycle build process
     #[arg(long, default_value_t = 10_000)]
     pub lock_timeout_ms: u64,
-}
-
-#[derive(Args, Debug)]
-pub struct ContractsArgs {
-    #[command(subcommand)]
-    pub command: ContractsCommands,
-}
-
-#[derive(Subcommand, Debug)]
-pub enum ContractsCommands {
-    /// Read-only aggregate contract check (never writes tracked files)
-    Check(ContractsCheckArgs),
-    /// Exact-scope accept with staging, atomic replace, and rollback
-    Accept(ContractsAcceptArgs),
-}
-
-#[derive(Args, Debug)]
-pub struct ContractsCheckArgs {
-    /// Catalog root directory
-    #[arg(long, default_value = ".")]
-    pub root: PathBuf,
-    /// Path to the contract catalog JSON (relative to root or absolute)
-    #[arg(long, default_value = "distributed.contracts.json")]
-    pub catalog: PathBuf,
-    /// Output format
-    #[arg(long, value_enum, default_value = "human")]
-    pub output: ContractsOutput,
-}
-
-#[derive(Args, Debug)]
-pub struct ContractsAcceptArgs {
-    /// Catalog root directory
-    #[arg(long, default_value = ".")]
-    pub root: PathBuf,
-    /// Exact accept scope (no broad wildcards)
-    #[arg(long)]
-    pub scope: String,
-    /// Staged payload file: JSON object mapping portable relative paths to UTF-8 contents
-    #[arg(long)]
-    pub staged: PathBuf,
-    /// Output format
-    #[arg(long, value_enum, default_value = "human")]
-    pub output: ContractsOutput,
-}
-
-#[derive(Clone, Copy, Debug, ValueEnum)]
-pub enum ContractsOutput {
-    Human,
-    Json,
 }
 
 #[derive(Args, Debug)]
@@ -657,7 +602,6 @@ pub fn run(args: &DistributedArgs, command_prefix: &[&str]) -> Result<(), Box<dy
     match &args.command {
         DistributedCommands::Build(build) => run_build(build, command_prefix),
         DistributedCommands::Dev(dev) => run_dev(dev, command_prefix),
-        DistributedCommands::Contracts(contracts) => run_contracts(contracts),
         DistributedCommands::Scaffold(scaffold) => run_scaffold(scaffold),
         DistributedCommands::Describe(describe) => run_describe(describe),
         DistributedCommands::Client(client) => run_client(client),
@@ -1124,86 +1068,6 @@ fn run_dev(args: &DevArgs, command_prefix: &[&str]) -> Result<(), Box<dyn Error>
         println!("process={process} restarts={count}");
     }
     Ok(())
-}
-
-fn run_contracts(args: &ContractsArgs) -> Result<(), Box<dyn Error>> {
-    match &args.command {
-        ContractsCommands::Check(check) => run_contracts_check(check),
-        ContractsCommands::Accept(accept) => run_contracts_accept(accept),
-    }
-}
-
-fn run_contracts_check(args: &ContractsCheckArgs) -> Result<(), Box<dyn Error>> {
-    let root = absolute_path(&args.root)?;
-    let catalog_path = if args.catalog.is_absolute() {
-        args.catalog.clone()
-    } else {
-        root.join(&args.catalog)
-    };
-    let catalog = ContractCatalog::from_path(&catalog_path)?;
-    let report = contracts_check(&catalog, &root, std::iter::empty());
-    match args.output {
-        ContractsOutput::Human => {
-            if report.human.is_empty() {
-                println!("contracts check: ok");
-            } else {
-                println!("{}", report.human);
-            }
-        }
-        ContractsOutput::Json => {
-            println!("{}", serde_json::to_string_pretty(&report.result)?);
-        }
-    }
-    if report.ok {
-        Ok(())
-    } else {
-        Err("contracts check failed".into())
-    }
-}
-
-fn run_contracts_accept(args: &ContractsAcceptArgs) -> Result<(), Box<dyn Error>> {
-    let Some(scope) = ContractAcceptScope::parse(&args.scope) else {
-        let diagnostic = unknown_scope_diagnostic(&args.scope);
-        return Err(diagnostic.human().into());
-    };
-    let root = absolute_path(&args.root)?;
-    let staged_source = fs::read_to_string(&args.staged)?;
-    let staged_json: serde_json::Value = serde_json::from_str(&staged_source)?;
-    let object = staged_json
-        .as_object()
-        .ok_or("staged payload must be a JSON object of path -> string contents")?;
-    let mut staged = BTreeMap::new();
-    for (path, value) in object {
-        let contents = value
-            .as_str()
-            .ok_or_else(|| format!("staged path `{path}` must map to a UTF-8 string"))?;
-        staged.insert(path.clone(), contents.as_bytes().to_vec());
-    }
-    let report = contracts_accept(&root, scope, &staged)?;
-    match args.output {
-        ContractsOutput::Human => {
-            if report.noop {
-                println!("contracts accept: no-op ({})", report.scope);
-            } else {
-                println!(
-                    "contracts accept: updated {} path(s) for scope {}",
-                    report.changed_paths.len(),
-                    report.scope
-                );
-                for path in &report.changed_paths {
-                    println!("  {path}");
-                }
-            }
-        }
-        ContractsOutput::Json => {
-            println!("{}", serde_json::to_string_pretty(&report)?);
-        }
-    }
-    if report.ok {
-        Ok(())
-    } else {
-        Err("contracts accept failed".into())
-    }
 }
 
 fn run_skills_list() -> Result<(), Box<dyn Error>> {

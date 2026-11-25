@@ -9,7 +9,7 @@
 
 .PHONY: all up down run run-api stop test ci-offline test-domain test-suite \
 	test-browser test-browser-install application-build js-install js-build ui-install ui-test \
-	contracts-check check clean help \
+	check clean help \
 	up-celld-nats down-celld-nats down-celld test-celld test-celld-http test-celld-nats
 
 # Defaults only — do NOT `include e2e-ui.env` (shell-quoted dotenv breaks Make).
@@ -280,10 +280,6 @@ ui-install: js-build
 
 ui-test:
 	cd ui && $(NPM) test
-
-## Aggregate read-only contract check (the repository's distributed.contracts.json).
-contracts-check:
-	$(MAKE) -C ../.. contracts-check
 
 check: application-build
 	cargo check --workspace

@@ -1,10 +1,10 @@
 //! The `distributed` CLI for Distributed applications — both a binary and a library.
 //!
-//! It bundles pure generation (`generate` / `atlas`), the contract lifecycle
-//! surface (`contracts`), and the clap command surface (`cli`). The standalone
-//! binary parses [`DistributedArgs`] and dispatches with [`run`]. A host CLI
-//! such as `hops` mounts the same arguments under one of its commands and
-//! passes that command to [`run`].
+//! It bundles pure generation (`generate` / `atlas`), the build/dev lifecycle
+//! (`lifecycle`, over the catalog records in `contracts`), and the clap
+//! command surface (`cli`). The standalone binary parses [`DistributedArgs`]
+//! and dispatches with [`run`]. A host CLI such as `hops` mounts the same
+//! arguments under one of its commands and passes that command to [`run`].
 
 mod atlas;
 mod cli;
@@ -26,8 +26,7 @@ mod wasm_pures;
 
 pub use atlas::{render_atlas_schema, AtlasDatabaseUrl, AtlasSchemaSpec};
 pub use cli::{
-    run, AgentHarness, BuildArgs, Bus, ClientArgs, ClientManifestArgs, ContractsAcceptArgs,
-    ContractsArgs, ContractsCheckArgs, ContractsCommands, ContractsOutput, DescribeArgs, DevArgs,
+    run, AgentHarness, BuildArgs, Bus, ClientArgs, ClientManifestArgs, DescribeArgs, DevArgs,
     DistributedArgs, DistributedCommands, Framework, GameClientArgs, GameManifestArgs,
     GameWasmArgs, GitopsPromote, JavascriptWatchArgs, LifecycleOutput, ManifestFormat, Metrics,
     ProbeArgs, ScaffoldArgs, SchemaArgs, SchemaDialect, SchemaFormat, SkillsArgs, SkillsCommands,
@@ -39,25 +38,6 @@ pub use client_compiler::{
     GeneratedIslandDirectives, GeneratedIslandLiveCoverage, GeneratedIslandPlan,
     GeneratedIslandSource, GeneratedIslandVariable, GeneratedIslandVariableSchema,
     GeneratedOperationSummary,
-};
-pub use contracts::{
-    check_migration_history, check_migration_inventory, check_predecessor_chain,
-    classify_release_programs, classify_snapshot_diff, close_local_contract_chain,
-    contracts_accept, contracts_check, diff_snapshots, snapshot_from_json, ArtifactIdentity,
-    ArtifactPredecessor, ArtifactProvenance, BaselineAvailability, ClassifiedChange,
-    ClientDeclaration, ClientInventory, ClientProgramArtifact, ClientProgramAsset,
-    ClientProgramDescriptor, ClientProgramSurface, ContractAcceptScope, ContractArtifactKind,
-    ContractCatalog, ContractCheckResult, ContractDiagnostic, ContractDiagnosticCode,
-    ContractEntry, ContractError, ContractScope, ContractsAcceptReport, ContractsCheckReport,
-    EnvironmentPolicyReference, LifecycleDecision, MigrationDialect, MigrationEntry, MigrationFile,
-    MigrationHistoryCheck, MigrationInventory, ObservedPredecessor, ProgramCompatibility,
-    SafeDiagnosticValue, SemanticSnapshot, SnapshotChange, SnapshotDiff, SnapshotEntry,
-    MAX_CATALOG_BYTES, MAX_CATALOG_DIRECTORIES, MAX_CATALOG_DIRECTORY_DEPTH,
-    MAX_CATALOG_DIRECTORY_ENTRIES, MAX_CATALOG_ENTRIES, MAX_CATALOG_FILES,
-    MAX_CATALOG_GLOB_MATCHES, MAX_CATALOG_JSON_DEPTH, MAX_MIGRATIONS,
-    MAX_MIGRATION_INVENTORY_BYTES, MAX_MIGRATION_SQL_BYTES, MAX_SNAPSHOT_DEPTH, MAX_SNAPSHOT_PATHS,
-    MAX_SNAPSHOT_VALUE_BYTES, MIGRATION_INVENTORY_PATH, MIGRATION_INVENTORY_SCHEMA_VERSION,
-    MIGRATION_OWNER, MIGRATION_SCOPE,
 };
 pub use game_client::{generate_game_client, validate_game_surface, ImportExtension};
 pub use generate::{generate_service_scaffold, package_name};

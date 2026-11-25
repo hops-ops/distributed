@@ -5,7 +5,7 @@
 //! tests at the end run the `distributed` binary on a real Cargo project.
 
 use distributed_cli::{
-    run_lifecycle_project_build, run_lifecycle_project_dev, ContractCatalog, LifecycleActivation,
+    run_lifecycle_project_build, run_lifecycle_project_dev, LifecycleActivation,
     LifecycleBuildReport, LifecycleBuildRequest, LifecycleDevReport, LifecycleError,
     LifecycleProjectDevOptions, LifecycleProjectPlan,
 };
@@ -64,8 +64,7 @@ impl Fixture {
     fn plan(&self) -> LifecycleProjectPlan {
         LifecycleProjectPlan {
             root: self.root.clone(),
-            catalog: ContractCatalog::from_json_str(&self.catalog.to_string())
-                .expect("parse lifecycle catalog"),
+            catalog: serde_json::from_value(self.catalog.clone()).expect("parse lifecycle catalog"),
             config: serde_json::from_value(self.config.clone()).expect("parse lifecycle config"),
             out: "dist/distributed".into(),
             cli_executable: env!("CARGO_BIN_EXE_distributed").into(),

@@ -300,13 +300,11 @@ pub fn discover_lifecycle_project(
         provenance: ArtifactProvenance {
             sources,
             generator: "distributed.application-manifest".to_string(),
-            source_revision: None,
             glob_limit: None,
         },
         predecessor: None,
         outputs: BTreeMap::from([("manifest".to_string(), APPLICATION_OUTPUT.to_string())]),
         lifecycle: BTreeSet::from(["build".to_string(), "check".to_string(), "dev".to_string()]),
-        environment_policy: None,
     };
     let mut entries = BTreeMap::from([(APPLICATION_NODE.to_string(), application_entry)]);
     if let Some(client) = &client_lifecycle {
@@ -328,7 +326,6 @@ pub fn discover_lifecycle_project(
                 provenance: ArtifactProvenance {
                     sources: client_sources,
                     generator: "distributed.sveltekit-clients".to_string(),
-                    source_revision: None,
                     glob_limit: Some(MAX_CATALOG_GLOB_MATCHES),
                 },
                 predecessor: Some(ArtifactPredecessor {
@@ -341,7 +338,6 @@ pub fn discover_lifecycle_project(
                     "check".to_string(),
                     "dev".to_string(),
                 ]),
-                environment_policy: None,
             },
         );
     }
