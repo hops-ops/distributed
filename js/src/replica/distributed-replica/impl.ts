@@ -1197,7 +1197,6 @@ export class DistributedReplicaImpl implements DistributedReplicaApi {
 					kind: 'normalization',
 					operation: artifact.id,
 					source,
-					records: this.#engine.recordCount,
 					indexes: summary.indexKeys.length,
 					partial:
 						summary.partial ||
