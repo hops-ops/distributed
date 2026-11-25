@@ -328,7 +328,8 @@ pub fn spawn_scrape_loop(service: Arc<Service>, cfg: ZitadelScrapeConfig) {
 async fn scrape_once(service: &Service, trigger: &str) {
     match crate::handlers::ingestors::zitadel_scrape::scrape(service, trigger).await {
         Ok(report) => eprintln!("zitadel scrape ({trigger}): {report}"),
-        Err(error) => eprintln!("zitadel scrape ({trigger}): {error}"),
+        // The operator's log: the full cause, not the client-facing message.
+        Err(error) => eprintln!("zitadel scrape ({trigger}) failed: {error:?}"),
     }
 }
 

@@ -78,8 +78,8 @@ pub struct Todos {
     pub status: String,
 }
 
-impl Todos {
-    pub fn permissions() -> ModelPermissions<Self> {
+impl AuthorizedReadModel for Todos {
+    fn permissions() -> ModelPermissions<Self> {
         ModelPermissions::new()
             .grant(
                 "user",
@@ -195,17 +195,18 @@ query Todos @load {
   todos { todo_id title status }
 }`;
 
-	const codeService = `// compose.rs (trimmed). Each routes(...) takes repo, locks,
-// read models, and the projection owner for that module.
-pub const MODULE_IDS: &[&str] = &[
-  todo::MODULE_ID, chat::MODULE_ID, blob::MODULE_ID, "identity",
-];
-
-Service::new()
-  .named("e2e-ui")
-  .routes(todo::routes(repo.clone(), locks.clone(), read_models.clone(), projections.todo))
-  .routes(chat::routes(repo.clone(), locks.clone(), read_models.clone(), projections.chat))
-  .routes(blob::routes(repo, locks, read_models, projections.blob))
+	const codeService = `// compose.rs (trimmed). Each module takes the stores and the
+// projections mounted from their descriptors.
+pub fn build_service<St: ServiceStores>(stores: &St) -> Service {
+  let projections = projections();
+  Service::new()
+    .named("e2e-ui")
+    .routes(todo::routes(stores, &projections))
+    .routes(chat::routes(stores, &projections))
+    .routes(blob::routes(stores))
+    .routes(identity::routes(stores, &projections))
+}
+// The application manifest's modules are derived from this Service.
 
 // Another crate can list the same modules, or only Eventual projectors.
 // You write that Service. You do not flip a Runtime::role flag.`;

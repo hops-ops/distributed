@@ -3,35 +3,23 @@
 //! No aggregate: the commands publish user profiles as external facts, which
 //! commit with their ledger receipts; the `AUTH_USERS` projection writes them.
 
-use distributed::graphql::SurfaceProjector;
-use distributed::microsvc::{ConfigurableOutboxPublisher, HasOutboxStore, HasRepo, Routes};
-use distributed::AggregateRepository;
+use distributed::microsvc::{Routes, ServiceStores, StoreDependencies};
+use distributed::LocalProjectionMounts;
+use e2e_projections::AUTH_USERS;
 
-use crate::bounds::{EventStore, ReadStore};
-use crate::deps::AuthDeps;
 use crate::handlers::ingestors::{zitadel, zitadel_scrape};
 
-pub const MODULE_ID: &str = "identity";
-
-/// Prefix of this module's command names (they are named for the provider).
-pub const COMMAND_PREFIX: &str = "zitadel.";
-
-pub fn routes<R, S>(
-    repo: R,
-    read_models: S,
-    auth_projector: SurfaceProjector,
-) -> Routes<AuthDeps<R, S>>
-where
-    R: EventStore,
-    S: ReadStore,
-    AggregateRepository<R, ()>:
-        HasRepo + HasOutboxStore + ConfigurableOutboxPublisher + Send + Sync + 'static,
-{
-    let scrape = zitadel_scrape::Scrape(read_models.clone());
-    Routes::for_stores(repo, read_models)
+/// Mount the Zitadel ingress and scrape commands and the auth_users
+/// projection.
+pub fn routes<St: ServiceStores>(
+    stores: &St,
+    projections: &LocalProjectionMounts,
+) -> Routes<StoreDependencies<St>> {
+    let scrape = zitadel_scrape::Scrape(stores.read_models().clone());
+    Routes::for_stores(stores.events().clone(), stores.read_models().clone())
         .typed_command(zitadel::command())
         .handle(zitadel::handle)
         .typed_command(zitadel_scrape::command())
         .handle(scrape)
-        .consume_projection(auth_projector)
+        .consume_projection(projections.projector(AUTH_USERS))
 }

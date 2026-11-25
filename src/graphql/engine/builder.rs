@@ -76,6 +76,11 @@ impl GraphqlEngineBuilder {
         self
     }
 
+    /// Expose every model of `models` with its own permissions.
+    pub fn read_models(self, models: &crate::graphql::ReadModels) -> Self {
+        models.register(self)
+    }
+
     pub fn model<M: RelationalReadModelIncludes>(mut self, perms: ModelPermissions<M>) -> Self {
         let schema = M::schema().clone();
         if let Err(e) = self.insert_catalog(schema.clone(), true) {

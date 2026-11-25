@@ -10,7 +10,6 @@ mod force_archive;
 mod purge;
 mod rename;
 mod reopen;
-mod support;
 
 pub use archive::{archive, Archive, TodoArchiveInput, TodoArchivePayload};
 pub use complete::{complete, Complete, TodoCompleteInput, TodoStatusPayload};

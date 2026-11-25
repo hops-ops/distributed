@@ -12,7 +12,7 @@
 use distributed::graphql::SurfaceProjector;
 use distributed::projection::lower::{EventualOnly, ProjectionDescriptor};
 use distributed::{
-    mutation_file, LocalProjectionMountsBuilder, Mutation, ReadModel, ReadModelCatalog,
+    mutation_file, LocalProjectionMounts, Mutation, ReadModel, ReadModelCatalog,
     RelationalReadModel,
 };
 use serde::{Deserialize, Serialize};
@@ -21,10 +21,6 @@ use crate::CrawlerMobKilledDomainEvent;
 
 /// Application of the read model (catalog and projector owner).
 pub const APPLICATION: &str = "mobpit";
-/// Projection name.
-pub const PROJECTOR: &str = "project_player_stats";
-/// Projection epoch: bump to rebuild the table from the bus log.
-pub const EPOCH: &str = "mobpit-player-stats-v1";
 
 /// One player's settled progress (a projection of their Crawler cell).
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, ReadModel)]
@@ -70,12 +66,9 @@ pub fn read_model_catalog() -> ReadModelCatalog {
 
 /// The modeled projector mount for [`PLAYER_STATS`].
 pub fn projector() -> SurfaceProjector {
-    LocalProjectionMountsBuilder::new(APPLICATION, "ordered-domain-events")
-        .expect("projection source")
-        .eventual_model::<PlayerStats, _>(PROJECTOR, PLAYER_STATS, EPOCH)
-        .expect("player stats mount")
+    LocalProjectionMounts::builder(APPLICATION, "ordered-domain-events")
+        .eventual(PLAYER_STATS)
         .build()
-        .expect("projection catalog")
-        .projector(PROJECTOR)
-        .expect("player stats projector")
+        .expect("player stats projection")
+        .projector(PLAYER_STATS)
 }

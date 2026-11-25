@@ -1,10 +1,10 @@
 use distributed::command;
 use distributed::command::{Atomic, CommandProjectionPureReduce, PreparedCommand};
-use distributed::microsvc::{CausalCommandContext, HandlerError};
+use distributed::microsvc::{guards, CausalCommandContext, HandlerError};
 use e2e_readmodels::BlobGames;
 use serde::Deserialize;
 
-use super::support::{authenticated_user, principal, rejected, sealed_row};
+use super::support::sealed_row;
 use crate::{domain_commands, BlobGame, Direction};
 
 #[derive(Debug, Deserialize, distributed::CommandInput)]
@@ -17,7 +17,7 @@ pub async fn handle_move(
     ctx: &CausalCommandContext<'_, BlobGame>,
     input: BlobMoveInput,
 ) -> Result<PreparedCommand<Atomic<BlobGames>>, HandlerError> {
-    let owner = principal(ctx)?;
+    let owner = ctx.user_id()?.to_string();
     let direction = Direction::parse(&input.direction).ok_or_else(|| {
         HandlerError::Rejected(format!(
             "invalid direction `{}` (use up|down|left|right)",
@@ -29,7 +29,8 @@ pub async fn handle_move(
         .get(&input.game_id)
         .await?
         .ok_or_else(|| HandlerError::NotFound(input.game_id.clone()))?;
-    game.move_dir(&owner, direction).map_err(rejected)?;
+    game.move_dir(&owner, direction)
+        .map_err(HandlerError::rejected)?;
     let row = sealed_row(&*game)?;
     repo.readmodel(row).publish_events().commit(game)?.atomic()
 }
@@ -63,7 +64,7 @@ command! {
     field: "blob_games_move",
     constructor: move_dir,
     preview_reduce_known_record: blob_preview(),
-    guard: authenticated_user,
+    guard: guards::authenticated,
     handle: handle_move,
 }
 

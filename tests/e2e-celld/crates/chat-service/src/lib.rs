@@ -4,10 +4,8 @@
 //! `chat.post` through [`distributed::cell_host::CelldCommandHost`]. GraphQL
 //! `@live` stays here.
 
-mod bounds;
-mod handlers;
 mod host;
 mod routes;
 
 pub use host::celld_route;
-pub use routes::{routes, MODULE_ID};
+pub use routes::routes;

@@ -560,13 +560,11 @@ fn source_snapshots_reject_direct_materialization() {
 }
 
 fn rebuild_projector() -> crate::graphql::SurfaceProjector {
-    let mounts = crate::LocalProjectionMountsBuilder::new("snapshot-test", "events")
-        .unwrap()
-        .eventual_model::<SnapshotRow, _>("rebuild-test", SNAPSHOTS, "snapshot-v1")
-        .unwrap()
+    crate::LocalProjectionMounts::builder("snapshot-test", "events")
+        .eventual(SNAPSHOTS)
         .build()
-        .unwrap();
-    mounts.projector("rebuild-test").unwrap()
+        .unwrap()
+        .projector(SNAPSHOTS)
 }
 
 async fn rebuild_matrix(store: &impl ProjectionProtocolStore) {
@@ -886,17 +884,11 @@ async fn snapshot_rebuild_original_private_log_coverage() {
 #[tokio::test]
 async fn snapshot_rebuild_external_sparse_members_and_mixed_origins() {
     let store = crate::InMemoryRepository::new();
-    let mounts = crate::LocalProjectionMountsBuilder::new("external-test", "events")
-        .unwrap()
-        .eventual_model::<SnapshotRow, _>(
-            "external-rebuild",
-            EXTERNAL_SNAPSHOTS,
-            "external-rebuild-v1",
-        )
-        .unwrap()
+    let projector = crate::LocalProjectionMounts::builder("external-test", "events")
+        .eventual(EXTERNAL_SNAPSHOTS)
         .build()
-        .unwrap();
-    let projector = mounts.projector("external-rebuild").unwrap();
+        .unwrap()
+        .projector(EXTERNAL_SNAPSHOTS);
     async fn bootstrap(
         store: &crate::InMemoryRepository,
         projector: &crate::graphql::SurfaceProjector,

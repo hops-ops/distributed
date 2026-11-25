@@ -1,4 +1,4 @@
-use distributed::graphql::{claim, col, read, ModelPermissions};
+use distributed::graphql::{claim, col, read, AuthorizedReadModel, ModelPermissions};
 use distributed::ReadModel;
 use serde::{Deserialize, Serialize};
 
@@ -22,9 +22,9 @@ pub struct BlobGames {
     pub owner: Option<AuthUsers>,
 }
 
-impl BlobGames {
+impl AuthorizedReadModel for BlobGames {
     /// Read authorization attached to the Blob game query model.
-    pub fn permissions() -> ModelPermissions<Self> {
+    fn permissions() -> ModelPermissions<Self> {
         ModelPermissions::new()
             .grant(
                 "user",

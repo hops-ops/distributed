@@ -320,9 +320,10 @@ the single relationship declaration; `AuthUsers` does not need reverse
 collections for every model that references it.
 
 Read RBAC is attached to those same query models through
-`Todos::permissions()`, `BlobGames::permissions()`, and their peers. The
-runtime GraphQL engine and generated application surfaces reuse those
-declarations; the service crate does not recreate the grants.
+`impl AuthorizedReadModel for Todos`, `BlobGames`, and their peers.
+`e2e_readmodels::read_models()` lists each model once; schema bootstrap, the
+runtime GraphQL engine and generated application surfaces all read that list,
+so the service crate neither recreates the grants nor repeats the models.
 
 ## Outcomes
 
@@ -342,23 +343,22 @@ the normal GraphQL command result.
 | `crates/*-domain/` | Aggregates, replay events, and outward domain-state contracts. |
 | `crates/readmodels/` | Query shapes, relationships, and model-owned read RBAC. |
 | `crates/projections/` | Todo, Chat, and Blob event-to-read-model programs. |
-| `crates/service/src/handlers/events/` | Explicit projector handlers that apply modeled programs. |
 | `crates/*-domain/src/commands/` | `command!` handlers: repository → get/create → domain operation → fluent commit. |
-| `crates/service/src/application.rs` | Composition root: client surfaces and the module inventory. |
-| `crates/service/src/modules/` | One module per bounded context (`todo`, `chat`, `blob`) mounting its typed commands and projectors; `compose.rs` lists them. |
-| `crates/service/src/host.rs` | Infrastructure: SQL dialect, outbox, OIDC, serving. |
+| `crates/service/src/application.rs` | Composition root: application name and client surfaces (declared once). |
+| `crates/service/src/modules/` | One module per bounded context (`todo`, `chat`, `blob`, `identity`) mounting its typed commands and projections; `compose.rs` lists them, and the application manifest is derived from that Service. |
+| `crates/service/src/host.rs` | Infrastructure: one host for SQLite and Postgres (`SqlStores`), OIDC, serving. |
 | `ui/src/routes/*/+page.graphql` | Co-located SSR/live reads. |
 | `ui/src/routes/*/+page.svelte` | `*.use()` and ordinary typed command calls. |
 | `.distributed/lifecycle/generations/<id>/ui/src/lib/generated/` | Immutable lifecycle-owned user/admin/public clients. |
 
-Todo and Chat mount catalog-pinned local causal executors through explicit
-`modeled_projector(...).handle(...)` event handlers. Those handlers apply the
+Todo and Chat mount catalog-pinned local causal executors with
+`consume_projection(projections.projector(TODOS))`: the runtime applies the
 shared plan without repeating its mapping — that is why the waiting client only
 has `.applies` previews until obligations complete. Blob has a catalog-pinned
 direct owner and no asynchronous event route or second writer: the command
 handler applies the same mutation IR and returns the row. The Zitadel provider
 ingestor remains an integration adapter, while its provider-event-to-`AuthUsers`
-mapping also lives in `e2e-projections` and runs from an explicit event handler.
+mapping also lives in `e2e-projections` and is consumed the same way.
 
 ## Application composition (framework direction)
 

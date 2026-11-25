@@ -71,6 +71,7 @@ mod dependencies;
 pub(crate) use dependencies::CausalHostProjections;
 mod descriptor;
 mod error;
+pub mod guards;
 pub(crate) mod lifecycle;
 mod message_router;
 mod projector;
@@ -78,6 +79,7 @@ mod runtime;
 pub mod schedule;
 mod service;
 mod session;
+mod stores;
 // Worker loops need a Tokio runtime (spawn/sleep); only compile when a feature
 // that enables the optional `tokio` dep is active (default feature set does not).
 #[cfg(feature = "runtime-tokio")]
@@ -134,6 +136,13 @@ pub(crate) mod wait_path;
 pub use session::{
     Session, ROLE_KEY, TRANSPORT_MESSAGE_ID_CLAIM, TRANSPORT_ROLE, TRANSPORT_USER_ID, USER_ID_KEY,
 };
+#[cfg(feature = "postgres")]
+pub use stores::PostgresStores;
+#[cfg(any(feature = "sqlite", feature = "postgres"))]
+pub use stores::SqlStores;
+#[cfg(feature = "sqlite")]
+pub use stores::SqliteStores;
+pub use stores::{AggregateDependencies, ServiceStores, StoreDependencies, Stores};
 
 /// Maximum accepted HTTP request body size for the microsvc ingresses, in bytes
 /// (1 MiB).

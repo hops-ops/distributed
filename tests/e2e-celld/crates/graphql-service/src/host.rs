@@ -4,7 +4,6 @@
 //! and Eventual projectors stay in this process.
 
 use std::sync::Arc;
-use std::time::Duration;
 
 use distributed::bus::celld_queue_relay_handler;
 use distributed::bus::NatsBus;
@@ -12,15 +11,14 @@ use distributed::cell_host::{CelldCommandHost, InternalHttpSecret};
 use distributed::command_dispatch::SharedCommandHost;
 use distributed::graphql::IdentityConfig;
 use distributed::microsvc::{
-    spawn_outbox_publish_loop, spawn_service_consumer_loop, LifecycleGate, Service,
+    spawn_service_consumer_loop, LifecycleGate, PostgresStores, Service, SqlStores,
 };
 use distributed::BusPublisher;
-use distributed::{PostgresLockManager, PostgresRepository};
 
 use crate::http::serve;
 use crate::{
-    build_graphql_engine, build_service, distributed_manifest, spawn_scrape_loop,
-    ZitadelScrapeConfig, E2E_UI_APPLICATION,
+    build_graphql_engine, build_service, read_models, spawn_scrape_loop, ZitadelScrapeConfig,
+    E2E_UI_APPLICATION,
 };
 
 const BUS_GROUP: &str = "e2e-celld";
@@ -55,21 +53,24 @@ async fn run_postgres(
     options: HostOptions,
     celld_url: String,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let repo = PostgresRepository::connect_and_migrate(database_url).await?;
-    let registry = distributed_manifest()
-        .table_registry()
-        .map_err(|e| format!("manifest: {e}"))?;
-    repo.bootstrap_table_schema_for_dev(&registry).await?;
-    let locks = PostgresLockManager::new(repo.pool().clone());
+    let stores = PostgresStores::connect(database_url).await?;
+    stores
+        .bootstrap_read_models(read_models().catalog())
+        .await?;
     let nats = connect_nats(&options.nats_url).await?;
 
-    let change_rx = repo.read_model_changes();
+    let change_rx = stores.read_model_changes();
     // Under `distributed dev`, only the active generation may write.
     let lifecycle = LifecycleGate::from_env();
-    let service = build_service(repo.clone(), locks.clone(), repo.clone())
+    let service = build_service(&stores)
         .with_lifecycle(lifecycle.clone())
         .with_bus(nats.clone());
-    let gql = build_graphql_engine(&repo, &service, options.identity.clone(), Some(change_rx))?;
+    let gql = build_graphql_engine(
+        stores.graphql_pool(),
+        &service,
+        options.identity.clone(),
+        Some(change_rx),
+    )?;
     let service = Arc::new(service.try_with_graphql(gql)?);
     let publisher = BusPublisher::new(Arc::new(nats.clone()));
     let celld_host = celld_command_host(
@@ -80,19 +81,11 @@ async fn run_postgres(
     let queue_relay = celld_queue_relay_handler(publisher);
     let host: SharedCommandHost = Arc::new(celld_host);
 
-    spawn_outbox_publish_loop(
-        repo.outbox_store(),
-        Arc::new(nats.clone()),
-        "e2e-celld",
-        Duration::from_secs(30),
-        5,
-    );
+    // `with_bus` also drains the outbox, so the consumer is the only loop.
     {
-        let repo = repo.clone();
-        let locks = locks.clone();
         let nats = nats.clone();
         spawn_service_consumer_loop(move || {
-            build_service(repo.clone(), locks.clone(), repo.clone())
+            build_service(&stores)
                 .with_lifecycle(lifecycle.clone())
                 .with_bus(nats.clone())
         });

@@ -7,47 +7,14 @@ pub mod models;
 
 pub use models::{AuthUsers, BlobGames, ChatMessages, Todos};
 
-pub fn distributed_manifest() -> distributed::ReadModelCatalog {
-    use distributed::RelationalReadModel;
-
-    // Schema-only catalog (physical tables). ApplicationManifest is the logical
-    // application contract and is composed separately.
-    distributed::ReadModelCatalog::new("e2e-ui")
-        .table_schema(Todos::schema().clone())
-        .table_schema(ChatMessages::schema().clone())
-        .table_schema(BlobGames::schema().clone())
-        .table_schema(AuthUsers::schema().clone())
-}
-
-/// Role grants compiled from the authorization attached to each read model.
-pub fn application_grants() -> std::collections::BTreeMap<
-    String,
-    std::collections::BTreeMap<String, distributed::graphql::ReadPermission>,
-> {
-    use distributed::graphql::ModelPermissions;
-    use distributed::RelationalReadModel;
-
-    fn add<M: RelationalReadModel>(
-        grants: &mut std::collections::BTreeMap<
-            String,
-            std::collections::BTreeMap<String, distributed::graphql::ReadPermission>,
-        >,
-        permissions: ModelPermissions<M>,
-    ) {
-        for (role, grant) in permissions.by_role() {
-            grants
-                .entry(role)
-                .or_default()
-                .insert(M::schema().model_name.clone(), grant);
-        }
-    }
-
-    let mut grants = std::collections::BTreeMap::new();
-    add(&mut grants, Todos::permissions());
-    add(&mut grants, ChatMessages::permissions());
-    add(&mut grants, BlobGames::permissions());
-    add(&mut grants, AuthUsers::permissions());
-    grants
+/// Every read model the application serves, with its permissions: the one
+/// list schema bootstrap, the GraphQL engine and client export read.
+pub fn read_models() -> distributed::graphql::ReadModels {
+    distributed::graphql::ReadModels::new("e2e-ui")
+        .model::<Todos>()
+        .model::<ChatMessages>()
+        .model::<BlobGames>()
+        .model::<AuthUsers>()
 }
 
 #[cfg(test)]
@@ -79,9 +46,8 @@ mod tests {
 
         assert!(AuthUsers::schema().relationships.is_empty());
 
-        let project = distributed_manifest();
         let surface = distributed::graphql::build_surface(
-            &project.tables,
+            &read_models().catalog().tables,
             &distributed::graphql::SurfaceOptions::sqlite(),
         )
         .unwrap();
@@ -115,7 +81,7 @@ mod tests {
 
     #[test]
     fn model_owned_permissions_compile_the_application_grants() {
-        let grants = application_grants();
+        let grants = read_models().grants();
         let user = &grants["user"];
         let admin = &grants["admin"];
         let anonymous = &grants["anonymous"];

@@ -1,10 +1,10 @@
 use distributed::command;
 use distributed::command::{Atomic, PreparedCommand};
-use distributed::microsvc::{CausalCommandContext, HandlerError};
+use distributed::microsvc::{guards, CausalCommandContext, HandlerError};
 use e2e_readmodels::BlobGames;
 use serde::Deserialize;
 
-use super::support::{authenticated_user, principal, rejected, sealed_row};
+use super::support::sealed_row;
 use crate::{domain_commands, BlobGame};
 
 #[derive(Debug, Deserialize, distributed::CommandInput)]
@@ -16,7 +16,7 @@ pub async fn handle_start(
     ctx: &CausalCommandContext<'_, BlobGame>,
     input: BlobStartInput,
 ) -> Result<PreparedCommand<Atomic<BlobGames>>, HandlerError> {
-    let owner = principal(ctx)?;
+    let owner = ctx.user_id()?.to_string();
     let repo = ctx.repo();
     if repo.get(&input.game_id).await?.is_some() {
         return Err(HandlerError::Rejected(format!(
@@ -26,7 +26,7 @@ pub async fn handle_start(
     }
     let mut game = repo.create();
     game.start_with_demo(&input.game_id, &owner)
-        .map_err(rejected)?;
+        .map_err(HandlerError::rejected)?;
     let row = sealed_row(&*game)?;
     repo.readmodel(row).publish_events().commit(game)?.atomic()
 }
@@ -40,6 +40,6 @@ command! {
     shard: |input| input.game_id.clone(),
     roles: ["user", "admin"],
     field: "blob_games_start",
-    guard: authenticated_user,
+    guard: guards::authenticated,
     handle: handle_start,
 }

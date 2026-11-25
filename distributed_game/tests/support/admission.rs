@@ -182,9 +182,11 @@ where
         "replayed ticket"
     );
 
-    // Silence after the upgrade: closed at the Hello deadline.
-    let mut silent = connect(&base, zone).await;
+    // Silence after the upgrade: closed at the Hello deadline. The server
+    // arms its timer before the upgrade response reaches us, so the clock
+    // starts before `connect`: a lower bound on the server's start.
     let started = Instant::now();
+    let mut silent = connect(&base, zone).await;
     let got = next(&mut silent, hello_timeout + Duration::from_secs(10)).await;
     assert!(
         matches!(got, Got::Closed | Got::Message(ServerMessage::Error { .. })),

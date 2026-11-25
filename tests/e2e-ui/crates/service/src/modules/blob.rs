@@ -1,43 +1,12 @@
-//! Blob game module: Atomic command mounts (direct projection seal).
+//! Blob game module: Atomic command mounts. Their `BLOB_GAMES` projection is
+//! direct: each command seals its row in its own transaction.
 
 use blob_domain::BlobGame;
-use distributed::graphql::SurfaceDirectProjection;
-use distributed::microsvc::{
-    ConfigurableOutboxPublisher, HasOutboxStore, HasRepo, RepoReadModelDependencies, Routes,
-};
-use distributed::{AggregateBuilder, AggregateRepository, QueuedRepository};
-
-use crate::bounds::{EventStore, Locks, ReadStore};
-
-/// Logical module id for composition inventories.
-pub const MODULE_ID: &str = "blob";
-
-type BlobRoutes<R, L, S> =
-    Routes<RepoReadModelDependencies<AggregateRepository<QueuedRepository<R, L>, BlobGame>, S>>;
+use distributed::microsvc::{AggregateDependencies, Routes, ServiceStores};
 
 /// Mount blob Atomic commands from blob-domain.
-pub fn routes<R, L, S>(
-    repo: R,
-    locks: L,
-    read_models: S,
-    _blob_direct: SurfaceDirectProjection,
-) -> BlobRoutes<R, L, S>
-where
-    R: EventStore,
-    L: Locks,
-    S: ReadStore,
-    QueuedRepository<R, L>: Clone
-        + AggregateBuilder
-        + HasOutboxStore
-        + distributed::TransactionalCommit
-        + Send
-        + Sync
-        + 'static,
-    AggregateRepository<QueuedRepository<R, L>, BlobGame>:
-        HasRepo + HasOutboxStore + ConfigurableOutboxPublisher + Send + Sync + 'static,
-{
-    let _ = _blob_direct;
-    Routes::for_aggregate::<R, L, BlobGame, S>(repo, locks, read_models)
+pub fn routes<St: ServiceStores>(stores: &St) -> Routes<AggregateDependencies<St, BlobGame>> {
+    Routes::for_aggregate(stores)
         .mount(blob_domain::commands::start())
         .mount(blob_domain::commands::move_dir())
         .mount(blob_domain::commands::start_level())

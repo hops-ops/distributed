@@ -187,7 +187,7 @@ mod client_contract {
     use distributed::microsvc::{CausalCommandContext, HandlerError, Routes, Service};
     use distributed::projection::lower::{EventualOnly, ProjectionDescriptor};
     use distributed::{
-        AggregateRepository, InMemoryRepository, LocalProjectionMountsBuilder, Mutation,
+        AggregateRepository, InMemoryRepository, LocalProjectionMounts, Mutation,
         RelationalReadModel,
     };
     use serde::{Deserialize, Serialize};
@@ -288,10 +288,8 @@ mod client_contract {
             compile_client, ClientCompileInput, ClientDocument, ClientSurfaceIdentity,
         };
 
-        let mounts = LocalProjectionMountsBuilder::new("members", "events")
-            .unwrap()
-            .eventual_model::<FlatMembers, _>("flat_members", MEMBERS, MEMBERS.epoch())
-            .unwrap()
+        let mounts = LocalProjectionMounts::builder("members", "events")
+            .eventual(MEMBERS)
             .build()
             .unwrap();
         let mut previous = None;
@@ -315,7 +313,7 @@ mod client_contract {
                 &SurfaceOptions::postgres(),
             )
             .unwrap()
-            .with_projectors([mounts.projector("flat_members").unwrap()])
+            .with_projectors([mounts.projector(MEMBERS)])
             .unwrap()
             .with_service(&service)
             .unwrap();
@@ -390,10 +388,8 @@ mod client_contract {
 
     #[test]
     fn an_event_mode_known_constant_reaches_projection_slots_without_applies() {
-        let mounts = LocalProjectionMountsBuilder::new("reviews", "events")
-            .unwrap()
-            .eventual_model::<FlatReviews, _>("flat_reviews", REVIEWS, REVIEWS.epoch())
-            .unwrap()
+        let mounts = LocalProjectionMounts::builder("reviews", "events")
+            .eventual(REVIEWS)
             .build()
             .unwrap();
         let service = Service::new().named("reviews").routes(
@@ -412,7 +408,7 @@ mod client_contract {
             &SurfaceOptions::postgres(),
         )
         .unwrap()
-        .with_projectors([mounts.projector("flat_reviews").unwrap()])
+        .with_projectors([mounts.projector(REVIEWS)])
         .unwrap()
         .with_service(&service)
         .unwrap();
@@ -438,10 +434,8 @@ mod client_contract {
 
     #[test]
     fn a_declared_event_constant_reaches_generated_projection_slots() {
-        let mounts = LocalProjectionMountsBuilder::new("reviews", "events")
-            .unwrap()
-            .eventual_model::<FlatReviews, _>("flat_reviews", REVIEWS, REVIEWS.epoch())
-            .unwrap()
+        let mounts = LocalProjectionMounts::builder("reviews", "events")
+            .eventual(REVIEWS)
             .build()
             .unwrap();
         let service = Service::new().named("reviews").routes(
@@ -467,7 +461,7 @@ mod client_contract {
             &SurfaceOptions::postgres(),
         )
         .unwrap()
-        .with_projectors([mounts.projector("flat_reviews").unwrap()])
+        .with_projectors([mounts.projector(REVIEWS)])
         .unwrap()
         .with_service(&service)
         .unwrap();

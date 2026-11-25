@@ -80,11 +80,7 @@ fn with_identity(
     if OFFLINE_OIDC_ENABLED.load(Ordering::Acquire) {
         request.bearer_auth(offline_bearer(user_id, role))
     } else {
-        let roles = if role == "admin" {
-            "admin,user"
-        } else {
-            role
-        };
+        let roles = if role == "admin" { "admin,user" } else { role };
         request
             .header("x-user-id", user_id)
             .header("x-roles", roles)
@@ -145,33 +141,20 @@ fn default_application_surface(
     role: &str,
 ) -> Result<(&'static str, Vec<&'static str>, Vec<&'static str>, String), String> {
     use e2e_service::{
-        distributed_admin_client_surface, distributed_client_surface, DISTRIBUTED_ADMIN_CLIENT_SURFACE,
-        DISTRIBUTED_CLIENT_SURFACE,
+        distributed_admin_client_surface, distributed_client_surface, ADMIN_CLIENT_SURFACE,
+        CLIENT_SURFACE,
     };
-    match role {
-        "admin" => {
-            let manifest = distributed_admin_client_surface()
-                .manifest()
-                .map_err(|e| e.to_string())?;
-            Ok((
-                DISTRIBUTED_ADMIN_CLIENT_SURFACE,
-                vec!["admin"],
-                vec!["admin"],
-                manifest.schema_fingerprint,
-            ))
-        }
-        _ => {
-            let manifest = distributed_client_surface()
-                .manifest()
-                .map_err(|e| e.to_string())?;
-            Ok((
-                DISTRIBUTED_CLIENT_SURFACE,
-                vec!["admin", "user"],
-                vec!["user"],
-                manifest.schema_fingerprint,
-            ))
-        }
-    }
+    let (surface, export) = match role {
+        "admin" => (ADMIN_CLIENT_SURFACE, distributed_admin_client_surface()),
+        _ => (CLIENT_SURFACE, distributed_client_surface()),
+    };
+    let manifest = export.manifest().map_err(|e| e.to_string())?;
+    Ok((
+        surface.name,
+        surface.eligible_roles.to_vec(),
+        surface.schema_roles.to_vec(),
+        manifest.schema_fingerprint,
+    ))
 }
 
 pub async fn graphql_for_application(
