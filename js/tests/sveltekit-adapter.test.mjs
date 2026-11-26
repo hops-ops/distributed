@@ -16,7 +16,7 @@ import { COMMAND_CONSISTENCY } from './fixtures/command-protocol.mjs';
 import {
 	assertReplicaAdapterConformance,
 	ControlledReplicaTransport,
-	REACT_FIXTURE_SCHEMA,
+	FIXTURE_SCHEMA,
 	TodoModel,
 	TodosArtifact,
 	todoFrame
@@ -383,7 +383,7 @@ test('Svelte composition shares one diagnostics sink with operations and generat
 		operationHash,
 		protocol: Object.freeze({
 			version: 1,
-			schemaHash: REACT_FIXTURE_SCHEMA,
+			schemaHash: FIXTURE_SCHEMA,
 			protocolHash: `sha256:${'c'.repeat(64)}`,
 			surface: Object.freeze({ kind: 'role', name: 'user' }),
 			operation: operationHash,

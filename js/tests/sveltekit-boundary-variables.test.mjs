@@ -11,7 +11,7 @@ import {
 } from '../dist/sveltekit/index.js';
 import { createDistributedReplica } from '../dist/replica/index.js';
 import {
-	REACT_FIXTURE_SCHEMA,
+	FIXTURE_SCHEMA,
 	TodosArtifact,
 	todoFrame
 } from './fixtures/adapter-conformance.mjs';
@@ -208,7 +208,7 @@ test('SSR, hydration, component use, navigation read, and prefetch share canonic
 			sent.push(body.variables);
 			assert.deepEqual(body.extensions.distributed.client, {
 				surface: { kind: 'role', name: 'user' },
-				schemaHash: REACT_FIXTURE_SCHEMA
+				schemaHash: FIXTURE_SCHEMA
 			});
 			return jsonResponse(
 				todoFrame(

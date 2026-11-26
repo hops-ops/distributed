@@ -1,6 +1,5 @@
 /** Isomorphic HTTP GraphQL request helper with injectable URL and authentication. */
 import { buildAuthHeaders } from './auth-headers.js';
-import { documentToString, type GqlDocument } from './document.js';
 import {
 	DistributedProtocolError,
 	parseGraphqlResponseExtensions
@@ -99,7 +98,7 @@ export async function requestGraphql<
 	TVariables extends GraphqlVariables = GraphqlVariables
 >(
 	url: string,
-	document: GqlDocument<TData, TVariables>,
+	document: string,
 	auth: GqlAuth = {},
 	variables: TVariables = {} as TVariables,
 	options: RequestGraphqlOptions = {}
@@ -116,7 +115,7 @@ export async function requestGraphql<
 		method: 'POST',
 		headers: buildAuthHeaders(auth),
 		body: JSON.stringify({
-			query: documentToString(document),
+			query: document,
 			variables,
 			...(options.extensions === undefined
 				? {}
@@ -183,6 +182,4 @@ export async function requestGraphql<
 	};
 }
 
-export type { GqlDocument } from './document.js';
-export { documentToString } from './document.js';
 export { buildAuthHeaders } from './auth-headers.js';

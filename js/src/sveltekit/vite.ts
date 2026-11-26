@@ -1,37 +1,65 @@
-import { spawn, type ChildProcess } from 'node:child_process';
-import { isMissing, isWithin } from '../lib/node-fs.js';
-import { randomUUID } from 'node:crypto';
-import {
-	existsSync,
-	lstatSync,
-	readFileSync,
-	realpathSync
-} from 'node:fs';
+import type { ChildProcess } from 'node:child_process';
+import { existsSync, realpathSync } from 'node:fs';
 import {
 	lstat,
 	mkdir,
 	mkdtemp,
-	open,
 	readFile,
 	readdir,
 	realpath,
 	rename,
 	rm,
-	unlink,
 	writeFile
 } from 'node:fs/promises';
-import {
-	basename,
-	dirname,
-	isAbsolute,
-	join,
-	relative,
-	resolve,
-	sep
-} from 'node:path';
-import { tmpdir } from 'node:os';
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { isMainThread } from 'node:worker_threads';
 
+import { isMissing, isWithin } from '../lib/node-fs.js';
+import {
+	acquireCompilerLock,
+	releaseCompilerLock,
+	requireCompilerLock,
+	withCompilerLock,
+	withCompilerStartup,
+	type CompilerLockLease
+} from '../vite/compiler-lock.js';
+import {
+	containedPath,
+	manifestWatchRoots,
+	nonempty,
+	physicalPathKey,
+	plannedPhysicalPath,
+	portablePath,
+	resolveCompilerCommand,
+	runCancellable,
+	runCommand,
+	stopCompiler,
+	throwIfAborted,
+	validateNearestExistingParent,
+	viteError
+} from '../vite/compiler-process.js';
+import { GameGenerator } from '../vite/game-generator.js';
+import {
+	resolveGames,
+	type DistributedGameSurfaceCompiler,
+	type ResolvedGame
+} from '../vite/games.js';
+import {
+	activeLifecycleGenerationRoot,
+	canonicalExistingPath,
+	configureLifecycleServer,
+	lifecycleActivePointer,
+	lifecycleGenerationMeta,
+	localFrameworkDist,
+	suppressFrameworkHotUpdate
+} from '../vite/lifecycle-middleware.js';
+import type {
+	CompilerManifestSource,
+	LifecycleHtmlTag,
+	RollupWatchContextLike,
+	ViteHotContextLike,
+	ViteServerLike
+} from '../vite/types.js';
 import {
 	analyzeDistributedSvelteKitBoundaries,
 	validateDistributedSvelteKitBoundaryPlan,
@@ -53,20 +81,18 @@ export {
 	type DistributedSvelteKitBoundaryRegistration
 } from './islands/boundaries.js';
 
+export {
+	checkDistributedGames,
+	generateDistributedGames,
+	type DistributedGameManifestSource,
+	type DistributedGameSurfaceCompiler
+} from '../vite/games.js';
+
 const GENERATED_SVELTEKIT_MODULE = 'sveltekit.ts';
-const SHA256_ID = /^sha256:[0-9a-f]{64}$/;
 const GENERATED_BOUNDARIES_MODULE = 'boundaries.ts';
-const MAX_COMMAND_OUTPUT_BYTES = 16 * 1024 * 1024;
 const MAX_GENERATED_COMPARE_FILES = 20_000;
 const MAX_GENERATED_COMPARE_BYTES = 128 * 1024 * 1024;
 const MODULE_NAME = /^\$distributed(?:\/[A-Za-z0-9][A-Za-z0-9._-]*)*$/;
-const COMPILER_LOCK = join('.svelte-kit', 'distributed', 'compiler.lock');
-const GENERATION_META = 'distributed-generation';
-const MAX_LIFECYCLE_STATE_BYTES = 1024 * 1024;
-const LIFECYCLE_CLI_EXECUTABLE_ENV = 'DISTRIBUTED_LIFECYCLE_CLI_EXECUTABLE';
-const COMPILER_COORDINATORS = Symbol.for(
-	'@hops-ops/distributed/sveltekit/compiler-coordinators/v1'
-);
 
 export type DistributedGraphqlProxyOptions = {
 	/** Absolute Distributed API origin, for example `http://127.0.0.1:8791`. */
@@ -124,39 +150,6 @@ export type DistributedSvelteKitClientCompiler = Readonly<{
 	out: string;
 }>;
 
-export type DistributedGameManifestSource =
-	| string
-	| Readonly<{
-			/**
-			 * Arguments passed to the configured distributed command. The first value
-			 * must be `game-manifest`; stdout (the GameSurface JSON) becomes
-			 * ephemeral compiler input.
-			 */
-			args: readonly string[];
-	  }>;
-
-/** One `distributed_game` surface: GameSurface → typed client (+ WebAssembly). */
-export type DistributedGameSurfaceCompiler = Readonly<{
-	/** Existing GameSurface JSON path, or canonical `distributed game-manifest` argv. */
-	manifest: DistributedGameManifestSource;
-	/** Directory owned by `distributed game-client` (and `game-wasm`'s `wasm/`), relative to `cwd`. */
-	out: string;
-	/** `game-client --import-extension`. Default `ts` (Vite resolves it). */
-	importExtension?: 'ts' | 'js' | 'none';
-	/**
-	 * `distributed game-wasm` for the zone's `#[predict]` step and
-	 * `#[game_pure]` functions: `'auto'` (default) when the surface declares
-	 * any, using the manifest's `--manifest-path`; `{ manifestPath }` to name
-	 * the Cargo manifest; `false` to skip.
-	 */
-	wasm?: 'auto' | false | Readonly<{ manifestPath: string }>;
-	/**
-	 * Extra Rust roots whose changes regenerate this surface (e.g. a local
-	 * crate holding the predicted step). The manifest crate's `Cargo.toml`,
-	 * `src/` and `crates/` are always watched.
-	 */
-	watch?: readonly string[];
-}>;
 
 export type DistributedSvelteKitViteOptions = Readonly<{
 	/** Project root used for distributed cwd, document globs, and output containment. */
@@ -185,13 +178,6 @@ export type DistributedSvelteKitViteOptions = Readonly<{
 	games?: readonly DistributedGameSurfaceCompiler[];
 }>;
 
-type ResolvedGame = Readonly<{
-	manifest: DistributedGameManifestSource;
-	out: string;
-	importExtension: 'ts' | 'js' | 'none';
-	wasm: false | 'auto' | Readonly<{ manifestPath: string }>;
-	watchRoots: readonly string[];
-}>;
 
 type ResolvedClient = Readonly<{
 	module: string;
@@ -220,70 +206,6 @@ type ResolvedIntegration = Readonly<{
 	games: readonly ResolvedGame[];
 }>;
 
-type CompilerCoordinator = {
-	path: string;
-	references: number;
-	ready: Promise<void>;
-	tail: Promise<void>;
-	startupRuns: Map<string, Promise<void>>;
-	closing?: Promise<void>;
-};
-
-type CompilerLockLease = {
-	coordinator: CompilerCoordinator;
-	released: boolean;
-};
-
-type ViteWebSocketLike = Readonly<{
-	send(payload: unknown): void;
-	/** Vite's `server.ws.on('connection', …)` (optional in test doubles). */
-	on?(event: 'connection', listener: () => void): void;
-}>;
-
-type ViteModuleGraphLike = Readonly<{
-	getModuleById(id: string): unknown;
-	invalidateModule(module: unknown): void;
-}>;
-
-type ViteMiddlewareRequest = Readonly<{
-	method?: string;
-	headers: Readonly<Record<string, string | readonly string[] | undefined>>;
-	on(event: 'data', listener: (chunk: Uint8Array) => void): void;
-	on(event: 'end' | 'error', listener: (value?: unknown) => void): void;
-}>;
-
-type ViteMiddlewareResponse = {
-	statusCode: number;
-	setHeader(name: string, value: string): void;
-	end(body?: string | Uint8Array): void;
-};
-
-type ViteServerLike = Readonly<{
-	watcher: Readonly<{ add(paths: string | readonly string[]): void }>;
-	ws: ViteWebSocketLike;
-	moduleGraph: ViteModuleGraphLike;
-	middlewares?: Readonly<{
-		use(
-			path: string,
-			handler: (request: ViteMiddlewareRequest, response: ViteMiddlewareResponse) => void
-		): void;
-	}>;
-	httpServer?:
-		| Readonly<{
-				once(event: 'close', listener: () => void): void;
-		  }>
-		| null;
-}>;
-
-type ViteHotContextLike = Readonly<{
-	file: string;
-	server: ViteServerLike;
-	modules?: readonly unknown[];
-}>;
-
-type RollupWatchContextLike = Readonly<{
-	addWatchFile(path: string): void;
-}>;
 
 /** Minimal structural Vite plugin type; avoids making Vite a runtime dependency. */
 export type DistributedSvelteKitVitePlugin = Readonly<{
@@ -314,12 +236,6 @@ export type DistributedLifecycleVitePlugin = Readonly<{
 	configureServer(server: ViteServerLike): void;
 	transformIndexHtml(): LifecycleHtmlTag[];
 	handleHotUpdate(context: ViteHotContextLike): never[] | undefined;
-}>;
-
-type LifecycleHtmlTag = Readonly<{
-	tag: 'meta';
-	attrs: Readonly<{ name: string; content: string }>;
-	injectTo: 'head-prepend';
 }>;
 
 /** Internal browser lifecycle side channel without generated-client resolution. */
@@ -393,89 +309,13 @@ export function distributedSvelteKit(
 	const children = new Set<ChildProcess>();
 	const cancellation = new AbortController();
 	let lock: CompilerLockLease | undefined;
-	let gamesDirty = false;
-	let gamesRunning: Promise<boolean> | undefined;
-	let gamesChanged = false;
-	/** `vite dev`: a failed game generation is reported, never thrown into Vite. */
-	let serving = false;
-	let logger: Readonly<{ error(message: string): void }> = { error: (message) => console.error(message) };
-	/** Last dev-mode game failure, replayed to overlays that connect later; cleared on success. */
-	let gameFailure: unknown;
-	let devServer: Readonly<{ ws: { send(payload: unknown): void } }> | undefined;
-
-	const reportGameFailure = (error: unknown): void => {
-		// The watcher and HMR hooks share one run: report its failure once.
-		if (error === gameFailure) return;
-		gameFailure = error;
-		logger.error(
-			`[distributed] game client generation failed; the dev server keeps the last generated client:\n${
-				error instanceof Error ? error.message : String(error)
-			}`
-		);
-		devServer?.ws.send({ type: 'error', err: viteError(error) });
-	};
-
-	/**
-	 * Dev-mode game regeneration (startup, HMR, watcher): failures go to the
-	 * console and the error overlay; the server keeps running on the last
-	 * generated client. Builds use `compileGames` directly and fail.
-	 */
-	const compileGamesInDev = async (): Promise<boolean> => {
-		try {
-			const changed = await compileGames();
-			gameFailure = undefined;
-			return changed;
-		} catch (error) {
-			if (stopped) return false;
-			reportGameFailure(error);
-			return false;
-		}
-	};
-
-	/** Serialized, coalescing game generation; resolves true when any output changed. */
-	const compileGames = (): Promise<boolean> => {
-		if (stopped) {
-			return Promise.reject(new Error('Distributed game compiler is closed'));
-		}
-		gamesDirty = true;
-		if (gamesRunning !== undefined) return gamesRunning;
-		gamesRunning = (async () => {
-			gamesChanged = false;
-			while (gamesDirty && !stopped) {
-				gamesDirty = false;
-				const integration = requireResolved(resolved);
-				if (await generateGames(integration, 'generate', children, cancellation.signal)) {
-					gamesChanged = true;
-				}
-			}
-			return gamesChanged;
-		})().finally(() => {
-			gamesRunning = undefined;
-		});
-		return gamesRunning;
-	};
+	const games = new GameGenerator(children, cancellation.signal);
 
 	const stop = async (): Promise<void> => {
 		if (stopped) return;
 		stopped = true;
 		dirty = false;
-		cancellation.abort();
-		for (const child of children) killChild(child, 'SIGTERM');
-		const force = setTimeout(() => {
-			for (const child of children) killChild(child, 'SIGKILL');
-		}, 1_500);
-		force.unref();
-		await Promise.race([
-			Promise.all([
-				running?.catch(() => undefined),
-				gamesRunning?.catch(() => undefined)
-			]),
-			new Promise<void>((resolvePromise) => {
-				const bounded = setTimeout(resolvePromise, 3_000);
-				bounded.unref();
-			})
-		]);
-		clearTimeout(force);
+		await stopCompiler(cancellation, children, [running, games.running]);
 		if (lock !== undefined) {
 			await releaseCompilerLock(lock);
 			lock = undefined;
@@ -499,7 +339,7 @@ export function distributedSvelteKit(
 				const operation = () =>
 					compileTransaction(integration, children, cancellation.signal);
 				await (startupPending
-					? withCompilerStartup(lease, integration, operation)
+					? withCompilerStartup(lease, JSON.stringify(integration), operation)
 					: withCompilerLock(lease, operation));
 				startupPending = false;
 			}
@@ -519,9 +359,8 @@ export function distributedSvelteKit(
 					'Distributed SvelteKit Vite plugin was configured more than once'
 				);
 			}
-			serving = config.command === 'serve';
-			if (config.logger !== undefined) logger = config.logger;
 			resolved = resolveIntegration(options, options.cwd ?? config.root);
+			games.configure(resolved, config);
 			frameworkDist = localFrameworkDist(config.root);
 			await validateResolvedPaths(resolved);
 			/*
@@ -537,16 +376,8 @@ export function distributedSvelteKit(
 			 * the owning build's physical project lock and duplicate generation.
 			 */
 			if (!isMainThread && process.env.SVELTEKIT_FORK === 'true') return;
-			if (resolved.games.length > 0) {
-				// Game surfaces are not lifecycle outputs: generate them here, once
-				// per build process (SvelteKit's client pass reloads the config).
-				if (config.command === 'build') {
-					await onceForBuild(resolved, () => compileGames());
-				} else {
-					// A Rust error at dev start must not keep the server down.
-					await compileGamesInDev();
-				}
-			}
+			// Game surfaces are not lifecycle outputs: they are generated here.
+			await games.start(config.command === 'build');
 			if (lifecycleOwnsCompile || resolved.clients.length === 0) return;
 			lock = await acquireCompilerLock(resolved.cwd);
 			try {
@@ -575,22 +406,14 @@ export function distributedSvelteKit(
 				];
 				if (roots.length > 0) server.watcher.add(roots);
 			}
-			const gameRoots = integration.games.flatMap((game) => game.watchRoots);
-			if (gameRoots.length > 0) server.watcher.add(gameRoots);
-			devServer = server;
-			// An overlay opened after a failed startup generation still shows it.
-			server.ws.on?.('connection', () => {
-				if (gameFailure !== undefined) server.ws.send({ type: 'error', err: viteError(gameFailure) });
-			});
+			games.configureServer(server);
 			server.httpServer?.once('close', () => {
 				void stop();
 			});
 		},
 		buildStart(): void {
 			const integration = requireResolved(resolved);
-			for (const game of integration.games) {
-				for (const root of game.watchRoots) this.addWatchFile(root);
-			}
+			for (const root of games.watchRoots()) this.addWatchFile(root);
 			if (lifecycleOwnsCompile || integration.clients.length === 0) return;
 			this.addWatchFile(integration.routesDir);
 			this.addWatchFile(integration.libDir);
@@ -679,11 +502,8 @@ export function distributedSvelteKit(
 				// the old virtual modules so that reload resolves the active generation.
 				return [];
 			}
-			if (isGameInput(context.file, integration)) {
-				devServer ??= context.server;
-				if (await compileGamesInDev()) {
-					context.server.ws.send({ type: 'full-reload', path: '*' });
-				}
+			if (games.isInput(context.file)) {
+				await games.hotUpdate(context.server);
 				if (!isCompilerInput(context.file, integration)) return [];
 			}
 			if (!isCompilerInput(context.file, integration)) return undefined;
@@ -714,13 +534,7 @@ export function distributedSvelteKit(
 		},
 		async watchChange(id): Promise<void> {
 			const integration = requireResolved(resolved);
-			// `vite dev` calls this hook from its file watcher without handling a
-			// rejection (the process would exit): there, report and keep serving.
-			// `vite build --watch` still fails the rebuild.
-			if (isGameInput(id, integration)) {
-				if (serving) await compileGamesInDev();
-				else await compileGames();
-			}
+			if (games.isInput(id)) await games.watchChange();
 			if (lifecycleOwnsCompile) return;
 			if (isCompilerInput(id, integration)) {
 				await compile(`GraphQL/Svelte watch change ${id}`);
@@ -730,246 +544,7 @@ export function distributedSvelteKit(
 	};
 }
 
-function localFrameworkDist(root: string): string | undefined {
-	try {
-		const candidate = join(
-			root,
-			'node_modules',
-			'@hops-ops',
-			'distributed',
-			'dist'
-		);
-		return existsSync(candidate) ? realpathSync(candidate) : undefined;
-	} catch {
-		return undefined;
-	}
-}
 
-function suppressFrameworkHotUpdate(
-	context: ViteHotContextLike,
-	frameworkDist: string | undefined
-): never[] | undefined {
-	if (
-		process.env.DISTRIBUTED_LIFECYCLE_DIR === undefined ||
-		frameworkDist === undefined ||
-		!isWithin(frameworkDist, canonicalExistingPath(context.file))
-	) return undefined;
-	for (const module of context.modules ?? []) {
-		context.server.moduleGraph.invalidateModule(module);
-	}
-	return [];
-}
-
-function canonicalExistingPath(value: string): string {
-	try {
-		return realpathSync(value);
-	} catch {
-		return resolve(value);
-	}
-}
-
-const CONTROL_ID = /^[A-Za-z0-9_:-]{16,128}$/;
-const MAX_ACK_BYTES = 4096;
-
-function lifecycleGenerationMeta(): LifecycleHtmlTag[] {
-	const configured = process.env.DISTRIBUTED_LIFECYCLE_DIR;
-	if (configured === undefined || !isAbsolute(configured)) return [];
-	try {
-		const encoded = readFileSync(join(resolve(configured), 'dev.json'));
-		if (encoded.byteLength > MAX_LIFECYCLE_STATE_BYTES) return [];
-		const state = JSON.parse(encoded.toString('utf8')) as {
-			active?: { generationId?: unknown };
-		};
-		const generationId = state.active?.generationId;
-		if (
-			typeof generationId !== 'string' ||
-			generationId.length === 0 ||
-			generationId.length > 512 ||
-			generationId !== generationId.trim() ||
-			/[\u0000-\u001f\u007f]/.test(generationId)
-		) return [];
-		return [Object.freeze({
-			tag: 'meta',
-			attrs: Object.freeze({ name: GENERATION_META, content: generationId }),
-			injectTo: 'head-prepend'
-		})];
-	} catch {
-		// A lifecycle file is atomically replaced. Missing or malformed state
-		// simply omits the hint; the browser falls back to its first poll.
-		return [];
-	}
-}
-
-function configureLifecycleServer(server: ViteServerLike): void {
-	const configured = process.env.DISTRIBUTED_LIFECYCLE_DIR;
-	if (configured === undefined || !isAbsolute(configured)) return;
-	const lifecycleRoot = resolve(configured);
-	server.middlewares?.use('/__distributed/lifecycle', (request, response) => {
-		void handleLifecycleRequest(lifecycleRoot, request, response).catch(() => {
-			if (response.statusCode < 400) response.statusCode = 500;
-			response.end();
-		});
-	});
-}
-
-async function handleLifecycleRequest(
-	lifecycleRoot: string,
-	request: ViteMiddlewareRequest,
-	response: ViteMiddlewareResponse
-): Promise<void> {
-	response.setHeader('cache-control', 'no-store');
-	if (request.method === 'GET') {
-		const participant = singleHeader(request.headers['x-distributed-participant']);
-		if (participant !== undefined && CONTROL_ID.test(participant)) {
-			await writeParticipantHeartbeat(lifecycleRoot, participant).catch(
-				() => undefined
-			);
-		}
-		const state = await readLifecycleState(lifecycleRoot);
-		if (state === undefined) {
-			response.statusCode = 404;
-			response.end();
-			return;
-		}
-		response.statusCode = 200;
-		response.setHeader('content-type', 'application/json');
-		response.end(state);
-		return;
-	}
-	if (request.method === 'POST') {
-		const contentType = singleHeader(request.headers['content-type']);
-		if (contentType?.split(';', 1)[0]?.trim().toLowerCase() !== 'application/json') {
-			response.statusCode = 415;
-			response.end();
-			return;
-		}
-		if (!sameOriginLifecycleRequest(request)) {
-			response.statusCode = 403;
-			response.end();
-			return;
-		}
-		const body = JSON.parse(await readRequestBody(request, MAX_ACK_BYTES)) as Record<string, unknown>;
-		if (
-			!CONTROL_ID.test(String(body.transitionId ?? '')) ||
-			!CONTROL_ID.test(String(body.participantId ?? '')) ||
-			typeof body.ok !== 'boolean'
-		) {
-			response.statusCode = 400;
-			response.end();
-			return;
-		}
-		const stateSource = await readLifecycleState(lifecycleRoot);
-		const state = stateSource === undefined ? undefined : JSON.parse(stateSource) as Record<string, unknown>;
-		if (state?.phase !== 'preparing' || state.transitionId !== body.transitionId) {
-			response.statusCode = 409;
-			response.end();
-			return;
-		}
-		await writeControlJson(
-			join(lifecycleRoot, 'dev-control', 'acks', String(body.transitionId)),
-			`${String(body.participantId)}.json`,
-			{ ok: body.ok }
-		);
-		response.statusCode = 204;
-		response.end();
-		return;
-	}
-	response.statusCode = 405;
-	response.end();
-}
-
-function writeParticipantHeartbeat(root: string, participant: string): Promise<void> {
-	return writeControlJson(
-		join(root, 'dev-control', 'participants'),
-		`${participant}.json`,
-		{ seenAtUnixMs: Date.now() }
-	);
-}
-
-async function readLifecycleState(root: string): Promise<string | undefined> {
-	const path = join(root, 'dev.json');
-	let metadata;
-	try {
-		metadata = await lstat(path);
-	} catch (error) {
-		if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
-		throw error;
-	}
-	if (metadata.isSymbolicLink() || !metadata.isFile() || metadata.size > MAX_LIFECYCLE_STATE_BYTES) {
-		throw new Error('invalid Distributed lifecycle state file');
-	}
-	return readFile(path, 'utf8');
-}
-
-async function writeControlJson(
-	directory: string,
-	name: string,
-	value: Readonly<Record<string, unknown>>
-): Promise<void> {
-	await mkdir(directory, { recursive: true });
-	const temporary = join(
-		directory,
-		`.${name}.${process.pid}.${Date.now()}.${randomUUID()}`
-	);
-	await writeFile(temporary, `${JSON.stringify(value)}\n`, { flag: 'wx', mode: 0o600 });
-	await rename(temporary, join(directory, name));
-}
-
-function sameOriginLifecycleRequest(request: ViteMiddlewareRequest): boolean {
-	const origin = singleHeader(request.headers.origin);
-	const host = singleHeader(request.headers.host);
-	if (origin === undefined || host === undefined) return false;
-	try {
-		const parsed = new URL(origin);
-		const forwarded = singleHeader(request.headers['x-forwarded-proto']);
-		const socket = (request as Readonly<{
-			socket?: Readonly<{ encrypted?: boolean }>;
-		}>).socket;
-		const protocol =
-			forwarded === 'http' || forwarded === 'https'
-				? `${forwarded}:`
-				: socket?.encrypted === true
-					? 'https:'
-					: 'http:';
-		return (
-			parsed.protocol === protocol &&
-			parsed.host === host &&
-			parsed.origin === origin
-		);
-	} catch {
-		return false;
-	}
-}
-
-function singleHeader(value: string | readonly string[] | undefined): string | undefined {
-	return typeof value === 'string' ? value : value?.[0];
-}
-
-function readRequestBody(
-	request: ViteMiddlewareRequest,
-	maximum: number
-): Promise<string> {
-	return new Promise((resolvePromise, reject) => {
-		const chunks: Uint8Array[] = [];
-		let bytes = 0;
-		let exceeded = false;
-		request.on('data', (chunk) => {
-			if (exceeded) return;
-			bytes += chunk.byteLength;
-			if (bytes > maximum) {
-				exceeded = true;
-				chunks.length = 0;
-				reject(new Error('lifecycle acknowledgement exceeds bound'));
-				return;
-			}
-			chunks.push(chunk);
-		});
-		request.on('error', reject);
-		request.on('end', () => {
-			if (!exceeded) resolvePromise(Buffer.concat(chunks).toString('utf8'));
-		});
-	});
-}
 
 async function runCompilerOnce(
 	options: DistributedSvelteKitViteOptions,
@@ -988,24 +563,15 @@ async function runResolvedCompilerOnce(
 ): Promise<void> {
 	await validateResolvedPaths(integration);
 	const lock = await acquireCompilerLock(integration.cwd);
-	const children = new Set<ChildProcess>();
-	const cancellation = new AbortController();
-	const cancel = (): void => {
-		cancellation.abort();
-		for (const child of children) killChild(child, 'SIGTERM');
-	};
-	process.once('SIGINT', cancel);
-	process.once('SIGTERM', cancel);
 	try {
-		await withCompilerLock(lock, () =>
-			mode === 'generate'
-				? compileTransaction(integration, children, cancellation.signal)
-				: checkTransaction(integration, children, cancellation.signal)
+		await runCancellable((children, signal) =>
+			withCompilerLock(lock, () =>
+				mode === 'generate'
+					? compileTransaction(integration, children, signal)
+					: checkTransaction(integration, children, signal)
+			)
 		);
 	} finally {
-		process.removeListener('SIGINT', cancel);
-		process.removeListener('SIGTERM', cancel);
-		for (const child of children) killChild(child, 'SIGKILL');
 		await releaseCompilerLock(lock);
 	}
 }
@@ -1054,12 +620,6 @@ export function distributedSvelteKitAliases(
 	);
 }
 
-function lifecycleActivePointer(): string | undefined {
-	const root = process.env.DISTRIBUTED_LIFECYCLE_DIR;
-	return root !== undefined && isAbsolute(root)
-		? canonicalExistingPath(join(resolve(root), 'active.json'))
-		: undefined;
-}
 
 function activeLifecycleClientEntry(client: ResolvedClient): string {
 	const generationRoot = activeLifecycleGenerationRoot();
@@ -1076,37 +636,6 @@ function activeLifecycleClientEntry(client: ResolvedClient): string {
 	);
 }
 
-function activeLifecycleGenerationRoot(): string {
-	const lifecycleRoot = process.env.DISTRIBUTED_LIFECYCLE_DIR;
-	const projectRoot = process.env.DISTRIBUTED_LIFECYCLE_PROJECT_ROOT;
-	if (
-		lifecycleRoot === undefined ||
-		projectRoot === undefined ||
-		!isAbsolute(lifecycleRoot) ||
-		!isAbsolute(projectRoot)
-	) {
-		throw new Error(
-			'Distributed lifecycle-owned client resolution requires absolute lifecycle and project roots'
-		);
-	}
-	const requestedGeneration = process.env.DISTRIBUTED_LIFECYCLE_GENERATION_ID;
-	let generation: unknown = requestedGeneration;
-	if (generation === undefined) {
-		const pointer = readFileSync(join(resolve(lifecycleRoot), 'active.json'));
-		if (pointer.byteLength > MAX_LIFECYCLE_STATE_BYTES) {
-			throw new Error('Distributed active lifecycle pointer exceeds 1 MiB');
-		}
-		const parsed = JSON.parse(pointer.toString('utf8')) as { generation_id?: unknown };
-		generation = parsed.generation_id;
-	}
-	if (
-		typeof generation !== 'string' ||
-		!SHA256_ID.test(generation)
-	) {
-		throw new Error('Distributed active lifecycle pointer has an invalid generation ID');
-	}
-	return join(resolve(lifecycleRoot), 'generations', generation);
-}
 
 function resolveIntegration(
 	options: DistributedSvelteKitViteOptions,
@@ -1116,43 +645,7 @@ function resolveIntegration(
 		throw new TypeError('distributedSvelteKit requires configuration');
 	}
 	const cwd = resolve(options.cwd ?? fallbackCwd);
-	const lifecycleExecutable = process.env[LIFECYCLE_CLI_EXECUTABLE_ENV];
-	const lifecycleRoot = process.env.DISTRIBUTED_LIFECYCLE_ROOT;
-	const lifecycleStage = process.env.DISTRIBUTED_LIFECYCLE_STAGE;
-	const hasLifecycleStage = lifecycleRoot !== undefined || lifecycleStage !== undefined;
-	const hasLifecycleOwnership =
-		process.env.DISTRIBUTED_LIFECYCLE_OWNS_CLIENT_COMPILE === '1';
-	const lifecycleContext = hasLifecycleStage || hasLifecycleOwnership;
-	const configuredCommand = options.command ?? 'distributed';
-	const validLifecyclePath = (value: string | undefined): value is string =>
-		value !== undefined &&
-		value.length > 0 &&
-		value === value.trim() &&
-		isAbsolute(value) &&
-		!/[\u0000-\u001f\u007f]/.test(value);
-	let command: string;
-	if (lifecycleContext) {
-		if (!validLifecyclePath(lifecycleExecutable)) {
-			throw new TypeError(
-				'Distributed lifecycle requires an absolute initiating executable identity'
-			);
-		}
-		if (
-			hasLifecycleStage &&
-			(!validLifecyclePath(lifecycleRoot) || !validLifecyclePath(lifecycleStage))
-		) {
-			throw new TypeError(
-				'Distributed lifecycle requires absolute root and stage identities'
-			);
-		}
-		command = lifecycleExecutable;
-	} else {
-		command = configuredCommand;
-	}
-	command = command.trim();
-	if (command.length === 0) {
-		throw new TypeError('Distributed SvelteKit command must not be empty');
-	}
+	const compiler = resolveCompilerCommand(cwd, options);
 	const configuredClients = options.clients ?? [];
 	const configuredGames = options.games ?? [];
 	if (!Array.isArray(configuredClients) || !Array.isArray(configuredGames)) {
@@ -1280,24 +773,9 @@ function resolveIntegration(
 			manifestWatchRoots: Object.freeze(manifestWatchRoots(cwd, client.manifest))
 		});
 	});
-	const commandArgs = (options.commandArgs ?? []).map((argument, index) => {
-		if (typeof argument !== 'string') {
-			throw new TypeError(
-				`Distributed commandArgs[${index}] must be a string`
-			);
-		}
-		return argument;
-	});
 	return Object.freeze({
-		cwd,
+		...compiler,
 		outputRoot: cwd,
-		command,
-		// A lifecycle-owned compile must be an invocation of the trusted
-		// initiating executable itself. A configured standalone prefix (most
-		// commonly `cargo run ... --`) belongs to the app's direct Vite mode;
-		// carrying it across would make the initiating binary parse launcher
-		// arguments as its own command and can select a different binary.
-		commandArgs: Object.freeze(lifecycleContext ? [] : commandArgs),
 		routesDir,
 		libDir,
 		aliases,
@@ -1341,7 +819,7 @@ function relocateLifecycleOutputs(
 
 function validateManifestSource(
 	module: string,
-	source: DistributedSvelteKitManifestSource
+	source: CompilerManifestSource
 ): void {
 	if (typeof source === 'string') {
 		nonempty(source, `${module} manifest path`);
@@ -1361,20 +839,6 @@ function validateManifestSource(
 	}
 }
 
-function nonempty(value: unknown, label: string): string {
-	if (typeof value !== 'string' || value.trim().length === 0) {
-		throw new TypeError(`${label} must be a non-empty string`);
-	}
-	return value;
-}
-
-function containedPath(root: string, value: string, label: string): string {
-	const target = resolve(root, nonempty(value, label));
-	if (!isWithin(root, target)) {
-		throw new TypeError(`${label} must stay within project root ${root}`);
-	}
-	return target;
-}
 
 function documentWatchRoots(
 	cwd: string,
@@ -1400,25 +864,6 @@ function documentWatchRoots(
 	return [...roots].sort();
 }
 
-function manifestWatchRoots(
-	cwd: string,
-	manifest: DistributedSvelteKitManifestSource
-): string[] {
-	const manifestPath =
-		typeof manifest === 'string'
-			? resolve(cwd, manifest)
-			: (() => {
-					const index = manifest.args.indexOf('--manifest-path');
-					return index === -1 || manifest.args[index + 1] === undefined
-						? undefined
-						: resolve(cwd, manifest.args[index + 1]);
-				})();
-	if (manifestPath === undefined) return [];
-	const root = dirname(manifestPath);
-	return [manifestPath, join(root, 'src'), join(root, 'crates')]
-		.filter((candidate) => existsSync(candidate))
-		.sort();
-}
 
 function isCompilerInput(file: string, integration: ResolvedIntegration): boolean {
 	if (integration.clients.length === 0) return false;
@@ -2049,105 +1494,6 @@ async function generatedTreesEqual(left: string, right: string): Promise<boolean
 	return compare(left, right);
 }
 
-async function runCommand(
-	integration: ResolvedIntegration,
-	args: readonly string[],
-	children: Set<ChildProcess>,
-	signal: AbortSignal
-): Promise<{ stdout: string; stderr: string }> {
-	throwIfAborted(signal);
-	const argv = [...integration.commandArgs, ...args];
-	return await new Promise((resolvePromise, rejectPromise) => {
-		const child = spawn(integration.command, argv, {
-			cwd: integration.cwd,
-			env: process.env,
-			shell: false,
-			detached: process.platform !== 'win32',
-			stdio: ['ignore', 'pipe', 'pipe']
-		});
-		children.add(child);
-		const stdout: Buffer[] = [];
-		const stderr: Buffer[] = [];
-		let bytes = 0;
-		let overflow = false;
-		let forceKill: ReturnType<typeof setTimeout> | undefined;
-		const cancel = (): void => {
-			killChild(child, 'SIGTERM');
-			forceKill ??= setTimeout(() => killChild(child, 'SIGKILL'), 1_500);
-			forceKill.unref();
-		};
-		signal.addEventListener('abort', cancel, { once: true });
-		const collect = (target: Buffer[]) => (chunk: Buffer | string): void => {
-			if (overflow) return;
-			const value = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
-			bytes += value.length;
-			if (bytes > MAX_COMMAND_OUTPUT_BYTES) {
-				overflow = true;
-				cancel();
-				return;
-			}
-			target.push(value);
-		};
-		child.stdout?.on('data', collect(stdout));
-		child.stderr?.on('data', collect(stderr));
-		child.once('error', (error) => {
-			children.delete(child);
-			signal.removeEventListener('abort', cancel);
-			if (forceKill !== undefined) clearTimeout(forceKill);
-			rejectPromise(
-				commandFailure(integration, argv, '', error.message)
-			);
-		});
-		child.once('close', (code, signal) => {
-			children.delete(child);
-			cancellationCleanup();
-			const out = Buffer.concat(stdout).toString('utf8');
-			const err = Buffer.concat(stderr).toString('utf8');
-			if (overflow) {
-				rejectPromise(
-					commandFailure(
-						integration,
-						argv,
-						err,
-						`output exceeded ${MAX_COMMAND_OUTPUT_BYTES} bytes`
-					)
-				);
-			} else if (code !== 0) {
-				rejectPromise(
-					commandFailure(
-						integration,
-						argv,
-						err,
-						`exit ${code ?? 'unknown'}${signal === null ? '' : ` (${signal})`}`
-					)
-				);
-			} else {
-				resolvePromise({ stdout: out, stderr: err });
-			}
-		});
-
-		function cancellationCleanup(): void {
-			signal.removeEventListener('abort', cancel);
-			if (forceKill !== undefined) clearTimeout(forceKill);
-		}
-	});
-}
-
-function commandFailure(
-	integration: ResolvedIntegration,
-	argv: readonly string[],
-	stderr: string,
-	summary: string
-): Error {
-	const renderedArgv = JSON.stringify([integration.command, ...argv]);
-	const details = [
-		`Distributed compiler command failed: ${summary}`,
-		`cwd: ${integration.cwd}`,
-		`argv: ${renderedArgv}`,
-		stderr.trim().length === 0 ? undefined : `stderr:\n${stderr.trim()}`
-	].filter((value): value is string => value !== undefined);
-	return new Error(details.join('\n'));
-}
 
 async function validateResolvedPaths(
 	integration: ResolvedIntegration
@@ -2183,283 +1529,7 @@ function validateResolvedPathsSync(integration: ResolvedIntegration): void {
 	}
 }
 
-function plannedPhysicalPath(
-	canonicalRoot: string,
-	lexicalRoot: string,
-	target: string
-): string {
-	const rel = relative(lexicalRoot, target);
-	let lexical = lexicalRoot;
-	if (rel !== '') {
-		for (const component of rel.split(sep)) {
-			lexical = join(lexical, component);
-			if (!existsSync(lexical)) break;
-			const metadata = lstatSync(lexical);
-			if (metadata.isSymbolicLink()) {
-				throw new Error(
-					`Distributed path ${target} contains symlink component ${lexical}`
-				);
-			}
-		}
-	}
 
-	let existing = target;
-	const suffix: string[] = [];
-	while (!existsSync(existing)) {
-		const parent = dirname(existing);
-		if (parent === existing) {
-			throw new Error(
-				`Distributed path ${target} has no existing parent within ${canonicalRoot}`
-			);
-		}
-		suffix.unshift(basename(existing));
-		existing = parent;
-	}
-	const canonicalExisting = realpathSync(existing);
-	if (!isWithin(canonicalRoot, canonicalExisting)) {
-		throw new Error(
-			`Distributed path ${target} resolves outside project root ${canonicalRoot}`
-		);
-	}
-	const planned = resolve(canonicalExisting, ...suffix);
-	if (!isWithin(canonicalRoot, planned)) {
-		throw new Error(
-			`Distributed path ${target} resolves outside project root ${canonicalRoot}`
-		);
-	}
-	return planned;
-}
-
-function physicalPathKey(path: string): string {
-	return process.platform === 'win32' || process.platform === 'darwin'
-		? path.toLocaleLowerCase('en-US')
-		: path;
-}
-
-async function validateNearestExistingParent(
-	root: string,
-	target: string
-): Promise<void> {
-	const canonicalRoot = realpathSync(root);
-	plannedPhysicalPath(canonicalRoot, root, target);
-}
-
-function compilerCoordinatorRegistry(): Map<string, CompilerCoordinator> {
-	const globalScope = globalThis as unknown as Record<symbol, unknown>;
-	const existing = globalScope[COMPILER_COORDINATORS];
-	if (existing instanceof Map) {
-		return existing as Map<string, CompilerCoordinator>;
-	}
-	const registry = new Map<string, CompilerCoordinator>();
-	globalScope[COMPILER_COORDINATORS] = registry;
-	return registry;
-}
-
-async function acquireCompilerLock(cwd: string): Promise<CompilerLockLease> {
-	const path = join(cwd, COMPILER_LOCK);
-	const registry = compilerCoordinatorRegistry();
-	for (;;) {
-		const existing = registry.get(path);
-		if (existing?.closing !== undefined) {
-			await existing.closing;
-			continue;
-		}
-		const coordinator =
-			existing ??
-			({
-				path,
-				references: 0,
-				ready: acquirePhysicalCompilerLock(cwd, path),
-				tail: Promise.resolve(),
-				startupRuns: new Map()
-			} satisfies CompilerCoordinator);
-		if (existing === undefined) registry.set(path, coordinator);
-		coordinator.references += 1;
-		try {
-			await coordinator.ready;
-			return { coordinator, released: false };
-		} catch (error) {
-			coordinator.references -= 1;
-			if (
-				coordinator.references === 0 &&
-				registry.get(path) === coordinator
-			) {
-				registry.delete(path);
-			}
-			throw error;
-		}
-	}
-}
-
-async function acquirePhysicalCompilerLock(
-	cwd: string,
-	path: string
-): Promise<void> {
-	await validateNearestExistingParent(cwd, dirname(path));
-	await mkdir(dirname(path), { recursive: true });
-	await validateNearestExistingParent(cwd, path);
-	for (let attempt = 0; attempt < 2; attempt += 1) {
-		try {
-			const handle = await open(path, 'wx', 0o600);
-			try {
-				await handle.writeFile(
-					`${JSON.stringify({ pid: process.pid, version: 1 })}\n`,
-					'utf8'
-				);
-			} finally {
-				await handle.close();
-			}
-			return;
-		} catch (error) {
-			if (!isAlreadyExists(error)) throw error;
-			let owner: unknown;
-			try {
-				owner = JSON.parse(await readFile(path, 'utf8')) as unknown;
-			} catch {
-				owner = undefined;
-			}
-			const pid =
-				owner !== null &&
-				typeof owner === 'object' &&
-				'pid' in owner &&
-				typeof owner.pid === 'number'
-					? owner.pid
-					: undefined;
-			if (pid !== undefined && processExists(pid)) {
-				throw new Error(
-					`Distributed SvelteKit compiler already owns ${cwd} (pid ${pid})`
-				);
-			}
-			await unlink(path).catch((unlinkError: unknown) => {
-				if (!isMissing(unlinkError)) throw unlinkError;
-			});
-		}
-	}
-	throw new Error(`could not acquire Distributed SvelteKit compiler lock ${path}`);
-}
-
-function withCompilerLock<T>(
-	lease: CompilerLockLease,
-	operation: () => Promise<T>
-): Promise<T> {
-	if (lease.released) {
-		return Promise.reject(
-			new Error('Distributed SvelteKit compiler lock lease is already released')
-		);
-	}
-	const coordinator = lease.coordinator;
-	const run = coordinator.tail.catch(() => undefined).then(operation);
-	coordinator.tail = run.then(
-		() => undefined,
-		() => undefined
-	);
-	return run;
-}
-
-function withCompilerStartup(
-	lease: CompilerLockLease,
-	integration: ResolvedIntegration,
-	operation: () => Promise<void>
-): Promise<void> {
-	if (lease.released) {
-		return Promise.reject(
-			new Error('Distributed SvelteKit compiler lock lease is already released')
-		);
-	}
-	const key = JSON.stringify(integration);
-	const coordinator = lease.coordinator;
-	const existing = coordinator.startupRuns.get(key);
-	if (existing !== undefined) return existing;
-	const run = withCompilerLock(lease, operation);
-	const cached = run.catch((error: unknown) => {
-		if (coordinator.startupRuns.get(key) === cached) {
-			coordinator.startupRuns.delete(key);
-		}
-		throw error;
-	});
-	coordinator.startupRuns.set(key, cached);
-	return cached;
-}
-
-function requireCompilerLock(
-	lease: CompilerLockLease | undefined
-): CompilerLockLease {
-	if (lease === undefined) {
-		throw new Error('Distributed SvelteKit compiler lock is not initialized');
-	}
-	return lease;
-}
-
-async function releaseCompilerLock(lease: CompilerLockLease): Promise<void> {
-	if (lease.released) return;
-	lease.released = true;
-	const coordinator = lease.coordinator;
-	await coordinator.tail.catch(() => undefined);
-	coordinator.references -= 1;
-	if (coordinator.references > 0) return;
-	if (coordinator.references < 0) {
-		throw new Error('Distributed SvelteKit compiler lock reference underflow');
-	}
-	const registry = compilerCoordinatorRegistry();
-	if (registry.get(coordinator.path) !== coordinator) return;
-	const closing = unlink(coordinator.path)
-		.catch((error: unknown) => {
-			if (!isMissing(error)) throw error;
-		})
-		.finally(() => {
-			if (registry.get(coordinator.path) === coordinator) {
-				registry.delete(coordinator.path);
-			}
-		});
-	coordinator.closing = closing;
-	await closing;
-}
-
-function processExists(pid: number): boolean {
-	try {
-		process.kill(pid, 0);
-		return true;
-	} catch (error) {
-		return (
-			error !== null &&
-			typeof error === 'object' &&
-			'code' in error &&
-			error.code === 'EPERM'
-		);
-	}
-}
-
-function killChild(
-	child: ChildProcess,
-	signal: NodeJS.Signals
-): void {
-	if (child.pid === undefined) return;
-	if (process.platform !== 'win32') {
-		try {
-			process.kill(-child.pid, signal);
-			return;
-		} catch {
-			// The child may have exited or failed to become its own process group.
-		}
-	}
-	child.kill(signal);
-}
-
-function throwIfAborted(signal: AbortSignal): void {
-	if (!signal.aborted) return;
-	const error = new Error('Distributed SvelteKit compiler was cancelled');
-	error.name = 'AbortError';
-	throw error;
-}
-
-function isAlreadyExists(error: unknown): boolean {
-	return (
-		error !== null &&
-		typeof error === 'object' &&
-		'code' in error &&
-		error.code === 'EEXIST'
-	);
-}
 
 function requireResolved(
 	value: ResolvedIntegration | undefined
@@ -2476,274 +1546,4 @@ function virtualId(module: string): string {
 	return `\0@hops-ops/distributed:sveltekit:${module}`;
 }
 
-function portablePath(path: string): string {
-	return path.replaceAll('\\', '/');
-}
 
-function viteError(error: unknown): Readonly<{
-	message: string;
-	stack?: string;
-}> {
-	if (error instanceof Error) {
-		return {
-			message: error.message,
-			...(error.stack === undefined ? {} : { stack: error.stack })
-		};
-	}
-	return { message: String(error) };
-}
-
-const GAME_EXTENSIONS = new Set(['ts', 'js', 'none']);
-const MAX_GAME_TREE_FILES = 2_000;
-const MAX_GAME_TREE_BYTES = 64 * 1024 * 1024;
-
-function resolveGames(
-	cwd: string,
-	games: readonly DistributedGameSurfaceCompiler[],
-	clientOutputs: readonly string[]
-): ResolvedGame[] {
-	const outputs = [...clientOutputs];
-	return games.map((game, index): ResolvedGame => {
-		const label = `Distributed game[${index}]`;
-		if (game === null || typeof game !== 'object') {
-			throw new TypeError(`${label} must be an object`);
-		}
-		const manifest = game.manifest;
-		if (typeof manifest === 'string') {
-			nonempty(manifest, `${label} manifest path`);
-		} else if (
-			manifest === null ||
-			typeof manifest !== 'object' ||
-			!Array.isArray(manifest.args) ||
-			manifest.args[0] !== 'game-manifest' ||
-			manifest.args.some((argument) => typeof argument !== 'string')
-		) {
-			throw new TypeError(`${label} manifest args must begin with game-manifest`);
-		}
-		const out = containedPath(cwd, game.out, `${label} out`);
-		if (out === cwd) throw new TypeError(`${label} cannot use the project root as generated output`);
-		for (const existing of outputs) {
-			if (isWithin(existing, out) || isWithin(out, existing)) {
-				throw new TypeError(`Distributed generated outputs must not overlap: \`${existing}\` and \`${out}\``);
-			}
-		}
-		outputs.push(out);
-		const importExtension = game.importExtension ?? 'ts';
-		if (!GAME_EXTENSIONS.has(importExtension)) {
-			throw new TypeError(`${label} importExtension must be ts, js or none`);
-		}
-		const wasm = game.wasm ?? 'auto';
-		let resolvedWasm: ResolvedGame['wasm'];
-		if (wasm === false || wasm === 'auto') {
-			resolvedWasm = wasm;
-		} else if (wasm !== null && typeof wasm === 'object') {
-			resolvedWasm = Object.freeze({
-				manifestPath: resolve(cwd, nonempty(wasm.manifestPath, `${label} wasm.manifestPath`))
-			});
-		} else {
-			throw new TypeError(`${label} wasm must be 'auto', false or { manifestPath }`);
-		}
-		const extra = (game.watch ?? []).map((root, rootIndex) =>
-			resolve(cwd, nonempty(root, `${label} watch[${rootIndex}]`))
-		);
-		const wasmRoots =
-			typeof resolvedWasm === 'object' ? manifestWatchRoots(cwd, resolvedWasm.manifestPath) : [];
-		const watchRoots = [
-			...new Set([
-				...manifestWatchRoots(cwd, manifest as DistributedSvelteKitManifestSource),
-				...wasmRoots,
-				...extra.filter((root) => existsSync(root))
-			])
-		].sort();
-		return Object.freeze({
-			manifest,
-			out,
-			importExtension,
-			wasm: resolvedWasm,
-			watchRoots: Object.freeze(watchRoots)
-		});
-	});
-}
-
-/** A Rust source of a game surface (or its Cargo manifest / lockfile). */
-function isGameInput(file: string, integration: ResolvedIntegration): boolean {
-	if (integration.games.length === 0) return false;
-	const absolute = resolve(integration.cwd, file);
-	const name = basename(absolute);
-	if (!absolute.endsWith('.rs') && name !== 'Cargo.toml' && name !== 'Cargo.lock') return false;
-	if (absolute.split(sep).includes('target')) return false;
-	return integration.games.some((game) =>
-		game.watchRoots.some(
-			(root) => isWithin(root, absolute) || (name === 'Cargo.lock' && isWithin(dirname(root), absolute))
-		)
-	);
-}
-
-function gameManifestPath(game: ResolvedGame, cwd: string): string | undefined {
-	if (typeof game.wasm === 'object') return game.wasm.manifestPath;
-	if (typeof game.manifest === 'string') return undefined;
-	const index = game.manifest.args.indexOf('--manifest-path');
-	const value = index === -1 ? undefined : game.manifest.args[index + 1];
-	return value === undefined ? undefined : resolve(cwd, value);
-}
-
-async function gameTreeDigest(root: string): Promise<string> {
-	const { createHash } = await import('node:crypto');
-	const hash = createHash('sha256');
-	const budget = { files: 0, bytes: 0 };
-	const walk = async (directory: string): Promise<void> => {
-		let entries;
-		try {
-			entries = await readdir(directory, { withFileTypes: true });
-		} catch (error) {
-			if (isMissing(error)) return;
-			throw error;
-		}
-		entries.sort((a, b) => a.name.localeCompare(b.name));
-		for (const entry of entries) {
-			const path = join(directory, entry.name);
-			if (entry.isDirectory()) {
-				await walk(path);
-			} else if (entry.isFile()) {
-				budget.files += 1;
-				const bytes = await readFile(path);
-				budget.bytes += bytes.byteLength;
-				if (budget.files > MAX_GAME_TREE_FILES || budget.bytes > MAX_GAME_TREE_BYTES) {
-					throw new Error(`generated game output ${root} exceeds its size budget`);
-				}
-				hash.update(relative(root, path)).update('\0').update(bytes).update('\0');
-			}
-		}
-	};
-	await walk(root);
-	return hash.digest('hex');
-}
-
-/**
- * Run `game-manifest` → `game-client` (→ `game-wasm`) for every game surface.
- * `check` runs `game-client --check` only (the WebAssembly is a build output,
- * never committed). Resolves true when any generated output changed.
- */
-async function generateGames(
-	integration: ResolvedIntegration,
-	mode: 'generate' | 'check',
-	children: Set<ChildProcess>,
-	signal: AbortSignal
-): Promise<boolean> {
-	let changed = false;
-	for (const [index, game] of integration.games.entries()) {
-		throwIfAborted(signal);
-		const scratch = await mkdtemp(join(tmpdir(), 'distributed-game-'));
-		try {
-			let manifest: string;
-			if (typeof game.manifest === 'string') {
-				manifest = resolve(integration.cwd, game.manifest);
-			} else {
-				const result = await runCommand(integration, [...game.manifest.args], children, signal);
-				manifest = join(scratch, `surface-${index}.json`);
-				await writeFile(manifest, result.stdout, { encoding: 'utf8', flag: 'wx' });
-			}
-			let surface: { predict?: unknown; pures?: unknown };
-			try {
-				surface = JSON.parse(await readFile(manifest, 'utf8')) as typeof surface;
-			} catch (error) {
-				throw new Error(`distributed game-manifest for ${game.out} did not emit valid JSON`, {
-					cause: error
-				});
-			}
-			const before = mode === 'generate' ? await gameTreeDigest(game.out) : '';
-			if (mode === 'generate') await mkdir(game.out, { recursive: true });
-			await validateNearestExistingParent(integration.cwd, game.out);
-			await runCommand(
-				integration,
-				[
-					'game-client',
-					'--manifest',
-					manifest,
-					'--out',
-					game.out,
-					'--import-extension',
-					game.importExtension,
-					...(mode === 'check' ? ['--check'] : [])
-				],
-				children,
-				signal
-			);
-			const declaresWasm =
-				(surface.predict !== undefined && surface.predict !== null) ||
-				(Array.isArray(surface.pures) && surface.pures.length > 0);
-			if (mode === 'generate' && game.wasm !== false && (game.wasm !== 'auto' || declaresWasm)) {
-				const manifestPath = gameManifestPath(game, integration.cwd);
-				if (manifestPath === undefined) {
-					throw new Error(
-						`Distributed game ${game.out}: game-wasm needs the Cargo manifest; pass wasm: { manifestPath }`
-					);
-				}
-				await runCommand(
-					integration,
-					['game-wasm', '--manifest', manifest, '--manifest-path', manifestPath, '--out', game.out],
-					children,
-					signal
-				);
-			}
-			if (mode === 'generate' && (await gameTreeDigest(game.out)) !== before) changed = true;
-		} finally {
-			await rm(scratch, { recursive: true, force: true });
-		}
-	}
-	return changed;
-}
-
-const BUILD_GAME_RUNS = Symbol.for('@hops-ops/distributed/sveltekit/game-build-runs/v1');
-
-function onceForBuild(integration: ResolvedIntegration, run: () => Promise<unknown>): Promise<unknown> {
-	const scope = globalThis as unknown as Record<symbol, Map<string, Promise<unknown>> | undefined>;
-	const runs = (scope[BUILD_GAME_RUNS] ??= new Map());
-	const key = JSON.stringify([integration.cwd, integration.games]);
-	let pending = runs.get(key);
-	if (pending === undefined) {
-		pending = run();
-		runs.set(key, pending);
-		pending.catch(() => runs.delete(key));
-	}
-	return pending;
-}
-
-async function runGamesOnce(
-	options: DistributedSvelteKitViteOptions,
-	mode: 'generate' | 'check'
-): Promise<boolean> {
-	const integration = resolveIntegration(
-		{ ...options, clients: [] },
-		options.cwd ?? process.cwd()
-	);
-	const children = new Set<ChildProcess>();
-	const cancellation = new AbortController();
-	const cancel = (): void => {
-		cancellation.abort();
-		for (const child of children) killChild(child, 'SIGTERM');
-	};
-	process.once('SIGINT', cancel);
-	process.once('SIGTERM', cancel);
-	try {
-		return await generateGames(integration, mode, children, cancellation.signal);
-	} finally {
-		process.removeListener('SIGINT', cancel);
-		process.removeListener('SIGTERM', cancel);
-		for (const child of children) killChild(child, 'SIGKILL');
-	}
-}
-
-/** Generate every configured game surface once (what the plugin does on start). */
-export async function generateDistributedGames(
-	options: DistributedSvelteKitViteOptions
-): Promise<boolean> {
-	return runGamesOnce(options, 'generate');
-}
-
-/** CI: `game-client --check` for every game surface; never writes. */
-export async function checkDistributedGames(
-	options: DistributedSvelteKitViteOptions
-): Promise<void> {
-	await runGamesOnce(options, 'check');
-}

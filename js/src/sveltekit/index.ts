@@ -51,7 +51,7 @@ export {
 	type DistributedSvelteKitLocationContext,
 	type SveltekitBoundaryLifecycleDiagnostic,
 	type SveltekitBoundaryRetention
-} from '../boundary-lifecycle.js';
+} from './boundary-lifecycle.js';
 export {
 	defineDistributedSvelteKitOperation,
 	provideDistributedSvelteKitClient,
@@ -82,13 +82,14 @@ export type {
 	SveltekitWindowStore,
 	UseSveltekitWindowOptions
 } from './window.js';
+// The framework-neutral client contracts, under this entry's names.
 export type {
-	SveltekitCommandRuntimeFactory,
-	SveltekitCommandRuntimeFactoryOptions,
-	SveltekitCommandRuntimeLike,
-	SveltekitReplicaAuthority,
-	SveltekitReplicaHydration,
-	SveltekitSessionSource
+	DistributedCommandRuntimeFactory as SveltekitCommandRuntimeFactory,
+	DistributedCommandRuntimeFactoryOptions as SveltekitCommandRuntimeFactoryOptions,
+	DistributedCommandRuntimeLike as SveltekitCommandRuntimeLike,
+	DistributedHydrationAuthority as SveltekitReplicaAuthority,
+	DistributedHydration as SveltekitReplicaHydration,
+	DistributedSessionSource as SveltekitSessionSource
 } from '../client.js';
 export {
 	createDistributedSvelteKitServer,

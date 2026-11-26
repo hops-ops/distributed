@@ -14,8 +14,8 @@ import {
 	type DistributedBoundaryOperation,
 	type DistributedBoundaryVariableContext
 } from './boundary-variables.js';
-import { boundaryOperationIdentity } from '../operation-identity.js';
-import type { SveltekitReplicaAuthority, SveltekitReplicaHydration } from '../client.js';
+import { boundaryOperationIdentity } from './operation-identity.js';
+import type { DistributedHydrationAuthority, DistributedHydration } from '../client.js';
 import type { SveltekitDistributedPageData } from './replica.js';
 
 export type SveltekitServerLoadEventLike<TLocals = unknown> = Readonly<{
@@ -248,8 +248,8 @@ function hydrationTransfer(
 	operations: readonly string[],
 	bindings: readonly string[] = []
 ): Readonly<{
-	hydration: SveltekitReplicaHydration;
-	authority: SveltekitReplicaAuthority;
+	hydration: DistributedHydration;
+	authority: DistributedHydrationAuthority;
 }> {
 	return Object.freeze({
 		hydration: Object.freeze({

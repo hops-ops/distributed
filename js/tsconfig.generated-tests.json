@@ -16,9 +16,6 @@
       "@hops-ops/distributed/replica/lazy": [
         "./src/replica/lazy.ts"
       ],
-      "@hops-ops/distributed/react": [
-        "./src/react/index.ts"
-      ],
       "@hops-ops/distributed/sveltekit": [
         "./src/sveltekit/index.ts"
       ],

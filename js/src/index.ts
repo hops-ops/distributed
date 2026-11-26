@@ -36,7 +36,6 @@ export {
 	type DistributedTrustedPresetCodec,
 	type GraphqlResponseExtensions
 } from './protocol.js';
-export { documentToString, type GqlDocument } from './document.js';
 export {
 	buildAuthHeaders,
 	wsConnectionInitPayload

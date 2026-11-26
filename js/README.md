@@ -25,12 +25,14 @@ application-authored cache policies.
 ## Install
 
 ```bash
-npm install @hops-ops/distributed graphql
+npm install @hops-ops/distributed
 ```
 
 The package is ESM-only and requires Node 20 or newer for server-side use. It
-also runs in modern browsers. Svelte 5 and React are optional peers used only
-by the `/sveltekit` and `/react` entry points, respectively.
+also runs in modern browsers. It has no runtime dependencies; Svelte 5 is an
+optional peer used only by the `/sveltekit` entry points. GraphQL documents are
+plain strings (generated artifacts carry them), so no GraphQL library is
+needed.
 
 ## Generate the client surface
 
@@ -754,63 +756,11 @@ Before acceptance the signal cancels dispatch. After finite acceptance it
 rejects only that caller's `receipt.projected` wait; the optimistic layer and
 internal causal tracking remain active, and `receipt.status()` stays available.
 
-## React
+## Diagnostics
 
-Install React and use the optional adapter over an application-owned replica:
+The replica is memory-only: nothing is written to browser storage.
 
-```tsx
-import {
-  DistributedProvider,
-  useDistributedQuery
-} from '@hops-ops/distributed/react';
-import { Operation_Todos } from './generated/distributed/index.js';
-
-function TodosView() {
-  const todos = useDistributedQuery(Operation_Todos, {}, { live: true });
-  return todos.complete
-    ? todos.data.todos.map((todo) => <div key={todo.todo_id}>{todo.title}</div>)
-    : null;
-}
-
-root.render(
-  <DistributedProvider replica={replica}>
-    <TodosView />
-  </DistributedProvider>
-);
-```
-
-The adapter is only a `useSyncExternalStore` bridge. It does not add another
-cache, transport, auth lifecycle, or command path. For SSR, create one replica
-per request and hydrate only under the same authoritative scope.
-
-## Persistence and diagnostics
-
-The default replica is memory-only. Optional IndexedDB persistence is explicit,
-confirmed-state-only, and governed by generated/application model policy.
-Optimistic layers, command inputs, credentials, cache authority, and live
-connections are never persisted as replica data.
-
-The same persistence object offers an opt-in durable command outbox for
-offline use. It decorates the command transport: commands whose policy is
-explicitly `{ durable: true, sensitive: false }` are written to IndexedDB
-before they are sent and drained in order with their original command ids
-(the server's receipts deduplicate resends). Rejections surface to the live
-caller as `REPLICA_COMMAND_REJECTED` and, for commands replayed after a
-reload, through `onSettled`. Only the prepared request is stored — never
-optimistic state — and entries replay only under the same cache scope.
-
-```ts
-const outbox = persistence.commandOutbox({
-  transport,                       // the network command transport
-  scope: () => currentAuthoritativeScope,
-  policy: { commands: { 'todo.create': { durable: true, sensitive: false } } },
-  onSettled: ({ commandId, outcome }) => console.info(commandId, outcome)
-});
-const commands = createCommands(replica, outbox.transport);
-addEventListener('online', () => void outbox.drain());
-```
-
-Diagnostics are also opt-in:
+Diagnostics are opt-in:
 
 ```ts
 import {
@@ -997,7 +947,7 @@ duplicated as decision documents in this package.
 - `@hops-ops/distributed` — GraphQL HTTP/WebSocket, auth, and protocol
   primitives.
 - `@hops-ops/distributed/replica` — replica, GraphQL transport, generated
-  command runtime, query-plan helpers, and optional persistence.
+  command runtime, and query-plan helpers.
 - `@hops-ops/distributed/replica/lazy` — `createLazyReplicaCommandRuntime`
   only, so a client that loads commands on demand (the generated lazy
   `commands.ts`) keeps eager command exports out of its first import graph.
@@ -1013,7 +963,6 @@ duplicated as decision documents in this package.
   game zone (`useGame`, `createGameState`) and `gameTicketSource`.
 - `@hops-ops/distributed/sveltekit/game/server` — server-only
   `createGameTicketHandler` and `mintGameTicket` (session-bound zone tickets).
-- `@hops-ops/distributed/react` — provider and query hook over the same replica.
 - `@hops-ops/distributed/game` — binary `distributed_game` zone protocol
   client: codec, `GameConnection` (handshake, reconnect, clock sync),
   interpolating `EntityReplica`, `Predictor` reconciliation (with
@@ -1026,7 +975,7 @@ All other subpaths are private and blocked by the package export map.
 
 ## Pre-release clean break
 
-The earlier pilot API and persistence format are intentionally unsupported.
+The earlier pilot API and its browser cache format are intentionally unsupported.
 There is no `QueryCache`, `CacheTarget`, `ListMergeSpec`, `target/at/by`
 addressing, manual cache-policy map, resource wrapper, document store, legacy
 command pipeline, or package-owned codegen executable.

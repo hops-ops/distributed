@@ -1,15 +1,12 @@
 /**
- * One parser reads the dehydrated-state format. SSR hydration and IndexedDB
- * persistence used to parse it separately and disagreed on the inputs below;
- * both now give the same answer for each, and both accept everything
- * `dehydrate()` writes.
+ * One parser reads the dehydrated-state format: hydration accepts everything
+ * `dehydrate()` writes, including after a JSON round trip, and refuses each
+ * malformed input below.
  */
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import { createDistributedReplica } from '../dist/replica/index.js';
-import { createReplicaIndexedDbPersistence } from '../dist/replica/index.js';
-import { FakeIndexedDb } from './fixtures/fake-indexeddb.mjs';
 import { flush } from './fixtures/game-harness.mjs';
 import { scripted, Todos, wireFrame } from './fixtures/replica-todos.mjs';
 
@@ -18,9 +15,6 @@ const SCOPE = Object.freeze({
 	schemaHash: 'schema-a',
 	authorizationGeneration: 'auth-1',
 	cacheScope: 'cache:a'
-});
-const POLICY = Object.freeze({
-	models: { TodoView: { retention: 'persist-confirmed', sensitive: false } }
 });
 
 /** A replica holding one query result and one admitted live frame. */
@@ -40,27 +34,7 @@ async function liveReplica() {
 	return { ...harness, watch };
 }
 
-/** How each consumer of the format answers `state`. */
-async function consumers(state) {
-	const hydrated = createDistributedReplica().hydrate(state, SCOPE);
-	const persistence = createReplicaIndexedDbPersistence({
-		indexedDB: new FakeIndexedDb(),
-		databaseName: 'dehydrated-state',
-		policy: POLICY
-	});
-	let saved;
-	try {
-		saved = await persistence.save(state);
-	} catch (error) {
-		assert.ok(error instanceof TypeError, String(error));
-		saved = false;
-	}
-	const restored = saved ? await persistence.restore(SCOPE) : undefined;
-	persistence.close();
-	return { hydrated, saved, restored };
-}
-
-test('a state whose live stream was lost is hydrated, saved and restored', async () => {
+test('a state whose live stream was lost hydrates, also after a JSON round trip', async () => {
 	const { replica, subscriptions, watch } = await liveReplica();
 	subscriptions[0].observer.error(Object.assign(new Error('lost'), { retryable: true }));
 	const state = replica.dehydrate();
@@ -70,13 +44,10 @@ test('a state whose live stream was lost is hydrated, saved and restored', async
 		'the retired live operation is part of what dehydrate() writes'
 	);
 
-	const { hydrated, saved, restored } = await consumers(state);
-	assert.equal(hydrated, true);
-	assert.equal(saved, true, 'persistence used to refuse retiredAtRevision as an unknown field');
-	assert.deepEqual(restored, JSON.parse(JSON.stringify(state)));
+	assert.equal(createDistributedReplica().hydrate(state, SCOPE), true);
 
 	const second = createDistributedReplica();
-	assert.equal(second.hydrate(restored, SCOPE), true);
+	assert.equal(second.hydrate(JSON.parse(JSON.stringify(state)), SCOPE), true);
 	assert.deepEqual(second.read(Todos, {}).data, watch.get().data);
 	watch.destroy();
 });
@@ -127,21 +98,16 @@ const REJECTED = {
 	}
 };
 
-test('hydration and persistence refuse the same malformed states', async (t) => {
+test('hydration refuses malformed states', async (t) => {
 	const { replica, watch } = await liveReplica();
 	const valid = JSON.parse(JSON.stringify(replica.dehydrate()));
 	watch.destroy();
-	assert.deepEqual(await consumers(valid).then(({ hydrated, saved }) => [hydrated, saved]), [
-		true,
-		true
-	]);
+	assert.equal(createDistributedReplica().hydrate(structuredClone(valid), SCOPE), true);
 	for (const [name, corrupt] of Object.entries(REJECTED)) {
-		await t.test(name, async () => {
+		await t.test(name, () => {
 			const state = structuredClone(valid);
 			corrupt(state);
-			const { hydrated, saved } = await consumers(state);
-			assert.equal(hydrated, false, 'hydration');
-			assert.equal(saved, false, 'persistence');
+			assert.equal(createDistributedReplica().hydrate(state, SCOPE), false);
 		});
 	}
 });

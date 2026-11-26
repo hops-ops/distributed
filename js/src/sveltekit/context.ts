@@ -17,7 +17,7 @@ import {
 import type {
 	DistributedSvelteKitBoundaryInstance,
 	SveltekitBoundaryRetention
-} from '../boundary-lifecycle.js';
+} from './boundary-lifecycle.js';
 import type {
 	DistributedSvelteKitClient,
 	SveltekitBoundOperation,

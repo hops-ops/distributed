@@ -233,7 +233,7 @@ function serializeOperationProtocolState(
 }
 
 /** A dehydrated state that passed {@link parseDehydratedState}. */
-export type ParsedDehydratedState = {
+type ParsedDehydratedState = {
 	readonly scope: ProtocolGeneration;
 	readonly payload: ReplicaDehydratedPayloadV1;
 };
@@ -276,8 +276,8 @@ export function sameScope(
 }
 
 /**
- * The one parser of the format `dehydrate()` writes: SSR hydration and
- * IndexedDB persistence both read a state through it and nothing else.
+ * The one parser of the format `dehydrate()` writes: hydration reads a state
+ * through it and nothing else.
  *
  * It admits exactly what `dehydrate()` can emit. Every object is plain and has
  * no unknown member, every revision is a canonical decimal string, the cache
@@ -825,7 +825,7 @@ function optional<T>(
 }
 
 /** A plain object with only `allowed` members and every `required` one. */
-export function exactRecord(
+function exactRecord(
 	value: unknown,
 	path: string,
 	allowed: readonly string[],
@@ -843,7 +843,7 @@ export function exactRecord(
 	return record;
 }
 
-export function plainRecord(value: unknown, path: string): Record<string, unknown> {
+function plainRecord(value: unknown, path: string): Record<string, unknown> {
 	if (!isPlainRecord(value)) invalid(path);
 	return value;
 }
@@ -853,7 +853,7 @@ function array(value: unknown, path: string): unknown[] {
 	return value;
 }
 
-export function nonEmptyString(value: unknown, path: string): string {
+function nonEmptyString(value: unknown, path: string): string {
 	if (typeof value !== 'string' || value.length === 0) invalid(path);
 	return value;
 }
@@ -873,7 +873,7 @@ function boolean(value: unknown, path: string): boolean {
 	return value;
 }
 
-export function nonNegativeInteger(value: unknown, path: string): number {
+function nonNegativeInteger(value: unknown, path: string): number {
 	if (!Number.isSafeInteger(value) || (value as number) < 0) invalid(path);
 	return value as number;
 }
