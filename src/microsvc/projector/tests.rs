@@ -1180,7 +1180,7 @@ where
         .expect_err("the stop survives a restart");
     assert_eq!(repair_handle(&still_stopped), handle);
     // A host learns of the stop from the store, without the run's error.
-    let stopped_service = two_projector_service(&repository, "task15-primary-v2", &applied);
+    let stopped_service = two_projector_service(&repository, true, &applied);
     assert_eq!(
         stopped_service.stopped_projections().await.unwrap(),
         [crate::microsvc::StoppedProjection {
@@ -1231,7 +1231,7 @@ async fn a_long_running_host_can_ask_which_projectors_are_stopped() {
     bus.publish_message(fact_message("a", "before the rollout"))
         .await
         .unwrap();
-    two_projector_service(&repository, "task15-primary-v1", &applied)
+    two_projector_service(&repository, false, &applied)
         .with_bus(bus.clone())
         .run(RunOptions::until_idle())
         .await
@@ -1239,12 +1239,12 @@ async fn a_long_running_host_can_ask_which_projectors_are_stopped() {
 
     let shutdown = crate::bus::Shutdown::new();
     let running = tokio::spawn(
-        two_projector_service(&repository, "task15-primary-v2", &applied)
+        two_projector_service(&repository, true, &applied)
             .with_bus(bus.clone())
             .run(RunOptions::until_shutdown(shutdown.clone())),
     );
     // The host's own service over the same stores, as its API process has.
-    let host = two_projector_service(&repository, "task15-primary-v2", &applied);
+    let host = two_projector_service(&repository, true, &applied);
     assert!(host.stopped_projections().await.unwrap().is_empty());
 
     bus.publish_message(fact_message("b", "after the rollout"))
