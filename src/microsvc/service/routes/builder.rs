@@ -423,15 +423,17 @@ where
     I: serde::de::DeserializeOwned + Send + Sync + 'static,
     T: crate::command::CommandOutputType + serde::Serialize + Send + Sync + 'static,
 {
-    /// Commit and return a Succeeded payload built from the aggregate and the
-    /// session principal. Used when the command is not Eventual.
+    /// Publish captured events, commit, and return a Succeeded payload built
+    /// from the aggregate and the session principal. Used when the command is
+    /// not Eventual: publication is the same, only the visibility promise
+    /// differs.
     pub fn succeeded<F>(self, payload: F) -> Routes<D>
     where
         F: Fn(&crate::microsvc::AggregateCheckout<D::Aggregate>, &str) -> T + Send + Sync + 'static,
     {
         self.finish(Arc::new(move |ctx, checkout, principal| {
             let body = payload(&checkout, principal);
-            ctx.commit(checkout)?.succeeded(body)
+            ctx.publish_events().commit(checkout)?.succeeded(body)
         }))
     }
 }
