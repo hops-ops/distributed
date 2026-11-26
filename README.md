@@ -1289,12 +1289,16 @@ not an atomic external effect plus publish. Aggregate decisions still use a
 transactional outbox. Bound external reads and make effects idempotent before
 using this pattern.
 
-### Scheduled messages, sagas and fenced leases
+### Schedules, sagas and fenced leases
 
-`OutboxMessage::deliver_at(at)` turns an outbox row into a durable timer that
-no claim path delivers before `at`. Cross-cell workflows use the event-sourced
-`Saga<D>` process manager (`distributed::saga`). Single-owner work uses TTL
-leases with monotonic fencing tokens (`distributed::lease`). See
+A command schedules future work for its aggregate with `ctx.schedule(Schedule)`
+(`distributed::schedule`): one durable row per (aggregate, name), committed
+with the aggregate's events, that a `ScheduleWorker` fires back into the
+service as a command, once per generation. It is the one timer mechanism:
+cross-cell workflows use the event-sourced `Saga<D>` process manager
+(`distributed::saga`), whose step timeouts are a schedule fired through the
+`SagaTimeouts` route. Single-owner work uses TTL leases with monotonic fencing
+tokens (`distributed::lease`). See
 [coordination primitives](docs/coordination-primitives.md).
 
 ### Publishing the Outbox

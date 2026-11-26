@@ -83,8 +83,9 @@ pub const MAX_SAGA_FAN_OUT: usize = 64;
 /// settles only once every member has replied or timed out; if any member
 /// failed or timed out, the step fails and compensation runs for the members
 /// that applied (or may have, after a timeout) — never for members that
-/// definitively rejected. Each member has its own timeout timer and a
-/// deterministic command id per `(step, member index)`.
+/// definitively rejected. Members share the step's deadline (every member
+/// still unanswered then times out) and each has a deterministic command id
+/// per `(step, member index)`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SagaAction {
     /// A single command (`member` is `None` on its replies).
@@ -134,8 +135,11 @@ impl From<SagaCommand> for SagaAction {
 pub trait SagaDefinition: Send + Sync + 'static {
     /// Durable aggregate type of the saga streams (e.g. `"funds.transfer"`).
     const SAGA_TYPE: &'static str;
-    /// Destination queue on which this saga receives replies and timers.
+    /// Destination queue on which this saga receives replies.
     const REPLY_TO: &'static str;
+    /// Command the saga's timeout schedule fires into the saga (route it with
+    /// [`SagaTimeouts`](super::SagaTimeouts)). Unique per service.
+    const TIMEOUT_COMMAND: &'static str;
     /// Compensation attempts (dispatch + retries) before the saga is marked
     /// [`Stuck`](super::SagaStatus::Stuck) for operator attention.
     const MAX_COMPENSATION_ATTEMPTS: u32 = 5;

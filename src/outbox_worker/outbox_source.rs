@@ -186,7 +186,6 @@ mod tests {
         [
             OutboxMessageStatus::Pending,
             OutboxMessageStatus::InFlight,
-            OutboxMessageStatus::Published,
             OutboxMessageStatus::Failed,
         ]
         .into_iter()

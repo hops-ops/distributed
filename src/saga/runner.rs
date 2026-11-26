@@ -3,22 +3,24 @@ use crate::clock::{Clock, SystemClock};
 use crate::repository::{
     GetStream, RepositoryError, TransactionalCommit, CONCURRENT_WRITE_RETRIES,
 };
+use crate::schedule::ScheduleWrite;
 
 use super::{Saga, SagaDefinition, SagaError, SagaMessage, SagaOutcome, SagaTransition};
 
 /// Load → transition → commit driver for a [`Saga`].
 ///
 /// Each call loads the saga, applies one transition and commits the saga's
-/// new events **together with** the commands and timers it emitted, in one
-/// repository transaction. A concurrent handler of the same saga loses on the
+/// new events **together with** the commands it emitted and its timeout
+/// schedule write, in one repository transaction. The timeouts fire through
+/// [`SagaTimeouts`](super::SagaTimeouts), not through the runner. A concurrent handler of the same saga loses on the
 /// stream version and is retried (the reload then sees the winner's state,
 /// so a duplicate message becomes a no-op).
 ///
 /// Use an *unqueued* repository: correctness comes from optimistic stream
 /// versions, and the runner does not hold `QueuedRepository` locks across a
 /// no-op. Inside a `microsvc` handler with a queued repo, call
-/// [`Saga::start`]/[`Saga::handle`] directly and commit with
-/// `ctx.repo().outbox(..).commit(&mut saga)`.
+/// [`Saga::start`]/[`Saga::handle`] directly and commit the transition's
+/// messages and timer through `ctx` (`ctx.outbox(..)`, `ctx.schedule(..)`).
 pub struct SagaRunner<R, D: SagaDefinition, C = SystemClock> {
     repo: AggregateRepository<R, Saga<D>>,
     clock: C,
@@ -66,7 +68,7 @@ where
         .await
     }
 
-    /// Apply an inbound reply/timeout.
+    /// Apply a participant's reply.
     pub async fn handle(&self, message: &SagaMessage) -> Result<SagaTransition, SagaError> {
         if message.saga_type != D::SAGA_TYPE {
             return Err(SagaError::Malformed(format!(
@@ -106,7 +108,7 @@ where
             if result.outcome != SagaOutcome::Applied {
                 return Ok(result);
             }
-            match self.commit(&mut saga, result.messages.clone()).await {
+            match self.commit(&mut saga, &result).await {
                 Ok(()) => return Ok(result),
                 Err(RepositoryError::ConcurrentWrite { .. })
                     if attempt < CONCURRENT_WRITE_RETRIES =>
@@ -118,19 +120,25 @@ where
         }
     }
 
-    async fn commit(
+    /// Commit `saga` with what `transition` emitted.
+    pub(super) async fn commit(
         &self,
         saga: &mut Saga<D>,
-        messages: Vec<crate::outbox::OutboxMessage>,
+        transition: &SagaTransition,
     ) -> Result<(), RepositoryError> {
-        let mut messages = messages.into_iter();
-        let Some(first) = messages.next() else {
-            return self.repo.commit(saga).await;
+        let mut messages = transition.messages.iter().cloned();
+        let commit = match transition.timer.clone() {
+            Some(ScheduleWrite::Arm(schedule)) => self.repo.schedule(schedule),
+            Some(ScheduleWrite::Cancel(name)) => self.repo.cancel_schedule(name),
+            None => match messages.next() {
+                Some(first) => self.repo.outbox(first),
+                None => return self.repo.commit(saga).await,
+            },
         };
-        let mut commit = self.repo.outbox(first);
-        for message in messages {
-            commit = commit.outbox(message);
-        }
-        commit.commit(saga).await.map(|_| ())
+        messages
+            .fold(commit, |commit, message| commit.outbox(message))
+            .commit(saga)
+            .await
+            .map(|_| ())
     }
 }

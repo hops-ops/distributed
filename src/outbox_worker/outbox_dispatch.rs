@@ -647,7 +647,7 @@ mod tests {
         let row = load(&repo, &id);
         assert!(row.is_pending());
         assert!(
-            row.deliver_at.is_some_and(|at| at > crate::time::now()),
+            row.available_at.is_some_and(|at| at > crate::time::now()),
             "the released row waits before its next attempt"
         );
     }

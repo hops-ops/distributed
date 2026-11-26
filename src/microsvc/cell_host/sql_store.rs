@@ -65,7 +65,7 @@ fn cell_migrations(
 ) -> impl Iterator<Item = &'static crate::repository::migrations::EmbeddedMigration> {
     crate::repository::migrations::SQLITE_MIGRATIONS
         .iter()
-        .filter(|migration| matches!(migration.version, 1 | 2 | 4 | 8 | 11))
+        .filter(|migration| matches!(migration.version, 1 | 2 | 4 | 8 | 11 | 15))
 }
 
 #[derive(Clone)]

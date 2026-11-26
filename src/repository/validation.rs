@@ -12,7 +12,7 @@ use std::collections::HashSet;
 use crate::entity::{
     EventRecord, EventRecordError, BITCODE_PAYLOAD_CODEC, BITCODE_PAYLOAD_CODEC_VERSION,
 };
-use crate::outbox::{validate_outbox_message_table_write, OutboxMessage};
+use crate::outbox::OutboxMessage;
 use crate::snapshot::SnapshotRecord;
 
 use super::{
@@ -99,8 +99,6 @@ fn reject_duplicate_streams(streams: &[StreamWrite<'_>]) -> Result<(), Repositor
 fn reject_duplicate_outbox_messages(messages: &[OutboxMessage]) -> Result<(), RepositoryError> {
     let mut seen = HashSet::with_capacity(messages.len());
     for message in messages {
-        validate_outbox_message_table_write(message)
-            .map_err(|err| RepositoryError::Model(err.to_string()))?;
         let id = message.id();
         if id.trim().is_empty() {
             return Err(RepositoryError::Model(
@@ -110,6 +108,11 @@ fn reject_duplicate_outbox_messages(messages: &[OutboxMessage]) -> Result<(), Re
         if message.event_type.trim().is_empty() {
             return Err(RepositoryError::Model(format!(
                 "outbox message `{id}` event type must not be empty"
+            )));
+        }
+        if message.payload_codec.trim().is_empty() || message.payload_codec_version == 0 {
+            return Err(RepositoryError::Model(format!(
+                "outbox message `{id}` needs a payload codec and a version above zero"
             )));
         }
         if !seen.insert(id.to_string()) {
