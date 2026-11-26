@@ -198,7 +198,7 @@ impl CommandService for GrpcHandler {
                 // internal error detail (SQL/driver text).
                 let status = e.status_code();
                 if status >= 500 {
-                    eprintln!("microsvc command `{}` failed: {e}", req.command);
+                    tracing::error!(command = %req.command, error = %e, "microsvc command failed");
                 }
                 Ok(Response::new(GrpcResponse {
                     status: status as u32,

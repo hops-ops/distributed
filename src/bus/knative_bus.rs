@@ -24,9 +24,36 @@ use std::collections::HashSet;
 
 use super::knative::unique_k8s_name;
 use super::{Bus, TransportError};
-use super::{Message, SubscriptionPlan};
+use super::{Message, SubscriptionPlan, WireEnvelope};
 
 const SEND_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// CloudEvents extension attribute carrying [`WireEnvelope::KIND`].
+/// CloudEvents attribute names are lowercase letters and digits only, so the
+/// envelope's reserved headers map onto attributes instead of travelling as
+/// `ce-x-distributed-*`: the id is `ce-id`, the content type `content-type`.
+pub(crate) const KIND_ATTRIBUTE: &str = "distributedkind";
+
+/// Context attributes this adapter writes itself. Metadata travels as
+/// `ce-<key>`, so a key named like one of these would override it.
+const WRITTEN_ATTRIBUTES: [&str; 6] = [
+    "id",
+    "type",
+    "source",
+    "specversion",
+    "datacontenttype",
+    KIND_ATTRIBUTE,
+];
+
+/// The HTTP header a [`WireEnvelope`] header travels as.
+fn cloud_event_header(key: &str) -> String {
+    match key {
+        WireEnvelope::ID => "ce-id".to_string(),
+        WireEnvelope::CONTENT_TYPE => "content-type".to_string(),
+        WireEnvelope::KIND => format!("ce-{KIND_ATTRIBUTE}"),
+        metadata => format!("ce-{metadata}"),
+    }
+}
 
 /// Knative Eventing [`Bus`] (produce) + manifest generator.
 #[derive(Clone)]
@@ -99,31 +126,34 @@ impl KnativeBus {
         url
     }
 
-    async fn post_cloud_event(
-        &self,
-        broker: &str,
-        message: &Message,
-    ) -> Result<(), TransportError> {
-        let Some(id) = message.id() else {
+    async fn post_cloud_event(&self, broker: &str, message: Message) -> Result<(), TransportError> {
+        if message.id().is_none() {
             return Err(TransportError::permanent(
                 "knative produce requires a message id (CloudEvents `id` is mandatory)",
             ));
-        };
+        }
+        if let Some((key, _)) = message.metadata.iter().find(|(key, _)| {
+            WRITTEN_ATTRIBUTES
+                .iter()
+                .any(|attribute| key.eq_ignore_ascii_case(attribute))
+        }) {
+            return Err(TransportError::permanent(format!(
+                "message metadata key {key:?} is a CloudEvents attribute this adapter writes"
+            )));
+        }
+        let envelope = WireEnvelope::encode(message)?;
         let mut request = self
             .client
             .post(self.ingress_url(broker))
             .timeout(SEND_TIMEOUT)
             .header("ce-specversion", "1.0")
-            .header("ce-id", id)
-            .header("ce-type", message.name())
-            .header("ce-source", self.source.as_str())
-            .header("ce-sourcedkind", message.kind.as_str())
-            .header("content-type", message.content_type.as_str());
-        for (key, value) in &message.metadata {
-            request = request.header(format!("ce-{key}"), value);
+            .header("ce-type", envelope.name.as_str())
+            .header("ce-source", self.source.as_str());
+        for (key, value) in &envelope.headers {
+            request = request.header(cloud_event_header(key), value);
         }
         let response = request
-            .body(message.payload.clone())
+            .body(envelope.payload)
             .send()
             .await
             .map_err(|err| TransportError::retryable(format!("knative POST: {err}")))?;
@@ -223,10 +253,39 @@ impl KnativeBus {
 
 impl Bus for KnativeBus {
     async fn send_message(&self, message: Message) -> Result<(), TransportError> {
-        self.post_cloud_event(&self.commands_broker, &message).await
+        self.post_cloud_event(&self.commands_broker, message).await
     }
 
     async fn publish_message(&self, message: Message) -> Result<(), TransportError> {
-        self.post_cloud_event(&self.events_broker, &message).await
+        self.post_cloud_event(&self.events_broker, message).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn envelope_headers_map_onto_cloud_event_attributes() {
+        assert_eq!(cloud_event_header(WireEnvelope::ID), "ce-id");
+        assert_eq!(
+            cloud_event_header(WireEnvelope::CONTENT_TYPE),
+            "content-type"
+        );
+        assert_eq!(cloud_event_header(WireEnvelope::KIND), "ce-distributedkind");
+        assert_eq!(cloud_event_header("traceparent"), "ce-traceparent");
+    }
+
+    #[tokio::test]
+    async fn metadata_that_would_override_an_attribute_is_refused_before_sending() {
+        // Port 1 is never listening; a refusal must come before any request.
+        let bus = KnativeBus::new("http://127.0.0.1:1", "ns", "orders", "c", "e");
+        for key in ["type", "Source", "distributedkind", "x-distributed-kind"] {
+            let message = Message::new("order.placed", crate::bus::MessageKind::Event, vec![])
+                .with_id("m-1")
+                .with_metadata(key, "forged");
+            let error = bus.publish_message(message).await.unwrap_err();
+            assert!(error.is_permanent(), "{key}: {error}");
+        }
     }
 }

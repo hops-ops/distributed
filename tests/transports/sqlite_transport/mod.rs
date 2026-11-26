@@ -945,7 +945,12 @@ async fn expired_queue_claim_cannot_be_settled_by_stale_worker() {
         .await
         .expect("first worker claimed the command");
 
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    // The first worker loses its claim (as when its renewals stop reaching
+    // the database for longer than the lease): the row is claimable again.
+    sqlx::query("UPDATE bus_queue SET locked_until = NULL, claim_token = NULL")
+        .execute(&pool)
+        .await
+        .expect("expire the first claim");
     let second = tokio::spawn({
         let bus = bus.clone();
         let handlers = handlers.clone();
@@ -953,7 +958,7 @@ async fn expired_queue_claim_cannot_be_settled_by_stale_worker() {
     });
     tokio::time::timeout(Duration::from_secs(2), second_claimed.notified())
         .await
-        .expect("second worker reclaimed the expired lease");
+        .expect("second worker reclaimed the lost claim");
 
     allow_first_finish.notify_one();
     tokio::time::timeout(Duration::from_secs(2), first)
@@ -979,4 +984,66 @@ async fn expired_queue_claim_cannot_be_settled_by_stale_worker() {
         .await
         .expect("count queue");
     assert_eq!(remaining, 0, "retried command was eventually acked");
+}
+
+/// A handler that runs longer than the claim lease keeps its claim: the lease
+/// is renewed while it runs, so no second worker runs the same row.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn long_handler_keeps_its_queue_claim_past_the_lease() {
+    let (_db, pool, bus) = bus().await;
+    let bus = bus.with_lease(Duration::from_secs(2));
+    bus.send_message(command("c1")).await.expect("send command");
+
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let claimed = Arc::new(Notify::new());
+    let finish = Arc::new(Notify::new());
+    let handlers = Arc::new({
+        let attempts = attempts.clone();
+        let claimed = claimed.clone();
+        let finish = finish.clone();
+        Handlers::new().on_command(COMMAND_NAME, move |_: &Message| {
+            attempts.fetch_add(1, Ordering::SeqCst);
+            let claimed = claimed.clone();
+            let finish = finish.clone();
+            async move {
+                claimed.notify_one();
+                finish.notified().await;
+                Ok(())
+            }
+        })
+    });
+
+    let first = tokio::spawn({
+        let bus = bus.clone();
+        let handlers = handlers.clone();
+        async move { bus.listen(handlers, RunOptions::until_idle()).await }
+    });
+    tokio::time::timeout(Duration::from_secs(5), claimed.notified())
+        .await
+        .expect("first worker claimed the command");
+
+    // Outlive the lease more than twice over while the handler runs, then let
+    // a second worker look: the renewed claim keeps the row from it.
+    tokio::time::sleep(Duration::from_millis(4500)).await;
+    bus.listen(handlers.clone(), RunOptions::until_idle())
+        .await
+        .expect("second worker finds nothing to claim");
+    assert_eq!(
+        attempts.load(Ordering::SeqCst),
+        1,
+        "no second worker ran the row"
+    );
+
+    finish.notify_one();
+    tokio::time::timeout(Duration::from_secs(5), first)
+        .await
+        .expect("first worker finished")
+        .expect("first worker joined")
+        .expect("first listener drains");
+    let remaining: i64 = sqlx::query_scalar("SELECT count(*) FROM bus_queue")
+        .fetch_one(&pool)
+        .await
+        .expect("count queue");
+    assert_eq!(remaining, 0, "the long handler's ack settled its row");
+    assert_eq!(attempts.load(Ordering::SeqCst), 1);
 }

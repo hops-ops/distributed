@@ -1,8 +1,9 @@
 //! Redis Streams [`MessagePublisher`].
 //!
-//! Each [`Message`] becomes one `XADD` entry with the fields `id`, `name`,
-//! `kind`, `content_type`, `payload` (raw bytes) and one `meta:<key>` field per
-//! metadata pair. By default the stream key is `<prefix>:{<message name>}`;
+//! Each [`Message`] becomes one `XADD` entry laid out as a [`WireEnvelope`]:
+//! the fields `name` and `payload` (raw bytes), then one `header:<key>` field
+//! per envelope header (`header:x-distributed-id`, `header:x-distributed-kind`,
+//! `header:x-distributed-content-type`, then the metadata in order). By default the stream key is `<prefix>:{<message name>}`;
 //! [`RedisStreamPublisher::with_stream`] sends everything to one stream.
 //!
 //! # Dedupe
@@ -27,7 +28,7 @@ use std::time::Duration;
 use redis::aio::{ConnectionManager, ConnectionManagerConfig};
 use redis::{Client, Script, Value};
 
-use super::{Message, MessagePublisher, TransportError};
+use super::{Message, MessagePublisher, TransportError, WireEnvelope};
 
 /// Default stream key prefix.
 pub const DEFAULT_REDIS_STREAM_PREFIX: &str = "distributed:stream";
@@ -138,31 +139,24 @@ impl RedisStreamPublisher {
 
     /// Publish and report whether a new entry was appended (`false` means the
     /// id was already published within the dedupe window).
-    pub async fn publish_entry(&self, message: &Message) -> Result<bool, TransportError> {
-        message
-            .validate_name()
-            .map_err(|err| TransportError::permanent(err.to_string()))?;
-        let stream = self.stream_key(message);
+    pub async fn publish_entry(&self, message: Message) -> Result<bool, TransportError> {
+        let stream = self.stream_key(&message);
+        let dedupe_key = message.id().map(|id| Self::dedupe_key(&stream, id));
+        let envelope = WireEnvelope::encode(message)?;
         let mut invocation = self.script.prepare_invoke();
         invocation.key(&stream);
-        if let Some(id) = message.id() {
-            invocation.key(Self::dedupe_key(&stream, id));
+        if let Some(dedupe_key) = dedupe_key {
+            invocation.key(dedupe_key);
         }
         invocation
             .arg(self.dedupe_ttl.as_secs())
             .arg(self.max_len)
-            .arg("id")
-            .arg(message.id().unwrap_or(""))
             .arg("name")
-            .arg(message.name())
-            .arg("kind")
-            .arg(message.kind.as_str())
-            .arg("content_type")
-            .arg(&message.content_type)
+            .arg(&envelope.name)
             .arg("payload")
-            .arg(message.payload());
-        for (key, value) in &message.metadata {
-            invocation.arg(format!("meta:{key}")).arg(value);
+            .arg(&envelope.payload);
+        for (key, value) in &envelope.headers {
+            invocation.arg(format!("header:{key}")).arg(value);
         }
         let mut conn = self.conn.clone();
         let reply: Value = invocation
@@ -175,6 +169,6 @@ impl RedisStreamPublisher {
 
 impl MessagePublisher for RedisStreamPublisher {
     async fn publish(&self, message: Message) -> Result<(), TransportError> {
-        self.publish_entry(&message).await.map(|_| ())
+        self.publish_entry(message).await.map(|_| ())
     }
 }

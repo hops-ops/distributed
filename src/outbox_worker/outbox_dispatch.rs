@@ -40,7 +40,7 @@ const OUTBOX_CONTENT_TYPE: &str = "application/octet-stream";
 /// Reserved metadata key prefix for framework-derived keys. User metadata must
 /// not use this prefix; keys here (payload codec, destination, source context)
 /// carry decode/routing semantics and must not be shadowable by user metadata.
-pub const SOURCED_METADATA_PREFIX: &str = "x-sourced-";
+pub const SOURCED_METADATA_PREFIX: &str = "x-distributed-";
 
 impl From<OutboxMessage> for Message {
     /// Map a durable outbox row to a canonical transport message.
@@ -66,7 +66,7 @@ impl From<OutboxMessage> for Message {
         };
 
         // User metadata first (correlation/trace/auth), then framework-derived
-        // keys under the reserved `x-sourced-` prefix. Any user key in the
+        // keys under the reserved `x-distributed-` prefix. Any user key in the
         // reserved namespace is dropped so framework values stay authoritative
         // and cannot be shadowed on case-insensitive lookup.
         let mut metadata: Vec<(String, String)> = outbox
@@ -515,9 +515,12 @@ mod tests {
             Some("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01")
         );
         assert_eq!(message.tracestate(), Some("vendor=value"));
-        assert_eq!(message.metadata("x-sourced-payload-codec"), Some("bytes"));
         assert_eq!(
-            message.metadata("x-sourced-payload-codec-version"),
+            message.metadata("x-distributed-payload-codec"),
+            Some("bytes")
+        );
+        assert_eq!(
+            message.metadata("x-distributed-payload-codec-version"),
             Some("1")
         );
     }
@@ -530,20 +533,26 @@ mod tests {
             "evt-1",
             "OrderCreated",
             b"\x01".to_vec(),
-            [("x-sourced-payload-codec".to_string(), "evil".to_string())]
-                .into_iter()
-                .collect(),
+            [(
+                "x-distributed-payload-codec".to_string(),
+                "evil".to_string(),
+            )]
+            .into_iter()
+            .collect(),
         )
         .unwrap();
         let message = Message::from(outbox);
         // The user's reserved-prefix key is dropped; lookup returns the
         // authoritative framework value, and there is exactly one such entry.
-        assert_eq!(message.metadata("x-sourced-payload-codec"), Some("bytes"));
+        assert_eq!(
+            message.metadata("x-distributed-payload-codec"),
+            Some("bytes")
+        );
         assert_eq!(
             message
                 .metadata
                 .iter()
-                .filter(|(k, _)| k == "x-sourced-payload-codec")
+                .filter(|(k, _)| k == "x-distributed-payload-codec")
                 .count(),
             1
         );
@@ -555,7 +564,10 @@ mod tests {
             OutboxMessage::create_to("cmd-1", "ShipOrder", "shipping", b"{}".to_vec()).unwrap();
         let message = Message::from(outbox);
         assert_eq!(message.kind, MessageKind::Command);
-        assert_eq!(message.metadata("x-sourced-destination"), Some("shipping"));
+        assert_eq!(
+            message.metadata("x-distributed-destination"),
+            Some("shipping")
+        );
     }
 
     fn dispatcher(

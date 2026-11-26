@@ -117,6 +117,7 @@ mod sql_bus_common;
 mod sqlite_bus;
 mod stable_id;
 mod topology;
+mod wire_envelope;
 
 #[cfg(feature = "kafka")]
 pub use kafka::{KafkaPublisher, KafkaReceived, KafkaSource};
@@ -126,6 +127,8 @@ pub use kafka_bus::{KafkaBus, KafkaBusConnect};
 pub use knative::knative_triggers;
 #[cfg(feature = "knative")]
 pub use knative_bus::KnativeBus;
+#[cfg(feature = "knative")]
+pub(crate) use knative_bus::KIND_ATTRIBUTE as KNATIVE_KIND_ATTRIBUTE;
 #[cfg(feature = "nats")]
 pub use nats::{NatsJetStreamSource, NatsPublisher, NatsReceived};
 #[cfg(feature = "nats")]
@@ -154,7 +157,7 @@ pub use failure_policy::{FailureAction, FailurePolicy};
 pub use handlers::{Handlers, MessageHandler};
 pub use in_memory_bus::{InMemoryBus, InMemoryReceived};
 #[cfg(any(feature = "nats", feature = "kafka", feature = "rabbitmq"))]
-pub(crate) use message::{message_from_wire, strip_address_prefix, CONTENT_TYPE_HEADER};
+pub(crate) use message::strip_address_prefix;
 pub use message::{Message, MessageKind, PayloadDecodeError, SubscriptionPlan};
 pub use message_name::{validate_message_name, MessageNameError, MAX_MESSAGE_NAME_LEN};
 pub use ordered_delivery::OrderedDelivery;
@@ -180,3 +183,4 @@ pub use topology::{
     resolve_consumer_group, validate_consumer_group, validate_namespace, BusTopologyConfig,
     DEFAULT_BUS_NAMESPACE, MAX_TOPOLOGY_NAME_LEN,
 };
+pub use wire_envelope::WireEnvelope;

@@ -26,7 +26,7 @@ where
             }
         }
         Ok(Err(refused)) => {
-            eprintln!("distributed_game: tier-up event for zone {parent} dropped: {refused}");
+            tracing::warn!(zone = %parent, %refused, "tier-up event dropped");
         }
         Err(host) => {
             let Some(secret) = inner.config.admin_secret.clone() else {
@@ -540,8 +540,11 @@ pub(super) async fn run_zone<Z>(
                 };
                 inner.metrics.record_hibernation_save(outcome);
                 if outcome != "saved" {
-                    eprintln!(
-                        "distributed_game: hibernation snapshot of zone {zone_id} (token {token}) not saved: {saved:?}",
+                    tracing::warn!(
+                        zone = %zone_id,
+                        %token,
+                        result = ?saved,
+                        "hibernation snapshot not saved"
                     );
                 }
             }
@@ -582,8 +585,11 @@ pub(super) async fn run_zone<Z>(
             }
             host.dispose();
             route(&mut host, &mut conns);
-            eprintln!(
-                "distributed_game: zone {zone_id} (token {token}) fenced without a live claim; {dropped} unsettled facts dropped",
+            tracing::warn!(
+                zone = %zone_id,
+                %token,
+                dropped,
+                "zone fenced without a live claim; unsettled facts dropped"
             );
             drop(host);
         }
@@ -675,12 +681,14 @@ where
                     .await
                 {
                     Ok((204, _)) => {}
-                    Ok((status, _)) => eprintln!(
-                        "distributed_game: zone message {} to {} refused: {status}",
-                        envelope.id, envelope.to
+                    Ok((status, _)) => tracing::warn!(
+                        message = %envelope.id,
+                        to = %envelope.to,
+                        status,
+                        "zone message refused"
                     ),
-                    Err(e) => {
-                        eprintln!("distributed_game: zone message to {}: {e}", envelope.to)
+                    Err(error) => {
+                        tracing::warn!(to = %envelope.to, %error, "zone message failed")
                     }
                 }
             });
