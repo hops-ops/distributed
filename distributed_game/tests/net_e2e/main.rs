@@ -1196,32 +1196,58 @@ async fn passes_the_admission_conformance_suite() {
 /// Commands queued faster than the zone handles them (each handler here
 /// takes 1 ms, as an expensive game hook might) never hold a due tick
 /// back for more than a bounded batch.
+///
+/// The whole flood is queued before the zone takes any of it: a gate command
+/// holds the zone until the test has sent the other 400. Without it, a zone
+/// that started draining a half-filled queue took a short batch, found no
+/// tick due yet, and took a full one: more than 64 commands at one tick
+/// with no due tick held back, which the run-length check cannot tell from
+/// a held-back tick.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_command_flood_never_holds_ticks_back() {
-    use std::sync::{Arc, Mutex};
+    use std::future::Future;
+    use std::sync::{mpsc, Arc, Mutex};
+    use std::task::Poll;
     let mut config = ServerConfig::new(TicketKey::new(SECRET));
     config.host.idle_tick_rate = Some(30);
     let server =
         GameServer::<Arena>::new(config, ZoneFactory::sync(|_| Some(ArenaConfig::default())));
     assert!(server.activate("zflood").await);
+    // `inspect` queues its command on the first poll and then waits for the
+    // reply. Unconstrained, so Tokio's cooperative budget cannot turn that
+    // first poll into a Pending that has not sent.
+    async fn send<F: Future + Unpin>(command: &mut F) {
+        tokio::task::unconstrained(std::future::poll_fn(|context| {
+            let _ = std::pin::Pin::new(&mut *command).poll(context);
+            Poll::Ready(())
+        }))
+        .await;
+    }
+    let (open, gate) = mpsc::channel::<()>();
+    let mut gated = Box::pin(server.inspect("zflood", move |_| {
+        gate.recv().expect("the test opens the gate");
+    }));
+    send(&mut gated).await;
     let seen = Arc::new(Mutex::new(Vec::new()));
-    let flood: Vec<_> = (0..400)
+    let mut flood: Vec<_> = (0..400)
         .map(|_| {
-            let (server, seen) = (server.clone(), seen.clone());
-            tokio::spawn(async move {
-                server
-                    .inspect("zflood", move |host| {
-                        std::thread::sleep(Duration::from_millis(1));
-                        seen.lock().unwrap().push(host.tick());
-                    })
-                    .await
-            })
+            let seen = seen.clone();
+            Box::pin(server.inspect("zflood", move |host| {
+                std::thread::sleep(Duration::from_millis(1));
+                seen.lock().unwrap().push(host.tick());
+            }))
         })
         .collect();
-    for task in flood {
-        task.await.unwrap().expect("handled");
+    for command in &mut flood {
+        send(command).await;
+    }
+    open.send(()).unwrap();
+    gated.await.expect("gate handled");
+    for command in flood {
+        command.await.expect("handled");
     }
     let seen = seen.lock().unwrap().clone();
+    assert_eq!(seen.len(), 400);
     let longest = seen
         .chunk_by(|a, b| a == b)
         .map(<[u64]>::len)
