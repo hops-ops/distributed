@@ -34,6 +34,12 @@
 // Backend traits are only ever used generically, never as `dyn`.
 #![allow(async_fn_in_trait)]
 
+/// Connections in each SQL test pool (`sqlite::TempDb::pool`,
+/// `postgres::PostgresTestSchema::repository`). A race over one pool puts
+/// at most this many contenders in the database at once; any more wait in the
+/// pool's queue, where a slow commit can outlast the pool's acquire timeout.
+pub const POOL_CONNECTIONS: u32 = 5;
+
 pub mod commands;
 pub mod env;
 pub mod ids;
