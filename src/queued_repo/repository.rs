@@ -397,6 +397,8 @@ impl<R: ProjectionProtocolStore, L: LockManager> ProjectionProtocolStore
         ) -> impl Future<Output = Result<Option<ProjectionFailure>, ProjectionProtocolError>> + Send + 'a;
         fn projection_failure_location<'a>(&'a self, failure_id: &'a str)
             -> impl Future<Output = Result<Option<ProjectionFailureLocation>, ProjectionProtocolError>> + Send + 'a;
+        fn stopped_projection_failures<'a>(&'a self, topology: &'a ProjectorTopologyId)
+            -> impl Future<Output = Result<Vec<String>, ProjectionProtocolError>> + Send + 'a;
     }
 }
 

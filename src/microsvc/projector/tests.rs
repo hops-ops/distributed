@@ -1002,6 +1002,15 @@ where
         .await
         .expect_err("the stop survives a restart");
     assert_eq!(repair_handle(&still_stopped), handle);
+    // A host learns of the stop from the store, without the run's error.
+    let stopped_service = two_projector_service(&repository, "task15-primary-v2", &applied);
+    assert_eq!(
+        stopped_service.stopped_projections().await.unwrap(),
+        [crate::microsvc::StoppedProjection {
+            projection: "task15_a_primary".into(),
+            repair: handle.clone(),
+        }]
+    );
     let while_stopped = take(&applied);
     assert_eq!(ids("secondary", &while_stopped), ["d"]);
     assert!(ids("primary", &while_stopped).is_empty());
@@ -1009,6 +1018,7 @@ where
     // The declaration is corrected and the operator repairs the failure.
     let repaired = two_projector_service(&repository, "task15-primary-v1", &applied);
     assert_eq!(repaired.repair_projection(&handle).await.unwrap().get(), 2);
+    assert!(repaired.stopped_projections().await.unwrap().is_empty());
     repaired
         .with_bus(bus.clone())
         .run(RunOptions::until_idle())
@@ -1021,6 +1031,80 @@ where
         "the repaired projector resumes from its failed input"
     );
     assert!(ids("secondary", &after).is_empty());
+}
+
+/// A long-running service does not return when a projector stops. A host
+/// still learns which projector stopped, and gets its repair handle, from
+/// the store, while the other projector keeps running.
+#[tokio::test]
+async fn a_long_running_host_can_ask_which_projectors_are_stopped() {
+    let repository = InMemoryRepository::new();
+    let bus = InMemoryBus::new();
+    let applied = Arc::new(Mutex::new(Vec::new()));
+    let secondary = |applied: &Arc<Mutex<Vec<(&'static str, String)>>>| -> Vec<String> {
+        applied
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(name, _)| *name == "secondary")
+            .map(|(_, id)| id.clone())
+            .collect()
+    };
+
+    bus.publish_message(fact_message("a", "before the rollout"))
+        .await
+        .unwrap();
+    two_projector_service(&repository, "task15-primary-v1", &applied)
+        .with_bus(bus.clone())
+        .run(RunOptions::until_idle())
+        .await
+        .unwrap();
+
+    let shutdown = crate::bus::Shutdown::new();
+    let running = tokio::spawn(
+        two_projector_service(&repository, "task15-primary-v2", &applied)
+            .with_bus(bus.clone())
+            .run(RunOptions::until_shutdown(shutdown.clone())),
+    );
+    // The host's own service over the same stores, as its API process has.
+    let host = two_projector_service(&repository, "task15-primary-v2", &applied);
+    assert!(host.stopped_projections().await.unwrap().is_empty());
+
+    bus.publish_message(fact_message("b", "after the rollout"))
+        .await
+        .unwrap();
+    let stopped = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            let stopped = host.stopped_projections().await.unwrap();
+            if !stopped.is_empty() {
+                break stopped;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the stop is visible while the service runs");
+    assert_eq!(stopped.len(), 1);
+    assert_eq!(stopped[0].projection, "task15_a_primary");
+    assert!(!running.is_finished(), "the service keeps running");
+
+    bus.publish_message(fact_message("c", "while stopped"))
+        .await
+        .unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while secondary(&applied) != ["a", "b", "c"] {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the other projector keeps delivering");
+
+    shutdown.trigger();
+    let error = running
+        .await
+        .unwrap()
+        .expect_err("the run reports the stop when it ends");
+    assert_eq!(repair_handle(&error), stopped[0].repair);
 }
 
 /// An event handler that retries until a projector has projected the same

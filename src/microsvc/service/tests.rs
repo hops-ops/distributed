@@ -839,6 +839,13 @@ impl ProjectionProtocolStore for AmbiguousCommitRepository {
            + 'a {
         self.inner.projection_failure_location(failure_id)
     }
+
+    fn stopped_projection_failures<'a>(
+        &'a self,
+        topology: &'a ProjectorTopologyId,
+    ) -> impl Future<Output = Result<Vec<String>, ProjectionProtocolError>> + Send + 'a {
+        self.inner.stopped_projection_failures(topology)
+    }
 }
 
 impl CommandLedgerStore for AmbiguousCommitRepository {

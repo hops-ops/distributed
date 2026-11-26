@@ -3163,6 +3163,18 @@ pub(crate) async fn failure_stops_the_partition_until_its_exact_repair(
     assert_eq!(stopped.active_generation, initial);
     assert_eq!(stopped.stopped_failure_id.as_ref(), Some(&failure_id));
     assert_eq!(stopped.pending_retry, None);
+    assert_eq!(
+        repository
+            .stopped_projection_failures(&scenario.topology())
+            .await
+            .unwrap(),
+        [failure_id.clone()]
+    );
+    assert!(repository
+        .stopped_projection_failures(&scenario.other_topology())
+        .await
+        .unwrap()
+        .is_empty());
 
     // While stopped, identity violations are still reported as what they
     // are; everything else is told the partition is stopped.
@@ -3205,6 +3217,11 @@ pub(crate) async fn failure_stops_the_partition_until_its_exact_repair(
     let repaired = runtime_state().await.unwrap();
     assert_eq!(repaired.active_generation, generation);
     assert_eq!(repaired.stopped_failure_id, None);
+    assert!(repository
+        .stopped_projection_failures(&scenario.topology())
+        .await
+        .unwrap()
+        .is_empty());
     let retry = repaired.pending_retry.unwrap();
     assert_eq!(retry.failure_id, failure_id);
     assert_eq!(retry.input, failure.input);

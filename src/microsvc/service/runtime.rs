@@ -1522,6 +1522,25 @@ impl Service {
         Ok(())
     }
 
+    /// The projectors of this service that a durable failure has stopped,
+    /// each with the handle [`repair_projection`](Self::repair_projection)
+    /// takes.
+    ///
+    /// A stopped projector's consumer ends while the other consumers keep
+    /// running, so a long-running [`run`](Self::run) does not return its
+    /// error. This reads the stop from the projection store instead: any
+    /// service built over the same stores answers, in any process, before
+    /// and after a restart. An empty list means no projector is stopped.
+    pub async fn stopped_projections(
+        &self,
+    ) -> Result<Vec<crate::microsvc::StoppedProjection>, HandlerError> {
+        let mut stopped = Vec::new();
+        for routes in &self.routes {
+            stopped.extend(routes.stopped_projections().await?);
+        }
+        Ok(stopped)
+    }
+
     /// Begin a new repair generation for the durable terminal failure named by
     /// an opaque operator handle.
     ///

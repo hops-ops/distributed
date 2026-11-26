@@ -743,6 +743,21 @@ where
         })
     }
 
+    fn stopped_projections(&self) -> super::erased::StoppedProjectionsFuture<'_> {
+        Box::pin(async move {
+            let mut stopped = Vec::new();
+            for projector in &self.projectors {
+                for repair in projector.handler.stopped(&self.dependencies).await? {
+                    stopped.push(crate::microsvc::StoppedProjection {
+                        projection: projector.name().to_owned(),
+                        repair,
+                    });
+                }
+            }
+            Ok(stopped)
+        })
+    }
+
     fn locates_projection_failure<'a>(
         &'a self,
         handle: &'a ProjectionRepairHandle,
