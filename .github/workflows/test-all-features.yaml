@@ -24,6 +24,11 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
         with:
           persist-credentials: false
+      # Cheap, so it runs first: every repo path and relative link in
+      # README.md, AGENTS.md and docs/ must exist. The README's Rust snippets
+      # are doctests (`#![doc = include_str!("../README.md")]`).
+      - name: Check README and docs paths
+        run: python3 scripts/check-doc-paths.py
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8
         with:
           toolchain: stable

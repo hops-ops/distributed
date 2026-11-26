@@ -469,7 +469,7 @@ route before invalidating SvelteKit page data. Follow-up data loads and ordinary
 SPA navigation execute their bounded server selections too: those requests can
 rotate credentials independently and need their own fresh authority. Routes
 without selections still do no GraphQL work. See
-[session refresh continuity](../docs/session-refresh-continuity.md).
+[session refresh continuity](../docs/design/session-refresh-continuity.md).
 
 Confirmed records and indexes under an active scope stay until auth/scope
 change, stale+revalidate, or a newer authoritative write. Same-scope soft
@@ -717,8 +717,9 @@ same replica and GraphQL transport. A command call:
 1. fixes its command id and fills generated `uuid_v7()`, `ulid()` and
    `now()` defaults exactly once, returning both synchronously on the call;
 2. validates and freezes its typed input;
-3. applies the generated optimistic effect transaction (from `.applies` /
-   portable mutation IR — works for **Eventual and Direct** when fields are known);
+3. applies the generated optimistic effect transaction (the command's known
+   event values through the projection's mutation program — works for
+   **Eventual and Direct** when fields are known);
 4. dispatches the exact compiler-owned mutation;
 5. keeps ambiguous commits recoverable by command ID;
 6. confirms or rejects only its own optimistic layer;

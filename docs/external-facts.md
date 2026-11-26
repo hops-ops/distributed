@@ -16,8 +16,8 @@ unknown-time sentinel; it must not present adapter receipt time as source time.
 
 An `external_snapshot` projection applies full-row source snapshots. It orders
 each external stream/member independently of actual broker delivery positions;
-it does not invent an aggregate sequence. Existing aggregate projection and
-command APIs retain their authority and fencing rules. Derived external facts
+it does not invent an aggregate sequence. Aggregate projections and commands
+keep their own authority and fencing rules. Derived external facts
 retain their source provenance, but are not accepted as direct source snapshots.
 
 NATS publishes external facts with a content-bound broker dedup key and a
@@ -34,8 +34,8 @@ delivery checkpoint within its execution generation. It does not repeat row
 changes, observations or business effects. A new execution generation applies
 its first delivery normally. Original and alias cursor bindings remain immutable,
 and one canonical topology-wide message identity arbitrates concurrent partition
-claims. Migration 0009 adds delivery aliases without deleting canonical identity
-or failure records. SQL mutation continues to use the existing partition lock.
+claims. Delivery aliases (migration 0009) sit beside canonical identity and
+failure records and never delete them. SQL mutation uses the partition lock.
 
 Permanent input identities and their aliases must be retained for the replay
 and source-conflict horizon. A bounded broker dedup window is not such a fence.

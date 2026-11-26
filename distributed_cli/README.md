@@ -5,9 +5,16 @@ binary — and a library — that scaffolds service crates, inspects a service's
 logical ApplicationManifest, and renders physical read-model schema artifacts
 (SQL or an Atlas Operator resource).
 
+The CLI, the `distributed` crate and the `@hops-ops/distributed` npm package
+release together, and an application must use one version of all three.
+From a checkout of this repository, run the CLI through Cargo:
+
 ```bash
-cargo install distributed_cli   # installs the `distributed` binary
+cargo run -p distributed_cli --bin distributed -- <command>
 ```
+
+Once a matching release is published, `cargo install distributed_cli
+--version <x.y.z>` installs the `distributed` binary.
 
 It is also a library, so another CLI can mount its commands instead of
 reimplementing them. `hops`, for example, exposes the same surface under

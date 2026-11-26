@@ -362,17 +362,19 @@ handler applies the same mutation IR and returns the row. The Zitadel provider
 ingestor remains an integration adapter, while its provider-event-to-`AuthUsers`
 mapping also lives in `e2e-projections` and is consumed the same way.
 
-## Application composition (framework direction)
+## Application composition
 
-e2e-ui is the Full-process reference. Long-term wiring should follow
+e2e-ui is the reference for
 [docs/application-composition.md](../../docs/application-composition.md):
 
-- **Logical:** command defs + projection mounts + surfaces (product graph)
-- **Process role:** Full | CommandWriter | EventualProjector | QueryApi
-- **Runtime:** store + locks + bus + workers + GraphQL (dialect / host)
+- **Logical:** command mounts and projection mounts per module
+  (`modules/`), one `Service` (`modules/compose.rs`), client surfaces
+  (`application.rs`)
+- **Runtime:** stores, locks, bus, consumer and GraphQL from one database,
+  written once against `SqlStores` (`host.rs`)
 
 Atomic commands stay collocated with their write path; Eventual projectors
-may run in another process on the same packages.
+may run in another process on the same crates.
 
 ## Generation and tests
 

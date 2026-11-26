@@ -9,8 +9,8 @@ Every live response declares `extensions.distributed.live.mode`:
 - `snapshot`: a fresh authorized replacement result, with `reset: true` and
   `cursors: []`. It carries no comparable index vector or projection observations.
   The client keeps listening and reconnects with a fresh query, not a resume token.
-- `resumable`: a result with matching, nonempty index and cursor vectors. Existing
-  resume validation, reset, replay and causal reconciliation rules apply.
+- `resumable`: a result with matching, nonempty index and cursor vectors. The
+  usual resume validation, reset, replay and causal reconciliation rules apply.
 
 A failed execution has no result and therefore no `live` metadata. It is sent
 as the terminal failure frame described below.
@@ -95,7 +95,7 @@ Only an error-only frame is a failure frame. A live frame that carries non-null
 `data` (including partial data with errors) without both `snapshot` and `live`
 is invalid, as are frames with `errors` that are absent, empty or malformed and
 lack live metadata, and frames with a `snapshot` or `live` but not both. A
-response without the `extensions.distributed` envelope is invalid as before.
+response without the `extensions.distributed` envelope is invalid too.
 Intermediaries that cannot relay a failure frame, such as shared gateway live
 fan-out, end the consumer with `LIVE_RESET_REQUIRED` instead.
 
@@ -128,7 +128,7 @@ those shared indexes, and the frame writes only its other indexes and its
 records. The resulting graph is exactly the frame's server result, so nothing
 is fabricated and no cross-stream order is assumed.
 
-The whole frame is rejected as before if any shared membership differs or
+The whole frame is rejected if any shared membership differs or
 cannot be established. That includes GraphQL errors, operation-local embedded
 rows and rows without record evidence. The subscription is then reopened after
 another operation next writes one of those shared indexes. The fresh result is
@@ -145,9 +145,8 @@ callbacks can arrive, so the reopened stream becomes an active owner again.
 Retirement is local replica metadata; it does not claim that the server's
 projection stopped or provide a server ordering signal.
 
-This is a breaking v5 protocol change: `mode` replaces the ambiguous `supported`
-boolean. Upgrade server and generated-client runtime together. Old or unknown
-wire forms fail closed; applications do not need a polling or reload workaround.
+The server and the generated-client runtime must speak the same protocol;
+an unknown live `mode` or other wire form fails closed.
 
 ## External read sources and leaderboard roots
 
@@ -171,8 +170,8 @@ with `rank_any_member`, `xpRank(member)`. A board family
 roots take the member from the verified session claim (default `x-user-id`,
 `LeaderboardSurface::member_claim`), never from an argument, and fail with
 `FORBIDDEN` when the claim is absent. The same declaration feeds the static
-SDL, the client manifest (`external.leaderboards`, omitted when empty so
-other manifests and fingerprints are unchanged) and the generated
+SDL, the client manifest (`external.leaderboards`, omitted when empty) and
+the generated
 `leaderboards.ts` (typed documents and `@live` subscription documents).
 
 `xpLeaderboard`, `xpLeaderboardAround` and `xpMyRank` are also subscription

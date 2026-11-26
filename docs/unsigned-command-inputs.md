@@ -25,7 +25,7 @@ optional fields and list elements. A field remains GraphQL `BigInt` and TypeScri
 for portable domain contracts.
 
 For example, an event preview can bind `input.expected_revision` to a typed
-`u64` event field. The manifest compiler now proves that assignment from the
+`u64` event field. The manifest compiler proves that assignment from the
 unsigned codec, and the generated command prepares the same integer in its
 optimistic projection and transport input. No browser annotation or handwritten
 optimistic mutation is needed.
@@ -40,14 +40,15 @@ cannot establish that proof.
 JavaScript numbers cannot represent every `u64` exactly. The browser boundary
 deliberately stops at `Number.MAX_SAFE_INTEGER`. Rust command execution retains
 the full unsigned range, and projection constants and stored aggregate state
-retain their existing full-width U64 representation. Signed command codecs and
-SQL read-model scalar codecs are unchanged.
+keep a full-width U64 representation. Signed command codecs and SQL read-model
+scalar codecs are not refined.
 
 ## Regeneration
 
-This changes command contract and protocol fingerprints. Rebuild the service
-and generated clients together with `distributed build` or `distributed dev`.
-Mixed old/new artifacts fail the existing fingerprint check.
+The unsigned refinement is part of the command contract and protocol
+fingerprints. Rebuild the service and generated clients together with
+`distributed build` or `distributed dev`; mismatched artifacts fail the
+fingerprint check.
 
 Code that manually constructs `CommandTypeField` or `SurfaceTypeField` must
 set `unsigned_integer` to the matching `CommandUnsignedInteger` variant, or
@@ -57,4 +58,4 @@ type. A refinement on a non-`BigInt` field is rejected.
 Typed application manifests preserve `unsigned_integer` in canonical Surface
 command input and output contracts, including nested types. Decoding and
 re-encoding retains the same contract bytes and fingerprints. Unrefined fields
-omit this metadata, preserving their existing canonical representation.
+omit this metadata from their canonical representation.
