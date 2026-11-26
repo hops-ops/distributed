@@ -739,7 +739,7 @@ network servers.
 | `nats` | No | `NatsBus` (NATS JetStream source/publisher). |
 | `rabbitmq` | No | `RabbitBus` (RabbitMQ source/publisher). |
 | `kafka` | No | `KafkaBus` (Kafka source/publisher). |
-| `redis-streams` | No | `bus::RedisStreamPublisher` (Redis Streams `XADD`, id dedupe). Sorted-set leaderboards live in the `distributed_leaderboard` crate (its own `redis` feature). |
+| `redis-streams` | No | `bus::RedisStreamBus` and `bus::RedisStreamPublisher` (Redis Streams `XADD` with id dedupe, consumer groups). Sorted-set leaderboards live in the `distributed_leaderboard` crate (its own `redis` feature). |
 | `metrics` | No | `distributed::metrics`: framework counters and gauges with Prometheus text exposition (no SDK dependency); with `http`, a scrape handler. Bus receive loops record into it. |
 | `otel` | No | OpenTelemetry tracing spans for bus receive loops and `microsvc` dispatch/handlers (`opentelemetry`, `tracing-opentelemetry`). |
 | `cloudflare-workers` | No | Code that runs inside a celld Worker (`wasm32` Durable Objects, Cloudflare `worker` crate): the cell host's Durable Object storage and outbox, and the celld Queue publisher/relay (`bus::CelldQueue*`). |
@@ -1404,12 +1404,13 @@ are rejected before broker topology is created.
 
 | `*Bus` | Feature | `send` / `listen` (competing) | `publish` / `subscribe` (fan-out) |
 |---|---|---|---|
-| `InMemoryBus` | (always) | named queue, popped once | retained log + per-subscriber cursor |
-| `PostgresBus` | `postgres` | `bus_queue`, `FOR UPDATE SKIP LOCKED` | `bus_log` + `bus_offset` per group (Kafka-style) |
-| `SqliteBus` | `sqlite` | `bus_queue`, atomic `UPDATE ... RETURNING` lease claim | `bus_log` + `bus_offset` per group |
+| `InMemoryBus` | (always) | one queue, each command taken once | one retained log + a position per group |
+| `PostgresBus` | `postgres` | `bus_queue`, `FOR UPDATE SKIP LOCKED` | `bus_log` + `bus_offset` per group, one reader per group (Kafka-style) |
+| `SqliteBus` | `sqlite` | `bus_queue`, atomic `UPDATE ... RETURNING` lease claim | `bus_log` + `bus_offset` per group, one reader per group |
 | `NatsBus` | `nats` | shared durable `{group}_cmd` on the stream | durable `{group}_evt` per group |
 | `RabbitBus` | `rabbitmq` | default exchange → durable queue `{ns}.cmd.{name}` | topic exchange → queue `{ns}.evt.{group}` per group |
-| `KafkaBus` | `kafka` | shared consumer group `{ns}.{group}.cmd` | consumer group per service `{ns}.{group}.evt` |
+| `KafkaBus` | `kafka` | topic `{ns}.cmd` keyed by stream, shared consumer group `{ns}.{group}.cmd` | topic `{ns}.evt` keyed by stream, consumer group per service `{ns}.{group}.evt` |
+| `RedisStreamBus` | `redis-streams` | stream `<prefix>:{ns}:cmd`, Redis consumer group per service | stream `<prefix>:{ns}:evt`, Redis consumer group per service |
 | `KnativeBus` | `knative` | POST CloudEvent → `{target}-commands` broker ingress | POST → `{source}-events` broker; consume via generated Triggers |
 
 `SqliteBus` uses the same single-database pattern scaled down to SQLite:

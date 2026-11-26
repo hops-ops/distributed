@@ -1,13 +1,17 @@
-//! Redis Streams publisher integration tests.
+//! Redis Streams: the bus contract over `RedisStreamBus`, and the
+//! publisher's entry layout and dedupe.
 //!
 //! Tests that need a server skip (with a logged reason) when `REDIS_URL` is
 //! unset; the unavailable-server test always runs.
 //!
 //!   REDIS_URL=redis://127.0.0.1:6379 cargo test --test transports --features redis-streams redis_streams::
 
-use distributed::bus::{Message, MessageKind, MessagePublisher, RedisStreamPublisher};
+use distributed::bus::{
+    Message, MessageKind, MessagePublisher, RedisStreamBus, RedisStreamPublisher,
+};
 
 use common::env as env_support;
+use common::transport::bus::{BusCapabilities, BusHarness, KindCapabilities};
 
 /// `XRANGE` reply row: entry id and field/value pairs.
 type StreamEntry = (String, Vec<(String, Vec<u8>)>);
@@ -104,3 +108,37 @@ async fn unreachable_redis_fails_fast_as_retryable() {
         .unwrap_err();
     assert!(err.is_retryable());
 }
+
+/// One namespace (stream pair) per test.
+struct Redis {
+    url: String,
+    namespace: String,
+}
+
+impl BusHarness for Redis {
+    type Bus = RedisStreamBus;
+
+    // One stream per kind, a publish script that stores an id once, and a
+    // consumer that claims a handed-back entry before it reads new ones.
+    const CAPABILITIES: BusCapabilities = BusCapabilities {
+        commands: KindCapabilities::LOG,
+        events: KindCapabilities::LOG,
+        rebalance_may_redeliver: false,
+        added_metadata: &[],
+    };
+
+    async fn start() -> Option<Self> {
+        Some(Self {
+            url: redis_url()?,
+            namespace: unique("ns"),
+        })
+    }
+
+    async fn bus(&self) -> RedisStreamBus {
+        RedisStreamBus::connect(&self.url)
+            .expect("redis url")
+            .namespace(&self.namespace)
+    }
+}
+
+common::bus_conformance_tests!(Redis);

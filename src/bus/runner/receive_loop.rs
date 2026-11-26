@@ -61,28 +61,50 @@ where
     R: MessageRouter,
     S: MessageSource,
 {
+    let outcome = receive_sequentially(router.as_ref(), &mut source, &options).await;
+    finish(&mut source, outcome).await
+}
+
+async fn receive_sequentially<R, S>(
+    router: &R,
+    source: &mut S,
+    options: &RunOptions,
+) -> Result<(), TransportError>
+where
+    R: MessageRouter,
+    S: MessageSource,
+{
     let service = router.consumer_group();
     let transport = source.transport_name();
 
-    while let Some(received) =
-        next_delivery(&mut source, &options.until, service, transport).await?
-    {
+    while let Some(received) = next_delivery(source, &options.until, service, transport).await? {
         let result = if let Some(error) = received.decode_error() {
             Err(TransportError::new(error.kind(), error.message()))
         } else if !router.handles(received.message().kind, received.message().name()) {
             settle_ignored(service, transport, received).await?;
             continue;
         } else {
-            dispatch(
-                router.as_ref(),
-                received.message(),
-                received.ordered_delivery(),
-            )
-            .await
+            dispatch(router, received.message(), received.ordered_delivery()).await
         };
-        settle_result(service, transport, &options, received, result).await?;
+        settle_result(service, transport, options, received, result).await?;
     }
     Ok(())
+}
+
+/// End a run: let the source write what it still holds. The run's own error
+/// wins over one from finishing.
+async fn finish<S: MessageSource>(
+    source: &mut S,
+    outcome: Result<(), TransportError>,
+) -> Result<(), TransportError> {
+    let finished = source.finish().await;
+    match (outcome, finished) {
+        (Err(error), Err(finish_error)) => {
+            tracing::warn!(%finish_error, "a source failed to finish after its run failed");
+            Err(error)
+        }
+        (outcome, finished) => outcome.and(finished),
+    }
 }
 
 /// The next delivery, or `None` when the run should end.
@@ -315,10 +337,14 @@ where
                 }
             }
             if self.in_flight.is_empty() && self.receiving.is_none() && self.stopping() {
-                if let Some(error) = self.stop_error.take() {
-                    return Err(error);
-                }
-                return self.source_finished.take().unwrap_or(Ok(()));
+                let outcome = match self.stop_error.take() {
+                    Some(error) => Err(error),
+                    None => self.source_finished.take().unwrap_or(Ok(())),
+                };
+                return match self.source.as_mut() {
+                    Some(source) => finish(source, outcome).await,
+                    None => outcome,
+                };
             }
 
             let running = &mut self.running;

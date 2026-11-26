@@ -170,7 +170,7 @@ pub use http::{command_router, router, serve, HttpCommandDispatch};
 #[cfg(feature = "knative")]
 mod knative_ingress;
 #[cfg(feature = "knative")]
-pub use knative_ingress::cloud_events_router;
+pub use knative_ingress::{cloud_events_router, decode_cloud_event};
 
 // gRPC transport (requires "grpc" feature)
 #[cfg(feature = "grpc")]

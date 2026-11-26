@@ -74,7 +74,7 @@ async fn ingress_handler(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    let message = match parse_cloud_event(&headers, &body) {
+    let message = match decode_cloud_event(&headers, &body) {
         Ok(message) => message,
         Err(reason) => return (StatusCode::BAD_REQUEST, reason).into_response(),
     };
@@ -108,8 +108,11 @@ fn header<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
     headers.get(name).and_then(|value| value.to_str().ok())
 }
 
-/// Parse a CloudEvent in binary or structured HTTP mode into a [`Message`].
-fn parse_cloud_event(headers: &HeaderMap, body: &Bytes) -> Result<Message, String> {
+/// Decode a CloudEvent in binary or structured HTTP mode into a [`Message`],
+/// as [`cloud_events_router`] does before dispatch. A Knative broker emulator
+/// (a test harness) uses it to store what a [`KnativeBus`](crate::bus::KnativeBus)
+/// produced exactly as a subscriber would receive it.
+pub fn decode_cloud_event(headers: &HeaderMap, body: &Bytes) -> Result<Message, String> {
     let content_type = header(headers, "content-type").unwrap_or("");
     let envelope = if content_type.starts_with(STRUCTURED_CONTENT_TYPE) {
         parse_structured(body)
@@ -251,7 +254,7 @@ mod tests {
             ("content-type", "application/json"),
         ]);
         let body = Bytes::from_static(br#"{"order":"o1"}"#);
-        let message = parse_cloud_event(&h, &body).unwrap();
+        let message = decode_cloud_event(&h, &body).unwrap();
         assert_eq!(message.id(), Some("evt-1"));
         assert_eq!(message.name(), "order.created");
         assert_eq!(message.payload(), br#"{"order":"o1"}"#);
@@ -271,7 +274,7 @@ mod tests {
         ]);
         let body = Bytes::from_static(br#"{"order":"o1"}"#);
 
-        let message = parse_cloud_event(&h, &body).unwrap();
+        let message = decode_cloud_event(&h, &body).unwrap();
 
         assert_eq!(message.traceparent(), Some(traceparent));
         assert_eq!(message.tracestate(), Some("vendor=value"));
@@ -297,7 +300,7 @@ mod tests {
         ]);
         let body = Bytes::from_static(br#"{"order":"o1"}"#);
 
-        let message = parse_cloud_event(&h, &body).unwrap();
+        let message = decode_cloud_event(&h, &body).unwrap();
 
         // Without an HTTP traceparent, headers must not disturb the trace
         // context the event itself carries.
@@ -318,7 +321,7 @@ mod tests {
             })
             .to_string(),
         );
-        let message = parse_cloud_event(&h, &body).unwrap();
+        let message = decode_cloud_event(&h, &body).unwrap();
         assert_eq!(message.id(), Some("evt-2"));
         assert_eq!(message.name(), "order.created");
         assert_eq!(message.payload(), br#"{"order":"o2"}"#);
@@ -343,7 +346,7 @@ mod tests {
             .to_string(),
         );
 
-        let message = parse_cloud_event(&h, &body).unwrap();
+        let message = decode_cloud_event(&h, &body).unwrap();
 
         assert_eq!(message.traceparent(), Some(traceparent));
     }
@@ -364,7 +367,7 @@ mod tests {
             .to_string(),
         );
 
-        let message = parse_cloud_event(&h, &body).unwrap();
+        let message = decode_cloud_event(&h, &body).unwrap();
 
         assert_eq!(message.traceparent(), Some(traceparent));
         assert_eq!(message.tracestate(), Some("vendor=value"));
@@ -373,7 +376,7 @@ mod tests {
     #[test]
     fn missing_id_is_rejected() {
         let h = headers(&[("ce-type", "order.created")]);
-        assert!(parse_cloud_event(&h, &Bytes::new()).is_err());
+        assert!(decode_cloud_event(&h, &Bytes::new()).is_err());
     }
 
     #[test]
@@ -381,7 +384,7 @@ mod tests {
         // A `ce-type` carrying a broker wildcard must not become a routing key.
         let h = headers(&[("ce-id", "evt-1"), ("ce-type", "order.*")]);
         let body = Bytes::from_static(br#"{}"#);
-        let err = parse_cloud_event(&h, &body).unwrap_err();
+        let err = decode_cloud_event(&h, &body).unwrap_err();
         assert!(err.contains("invalid message name"), "got {err}");
     }
 
@@ -397,7 +400,7 @@ mod tests {
             })
             .to_string(),
         );
-        let err = parse_cloud_event(&h, &body).unwrap_err();
+        let err = decode_cloud_event(&h, &body).unwrap_err();
         assert!(err.contains("invalid message name"), "got {err}");
     }
 
@@ -410,7 +413,7 @@ mod tests {
             ("ce-correlation", "corr-1"),
             ("content-type", "application/octet-stream"),
         ]);
-        let message = parse_cloud_event(&h, &Bytes::from_static(b"\x00")).unwrap();
+        let message = decode_cloud_event(&h, &Bytes::from_static(b"\x00")).unwrap();
         assert_eq!(message.id(), Some("cmd-1"));
         assert_eq!(message.kind, crate::bus::MessageKind::Command);
         assert_eq!(message.content_type, "application/octet-stream");
@@ -430,7 +433,7 @@ mod tests {
                 ("ce-distributedkind", "event"),
                 (key, value),
             ]);
-            assert!(parse_cloud_event(&h, &Bytes::new()).is_err(), "{key}");
+            assert!(decode_cloud_event(&h, &Bytes::new()).is_err(), "{key}");
         }
     }
 
@@ -450,7 +453,7 @@ mod tests {
                     store
                         .lock()
                         .unwrap()
-                        .push(parse_cloud_event(&headers, &body).unwrap());
+                        .push(decode_cloud_event(&headers, &body).unwrap());
                     StatusCode::OK
                 }
             }),

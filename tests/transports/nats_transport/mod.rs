@@ -1,7 +1,9 @@
 //! NATS JetStream transport adapter integration tests.
 //!
-//! Publishes via `NatsPublisher` and consumes via `NatsJetStreamSource` against a
-//! JetStream-enabled NATS server. Skips when `NATS_URL` is unset.
+//! The bus contract over `NatsBus`, and what only JetStream does (external
+//! identities, broker dedupe of a publish prefix, fetch latency, delivery
+//! lanes) over `NatsPublisher` and `NatsJetStreamSource`. Skips when
+//! `NATS_URL` is unset.
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -13,10 +15,9 @@ use distributed::bus::{
 use distributed::microsvc::{Context, Message, MessageKind, Routes, Service};
 use serde_json::json;
 
-// Shared broker-test helpers (bus scenarios, unique, ...).
 use common::env as env_support;
-use common::transport as conformance;
-use conformance::unique;
+use common::ids::unique;
+use common::transport::bus::{BusCapabilities, BusHarness, KindCapabilities};
 
 fn nats_url() -> Option<String> {
     env_support::require_service("NATS_URL", "nats transport test")
@@ -41,29 +42,6 @@ fn external_balance(position: u64, value: u64) -> distributed::DomainEventOccurr
         &ExternalBalance { value },
     )
     .unwrap()
-}
-
-/// Options that drain to idle and keep dead letters where the test can read
-/// them.
-fn storing_dead_letters() -> (Arc<distributed::bus::InMemoryDeadLetters>, RunOptions) {
-    let dead = Arc::new(distributed::bus::InMemoryDeadLetters::new());
-    let options = RunOptions::until_idle().with_dead_letters(dead.clone());
-    (dead, options)
-}
-
-/// The one stored dead letter: its message id (if any), payload and reason.
-fn only_dead_letter(
-    dead: &distributed::bus::InMemoryDeadLetters,
-) -> (Option<String>, Vec<u8>, String) {
-    let mut all = dead.all();
-    assert_eq!(all.len(), 1, "exactly one message was dead-lettered");
-    let dead = all.remove(0);
-    assert_eq!(dead.attempts, 1);
-    (
-        dead.message.id().map(str::to_owned),
-        dead.message.payload().to_vec(),
-        dead.reason,
-    )
 }
 
 #[tokio::test]
@@ -353,86 +331,30 @@ async fn derived_facts_round_trip_after_interrupted_publish_prefix() {
     assert_eq!(seen[1], initial[1]);
 }
 
-#[tokio::test]
-async fn publish_then_consume_round_trips_through_jetstream() {
-    let Some(url) = nats_url() else { return };
-    let subject = unique("order.initialized");
-    let stream = unique("STREAM");
-    let durable = unique("consumer");
-
-    // Create the stream + durable consumer first so the stream exists before we
-    // publish (JetStream publish requires a stream bound to the subject).
-    let source = NatsJetStreamSource::connect(&url, &stream, vec![subject.clone()], &durable)
-        .await
-        .expect("connect source")
-        .with_fetch_timeout(Duration::from_millis(800));
-
-    // Publish three events.
-    let publisher = NatsPublisher::connect(&url)
-        .await
-        .expect("connect publisher");
-    for i in 0..3 {
-        let message =
-            Message::new(&subject, MessageKind::Event, b"{}".to_vec()).with_id(format!("m{i}"));
-        publisher.publish(message).await.expect("publish");
-    }
-
-    // Consume via the shared runner.
-    let handled = Arc::new(Mutex::new(Vec::<String>::new()));
-    let h = handled.clone();
-    let subject_for_handler = subject.clone();
-    let service = Arc::new(
-        Service::new().routes(
-            Routes::new()
-                .with_dependencies(())
-                .event(Box::leak(subject.clone().into_boxed_str()))
-                .handle(move |ctx: &Context<()>| {
-                    assert_eq!(ctx.message().name(), subject_for_handler);
-                    h.lock()
-                        .unwrap()
-                        .push(ctx.message().id().unwrap_or_default().to_string());
-                    async move { Ok(json!({})) }
-                }),
-        ),
-    );
-
-    run_source(service, source, RunOptions::until_idle())
-        .await
-        .expect("run_source drains the stream");
-
-    let mut ids = handled.lock().unwrap().clone();
-    ids.sort();
-    assert_eq!(
-        ids,
-        vec!["m0".to_string(), "m1".to_string(), "m2".to_string()]
-    );
-}
-
-/// Build a namespaced `NatsBus` for `group` (empty `group` = no group), with
-/// the stream ensured so publishes have a destination.
-async fn nats_bus(url: &str, namespace: &str, group: &str) -> NatsBus {
-    let builder = NatsBus::connect(url).namespace(namespace);
-    let builder = if group.is_empty() {
-        builder
-    } else {
-        builder.group(group)
-    };
-    let bus = builder
-        .await
-        .expect("connect bus")
-        .with_fetch_timeout(Duration::from_millis(600));
-    bus.ensure_stream().await.expect("ensure stream");
-    bus
-}
-
 /// One namespace (stream) per test.
 struct Nats {
     url: String,
     namespace: String,
 }
 
-impl conformance::bus::BusHarness for Nats {
+/// JetStream drops a message id it saw within its duplicate window, keeps
+/// one stream per namespace in order, and redelivers a nacked message when
+/// its delay ends, after whatever was fetched meanwhile.
+const JETSTREAM: KindCapabilities = KindCapabilities {
+    dedupes_ids: true,
+    retry_holds_position: false,
+    ordered_across_names: true,
+};
+
+impl BusHarness for Nats {
     type Bus = NatsBus;
+
+    const CAPABILITIES: BusCapabilities = BusCapabilities {
+        commands: JETSTREAM,
+        events: JETSTREAM,
+        rebalance_may_redeliver: false,
+        added_metadata: &[],
+    };
 
     async fn start() -> Option<Self> {
         Some(Self {
@@ -441,131 +363,18 @@ impl conformance::bus::BusHarness for Nats {
         })
     }
 
-    async fn bus(&self, group: &str) -> NatsBus {
-        nats_bus(&self.url, &self.namespace, group).await
+    async fn bus(&self) -> NatsBus {
+        let bus = NatsBus::connect(&self.url)
+            .namespace(&self.namespace)
+            .await
+            .expect("connect bus")
+            .with_fetch_timeout(Duration::from_millis(600));
+        bus.ensure_stream().await.expect("ensure stream");
+        bus
     }
 }
 
 common::bus_conformance_tests!(Nats);
-
-/// `send` + `listen`: replicas sharing a `group` compete for the command — each
-/// message is handled exactly once across the pool (point-to-point).
-#[tokio::test]
-async fn bus_send_listen_is_point_to_point_across_a_group() {
-    let Some(url) = nats_url() else { return };
-    let namespace = unique("ns").to_lowercase();
-    conformance::bus_send_listen_is_point_to_point_across_a_group(|group| {
-        nats_bus(&url, &namespace, group)
-    })
-    .await;
-}
-
-/// `publish` + `subscribe`: distinct `group`s each get their own durable on the
-/// shared stream, so every group sees every event (fan-out).
-#[tokio::test]
-async fn bus_publish_subscribe_fans_out_across_groups() {
-    let Some(url) = nats_url() else { return };
-    let namespace = unique("ns").to_lowercase();
-    conformance::bus_publish_subscribe_fans_out_across_groups(|group| {
-        nats_bus(&url, &namespace, group)
-    })
-    .await;
-}
-
-#[tokio::test]
-async fn bus_subscribe_uses_named_service_as_consumer_group() {
-    let Some(url) = nats_url() else { return };
-    let namespace = unique("ns").to_lowercase();
-    conformance::bus_subscribe_uses_named_service_as_consumer_group(|| {
-        nats_bus(&url, &namespace, "")
-    })
-    .await;
-}
-
-// ---- failure paths: redelivery, termination (dead-letter), undecodable payloads ----
-
-/// Connect a fresh stream + durable pull source for `subject`.
-async fn failure_source(
-    url: &str,
-    subject: &str,
-    stream: &str,
-    durable: &str,
-) -> NatsJetStreamSource {
-    NatsJetStreamSource::connect(url, stream, vec![subject.to_string()], durable)
-        .await
-        .expect("connect source")
-        .with_fetch_timeout(Duration::from_millis(800))
-}
-
-/// A handler set for `subject` that decodes its payload as JSON, permanently
-/// failing (→ dead-letter) on garbage and recording the id on success.
-///
-/// The handler is the decode point on purpose: `Service::dispatch_message`
-/// falls back to a `Null` input when the payload is not JSON instead of
-/// failing, so payload validation is the consumer's contract.
-fn json_decoding_handlers(subject: &str, rec: Arc<Mutex<Vec<String>>>) -> Arc<Handlers> {
-    Arc::new(Handlers::new().on_event(subject, move |message: &Message| {
-        let id = message.id().unwrap_or_default().to_string();
-        let decoded = serde_json::from_slice::<serde_json::Value>(message.payload()).is_ok();
-        let rec = rec.clone();
-        async move {
-            if !decoded {
-                return Err(TransportError::permanent("undecodable payload"));
-            }
-            rec.lock().unwrap().push(id);
-            Ok(())
-        }
-    }))
-}
-
-#[tokio::test]
-async fn undecodable_payload_dead_letters_without_blocking() {
-    let Some(url) = nats_url() else { return };
-    let subject = unique("delivery.garbage");
-    let stream = unique("STREAM");
-    let durable = unique("consumer");
-    let source = failure_source(&url, &subject, &stream, &durable).await;
-
-    // Raw garbage straight onto the stream subject: no headers, invalid JSON.
-    let raw = async_nats::connect(&url).await.expect("connect raw client");
-    raw.publish(subject.clone(), vec![0xff, 0xfe, b'{'].into())
-        .await
-        .expect("raw publish");
-    raw.flush().await.expect("flush raw publish");
-
-    let publisher = NatsPublisher::connect(&url)
-        .await
-        .expect("connect publisher");
-    publisher
-        .publish(Message::new(&subject, MessageKind::Event, b"{}".to_vec()).with_id("ok"))
-        .await
-        .expect("publish ok");
-
-    // The decoding handler fails permanently on the garbage, so it is
-    // dead-lettered instead of blocking the subject with endless
-    // redeliveries.
-    let (dead, options) = storing_dead_letters();
-    let rec = Arc::new(Mutex::new(Vec::new()));
-    run_source(
-        json_decoding_handlers(&subject, rec.clone()),
-        source,
-        options,
-    )
-    .await
-    .expect("run drains: the undecodable payload is terminated, not redelivered forever");
-    assert_eq!(
-        rec.lock().unwrap().clone(),
-        vec!["ok".to_string()],
-        "the message behind the garbage is still handled"
-    );
-    let (_, payload, reason) = only_dead_letter(&dead);
-    assert_eq!(
-        payload,
-        vec![0xff, 0xfe, b'{'],
-        "the garbage itself was stored"
-    );
-    assert!(!reason.is_empty());
-}
 
 // ---- latency: idle delivery, retry backoff, delivery lanes ----
 // See docs/consumer-delivery-lanes.md.
@@ -705,7 +514,7 @@ async fn retryable_nack_backs_off_without_starving_newer_messages() {
 async fn slow_default_lane_does_not_delay_process_lane_over_jetstream() {
     let Some(url) = nats_url() else { return };
     let namespace = unique("lanes").to_lowercase();
-    let bus = nats_bus(&url, &namespace, "lanes").await;
+    let bus = Nats { url, namespace }.bus().await;
     let m2_policy_ran = Arc::new(tokio::sync::Notify::new());
     let projection_done = Arc::new(Mutex::new(Vec::<String>::new()));
     let policy_done = Arc::new(Mutex::new(Vec::<String>::new()));

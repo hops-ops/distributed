@@ -177,13 +177,13 @@ impl Message {
     }
 }
 
-/// Derive a message name from a transport address (NATS subject, Kafka topic,
-/// or AMQP routing key) by stripping the publisher's `prefix`.
+/// Derive a message name from a transport address (NATS subject or AMQP
+/// routing key) by stripping the publisher's `prefix`.
 ///
 /// Takes ownership of `address` so the common `None`/no-match paths reuse the
 /// existing allocation instead of cloning. When `prefix` is set but does not
 /// match, the full address is returned unchanged.
-#[cfg(any(feature = "nats", feature = "kafka", feature = "rabbitmq"))]
+#[cfg(any(feature = "nats", feature = "rabbitmq"))]
 pub(crate) fn strip_address_prefix(address: String, prefix: Option<&str>) -> String {
     match prefix {
         Some(prefix) => address

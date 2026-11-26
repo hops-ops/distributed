@@ -156,7 +156,7 @@ pub use error::{TransportError, TransportErrorKind};
 pub use failure_policy::{FailureAction, FailurePolicy};
 pub use handlers::{Handlers, MessageHandler};
 pub use in_memory_bus::{InMemoryBus, InMemoryReceived};
-#[cfg(any(feature = "nats", feature = "kafka", feature = "rabbitmq"))]
+#[cfg(any(feature = "nats", feature = "rabbitmq"))]
 pub(crate) use message::strip_address_prefix;
 pub use message::{Message, MessageKind, PayloadDecodeError, SubscriptionPlan};
 pub use message_name::{validate_message_name, MessageNameError, MAX_MESSAGE_NAME_LEN};
@@ -166,7 +166,8 @@ pub use postgres_bus::{LogReceived, PostgresBus, QueueReceived};
 pub use publisher::MessagePublisher;
 #[cfg(feature = "redis-streams")]
 pub use redis_streams::{
-    RedisStreamPublisher, DEFAULT_REDIS_DEDUPE_TTL, DEFAULT_REDIS_STREAM_PREFIX,
+    RedisStreamBus, RedisStreamPublisher, RedisStreamReceived, DEFAULT_REDIS_BLOCK,
+    DEFAULT_REDIS_DEDUPE_TTL, DEFAULT_REDIS_LEASE, DEFAULT_REDIS_STREAM_PREFIX,
 };
 pub use router::{LaneSet, MessageRouter};
 pub use run_options::{

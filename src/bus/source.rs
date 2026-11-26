@@ -58,6 +58,16 @@ pub trait MessageSource: Send {
     fn ready(&mut self) -> impl Future<Output = ()> + Send + '_ {
         std::future::ready(())
     }
+
+    /// The run is over: write whatever this source still holds and give up
+    /// what it claimed. Called once when a run ends, however it ends.
+    ///
+    /// A source that records acknowledgements and writes them in batches (an
+    /// offset written once per batch) writes the last batch here. The default
+    /// holds nothing.
+    fn finish(&mut self) -> impl Future<Output = Result<(), TransportError>> + Send + '_ {
+        std::future::ready(Ok(()))
+    }
 }
 
 /// One delivery of a message.

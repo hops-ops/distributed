@@ -42,6 +42,14 @@ const OUTBOX_CONTENT_TYPE: &str = "application/octet-stream";
 /// carry decode/routing semantics and must not be shadowable by user metadata.
 pub const SOURCED_METADATA_PREFIX: &str = "x-distributed-";
 
+/// Metadata key naming the type of the aggregate a message came from.
+pub const SOURCE_AGGREGATE_TYPE: &str = "x-distributed-source-aggregate-type";
+
+/// Metadata key naming the aggregate a message came from: its stream id.
+/// Transports that partition (Kafka) key by it, so one aggregate's messages
+/// keep their order.
+pub const SOURCE_AGGREGATE_ID: &str = "x-distributed-source-aggregate-id";
+
 impl From<OutboxMessage> for Message {
     /// Map a durable outbox row to a canonical transport message.
     ///
@@ -89,16 +97,10 @@ impl From<OutboxMessage> for Message {
             metadata.push((format!("{SOURCED_METADATA_PREFIX}destination"), destination));
         }
         if let Some(source_type) = outbox.source_aggregate_type {
-            metadata.push((
-                format!("{SOURCED_METADATA_PREFIX}source-aggregate-type"),
-                source_type,
-            ));
+            metadata.push((SOURCE_AGGREGATE_TYPE.to_string(), source_type));
         }
         if let Some(source_id) = outbox.source_aggregate_id {
-            metadata.push((
-                format!("{SOURCED_METADATA_PREFIX}source-aggregate-id"),
-                source_id,
-            ));
+            metadata.push((SOURCE_AGGREGATE_ID.to_string(), source_id));
         }
         if let Some(sequence) = outbox.source_sequence {
             metadata.push((
