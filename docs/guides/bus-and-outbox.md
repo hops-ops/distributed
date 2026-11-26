@@ -81,7 +81,8 @@ host is `microsvc::schedule::ScheduleWorker`. The route declares
 `.requires(Capability::Scheduling)`; the fired command runs with the trusted
 `schedule` role (`microsvc::schedule::SCHEDULE_ROLE`, admitted by
 `schedule_guard`). It is the one timer mechanism: cross-cell workflows use the
-event-sourced `Saga<D>` process manager (`distributed::saga`), whose step
+event-sourced `Saga<D>` (`distributed::saga`), an ordered sequence of steps
+with compensation, whose step
 timeouts are a schedule that fires the definition's `TIMEOUT_COMMAND` through
 the `SagaTimeouts` route, mounted on the service over the saga repository.
 Single-owner work uses TTL leases with monotonic fencing tokens
