@@ -115,6 +115,21 @@ pub(crate) trait ProjectionProtocolScenario: Sized + Send + Sync {
         position: u64,
     ) -> impl Future<Output = ()> + Send + 'a;
 
+    /// The change epoch stored for [`Self::partition`]; `None` until a write
+    /// creates the partition.
+    fn stored_change_epoch<'a>(
+        &'a self,
+        store: &'a Self::Store,
+    ) -> impl Future<Output = Option<ProjectionEpoch>> + Send + 'a;
+
+    /// Create [`Self::partition`] the way an earlier release did: with an
+    /// epoch its application declared.
+    fn insert_partition<'a>(
+        &'a self,
+        store: &'a Self::Store,
+        epoch: &'a ProjectionEpoch,
+    ) -> impl Future<Output = ()> + Send + 'a;
+
     /// The positions physically held in [`Self::partition`]'s change log.
     fn stored_change_positions<'a>(
         &'a self,
@@ -189,18 +204,20 @@ pub(crate) trait ProjectionProtocolScenario: Sized + Send + Sync {
         )
     }
 
-    fn change_epoch(&self) -> ProjectionEpoch {
-        ProjectionEpoch::new("changes-v1").unwrap()
-    }
-
-    fn change_cursor(&self, position: u64) -> ProjectionChangeCursor {
-        ProjectionChangeCursor::new(
-            self.topology(),
-            self.partition(),
-            self.change_epoch(),
-            position,
-        )
-        .unwrap()
+    /// A cursor in the change log of [`Self::partition`], which a write has
+    /// already created.
+    fn change_cursor<'a>(
+        &'a self,
+        store: &'a Self::Store,
+        position: u64,
+    ) -> impl Future<Output = ProjectionChangeCursor> + Send + 'a {
+        async move {
+            let epoch = self
+                .stored_change_epoch(store)
+                .await
+                .expect("a write created the partition");
+            ProjectionChangeCursor::new(self.topology(), self.partition(), epoch, position).unwrap()
+        }
     }
 
     fn ownership(&self) -> ProjectionModelOwnership {
@@ -231,7 +248,6 @@ pub(crate) trait ProjectionProtocolScenario: Sized + Send + Sync {
     ) -> ProjectionCommitBatch {
         ProjectionCommitBatch {
             input,
-            change_epoch: self.change_epoch(),
             ownership: vec![self.ownership()],
             mutations,
             observations,
@@ -239,14 +255,8 @@ pub(crate) trait ProjectionProtocolScenario: Sized + Send + Sync {
     }
 
     fn failure(&self, input: TrustedProjectionInput, failure_id: &str) -> ProjectionFailureBatch {
-        ProjectionFailureBatch::new(
-            input,
-            self.change_epoch(),
-            failure_id,
-            "decode_error",
-            b"bad payload".to_vec(),
-        )
-        .unwrap()
+        ProjectionFailureBatch::new(input, failure_id, "decode_error", b"bad payload".to_vec())
+            .unwrap()
     }
 }
 
@@ -1229,61 +1239,84 @@ pub(crate) async fn source_capability_mismatch_outranks_message_id_reuse(
     ));
 }
 
-/// A partition's change epoch is part of its scope. A writer naming another
-/// epoch is told which scope field disagrees.
-pub(crate) async fn change_epoch_is_fixed_per_partition(scenario: impl ProjectionProtocolScenario) {
+/// Nobody declares a change epoch. The store mints one when a write creates
+/// the partition, and every later write of that partition continues it.
+pub(crate) async fn a_new_partition_mints_its_change_epoch_once(
+    scenario: impl ProjectionProtocolScenario,
+) {
     let repository = scenario.repository().await;
-    repository
-        .commit_projection(scenario.batch(
+    assert_eq!(scenario.stored_change_epoch(&repository).await, None);
+
+    let first = repository
+        .commit_projection(noop(&scenario, 1, ProjectionGeneration::initial()))
+        .await
+        .unwrap();
+    let minted = scenario
+        .stored_change_epoch(&repository)
+        .await
+        .expect("the first write created the partition");
+    let change_epoch =
+        |checkpoint: Option<&ProjectionCheckpoint>| checkpoint.unwrap().change().epoch().clone();
+    assert_eq!(change_epoch(first.checkpoint.as_ref()), minted);
+
+    let second = repository
+        .commit_projection(noop(&scenario, 2, ProjectionGeneration::initial()))
+        .await
+        .unwrap();
+    assert_eq!(change_epoch(second.checkpoint.as_ref()), minted);
+    let failure = repository
+        .record_projection_failure(scenario.failure(
             scenario.input(
-                1,
-                b"epoch-one",
-                "epoch-message-1",
-                "epoch-cause-1",
+                3,
+                b"input-3",
+                "message-3",
+                "cause-3",
                 ProjectionGeneration::initial(),
             ),
-            Vec::new(),
-            Vec::new(),
+            &scenario.failure_id("minted-epoch-failure"),
         ))
         .await
         .unwrap();
-    let next = scenario.input(
-        2,
-        b"epoch-two",
-        "epoch-message-2",
-        "epoch-cause-2",
-        ProjectionGeneration::initial(),
+    assert_eq!(failure.change.epoch(), &minted);
+    assert_eq!(
+        scenario.stored_change_epoch(&repository).await,
+        Some(minted)
     );
-    let other_epoch = ProjectionEpoch::new("another-change-epoch").unwrap();
-    let mut batch = scenario.batch(next.clone(), Vec::new(), Vec::new());
-    batch.change_epoch = other_epoch.clone();
+}
 
-    let is_epoch_mismatch = |error: ProjectionProtocolError| {
-        matches!(
-            error,
-            ProjectionProtocolError::ScopeMismatch {
-                field: "projection change epoch"
-            }
-        )
-    };
-    assert!(is_epoch_mismatch(
-        repository.commit_projection(batch).await.unwrap_err()
-    ));
-    assert!(is_epoch_mismatch(
-        repository
-            .record_projection_failure(
-                ProjectionFailureBatch::new(
-                    next,
-                    other_epoch,
-                    &scenario.failure_id("epoch-failure"),
-                    "decode_error",
-                    b"bad payload".to_vec(),
-                )
-                .unwrap(),
-            )
-            .await
-            .unwrap_err()
-    ));
+/// A partition an earlier release created with a declared epoch keeps it:
+/// commits and failures continue its change log, and nothing is refused.
+pub(crate) async fn an_existing_partition_keeps_the_change_epoch_it_has(
+    scenario: impl ProjectionProtocolScenario,
+) {
+    let repository = scenario.repository().await;
+    let declared = ProjectionEpoch::new("todos-v1").unwrap();
+    scenario.insert_partition(&repository, &declared).await;
+
+    let committed = repository
+        .commit_projection(noop(&scenario, 1, ProjectionGeneration::initial()))
+        .await
+        .unwrap();
+    assert_eq!(committed.outcome, ProjectionCommitOutcome::Applied);
+    assert_eq!(committed.checkpoint.unwrap().change().epoch(), &declared);
+    let failure = repository
+        .record_projection_failure(scenario.failure(
+            scenario.input(
+                2,
+                b"input-2",
+                "message-2",
+                "cause-2",
+                ProjectionGeneration::initial(),
+            ),
+            &scenario.failure_id("declared-epoch-failure"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(failure.change.epoch(), &declared);
+    assert_eq!(
+        scenario.stored_change_epoch(&repository).await,
+        Some(declared)
+    );
 }
 
 fn assert_query_snapshot_is_coherent(snapshot: &ProjectionQuerySnapshot) {
@@ -1419,7 +1452,6 @@ pub(crate) async fn execution_snapshot_echoes_every_requested_scope_across_table
                 "execution-snapshot-cause-1",
                 ProjectionGeneration::initial(),
             ),
-            change_epoch: scenario.change_epoch(),
             ownership: schemas.iter().map(|schema| ownership(schema)).collect(),
             mutations: vec![
                 create(parent, &[("id", "parent-1")]),
@@ -1485,7 +1517,6 @@ pub(crate) async fn one_four_table_occurrence_commits_rows_and_every_causal_arti
     let result = repository
         .commit_projection(ProjectionCommitBatch {
             input: trusted.clone(),
-            change_epoch: scenario.change_epoch(),
             ownership: schemas.iter().map(|schema| ownership(schema)).collect(),
             mutations: schemas
                 .iter()
@@ -2044,10 +2075,13 @@ pub(crate) async fn change_retention_compacts_success_and_failure_prefixes(
         ProjectionChangeRetention::new(2).unwrap(),
     );
     let read = |after: Option<u64>| {
-        let after = after.map(|position| scenario.change_cursor(position));
         let repository = &repository;
         let scenario = &scenario;
         async move {
+            let after = match after {
+                Some(position) => Some(scenario.change_cursor(repository, position).await),
+                None => None,
+            };
             repository
                 .projection_changes(
                     &scenario.topology(),
@@ -2069,7 +2103,7 @@ pub(crate) async fn change_retention_compacts_success_and_failure_prefixes(
     assert_eq!(
         read(None).await,
         ProjectionChangeRead::ResetRequired {
-            head: Some(scenario.change_cursor(4)),
+            head: Some(scenario.change_cursor(&repository, 4).await),
             compacted_through: 2,
         }
     );
@@ -2082,7 +2116,7 @@ pub(crate) async fn change_retention_compacts_success_and_failure_prefixes(
     else {
         panic!("the exact compacted-through cursor must resume retained changes");
     };
-    assert_eq!(head, Some(scenario.change_cursor(4)));
+    assert_eq!(head, Some(scenario.change_cursor(&repository, 4).await));
     assert_eq!(compacted_through, 2);
     assert_eq!(positions(&changes), [3, 4]);
     assert!(matches!(
@@ -2115,7 +2149,7 @@ pub(crate) async fn change_retention_compacts_success_and_failure_prefixes(
     else {
         panic!("the new compacted-through cursor must resume retained changes");
     };
-    assert_eq!(head, Some(scenario.change_cursor(5)));
+    assert_eq!(head, Some(scenario.change_cursor(&repository, 5).await));
     assert_eq!(compacted_through, 3);
     assert_eq!(
         changes
@@ -2153,7 +2187,7 @@ pub(crate) async fn change_retention_compacts_success_and_failure_prefixes(
             .await
             .unwrap(),
         ProjectionChangeRead::ResetRequired {
-            head: Some(scenario.change_cursor(7)),
+            head: Some(scenario.change_cursor(&repository, 7).await),
             compacted_through: 3,
         }
     );
@@ -2174,7 +2208,7 @@ pub(crate) async fn lengthening_retention_never_restores_a_compacted_prefix(
     }
     assert_eq!(
         repository
-            .compact_projection_changes(&scenario.change_cursor(3))
+            .compact_projection_changes(&scenario.change_cursor(&repository, 3).await)
             .await
             .unwrap(),
         3
@@ -2189,7 +2223,7 @@ pub(crate) async fn lengthening_retention_never_restores_a_compacted_prefix(
     assert_eq!(
         all_changes(&scenario, &lengthened).await,
         ProjectionChangeRead::ResetRequired {
-            head: Some(scenario.change_cursor(4)),
+            head: Some(scenario.change_cursor(&lengthened, 4).await),
             compacted_through: 3,
         }
     );
@@ -2198,16 +2232,16 @@ pub(crate) async fn lengthening_retention_never_restores_a_compacted_prefix(
             .projection_changes(
                 &scenario.topology(),
                 &scenario.partition(),
-                Some(&scenario.change_cursor(3)),
+                Some(&scenario.change_cursor(&lengthened, 3).await),
                 100
             )
             .await
             .unwrap(),
         ProjectionChangeRead::Changes {
-            head: Some(scenario.change_cursor(4)),
+            head: Some(scenario.change_cursor(&lengthened, 4).await),
             compacted_through: 3,
             changes: vec![ProjectionChange {
-                cursor: scenario.change_cursor(4),
+                cursor: scenario.change_cursor(&lengthened, 4).await,
                 kind: ProjectionChangeKind::Checkpoint,
                 causation_id: "cause-3".into(),
                 observation_kind: None,
@@ -2294,13 +2328,13 @@ pub(crate) async fn retention_failure_rolls_back_rows_protocol_and_inbox(
             .projection_changes(
                 &scenario.topology(),
                 &scenario.partition(),
-                Some(&scenario.change_cursor(1)),
+                Some(&scenario.change_cursor(&repository, 1).await),
                 100
             )
             .await
             .unwrap(),
         ProjectionChangeRead::Changes {
-            head: Some(scenario.change_cursor(1)),
+            head: Some(scenario.change_cursor(&repository, 1).await),
             compacted_through: 0,
             changes: Vec::new(),
         }
@@ -2318,10 +2352,13 @@ pub(crate) async fn change_page_with_a_hole_is_rejected(scenario: impl Projectio
             .unwrap();
     }
     let read = |after: Option<u64>, limit: usize| {
-        let after = after.map(|position| scenario.change_cursor(position));
         let repository = &repository;
         let scenario = &scenario;
         async move {
+            let after = match after {
+                Some(position) => Some(scenario.change_cursor(repository, position).await),
+                None => None,
+            };
             repository
                 .projection_changes(
                     &scenario.topology(),
@@ -3325,7 +3362,9 @@ pub(crate) async fn failure_stops_the_partition_until_its_exact_repair(
         read(boundary).await,
         ProjectionChangeRead::ResetRequired { .. }
     ));
-    let future = scenario.change_cursor(later.changes[0].cursor.position() + 10);
+    let future = scenario
+        .change_cursor(&repository, later.changes[0].cursor.position() + 10)
+        .await;
     assert!(matches!(
         read(future).await,
         ProjectionChangeRead::ResetRequired { .. }
@@ -3476,7 +3515,8 @@ macro_rules! projection_protocol_scenario_tests {
             causation_evidence_is_ordered_by_canonical_scope_bytes,
             another_partition_cannot_create_an_owned_row,
             source_capability_mismatch_outranks_message_id_reuse,
-            change_epoch_is_fixed_per_partition,
+            a_new_partition_mints_its_change_epoch_once,
+            an_existing_partition_keeps_the_change_epoch_it_has,
             query_snapshot_never_mixes_row_revision_checkpoint_or_resume_head,
             execution_snapshot_echoes_every_requested_scope_across_tables,
             one_four_table_occurrence_commits_rows_and_every_causal_artifact,

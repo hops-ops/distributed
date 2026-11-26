@@ -107,19 +107,19 @@ impl InMemoryProjectionProtocolState {
         }
     }
 
-    pub(super) fn ensure_partition(
-        &mut self,
-        key: &PartitionKey,
-        change_epoch: &ProjectionEpoch,
-    ) -> Result<(), ProjectionProtocolError> {
-        if let Some(partition) = self.partitions.get(key) {
-            ensure_change_epoch(&partition.change_epoch, change_epoch)?;
-        }
-        self.partition_mut(key, change_epoch);
-        Ok(())
+    /// The partition's stored change epoch, or a newly minted one for a
+    /// partition that does not exist yet. Pass it to
+    /// [`partition_mut`](Self::partition_mut) to keep it.
+    pub(super) fn change_epoch(&self, key: &PartitionKey) -> ProjectionEpoch {
+        self.partitions
+            .get(key)
+            .map_or_else(ProjectionEpoch::mint, |partition| {
+                partition.change_epoch.clone()
+            })
     }
 
-    /// The partition's state, created at the initial generation on first use.
+    /// The partition's state, created at the initial generation with
+    /// `change_epoch` on first use. An existing partition keeps its epoch.
     pub(super) fn partition_mut(
         &mut self,
         key: &PartitionKey,
@@ -140,18 +140,14 @@ impl InMemoryProjectionProtocolState {
     }
 
     /// Check an input's durable identities and partition fences, then
-    /// classify it. `change_epoch` is absent for a read that stages nothing.
+    /// classify it.
     pub(super) fn input_disposition(
         &self,
         input: &TrustedProjectionInput,
-        change_epoch: Option<&ProjectionEpoch>,
     ) -> Result<ProjectionInputDisposition, ProjectionProtocolError> {
         self.require_registered_topology(input.cursor.topology())?;
         let key = PartitionKey::from_input(&input.cursor);
         let partition = self.partitions.get(&key);
-        if let (Some(partition), Some(change_epoch)) = (partition, change_epoch) {
-            ensure_change_epoch(&partition.change_epoch, change_epoch)?;
-        }
         self.validate_input_identity(input)?;
         ensure_active_input(
             input,

@@ -68,7 +68,7 @@ export const Command_importTodos: ReplicaCommandArtifact<Command_importTodos_Inp
   "protocol": {
     "operation": "sha256:e8e54238fd7618fa94e90ae60b1dfac8833943027d04e71be84cb03702f1cebf",
     "protocolHash": "sha256:0dfa8a3f49e17d8d99c5c095c1ed14f528cae3e55fbc2f2b852975a50936ec5b",
-    "schemaHash": "sha256:61516eab287be736090390cf07b56f85fa2035cf83223ff30985f32c67b9bbd9",
+    "schemaHash": "sha256:bc33aebc87b3715d31edad3f7490a969fe99894a239b84514a306c2a7806753b",
     "surface": {
       "kind": "role",
       "name": "user"
@@ -132,7 +132,7 @@ export const Command_pingTodos: ReplicaCommandArtifact<Command_pingTodos_Input, 
   "protocol": {
     "operation": "sha256:3cb3c1e96331b4e98191cc725ab6b01c0e9b04cc7cc0f37f4fa0ef394fee9acf",
     "protocolHash": "sha256:0dfa8a3f49e17d8d99c5c095c1ed14f528cae3e55fbc2f2b852975a50936ec5b",
-    "schemaHash": "sha256:61516eab287be736090390cf07b56f85fa2035cf83223ff30985f32c67b9bbd9",
+    "schemaHash": "sha256:bc33aebc87b3715d31edad3f7490a969fe99894a239b84514a306c2a7806753b",
     "surface": {
       "kind": "role",
       "name": "user"
@@ -177,7 +177,6 @@ export type Command_projectTodo_Output = {
 export const Command_projectTodo: ReplicaCommandArtifact<Command_projectTodo_Input, Command_projectTodo_Output> = {
   "consistency": "atomic",
   "directProjection": {
-    "changeEpoch": "todos-v1",
     "identityFields": [
       "tenantId",
       "id"
@@ -424,7 +423,6 @@ export const Command_projectTodo: ReplicaCommandArtifact<Command_projectTodo_Inp
     "projections": [
       {
         "bindingId": "pb1:sha256:2222222222222222222222222222222222222222222222222222222222222222",
-        "epoch": "todos-projection-v2",
         "operationSemanticsVersion": 1,
         "programId": "pp1:sha256:1111111111111111111111111111111111111111111111111111111111111111",
         "programIrVersion": 1
@@ -435,7 +433,7 @@ export const Command_projectTodo: ReplicaCommandArtifact<Command_projectTodo_Inp
   "protocol": {
     "operation": "sha256:f986d060555cdedfe94621914116306af704d8bb90e75289722a3b7119211d32",
     "protocolHash": "sha256:0dfa8a3f49e17d8d99c5c095c1ed14f528cae3e55fbc2f2b852975a50936ec5b",
-    "schemaHash": "sha256:61516eab287be736090390cf07b56f85fa2035cf83223ff30985f32c67b9bbd9",
+    "schemaHash": "sha256:bc33aebc87b3715d31edad3f7490a969fe99894a239b84514a306c2a7806753b",
     "surface": {
       "kind": "role",
       "name": "user"

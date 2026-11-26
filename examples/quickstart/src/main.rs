@@ -182,7 +182,6 @@ distributed::projection! {
     pub const TODOS: ProjectionDescriptor<EventualOnly> = {
         name: "project_todos",
         version: 1,
-        epoch: "quickstart-todos-v1",
         model: Todos,
         on {
             events: [TodoCreatedDomainEvent],

@@ -122,10 +122,6 @@ fn client_manifest_uses_service_surface_export() {
         manifest["commands"][0]["extensions"]["direct_projection"]["model"],
         "OrderView"
     );
-    assert_eq!(
-        manifest["commands"][0]["extensions"]["direct_projection"]["change_epoch"],
-        "orders-v1"
-    );
     assert!(manifest["commands"][0]["extensions"]["direct_projection"]
         .get("partition")
         .is_none());

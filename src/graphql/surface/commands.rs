@@ -434,13 +434,6 @@ pub(in crate::graphql::surface) fn bind_surface_direct_projection_targets(
                 ))
             }
         };
-        let binding_change_epoch = projector.binding_change_epoch();
-        if binding_change_epoch.is_none() {
-            return Err(format!(
-                "typed projected command `{}` owner `{}` has no registered change-log epoch",
-                command.command_name, projector.name
-            ));
-        }
         let registered_schema = &models
             .get(&projected.model)
             .expect("projector ownership above requires a registered model")
@@ -470,7 +463,6 @@ pub(in crate::graphql::surface) fn bind_surface_direct_projection_targets(
             &binding_facts,
             &binding_models,
             &projector.partition,
-            binding_change_epoch.as_deref(),
             ownership.clone(),
             Some(protocol_topology.clone()),
             projector.active_modeled_program_id_for(&projected.model),
@@ -544,10 +536,9 @@ pub(in crate::graphql::surface) fn validate_command_projection_topology(
                 &projector.facts,
                 &projector.models,
                 &projector.partition,
-                projector.change_epoch.as_deref(),
             ) {
                 return Err(format!(
-                    "typed projected command `{}` captured direct projector `{}` topology/change epoch does not match the registered owner",
+                    "typed projected command `{}` captured direct projector `{}` topology does not match the registered owner",
                     command.command_name, target.projector
                 ));
             }
@@ -557,12 +548,6 @@ pub(in crate::graphql::surface) fn validate_command_projection_topology(
             if !target.protocol_topology_matches(expected_topology) {
                 return Err(format!(
                     "typed projected command `{}` direct projector `{}` is not bound to the exact compiled schema topology",
-                    command.command_name, target.projector
-                ));
-            }
-            if projector.change_epoch.is_none() {
-                return Err(format!(
-                    "typed projected command `{}` direct projector `{}` has no registered change-log epoch",
                     command.command_name, target.projector
                 ));
             }

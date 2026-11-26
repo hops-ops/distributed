@@ -47,6 +47,12 @@ does not cover internal changes.
   commit, `ReadModelWritePlanCommitExt` and read-model plans on `CommitBatch`
   are removed; declare the command `Atomic<Model>` when its response must
   carry the committed row.
+- A projection declares no epoch: remove `epoch:` from `projection!` and
+  `.change_epoch(..)` from surface projection builders
+  (`ProjectionDescriptor::epoch()` and the epoch argument of
+  `ProjectionBindingActivation::new` are gone too). The store mints a
+  partition's change epoch when it creates the partition; existing
+  partitions keep theirs, with no rebuild.
 - A queued repository's lock is owned by the loaded aggregate: committing or
   dropping it releases the lock.
 

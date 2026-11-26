@@ -45,7 +45,6 @@ pub(crate) fn failure_matches_batch(
         && failure.failure_code == batch.failure_code
         && failure.failure_bytes == batch.failure_bytes
         && failure.failure_digest == batch.failure_digest
-        && failure.change.epoch() == &batch.change_epoch
 }
 
 #[cfg(test)]
@@ -82,14 +81,8 @@ mod tests {
             true,
         )
         .unwrap();
-        ProjectionFailureBatch::new(
-            input,
-            ProjectionEpoch::new("changes-v1").unwrap(),
-            "failure-1",
-            "decode_error",
-            b"bad payload".to_vec(),
-        )
-        .unwrap()
+        ProjectionFailureBatch::new(input, "failure-1", "decode_error", b"bad payload".to_vec())
+            .unwrap()
     }
 
     #[test]
@@ -109,7 +102,7 @@ mod tests {
             change: ProjectionChangeCursor::new(
                 topology(),
                 partition(),
-                batch.change_epoch.clone(),
+                ProjectionEpoch::new("changes-v1").unwrap(),
                 1,
             )
             .unwrap(),

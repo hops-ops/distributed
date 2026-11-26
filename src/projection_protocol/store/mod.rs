@@ -60,9 +60,8 @@ pub(crate) use commit::{
 pub(crate) use decisions::same_input;
 pub(crate) use decisions::{
     change_page, change_read_window, classify_input, corrupt_storage, ensure_active_input,
-    ensure_change_epoch, next_record, plan_repair, program_id_for_model, resolve_observation,
-    sort_causation_evidence, validate_input_identity, validate_pending_retry,
-    validate_physical_row,
+    next_record, plan_repair, program_id_for_model, resolve_observation, sort_causation_evidence,
+    validate_input_identity, validate_pending_retry, validate_physical_row,
 };
 pub use error::ProjectionProtocolError;
 pub(super) use helpers::domain_separated_digest;

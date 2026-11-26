@@ -196,7 +196,6 @@ impl CompiledCommandProjection {
 struct PreviewProjectionIdentity {
     program_id: String,
     binding_id: String,
-    epoch: String,
     program_ir_version: u16,
     operation_semantics_version: u16,
 }
@@ -465,7 +464,6 @@ pub(crate) fn compile_command_preview(
         identities.push(PreviewProjectionIdentity {
             program_id: program.program_id.clone(),
             binding_id: binding.binding_id.clone(),
-            epoch: binding.epoch.clone(),
             program_ir_version: program.ir_version,
             operation_semantics_version: program.operation_semantics_version,
         });

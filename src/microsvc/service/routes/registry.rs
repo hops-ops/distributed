@@ -260,7 +260,7 @@ impl<D: Send + Sync + 'static> Routes<D> {
     ///
     /// Remote bindings remain producer-visible registry entries but install no
     /// local event route. Active and draining local bindings both execute so a
-    /// draining epoch can finish already-published work; only Active+Causal is
+    /// draining binding can finish already-published work; only Active+Causal is
     /// eligible for new client obligations.
     #[cfg(feature = "graphql")]
     pub fn consume_projection(self, projector: SurfaceProjector) -> Self
@@ -322,14 +322,6 @@ impl<D: Send + Sync + 'static> Routes<D> {
                     binding.id()
                 )
             });
-            let change_epoch =
-                crate::projection_protocol::ProjectionEpoch::new(projection.epoch().as_str())
-                    .unwrap_or_else(|error| {
-                        panic!(
-                            "local modeled projection binding `{}` has invalid epoch: {error}",
-                            binding.id()
-                        )
-                    });
             let facts = projection.event_names();
             assert!(
                 !facts.is_empty(),
@@ -341,7 +333,6 @@ impl<D: Send + Sync + 'static> Routes<D> {
                 HandlerSpec::projector(facts),
                 Box::new(crate::microsvc::projector::RegisteredModeledProjector {
                     compiled,
-                    change_epoch,
                     executor,
                     handle: handler.clone(),
                 }),

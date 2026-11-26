@@ -77,7 +77,6 @@ export type ReplicaCommandDirectProjection = {
 	readonly model: string;
 	readonly identityFields: readonly string[];
 	readonly partition?: ReplicaCommandEffectExpression;
-	readonly changeEpoch: string;
 };
 
 /**
@@ -166,7 +165,6 @@ export type ReplicaPreparedCommand<TInput = void, TOutput = unknown> = {
 		readonly model: string;
 		readonly identityFields: readonly string[];
 		readonly partition?: ReplicaValue;
-		readonly changeEpoch: string;
 	};
 	readonly revalidation: ReplicaCommandRevalidationPlan;
 	/** Phantom output slot for generated wrappers. */

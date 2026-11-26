@@ -199,7 +199,6 @@ const commandArtifact = Object.freeze({
 			Object.freeze({
 				programId: `pp1:sha256:${'1'.repeat(64)}`,
 				bindingId: `pb1:sha256:${'2'.repeat(64)}`,
-				epoch: 'todos-v1',
 				programIrVersion: 1,
 				operationSemanticsVersion: 1
 			})

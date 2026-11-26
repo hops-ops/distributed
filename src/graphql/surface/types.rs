@@ -233,7 +233,6 @@ pub struct SurfaceProjectionOwner {
     pub facts: Vec<String>,
     pub models: Vec<String>,
     pub dependencies: Vec<String>,
-    pub(crate) change_epoch: Option<String>,
     pub(crate) partition: ProjectionPartitionSpec,
     pub(in crate::graphql::surface) kind: SurfaceProjectionOwnerKind,
     pub(crate) modeled: Vec<SurfaceModeledProjection>,
@@ -269,19 +268,6 @@ impl SurfaceProjectionOwner {
             .collect::<BTreeSet<_>>()
             .into_iter()
             .collect()
-    }
-
-    pub(crate) fn binding_change_epoch(&self) -> Option<String> {
-        if self.modeled.is_empty() {
-            return self.change_epoch.clone();
-        }
-        self.modeled
-            .iter()
-            .find(|modeled| {
-                modeled.state() == crate::projection::placement::ProjectionBindingState::Active
-            })
-            .or_else(|| self.modeled.first())
-            .map(|modeled| modeled.epoch().as_str().to_owned())
     }
 
     pub(crate) fn active_modeled_program_id_for(
@@ -368,7 +354,6 @@ impl SurfaceProjector {
                 facts: Vec::new(),
                 models: Vec::new(),
                 dependencies: Vec::new(),
-                change_epoch: None,
                 partition: ProjectionPartitionSpec::unit(),
                 kind: SurfaceProjectionOwnerKind::Async,
                 modeled: Vec::new(),
@@ -392,15 +377,6 @@ impl SurfaceProjector {
     /// per program is accepted when the owner registry is attached.
     pub fn modeled(mut self, projection: SurfaceModeledProjection) -> Self {
         self.owner.modeled.push(projection);
-        self
-    }
-
-    /// Register the opaque change-log epoch owned by this projector topology.
-    ///
-    /// Epoch contents have no ordering meaning. They fence live resume and
-    /// same-transaction record-change evidence across projector rebuilds.
-    pub fn change_epoch(mut self, epoch: impl Into<String>) -> Self {
-        self.owner.change_epoch = Some(epoch.into());
         self
     }
 
@@ -432,7 +408,6 @@ impl SurfaceProjector {
             &self.owner.facts,
             &self.owner.models,
             &self.owner.partition,
-            self.owner.change_epoch.as_deref(),
         )
     }
 }
@@ -447,8 +422,8 @@ impl From<SurfaceProjector> for SurfaceProjectionOwner {
 ///
 /// It intentionally has no fact inventory and cannot be passed to an
 /// asynchronous projector route. The owner still supplies the complete model
-/// topology, partition codec, and change epoch used by direct commits, query
-/// evidence, live changes, and generated clients.
+/// topology and partition codec used by direct commits, query evidence, live
+/// changes, and generated clients.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SurfaceDirectProjection {
     owner: SurfaceProjectionOwner,
@@ -462,7 +437,6 @@ impl SurfaceDirectProjection {
                 facts: Vec::new(),
                 models: Vec::new(),
                 dependencies: Vec::new(),
-                change_epoch: None,
                 partition: ProjectionPartitionSpec::unit(),
                 kind: SurfaceProjectionOwnerKind::Direct,
                 modeled: Vec::new(),
@@ -487,12 +461,6 @@ impl SurfaceDirectProjection {
     /// Attach one exact same-transaction modeled projection.
     pub fn modeled(mut self, projection: SurfaceModeledProjection) -> Self {
         self.owner.modeled.push(projection);
-        self
-    }
-
-    /// Register the opaque change-log epoch for direct record evidence.
-    pub fn change_epoch(mut self, epoch: impl Into<String>) -> Self {
-        self.owner.change_epoch = Some(epoch.into());
         self
     }
 
@@ -859,11 +827,7 @@ impl Surface {
                 }
                 for modeled in &projector.modeled {
                     modeled.validate_for_surface(&projector.name, projector.kind, &self.models)?;
-                    if !modeled_registrations.insert((
-                        modeled.binding_id(),
-                        modeled.epoch().as_str().to_owned(),
-                        modeled.state(),
-                    )) {
+                    if !modeled_registrations.insert((modeled.binding_id(), modeled.state())) {
                         return Err(format!(
                             "projection binding `{}` is registered more than once on the Surface",
                             modeled.binding_id()
@@ -892,7 +856,6 @@ impl Surface {
                 }
                 projector.models = projector.binding_models();
                 projector.facts = projector.binding_facts();
-                projector.change_epoch = projector.binding_change_epoch();
                 projector.partition = modeled_owner_partition_contract(&projector)?;
             }
             match projector.kind {
@@ -924,14 +887,6 @@ impl Surface {
                 &projector.models,
                 &format!("projector `{}` model", projector.name),
             )?;
-            if let Some(epoch) = projector.change_epoch.as_deref() {
-                crate::projection_protocol::ProjectionEpoch::new(epoch).map_err(|error| {
-                    format!(
-                        "projector `{}` change-log epoch is invalid: {error}",
-                        projector.name
-                    )
-                })?;
-            }
             projector.partition.validate().map_err(|error| {
                 format!(
                     "projector `{}` has invalid partition declaration: {error}",

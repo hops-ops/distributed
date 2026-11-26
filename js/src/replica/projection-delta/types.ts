@@ -30,7 +30,6 @@ export type ProjectionDeltaIdentity = Readonly<{
 export type ProjectionDeltaProjectionIdentity = Readonly<{
 	program_id: string;
 	binding_id: string;
-	epoch: string;
 	program_ir_version: 1;
 	operation_semantics_version: 1;
 }>;
@@ -319,7 +318,6 @@ export type ReplicaCommandProjection = Readonly<{
 	projections: readonly Readonly<{
 		programId: string;
 		bindingId: string;
-		epoch: string;
 		programIrVersion: 1;
 		operationSemanticsVersion: 1;
 	}>[];

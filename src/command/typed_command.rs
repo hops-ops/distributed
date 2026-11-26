@@ -18,7 +18,6 @@ use super::projections::{
 };
 use super::types::{CommandInputType, CommandTypeDef};
 use crate::microsvc::Session;
-use crate::projection_protocol::ProjectionEpoch;
 use crate::read_model::RelationalReadModel;
 
 #[derive(Clone, Debug)]
@@ -243,18 +242,6 @@ impl TypedServiceCommandBinding {
                         contract.name, target.model, contract.output.name
                     ));
                 }
-                let Some(change_epoch) = target.change_epoch.as_deref() else {
-                    return Err(format!(
-                        "typed projected command `{}` direct target has no registered change-log epoch",
-                        contract.name
-                    ));
-                };
-                ProjectionEpoch::new(change_epoch).map_err(|error| {
-                    format!(
-                        "typed projected command `{}` direct target change epoch is invalid: {error}",
-                        contract.name
-                    )
-                })?;
             }
             types.insert(
                 contract.name.clone(),

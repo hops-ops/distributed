@@ -435,7 +435,6 @@ function parseCommandProjectionArtifact(
 			[
 				'programId',
 				'bindingId',
-				'epoch',
 				'programIrVersion',
 				'operationSemanticsVersion'
 			],
@@ -454,7 +453,6 @@ function parseCommandProjectionArtifact(
 			return Object.freeze({
 				programId: identityString(identity.programId, `${itemPath}.programId`),
 				bindingId: identityString(identity.bindingId, `${itemPath}.bindingId`),
-				epoch: projectionEpoch(identity.epoch, `${itemPath}.epoch`),
 				programIrVersion: 1 as const,
 				operationSemanticsVersion: 1 as const
 			});
@@ -466,14 +464,12 @@ function parseCommandProjectionArtifact(
 				[
 					left.programId,
 					left.bindingId,
-					left.epoch,
 					left.programIrVersion,
 					left.operationSemanticsVersion
 				],
 				[
 					right.programId,
 					right.bindingId,
-					right.epoch,
 					right.programIrVersion,
 					right.operationSemanticsVersion
 				]
@@ -853,7 +849,6 @@ export function validateProjectionMetadataAuthority(
 		if (
 			expected.programId !== actual.program_id ||
 			expected.bindingId !== actual.binding_id ||
-			expected.epoch !== actual.epoch ||
 			expected.programIrVersion !== actual.program_ir_version ||
 			expected.operationSemanticsVersion !==
 				actual.operation_semantics_version
@@ -873,7 +868,6 @@ function parseProjectionIdentity(
 		[
 			'program_id',
 			'binding_id',
-			'epoch',
 			'program_ir_version',
 			'operation_semantics_version'
 		],
@@ -894,7 +888,6 @@ function parseProjectionIdentity(
 	return Object.freeze({
 		program_id: identity.program_id,
 		binding_id: identity.binding_id,
-		epoch: projectionEpoch(identity.epoch, `${path}.epoch`),
 		program_ir_version: 1 as const,
 		operation_semantics_version: 1 as const
 	});
@@ -2202,14 +2195,12 @@ function compareProjectionIdentity(
 		[
 			left.program_id,
 			left.binding_id,
-			left.epoch,
 			left.program_ir_version,
 			left.operation_semantics_version
 		],
 		[
 			right.program_id,
 			right.binding_id,
-			right.epoch,
 			right.program_ir_version,
 			right.operation_semantics_version
 		]
@@ -2415,17 +2406,6 @@ function identityString(value: unknown, path: string): string {
 		invalid(path);
 	}
 	return value;
-}
-
-function projectionEpoch(value: unknown, path: string): string {
-	const epoch = identityString(value, path);
-	if (
-		encoder.encode(epoch).byteLength > 128 ||
-		[...epoch].some((character) => /\p{Cc}/u.test(character))
-	) {
-		invalid(path);
-	}
-	return epoch;
 }
 
 function projectionModel(value: unknown, path: string): string {

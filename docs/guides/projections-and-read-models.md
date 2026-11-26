@@ -15,7 +15,6 @@ distributed::projection! {
     pub const TODOS: ProjectionDescriptor<EventualOnly> = {
         name: "project_todos",
         version: 2,
-        epoch: "todos-source-snapshots-v1",
         model: Todos,
         source: aggregate_snapshot,
         on {
@@ -54,8 +53,8 @@ own version (see [external facts](../external-facts.md)).
 Migration `0005_projection_source_snapshots` persists the fence alongside each
 record, including tombstones; compaction does not remove it. Enabling this on
 an existing unversioned projection requires an explicit read-model rebuild
-from retained canonical events. Merely changing the projection version or epoch
-does not infer a source version for existing rows. The normal ordered-delivery
+from retained canonical events. Merely changing the projection version does
+not infer a source version for existing rows. The normal ordered-delivery
 contract and transport identity checks still apply; this is not a replacement
 for reliable broker delivery or an incremental-event reorder buffer.
 
@@ -179,7 +178,6 @@ distributed::projection! {
     pub const TODOS: ProjectionDescriptor<EventualOnly> = {
         name: "project_todos",
         version: 1,
-        epoch: "e2e-ui-todos-v2",
         model: Todos,
         on {
             events: [TodoCreatedDomainEvent, TodoCompletedDomainEvent /* … */],
@@ -220,6 +218,19 @@ Routes::for_aggregate(stores)
 The projector consumes published domain events and commits the row changes,
 row revisions, broker checkpoint and causal observations in one adapter
 transaction, so bus redelivery is idempotent.
+
+### Changing a projection
+
+A changed projection applies to the events delivered after it is deployed.
+Rows already written stay as they are: starting a service with a new program
+resets nothing and refuses nothing, and two nodes running different programs
+can write the same partition during a rollout. To recompute existing rows,
+rebuild them explicitly (see above).
+
+A projection declares no epoch. The store gives each partition's change log
+a random identity when the first write creates the partition, and every
+later reader and writer uses the stored one. A partition created by an
+earlier release keeps the epoch it was created with.
 
 ### Atomic Commits (Read Model + Aggregate)
 

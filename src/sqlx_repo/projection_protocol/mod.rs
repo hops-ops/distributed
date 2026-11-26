@@ -20,8 +20,8 @@ use sqlx::{Encode, Executor, IntoArguments, Pool, QueryBuilder, Row, Transaction
 use crate::projection::ProjectionProgramId;
 use crate::projection_protocol::{
     change_kind_for_mutation, change_page, change_read_window, checked_next, classify_input,
-    corrupt_storage, ensure_active_input, ensure_change_epoch, failure_matches_batch, next_record,
-    plan_repair, program_id_for_model, resolve_observation, same_input, sort_causation_evidence,
+    corrupt_storage, ensure_active_input, failure_matches_batch, next_record, plan_repair,
+    program_id_for_model, resolve_observation, same_input, sort_causation_evidence,
     table_model_name, validate_input_identity, validate_pending_retry, validate_physical_row,
     PartitionId, ProjectionCausationEvidenceBatch, ProjectionCausationEvidenceRequest,
     ProjectionChange, ProjectionChangeCursor, ProjectionChangeKind, ProjectionChangeRead,

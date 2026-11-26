@@ -365,8 +365,7 @@ where
                 .map_err(|error| protocol_storage_error::<DB>("begin projection commit", error))?;
             verify_registered_topology_in_tx(&mut tx, self.verified_registrations(), &topology)
                 .await?;
-            let mut state =
-                lock_partition_in_tx(&mut tx, &topology, &partition, &batch.change_epoch).await?;
+            let mut state = lock_partition_in_tx(&mut tx, &topology, &partition).await?;
             validate_input_identity_in_tx(&mut tx, &batch.input).await?;
             ensure_active_input(
                 &batch.input,
@@ -656,8 +655,7 @@ where
                 .map_err(|error| protocol_storage_error::<DB>("begin projection failure", error))?;
             verify_registered_topology_in_tx(&mut tx, self.verified_registrations(), &topology)
                 .await?;
-            let mut state =
-                lock_partition_in_tx(&mut tx, &topology, &partition, &batch.change_epoch).await?;
+            let mut state = lock_partition_in_tx(&mut tx, &topology, &partition).await?;
             validate_input_identity_in_tx(&mut tx, &batch.input).await?;
             ensure_active_input(&batch.input, state.active_generation, None)?;
             if let Some(stopped) = &state.stopped_failure_id {

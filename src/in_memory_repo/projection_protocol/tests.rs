@@ -66,14 +66,6 @@ fn input(
     .unwrap()
 }
 
-fn change_epoch() -> ProjectionEpoch {
-    ProjectionEpoch::new("changes-v1").unwrap()
-}
-
-fn change_cursor(position: u64) -> ProjectionChangeCursor {
-    ProjectionChangeCursor::new(topology(), partition(), change_epoch(), position).unwrap()
-}
-
 fn schema() -> &'static TableSchema {
     static SCHEMA: LazyLock<TableSchema> = LazyLock::new(|| TableSchema {
         model_name: "TodoView".into(),
@@ -230,6 +222,18 @@ impl crate::projection_protocol::scenario_tests::ProjectionProtocolScenario for 
             .unwrap();
     }
 
+    async fn stored_change_epoch(&self, store: &Self::Store) -> Option<ProjectionEpoch> {
+        let protocol = store.projection_protocol.read().unwrap();
+        protocol
+            .partitions
+            .get(&PartitionKey::new(&topology(), &self.partition()))
+            .map(|partition| partition.change_epoch.clone())
+    }
+
+    async fn insert_partition(&self, store: &Self::Store, epoch: &ProjectionEpoch) {
+        store.insert_projection_partition(&topology(), &self.partition(), epoch);
+    }
+
     async fn stored_change_positions(&self, store: &Self::Store) -> Vec<u64> {
         self.with_changes(store, |changes| changes.keys().copied().collect())
     }
@@ -294,7 +298,6 @@ fn batch(
 ) -> ProjectionCommitBatch {
     ProjectionCommitBatch {
         input: trusted,
-        change_epoch: change_epoch(),
         ownership: vec![ownership()],
         mutations,
         observations,
@@ -314,7 +317,6 @@ fn direct_batch(causation_id: &str) -> SameTransactionProjectionBatch {
     SameTransactionProjectionBatch::single_upsert(
         topology(),
         partition(),
-        change_epoch(),
         ownership(),
         record_scope(),
         upsert_table_mutation(true),
@@ -407,7 +409,6 @@ async fn direct_projection_is_fenced_while_exact_failure_repair_is_pending() {
                     "failed-cause",
                     ProjectionGeneration::initial(),
                 ),
-                change_epoch(),
                 "failure-1",
                 "decode_error",
                 b"bad payload".to_vec(),
@@ -646,6 +647,15 @@ async fn direct_projection_retention_preserves_durable_evidence() {
         partition.changes.keys().copied().collect::<Vec<_>>(),
         vec![2]
     );
+    let change_cursor = |position| {
+        ProjectionChangeCursor::new(
+            topology(),
+            self::partition(),
+            partition.change_epoch.clone(),
+            position,
+        )
+        .unwrap()
+    };
     assert_eq!(first.changes[0].cursor, change_cursor(1));
     assert_eq!(second.changes[0].cursor, change_cursor(2));
     assert_eq!(
@@ -681,7 +691,6 @@ async fn topology_bootstrap_is_required_for_noop_success_and_failure() {
             "cause-noop",
             ProjectionGeneration::initial(),
         ),
-        change_epoch: change_epoch(),
         ownership: Vec::new(),
         mutations: Vec::new(),
         observations: Vec::new(),
@@ -699,7 +708,6 @@ async fn topology_bootstrap_is_required_for_noop_success_and_failure() {
             "cause-failure",
             ProjectionGeneration::initial(),
         ),
-        change_epoch(),
         "failure-unbootstrapped",
         "decode_error",
         b"bad payload".to_vec(),
@@ -752,7 +760,6 @@ async fn topology_bootstrap_is_required_for_noop_success_and_failure() {
                     "cause-failure",
                     ProjectionGeneration::initial(),
                 ),
-                change_epoch(),
                 "failure-bootstrapped",
                 "decode_error",
                 b"bad payload".to_vec(),
@@ -837,7 +844,6 @@ async fn repair_stores_generation_lineage_and_an_inherited_duplicate_writes_no_r
         .record_projection_failure(
             ProjectionFailureBatch::new(
                 input(2, b"two", "message-2", "cause-2", initial),
-                change_epoch(),
                 "failure-2",
                 "decode_error",
                 b"bad payload".to_vec(),

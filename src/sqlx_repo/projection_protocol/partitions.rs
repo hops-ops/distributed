@@ -76,7 +76,6 @@ pub(super) async fn lock_partition_in_tx<DB>(
     tx: &mut Transaction<'_, DB>,
     topology: &ProjectorTopologyId,
     partition: &crate::projection_protocol::PartitionId,
-    change_epoch: &ProjectionEpoch,
 ) -> Result<PartitionState, ProjectionProtocolError>
 where
     DB: SqlxRepoBackend,
@@ -92,6 +91,9 @@ where
     let topology_hash = topology.digest();
     let partition_hash = partition.digest();
     let topology_bytes = topology.canonical_bytes();
+    // Only a partition this statement creates takes the minted epoch. An
+    // existing partition keeps the epoch it has and returns it.
+    let minted_epoch = ProjectionEpoch::mint();
     let mut builder = QueryBuilder::<DB>::new(
         "INSERT INTO projection_partitions \
          (topology_bytes, topology_hash, partition_bytes, partition_hash, active_generation, change_epoch) \
@@ -105,7 +107,7 @@ where
     builder.push(", ");
     builder.push_bind(partition_hash.as_slice());
     builder.push(", 1, ");
-    builder.push_bind(change_epoch.as_str());
+    builder.push_bind(minted_epoch.as_str());
     builder.push(
         ") ON CONFLICT (topology_hash, partition_hash) DO UPDATE \
          SET topology_hash = excluded.topology_hash \
@@ -118,7 +120,6 @@ where
         .await
         .map_err(|error| protocol_storage_error::<DB>("lock projection partition", error))?;
     let state = decode_partition_row::<DB>(&row, topology, partition)?;
-    ensure_change_epoch(&state.change_epoch, change_epoch)?;
 
     if generation_exists_in_tx::<DB>(tx, topology, partition, state.active_generation).await? {
         return Ok(state);
@@ -276,7 +277,6 @@ pub(crate) async fn read_projection_partition_snapshot_in_executor<DB>(
     connection: &mut DB::Connection,
     topology: &ProjectorTopologyId,
     partition: &PartitionId,
-    declared_epoch: &ProjectionEpoch,
 ) -> Result<ProjectionPartitionSnapshot, ProjectionProtocolError>
 where
     DB: SqlxRepoBackend,
@@ -290,24 +290,23 @@ where
 {
     let Some(state) = load_partition_in_connection(connection, topology, partition).await? else {
         return Ok(ProjectionPartitionSnapshot {
+            epoch: None,
             head: None,
             compacted_through: 0,
         });
     };
-    if &state.change_epoch != declared_epoch {
-        return Err(ProjectionProtocolError::IncomparableInput);
-    }
     let head = (state.change_head != 0)
         .then(|| {
             ProjectionChangeCursor::new(
                 topology.clone(),
                 partition.clone(),
-                state.change_epoch,
+                state.change_epoch.clone(),
                 state.change_head,
             )
         })
         .transpose()?;
     Ok(ProjectionPartitionSnapshot {
+        epoch: Some(state.change_epoch),
         head,
         compacted_through: state.compacted_through,
     })

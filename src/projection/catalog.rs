@@ -9,7 +9,7 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
-use crate::projection_protocol::{canonical_projection_topology_bytes, ProjectionEpoch};
+use crate::projection_protocol::canonical_projection_topology_bytes;
 
 use super::placement::{
     ProjectionBinding, ProjectionBindingId, ProjectionBindingState, ProjectionEventSchema,
@@ -104,19 +104,17 @@ impl ProjectionCatalog {
             .map(|index| &self.bindings[index])
     }
 
-    /// Validate an exact live view, optionally against the previously active
-    /// deployment.
+    /// Validate an exact live view.
     ///
     /// # Errors
     ///
     /// Fails service construction for unknown identities, missing routes,
-    /// duplicate writers, direct/eventual overlap, or same-epoch takeover.
+    /// duplicate writers, or direct/eventual overlap.
     pub fn activate(
         &self,
         activations: Vec<ProjectionBindingActivation>,
-        previous: Option<(&ProjectionCatalog, &ActiveProjectionBindings)>,
     ) -> Result<ActiveProjectionBindings, ProjectionCatalogError> {
-        ActiveProjectionBindings::try_new(self, activations, previous)
+        ActiveProjectionBindings::try_new(self, activations)
     }
 }
 
@@ -126,7 +124,6 @@ pub struct ProjectionBindingActivation {
     binding_id: ProjectionBindingId,
     #[serde(with = "program_id_serde")]
     program_id: ProjectionProgramId,
-    epoch: ProjectionEpoch,
     state: ProjectionBindingState,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     route: Option<ProjectionExecutorRoute>,
@@ -140,14 +137,12 @@ impl ProjectionBindingActivation {
     pub fn new(
         binding_id: ProjectionBindingId,
         program_id: ProjectionProgramId,
-        epoch: ProjectionEpoch,
         state: ProjectionBindingState,
         route: Option<ProjectionExecutorRoute>,
     ) -> Self {
         Self {
             binding_id,
             program_id,
-            epoch,
             state,
             route,
         }
@@ -161,11 +156,6 @@ impl ProjectionBindingActivation {
     /// Return the exact semantic program identity.
     pub fn program_id(&self) -> ProjectionProgramId {
         self.program_id
-    }
-
-    /// Return the physical projection incarnation.
-    pub fn epoch(&self) -> &ProjectionEpoch {
-        &self.epoch
     }
 
     /// Return active or draining lifecycle.
@@ -190,7 +180,6 @@ impl ActiveProjectionBindings {
     fn try_new(
         catalog: &ProjectionCatalog,
         mut activations: Vec<ProjectionBindingActivation>,
-        previous: Option<(&ProjectionCatalog, &Self)>,
     ) -> Result<Self, ProjectionCatalogError> {
         activations.sort_by_key(ProjectionBindingActivation::binding_id);
         for pair in activations.windows(2) {
@@ -205,14 +194,6 @@ impl ActiveProjectionBindings {
         }
         validate_primary_binding_uniqueness(catalog, &activations)?;
         validate_authoritative_writers(catalog, &activations)?;
-        if let Some((previous_catalog, previous_bindings)) = previous {
-            validate_epoch_takeover(
-                catalog,
-                &activations,
-                previous_catalog,
-                &previous_bindings.bindings,
-            )?;
-        }
         Ok(Self {
             wire_version: PROJECTION_ACTIVE_BINDINGS_WIRE_VERSION,
             bindings: activations,
@@ -220,9 +201,6 @@ impl ActiveProjectionBindings {
     }
 
     /// Decode and validate an exact canonical active-binding view.
-    ///
-    /// Historical same-epoch takeover is validated at service construction by
-    /// [`ProjectionCatalog::activate`], where the previous catalog is present.
     ///
     /// # Errors
     ///
@@ -240,7 +218,7 @@ impl ActiveProjectionBindings {
                 actual: decoded.wire_version,
             });
         }
-        let canonical = Self::try_new(catalog, decoded.bindings, None)?;
+        let canonical = Self::try_new(catalog, decoded.bindings)?;
         if canonical.canonical_bytes()? != bytes {
             return Err(ProjectionCatalogError::NonCanonical {
                 field: "active projection bindings",
@@ -272,9 +250,8 @@ impl ActiveProjectionBindings {
         catalog: &ProjectionCatalog,
         binding_id: ProjectionBindingId,
         program_id: ProjectionProgramId,
-        epoch: &ProjectionEpoch,
     ) -> bool {
-        self.exact(catalog, binding_id, program_id, epoch).is_some()
+        self.exact(catalog, binding_id, program_id).is_some()
     }
 
     /// Return whether an exact binding may mint ordinary UI causal
@@ -287,9 +264,8 @@ impl ActiveProjectionBindings {
         catalog: &ProjectionCatalog,
         binding_id: ProjectionBindingId,
         program_id: ProjectionProgramId,
-        epoch: &ProjectionEpoch,
     ) -> bool {
-        let Some((binding, activation)) = self.exact(catalog, binding_id, program_id, epoch) else {
+        let Some((binding, activation)) = self.exact(catalog, binding_id, program_id) else {
             return false;
         };
         activation.state == ProjectionBindingState::Active
@@ -319,7 +295,6 @@ impl ActiveProjectionBindings {
             binding_id,
             program_ir_version: binding.program_ir_version(),
             operation_semantics_version: binding.operation_semantics_version(),
-            epoch: activation.epoch.clone(),
         })
     }
 
@@ -328,7 +303,6 @@ impl ActiveProjectionBindings {
         catalog: &'catalog ProjectionCatalog,
         binding_id: ProjectionBindingId,
         program_id: ProjectionProgramId,
-        epoch: &ProjectionEpoch,
     ) -> Option<(
         &'catalog ProjectionBinding,
         &'bindings ProjectionBindingActivation,
@@ -341,7 +315,6 @@ impl ActiveProjectionBindings {
         let binding = catalog.binding(binding_id)?;
         (activation.program_id == program_id
             && binding.program_id() == program_id
-            && activation.epoch == *epoch
             && activation.route.is_some())
         .then_some((binding, activation))
     }
@@ -356,7 +329,6 @@ pub struct ProjectionCompatibilityPins {
     binding_id: ProjectionBindingId,
     program_ir_version: u16,
     operation_semantics_version: u16,
-    epoch: ProjectionEpoch,
 }
 
 impl ProjectionCompatibilityPins {
@@ -383,11 +355,6 @@ impl ProjectionCompatibilityPins {
     /// Return the operation-semantics pin.
     pub fn operation_semantics_version(&self) -> u16 {
         self.operation_semantics_version
-    }
-
-    /// Return the physical incarnation pin.
-    pub fn epoch(&self) -> &ProjectionEpoch {
-        &self.epoch
     }
 }
 
@@ -448,7 +415,7 @@ pub enum ProjectionCatalogError {
         /// Affected binding.
         binding: ProjectionBindingId,
     },
-    /// Two activations share the same event, primary read model, owner, and epoch.
+    /// Two activations share the same event, primary read model, and owner.
     DuplicatePrimaryBinding {
         /// Semantic event name.
         event: String,
@@ -456,8 +423,6 @@ pub enum ProjectionCatalogError {
         read_model_id: String,
         /// Projector owner.
         owner: String,
-        /// Shared epoch.
-        epoch: String,
     },
     /// Two live bindings can authoritatively write one logical scope.
     AuthoritativeWriterConflict {
@@ -467,13 +432,6 @@ pub enum ProjectionCatalogError {
         first: ProjectionBindingId,
         /// Second writer.
         second: ProjectionBindingId,
-    },
-    /// Behavior or ownership changed without advancing the physical epoch.
-    SameEpochTakeover {
-        /// Logical output model.
-        model: String,
-        /// Reused epoch.
-        epoch: String,
     },
     /// A canonical wire version is unsupported.
     UnsupportedVersion {
@@ -543,10 +501,9 @@ impl fmt::Display for ProjectionCatalogError {
                 event,
                 read_model_id,
                 owner,
-                epoch,
             } => write!(
                 formatter,
-                "duplicate primary binding for event `{event}` read model `{read_model_id}` owner `{owner}` epoch `{epoch}`"
+                "duplicate primary binding for event `{event}` read model `{read_model_id}` owner `{owner}`"
             ),
             Self::AuthoritativeWriterConflict {
                 model,
@@ -555,10 +512,6 @@ impl fmt::Display for ProjectionCatalogError {
             } => write!(
                 formatter,
                 "projection model `{model}` has overlapping authoritative writers `{first}` and `{second}`"
-            ),
-            Self::SameEpochTakeover { model, epoch } => write!(
-                formatter,
-                "projection model `{model}` changed binding behavior while retaining epoch `{epoch}`"
             ),
             Self::UnsupportedVersion {
                 field,
@@ -621,7 +574,7 @@ fn validate_primary_binding_uniqueness(
     catalog: &ProjectionCatalog,
     activations: &[ProjectionBindingActivation],
 ) -> Result<(), ProjectionCatalogError> {
-    let mut seen = BTreeSet::<(String, u64, String, String, String)>::new();
+    let mut seen = BTreeSet::<(String, u64, String, String)>::new();
     for activation in activations {
         let binding = catalog.binding(activation.binding_id).ok_or(
             ProjectionCatalogError::UnknownBinding {
@@ -641,7 +594,6 @@ fn validate_primary_binding_uniqueness(
             continue;
         }
         let owner = binding.owner().name().to_string();
-        let epoch = activation.epoch.as_str().to_string();
         for read_model_id in read_model_ids {
             for event in binding.events() {
                 let key = (
@@ -649,14 +601,12 @@ fn validate_primary_binding_uniqueness(
                     event.version(),
                     read_model_id.to_string(),
                     owner.clone(),
-                    epoch.clone(),
                 );
                 if !seen.insert(key.clone()) {
                     return Err(ProjectionCatalogError::DuplicatePrimaryBinding {
                         event: key.0,
                         read_model_id: key.2,
                         owner: key.3,
-                        epoch: key.4,
                     });
                 }
             }
@@ -686,40 +636,6 @@ fn validate_authoritative_writers(
                     model,
                     first: left.id(),
                     second: right.id(),
-                });
-            }
-        }
-    }
-    Ok(())
-}
-
-fn validate_epoch_takeover(
-    catalog: &ProjectionCatalog,
-    activations: &[ProjectionBindingActivation],
-    previous_catalog: &ProjectionCatalog,
-    previous_activations: &[ProjectionBindingActivation],
-) -> Result<(), ProjectionCatalogError> {
-    for activation in activations {
-        let current = catalog.binding(activation.binding_id).ok_or(
-            ProjectionCatalogError::UnknownBinding {
-                binding: activation.binding_id,
-            },
-        )?;
-        for previous_activation in previous_activations {
-            if activation.epoch != previous_activation.epoch
-                || activation.binding_id == previous_activation.binding_id
-            {
-                continue;
-            }
-            let previous = previous_catalog
-                .binding(previous_activation.binding_id)
-                .ok_or(ProjectionCatalogError::UnknownBinding {
-                    binding: previous_activation.binding_id,
-                })?;
-            if let Some(model) = overlapping_model(current, previous) {
-                return Err(ProjectionCatalogError::SameEpochTakeover {
-                    model,
-                    epoch: activation.epoch.as_str().to_owned(),
                 });
             }
         }
@@ -849,10 +765,7 @@ mod tests {
         ProjectionTarget, ProjectionValue, PROJECTION_OPERATION_SEMANTICS_VERSION,
         PROJECTION_PROGRAM_IR_VERSION,
     };
-    use crate::projection_protocol::ProjectionEpoch;
-    use crate::projection_protocol::{
-        PartitionId, ProjectionInputCursor, ProjectionSource, ProjectorTopologyId,
-    };
+    use crate::projection_protocol::ProjectorTopologyId;
     use crate::table::{
         ColumnType, PrimaryKey, RelationshipDef, RelationshipKind, TableColumn, TableKind,
         TableSchema,
@@ -896,7 +809,6 @@ mod tests {
         ProjectionDescriptor::new(
             "project_todos",
             1,
-            "todos-v1",
             || {
                 static PROGRAM: crate::projection::lower::ProjectionProgramCell =
                     crate::projection::lower::ProjectionProgramCell::new();
@@ -1207,17 +1119,10 @@ mod tests {
 
     fn activation(
         binding: &ProjectionBinding,
-        epoch: &str,
         state: ProjectionBindingState,
         route: Option<ProjectionExecutorRoute>,
     ) -> ProjectionBindingActivation {
-        ProjectionBindingActivation::new(
-            binding.id(),
-            binding.program_id(),
-            ProjectionEpoch::new(epoch).unwrap(),
-            state,
-            route,
-        )
+        ProjectionBindingActivation::new(binding.id(), binding.program_id(), state, route)
     }
 
     #[test]
@@ -1314,50 +1219,29 @@ mod tests {
     }
 
     #[test]
-    fn route_relocation_and_epoch_rotation_leave_both_static_identities_stable() {
+    fn route_relocation_leaves_both_static_identities_stable() {
         let program = program("project_todos", FINGERPRINT_A);
         let binding = eventual(&program, "todo-reads", ProjectionExecutionClass::Causal);
         let catalog = ProjectionCatalog::try_new(vec![binding.clone()]).unwrap();
         let local = catalog
-            .activate(
-                vec![activation(
-                    &binding,
-                    "todos-v1",
-                    ProjectionBindingState::Active,
-                    Some(ProjectionExecutorRoute::local("todo-api").unwrap()),
-                )],
-                None,
-            )
+            .activate(vec![activation(
+                &binding,
+                ProjectionBindingState::Active,
+                Some(ProjectionExecutorRoute::local("todo-api").unwrap()),
+            )])
             .unwrap();
         let remote = catalog
-            .activate(
-                vec![activation(
-                    &binding,
-                    "todos-v1",
-                    ProjectionBindingState::Active,
-                    Some(ProjectionExecutorRoute::remote("todo-projector").unwrap()),
-                )],
-                Some((&catalog, &local)),
-            )
-            .unwrap();
-        let rotated = catalog
-            .activate(
-                vec![activation(
-                    &binding,
-                    "todos-v2",
-                    ProjectionBindingState::Active,
-                    Some(ProjectionExecutorRoute::remote("todo-projector").unwrap()),
-                )],
-                Some((&catalog, &remote)),
-            )
+            .activate(vec![activation(
+                &binding,
+                ProjectionBindingState::Active,
+                Some(ProjectionExecutorRoute::remote("todo-projector").unwrap()),
+            )])
             .unwrap();
 
         assert_eq!(binding.program_id(), program.id());
         assert_eq!(local.bindings()[0].binding_id(), binding.id());
         assert_eq!(remote.bindings()[0].binding_id(), binding.id());
-        assert_eq!(rotated.bindings()[0].binding_id(), binding.id());
         assert_ne!(local.bindings()[0].route(), remote.bindings()[0].route());
-        assert_ne!(remote.bindings()[0].epoch(), rotated.bindings()[0].epoch());
     }
 
     #[test]
@@ -1365,16 +1249,10 @@ mod tests {
         let program = program("project_todos", FINGERPRINT_A);
         let binding = eventual(&program, "todo-reads", ProjectionExecutionClass::Causal);
         let catalog = ProjectionCatalog::try_new(vec![binding.clone()]).unwrap();
-        let inactive = catalog.activate(vec![], None).unwrap();
-        let epoch = ProjectionEpoch::new("todos-v1").unwrap();
+        let inactive = catalog.activate(vec![]).unwrap();
 
-        assert!(!inactive.is_live(&catalog, binding.id(), binding.program_id(), &epoch));
-        assert!(!inactive.is_causally_eligible(
-            &catalog,
-            binding.id(),
-            binding.program_id(),
-            &epoch
-        ));
+        assert!(!inactive.is_live(&catalog, binding.id(), binding.program_id()));
+        assert!(!inactive.is_causally_eligible(&catalog, binding.id(), binding.program_id()));
     }
 
     #[test]
@@ -1387,56 +1265,17 @@ mod tests {
             ProjectionExecutionClass::Causal,
         );
         let catalog = ProjectionCatalog::try_new(vec![binding.clone()]).unwrap();
-        let epoch = ProjectionEpoch::new("todos-v1").unwrap();
         let active = catalog
-            .activate(
-                vec![activation(
-                    &binding,
-                    epoch.as_str(),
-                    ProjectionBindingState::Active,
-                    Some(ProjectionExecutorRoute::remote("todo-projector").unwrap()),
-                )],
-                None,
-            )
+            .activate(vec![activation(
+                &binding,
+                ProjectionBindingState::Active,
+                Some(ProjectionExecutorRoute::remote("todo-projector").unwrap()),
+            )])
             .unwrap();
 
-        assert!(active.is_live(&catalog, binding.id(), binding.program_id(), &epoch));
-        assert!(active.is_causally_eligible(&catalog, binding.id(), binding.program_id(), &epoch));
-        assert!(!active.is_live(&catalog, binding.id(), other_program.id(), &epoch));
-        assert!(!active.is_live(
-            &catalog,
-            binding.id(),
-            binding.program_id(),
-            &ProjectionEpoch::new("todos-v2").unwrap()
-        ));
-    }
-
-    #[test]
-    fn activation_epoch_flows_into_protocol_cursor_without_conversion() {
-        let program = program("project_todos", FINGERPRINT_A);
-        let binding = eventual(&program, "todo-reads", ProjectionExecutionClass::Causal);
-        let catalog = ProjectionCatalog::try_new(vec![binding.clone()]).unwrap();
-        let active = catalog
-            .activate(
-                vec![activation(
-                    &binding,
-                    "todos-v1",
-                    ProjectionBindingState::Active,
-                    Some(ProjectionExecutorRoute::remote("todo-projector").unwrap()),
-                )],
-                None,
-            )
-            .unwrap();
-        let cursor = ProjectionInputCursor::new(
-            ProjectorTopologyId::new(1, "project_todos", [0x44; 32]).unwrap(),
-            PartitionId::new(b"tenant-a".to_vec()).unwrap(),
-            ProjectionSource::new("todo-domain", b"todo-1".to_vec()).unwrap(),
-            active.bindings()[0].epoch().clone(),
-            1,
-        )
-        .unwrap();
-
-        assert_eq!(cursor.epoch(), active.bindings()[0].epoch());
+        assert!(active.is_live(&catalog, binding.id(), binding.program_id()));
+        assert!(active.is_causally_eligible(&catalog, binding.id(), binding.program_id()));
+        assert!(!active.is_live(&catalog, binding.id(), other_program.id()));
     }
 
     #[test]
@@ -1448,38 +1287,29 @@ mod tests {
             ProjectionExecutionClass::Background,
         );
         let catalog = ProjectionCatalog::try_new(vec![binding.clone()]).unwrap();
-        let epoch = ProjectionEpoch::new("analytics-v1").unwrap();
         let active = catalog
-            .activate(
-                vec![activation(
-                    &binding,
-                    epoch.as_str(),
-                    ProjectionBindingState::Active,
-                    Some(ProjectionExecutorRoute::remote("analytics").unwrap()),
-                )],
-                None,
-            )
+            .activate(vec![activation(
+                &binding,
+                ProjectionBindingState::Active,
+                Some(ProjectionExecutorRoute::remote("analytics").unwrap()),
+            )])
             .unwrap();
 
-        assert!(active.is_live(&catalog, binding.id(), binding.program_id(), &epoch));
-        assert!(!active.is_causally_eligible(&catalog, binding.id(), binding.program_id(), &epoch));
+        assert!(active.is_live(&catalog, binding.id(), binding.program_id()));
+        assert!(!active.is_causally_eligible(&catalog, binding.id(), binding.program_id()));
     }
 
     #[test]
-    fn compatibility_pins_event_program_binding_semantics_and_epoch_separately() {
+    fn compatibility_pins_event_program_binding_and_semantics_separately() {
         let program = program("project_todos", FINGERPRINT_A);
         let binding = eventual(&program, "todo-reads", ProjectionExecutionClass::Causal);
         let catalog = ProjectionCatalog::try_new(vec![binding.clone()]).unwrap();
         let active = catalog
-            .activate(
-                vec![activation(
-                    &binding,
-                    "todos-v7",
-                    ProjectionBindingState::Active,
-                    Some(ProjectionExecutorRoute::local("todo-api").unwrap()),
-                )],
-                None,
-            )
+            .activate(vec![activation(
+                &binding,
+                ProjectionBindingState::Active,
+                Some(ProjectionExecutorRoute::local("todo-api").unwrap()),
+            )])
             .unwrap();
         let pins = active.compatibility_pins(&catalog, binding.id()).unwrap();
 
@@ -1492,7 +1322,6 @@ mod tests {
             pins.operation_semantics_version(),
             PROJECTION_OPERATION_SEMANTICS_VERSION
         );
-        assert_eq!(pins.epoch().as_str(), "todos-v7");
     }
 
     #[test]
@@ -1502,23 +1331,18 @@ mod tests {
         let second = eventual(&program, "todo-reads-b", ProjectionExecutionClass::Causal);
         let catalog = ProjectionCatalog::try_new(vec![first.clone(), second.clone()]).unwrap();
         let error = catalog
-            .activate(
-                vec![
-                    activation(
-                        &first,
-                        "todos-v1",
-                        ProjectionBindingState::Active,
-                        Some(ProjectionExecutorRoute::local("worker-a").unwrap()),
-                    ),
-                    activation(
-                        &second,
-                        "todos-v2",
-                        ProjectionBindingState::Active,
-                        Some(ProjectionExecutorRoute::remote("worker-b").unwrap()),
-                    ),
-                ],
-                None,
-            )
+            .activate(vec![
+                activation(
+                    &first,
+                    ProjectionBindingState::Active,
+                    Some(ProjectionExecutorRoute::local("worker-a").unwrap()),
+                ),
+                activation(
+                    &second,
+                    ProjectionBindingState::Active,
+                    Some(ProjectionExecutorRoute::remote("worker-b").unwrap()),
+                ),
+            ])
             .unwrap_err();
 
         assert!(matches!(
@@ -1605,23 +1429,18 @@ mod tests {
 
         let catalog = ProjectionCatalog::try_new(vec![first.clone(), second.clone()]).unwrap();
         catalog
-            .activate(
-                vec![
-                    activation(
-                        &first,
-                        "ops-v1",
-                        ProjectionBindingState::Active,
-                        Some(ProjectionExecutorRoute::local("ops").unwrap()),
-                    ),
-                    activation(
-                        &second,
-                        "analytics-v1",
-                        ProjectionBindingState::Active,
-                        Some(ProjectionExecutorRoute::local("analytics").unwrap()),
-                    ),
-                ],
-                None,
-            )
+            .activate(vec![
+                activation(
+                    &first,
+                    ProjectionBindingState::Active,
+                    Some(ProjectionExecutorRoute::local("ops").unwrap()),
+                ),
+                activation(
+                    &second,
+                    ProjectionBindingState::Active,
+                    Some(ProjectionExecutorRoute::local("analytics").unwrap()),
+                ),
+            ])
             .unwrap();
     }
 
@@ -1632,23 +1451,18 @@ mod tests {
         let direct = direct(program, "todo-direct");
         let catalog = ProjectionCatalog::try_new(vec![eventual.clone(), direct.clone()]).unwrap();
         let error = catalog
-            .activate(
-                vec![
-                    activation(
-                        &eventual,
-                        "todos-v1",
-                        ProjectionBindingState::Active,
-                        Some(ProjectionExecutorRoute::remote("todo-projector").unwrap()),
-                    ),
-                    activation(
-                        &direct,
-                        "todos-v2",
-                        ProjectionBindingState::Active,
-                        Some(ProjectionExecutorRoute::local("todo-api").unwrap()),
-                    ),
-                ],
-                None,
-            )
+            .activate(vec![
+                activation(
+                    &eventual,
+                    ProjectionBindingState::Active,
+                    Some(ProjectionExecutorRoute::remote("todo-projector").unwrap()),
+                ),
+                activation(
+                    &direct,
+                    ProjectionBindingState::Active,
+                    Some(ProjectionExecutorRoute::local("todo-api").unwrap()),
+                ),
+            ])
             .unwrap_err();
 
         assert!(matches!(
@@ -1679,23 +1493,18 @@ mod tests {
         );
         let catalog = ProjectionCatalog::try_new(vec![first.clone(), second.clone()]).unwrap();
         let error = catalog
-            .activate(
-                vec![
-                    activation(
-                        &first,
-                        "todos-v1",
-                        ProjectionBindingState::Active,
-                        Some(ProjectionExecutorRoute::local("worker-a").unwrap()),
-                    ),
-                    activation(
-                        &second,
-                        "todos-v2",
-                        ProjectionBindingState::Active,
-                        Some(ProjectionExecutorRoute::remote("worker-b").unwrap()),
-                    ),
-                ],
-                None,
-            )
+            .activate(vec![
+                activation(
+                    &first,
+                    ProjectionBindingState::Active,
+                    Some(ProjectionExecutorRoute::local("worker-a").unwrap()),
+                ),
+                activation(
+                    &second,
+                    ProjectionBindingState::Active,
+                    Some(ProjectionExecutorRoute::remote("worker-b").unwrap()),
+                ),
+            ])
             .unwrap_err();
 
         assert!(matches!(
@@ -1710,15 +1519,11 @@ mod tests {
         let binding = eventual(&program, "todo-reads", ProjectionExecutionClass::Causal);
         let catalog = ProjectionCatalog::try_new(vec![binding.clone()]).unwrap();
         let error = catalog
-            .activate(
-                vec![activation(
-                    &binding,
-                    "todos-v1",
-                    ProjectionBindingState::Active,
-                    None,
-                )],
+            .activate(vec![activation(
+                &binding,
+                ProjectionBindingState::Active,
                 None,
-            )
+            )])
             .unwrap_err();
 
         assert!(matches!(error, ProjectionCatalogError::MissingRoute { .. }));
@@ -1729,15 +1534,11 @@ mod tests {
         let binding = direct(program("project_todos", FINGERPRINT_A), "todo-direct");
         let catalog = ProjectionCatalog::try_new(vec![binding.clone()]).unwrap();
         let error = catalog
-            .activate(
-                vec![activation(
-                    &binding,
-                    "todos-v1",
-                    ProjectionBindingState::Active,
-                    Some(ProjectionExecutorRoute::remote("other-service").unwrap()),
-                )],
-                None,
-            )
+            .activate(vec![activation(
+                &binding,
+                ProjectionBindingState::Active,
+                Some(ProjectionExecutorRoute::remote("other-service").unwrap()),
+            )])
             .unwrap_err();
 
         assert!(matches!(
@@ -1795,198 +1596,38 @@ mod tests {
     }
 
     #[test]
-    fn same_epoch_behavior_takeover_fails_before_start() {
+    fn rollout_then_draining_stops_new_obligations() {
         let program = program("project_todos", FINGERPRINT_A);
         let previous_binding =
             eventual(&program, "todo-reads-v1", ProjectionExecutionClass::Causal);
         let previous_catalog = ProjectionCatalog::try_new(vec![previous_binding.clone()]).unwrap();
-        let previous_active = previous_catalog
-            .activate(
-                vec![activation(
-                    &previous_binding,
-                    "todos-rebuild-1",
-                    ProjectionBindingState::Active,
-                    Some(ProjectionExecutorRoute::remote("projector-v1").unwrap()),
-                )],
-                None,
-            )
-            .unwrap();
         let next_binding = eventual(&program, "todo-reads-v2", ProjectionExecutionClass::Causal);
         let next_catalog = ProjectionCatalog::try_new(vec![next_binding.clone()]).unwrap();
-        let error = next_catalog
-            .activate(
-                vec![activation(
-                    &next_binding,
-                    "todos-rebuild-1",
-                    ProjectionBindingState::Active,
-                    Some(ProjectionExecutorRoute::remote("projector-v2").unwrap()),
-                )],
-                Some((&previous_catalog, &previous_active)),
-            )
-            .unwrap_err();
-
-        assert!(matches!(
-            error,
-            ProjectionCatalogError::SameEpochTakeover { .. }
-        ));
-    }
-
-    #[test]
-    fn semantic_program_replacement_requires_epoch_rotation_before_replay() {
-        let previous_program = program_with_kind_and_partition(
-            "project_todos",
-            FINGERPRINT_A,
-            "Todos",
-            "todos",
-            MutationKind::Upsert,
-            ProjectionPartition::Unit,
-        );
-        let replacement_program = program_with_kind_and_partition(
-            "project_todos",
-            FINGERPRINT_A,
-            "Todos",
-            "todos",
-            MutationKind::Patch,
-            ProjectionPartition::Unit,
-        );
-        assert_ne!(
-            previous_program.id(),
-            replacement_program.id(),
-            "different projection behavior must have different semantic identities"
-        );
-        let previous_binding = eventual(
-            &previous_program,
-            "todo-reads-v1",
-            ProjectionExecutionClass::Causal,
-        );
-        let replacement_binding = eventual(
-            &replacement_program,
-            "todo-reads-v2",
-            ProjectionExecutionClass::Causal,
-        );
-        assert_eq!(
-            previous_binding.physical_topology(),
-            replacement_binding.physical_topology(),
-            "the physical owner may remain stable while the program changes"
-        );
-
-        let previous_catalog = ProjectionCatalog::try_new(vec![previous_binding.clone()]).unwrap();
-        let previous_active = previous_catalog
-            .activate(
-                vec![activation(
-                    &previous_binding,
-                    "todos-rebuild-1",
-                    ProjectionBindingState::Active,
-                    Some(ProjectionExecutorRoute::remote("projector-v1").unwrap()),
-                )],
-                None,
-            )
-            .unwrap();
-        let replacement_catalog =
-            ProjectionCatalog::try_new(vec![replacement_binding.clone()]).unwrap();
-        let same_epoch = replacement_catalog
-            .activate(
-                vec![activation(
-                    &replacement_binding,
-                    "todos-rebuild-1",
-                    ProjectionBindingState::Active,
-                    Some(ProjectionExecutorRoute::remote("projector-v2").unwrap()),
-                )],
-                Some((&previous_catalog, &previous_active)),
-            )
-            .unwrap_err();
-        assert!(matches!(
-            same_epoch,
-            ProjectionCatalogError::SameEpochTakeover { .. }
-        ));
-
-        let rotated = replacement_catalog
-            .activate(
-                vec![activation(
-                    &replacement_binding,
-                    "todos-rebuild-2",
-                    ProjectionBindingState::Active,
-                    Some(ProjectionExecutorRoute::remote("projector-v2").unwrap()),
-                )],
-                Some((&previous_catalog, &previous_active)),
-            )
-            .unwrap();
-        assert_eq!(rotated.bindings()[0].program_id(), replacement_program.id());
-        assert_eq!(rotated.bindings()[0].epoch().as_str(), "todos-rebuild-2");
-    }
-
-    #[test]
-    fn new_epoch_allows_rollout_then_draining_stops_new_obligations() {
-        let program = program("project_todos", FINGERPRINT_A);
-        let previous_binding =
-            eventual(&program, "todo-reads-v1", ProjectionExecutionClass::Causal);
-        let previous_catalog = ProjectionCatalog::try_new(vec![previous_binding.clone()]).unwrap();
-        let previous_active = previous_catalog
-            .activate(
-                vec![activation(
-                    &previous_binding,
-                    "todos-rebuild-1",
-                    ProjectionBindingState::Active,
-                    Some(ProjectionExecutorRoute::remote("projector-v1").unwrap()),
-                )],
-                None,
-            )
-            .unwrap();
-        let next_binding = eventual(&program, "todo-reads-v2", ProjectionExecutionClass::Causal);
-        let next_catalog = ProjectionCatalog::try_new(vec![next_binding.clone()]).unwrap();
-        let next_active = next_catalog
-            .activate(
-                vec![activation(
-                    &next_binding,
-                    "todos-rebuild-2",
-                    ProjectionBindingState::Active,
-                    Some(ProjectionExecutorRoute::remote("projector-v2").unwrap()),
-                )],
-                Some((&previous_catalog, &previous_active)),
-            )
-            .unwrap();
         let draining = next_catalog
-            .activate(
-                vec![activation(
-                    &next_binding,
-                    "todos-rebuild-2",
-                    ProjectionBindingState::Draining,
-                    Some(ProjectionExecutorRoute::remote("projector-v2").unwrap()),
-                )],
-                Some((&next_catalog, &next_active)),
-            )
+            .activate(vec![activation(
+                &next_binding,
+                ProjectionBindingState::Draining,
+                Some(ProjectionExecutorRoute::remote("projector-v2").unwrap()),
+            )])
             .unwrap();
-        let epoch = ProjectionEpoch::new("todos-rebuild-2").unwrap();
         let rolled_back = previous_catalog
-            .activate(
-                vec![activation(
-                    &previous_binding,
-                    "todos-rebuild-1",
-                    ProjectionBindingState::Active,
-                    Some(ProjectionExecutorRoute::remote("projector-v1").unwrap()),
-                )],
-                Some((&next_catalog, &draining)),
-            )
+            .activate(vec![activation(
+                &previous_binding,
+                ProjectionBindingState::Active,
+                Some(ProjectionExecutorRoute::remote("projector-v1").unwrap()),
+            )])
             .unwrap();
-        let previous_epoch = ProjectionEpoch::new("todos-rebuild-1").unwrap();
 
-        assert!(draining.is_live(
-            &next_catalog,
-            next_binding.id(),
-            next_binding.program_id(),
-            &epoch
-        ));
+        assert!(draining.is_live(&next_catalog, next_binding.id(), next_binding.program_id()));
         assert!(!draining.is_causally_eligible(
             &next_catalog,
             next_binding.id(),
-            next_binding.program_id(),
-            &epoch
+            next_binding.program_id()
         ));
         assert!(rolled_back.is_causally_eligible(
             &previous_catalog,
             previous_binding.id(),
-            previous_binding.program_id(),
-            &previous_epoch
+            previous_binding.program_id()
         ));
     }
 
@@ -2041,24 +1682,19 @@ mod tests {
         let catalog = ProjectionCatalog::try_new(vec![first.clone(), second.clone()]).unwrap();
         let first_activation = activation(
             &first,
-            "todos-v1",
             ProjectionBindingState::Active,
             Some(ProjectionExecutorRoute::local("todo-api").unwrap()),
         );
         let second_activation = activation(
             &second,
-            "archive-v1",
             ProjectionBindingState::Active,
             Some(ProjectionExecutorRoute::remote("archive-projector").unwrap()),
         );
         let left = catalog
-            .activate(
-                vec![first_activation.clone(), second_activation.clone()],
-                None,
-            )
+            .activate(vec![first_activation.clone(), second_activation.clone()])
             .unwrap();
         let right = catalog
-            .activate(vec![second_activation, first_activation], None)
+            .activate(vec![second_activation, first_activation])
             .unwrap();
         let bytes = left.canonical_bytes().unwrap();
 

@@ -633,7 +633,6 @@ pub struct CommandDirectProjectionExtension {
     /// A `Constant` value is canonical JSON (sorted object keys).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub partition: Option<EffectExpression>,
-    pub change_epoch: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -680,7 +679,6 @@ pub struct ClientProjectionBinding {
     pub version: u32,
     pub binding_id: String,
     pub program_id: String,
-    pub epoch: String,
     pub state: ProjectionBindingState,
     pub placement: ProjectionPlacement,
     pub execution_class: ProjectionExecutionClass,

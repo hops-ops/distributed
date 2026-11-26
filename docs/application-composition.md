@@ -31,7 +31,7 @@ Each fact has one home:
   `#[sourced]` or with `command!` (`todo-domain/src/commands/`).
 - A read model's permissions are on the model (`impl AuthorizedReadModel`,
   `readmodels/src/models/`).
-- A projection's name, version, epoch, model and event-to-mutation mapping
+- A projection's name, version, model and event-to-mutation mapping
   are in its `projection!` descriptor (`projections/src/`).
 
 ### Projection mounts

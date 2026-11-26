@@ -136,27 +136,27 @@ impl ProjectionProtocolStore for InMemoryRepository {
                 .write()
                 .map_err(|_| RepositoryError::LockPoisoned("projection inbox write"))?;
 
-            let redelivery =
-                match protocol.input_disposition(&batch.input, Some(&batch.change_epoch))? {
-                    ProjectionInputDisposition::Duplicate(checkpoint) => {
-                        return Ok(ProjectionCommitResult::not_applied(
-                            ProjectionCommitOutcome::Duplicate,
-                            Some(checkpoint),
-                        ));
-                    }
-                    ProjectionInputDisposition::Stale(checkpoint) => {
-                        return Ok(ProjectionCommitResult::not_applied(
-                            ProjectionCommitOutcome::StaleInput,
-                            Some(checkpoint),
-                        ));
-                    }
-                    ProjectionInputDisposition::Pending => false,
-                    ProjectionInputDisposition::Redelivery => {
-                        batch.mutations.clear();
-                        batch.observations.clear();
-                        true
-                    }
-                };
+            let change_epoch = protocol.change_epoch(&partition_key);
+            let redelivery = match protocol.input_disposition(&batch.input)? {
+                ProjectionInputDisposition::Duplicate(checkpoint) => {
+                    return Ok(ProjectionCommitResult::not_applied(
+                        ProjectionCommitOutcome::Duplicate,
+                        Some(checkpoint),
+                    ));
+                }
+                ProjectionInputDisposition::Stale(checkpoint) => {
+                    return Ok(ProjectionCommitResult::not_applied(
+                        ProjectionCommitOutcome::StaleInput,
+                        Some(checkpoint),
+                    ));
+                }
+                ProjectionInputDisposition::Pending => false,
+                ProjectionInputDisposition::Redelivery => {
+                    batch.mutations.clear();
+                    batch.observations.clear();
+                    true
+                }
+            };
 
             let receipt = batch.input.inbox_receipt();
             receipt.validate()?;
@@ -170,7 +170,6 @@ impl ProjectionProtocolStore for InMemoryRepository {
 
             // Everything fallible runs against the stored state and stages
             // what this commit adds; the stores change only after it all passed.
-            // `input_disposition` already fenced the partition's change epoch.
             let partition = protocol.partitions.get(&partition_key);
             let mut head = partition.map_or(0, |partition| partition.change_head);
             protocol.check_ownership(&partition_key, &batch)?;
@@ -218,7 +217,7 @@ impl ProjectionProtocolStore for InMemoryRepository {
                 )?;
                 let change = next_change(
                     &partition_key,
-                    &batch.change_epoch,
+                    &change_epoch,
                     &mut head,
                     PendingChange {
                         kind: change_kind_for_mutation(mutation.kind),
@@ -296,7 +295,7 @@ impl ProjectionProtocolStore for InMemoryRepository {
                     None => {
                         let change = next_change(
                             &partition_key,
-                            &batch.change_epoch,
+                            &change_epoch,
                             &mut head,
                             PendingChange {
                                 kind: ProjectionChangeKind::Observation,
@@ -327,7 +326,7 @@ impl ProjectionProtocolStore for InMemoryRepository {
             if changes.is_empty() {
                 changes.push(next_change(
                     &partition_key,
-                    &batch.change_epoch,
+                    &change_epoch,
                     &mut head,
                     PendingChange {
                         kind: ProjectionChangeKind::Checkpoint,
@@ -364,7 +363,7 @@ impl ProjectionProtocolStore for InMemoryRepository {
                 }
             }
             let protocol = &mut *protocol;
-            let partition = protocol.partition_mut(&partition_key, &batch.change_epoch);
+            let partition = protocol.partition_mut(&partition_key, &change_epoch);
             partition.append(changes.iter().cloned());
             partition.compact(through);
             partition.pending_retry_failure_id = None;
@@ -436,9 +435,6 @@ impl ProjectionProtocolStore for InMemoryRepository {
 
             protocol.require_registered_topology(batch.input.cursor.topology())?;
             let partition = protocol.partitions.get(&partition_key);
-            if let Some(partition) = partition {
-                ensure_change_epoch(&partition.change_epoch, &batch.change_epoch)?;
-            }
             protocol.validate_input_identity(&batch.input)?;
             ensure_active_input(
                 &batch.input,
@@ -481,10 +477,11 @@ impl ProjectionProtocolStore for InMemoryRepository {
             }
 
             // As in a commit: compute against stored state, then apply.
+            let change_epoch = protocol.change_epoch(&partition_key);
             let mut head = partition.map_or(0, |partition| partition.change_head);
             let change = next_change(
                 &partition_key,
-                &batch.change_epoch,
+                &change_epoch,
                 &mut head,
                 PendingChange {
                     kind: ProjectionChangeKind::Failure,
@@ -513,7 +510,7 @@ impl ProjectionProtocolStore for InMemoryRepository {
 
             // Nothing below can fail.
             let protocol = &mut *protocol;
-            let partition = protocol.partition_mut(&partition_key, &batch.change_epoch);
+            let partition = protocol.partition_mut(&partition_key, &change_epoch);
             partition.append([change]);
             partition.compact(through);
             partition.stopped_failure_id = Some(batch.failure_id.clone());
@@ -585,7 +582,7 @@ impl ProjectionProtocolStore for InMemoryRepository {
                 .projection_protocol
                 .read()
                 .map_err(|_| RepositoryError::LockPoisoned("projection input disposition read"))?;
-            protocol.input_disposition(input, None)
+            protocol.input_disposition(input)
         }
     }
 
@@ -996,5 +993,22 @@ impl ProjectionProtocolStore for InMemoryRepository {
                     partition: failure.input.projection_partition().clone(),
                 }))
         }
+    }
+}
+
+#[cfg(test)]
+impl InMemoryRepository {
+    /// Create a projection partition the way an earlier release did, with
+    /// the change epoch its application declared.
+    pub(crate) fn insert_projection_partition(
+        &self,
+        topology: &ProjectorTopologyId,
+        partition: &PartitionId,
+        epoch: &ProjectionEpoch,
+    ) {
+        self.projection_protocol
+            .write()
+            .unwrap()
+            .partition_mut(&PartitionKey::new(topology, partition), epoch);
     }
 }

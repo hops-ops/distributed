@@ -769,7 +769,6 @@ mod tests {
     > = crate::projection::lower::ProjectionDescriptor::new(
         "executor-generated-multi-table",
         1,
-        "executor-generated-v1",
         || {
             static PROGRAM: crate::projection::lower::ProjectionProgramCell =
                 crate::projection::lower::ProjectionProgramCell::new();
@@ -820,13 +819,7 @@ mod tests {
             true,
         )
         .unwrap();
-        ProjectionWorkspace::new(
-            Arc::new(codec),
-            partition_value,
-            input,
-            ProjectionEpoch::new("changes-v1").unwrap(),
-        )
-        .unwrap()
+        ProjectionWorkspace::new(Arc::new(codec), partition_value, input).unwrap()
     }
 
     fn todo(id: &str, title: &str) -> TodoView {

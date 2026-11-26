@@ -296,8 +296,7 @@ function commandArtifact(consistency) {
 							digest: `sha256:${'11'.repeat(32)}`
 						}),
 						model: 'TodoView',
-						identityFields: Object.freeze(['id']),
-						changeEpoch: 'todos-v1'
+						identityFields: Object.freeze(['id'])
 					})
 				}
 			: {}),

@@ -171,6 +171,10 @@ auto-optimism. The mutation file looks like GraphQL but is **internal IR**,
 not a public client field. Field names are snake_case table names
 (`upsert_todos`). Pages still send domain commands.
 
+The read model is an ordinary SQL database. A changed projection applies to
+the events that come after it; rows already written stay as they are, and
+nothing is reset or refused when a new program starts.
+
 [`tests/e2e-ui/crates/projections/src/todos.rs`](tests/e2e-ui/crates/projections/src/todos.rs)
 
 ```rust,ignore
@@ -179,7 +183,6 @@ distributed::projection! {
     pub const TODOS: ProjectionDescriptor<EventualOnly> = {
         name: "project_todos",
         version: 1,
-        epoch: "e2e-ui-todos-v2",
         model: Todos,
         on {
             events: [

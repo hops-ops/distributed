@@ -217,7 +217,6 @@ pub struct SnapshotProjectionRebuild {
 #[derive(Clone, Debug)]
 pub(crate) struct RebuildContext {
     pub(crate) compiled: CompiledProjectionTopology,
-    pub(crate) epoch: ProjectionEpoch,
 }
 
 impl RebuildContext {
@@ -299,10 +298,7 @@ impl SnapshotProjectionRebuild {
                 .iter()
                 .map(|o| (o.model.as_str(), o.storage.as_str(), &o.schema)),
         )?;
-        let context = RebuildContext {
-            compiled,
-            epoch: ProjectionEpoch::new(executor.epoch)?,
-        };
+        let context = RebuildContext { compiled };
         let expected = store.projection_rebuild_records(&context).await?;
         Ok(Self {
             context,

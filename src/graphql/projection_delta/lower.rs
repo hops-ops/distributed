@@ -128,7 +128,6 @@ pub(crate) struct ProjectionDeltaSource {
     authority: ProjectionDeltaIdentity,
     program_id: String,
     binding_id: String,
-    epoch: String,
     program_ir_version: u16,
     operation_semantics_version: u16,
     placement: ProjectionPlacement,
@@ -162,7 +161,6 @@ impl ProjectionDeltaSource {
         let manifest_placement = manifest_binding.placement;
         let manifest_execution = manifest_binding.execution_class;
         if manifest_binding.program_id != program_id
-            || manifest_binding.epoch != projection.epoch().as_str()
             || manifest_program.name != selected.name
             || manifest_program.program_version != selected.version
             || manifest_program.ir_version != selected.ir_version
@@ -177,7 +175,6 @@ impl ProjectionDeltaSource {
             authority,
             program_id,
             binding_id,
-            epoch: projection.epoch().as_str().to_owned(),
             program_ir_version: selected.ir_version,
             operation_semantics_version: selected.operation_semantics_version,
             placement: projection.placement(),
@@ -193,7 +190,6 @@ impl ProjectionDeltaSource {
         ProjectionDeltaProjectionIdentity {
             program_id: self.program_id.clone(),
             binding_id: self.binding_id.clone(),
-            epoch: self.epoch.clone(),
             program_ir_version: self.program_ir_version,
             operation_semantics_version: self.operation_semantics_version,
         }
@@ -350,7 +346,6 @@ fn lower_projection_delta(
         if sources.iter().any(|existing: &&ProjectionDeltaSource| {
             existing.program_id == source.program_id
                 && existing.binding_id == source.binding_id
-                && existing.epoch == source.epoch
                 && existing.program_ir_version == source.program_ir_version
                 && existing.operation_semantics_version == source.operation_semantics_version
         }) {
