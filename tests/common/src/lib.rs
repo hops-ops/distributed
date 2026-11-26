@@ -57,6 +57,8 @@ pub mod graphql;
 pub mod lock;
 #[cfg(all(feature = "graphql", feature = "sqlite"))]
 pub mod oidc;
+#[cfg(feature = "kafka")]
+pub mod kafka;
 #[cfg(feature = "postgres")]
 pub mod postgres;
 #[cfg(any(feature = "sqlite", feature = "postgres"))]

@@ -58,7 +58,7 @@ postgres = ["dep:sqlx", "runtime-tokio", "sqlx/postgres", "sqlx/migrate", "sqlx/
 sqlite = ["dep:sqlx", "runtime-tokio", "sqlx/migrate", "sqlx/runtime-tokio", "sqlx/sqlite", "sqlx/json", "common/sqlite"]
 nats = ["dep:async-nats", "dep:futures", "runtime-tokio"]
 rabbitmq = ["dep:lapin", "dep:futures", "runtime-tokio"]
-kafka = ["dep:rdkafka", "runtime-tokio"]
+kafka = ["dep:rdkafka", "runtime-tokio", "common/kafka"]
 # `bus::RedisStreamPublisher`: the Redis Streams `MessagePublisher`.
 redis-streams = ["dep:redis", "runtime-tokio"]
 # Code that runs inside a celld Worker (wasm32 Durable Objects): the cell
