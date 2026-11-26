@@ -696,7 +696,11 @@ export class GameClient<TInput = unknown> {
 			this.#handedOff = { zoneId: from, id: last.id };
 			const predicted = this.#predictor?.predicted();
 			const fields = predicted === undefined ? undefined : this.#options.prediction?.handoffFrame?.(predicted, from, to);
-			if (fields !== undefined) this.#carry = { zoneId: to, base: last, fields, unsent: [] };
+			// The prediction includes the inputs sent after the last one the
+			// source applied (`ackSeq`); the source never will, so they go to
+			// the target first, or the target's state lags what was drawn.
+			const unapplied = (this.#predictor?.pending ?? []).filter((p) => p.seq > message.ackSeq).map(({ input, dtMs }) => ({ input, dtMs }));
+			if (fields !== undefined) this.#carry = { zoneId: to, base: last, fields, unsent: unapplied };
 		}
 		this.#controlledOverride = undefined;
 		this.#predictor?.bind(undefined);

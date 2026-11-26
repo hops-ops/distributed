@@ -172,6 +172,18 @@ test('a new correction while easing starts from the currently displayed value', 
 	close(p.current(150).x, 0, 1e-9);
 });
 
+test('a Delta that agrees leaves a running correction to finish on time', () => {
+	const p = boundPredictor({ mode: 'ease', durationMs: 100 });
+	p.record(1, 10, 1000); // predicted x = 10
+	p.reconcile(1, { x: 4, y: 0, yaw: 0, hp: 100, name: 'p' }, 0); // server says 4: eased from 10
+	close(p.current(50).x, 7, 1e-9);
+	const agree = p.reconcile(1, { x: 4, y: 0, yaw: 0, hp: 100, name: 'p' }, 50);
+	assert.deepEqual(agree.errors, {});
+	close(p.current(50).x, 7, 1e-9, 'no visual pop');
+	close(p.current(75).x, 5.5, 1e-9, 'still on the first schedule');
+	close(p.current(100).x, 4, 1e-9, 'converged after durationMs');
+});
+
 test('a step recorded with its time is drawn as motion over its interval', () => {
 	const p = boundPredictor({ mode: 'ease', durationMs: 100 });
 	p.record(1, 10, 100, 0); // predicted x = 1, drawn from 0 over 100 ms

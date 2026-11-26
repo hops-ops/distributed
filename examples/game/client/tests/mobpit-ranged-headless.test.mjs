@@ -18,12 +18,27 @@ import { DevApi } from '../src/shared/dev-api.ts';
 import { memoryStorage, sleep, until } from './helpers/demo-server.mjs';
 import { startPit } from './helpers/mobpit.mjs';
 
-/** Loose `n` arrows at the nearest rendered mob, each when the client sees a clear hit. */
+/**
+ * Loose arrows at the nearest rendered mob, each when the client sees a
+ * clear hit, until the room answered `n` of them.
+ *
+ * Each arrow waits for its answer before the next: the room's verdict, or
+ * none at all. The room answers nothing for a shot it refuses (the bow on
+ * cooldown, the archer dead), and says so only by applying the input that
+ * carried it. Its events leave in order with its Deltas, each Delta acking
+ * the inputs applied before it, so once the shot's input is acked without a
+ * verdict, none is coming. The next arrow is loosed a whole cooldown after
+ * the answer, so after the room applied the last one: a stall in between
+ * counts towards the cooldown. A refused arrow is not counted; every wait
+ * is bounded, so a room that stops answering fails the test, it never
+ * outlives it.
+ */
 async function volley(pit, n, compensated) {
-	const records = [];
+	const answered = [];
+	let refused = 0;
 	const deadline = Date.now() + 60_000;
-	while (records.length < n) {
-		assert.ok(Date.now() < deadline, 'volley');
+	while (answered.length < n) {
+		assert.ok(Date.now() < deadline, `volley: ${answered.length}/${n} answered, ${refused} refused`);
 		await sleep(1000 / 30);
 		const me = pit.me();
 		if (me === undefined) continue;
@@ -41,14 +56,19 @@ async function volley(pit, n, compensated) {
 		const pitch = Math.atan2(mid - eye, d);
 		// First person: from the eye, pitched at the mob's middle.
 		const shot = pit.aimShot(yaw, pitch, compensated, true);
-		if (shot === undefined) continue;
-		pit.client.sendInput({ mx: 0, my: 0, ...shot.input });
-		if (shot.record.predicted === mob.e.id) records.push(shot.record);
-		// The bow's cooldown.
+		if (shot === undefined || shot.record.predicted !== mob.e.id) continue;
+		const seq = pit.client.sendInput({ mx: 0, my: 0, ...shot.input });
+		assert.ok(seq !== undefined, 'the shot was sent');
+		const known = () => pit.shots.get(shot.record.id)?.verdict;
+		await until(() => known() !== undefined || pit.client.predictor.lastAck >= seq, 10_000, `shot ${shot.record.id} answered or applied`);
+		const verdict = known();
+		if (verdict === undefined) refused += 1;
+		else answered.push({ predicted: shot.record.predicted, ...verdict });
+		// The bow's cooldown, from the room's answer.
 		await sleep((PIT_RULES.fireCooldown * 1000) / 30 + 20);
 	}
-	const verdicts = await Promise.all(records.map((r) => pit.verdict(r.id)));
-	return records.map((r, i) => ({ predicted: r.predicted, ...verdicts[i] }));
+	if (refused > 0) console.error(`${refused} arrow(s) refused by the room`);
+	return answered;
 }
 
 test('arrows: lag compensation confirms what the archer saw', { timeout: 600_000 }, async () => {

@@ -1297,11 +1297,15 @@ impl MobPit {
         // inputs arrive: after a stall the socket's inputs often land after
         // the catch-up tick.
         let dropped = u16::try_from(ctx.dropped_ticks()).unwrap_or(u16::MAX);
+        // The cooldowns run on the same clock: a stall is time the player
+        // waited too, or the first shot or swing after it is refused (no
+        // verdict) although it came a whole cooldown after the last one.
+        let elapsed = u8::try_from(dropped.saturating_add(1)).unwrap_or(u8::MAX);
         for (id, p) in &mut self.players {
             p.credits = (p.credits + 1).min(MAX_CREDITS);
             p.owed = p.owed.saturating_add(dropped).min(MAX_OWED);
-            p.swing_cd = p.swing_cd.saturating_sub(1);
-            p.fire_cd = p.fire_cd.saturating_sub(1);
+            p.swing_cd = p.swing_cd.saturating_sub(elapsed);
+            p.fire_cd = p.fire_cd.saturating_sub(elapsed);
             p.shot_anim = p.shot_anim.saturating_sub(1);
             p.swing_anim = p.swing_anim.saturating_sub(1);
             if let Some(until) = p.dead_until {

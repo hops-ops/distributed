@@ -447,12 +447,29 @@ impl<Z: Zone> ZoneHost<Z> {
 
     /// [`Stimulus::Handoff`].
     pub(super) fn hand_off(&mut self, player: PlayerId, target_zone: &str, transfer_ticket: &str) {
+        self.remove_handed_off(player, target_zone.into(), transfer_ticket.into());
+        self.process_kicks();
+    }
+
+    /// Remove `player` with its `Handoff`, which carries the last input
+    /// this zone applied: the ones after it go to the target instead.
+    fn remove_handed_off(
+        &mut self,
+        player: PlayerId,
+        target_zone: String,
+        transfer_ticket: String,
+    ) {
+        let ack_seq = self
+            .core
+            .players
+            .get(&player)
+            .map_or(0, |slot| slot.inputs.last_processed());
         let message = ServerMessage::Handoff {
-            target_zone: target_zone.into(),
-            transfer_ticket: transfer_ticket.into(),
+            target_zone,
+            transfer_ticket,
+            ack_seq,
         };
         self.remove_player(player, LeaveReason::Handoff, Some(message));
-        self.process_kicks();
     }
 
     pub(super) fn remove_player(
@@ -504,9 +521,11 @@ impl<Z: Zone> ZoneHost<Z> {
     }
 
     pub(super) fn process_kicks(&mut self) {
-        while let Some((player, message, departed_at_ms)) = self.core.pending_handoffs.pop() {
+        while let Some((player, target_zone, ticket, departed_at_ms)) =
+            self.core.pending_handoffs.pop()
+        {
             self.core.pinned_stamp_ms = Some(departed_at_ms);
-            self.remove_player(player, LeaveReason::Handoff, Some(message));
+            self.remove_handed_off(player, target_zone, ticket);
             self.core.pinned_stamp_ms = None;
         }
         while let Some((player, message)) = self.core.pending_kicks.pop() {

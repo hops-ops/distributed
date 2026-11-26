@@ -401,6 +401,10 @@ pub enum ServerMessage {
         target_zone: String,
         /// Ticket to present in the next Hello.
         transfer_ticket: String,
+        /// Highest input sequence this zone processed for the player (as
+        /// a Delta's `ack_seq`): the inputs after it were never applied
+        /// here, so the client sends them to the target.
+        ack_seq: u32,
     },
     /// Removed from the zone; the server closes the socket.
     Kick {
@@ -504,10 +508,12 @@ impl ServerMessage {
             Self::Handoff {
                 target_zone,
                 transfer_ticket,
+                ack_seq,
             } => {
                 w.u8(tag::HANDOFF)
                     .string(target_zone)
-                    .string(transfer_ticket);
+                    .string(transfer_ticket)
+                    .varuint(*ack_seq);
             }
             Self::Kick { code, message } => {
                 w.u8(tag::KICK).varuint(*code).string(message);
@@ -551,6 +557,7 @@ impl ServerMessage {
             tag::HANDOFF => Self::Handoff {
                 target_zone: r.string()?,
                 transfer_ticket: r.string()?,
+                ack_seq: r.varuint()?,
             },
             tag::KICK => Self::Kick {
                 code: r.varuint()?,

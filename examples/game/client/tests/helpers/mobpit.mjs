@@ -8,7 +8,7 @@ import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { BUTTON, isMob, isPlayer, mobFields, PIT_WORLD, playerFields } from '../../src/generated/mobpit/index.ts';
+import { BUTTON, CORRECTIONS, isMob, isPlayer, mobFields, PIT_WORLD, playerFields } from '../../src/generated/mobpit/index.ts';
 import { freePort, startCelld } from './celld.mjs';
 import { sleep, startDemo } from './demo-server.mjs';
 import { startFleet } from './fleet.mjs';
@@ -158,7 +158,8 @@ export async function walkTo(pit, obstacles, [tx, ty], seen = { max: 0 }, timeou
  * Walk to the doorway on side `[dx, dy]` and through it (one command frame
  * per tick) until the client's authority is the next room and the own
  * player is predicted there again. Returns the new room and the own world
- * position sampled every frame on the way (`{ t, room, x, y }`). `along`
+ * position sampled every frame on the way (`{ t, room, x, y, bound }`;
+ * `bound`: a room has bound the player, false on the handoff bridge). `along`
  * is how far off the side's middle to cross (an open side: anywhere).
  *
  * Arrived means the next room bound the player (the predictor is active
@@ -183,7 +184,7 @@ export async function walkThroughDoor(pit, [dx, dy], timeoutMs = 30_000, along =
 		if (Date.now() > deadline) throw new Error(`walk through door ${dx},${dy} timed out`);
 		const me = pit.me();
 		const at = pit.position();
-		if (at !== undefined) trace.push({ t: Date.now(), room: me.zoneId, predicted: me.predicted, dead: playerFields(me).dead, ...at });
+		if (at !== undefined) trace.push({ t: Date.now(), room: me.zoneId, predicted: me.predicted, dead: playerFields(me).dead, bound: client.predictor?.active === true, ...at });
 		let input = { mx: 0, my: 0, buttons: 0 };
 		if (at !== undefined) {
 			// Beside the pillar on the door's axis, through the gap, and on
@@ -203,10 +204,31 @@ export async function walkThroughDoor(pit, [dx, dy], timeoutMs = 30_000, along =
 	return { room: pit.room(), trace };
 }
 
-/** Largest move (m) between consecutive samples of a `walkThroughDoor` trace (a death's respawn is no step). */
+/** How long the SDK eases a position correction (the player's `x`/`y` policy). */
+const SWITCH_EASE_MS = Math.max(CORRECTIONS.player.x.durationMs, CORRECTIONS.player.y.durationMs);
+
+/**
+ * Largest move (m) between consecutive samples of a `walkThroughDoor`
+ * trace. Not steps: a death's respawn, and the switch from the handoff
+ * bridge to the target's state (from each sample a room bound the player
+ * again, for the correction's ease).
+ *
+ * The switch is a correction like any other, bounded in time, not in size.
+ * The bridge goes on predicting in the target's frame what was drawn, and
+ * the target replays every input the source did not apply (the Handoff's
+ * `ack_seq`), but the inputs the client predicted *before* the Handoff
+ * reached it were predicted in the source's frame: past its crossing line
+ * the source's step holds the player at the room's bound. The slower the
+ * handoff (a busy room), the more of them; the target walks them on, and
+ * the drawn player eases there (snaps above `snapAbove`).
+ */
 export function largestStep(trace) {
 	let max = 0;
+	let switched;
 	for (let i = 1; i < trace.length; i += 1) {
+		if (trace[i].bound && !trace[i - 1].bound) switched = trace[i].t;
+		// Any step that overlaps the ease (it may end a frame past it).
+		if (switched !== undefined && trace[i - 1].t - switched < SWITCH_EASE_MS) continue;
 		if (trace[i].dead || trace[i - 1].dead) continue;
 		max = Math.max(max, Math.hypot(trace[i].x - trace[i - 1].x, trace[i].y - trace[i - 1].y));
 	}

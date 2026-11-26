@@ -169,6 +169,8 @@ export type HandoffMessage = Readonly<{
 	type: 'Handoff';
 	targetZone: string;
 	transferTicket: string;
+	/** The last input the zone applied (as a Delta's): the ones after it go to the target. */
+	ackSeq: number;
 }>;
 export type KickMessage = Readonly<{ type: 'Kick'; code: number; message: string }>;
 export type ErrorMessage = Readonly<{ type: 'Error'; code: number; message: string }>;
@@ -313,7 +315,7 @@ export function encodeServerMessage(
 				.string(message.notes);
 			break;
 		case 'Handoff':
-			w.u8(GameMessageTag.HANDOFF).string(message.targetZone).string(message.transferTicket);
+			w.u8(GameMessageTag.HANDOFF).string(message.targetZone).string(message.transferTicket).varuint(message.ackSeq);
 			break;
 		case 'Kick':
 			w.u8(GameMessageTag.KICK).varuint(message.code).string(message.message);
@@ -379,7 +381,7 @@ export function decodeServerMessage(
 			};
 			break;
 		case GameMessageTag.HANDOFF:
-			message = { type: 'Handoff', targetZone: r.string(), transferTicket: r.string() };
+			message = { type: 'Handoff', targetZone: r.string(), transferTicket: r.string(), ackSeq: r.varuint() };
 			break;
 		case GameMessageTag.KICK:
 			message = { type: 'Kick', code: r.varuint(), message: r.string() };

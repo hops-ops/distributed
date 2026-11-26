@@ -290,6 +290,7 @@ async fn cross_host_handoff_follows_redirect_and_ticket_is_single_use() {
             Some(ServerMessage::Handoff {
                 target_zone,
                 transfer_ticket,
+                ..
             }) => break (target_zone, transfer_ticket),
             Some(_) => continue,
             None => panic!("closed before Handoff"),

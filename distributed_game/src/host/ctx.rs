@@ -58,9 +58,9 @@ pub(crate) struct Core<Z: Zone> {
     pub(super) rewind: Rewind,
     pub(super) colliders: Colliders,
     pub(super) transfer_issuer: Option<Box<TransferIssuer>>,
-    /// Handoffs to finish after the hook: player, `Handoff` message and the
-    /// departure stamp time signed into the transfer ticket.
-    pub(super) pending_handoffs: Vec<(PlayerId, ServerMessage, u64)>,
+    /// Handoffs to finish after the hook: player, target zone, transfer
+    /// ticket and the departure stamp time signed into the ticket.
+    pub(super) pending_handoffs: Vec<(PlayerId, String, String, u64)>,
     pub(super) upward: Vec<ChildEvent>,
     pub(super) child_inbox: Vec<ChildEvent>,
     pub(super) dropped_frozen: u64,
@@ -785,7 +785,7 @@ impl<Z: Zone> Ctx<'_, Z> {
             .core
             .pending_handoffs
             .iter()
-            .any(|(queued, _, _)| *queued == player)
+            .any(|(queued, ..)| *queued == player)
         {
             return Err(HandoffError::Refused);
         }
@@ -805,14 +805,9 @@ impl<Z: Zone> Ctx<'_, Z> {
             .as_mut()
             .ok_or(HandoffError::NoIssuer)?;
         let ticket = issuer(&request).ok_or(HandoffError::Refused)?;
-        self.core.pending_handoffs.push((
-            player,
-            ServerMessage::Handoff {
-                target_zone: request.target_zone,
-                transfer_ticket: ticket,
-            },
-            departed_at_ms,
-        ));
+        self.core
+            .pending_handoffs
+            .push((player, request.target_zone, ticket, departed_at_ms));
         Ok(())
     }
 
