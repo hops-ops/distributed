@@ -5,7 +5,7 @@
 //! running as a celld Durable Object
 //! ([`CelldObjectHost`](crate::celld_zone::CelldObjectHost), feature
 //! `celld-zone`, wasm32), or in an ordinary service over any repository
-//! ([`LocalCommandHost`], feature `command-host`).
+//! ([`Service`](distributed::microsvc::Service), feature `command-host`).
 //!
 //! One sink per zone (host) routes every fact by its command
 //! ([`FactCommand::COMMAND`](crate::FactCommand::COMMAND)) to a registered
@@ -35,7 +35,7 @@ use std::time::Duration;
 #[cfg(feature = "command-host")]
 use distributed::cell_host::{CelldCommandHost, InternalHttpSecret};
 #[cfg(feature = "command-host")]
-use distributed::command_dispatch::{CommandHost, LocalCommandHost, VerifiedPrincipal};
+use distributed::command_dispatch::{CommandHost, VerifiedPrincipal};
 #[cfg(feature = "command-host")]
 #[cfg(feature = "command-host")]
 use distributed::microsvc::CausalDispatchError;
@@ -139,7 +139,7 @@ pub struct FactCall<'a> {
 
 /// What a [`CommandFactSink`] dispatches through: anything that runs one
 /// durable command idempotently by command id. Implemented for
-/// [`CelldCommandHost`] and [`LocalCommandHost`] (feature `command-host`)
+/// [`CelldCommandHost`] and [`Service`](distributed::microsvc::Service) (feature `command-host`)
 /// and for the celld object host (feature `celld-zone`).
 pub trait FactHost: Send + Sync + 'static {
     /// Learn `route` (a host that addresses aggregates by kind and shard
@@ -426,7 +426,7 @@ fn invoke_command_host<'a, H: CommandHost>(
 
 /// A service routes by command: its handler selects the stream.
 #[cfg(feature = "command-host")]
-impl FactHost for LocalCommandHost {
+impl FactHost for distributed::microsvc::Service {
     fn dispatch_fact<'a>(
         &'a self,
         call: FactCall<'a>,

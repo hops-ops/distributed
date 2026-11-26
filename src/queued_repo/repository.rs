@@ -281,7 +281,6 @@ where
             let CommitBatch {
                 mut streams,
                 outbox_messages,
-                read_model_plans,
                 snapshots,
                 inbox_receipts,
                 schedules,
@@ -294,7 +293,6 @@ where
                     .map(|stream| StreamWrite::new(stream.identity.clone(), &mut *stream.entity))
                     .collect(),
                 outbox_messages,
-                read_model_plans,
                 snapshots,
                 inbox_receipts,
                 schedules,

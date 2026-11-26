@@ -187,9 +187,6 @@ struct Bounds {
     /// fence, ledger read, ledger clock, stream version, event insert, outbox
     /// insert, ledger completion.
     command: usize,
-    /// The same with one raw read-model row: the causal marker read, the row
-    /// upsert and, on Postgres, the fence lock and `pg_notify`.
-    command_with_read_model: usize,
     /// One raw read-model row on its own: marker read and row upsert, plus
     /// the fence lock and `pg_notify` on Postgres.
     read_model_plan: usize,
@@ -451,29 +448,6 @@ where
         .await
         .unwrap();
 
-    let mut entity = Entity::with_id(format!("stream-{}", uuid::Uuid::now_v7()));
-    let attempt = reserve(store).await;
-    let completion = succeeded(&attempt);
-    let mut domain = domain_write(&mut entity);
-    domain
-        .read_model_plans
-        .push(TableWritePlan::new(vec![Fixture::upsert(
-            fixture.raw,
-            "raw-1",
-            "one",
-        )]));
-    let (committed, counted) = statements(
-        pool,
-        store.commit_causal_batch(CausalCommitBatch::new(domain, completion)),
-    )
-    .await;
-    committed.unwrap();
-    assert_at_most(
-        "command commit with one read-model row",
-        &counted,
-        bounds.command_with_read_model,
-    );
-
     let (committed, counted) = statements(
         pool,
         store.commit_write_plan(TableWritePlan::new(vec![Fixture::upsert(
@@ -617,7 +591,6 @@ async fn sqlite_statements_per_operation_are_pinned() {
             projection_first: 27,
             projection_steady: 22,
             command: 7,
-            command_with_read_model: 10,
             read_model_plan: 3,
             direct_projection: 15,
             snapshot_batch_1: 1,
@@ -652,7 +625,6 @@ async fn postgres_statements_per_operation_are_pinned() {
             projection_first: 28,
             projection_steady: 23,
             command: 7,
-            command_with_read_model: 11,
             read_model_plan: 4,
             direct_projection: 16,
             snapshot_batch_1: 1,

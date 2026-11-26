@@ -30,7 +30,7 @@ use crate::read_model::in_memory::{
     apply_read_model_write_plan, relational_storage_key, StoredRow,
 };
 use crate::repository::RepositoryError;
-use crate::table::{TableMutation, TableStoreError, TableWritePlan};
+use crate::table::TableWritePlan;
 
 mod direct_projection;
 mod read_helpers;
@@ -41,7 +41,7 @@ mod store_impl;
 mod util;
 
 pub(super) use direct_projection::stage_same_transaction_projection;
-pub(super) use state::{reject_causal_owned_plans, InMemoryProjectionProtocolState};
+pub(super) use state::InMemoryProjectionProtocolState;
 
 use read_helpers::{
     read_projection_execution_snapshot_batch_from_state, read_projection_query_snapshot_from_state,

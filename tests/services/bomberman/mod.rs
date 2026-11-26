@@ -1,11 +1,13 @@
 //! Bomberman Game Example — exercises the full distributed framework.
 //!
 //! A 4-player Bomberman demonstrates:
-//! - Single aggregate + atomic read model commit (player join/move)
-//! - Multi-aggregate atomic commit via the staged commit builder (bomb placement)
+//! - Multi-aggregate atomic commit via the staged commit builder (join, move,
+//!   bomb placement)
 //! - Aggregate lifecycle: bomb created -> ticked -> exploded -> explosion expands
 //! - In-process orchestration saga (tick resolves explosions across aggregates)
-//! - Composite read model (BoardView from map + players + bombs + explosions)
+//! - Composite read model (BoardView from map + players + bombs + explosions),
+//!   written only by its projection (`views::project_board`), never by a
+//!   command
 //! - Outbox events ("player.killed" on death)
 //! - Guard conditions (can't move when dead, can't bomb at max)
 
@@ -32,7 +34,7 @@ const SMALL_MAP: &str = "\
 
 // ============================================================================
 // Test 1: Game setup and movement
-// Pattern: Single aggregate + read model commit, terrain validation
+// Pattern: Multi-aggregate commit + board projection, terrain validation
 // ============================================================================
 
 #[test]
@@ -387,8 +389,10 @@ async fn concurrent_bomb_placement() {
     r1.unwrap();
     r2.unwrap();
 
-    // Verify both bombs placed
-    let _board = repo
+    // The projection, run after both commits, sees both bombs.
+    let board = views::project_board(&*repo, "game-5").await.unwrap();
+    assert_eq!(board.bombs.len(), 2);
+    let stored = repo
         .workspace()
         .load::<views::BoardView>(RowKey::new([(
             "game_id",
@@ -398,8 +402,7 @@ async fn concurrent_bomb_placement() {
         .await
         .unwrap()
         .unwrap();
-    // Board may show 1 or 2 bombs depending on which task's board view won the race,
-    // but both bomb aggregates should exist in the repo.
+    assert_eq!(stored.data.bombs.len(), 2);
     let alice: domain::player::Player =
         handlers::get_aggregate::<_, domain::player::Player>(&*repo, "player:p1")
             .await

@@ -12,6 +12,14 @@ pub struct GameMap {
     pub tiles: Vec<Vec<Tile>>,
     pub spawn_points: Vec<(i32, i32)>,
     pub power_ups: Vec<((i32, i32), PowerUp)>,
+    /// Stream ids of the players who joined, in join order.
+    pub players: Vec<String>,
+    /// Ticks resolved so far.
+    pub turn: u32,
+    /// Explosions ever started (numbers the next explosion id).
+    pub explosions_created: u64,
+    /// Stream ids of the explosions still active after the last tick.
+    pub explosions: Vec<String>,
 }
 
 #[sourced(entity)]
@@ -31,6 +39,19 @@ impl GameMap {
         self.tiles = tiles;
         self.spawn_points = spawn_points;
         self.power_ups = vec![];
+    }
+
+    #[event("player_joined")]
+    pub fn add_player(&mut self, player_id: String) {
+        self.players.push(player_id);
+    }
+
+    /// What a resolved tick leaves behind for the next one.
+    #[event("ticked")]
+    pub fn record_tick(&mut self, turn: u32, explosions_created: u64, explosions: Vec<String>) {
+        self.turn = turn;
+        self.explosions_created = explosions_created;
+        self.explosions = explosions;
     }
 
     #[event("block_destroyed", when = self.tile_at(x, y) == &Tile::Block)]

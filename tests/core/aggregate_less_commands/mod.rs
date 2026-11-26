@@ -2,7 +2,7 @@
 //! ([`Routes::for_stores`]): a provider webhook, a reconciliation.
 //!
 //! They run the pipeline every typed command runs. What a handler stages (an
-//! outbox message, a read-model plan) commits with the command's ledger
+//! outbox message, an external fact) commits with the command's ledger
 //! receipt in one transaction, and no stream is written:
 //!
 //! - a second dispatch of one command id replays and stages nothing more;
@@ -27,11 +27,7 @@ use distributed::microsvc::{
     CausalCommandContext, CausalDispatchError, CausalDispatchResult, HandlerError, HasOutboxStore,
     Routes, Service, Session, ROLE_KEY, USER_ID_KEY,
 };
-use distributed::read_model::ReadModelWritePlanBuilder;
-use distributed::{
-    ExternalEventSource, OutboxMessage, OutboxStore, ReadModel, ReadModelWorkspaceExt, RowKey,
-    RowValue,
-};
+use distributed::{ExternalEventSource, OutboxMessage, OutboxStore};
 
 const RECEIVE: &str = "webhook.receive";
 const SUBJECT: &str = "system:webhook";
@@ -41,9 +37,8 @@ const ROLE: &str = "webhook";
 struct ReceiveInput {
     /// The id of the outbox message the handler stages.
     delivery: String,
-    /// `publish`, `record` (also upserts a read-model row), `external`
-    /// (publishes [`WebhookReceived`] instead of a raw message), `nothing`
-    /// or `reject`.
+    /// `publish`, `external` (publishes [`WebhookReceived`] instead of a raw
+    /// message), `nothing` or `reject`.
     mode: String,
 }
 
@@ -67,14 +62,6 @@ fn webhook_source(delivery: &str) -> ExternalEventSource {
 #[derive(Debug, Serialize, distributed::CommandOutput)]
 struct ReceivePayload {
     published: bool,
-    command_id: String,
-}
-
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, ReadModel)]
-#[table("webhook_deliveries")]
-struct WebhookDelivery {
-    #[id]
-    delivery: String,
     command_id: String,
 }
 
@@ -126,18 +113,6 @@ async fn receive(
             .succeeded(payload(true)),
         "nothing" => PreparedCommand::prepare(payload(false))
             .map_err(|error| HandlerError::Other(Box::new(error))),
-        "record" => {
-            let mut rows = ReadModelWritePlanBuilder::new();
-            rows.upsert(&WebhookDelivery {
-                delivery: input.delivery.clone(),
-                command_id: command_id.clone(),
-            })
-            .map_err(|error| HandlerError::Other(Box::new(error)))?;
-            ctx.outbox(message()?)
-                .read_models(rows)
-                .commit()?
-                .succeeded(payload(true))
-        }
         _ => ctx.outbox(message()?).commit()?.succeeded(payload(true)),
     }
 }
@@ -237,32 +212,6 @@ macro_rules! scenarios {
                 "{reused:?}"
             );
             assert_eq!(runs(delivery), 1);
-        }
-
-        #[tokio::test]
-        async fn a_read_model_plan_commits_with_the_message_and_the_receipt() {
-            let db = $fresh.await;
-            let repo: $repo_ty = db.repo().await;
-            let service = service(repo.clone());
-            let delivery = concat!($backend, "-record");
-            let id = command_id(delivery);
-
-            for _delivery in 0..2 {
-                dispatch(&service, &id, delivery, "record").await.unwrap();
-            }
-            assert_eq!(runs(delivery), 1);
-            assert_eq!(staged(&repo.outbox_store(), delivery).await, 1);
-            let row = repo
-                .workspace()
-                .load::<WebhookDelivery>(RowKey::new([(
-                    "delivery",
-                    RowValue::String(delivery.into()),
-                )]))
-                .one()
-                .await
-                .unwrap()
-                .expect("the staged row was committed");
-            assert_eq!(row.data.command_id, id);
         }
 
         #[tokio::test]
@@ -408,7 +357,6 @@ mod in_memory {
 #[cfg(feature = "sqlite")]
 mod sqlite {
     use super::*;
-    use distributed::table::TableSchemaRegistry;
     use distributed::SqliteRepository;
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -425,11 +373,6 @@ mod sqlite {
             ))
             .await
             .unwrap();
-            let mut registry = TableSchemaRegistry::new();
-            registry.register::<WebhookDelivery>().unwrap();
-            repo.bootstrap_table_schema_for_dev(&registry)
-                .await
-                .unwrap();
             repo
         }
     }

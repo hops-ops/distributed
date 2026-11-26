@@ -1,38 +1,10 @@
-use distributed::read_model::ReadModelWritePlanBuilder;
-use distributed::{
-    hydrate, Aggregate, GetStream, ReadModelWorkspaceExt, ReadModelWritePlanStore,
-    RelationalReadModelQueryStore, RepositoryError, RowKey, RowValue, StreamIdentity,
-};
+use distributed::{hydrate, Aggregate, GetStream, RepositoryError, StreamIdentity};
 
 use crate::bomberman::domain::bomb::Bomb;
 use crate::bomberman::domain::explosion::Explosion;
 use crate::bomberman::domain::game_map::GameMap;
 use crate::bomberman::domain::player::Player;
 use crate::bomberman::error::GameError;
-use crate::bomberman::views::{build_board, BoardView};
-
-pub(crate) fn board_key(game_id: &str) -> RowKey {
-    RowKey::new([("game_id", RowValue::String(game_id.into()))])
-}
-
-pub(crate) fn board_write_plan(board: &BoardView) -> Result<ReadModelWritePlanBuilder, GameError> {
-    let mut read_models = ReadModelWritePlanBuilder::new();
-    read_models.upsert(board).map_err(RepositoryError::from)?;
-    Ok(read_models)
-}
-
-pub(crate) async fn load_board<R>(repo: &R, game_id: &str) -> Result<BoardView, GameError>
-where
-    R: ReadModelWritePlanStore + RelationalReadModelQueryStore,
-{
-    repo.workspace()
-        .load::<BoardView>(board_key(game_id))
-        .one()
-        .await
-        .map_err(RepositoryError::from)?
-        .map(|board| board.data)
-        .ok_or(GameError::GameNotFound)
-}
 
 /// Load and hydrate a single aggregate by its raw id, keyed under the
 /// aggregate's own stream type. Works through `&R` (handlers borrow the repo).
@@ -66,54 +38,40 @@ where
     Ok(results)
 }
 
-pub(crate) async fn load_board_players<R: GetStream>(
+/// Every player who joined the game.
+pub(crate) async fn load_game_players<R: GetStream>(
     repo: &R,
-    board: &BoardView,
-) -> Result<Vec<Player>, GameError> {
-    load_indexed_aggregates(repo, board.players.iter().map(|player| player.id.as_str())).await
-}
-
-pub(crate) async fn load_board_bombs<R: GetStream>(
-    repo: &R,
-    board: &BoardView,
-) -> Result<Vec<Bomb>, GameError> {
-    load_indexed_aggregates(repo, board.bombs.iter().map(|bomb| bomb.id.as_str())).await
-}
-
-pub(crate) async fn load_board_explosions<R: GetStream>(
-    repo: &R,
-    board: &BoardView,
-) -> Result<Vec<Explosion>, GameError> {
-    load_indexed_aggregates(
-        repo,
-        board
-            .explosions
-            .iter()
-            .map(|explosion| explosion.id.as_str()),
-    )
-    .await
-}
-
-pub(crate) fn build_board_from_aggregates(
-    game_id: &str,
     map: &GameMap,
-    players: &[Player],
-    bombs: &[Bomb],
-    explosions: &[Explosion],
-    turn: u32,
-    explosions_created: u64,
-) -> BoardView {
-    let player_refs: Vec<&Player> = players.iter().collect();
-    let bomb_refs: Vec<&Bomb> = bombs.iter().collect();
-    let explosion_refs: Vec<&Explosion> = explosions.iter().collect();
+) -> Result<Vec<Player>, GameError> {
+    load_indexed_aggregates(repo, &map.players).await
+}
 
-    build_board(
-        game_id,
-        map,
-        &player_refs,
-        &bomb_refs,
-        &explosion_refs,
-        turn,
-        explosions_created,
-    )
+/// Every bomb still on the board. Bomb ids are numbered per player
+/// (`bomb:{player}:{n}`), so a player's `bombs_placed` names them all.
+pub(crate) async fn load_live_bombs<R: GetStream>(
+    repo: &R,
+    players: &[Player],
+) -> Result<Vec<Bomb>, GameError> {
+    let ids = players.iter().flat_map(|player| {
+        let owner = player
+            .entity
+            .id()
+            .strip_prefix("player:")
+            .unwrap_or(player.entity.id())
+            .to_string();
+        (1..=player.bombs_placed).map(move |n| format!("bomb:{owner}:{n}"))
+    });
+    Ok(load_indexed_aggregates::<R, Bomb, _>(repo, ids)
+        .await?
+        .into_iter()
+        .filter(|bomb| !bomb.exploded)
+        .collect())
+}
+
+/// Every explosion still active after the last tick.
+pub(crate) async fn load_active_explosions<R: GetStream>(
+    repo: &R,
+    map: &GameMap,
+) -> Result<Vec<Explosion>, GameError> {
+    load_indexed_aggregates(repo, &map.explosions).await
 }

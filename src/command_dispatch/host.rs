@@ -49,7 +49,7 @@ pub trait CommandHost: Send + Sync {
 
     /// The in-process service whose command ledger records the commands
     /// this host runs, if there is one.
-    fn ledger(&self) -> Option<&Arc<Service>> {
+    fn ledger(&self) -> Option<&Service> {
         None
     }
 }
@@ -99,23 +99,12 @@ pub(crate) fn validate_principal_session_if_present(
     }
 }
 
-/// In-process host wrapping a writer [`Service`].
-pub struct LocalCommandHost {
-    service: Arc<Service>,
-}
-
-impl LocalCommandHost {
-    pub fn new(service: Arc<Service>) -> Self {
-        Self { service }
-    }
-
-    pub fn service(&self) -> &Arc<Service> {
-        &self.service
-    }
-}
-
+/// A [`Service`] is the in-process host: it runs the commands it mounts and
+/// owns their ledger. Every in-process ingress dispatches through this, the
+/// GraphQL transport and the framework's own trusted ingress (bus, Knative,
+/// schedule worker) alike.
 #[async_trait]
-impl CommandHost for LocalCommandHost {
+impl CommandHost for Service {
     async fn invoke(
         &self,
         command: &str,
@@ -129,27 +118,25 @@ impl CommandHost for LocalCommandHost {
         match authority {
             #[cfg(feature = "graphql")]
             Some(authority) => {
-                self.service
-                    .dispatch_causal_with_receipt_and_protocol(
-                        command,
-                        command_id,
-                        input,
-                        session,
-                        principal,
-                        authority.protocol,
-                    )
-                    .await
+                self.dispatch_causal_with_receipt_and_protocol(
+                    command,
+                    command_id,
+                    input,
+                    session,
+                    principal,
+                    authority.protocol,
+                )
+                .await
             }
             _ => {
-                self.service
-                    .dispatch_causal_with_receipt(command, command_id, input, session, principal)
+                self.dispatch_causal_with_receipt(command, command_id, input, session, principal)
                     .await
             }
         }
     }
 
-    fn ledger(&self) -> Option<&Arc<Service>> {
-        Some(&self.service)
+    fn ledger(&self) -> Option<&Service> {
+        Some(self)
     }
 }
 

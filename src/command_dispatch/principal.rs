@@ -27,15 +27,22 @@ pub(crate) struct VerifiedAudience {
 enum Provenance {
     /// A bearer token validated against the issuer's keys.
     Oidc,
-    /// Minted by the framework for work it starts itself, or rebuilt by a
-    /// service from a subject its own authenticated transport delivered.
+    /// Rebuilt by a service from a subject its own authenticated transport
+    /// delivered, or minted for work it starts itself.
     Internal,
+    /// The framework's own ingress: a bus or Knative delivery, a fired
+    /// schedule. Only the crate mints it.
+    TrustedTransport,
 }
 
 /// Issuer recorded on internal principals. It is not a URL an identity
 /// provider can be configured with, so it cannot collide with a token issuer.
 const INTERNAL_ISSUER: &str = "distributed:internal";
 const INTERNAL_AUDIENCE: &str = "distributed:internal";
+/// Issuer of trusted-transport principals. It differs from
+/// [`INTERNAL_ISSUER`], so no [`VerifiedPrincipal::internal`] subject shares a
+/// ledger partition with the framework's own ingress.
+const TRUSTED_TRANSPORT_ISSUER: &str = "distributed:trusted-transport";
 
 /// A subject that cannot name a principal.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -83,6 +90,27 @@ impl VerifiedPrincipal {
             tenant_partitions: Vec::new(),
             expires_at: None,
         })
+    }
+
+    /// The principal the framework's own ingress dispatches a typed command
+    /// under: a bus or Knative delivery
+    /// ([`TRANSPORT_USER_ID`](crate::microsvc::TRANSPORT_USER_ID)) or a fired
+    /// schedule
+    /// ([`SCHEDULE_USER_ID`](crate::microsvc::schedule::SCHEDULE_USER_ID)).
+    /// The subject is a framework constant, never a value a message carries.
+    pub(crate) fn trusted_transport(subject: &'static str) -> Self {
+        debug_assert!(!subject.trim().is_empty());
+        Self {
+            provenance: Provenance::TrustedTransport,
+            issuer: TRUSTED_TRANSPORT_ISSUER.into(),
+            subject: subject.to_string(),
+            audiences: vec![VerifiedAudience {
+                source: VerifiedAudienceSource::Aud,
+                value: INTERNAL_AUDIENCE.into(),
+            }],
+            tenant_partitions: Vec::new(),
+            expires_at: None,
+        }
     }
 
     /// A principal proved by a bearer token the caller has validated against
@@ -193,4 +221,21 @@ impl std::fmt::Debug for VerifiedPrincipal {
 
 pub(crate) fn normalize_issuer(iss: &str) -> String {
     iss.trim_end_matches('/').to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_internal_principal_cannot_share_the_trusted_transport_ledger_partition() {
+        let subject = crate::microsvc::TRANSPORT_USER_ID;
+        let trusted = VerifiedPrincipal::trusted_transport(subject);
+        let internal = VerifiedPrincipal::internal(subject).unwrap();
+        assert!(trusted.subject_matches(subject));
+        assert_ne!(
+            trusted.partition_for_service("billing"),
+            internal.partition_for_service("billing")
+        );
+    }
 }

@@ -1979,35 +1979,19 @@ database. Its JSON-column filters are the dialect-neutral operators (`_eq`,
 
 ### Atomic Commits (Read Model + Aggregate)
 
-When the response to a command must include the fully consistent, updated view, commit the aggregate and read model together in one transaction:
+Read models are written only by projections. When the response to a command
+must include the fully consistent, updated view, declare the command
+`Atomic<Model>`: the command's `projection!` program writes the row in the same
+transaction as the aggregate's events and the ledger receipt, and the response
+is that committed row (see
+[`move_dir.rs`](tests/e2e-ui/crates/blob-domain/src/commands/move_dir.rs)).
+A handler never stages raw read-model rows; `CommitBatch` carries streams,
+outbox messages, snapshots, schedules and inbox receipts only.
 
-```rust,ignore
-use distributed::{ReadModelWritePlanCommitExt, ReadModelWritePlanBuilder};
-
-// Player submits a move
-game.make_move(player_move)?;
-
-// Build the view from the updated aggregate
-let view = GameView::from(&game);
-
-// Commit aggregate + view in one transactional batch
-let mut read_models = ReadModelWritePlanBuilder::new();
-read_models.upsert(&view)?;
-repo.read_models(read_models).commit(&mut game).await?;
-
-// Return `view` to the client — it reflects the committed state
-```
-
-For related rows, build the same structured write plan:
-
-```rust,ignore
-let mut read_models = ReadModelWritePlanBuilder::new();
-read_models.upsert(&player_view)?;
-read_models.upsert_related(&player_view, "weapons", &weapon_view)?;
-repo.read_models(read_models).commit(&mut game).await?;
-```
-
-This is a deliberate consistency tradeoff: the read model is in sync with the aggregate only when the repository can write both in the same transaction boundary (`TransactionalCommit`). For cross-service or cross-database views, use the eventually consistent outbox/projector pattern instead.
+This is a deliberate consistency tradeoff: the row is in sync with the
+aggregate only when the repository can write both in the same transaction
+boundary. For cross-service or cross-database views, use the eventually
+consistent outbox/projector pattern instead.
 
 ### Eventual Projection
 

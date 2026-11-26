@@ -1130,7 +1130,7 @@ mod causal_command_schema_tests {
 
     use super::*;
     use crate::command::CommandConsistency;
-    use crate::command_dispatch::{LocalCommandHost, SharedCommandHost};
+    use crate::command_dispatch::SharedCommandHost;
     use crate::graphql::protocol::{
         DistributedEnvelopeV1, ProtocolResponseAccumulator, ProtocolTokenCodec,
         ProtocolTokenPurpose,
@@ -1324,9 +1324,7 @@ mod causal_command_schema_tests {
             "{{ {COMMAND_STATUS_ROOT_FIELD}(commandId: \"{}\") {{ s: state }} }}",
             uuid::Uuid::now_v7()
         ))
-        .data(Arc::new(LocalCommandHost::new(Arc::new(
-            Service::new().named("status-test"),
-        ))) as SharedCommandHost)
+        .data(Arc::new(Service::new().named("status-test")) as SharedCommandHost)
         .data(VerifiedPrincipal::test_oidc(
             "https://issuer.example/",
             "status-test-subject",

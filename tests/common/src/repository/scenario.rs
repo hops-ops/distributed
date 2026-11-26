@@ -170,7 +170,6 @@ where
                 StreamWrite::new(checkout_identity.clone(), checkout.entity_mut()),
             ],
             outbox_messages: Vec::new(),
-            read_model_plans: Vec::new(),
             snapshots: vec![SnapshotWrite::Save {
                 identity: checkout_identity.clone(),
                 record: SnapshotRecord::new(

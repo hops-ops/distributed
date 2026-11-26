@@ -5,12 +5,10 @@ use std::sync::Arc;
 use crate::aggregate::{Aggregate, AggregateRepository};
 use crate::domain_event::{DomainEvent, DomainEventCaptureError, DomainEventCommitGuardError};
 use crate::outbox::{OutboxMessage, PreparedDomainEvent};
-use crate::read_model::ReadModelWritePlanBuilder;
 use crate::repository::{
     CommitBatch, RepositoryError, StreamIdentity, StreamWrite, TransactionalCommit,
 };
 use crate::schedule::{Schedule, ScheduleWrite};
-use crate::table::TableWritePlan;
 
 /// What a commit does with the ids of the outbox rows it just inserted.
 type AfterCommit =
@@ -75,22 +73,20 @@ impl CommitReceipt {
     }
 }
 
-/// Builder returned by [`AggregateRepository::outbox`],
-/// [`AggregateRepository::read_models`] and
-/// [`AggregateRepository::schedule`] that commits an aggregate together with
-/// outbox rows, relational read-model writes, schedule writes and (when the
+/// Builder returned by [`AggregateRepository::outbox`] (and `publish` /
+/// `publish_events`) and [`AggregateRepository::schedule`] that commits an
+/// aggregate together with outbox rows, schedule writes and (when the
 /// repository has snapshots configured) a snapshot — all in one async
 /// transactional batch.
 ///
 /// Borrows the repository so it can be called through `ctx.repo()` inside async
-/// handlers. Chain `.outbox(..)` / `.read_models(..)` to stage more, then
+/// handlers. Chain `.outbox(..)` / `.publish(..)` to stage more, then
 /// `.commit(&mut aggregate)`.
 pub struct AggregateCommit<'a, R, A> {
     repo: &'a AggregateRepository<R, A>,
     publish_captured_events: bool,
     explicit_domain_events: Vec<PreparedDomainEvent>,
     outbox_messages: Vec<OutboxMessage>,
-    read_model_plans: Vec<TableWritePlan>,
     schedules: Vec<ScheduleWrite>,
     error: Option<RepositoryError>,
 }
@@ -102,7 +98,6 @@ impl<'a, R, A> AggregateCommit<'a, R, A> {
             publish_captured_events: false,
             explicit_domain_events: Vec::new(),
             outbox_messages: Vec::new(),
-            read_model_plans: Vec::new(),
             schedules: Vec::new(),
             error: None,
         }
@@ -140,17 +135,6 @@ impl<'a, R, A> AggregateCommit<'a, R, A> {
         self
     }
 
-    /// Stage relational read-model writes to apply in the same transaction.
-    pub fn read_models(mut self, read_models: ReadModelWritePlanBuilder) -> Self {
-        if self.error.is_none() {
-            match read_models.into_write_plan() {
-                Ok(plan) => self.read_model_plans.push(plan),
-                Err(err) => self.error = Some(err.into()),
-            }
-        }
-        self
-    }
-
     /// Schedule (or re-schedule) work for the committed aggregate
     /// ([`crate::schedule`]), in the same transaction. It fires only where
     /// the repository's schedules are dispatched (a schedule worker
@@ -173,8 +157,8 @@ where
     R: TransactionalCommit,
     A: Aggregate + Send,
 {
-    /// Commit the aggregate together with the staged outbox rows, read-model
-    /// writes, and a snapshot (when due) in one transaction. Command completion
+    /// Commit the aggregate together with the staged outbox rows and a
+    /// snapshot (when due) in one transaction. Command completion
     /// is this commit. When the repository has a bus (`Service::with_bus`),
     /// pending outbox ids are handed to a bounded worker after commit and do
     /// not delay the returned receipt.
@@ -214,7 +198,6 @@ where
             .commit_batch(CommitBatch {
                 streams: vec![stream],
                 outbox_messages: self.outbox_messages,
-                read_model_plans: self.read_model_plans,
                 snapshots,
                 inbox_receipts: Vec::new(),
                 schedules: self.schedules,
@@ -304,12 +287,6 @@ impl<R, A> AggregateRepository<R, A> {
     /// Start a commit with an outbox message attached.
     pub fn outbox(&self, message: OutboxMessage) -> AggregateCommit<'_, R, A> {
         AggregateCommit::empty(self).outbox(message)
-    }
-
-    /// Start a commit with relational read-model writes attached. Composes with
-    /// `.outbox(..)`, the aggregate's events, and snapshots in one transaction.
-    pub fn read_models(&self, read_models: ReadModelWritePlanBuilder) -> AggregateCommit<'_, R, A> {
-        AggregateCommit::empty(self).read_models(read_models)
     }
 
     /// Start a commit that schedules work for the aggregate
@@ -602,7 +579,7 @@ mod tests {
         counter.open("counter-guard".into()).unwrap();
 
         let error = repo
-            .read_models(ReadModelWritePlanBuilder::new())
+            .outbox(OutboxMessage::create("guard-msg", "counter.guard", vec![]).unwrap())
             .commit(&mut counter)
             .await
             .unwrap_err();
@@ -659,14 +636,6 @@ mod tests {
         assert_eq!(occurrence.aggregate_sequence(), 1);
     }
 
-    #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize, crate::ReadModel)]
-    #[table("agg_commit_views")]
-    struct ComposeView {
-        #[id]
-        id: String,
-        n: i32,
-    }
-
     #[derive(Default, crate::Snapshot)]
     struct ComposeCounter {
         entity: Entity,
@@ -683,11 +652,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn read_models_and_snapshot_commit_in_one_transaction() {
-        use crate::read_model::ReadModelWritePlanBuilder;
-        use crate::{
-            Aggregate, ReadModelWorkspaceExt, RowKey, RowValue, SnapshotStore, StreamIdentity,
-        };
+    async fn aggregate_outbox_and_snapshot_commit_in_one_transaction() {
+        use crate::{Aggregate, GetStream, SnapshotStore, StreamIdentity};
 
         let repo = InMemoryRepository::new()
             .aggregate::<ComposeCounter>()
@@ -695,69 +661,11 @@ mod tests {
 
         let mut counter = ComposeCounter::default();
         counter.bump("c1".to_string()).unwrap();
-
-        let mut plan = ReadModelWritePlanBuilder::new();
-        plan.upsert(&ComposeView {
-            id: "c1".into(),
-            n: 1,
-        })
-        .unwrap();
-
-        // Read-model writes + the aggregate's events + a snapshot — one commit.
-        repo.read_models(plan).commit(&mut counter).await.unwrap();
-
-        // The read-model row is committed...
-        let loaded = repo
-            .repo()
-            .model_store()
-            .workspace()
-            .load::<ComposeView>(RowKey::new([("id", RowValue::String("c1".into()))]))
-            .one()
-            .await
-            .unwrap();
-        assert!(loaded.is_some(), "read-model row should be committed");
-
-        // ...and a snapshot was staged in the same transaction (frequency 1).
-        let identity = StreamIdentity::new(ComposeCounter::aggregate_type(), "c1").unwrap();
-        let snapshot = repo.repo().get_snapshot(&identity).await.unwrap();
-        assert!(
-            snapshot.is_some(),
-            "snapshot should be staged alongside the read-model commit"
-        );
-    }
-
-    #[tokio::test]
-    async fn aggregate_outbox_read_model_and_snapshot_commit_in_one_transaction() {
-        use crate::read_model::ReadModelWritePlanBuilder;
-        use crate::{
-            Aggregate, GetStream, ReadModelWorkspaceExt, RowKey, RowValue, SnapshotStore,
-            StreamIdentity,
-        };
-
-        let repo = InMemoryRepository::new()
-            .aggregate::<ComposeCounter>()
-            .with_snapshots(1);
-
-        let mut counter = ComposeCounter::default();
-        counter.bump("c1".to_string()).unwrap();
-
-        let mut plan = ReadModelWritePlanBuilder::new();
-        plan.upsert(&ComposeView {
-            id: "c1".into(),
-            n: 1,
-        })
-        .unwrap();
 
         let message = OutboxMessage::create("evt-c1", "counter.bumped", b"{}".to_vec()).unwrap();
 
-        // All four in one commit: aggregate events + outbox row + read-model
-        // write + snapshot.
-        let receipt = repo
-            .outbox(message)
-            .read_models(plan)
-            .commit(&mut counter)
-            .await
-            .unwrap();
+        // All three in one commit: aggregate events + outbox row + snapshot.
+        let receipt = repo.outbox(message).commit(&mut counter).await.unwrap();
         assert_eq!(receipt.outbox_message_ids(), ["evt-c1".to_string()]);
 
         let identity = StreamIdentity::new(ComposeCounter::aggregate_type(), "c1").unwrap();
@@ -778,18 +686,7 @@ mod tests {
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].id(), "evt-c1");
 
-        // 3) read-model row written
-        let loaded = repo
-            .repo()
-            .model_store()
-            .workspace()
-            .load::<ComposeView>(RowKey::new([("id", RowValue::String("c1".into()))]))
-            .one()
-            .await
-            .unwrap();
-        assert!(loaded.is_some(), "read-model row should be committed");
-
-        // 4) snapshot staged
+        // 3) snapshot staged
         assert!(
             repo.repo().get_snapshot(&identity).await.unwrap().is_some(),
             "snapshot should be staged"

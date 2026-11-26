@@ -125,10 +125,9 @@ impl CellSqlRepository {
         batch: CommitBatch<'_>,
         completion: Option<&CommandCompletion<'_>>,
     ) -> Result<(), CommandLedgerError> {
-        if !batch.read_model_plans.is_empty() || !batch.inbox_receipts.is_empty() {
+        if !batch.inbox_receipts.is_empty() {
             return Err(CommandLedgerError::Invalid(
-                "aggregate cells accept command effects, not projection or consumer-inbox writes"
-                    .into(),
+                "aggregate cells accept command effects, not consumer-inbox writes".into(),
             ));
         }
         let prepared = validate_commit_batch(&batch)?;

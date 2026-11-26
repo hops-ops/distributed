@@ -594,9 +594,7 @@ fn session_with_role(role: &str) -> Session {
 
 #[cfg(feature = "graphql")]
 fn command_host(service: &Arc<Service>) -> crate::command_dispatch::SharedCommandHost {
-    Arc::new(crate::command_dispatch::LocalCommandHost::new(Arc::clone(
-        service,
-    )))
+    Arc::clone(service) as crate::command_dispatch::SharedCommandHost
 }
 
 #[cfg(feature = "graphql")]
@@ -1280,8 +1278,8 @@ async fn causal_dispatch_replays_canonical_equivalent_input_without_reinvoking_h
 /// The command host is core: it runs and replays a typed command in every
 /// build, the GraphQL transport included or not.
 #[tokio::test]
-async fn local_command_host_runs_typed_commands_through_the_ledger() {
-    use crate::command_dispatch::{CommandHost, LocalCommandHost};
+async fn service_command_host_runs_typed_commands_through_the_ledger() {
+    use crate::command_dispatch::CommandHost;
 
     let service = Arc::new(
         Service::new().named("causal-tests").routes(
@@ -1303,10 +1301,10 @@ async fn local_command_host_runs_typed_commands_through_the_ledger() {
                 ),
         ),
     );
-    let host = LocalCommandHost::new(Arc::clone(&service));
+    let host = Arc::clone(&service);
     assert!(host
         .ledger()
-        .is_some_and(|ledger| Arc::ptr_eq(ledger, &service)));
+        .is_some_and(|ledger| std::ptr::eq(ledger, service.as_ref())));
 
     let mut session = Session::new();
     session.set(crate::microsvc::USER_ID_KEY, "causal-test-subject");
@@ -2177,16 +2175,23 @@ async fn causal_dispatch_uses_the_configured_immediate_outbox_publisher() {
 
 #[tokio::test]
 async fn causal_prepared_batch_failure_rolls_back_every_atomic_participant() {
-    use crate::{ReadModelWorkspaceExt, RowKey, RowPatch, RowValue, SnapshotStore};
+    use crate::{CommitBuilderExt, SnapshotStore};
 
+    let aggregate_id = "atomic-rollback-aggregate";
     let repository = InMemoryRepository::new();
+    // An outbox row already holds the id the command stages, so its batch
+    // fails after the stream, snapshot and outbox legs are staged.
     repository
-        .model_store()
-        .register_schema::<CausalProjectionObligationView>()
-        .unwrap();
-    repository
-        .model_store()
-        .register_schema::<CausalProjectionSiblingView>()
+        .outbox(
+            OutboxMessage::create(
+                format!("{aggregate_id}:atomic-fact"),
+                "causal.atomic_fact",
+                b"earlier".to_vec(),
+            )
+            .unwrap(),
+        )
+        .commit_all()
+        .await
         .unwrap();
     let service = Service::new().named("causal-atomic-rollback").routes(
         Routes::new()
@@ -2208,31 +2213,6 @@ async fn causal_prepared_batch_failure_rolls_back_every_atomic_participant() {
                             .record(input.id.clone())
                             .map_err(|error| HandlerError::Other(Box::new(error)))?;
 
-                        let committed_row_id = format!("{}:committed-row", input.id);
-                        let mut read_models = crate::read_model::ReadModelWritePlanBuilder::new();
-                        read_models
-                            .upsert(&CausalProjectionObligationView {
-                                id: committed_row_id,
-                            })
-                            .map_err(|error| HandlerError::Other(Box::new(error)))?;
-                        read_models
-                            .upsert(&CausalProjectionSiblingView {
-                                id: format!("{}:sibling-row", input.id),
-                            })
-                            .map_err(|error| HandlerError::Other(Box::new(error)))?;
-                        read_models
-                            .patch::<CausalProjectionObligationView>(
-                                RowKey::new([(
-                                    "id",
-                                    RowValue::String(format!("{}:missing-row", input.id)),
-                                )]),
-                                RowPatch::new().set(
-                                    "id",
-                                    RowValue::String(format!("{}:still-missing", input.id)),
-                                ),
-                            )
-                            .map_err(|error| HandlerError::Other(Box::new(error)))?;
-
                         let outbox = OutboxMessage::create(
                             format!("{}:atomic-fact", input.id),
                             "causal.atomic_fact",
@@ -2242,7 +2222,6 @@ async fn causal_prepared_batch_failure_rolls_back_every_atomic_participant() {
 
                         context
                             .outbox(outbox)
-                            .read_models(read_models)
                             .commit(checkout)?
                             .succeeded(TypedOutput { id: input.id })
                     })();
@@ -2252,7 +2231,6 @@ async fn causal_prepared_batch_failure_rolls_back_every_atomic_participant() {
     );
     let command_id = causal_test_command_id();
     let principal = causal_test_principal();
-    let aggregate_id = "atomic-rollback-aggregate";
 
     let error = service
         .dispatch_causal(
@@ -2263,7 +2241,7 @@ async fn causal_prepared_batch_failure_rolls_back_every_atomic_participant() {
             principal.clone(),
         )
         .await
-        .expect_err("the update-existing patch against a missing row must fail the batch");
+        .expect_err("the duplicate outbox id must fail the batch");
     assert_eq!(error.code(), "INTERNAL");
 
     let identity =
@@ -2273,46 +2251,12 @@ async fn causal_prepared_batch_failure_rolls_back_every_atomic_participant() {
         repository.get_stream(&identity).await.unwrap().is_none(),
         "aggregate stream must roll back"
     );
-    assert!(
-        repository
-            .outbox_store()
-            .pending(usize::MAX)
-            .await
-            .unwrap()
-            .is_empty(),
-        "outbox row must roll back"
-    );
+    let pending = repository.outbox_store().pending(usize::MAX).await.unwrap();
+    assert_eq!(pending.len(), 1, "the command's outbox row must roll back");
+    assert_eq!(pending[0].payload, b"earlier");
     assert!(
         repository.get_snapshot(&identity).await.unwrap().is_none(),
         "snapshot must roll back"
-    );
-    let projected = repository
-        .model_store()
-        .workspace()
-        .load::<CausalProjectionObligationView>(RowKey::new([(
-            "id",
-            RowValue::String(format!("{aggregate_id}:committed-row")),
-        )]))
-        .one()
-        .await
-        .unwrap();
-    assert!(
-        projected.is_none(),
-        "earlier read-model writes must roll back"
-    );
-    let sibling = repository
-        .model_store()
-        .workspace()
-        .load::<CausalProjectionSiblingView>(RowKey::new([(
-            "id",
-            RowValue::String(format!("{aggregate_id}:sibling-row")),
-        )]))
-        .one()
-        .await
-        .unwrap();
-    assert!(
-        sibling.is_none(),
-        "multi-table writes must roll back together"
     );
     assert!(matches!(
         service
