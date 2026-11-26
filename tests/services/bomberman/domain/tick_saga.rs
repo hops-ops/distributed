@@ -22,7 +22,7 @@ pub struct TickSaga {
     pub winner: Option<String>,
 }
 
-#[sourced(entity)]
+#[sourced(entity, aggregate_type = "tick_saga")]
 impl TickSaga {
     #[event("started")]
     pub fn start(&mut self, saga_id: String, game_id: String, bombs_ticked: usize) {

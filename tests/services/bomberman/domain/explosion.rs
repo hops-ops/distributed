@@ -12,7 +12,7 @@ pub struct Explosion {
     pub active: bool,
 }
 
-#[sourced(entity)]
+#[sourced(entity, aggregate_type = "explosion")]
 impl Explosion {
     #[event("started")]
     pub fn start(

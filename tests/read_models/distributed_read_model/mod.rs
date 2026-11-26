@@ -27,9 +27,9 @@ use distributed::read_model::ReadModelWritePlanBuilder;
 #[cfg(feature = "sqlite")]
 use distributed::SqliteRepository;
 use distributed::{
-    AggregateBuilder, CommitBuilderExt, GetStream, OutboxMessage, OutboxStore,
-    ReadModelWritePlanStore, RelationalReadModel, RelationalReadModelIncludes,
-    RelationalReadModelQueryStore, TableStoreError, TransactionalCommit,
+    AggregateBuilder, GetStream, OutboxMessage, OutboxStore, ReadModelWritePlanStore,
+    RelationalReadModel, RelationalReadModelIncludes, RelationalReadModelQueryStore,
+    TableStoreError, TransactionalCommit,
 };
 use distributed::{InMemoryReadModelStore, InMemoryRepository, Queueable};
 use projection_service::service as projection_service;
@@ -138,7 +138,7 @@ async fn run_persistent_checkout_flow<R, CheckoutOutbox, SeatOutbox>(
 
 async fn add_seat<R>(repo: &R, seat_id: &str, category: &str) -> OutboxMessage
 where
-    R: TransactionalCommit + Send + Sync,
+    R: Clone + TransactionalCommit + Send + Sync + 'static,
 {
     let mut seat = Seat::default();
     seat.add(seat_id.to_string(), category.to_string())
@@ -150,7 +150,9 @@ where
     let outbox = json_outbox_event(seat_id, seat_event::ADDED, &event)
         .expect("seat added outbox should encode");
 
-    repo.outbox(outbox.clone())
+    repo.clone()
+        .aggregate::<Seat>()
+        .outbox(outbox.clone())
         .commit(&mut seat)
         .await
         .expect("seat add should commit");
@@ -164,7 +166,7 @@ async fn start_checkout<R>(
     seat_category: &str,
 ) -> OutboxMessage
 where
-    R: TransactionalCommit + Send + Sync,
+    R: Clone + TransactionalCommit + Send + Sync + 'static,
 {
     let mut saga = CheckoutSaga::default();
     saga.start(
@@ -181,7 +183,9 @@ where
     let outbox = json_outbox_event(checkout_id, checkout_event::STARTED, &event)
         .expect("checkout started outbox should encode");
 
-    repo.outbox(outbox.clone())
+    repo.clone()
+        .aggregate::<CheckoutSaga>()
+        .outbox(outbox.clone())
         .commit(&mut saga)
         .await
         .expect("checkout start should commit");
@@ -217,7 +221,9 @@ where
     let outbox = json_outbox_event(&msg.checkout_id, seat_event::RESERVED, &event)
         .expect("seat reserved outbox should encode");
 
-    repo.outbox(outbox.clone())
+    repo.clone()
+        .aggregate::<Seat>()
+        .outbox(outbox.clone())
         .commit(&mut seat)
         .await
         .expect("seat reservation should commit");
@@ -253,7 +259,9 @@ where
     )
     .expect("seat reservation completed outbox should encode");
 
-    repo.outbox(outbox.clone())
+    repo.clone()
+        .aggregate::<CheckoutSaga>()
+        .outbox(outbox.clone())
         .commit(&mut saga)
         .await
         .expect("checkout saga update should commit");

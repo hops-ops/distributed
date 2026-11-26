@@ -8,9 +8,13 @@ pub mod outbox;
 pub mod read_models;
 pub mod scenario;
 pub mod seat;
+pub mod snapshots;
 pub mod storage;
 
-use distributed::{InMemoryOutboxStore, InMemoryRepository, OutboxMessage, OutboxStore};
+use distributed::{
+    InMemoryOutboxStore, InMemoryRepository, OutboxMessage, OutboxStore, Queueable,
+    QueuedRepository,
+};
 
 /// A repository under test. `open` returns `None` to skip when the backing
 /// service is absent and not required (see [`crate::env::require_service`]);
@@ -77,6 +81,55 @@ impl RepositoryBackend for InMemory {
 
     fn outbox_store(repository: &InMemoryRepository) -> InMemoryOutboxStore {
         repository.outbox_store()
+    }
+}
+
+/// `B` behind a [`QueuedRepository`]: the wrapper must pass the whole
+/// contract of the repository it wraps, so it is run on every backend.
+pub struct Queued<B>(B);
+
+impl<B: RepositoryBackend> RepositoryBackend for Queued<B> {
+    type Repository = QueuedRepository<B::Repository>;
+    type Outbox = B::Outbox;
+
+    async fn open(case: &str) -> Option<Self> {
+        B::open(case).await.map(Self)
+    }
+
+    fn repository(&self) -> Self::Repository {
+        self.0.repository().queued()
+    }
+
+    fn outbox_store(repository: &Self::Repository) -> B::Outbox {
+        B::outbox_store(repository.inner())
+    }
+}
+
+impl<B: SqlFaults> SqlFaults for Queued<B> {
+    async fn reject_negative(&self, table: &str, column: &str) {
+        self.0.reject_negative(table, column).await
+    }
+
+    async fn insert_event_with_unsupported_codec(&self, aggregate_type: &str, aggregate_id: &str) {
+        self.0
+            .insert_event_with_unsupported_codec(aggregate_type, aggregate_id)
+            .await
+    }
+
+    async fn insert_outbox_row_with_trace_columns(&self, message_id: &str) {
+        self.0
+            .insert_outbox_row_with_trace_columns(message_id)
+            .await
+    }
+}
+
+impl<B: Durable> Durable for Queued<B> {
+    async fn open_durable(case: &str) -> Option<Self> {
+        B::open_durable(case).await.map(Self)
+    }
+
+    async fn reopen(&self) -> Self::Repository {
+        self.0.reopen().await.queued()
     }
 }
 
@@ -296,15 +349,24 @@ mod postgres {
 
 /// Expands every repository conformance case as a `#[tokio::test]` for
 /// `$backend`, a [`RepositoryBackend`]. Each capability must be stated; a
-/// `false` capability leaves out the cases that need it.
+/// `false` capability leaves out the cases that need it. `queued: true`
+/// states that `$backend`'s repository is a [`QueuedRepository`], whose
+/// locking reads serialize racers instead of letting them conflict, so it
+/// runs the queued cases in place of the optimistic race.
 ///
 /// ```ignore
-/// common::repository_conformance_tests!(common::repository::Sqlite, sql_faults: true, durable: true);
+/// common::repository_conformance_tests!(common::repository::Sqlite, sql_faults: true, durable: true, queued: false);
 /// ```
 #[macro_export]
 macro_rules! repository_conformance_tests {
-    ($backend:ty, sql_faults: $sql_faults:tt, durable: $durable:tt $(,)?) => {
+    ($backend:ty, sql_faults: $sql_faults:tt, durable: $durable:tt, queued: $queued:tt $(,)?) => {
         $crate::conformance_cases! { $crate::repository::RepositoryBackend, $backend, open;
+            #[tokio::test]
+            snapshotted_reads_hydrate_snapshot_then_tail(b) =>
+                $crate::repository::snapshots::snapshotted_reads_hydrate_snapshot_then_tail(b.repository());
+            #[tokio::test]
+            stream_tail_of_missing_stream_is_none_and_past_bound_clamps(b) =>
+                $crate::repository::snapshots::stream_tail_of_missing_stream_is_none_and_past_bound_clamps(b.repository());
             #[tokio::test]
             aggregate_checkout_flow_persists_reloaded_state(b) =>
                 $crate::repository::scenario::aggregate_checkout_flow_persists_reloaded_state(b.repository());
@@ -326,9 +388,6 @@ macro_rules! repository_conformance_tests {
             #[tokio::test]
             snapshots_use_full_stream_identity(b) =>
                 $crate::repository::scenario::snapshots_use_full_stream_identity(b.repository());
-            #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-            racing_commits_one_wins_one_conflicts(b) =>
-                $crate::repository::scenario::racing_commits_one_wins_one_conflicts(b.repository(), 8);
             #[tokio::test]
             aggregate_stream_round_trips_with_metadata(b) =>
                 $crate::repository::storage::aggregate_stream_round_trips_with_metadata(b.repository());
@@ -397,6 +456,19 @@ macro_rules! repository_conformance_tests {
             #[tokio::test]
             outbox_trace_columns_round_trip_into_message_metadata(b) =>
                 $crate::repository::storage::outbox_trace_columns_round_trip_into_message_metadata(&b);
+        }
+        $crate::conformance_cases! { @unless $queued $crate::repository::RepositoryBackend, $backend, open;
+            #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+            racing_commits_one_wins_one_conflicts(b) =>
+                $crate::repository::scenario::racing_commits_one_wins_one_conflicts(b.repository(), 8);
+        }
+        $crate::conformance_cases! { @if $queued $crate::repository::RepositoryBackend, $backend, open;
+            #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+            queued_racing_commits_take_turns(b) =>
+                $crate::repository::scenario::queued_racing_commits_take_turns(b.repository(), 8);
+            #[tokio::test]
+            queued_snapshotted_reads_hydrate_snapshot_then_tail(b) =>
+                $crate::repository::snapshots::queued_snapshotted_reads_hydrate_snapshot_then_tail(b.repository());
         }
         $crate::conformance_cases! { @if $durable $crate::repository::Durable, $backend, open_durable;
             #[tokio::test]

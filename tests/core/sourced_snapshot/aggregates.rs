@@ -19,7 +19,7 @@ pub struct Inventory {
     pub available: u32,
 }
 
-#[sourced(entity)]
+#[sourced(entity, aggregate_type = "inventory")]
 impl Inventory {
     pub fn new() -> Self {
         Self::default()
@@ -51,7 +51,7 @@ pub struct Order {
     pub cached_label: String,
 }
 
-#[sourced(entity)]
+#[sourced(entity, aggregate_type = "order")]
 impl Order {
     pub fn new() -> Self {
         Self::default()
@@ -67,7 +67,7 @@ impl Order {
 }
 
 // ============================================================================
-// Works with #[sourced(entity)] on impl
+// Works with #[sourced] on impl
 // ============================================================================
 
 #[derive(Default, Snapshot)]
@@ -76,7 +76,7 @@ pub struct Counter {
     pub count: i64,
 }
 
-#[distributed::sourced(entity)]
+#[distributed::sourced(entity, aggregate_type = "counter")]
 impl Counter {
     pub fn new() -> Self {
         Self::default()
@@ -105,7 +105,7 @@ pub struct Widget {
     pub weight: f64,
 }
 
-#[sourced(my_entity)]
+#[sourced(my_entity, aggregate_type = "widget")]
 impl Widget {
     pub fn new() -> Self {
         Self::default()
@@ -135,7 +135,7 @@ pub struct Notifier {
     pub emitter: DummyEmitter,
 }
 
-#[sourced(entity)]
+#[sourced(entity, aggregate_type = "notifier")]
 impl Notifier {
     pub fn new() -> Self {
         Self::default()

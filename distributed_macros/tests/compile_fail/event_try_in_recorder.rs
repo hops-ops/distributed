@@ -11,7 +11,7 @@ impl Todo {
     }
 }
 
-#[sourced(entity)]
+#[sourced(entity, aggregate_type = "todo")]
 impl Todo {
     #[event("todo.completed")]
     fn complete(&mut self) {

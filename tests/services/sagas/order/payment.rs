@@ -24,7 +24,7 @@ pub struct Payment {
 }
 
 #[allow(dead_code)]
-#[sourced(entity)]
+#[sourced(entity, aggregate_type = "payment")]
 impl Payment {
     pub fn new() -> Self {
         Self::default()

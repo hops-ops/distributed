@@ -13,7 +13,7 @@ pub struct Inventory {
 }
 
 #[allow(dead_code)]
-#[sourced(entity)]
+#[sourced(entity, aggregate_type = "inventory")]
 impl Inventory {
     pub fn new() -> Self {
         Self::default()

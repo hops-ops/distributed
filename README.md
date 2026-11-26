@@ -854,7 +854,7 @@ struct Todo {
     completed: bool,
 }
 
-#[sourced(entity)]
+#[sourced(entity, aggregate_type = "todo")]
 impl Todo {
     #[event("initialized")]
     fn initialize(&mut self, id: String, user_id: String, task: String) {
@@ -983,7 +983,7 @@ the generated delete-projection client, helper replay and conflicting/dynamic-va
 
 ### Durable Stream Identity
 
-`Aggregate::aggregate_type()` provides the type component of a persistence stream's identity (the pair `(aggregate_type, aggregate_id)`). The default uses Rust's type name for development convenience, but **production persistence should set an explicit, stable durable name**:
+`Aggregate::aggregate_type()` provides the type component of a persistence stream's identity (the pair `(aggregate_type, aggregate_id)`). It is required, and must be a stable durable name: renaming or moving the Rust type must not change it.
 
 ```rust,ignore
 #[sourced(entity, aggregate_type = "todo")]
@@ -1014,7 +1014,7 @@ fn print_todo_event(record: &EventRecord) -> Result<(), String> {
 ### Custom Enum Name
 
 ```rust,ignore
-#[sourced(entity, events = "TodoCommand")]
+#[sourced(entity, events = "TodoCommand", aggregate_type = "todo")]
 impl Todo {
     // generates TodoCommand enum instead of TodoEvent
 }
@@ -1032,7 +1032,7 @@ fn upcast_init_v1_v2((id, task): InitV1) -> InitV2 {
     (id, task, 0)
 }
 
-#[sourced(entity, upcasters(
+#[sourced(entity, aggregate_type = "todo_v2", upcasters(
     ("initialized", 1 => 2, InitV1 => InitV2, upcast_init_v1_v2),
 ))]
 impl TodoV2 {
@@ -1051,7 +1051,7 @@ impl TodoV2 {
 ### Custom Entity Field
 
 ```rust,ignore
-#[sourced(my_entity)]
+#[sourced(my_entity, aggregate_type = "my_aggregate")]
 impl MyAggregate {
     #[event("initialized")]
     fn create(&mut self, name: String) {
@@ -2534,7 +2534,7 @@ fn upcast_init_v1_v2((id, task): InitV1) -> InitV2 {
 With `#[sourced]`, add upcasters directly in the attribute:
 
 ```rust,ignore
-#[sourced(entity, upcasters(
+#[sourced(entity, aggregate_type = "todo", upcasters(
     ("initialized", 1 => 2, InitV1 => InitV2, upcast_init_v1_v2),
 ))]
 impl Todo {
@@ -2559,7 +2559,7 @@ Old events stored as `(id, task)` at v1 are transparently upcast to `(id, task, 
 Upcasters chain automatically. Each transforms one version to the next (v1→v2→v3):
 
 ```rust,ignore
-#[sourced(entity, upcasters(
+#[sourced(entity, aggregate_type = "todo", upcasters(
     ("initialized", 1 => 2, InitV1 => InitV2, upcast_init_v1_v2),
     ("initialized", 2 => 3, InitV2 => InitV3, upcast_init_v2_v3),
 ))]
@@ -2792,7 +2792,6 @@ src/
   command/            # Typed commands: Eventual/Atomic/Succeeded, prepared completions, client effects
   command_dispatch/   # CommandHost: local, HTTP and remote dispatch boundary
   command_ledger/     # Durable command identity and fenced commit primitives (crate-private)
-  commit_builder/     # Transactional batches for aggregates, outbox, and read models
   domain_event/       # Typed outward domain events, separate from replay bytes
   entity/             # Entity, event records, metadata, upcasting codecs
   gateway/            # Portable application gateway contracts (feature = "gateway*")
@@ -2803,7 +2802,7 @@ src/
   metrics/            # Prometheus-compatible framework metrics (feature = "metrics")
   microsvc/           # Command/event handler framework: service, context, session, cell_host (celld)
   mutation/           # Event-independent read-model mutation IR and interpreters
-  outbox/             # Durable outbox message + commit extension
+  outbox/             # Durable outbox message + the aggregate commit builder
   outbox_worker/      # Outbox claiming, publishing, workers
   postgres_repo/      # Postgres async SQL repository (feature = "postgres")
   projection/         # Deterministic domain-event projection programs and runtime

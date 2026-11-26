@@ -1,6 +1,6 @@
-use distributed::{CommitBuilderExt, GetStream, TransactionalCommit};
+use distributed::{GetStream, TransactionalCommit};
 
-use super::shared::get_aggregate;
+use super::shared::{commit_aggregates, get_aggregate, stream};
 use crate::bomberman::domain::game_map::GameMap;
 use crate::bomberman::domain::player::Player;
 use crate::bomberman::domain::types::Direction;
@@ -42,10 +42,7 @@ where
         player.apply_power_up(power_up)?;
     }
 
-    repo.aggregate(&mut map)
-        .aggregate(&mut player)
-        .commit()
-        .await?;
+    commit_aggregates(repo, vec![stream(&mut map)?, stream(&mut player)?]).await?;
 
     Ok(())
 }

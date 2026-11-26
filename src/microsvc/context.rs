@@ -158,6 +158,10 @@ mod tests {
     impl Aggregate for DownstreamAggregate {
         type ReplayError = String;
 
+        fn aggregate_type() -> &'static str {
+            "downstream_aggregate"
+        }
+
         fn entity(&self) -> &Entity {
             &self.entity
         }

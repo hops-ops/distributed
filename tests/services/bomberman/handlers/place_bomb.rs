@@ -1,6 +1,6 @@
-use distributed::{CommitBuilderExt, GetStream, TransactionalCommit};
+use distributed::{GetStream, TransactionalCommit};
 
-use super::shared::get_aggregate;
+use super::shared::{commit_aggregates, get_aggregate, stream};
 use crate::bomberman::domain::bomb::Bomb;
 use crate::bomberman::domain::game_map::GameMap;
 use crate::bomberman::domain::player::Player;
@@ -39,10 +39,7 @@ where
         player.blast_radius,
     )?;
 
-    repo.aggregate(&mut player)
-        .aggregate(&mut bomb)
-        .commit()
-        .await?;
+    commit_aggregates(repo, vec![stream(&mut player)?, stream(&mut bomb)?]).await?;
 
     Ok(())
 }

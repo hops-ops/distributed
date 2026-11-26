@@ -13,6 +13,7 @@ use crate::entity::{
     EventRecord, EventRecordError, BITCODE_PAYLOAD_CODEC, BITCODE_PAYLOAD_CODEC_VERSION,
 };
 use crate::outbox::OutboxMessage;
+use crate::projection_protocol::SameTransactionProjectionBatch;
 use crate::snapshot::SnapshotRecord;
 
 use super::{
@@ -23,15 +24,26 @@ use super::{
 ///
 /// This is the single validation preamble every backend runs before touching
 /// storage: duplicate-stream and duplicate-outbox rejection, entity/identity
-/// agreement, sequence-contiguity of the prepared appends, and snapshot
-/// identity agreement. Backends must not add or skip batch-shape checks
-/// locally — extending this function is what keeps them from drifting.
+/// agreement, sequence-contiguity of the prepared appends, snapshot identity
+/// agreement, and the domain-event guard. Backends must not add or skip
+/// batch-shape checks locally — extending this function is what keeps them
+/// from drifting.
+///
+/// The domain-event guard: an aggregate's capture poison fails the commit,
+/// and every domain event it captured must leave in the same commit, as an
+/// outbox row with the occurrence's id, so no commit path can persist the
+/// replay events and silently drop the publication. The one exception is
+/// `projection`: a causal command commit whose same-transaction projection
+/// consumes the occurrences (the causal workspace has already required a
+/// publication or that projection for each of them).
 pub(crate) fn validate_commit_batch<'a>(
     batch: &'a CommitBatch<'_>,
+    projection: Option<&SameTransactionProjectionBatch>,
 ) -> Result<Vec<PreparedEventAppend<'a>>, RepositoryError> {
     reject_duplicate_streams(&batch.streams)?;
     reject_duplicate_outbox_messages(&batch.outbox_messages)?;
     validate_entity_id_matches_identity(&batch.streams)?;
+    require_captured_events_are_published(batch, projection.is_some())?;
 
     let prepared = batch
         .streams
@@ -51,21 +63,20 @@ pub(crate) fn validate_commit_batch<'a>(
     Ok(prepared)
 }
 
-/// A domain event an aggregate captured must leave in the same commit, as an
-/// outbox row with the occurrence's id. Every backend runs this for a commit
-/// that is not a causal command commit, so no builder can persist the replay
-/// events and silently drop the publication. (A causal commit applies its own
-/// guard: it may hand the occurrences to a same-transaction projection.)
-pub(crate) fn require_captured_events_are_published(
+fn require_captured_events_are_published(
     batch: &CommitBatch<'_>,
+    projected: bool,
 ) -> Result<(), RepositoryError> {
     for stream in &batch.streams {
         let pending = stream
             .entity
             .pending_domain_events_for_commit()
             .map_err(|error| RepositoryError::Model(error.to_string()))?;
+        if projected {
+            continue;
+        }
         for occurrence in pending {
-            let id = occurrence.id().to_string();
+            let id = occurrence.id();
             if !batch
                 .outbox_messages
                 .iter()

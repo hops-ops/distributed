@@ -1,3 +1,3 @@
 mod repository;
 
-pub use repository::{GetAllWithOpts, GetWithOpts, Queueable, QueuedRepository, ReadOpts};
+pub use repository::{Queueable, QueuedRepository, ReadOpts};

@@ -19,7 +19,7 @@ use crate::shared::{
 pub(crate) struct SourcedArgs {
     entity_field: Ident,
     enum_name: Option<LitStr>,
-    aggregate_type: Option<LitStr>,
+    aggregate_type: LitStr,
     domain_state: Option<Type>,
     pub(crate) upcasters: Vec<UpcasterDef>,
 }
@@ -73,6 +73,14 @@ pub(crate) fn parse_sourced_args(input: ParseStream) -> syn::Result<SourcedArgs>
             ));
         }
     }
+
+    let aggregate_type = aggregate_type.ok_or_else(|| {
+        syn::Error::new_spanned(
+            &entity_field,
+            "#[sourced] requires `aggregate_type = \"...\"`: the durable stream name, which \
+             must not change when the Rust type is renamed or moved",
+        )
+    })?;
 
     Ok(SourcedArgs {
         entity_field,
@@ -324,7 +332,7 @@ fn expand_domain_capture(
     aggregate: &Ident,
     event_enum: &Ident,
     entity_field: &Ident,
-    aggregate_type: Option<&LitStr>,
+    aggregate_type: &LitStr,
     domain_state: Option<&Type>,
     event_attr: &EventAttr,
     params: &[(Ident, Type)],
@@ -338,21 +346,6 @@ fn expand_domain_capture(
         });
     };
 
-    let aggregate_type = match (mode, aggregate_type) {
-        (DomainMode::Deleted, None) => {
-            return Err(syn::Error::new_spanned(
-                &event_attr.event_name,
-                "`domain = deleted` requires `aggregate_type = \"...\"` in #[sourced(...)] so the deletion has stable typed identity",
-            ));
-        }
-        (_, None) => {
-            return Err(syn::Error::new_spanned(
-                &event_attr.event_name,
-                "domain-event capture requires `aggregate_type = \"...\"` in #[sourced(...)]",
-            ));
-        }
-        (_, Some(aggregate_type)) => aggregate_type,
-    };
     let version = event_version(event_attr.version.as_ref());
     let event_name = &event_attr.event_name;
     let framework = framework_path()?;
@@ -798,7 +791,7 @@ pub(crate) fn expand_sourced(attr: TokenStream2, item: TokenStream2) -> syn::Res
                         &struct_name,
                         &enum_name,
                         &args.entity_field,
-                        args.aggregate_type.as_ref(),
+                        &args.aggregate_type,
                         args.domain_state.as_ref(),
                         &event_attr,
                         &params,
@@ -1047,13 +1040,12 @@ pub(crate) fn expand_sourced(attr: TokenStream2, item: TokenStream2) -> syn::Res
 
     let (upcaster_wrappers, upcasters_method) =
         generate_upcaster_tokens(&framework, &struct_name, &args.upcasters);
-    let aggregate_type_method = args.aggregate_type.as_ref().map(|aggregate_type| {
-        quote! {
-            fn aggregate_type() -> &'static str {
-                #aggregate_type
-            }
+    let aggregate_type = &args.aggregate_type;
+    let aggregate_type_method = quote! {
+        fn aggregate_type() -> &'static str {
+            #aggregate_type
         }
-    });
+    };
 
     // ReplayError stays `String` — see the rationale on `expand_aggregate`.
     let aggregate_impl = aggregate_impl_tokens(

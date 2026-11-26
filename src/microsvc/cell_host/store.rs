@@ -249,7 +249,7 @@ impl CellStreamStore {
         if self.memory().is_err() {
             return Ok(None);
         }
-        let prepared = validate_commit_batch(batch)?;
+        let prepared = validate_commit_batch(batch, None)?;
         if prepared.iter().all(|append| append.events.is_empty()) {
             return Ok(None);
         }

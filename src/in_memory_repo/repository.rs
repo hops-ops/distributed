@@ -23,9 +23,9 @@ use crate::projection_protocol::{
 };
 use crate::read_model::{InMemoryReadModelStore, ReadModelLoadGraph, ReadModelLoadRequest};
 use crate::repository::{
-    validate_commit_batch, validate_snapshot_identity, CommitBatch, GetStream, InboxStore,
-    ReadModelWritePlanStore, RelationalReadModelQueryStore, RepositoryError, SnapshotStore,
-    SnapshotWrite, StreamIdentity, TransactionalCommit,
+    validate_commit_batch, CommitBatch, GetStream, InboxStore, ReadModelWritePlanStore,
+    RelationalReadModelQueryStore, RepositoryError, SnapshotStore, SnapshotWrite, StreamIdentity,
+    TransactionalCommit,
 };
 use crate::snapshot::{InMemorySnapshotStore, SnapshotRecord};
 use crate::table::{TableStoreError, TableWritePlan};
@@ -240,10 +240,7 @@ impl InMemoryRepository {
         let mut batch = batch;
         let schedule_owner = crate::schedule::schedule_owner(&batch)?;
         crate::schedule::resolve_schedule_writes(&mut batch.schedules, self.clock.now())?;
-        let prepared = validate_commit_batch(&batch)?;
-        if completion.is_none() {
-            crate::repository::require_captured_events_are_published(&batch)?;
-        }
+        let prepared = validate_commit_batch(&batch, direct_projection.as_ref())?;
         if let Some(direct_projection) = &direct_projection {
             direct_projection.validate()?;
             let completion = completion.as_ref().ok_or_else(|| {
@@ -820,36 +817,20 @@ impl RelationalReadModelQueryStore for InMemoryRepository {
     }
 }
 
+/// Its snapshots are its [`InMemorySnapshotStore`].
 impl SnapshotStore for InMemoryRepository {
     fn get_snapshot<'a>(
         &'a self,
         identity: &'a StreamIdentity,
     ) -> impl Future<Output = Result<Option<SnapshotRecord>, RepositoryError>> + Send + 'a {
-        async move {
-            let storage = self
-                .snapshot_store
-                .storage
-                .read()
-                .map_err(|_| RepositoryError::LockPoisoned("async snapshot read"))?;
-            Ok(storage.get(&identity.storage_key()).cloned())
-        }
+        self.snapshot_store.get_snapshot(identity)
     }
 
     fn get_snapshots<'a>(
         &'a self,
         identities: &'a [StreamIdentity],
     ) -> impl Future<Output = Result<Vec<SnapshotRecord>, RepositoryError>> + Send + 'a {
-        async move {
-            let storage = self
-                .snapshot_store
-                .storage
-                .read()
-                .map_err(|_| RepositoryError::LockPoisoned("async snapshot read"))?;
-            Ok(identities
-                .iter()
-                .filter_map(|identity| storage.get(&identity.storage_key()).cloned())
-                .collect())
-        }
+        self.snapshot_store.get_snapshots(identities)
     }
 
     fn save_snapshot<'a>(
@@ -857,30 +838,14 @@ impl SnapshotStore for InMemoryRepository {
         identity: &'a StreamIdentity,
         record: SnapshotRecord,
     ) -> impl Future<Output = Result<(), RepositoryError>> + Send + 'a {
-        async move {
-            validate_snapshot_identity(identity, &record)?;
-            let mut storage = self
-                .snapshot_store
-                .storage
-                .write()
-                .map_err(|_| RepositoryError::LockPoisoned("async snapshot write"))?;
-            storage.insert(identity.storage_key(), record);
-            Ok(())
-        }
+        self.snapshot_store.save_snapshot(identity, record)
     }
 
     fn delete_snapshot<'a>(
         &'a self,
         identity: &'a StreamIdentity,
     ) -> impl Future<Output = Result<bool, RepositoryError>> + Send + 'a {
-        async move {
-            let mut storage = self
-                .snapshot_store
-                .storage
-                .write()
-                .map_err(|_| RepositoryError::LockPoisoned("async snapshot write"))?;
-            Ok(storage.remove(&identity.storage_key()).is_some())
-        }
+        self.snapshot_store.delete_snapshot(identity)
     }
 }
 

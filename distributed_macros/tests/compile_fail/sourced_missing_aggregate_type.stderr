@@ -1,0 +1,5 @@
+error: #[sourced] requires `aggregate_type = "..."`: the durable stream name, which must not change when the Rust type is renamed or moved
+ --> tests/compile_fail/sourced_missing_aggregate_type.rs:8:11
+  |
+8 | #[sourced(entity)]
+  |           ^^^^^^

@@ -45,10 +45,7 @@ where
 {
     let mut batch = batch;
     let schedule_owner = crate::schedule::schedule_owner(&batch)?;
-    let prepared = validate_commit_batch(&batch)?;
-    if completion.is_none() {
-        crate::repository::require_captured_events_are_published(&batch)?;
-    }
+    let prepared = validate_commit_batch(&batch, direct_projection.as_ref())?;
     if let Some(direct_projection) = &direct_projection {
         direct_projection.validate().map_err(|error| {
             CommandLedgerError::Storage(RepositoryError::Model(error.to_string()))

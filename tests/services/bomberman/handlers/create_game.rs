@@ -1,5 +1,6 @@
-use distributed::{CommitBuilderExt, TransactionalCommit};
+use distributed::TransactionalCommit;
 
+use super::shared::{commit_aggregates, stream};
 use crate::bomberman::domain::game_map::GameMap;
 use crate::bomberman::error::GameError;
 
@@ -11,7 +12,7 @@ where
 
     let mut map = GameMap::default();
     map.create(game_id.into(), width, height, tiles, spawn_points)?;
-    repo.aggregate(&mut map).commit().await?;
+    commit_aggregates(repo, vec![stream(&mut map)?]).await?;
 
     Ok(map)
 }

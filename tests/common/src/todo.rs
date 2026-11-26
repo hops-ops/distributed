@@ -11,7 +11,7 @@ pub struct Todo {
     pub completed: bool,
 }
 
-#[sourced(entity)]
+#[sourced(entity, aggregate_type = "todo")]
 impl Todo {
     pub fn new() -> Self {
         Self::default()

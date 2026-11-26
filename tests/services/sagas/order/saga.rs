@@ -48,7 +48,7 @@ pub struct OrderFulfillmentSaga {
 }
 
 #[allow(dead_code)]
-#[sourced(entity)]
+#[sourced(entity, aggregate_type = "order_fulfillment_saga")]
 impl OrderFulfillmentSaga {
     pub fn new() -> Self {
         Self::default()

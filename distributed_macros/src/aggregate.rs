@@ -14,7 +14,7 @@ pub(crate) fn aggregate_impl_tokens(
     framework: &TokenStream2,
     type_name: &Ident,
     entity_field: &Ident,
-    aggregate_type_method: &Option<TokenStream2>,
+    aggregate_type_method: &TokenStream2,
     version_arms: &[TokenStream2],
     replay_arms: &[TokenStream2],
     upcasters_method: &TokenStream2,

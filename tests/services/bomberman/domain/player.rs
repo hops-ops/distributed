@@ -15,7 +15,7 @@ pub struct Player {
     pub blast_radius: u8,
 }
 
-#[sourced(entity)]
+#[sourced(entity, aggregate_type = "player")]
 impl Player {
     #[event("joined")]
     pub fn join(&mut self, id: String, name: String, x: i32, y: i32) {

@@ -1,14 +1,16 @@
 use std::sync::Arc;
 
 use distributed::{
-    Aggregate, AggregateBuilder, CommitBatch, Entity, GetStream, RepositoryError, SnapshotRecord,
-    SnapshotStore, SnapshotWrite, StreamIdentity, StreamWrite, TraceContext, TransactionalCommit,
+    Aggregate, AggregateBuilder, CommitBatch, Entity, GetStream, QueuedRepository, RepositoryError,
+    SnapshotRecord, SnapshotStore, SnapshotWrite, StreamIdentity, StreamWrite, TraceContext,
+    TransactionalCommit,
 };
 use tokio::sync::Barrier;
 
 use super::checkout::{CHECKOUT_SEAT_RESERVED_STATUS, SEAT_RESERVED_STATUS};
 use super::checkout_saga::CheckoutSaga;
 use super::seat::Seat;
+use super::snapshots::Tally;
 
 pub use crate::ids::unique_id;
 
@@ -123,11 +125,9 @@ where
         .await
         .expect("stale load should succeed")
         .expect("stale seat should exist");
-    let mut winner = seat_repo
-        .get(&seat_id)
-        .await
-        .expect("winner load should succeed")
-        .expect("winner seat should exist");
+    // The winner is the committed original, not a second load: a second
+    // load of the stream would wait on a queued repository's lock.
+    let mut winner = original;
     stale
         .reserve(
             unique_id("checkout-stale"),
@@ -574,4 +574,52 @@ where
         seat_id: event.seat_id,
         seat_category: event.seat_category,
     })
+}
+
+/// The queued counterpart of [`racing_commits_one_wins_one_conflicts`]: on a
+/// queued repository racers' locking loads take turns, each after the previous
+/// racer's commit, so every racer commits and the stream stays gap-free.
+pub async fn queued_racing_commits_take_turns<R>(repo: QueuedRepository<R>, concurrency: usize)
+where
+    R: GetStream + TransactionalCommit + Clone + Send + Sync + 'static,
+{
+    let id = unique_id("queued-racing-tally");
+    let tallies = repo.clone().aggregate::<Tally>();
+    let mut seed = Tally::default();
+    seed.open(id.clone()).unwrap();
+    tallies.commit(&mut seed).await.expect("seed should commit");
+
+    let barrier = Arc::new(Barrier::new(concurrency));
+    let mut handles = Vec::with_capacity(concurrency);
+    for _ in 0..concurrency {
+        let tallies = repo.clone().aggregate::<Tally>();
+        let barrier = Arc::clone(&barrier);
+        let id = id.clone();
+        handles.push(tokio::spawn(async move {
+            barrier.wait().await;
+            let mut tally = tallies
+                .get(&id)
+                .await
+                .expect("racer load should succeed")
+                .expect("racer should see the seeded tally");
+            tally.add(1).unwrap();
+            tallies.commit(&mut tally).await
+        }));
+    }
+    for handle in handles {
+        handle
+            .await
+            .expect("racer task should not panic")
+            .expect("every queued racer should commit");
+    }
+
+    let tally = tallies.get(&id).await.unwrap().unwrap();
+    assert_eq!(tally.total, concurrency as i64);
+    let sequences = tally
+        .entity
+        .events()
+        .iter()
+        .map(|event| event.sequence)
+        .collect::<Vec<_>>();
+    assert_eq!(sequences, (1..=concurrency as u64 + 1).collect::<Vec<_>>());
 }

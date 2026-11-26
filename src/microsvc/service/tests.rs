@@ -496,7 +496,7 @@ struct RouteComboAggregate {
     entity: Entity,
 }
 
-#[sourced(entity)]
+#[sourced(entity, aggregate_type = "route_combo_aggregate")]
 impl RouteComboAggregate {
     #[event("created")]
     fn create(&mut self) {
@@ -2175,22 +2175,22 @@ async fn causal_dispatch_uses_the_configured_immediate_outbox_publisher() {
 
 #[tokio::test]
 async fn causal_prepared_batch_failure_rolls_back_every_atomic_participant() {
-    use crate::{CommitBuilderExt, SnapshotStore};
+    use crate::{CommitBatch, SnapshotStore, TransactionalCommit};
 
     let aggregate_id = "atomic-rollback-aggregate";
     let repository = InMemoryRepository::new();
     // An outbox row already holds the id the command stages, so its batch
     // fails after the stream, snapshot and outbox legs are staged.
     repository
-        .outbox(
-            OutboxMessage::create(
+        .commit_batch(CommitBatch {
+            outbox_messages: vec![OutboxMessage::create(
                 format!("{aggregate_id}:atomic-fact"),
                 "causal.atomic_fact",
                 b"earlier".to_vec(),
             )
-            .unwrap(),
-        )
-        .commit_all()
+            .unwrap()],
+            ..CommitBatch::empty()
+        })
         .await
         .unwrap();
     let service = Service::new().named("causal-atomic-rollback").routes(

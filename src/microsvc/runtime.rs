@@ -204,7 +204,7 @@ mod tests {
         entity: Entity,
     }
 
-    #[sourced(entity)]
+    #[sourced(entity, aggregate_type = "dummy")]
     impl Dummy {
         #[event("touched")]
         fn touch(&mut self) {

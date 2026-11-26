@@ -16,7 +16,7 @@ pub struct TodoV1 {
     pub completed: bool,
 }
 
-#[sourced(entity)]
+#[sourced(entity, aggregate_type = "todo_v1")]
 impl TodoV1 {
     #[event("initialized")]
     pub fn initialize(&mut self, id: String, user_id: String, task: String) {
@@ -48,7 +48,7 @@ pub struct TodoV2 {
     pub completed: bool,
 }
 
-#[sourced(entity, upcasters(
+#[sourced(entity, aggregate_type = "todo_v2", upcasters(
     ("initialized", 1 => 2, InitializedV1 => InitializedV2, Self::upcast_initialized_v1_v2),
 ))]
 impl TodoV2 {
@@ -88,7 +88,7 @@ pub struct TodoV3 {
     pub completed: bool,
 }
 
-#[sourced(entity, upcasters(
+#[sourced(entity, aggregate_type = "todo_v3", upcasters(
     ("initialized", 1 => 2, InitializedV1 => InitializedV2, upcast_initialized_v1_v2),
     ("initialized", 2 => 3, InitializedV2 => InitializedV3, upcast_initialized_v2_v3),
 ))]

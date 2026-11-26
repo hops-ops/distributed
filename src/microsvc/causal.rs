@@ -74,7 +74,7 @@ where
     where
         A: Aggregate + Send + Sync + 'static,
     {
-        self.repository.snapshot_writes_for(aggregate)
+        self.repository.snapshot_writes(aggregate)
     }
 }
 

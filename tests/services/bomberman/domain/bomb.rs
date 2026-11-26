@@ -11,7 +11,7 @@ pub struct Bomb {
     pub exploded: bool,
 }
 
-#[sourced(entity)]
+#[sourced(entity, aggregate_type = "bomb")]
 impl Bomb {
     #[event("initialized")]
     pub fn create(&mut self, id: String, owner_id: String, x: i32, y: i32, blast_radius: u8) {
