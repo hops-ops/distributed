@@ -283,7 +283,11 @@ export class Predictor<TInput> {
 				}
 				if (policy.mode === 'ease') {
 					const duration = policy.durationMs ?? 100;
-					if (Math.abs(visual) > epsilon && duration > 0 && !cut) {
+					if (Math.abs(error) <= epsilon && !cut && this.#offsets.has(name)) {
+						// Nothing new to correct: the running ease goes on as
+						// scheduled (restarting it on every Delta would stretch a
+						// correction far past `durationMs`).
+					} else if (Math.abs(visual) > epsilon && duration > 0 && !cut) {
 						this.#offsets.set(name, { value: visual, start: now, durationMs: duration, angle });
 					} else {
 						this.#offsets.delete(name);

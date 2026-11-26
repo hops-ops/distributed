@@ -43,7 +43,13 @@ test('rooms on celld: kills settle, doorways hand over, left rooms sleep and res
 	try {
 		const api = new DevApi({ base: server.httpUrl, name: () => 'Hunter', storage });
 		const pitApi = new MobPitApi(server.httpUrl, server.roomsUrl);
-		const pit = createMobPitClient({ api, roomsBase: server.roomsUrl });
+		// Proximity wake off (its own test): the player stands beside the
+		// doorway it came through, in reach of the room it left, so with it
+		// on that room would stay awake while the player lives, or (its
+		// watcher's first ticket granted no wake yet) sleep and be woken
+		// again by the next. Off, the left room sleeps because it emptied,
+		// and nothing wakes it before the player walks back in.
+		const pit = createMobPitClient({ api, roomsBase: server.roomsUrl, wake: false });
 		clients.push(pit.client);
 		const welcome = await pit.client.connect('pit.0.0');
 		assert.deepEqual(welcome.schema.kinds.map((k) => k.name), ['player', 'mob', 'pillar', 'pit']);

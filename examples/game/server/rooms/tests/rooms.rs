@@ -115,6 +115,7 @@ fn a_room_greets_with_its_coordinates_and_hands_off_through_doorways() {
             ServerMessage::Handoff {
                 target_zone,
                 transfer_ticket,
+                ..
             } => Some((target_zone, transfer_ticket)),
             _ => None,
         });
@@ -680,6 +681,49 @@ fn a_laser_hits_the_mob_it_was_aimed_at_and_bounces_off_obstacles() {
     let (hit, path) = fire(&mut room, 4, 10, yaw);
     assert_eq!(hit, Some(target), "bank shot: {path:?}");
     assert_eq!(path.len(), 2, "pillar, then the mob: {path:?}");
+}
+
+#[test]
+fn a_stall_counts_towards_the_bow_cooldown() {
+    let clock = ManualClock::new();
+    let mut room = host("pit.0.0", &clock);
+    let (client, _) = join(&mut room, "ana");
+    tick(&mut room, &clock);
+    let shot = |n: u16| {
+        distributed_game::GameInput::to_payload(&PitInput {
+            buttons: PitInput::FIRE | PitInput::NO_COMP,
+            shot: n,
+            ..PitInput::default()
+        })
+    };
+    let verdicts = |out: &[Outbound]| {
+        events(out)
+            .into_iter()
+            .filter_map(|e| match e {
+                PitEvent::Shot { shot, .. } => Some(shot),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    };
+    room.push_input(client, 1, room.tick() as u32, &shot(1));
+    let mut seen = verdicts(&tick(&mut room, &clock));
+    assert_eq!(seen, [1], "the first shot");
+    // The room stalls for a second (more than a cooldown) right after it:
+    // the host runs its catch-up cap and drops the other ticks. The next
+    // shot, sent during the stall, is a whole cooldown after the first.
+    room.push_input(client, 2, room.tick() as u32, &shot(2));
+    clock.advance(Duration::from_secs(1));
+    let report = room.advance();
+    assert!(
+        report.dropped_ticks > mobpit_rooms::FIRE_COOLDOWN.into(),
+        "dropped {}",
+        report.dropped_ticks
+    );
+    seen.extend(verdicts(&room.drain_outbound()));
+    for _ in 0..3 {
+        seen.extend(verdicts(&tick(&mut room, &clock)));
+    }
+    assert_eq!(seen, [1, 2], "the shot after the stall is answered");
 }
 
 /// Walk `player` towards `(tx, ty)` (room-local) until the room hands it

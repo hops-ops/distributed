@@ -323,7 +323,7 @@ Event   := 0x82, varuint type_id, bytes payload
 Pong    := 0x83, f64 client_time, f64 server_time
 Freeze  := 0x84, string reason, string version, string notes
 Resume  := 0x85, string reason, string version, string notes
-Handoff := 0x86, string target_zone, string transfer_ticket
+Handoff := 0x86, string target_zone, string transfer_ticket, varuint ack_seq
 Kick    := 0x87, varuint code, string message
 Error   := 0x88, varuint code, string message
 Redirect := 0x89, string zone_id, string url
@@ -359,6 +359,9 @@ Redirect := 0x89, string zone_id, string url
   `/zones/{target_zone}` (on the current host; follow any Redirect) and
   present `transfer_ticket` as the Hello `ticket` (empty
   `reconnect_token`). The server closes the socket. See §8.1.
+  `ack_seq` is the highest input sequence this zone processed for the
+  player (as in a Delta, §7.1); this zone applies no input after it, so a
+  predicting client sends those inputs to the target after its Welcome.
 - **Kick**: the session is over; the server closes the socket.
   Codes: `1` BY_ZONE, `2` REPLACED (same principal connected again),
   `3` SHUTDOWN, `4` RATE_LIMITED, `5` ZONE_DISPOSED, `6` SLOW_CONSUMER,

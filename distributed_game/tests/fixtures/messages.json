@@ -633,12 +633,13 @@
     },
     {
       "decoded": {
+        "ack_seq": 300,
         "target_zone": "z2",
         "transfer_ticket": "tt",
         "type": "Handoff"
       },
       "direction": "server_to_client",
-      "hex": "86027a32027474",
+      "hex": "86027a32027474ac02",
       "name": "handoff"
     },
     {

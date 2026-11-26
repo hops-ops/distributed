@@ -201,7 +201,8 @@ function messageFromJson(decoded, schema) {
 			return {
 				type: 'Handoff',
 				targetZone: decoded.target_zone,
-				transferTicket: decoded.transfer_ticket
+				transferTicket: decoded.transfer_ticket,
+				ackSeq: decoded.ack_seq
 			};
 		case 'Kick':
 		case 'Error':
@@ -290,6 +291,7 @@ function messageToJson(message, kinds) {
 			return { notes: message.notes, reason: message.reason, type: message.type, version: message.version };
 		case 'Handoff':
 			return {
+				ack_seq: message.ackSeq,
 				target_zone: message.targetZone,
 				transfer_ticket: message.transferTicket,
 				type: 'Handoff'

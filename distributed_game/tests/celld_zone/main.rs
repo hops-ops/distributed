@@ -385,6 +385,7 @@ async fn single_node() {
             Got::Server(ServerMessage::Handoff {
                 target_zone,
                 transfer_ticket,
+                ..
             }) => {
                 assert_eq!(target_zone, "room-b");
                 Some(transfer_ticket.clone())

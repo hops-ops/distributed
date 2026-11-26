@@ -180,7 +180,7 @@ test('refused handoff returns to the source with the same Hello, then falls back
 	await client.connect('z1');
 	network.last('z1').send(delta({ creates: [avatar(1, 5)] }));
 
-	network.last('z1').send({ type: 'Handoff', targetZone: 'z2', transferTicket: 'transfer:t1' });
+	network.last('z1').send({ type: 'Handoff', targetZone: 'z2', transferTicket: 'transfer:t1', ackSeq: 0 });
 	network.last('z1').close();
 	await scheduler.advance(10);
 	assert.equal(network.last('z2').lastHello.ticket, 'transfer:t1');
@@ -199,7 +199,7 @@ test('refused handoff returns to the source with the same Hello, then falls back
 	const failures2 = [];
 	client2.on('handoffFailed', (f) => failures2.push(f.stage));
 	await client2.connect('z1');
-	net2.last('z1').send({ type: 'Handoff', targetZone: 'z2', transferTicket: 'transfer:t1' });
+	net2.last('z1').send({ type: 'Handoff', targetZone: 'z2', transferTicket: 'transfer:t1', ackSeq: 0 });
 	net2.last('z1').close();
 	await scheduler.advance(10);
 	assert.deepEqual(failures2, ['target', 'return']);
@@ -220,7 +220,7 @@ test('handoff holds the predicted entity until the target binds it (no source co
 	const own = () => client.render().filter((e) => e.id === 1);
 	assert.deepEqual(own().map((e) => [e.key, e.predicted]), [['z1:1', true]]);
 
-	network.last('z1').send({ type: 'Handoff', targetZone: 'z2', transferTicket: 'transfer:t1' });
+	network.last('z1').send({ type: 'Handoff', targetZone: 'z2', transferTicket: 'transfer:t1', ackSeq: 0 });
 	await scheduler.advance(10);
 	assert.equal(client.authority.zoneId, 'z2');
 	// Welcomed by z2 but no Delta yet: one frozen predicted copy, not the
@@ -235,7 +235,7 @@ test('handoff holds the predicted entity until the target binds it (no source co
 	client.close();
 });
 
-test('handoffFrame: the prediction continues through a handoff in the target frame, inputs reach the target, the switch eases', async () => {
+test('handoffFrame: the prediction continues through a handoff in the target frame, inputs reach the target, nothing is lost', async () => {
 	const network = new FakeNetwork();
 	const scheduler = new FakeScheduler();
 	const inputs = { z1: [], z2: [] };
@@ -265,10 +265,10 @@ test('handoffFrame: the prediction continues through a handoff in the target fra
 	const own = () => client.render().filter((e) => e.id === 1);
 	await client.connect('z1');
 	network.last('z1').send(delta({ creates: [avatar(1, 9.5)] }));
-	client.sendInput(10, 100); // +1 → 10.5 (lost: z1 hands off before applying it)
+	client.sendInput(10, 100); // +1 → 10.5 (z1 hands off before applying it: ackSeq 0)
 	assert.ok(Math.abs(world(own()[0]) - 10.5) < 1e-3, `predicted: ${JSON.stringify(own())}`);
 
-	network.last('z1').send({ type: 'Handoff', targetZone: 'z2', transferTicket: 'transfer:t1' });
+	network.last('z1').send({ type: 'Handoff', targetZone: 'z2', transferTicket: 'transfer:t1', ackSeq: 0 });
 	await scheduler.advance(10);
 	// Not welcomed yet: predicted on in z2's frame, the inputs kept.
 	client.sendInput(10, 100);
@@ -278,20 +278,57 @@ test('handoffFrame: the prediction continues through a handoff in the target fra
 	assert.ok(Math.abs(world(shown[0]) - 12.5) < 1e-3, `continued: ${world(shown[0])}`);
 	assert.deepEqual(inputs.z2, []);
 
-	// Welcomed: the kept inputs go to the target.
+	// Welcomed: the input z1 never applied, then the kept ones, go to the
+	// target (after its first try timed out into the return path, retried).
 	welcomeZ2 = true;
 	network.last('z2').close();
 	await scheduler.advance(2000);
-	assert.equal(inputs.z2.length >= 2, true, `sent to z2: ${inputs.z2}`);
-	// The target admitted the entity where z1 last had it (9.5 → z2's −0.5),
-	// without the lost input; it has not applied the two kept ones yet.
+	assert.equal(inputs.z2.length, 3, `sent to z2: ${inputs.z2}`);
+	// The target admitted the entity where z1 last had it (9.5 → z2's −0.5)
+	// and has applied none of the three yet: replayed, they put it where it
+	// was drawn, so there is nothing to ease back.
 	network.last('z2').send(delta({ ackSeq: 0, creates: [avatar(1, -0.5)] }));
 	network.last('z1').send(delta({ serverTick: 101, updates: [] }));
 	shown = own();
 	assert.deepEqual(shown.map((e) => [e.key, e.predicted]), [['z2:1', true]]);
-	assert.ok(Math.abs(world(shown[0]) - 12.5) < 1e-3, `eases from what was shown: ${world(shown[0])}`);
+	assert.ok(Math.abs(world(shown[0]) - 12.5) < 1e-3, `where it was shown: ${world(shown[0])}`);
 	await scheduler.advance(1000);
-	assert.ok(Math.abs(world(own()[0]) - 11.5) < 1e-3, `converged on the target's prediction: ${world(own()[0])}`);
+	assert.ok(Math.abs(world(own()[0]) - 12.5) < 1e-3, `the target's prediction keeps every input: ${world(own()[0])}`);
+	client.close();
+});
+
+test('handoffFrame: only the inputs after the source\'s ackSeq go to the target', async () => {
+	const network = new FakeNetwork();
+	const scheduler = new FakeScheduler();
+	const sent = [];
+	network.onMessage = (conn, m) => {
+		if (m.type === 'Hello') conn.send(welcome({ zoneId: conn.zoneId }));
+		if (m.type === 'Input' && conn.zoneId === 'z2') sent.push(m.payload[0]);
+	};
+	const client = new GameClient({
+		url: (zone) => `ws://game.test/zones/${zone}`,
+		ticket: ({ zoneId }) => `fresh:${zoneId}`,
+		socket: network.factory,
+		scheduler,
+		pingIntervalMs: 60_000,
+		prediction: {
+			encodeInput: (dx) => new Uint8Array([dx & 0xff]),
+			predict: (s, dx, dt) => ({ x: s.x + (dx * dt) / 1000 }),
+			controlledEntity: () => 1,
+			handoffFrame: (fields) => ({ ...fields }),
+			smoothSteps: false
+		}
+	});
+	await client.connect('z1');
+	network.last('z1').send(delta({ creates: [avatar(1, 0)] }));
+	client.sendInput(1, 100);
+	client.sendInput(2, 100);
+	client.sendInput(3, 100);
+	client.render(); // a drawn frame: what the handoff bridge starts from
+	// z1 applied seq 1 and 2 (no Delta acked them yet), then handed off.
+	network.last('z1').send({ type: 'Handoff', targetZone: 'z2', transferTicket: 'transfer:t1', ackSeq: 2 });
+	await scheduler.advance(10);
+	assert.deepEqual(sent, [3], 'the one input z1 never applied, once');
 	client.close();
 });
 
@@ -305,7 +342,7 @@ test('a silent handoff target times out into the return path', async () => {
 	const failures = [];
 	client.on('handoffFailed', (f) => failures.push(f.reason));
 	await client.connect('z1');
-	network.last('z1').send({ type: 'Handoff', targetZone: 'z2', transferTicket: 'transfer:t9' });
+	network.last('z1').send({ type: 'Handoff', targetZone: 'z2', transferTicket: 'transfer:t9', ackSeq: 0 });
 	network.last('z1').close();
 	await scheduler.advance(1000);
 	assert.deepEqual(failures, []);
@@ -361,7 +398,7 @@ test('a reloaded content version is presented on later handoffs; setContentVersi
 	assert.equal(client.contentVersion, 'c2', 'client learns the reloaded version');
 
 	// The next zone (handoff target) must not present the stale option value.
-	network.last('hub').send({ type: 'Handoff', targetZone: 'field', transferTicket: 'transfer:t1' });
+	network.last('hub').send({ type: 'Handoff', targetZone: 'field', transferTicket: 'transfer:t1', ackSeq: 0 });
 	network.last('hub').close();
 	await scheduler.advance(10);
 	assert.equal(network.last('field').lastHello.contentVersion, 'c2');

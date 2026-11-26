@@ -602,7 +602,7 @@ test('handoff connects to the target with the transfer ticket without blanking t
 	assert.equal(client.render().length, 4);
 
 	// Zone 1 hands the player to zone 2.
-	z1.send({ type: 'Handoff', targetZone: 'z2', transferTicket: 'transfer:abc' });
+	z1.send({ type: 'Handoff', targetZone: 'z2', transferTicket: 'transfer:abc', ackSeq: 0 });
 	z1.close();
 	await flush();
 	const target = network.last('z2');

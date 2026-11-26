@@ -194,6 +194,8 @@ fn handoff_issues_ticket_and_removes_player_first() {
     assert!(msgs.contains(&ServerMessage::Handoff {
         target_zone: "realm.west".into(),
         transfer_ticket: "signed-transfer".into(),
+        // The command that crossed was applied here.
+        ack_seq: 1,
     }));
     assert!(closed(&out, joined.client));
     assert_eq!(h.player_count(), 0);

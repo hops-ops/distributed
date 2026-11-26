@@ -170,8 +170,9 @@ fn server_json(m: &ServerMessage) -> Value {
         ServerMessage::Handoff {
             target_zone,
             transfer_ticket,
+            ack_seq,
         } => {
-            json!({ "type": "Handoff", "target_zone": target_zone, "transfer_ticket": transfer_ticket })
+            json!({ "type": "Handoff", "target_zone": target_zone, "transfer_ticket": transfer_ticket, "ack_seq": ack_seq })
         }
         ServerMessage::Kick { code, message } => {
             json!({ "type": "Kick", "code": code, "message": message })
@@ -521,6 +522,7 @@ fn messages() {
             ServerMessage::Handoff {
                 target_zone: "z2".into(),
                 transfer_ticket: "tt".into(),
+                ack_seq: 300,
             },
         ),
         (
