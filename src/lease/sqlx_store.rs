@@ -2,9 +2,9 @@
 //!
 //! Mirrors the [`crate::lock`] SQLx layout: dialect-neutral machinery in
 //! [`SqlxLeaseStore`], per-backend SQL in a zero-sized [`LeaseDialect`]
-//! marker. All expiry decisions use the **database clock**
-//! (`unixepoch('now','subsec')` / `extract(epoch from now())`), so processes
-//! with skewed clocks still agree on who holds a lease.
+//! marker. All expiry decisions use the **database clock**, so processes with
+//! skewed clocks still agree on who holds a lease. Times are integer
+//! microseconds since the UNIX epoch, like every framework timestamp.
 //!
 //! Each statement is a single atomic conditional write:
 //!
@@ -20,11 +20,15 @@
 
 use std::future::Future;
 use std::marker::PhantomData;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime};
 
 use sqlx::{Database, Encode, FromRow, IntoArguments, Pool, Type};
 
 use super::{validate_request, FencingToken, Lease, LeaseError, LeaseStore};
+#[cfg(feature = "postgres")]
+use crate::repository::sql::postgres_now;
+#[cfg(feature = "sqlite")]
+use crate::repository::sql::sqlite_now;
 
 /// Per-backend SQL for [`SqlxLeaseStore`].
 pub trait LeaseDialect: Send + Sync + 'static {
@@ -34,10 +38,10 @@ pub trait LeaseDialect: Send + Sync + 'static {
     /// Idempotent `coordination_leases` DDL, `;`-separated. The repository
     /// migration `0010_coordination_leases` creates the same table.
     const DDL: &'static str;
-    /// Binds `(key, holder, ttl_secs)`; `RETURNING holder, fencing_token,
+    /// Binds `(key, holder, ttl_micros)`; `RETURNING holder, fencing_token,
     /// expires_at` only when this call acquired.
     const ACQUIRE_SQL: &'static str;
-    /// Binds `(key, holder, token, ttl_secs)`; `RETURNING holder,
+    /// Binds `(key, holder, token, ttl_micros)`; `RETURNING holder,
     /// fencing_token, expires_at` only when the lease was live and ours.
     const RENEW_SQL: &'static str;
     /// Binds `(key, holder, token)`; `RETURNING holder, fencing_token,
@@ -52,8 +56,8 @@ pub trait LeaseDialect: Send + Sync + 'static {
     }
 }
 
-type LeaseRow = (String, i64, f64);
-type CurrentRow = (String, i64, f64, f64);
+type LeaseRow = (String, i64, i64);
+type CurrentRow = (String, i64, i64, i64);
 
 /// Durable [`LeaseStore`] over a SQLx pool. Cheap to clone.
 pub struct SqlxLeaseStore<D: LeaseDialect> {
@@ -95,12 +99,14 @@ fn backend_error<D: LeaseDialect>(op: &str, err: sqlx::Error) -> LeaseError {
     }
 }
 
-fn epoch_to_time(secs: f64) -> SystemTime {
-    if secs.is_finite() && secs > 0.0 {
-        UNIX_EPOCH + Duration::from_secs_f64(secs)
-    } else {
-        UNIX_EPOCH
-    }
+fn epoch_to_time(micros: i64) -> Result<SystemTime, LeaseError> {
+    crate::repository::sql::timestamp_from_micros(micros)
+        .map_err(|error| LeaseError::Backend(format!("invalid stored lease time: {error}")))
+}
+
+fn ttl_micros(ttl: Duration) -> Result<i64, LeaseError> {
+    crate::repository::sql::duration_micros(ttl)
+        .map_err(|error| LeaseError::Invalid(format!("lease ttl: {error}")))
 }
 
 fn lease_from_row(key: &str, (holder, token, expires_at): LeaseRow) -> Result<Lease, LeaseError> {
@@ -110,7 +116,7 @@ fn lease_from_row(key: &str, (holder, token, expires_at): LeaseRow) -> Result<Le
         key: key.to_string(),
         holder,
         token: FencingToken::new(token),
-        expires_at: epoch_to_time(expires_at),
+        expires_at: epoch_to_time(expires_at)?,
     })
 }
 
@@ -125,7 +131,6 @@ where
     for<'c> &'c Pool<D::Db>: sqlx::Executor<'c, Database = D::Db>,
     <D::Db as Database>::Arguments: IntoArguments<D::Db>,
     for<'q> &'q str: Encode<'q, D::Db> + Type<D::Db>,
-    for<'q> f64: Encode<'q, D::Db> + Type<D::Db>,
     for<'q> i64: Encode<'q, D::Db> + Type<D::Db>,
     for<'r> LeaseRow: FromRow<'r, <D::Db as Database>::Row>,
     for<'r> CurrentRow: FromRow<'r, <D::Db as Database>::Row>,
@@ -154,7 +159,7 @@ where
         row.map(|(holder, token, expires_at, now)| {
             Ok((
                 lease_from_row(key, (holder, token, expires_at))?,
-                epoch_to_time(now),
+                epoch_to_time(now)?,
             ))
         })
         .transpose()
@@ -167,7 +172,6 @@ where
     for<'c> &'c Pool<D::Db>: sqlx::Executor<'c, Database = D::Db>,
     <D::Db as Database>::Arguments: IntoArguments<D::Db>,
     for<'q> &'q str: Encode<'q, D::Db> + Type<D::Db>,
-    for<'q> f64: Encode<'q, D::Db> + Type<D::Db>,
     for<'q> i64: Encode<'q, D::Db> + Type<D::Db>,
     for<'r> LeaseRow: FromRow<'r, <D::Db as Database>::Row>,
     for<'r> CurrentRow: FromRow<'r, <D::Db as Database>::Row>,
@@ -183,7 +187,7 @@ where
             let acquired = sqlx::query_as::<_, LeaseRow>(D::ACQUIRE_SQL)
                 .bind(key)
                 .bind(holder)
-                .bind(ttl.as_secs_f64())
+                .bind(ttl_micros(ttl)?)
                 .fetch_optional(&self.pool)
                 .await
                 .map_err(|err| backend_error::<D>("acquire", err))?;
@@ -223,7 +227,7 @@ where
                 .bind(lease.key.as_str())
                 .bind(lease.holder.as_str())
                 .bind(token_bind(lease)?)
-                .bind(ttl.as_secs_f64())
+                .bind(ttl_micros(ttl)?)
                 .fetch_optional(&self.pool)
                 .await
                 .map_err(|err| backend_error::<D>("renew", err))?;
@@ -270,7 +274,8 @@ where
 // SQLite
 // ---------------------------------------------------------------------------
 
-/// SQLite [`LeaseDialect`]: `?n` placeholders, `unixepoch('now','subsec')`.
+/// SQLite [`LeaseDialect`]: `?n` placeholders, `unixepoch('now','subsec')` in
+/// microseconds.
 #[cfg(feature = "sqlite")]
 #[derive(Debug, Clone, Copy)]
 pub struct SqliteLeaseDialect;
@@ -284,46 +289,45 @@ CREATE TABLE IF NOT EXISTS coordination_leases (\
   lease_key TEXT NOT NULL PRIMARY KEY,\
   holder TEXT NOT NULL,\
   fencing_token INTEGER NOT NULL,\
-  acquired_at REAL NOT NULL,\
-  expires_at REAL NOT NULL,\
+  acquired_at INTEGER NOT NULL,\
+  expires_at INTEGER NOT NULL,\
   CHECK (lease_key <> ''),\
   CHECK (holder <> ''),\
   CHECK (fencing_token > 0)\
 )";
 
-    const ACQUIRE_SQL: &'static str = r#"
-        INSERT INTO coordination_leases (lease_key, holder, fencing_token, acquired_at, expires_at)
-        VALUES (?1, ?2, 1, unixepoch('now','subsec'), unixepoch('now','subsec') + ?3)
-        ON CONFLICT (lease_key) DO UPDATE
-          SET holder = excluded.holder,
-              fencing_token = coordination_leases.fencing_token + 1,
-              acquired_at = excluded.acquired_at,
-              expires_at = excluded.expires_at
-          WHERE coordination_leases.expires_at <= unixepoch('now','subsec')
-        RETURNING holder, fencing_token, expires_at
-        "#;
+    const ACQUIRE_SQL: &'static str = concat!(
+        "INSERT INTO coordination_leases (lease_key, holder, fencing_token, acquired_at, expires_at) VALUES (?1, ?2, 1, ",
+        sqlite_now!(),
+        ", ",
+        sqlite_now!(),
+        " + ?3) ON CONFLICT (lease_key) DO UPDATE SET holder = excluded.holder, \
+         fencing_token = coordination_leases.fencing_token + 1, acquired_at = excluded.acquired_at, \
+         expires_at = excluded.expires_at WHERE coordination_leases.expires_at <= ",
+        sqlite_now!(),
+        " RETURNING holder, fencing_token, expires_at"
+    );
 
-    const RENEW_SQL: &'static str = r#"
-        UPDATE coordination_leases
-           SET expires_at = unixepoch('now','subsec') + ?4
-         WHERE lease_key = ?1 AND holder = ?2 AND fencing_token = ?3
-           AND expires_at > unixepoch('now','subsec')
-        RETURNING holder, fencing_token, expires_at
-        "#;
+    const RENEW_SQL: &'static str = concat!(
+        "UPDATE coordination_leases SET expires_at = ",
+        sqlite_now!(),
+        " + ?4 WHERE lease_key = ?1 AND holder = ?2 AND fencing_token = ?3 AND expires_at > ",
+        sqlite_now!(),
+        " RETURNING holder, fencing_token, expires_at"
+    );
 
-    const RELEASE_SQL: &'static str = r#"
-        UPDATE coordination_leases
-           SET expires_at = 0
-         WHERE lease_key = ?1 AND holder = ?2 AND fencing_token = ?3
-           AND expires_at > unixepoch('now','subsec')
-        RETURNING holder, fencing_token, expires_at
-        "#;
+    const RELEASE_SQL: &'static str = concat!(
+        "UPDATE coordination_leases SET expires_at = 0 \
+         WHERE lease_key = ?1 AND holder = ?2 AND fencing_token = ?3 AND expires_at > ",
+        sqlite_now!(),
+        " RETURNING holder, fencing_token, expires_at"
+    );
 
-    const CURRENT_SQL: &'static str = r#"
-        SELECT holder, fencing_token, expires_at, unixepoch('now','subsec') AS db_now
-          FROM coordination_leases
-         WHERE lease_key = ?1
-        "#;
+    const CURRENT_SQL: &'static str = concat!(
+        "SELECT holder, fencing_token, expires_at, ",
+        sqlite_now!(),
+        " AS db_now FROM coordination_leases WHERE lease_key = ?1"
+    );
 
     fn is_busy(err: &sqlx::Error) -> bool {
         crate::sqlx_repo::is_sqlite_busy(err)
@@ -338,7 +342,8 @@ pub type SqliteLeaseStore = SqlxLeaseStore<SqliteLeaseDialect>;
 // Postgres
 // ---------------------------------------------------------------------------
 
-/// Postgres [`LeaseDialect`]: `$n` placeholders, `extract(epoch from now())`.
+/// Postgres [`LeaseDialect`]: `$n` placeholders, `clock_timestamp()` in
+/// microseconds.
 #[cfg(feature = "postgres")]
 #[derive(Debug, Clone, Copy)]
 pub struct PostgresLeaseDialect;
@@ -352,49 +357,45 @@ CREATE TABLE IF NOT EXISTS coordination_leases (\
   lease_key text NOT NULL PRIMARY KEY,\
   holder text NOT NULL,\
   fencing_token bigint NOT NULL,\
-  acquired_at double precision NOT NULL,\
-  expires_at double precision NOT NULL,\
+  acquired_at bigint NOT NULL,\
+  expires_at bigint NOT NULL,\
   CHECK (lease_key <> ''),\
   CHECK (holder <> ''),\
   CHECK (fencing_token > 0)\
 )";
 
-    const ACQUIRE_SQL: &'static str = r#"
-        INSERT INTO coordination_leases (lease_key, holder, fencing_token, acquired_at, expires_at)
-        VALUES ($1, $2, 1,
-                extract(epoch from clock_timestamp())::double precision,
-                extract(epoch from clock_timestamp())::double precision + $3)
-        ON CONFLICT (lease_key) DO UPDATE
-          SET holder = EXCLUDED.holder,
-              fencing_token = coordination_leases.fencing_token + 1,
-              acquired_at = EXCLUDED.acquired_at,
-              expires_at = EXCLUDED.expires_at
-          WHERE coordination_leases.expires_at <= extract(epoch from clock_timestamp())::double precision
-        RETURNING holder, fencing_token, expires_at
-        "#;
+    const ACQUIRE_SQL: &'static str = concat!(
+        "INSERT INTO coordination_leases (lease_key, holder, fencing_token, acquired_at, expires_at) VALUES ($1, $2, 1, ",
+        postgres_now!(),
+        ", ",
+        postgres_now!(),
+        " + $3) ON CONFLICT (lease_key) DO UPDATE SET holder = EXCLUDED.holder, \
+         fencing_token = coordination_leases.fencing_token + 1, acquired_at = EXCLUDED.acquired_at, \
+         expires_at = EXCLUDED.expires_at WHERE coordination_leases.expires_at <= ",
+        postgres_now!(),
+        " RETURNING holder, fencing_token, expires_at"
+    );
 
-    const RENEW_SQL: &'static str = r#"
-        UPDATE coordination_leases
-           SET expires_at = extract(epoch from clock_timestamp())::double precision + $4
-         WHERE lease_key = $1 AND holder = $2 AND fencing_token = $3
-           AND expires_at > extract(epoch from clock_timestamp())::double precision
-        RETURNING holder, fencing_token, expires_at
-        "#;
+    const RENEW_SQL: &'static str = concat!(
+        "UPDATE coordination_leases SET expires_at = ",
+        postgres_now!(),
+        " + $4 WHERE lease_key = $1 AND holder = $2 AND fencing_token = $3 AND expires_at > ",
+        postgres_now!(),
+        " RETURNING holder, fencing_token, expires_at"
+    );
 
-    const RELEASE_SQL: &'static str = r#"
-        UPDATE coordination_leases
-           SET expires_at = 0
-         WHERE lease_key = $1 AND holder = $2 AND fencing_token = $3
-           AND expires_at > extract(epoch from clock_timestamp())::double precision
-        RETURNING holder, fencing_token, expires_at
-        "#;
+    const RELEASE_SQL: &'static str = concat!(
+        "UPDATE coordination_leases SET expires_at = 0 \
+         WHERE lease_key = $1 AND holder = $2 AND fencing_token = $3 AND expires_at > ",
+        postgres_now!(),
+        " RETURNING holder, fencing_token, expires_at"
+    );
 
-    const CURRENT_SQL: &'static str = r#"
-        SELECT holder, fencing_token, expires_at,
-               extract(epoch from clock_timestamp())::double precision AS db_now
-          FROM coordination_leases
-         WHERE lease_key = $1
-        "#;
+    const CURRENT_SQL: &'static str = concat!(
+        "SELECT holder, fencing_token, expires_at, ",
+        postgres_now!(),
+        " AS db_now FROM coordination_leases WHERE lease_key = $1"
+    );
 }
 
 /// Postgres-backed [`LeaseStore`].

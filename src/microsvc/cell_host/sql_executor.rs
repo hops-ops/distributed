@@ -5,7 +5,6 @@
 //! commit cannot yield between its domain and delivery/receipt participants.
 
 use std::collections::HashMap;
-use std::time::SystemTime;
 
 use worker::js_sys::{Function, Reflect};
 use worker::send::SendWrapper;
@@ -13,7 +12,7 @@ use worker::wasm_bindgen::{closure::ScopedClosure, JsCast, JsValue};
 use worker::{SqlStorage, SqlStorageValue, State};
 
 use crate::repository::sql::{SqlBind, SqlExecutor, SqlPart, SqlRow, Statement};
-use crate::repository::{sqlite_codec, RepositoryError};
+use crate::repository::{sqlite_select, RepositoryError};
 
 #[derive(Clone)]
 pub(crate) struct CellSqlConnection {
@@ -124,15 +123,6 @@ impl SqlRow for CellSqlRow {
             _ => self.text(column).map(Some),
         }
     }
-    fn optional_timestamp(
-        &self,
-        column: &'static str,
-    ) -> Result<Option<SystemTime>, RepositoryError> {
-        match self.value(column)? {
-            SqlStorageValue::Null => Ok(None),
-            _ => self.timestamp(column).map(Some),
-        }
-    }
     fn optional_integer(&self, column: &'static str) -> Result<Option<i64>, RepositoryError> {
         match self.value(column)? {
             SqlStorageValue::Null => Ok(None),
@@ -145,14 +135,6 @@ impl SqlRow for CellSqlRow {
             _ => Err(Self::invalid(column)),
         }
     }
-    fn timestamp(&self, column: &'static str) -> Result<SystemTime, RepositoryError> {
-        match self.value(column)? {
-            SqlStorageValue::String(value) => sqlite_codec::decode(value),
-            SqlStorageValue::Float(value) => sqlite_codec::decode_epoch(*value),
-            SqlStorageValue::Integer(value) => sqlite_codec::decode_epoch(*value as f64),
-            _ => Err(Self::invalid(column)),
-        }
-    }
 }
 
 impl CellSqlExecutor {
@@ -161,27 +143,6 @@ impl CellSqlExecutor {
         let mut bindings = Vec::new();
         for part in statement.0 {
             match part {
-                SqlPart::TimestampCompare {
-                    column,
-                    operator,
-                    value,
-                } => {
-                    sql.push_str(&format!(
-                        "CAST({column} AS REAL) {operator} CAST(? AS REAL)"
-                    ));
-                    bindings.push(SqlStorageValue::String(sqlite_codec::encode(value)?));
-                }
-                SqlPart::LedgerNow | SqlPart::LedgerNowEpoch => {
-                    sql.push_str("unixepoch('now','subsec')")
-                }
-                SqlPart::LedgerDeadline(duration) => {
-                    sql.push_str("(unixepoch('now','subsec') + ?)");
-                    bindings.push(SqlStorageValue::Float(duration.as_secs_f64()));
-                }
-                SqlPart::LedgerDeadlineIsLive(deadline) => {
-                    sql.push_str("CAST(? AS REAL) > unixepoch('now','subsec')");
-                    bindings.push(SqlStorageValue::String(sqlite_codec::encode(deadline)?));
-                }
                 SqlPart::LedgerJson(json) => {
                     sql.push('?');
                     bindings.push(SqlStorageValue::String(json));
@@ -203,9 +164,6 @@ impl CellSqlExecutor {
                                 ))
                             })?
                         }
-                        SqlBind::Timestamp(value) => {
-                            SqlStorageValue::String(sqlite_codec::encode(value)?)
-                        }
                     });
                 }
             }
@@ -216,11 +174,11 @@ impl CellSqlExecutor {
 
 impl SqlExecutor for CellSqlExecutor {
     type Row = CellSqlRow;
-    const EVENT_SELECT: &'static str = sqlite_codec::EVENT_SELECT;
-    const SNAPSHOT_SELECT: &'static str = sqlite_codec::SNAPSHOT_SELECT;
-    const OUTBOX_SELECT: &'static str = sqlite_codec::OUTBOX_SELECT;
-    const NOW: &'static str = "CURRENT_TIMESTAMP";
-    const COMMAND_LEDGER_SELECT: &'static str = sqlite_codec::COMMAND_LEDGER_SELECT;
+    const EVENT_SELECT: &'static str = sqlite_select::EVENT_SELECT;
+    const SNAPSHOT_SELECT: &'static str = sqlite_select::SNAPSHOT_SELECT;
+    const OUTBOX_SELECT: &'static str = sqlite_select::OUTBOX_SELECT;
+    const NOW: &'static str = crate::repository::sql::sqlite_now!();
+    const COMMAND_LEDGER_SELECT: &'static str = sqlite_select::COMMAND_LEDGER_SELECT;
     const COMMAND_LEDGER_LOCK_SUFFIX: &'static str = "";
     const COMMAND_LEDGER_COMPACTION_LOCK_SUFFIX: &'static str = "";
 

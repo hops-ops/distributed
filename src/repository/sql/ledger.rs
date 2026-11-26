@@ -1,6 +1,6 @@
 //! Shared fenced command-ledger operations. The caller owns the transaction.
 //! Both SQLx and cell SQL use these statements and the same record state machine.
-use super::{signed, unsigned, SqlBind, SqlExecutor, SqlPart, SqlRow, Statement};
+use super::{duration_micros, signed, unsigned, SqlBind, SqlExecutor, SqlPart, SqlRow, Statement};
 use crate::command_ledger::{
     AttemptFence, AttemptToken, CanonicalInputHash, CausationId, CommandCompletion,
     CommandContractFingerprint, CommandId, CommandLedgerError, CommandLedgerKey,
@@ -8,7 +8,7 @@ use crate::command_ledger::{
     ExternalCommandCompletion, ExternalDispatchBinding, PrincipalPartitionId, ReservationDecision,
     ReservationOutcome,
 };
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 fn corrupt(error: CommandLedgerError) -> CommandLedgerError {
     CommandLedgerError::Corrupt(error.to_string())
@@ -63,15 +63,39 @@ fn record_from_row(
     Ok(record)
 }
 
-pub(crate) async fn now(executor: &mut impl SqlExecutor) -> Result<SystemTime, CommandLedgerError> {
-    let mut statement = Statement::new("SELECT ");
-    statement.part(SqlPart::LedgerNowEpoch);
-    statement.push(" AS ledger_now");
+pub(crate) async fn now<E: SqlExecutor>(
+    executor: &mut E,
+) -> Result<SystemTime, CommandLedgerError> {
+    let statement = Statement::new("SELECT ").sql(E::NOW).sql(" AS ledger_now");
     let rows = executor.query(statement).await?;
     let row = rows
         .first()
         .ok_or_else(|| CommandLedgerError::Corrupt("database clock returned no row".into()))?;
     Ok(row.timestamp("ledger_now")?)
+}
+
+/// `database now + duration`, both stored timestamps.
+fn push_deadline<E: SqlExecutor>(
+    statement: &mut Statement<'_>,
+    duration: Duration,
+) -> Result<(), CommandLedgerError> {
+    statement.push("(");
+    statement.push(E::NOW);
+    statement.push(" + ");
+    statement.push_bind(duration_micros(duration)?);
+    statement.push(")");
+    Ok(())
+}
+
+/// `deadline > database now`.
+fn push_deadline_is_live<E: SqlExecutor>(
+    statement: &mut Statement<'_>,
+    deadline: SystemTime,
+) -> Result<(), CommandLedgerError> {
+    statement.push_bind(SqlBind::timestamp(deadline)?);
+    statement.push(" > ");
+    statement.push(E::NOW);
+    Ok(())
 }
 
 fn key_filter<'a>(mut statement: Statement<'a>, key: &CommandLedgerKey) -> Statement<'a> {
@@ -180,13 +204,13 @@ pub(crate) async fn insert_reservation<E: SqlExecutor>(
         None => builder.push("NULL"),
     }
     builder.push(", ");
-    builder.part(SqlPart::LedgerDeadline(reservation.lease()));
+    push_deadline::<E>(&mut builder, reservation.lease())?;
     builder.push(", NULL, ");
-    builder.part(SqlPart::LedgerNow);
+    builder.push(E::NOW);
     builder.push(", ");
-    builder.part(SqlPart::LedgerNow);
+    builder.push(E::NOW);
     builder.push(", NULL, ");
-    builder.part(SqlPart::LedgerDeadline(reservation.retention()));
+    push_deadline::<E>(&mut builder, reservation.retention())?;
     builder.push(", NULL");
     builder.push(") ON CONFLICT (service_id, principal_partition, command_id) DO NOTHING");
     let result = executor.execute(builder).await?;
@@ -202,9 +226,9 @@ pub(crate) async fn expire<E: SqlExecutor>(
         "UPDATE command_ledger SET state = 'expired', attempt_token = NULL, \
          lease_expires_at = NULL, outcome = NULL, updated_at = ",
     );
-    builder.part(SqlPart::LedgerNow);
+    builder.push(E::NOW);
     builder.push(", compacted_at = ");
-    builder.part(SqlPart::LedgerNow);
+    builder.push(E::NOW);
     builder.push(" WHERE service_id = ");
     builder.push_bind(key.service_id());
     builder.push(" AND principal_partition = ");
@@ -214,7 +238,7 @@ pub(crate) async fn expire<E: SqlExecutor>(
     builder.push(" AND state <> 'expired'");
     if require_retention_due {
         builder.push(" AND retention_expires_at <= ");
-        builder.part(SqlPart::LedgerNow);
+        builder.push(E::NOW);
     }
     let result = executor.execute(builder).await?;
     Ok(result)
@@ -234,11 +258,11 @@ pub(crate) async fn reclaim<E: SqlExecutor>(
     builder.push(", attempt_number = ");
     builder.push_bind(attempt_number);
     builder.push(", lease_expires_at = ");
-    builder.part(SqlPart::LedgerDeadline(reservation.lease()));
+    push_deadline::<E>(&mut builder, reservation.lease())?;
     builder.push(", outcome = NULL, updated_at = ");
-    builder.part(SqlPart::LedgerNow);
+    builder.push(E::NOW);
     builder.push(", completed_at = NULL, retention_expires_at = ");
-    builder.part(SqlPart::LedgerDeadline(reservation.retention()));
+    push_deadline::<E>(&mut builder, reservation.retention())?;
     builder.push(", compacted_at = NULL WHERE service_id = ");
     builder.push_bind(record.key.service_id());
     builder.push(" AND principal_partition = ");
@@ -267,13 +291,13 @@ pub(crate) async fn complete<E: SqlExecutor>(
     builder.push(", attempt_token = NULL, lease_expires_at = NULL, outcome = ");
     builder.part(SqlPart::LedgerJson(completion.replay_json().into()));
     builder.push(", updated_at = ");
-    builder.part(SqlPart::LedgerNow);
+    builder.push(E::NOW);
     builder.push(", completed_at = ");
-    builder.part(SqlPart::LedgerNow);
+    builder.push(E::NOW);
     builder.push(", retention_expires_at = ");
     match retention_expires_at.as_ref() {
-        Some(deadline) => builder.push_bind(SqlBind::Timestamp(*deadline)),
-        None => builder.part(SqlPart::LedgerDeadline(completion.retention())),
+        Some(deadline) => builder.push_bind(SqlBind::timestamp(*deadline)?),
+        None => push_deadline::<E>(&mut builder, completion.retention())?,
     }
     builder.push(", compacted_at = NULL WHERE service_id = ");
     builder.push_bind(fence.key().service_id());
@@ -293,10 +317,10 @@ pub(crate) async fn complete<E: SqlExecutor>(
     builder.push(" AND attempt_number = ");
     builder.push_bind(attempt_number);
     builder.push(" AND lease_expires_at > ");
-    builder.part(SqlPart::LedgerNow);
+    builder.push(E::NOW);
     if let Some(deadline) = retention_expires_at.as_ref() {
         builder.push(" AND ");
-        builder.part(SqlPart::LedgerDeadlineIsLive(*deadline));
+        push_deadline_is_live::<E>(&mut builder, *deadline)?;
     }
     let result = executor.execute(builder).await?;
     if result != 1 {
@@ -321,13 +345,13 @@ pub(crate) async fn complete_external<E: SqlExecutor>(
     builder.push(", attempt_token = NULL, lease_expires_at = NULL, outcome = ");
     builder.part(SqlPart::LedgerJson(completion.replay_json().into()));
     builder.push(", updated_at = ");
-    builder.part(SqlPart::LedgerNow);
+    builder.push(E::NOW);
     builder.push(", completed_at = ");
-    builder.part(SqlPart::LedgerNow);
+    builder.push(E::NOW);
     builder.push(", retention_expires_at = ");
     match retention_expires_at.as_ref() {
-        Some(deadline) => builder.push_bind(SqlBind::Timestamp(*deadline)),
-        None => builder.part(SqlPart::LedgerDeadline(completion.retention())),
+        Some(deadline) => builder.push_bind(SqlBind::timestamp(*deadline)?),
+        None => push_deadline::<E>(&mut builder, completion.retention())?,
     }
     builder.push(", compacted_at = NULL WHERE service_id = ");
     builder.push_bind(fence.key().service_id());
@@ -348,10 +372,10 @@ pub(crate) async fn complete_external<E: SqlExecutor>(
     builder.push(" AND attempt_number = ");
     builder.push_bind(attempt_number);
     builder.push(" AND lease_expires_at > ");
-    builder.part(SqlPart::LedgerNow);
+    builder.push(E::NOW);
     if let Some(deadline) = retention_expires_at.as_ref() {
         builder.push(" AND ");
-        builder.part(SqlPart::LedgerDeadlineIsLive(*deadline));
+        push_deadline_is_live::<E>(&mut builder, *deadline)?;
     }
     if executor.execute(builder).await? != 1 {
         return Err(CommandLedgerError::AttemptFenced {
@@ -422,12 +446,12 @@ pub(crate) async fn lookup(
     record.lookup()
 }
 
-pub(crate) async fn mark_retryable(
-    executor: &mut impl SqlExecutor,
+pub(crate) async fn mark_retryable<E: SqlExecutor>(
+    executor: &mut E,
     attempt: &AttemptFence,
 ) -> Result<(), CommandLedgerError> {
     let mut builder = Statement::new("UPDATE command_ledger SET state = 'retryable_unknown', attempt_token = NULL, lease_expires_at = NULL, updated_at = ");
-    builder.part(SqlPart::LedgerNow);
+    builder.push(E::NOW);
     builder.push(" WHERE service_id = ");
     builder = key_filter(builder, attempt.key());
     builder.push(" AND command_contract_hash = ");
@@ -466,7 +490,7 @@ pub(crate) async fn compact<E: SqlExecutor>(
         ))
         .await?;
     let mut select = Statement::new("SELECT service_id, principal_partition, command_id FROM command_ledger WHERE state <> 'expired' AND retention_expires_at <= ");
-    select.part(SqlPart::LedgerNow);
+    select.push(E::NOW);
     select
         .push(" ORDER BY retention_expires_at, service_id, principal_partition, command_id LIMIT ");
     select.push_bind(limit);

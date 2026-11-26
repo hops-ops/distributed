@@ -23,19 +23,11 @@ where
 {
     request.validate()?;
     let schema = &request.schema;
-    let collation = if DB::BACKEND == "postgres" {
-        " COLLATE \"C\""
-    } else {
-        " COLLATE BINARY"
-    };
     let mut builder = relational_row_select::<DB>(schema)?;
     builder.push(" WHERE 1=1");
     for (name, value) in request.equals.iter() {
         builder.push(" AND ");
         builder.push(quote_identifier(name));
-        if column_by_name(schema, name)?.column_type == crate::ColumnType::Text {
-            builder.push(collation);
-        }
         if matches!(value, RowValue::Null) {
             builder.push(" IS NULL");
         } else {
@@ -43,11 +35,11 @@ where
             DB::push_row_value_bind(&mut builder, value.clone(), column_by_name(schema, name)?)?;
         }
     }
-    // Bytewise text order matches Rust and remains stable across database locales.
+    // Generated text columns compare bytewise (`COLLATE "C"` on Postgres,
+    // SQLite's default `BINARY`), so the order matches Rust's on every locale.
     if let Some(after) = request.after() {
         builder.push(" AND ");
         builder.push(quote_identifier(request.key_column()));
-        builder.push(collation);
         builder.push(" > ");
         DB::push_row_value_bind(
             &mut builder,
@@ -57,7 +49,6 @@ where
     }
     builder.push(" ORDER BY ");
     builder.push(quote_identifier(request.key_column()));
-    builder.push(collation);
     builder.push(" ASC LIMIT ");
     builder.push_bind(i64::from(request.limit) + 1);
     let rows = builder.build().fetch_all(pool).await.map_err(|error| {

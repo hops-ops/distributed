@@ -36,6 +36,8 @@ pub use registry::{
     resolve_direct_join_keys, resolve_m2m_join_keys, DirectJoinPair, JoinColumnPair, M2mJoinKeys,
     TableMigrationArtifact, TableSchemaBootstrap, TableSchemaRegistry,
 };
+#[cfg(any(feature = "sqlite", feature = "postgres"))]
+pub(crate) use sql::text_collation_upgrades;
 pub use sql::{
     bootstrap_result as table_schema_bootstrap_result, generate_table_migration_artifacts,
     table_schema_statements, TableSqlDialect,

@@ -16,8 +16,6 @@ pub struct DialectOps {
     pub json_agg: &'static str,
     pub empty_array: &'static str,
     pub build_object: &'static str,
-    /// Deterministic UTF-8 byte order shared with the generated client replica.
-    pub binary_collation: &'static str,
     /// SQLite wraps list roots with `json(...)`; Postgres leaves this empty.
     pub json_cast_fn: Option<&'static str>,
 }
@@ -29,14 +27,12 @@ impl SqlDialect {
                 json_agg: "jsonb_agg",
                 empty_array: "'[]'::jsonb",
                 build_object: "jsonb_build_object",
-                binary_collation: r#""C""#,
                 json_cast_fn: None,
             },
             SqlDialect::Sqlite => DialectOps {
                 json_agg: "json_group_array",
                 empty_array: "'[]'",
                 build_object: "json_object",
-                binary_collation: "BINARY",
                 // Ensures json_object TEXT is treated as JSON, not a JSON string.
                 json_cast_fn: Some("json"),
             },
@@ -73,9 +69,9 @@ impl DialectOps {
 /// The dialects' own operators disagree, which is why none is used bare:
 /// SQLite `LIKE` folds ASCII and has no default escape, Postgres `LIKE` is
 /// exact with `\` as its default escape, and Postgres `ILIKE` folds by the
-/// database collation. So the case-sensitive form is `GLOB` on SQLite, with
-/// the pattern translated, and the folding form pins `COLLATE "C"` on
-/// Postgres.
+/// column's collation. So the case-sensitive form is `GLOB` on SQLite, with
+/// the pattern translated, and the folding form relies on generated Postgres
+/// text columns being `COLLATE "C"`, under which `ILIKE` folds ASCII only.
 pub(super) fn text_pattern(
     dialect: SqlDialect,
     column: &str,
@@ -116,7 +112,7 @@ pub(super) fn text_pattern(
             pattern.to_string(),
         ),
         (SqlDialect::Postgres, false) => (
-            format!("{column} COLLATE \"C\" ILIKE {placeholder} ESCAPE '{escape}'"),
+            format!("{column} ILIKE {placeholder} ESCAPE '{escape}'"),
             pattern.to_string(),
         ),
     })
@@ -311,32 +307,5 @@ mod join_predicate_tests {
         assert!(join_predicate_m2m_pairs("j1", "t1", &[])
             .unwrap_err()
             .contains("at least one key column"));
-    }
-}
-
-/// The column as the left side of a comparison, compared byte for byte when
-/// it is text, which is how the client replica and
-/// [`FilterExpr::evaluate`](crate::graphql::FilterExpr::evaluate) compare it.
-///
-/// Order (`<`, `>` and friends) depends on the collation everywhere, so the
-/// binary one is always pinned, as it is for `ORDER BY`.
-///
-/// Equality (`=`, `<>`, `IN`) is pinned on SQLite, which compares under the
-/// column's declared collation. Postgres is left alone: its text equality is
-/// already bytewise under every deterministic collation, and pinning one
-/// stops the planner from using the column's index. A Postgres column
-/// declared with a nondeterministic collation or as `citext` is outside this
-/// contract.
-pub(super) fn comparison_operand(
-    dialect: SqlDialect,
-    column_type: &crate::table::ColumnType,
-    col_ref: &str,
-    ordered: bool,
-) -> String {
-    let text = matches!(column_type, crate::table::ColumnType::Text);
-    if text && (ordered || dialect == SqlDialect::Sqlite) {
-        format!("{col_ref} COLLATE {}", dialect.ops().binary_collation)
-    } else {
-        col_ref.to_string()
     }
 }

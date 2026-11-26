@@ -2,6 +2,8 @@ use crate::repository::RepositoryError;
 #[cfg(any(feature = "postgres", feature = "sqlite"))]
 use crate::table::TableStoreError;
 
+#[cfg(all(test, feature = "postgres"))]
+pub(crate) mod postgres_test_schema;
 #[cfg(any(feature = "postgres", feature = "sqlite"))]
 pub(crate) mod projection_protocol;
 #[cfg(any(feature = "postgres", feature = "sqlite"))]
@@ -10,6 +12,8 @@ pub(crate) mod read_model;
 pub(crate) mod repo;
 #[cfg(all(test, any(feature = "postgres", feature = "sqlite")))]
 pub(crate) mod statement_count_tests;
+#[cfg(all(test, any(feature = "postgres", feature = "sqlite")))]
+mod upgrade_tests;
 
 #[cfg(feature = "postgres")]
 pub(crate) fn repository_i64_from_u64(

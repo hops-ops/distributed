@@ -452,10 +452,13 @@ async fn source_snapshots_sqlite_reordering_and_restart() {
 #[cfg(feature = "postgres")]
 #[tokio::test]
 async fn source_snapshots_postgres_reordering_and_restart() {
-    let Some(url) = crate::test_env::require_service(
+    let Some((_schema, url)) = crate::sqlx_repo::postgres_test_schema::postgres_test_schema(
         "DISTRIBUTED_SNAPSHOT_TEST_POSTGRES_URL",
         "Postgres source snapshot test",
-    ) else {
+        "source_snapshots",
+    )
+    .await
+    else {
         return;
     };
     let store = crate::PostgresRepository::connect_and_migrate(&url)
@@ -1011,10 +1014,13 @@ async fn snapshot_rebuild_sqlite() {
 #[cfg(feature = "postgres")]
 #[tokio::test]
 async fn snapshot_rebuild_postgres() {
-    let Some(url) = crate::test_env::require_service(
+    let Some((_schema, url)) = crate::sqlx_repo::postgres_test_schema::postgres_test_schema(
         "DISTRIBUTED_REBUILD_TEST_POSTGRES_URL",
         "Postgres source snapshot test",
-    ) else {
+        "snapshot_rebuild",
+    )
+    .await
+    else {
         return;
     };
     let store = crate::PostgresRepository::connect_and_migrate(&url)

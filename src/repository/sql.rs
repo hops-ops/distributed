@@ -8,7 +8,7 @@
 
 use std::borrow::Cow;
 use std::future::Future;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 pub(crate) mod ledger;
 pub(crate) mod outbox;
@@ -26,8 +26,103 @@ pub(crate) enum SqlBind<'a> {
     Integer(i64),
     Bytes(Cow<'a, [u8]>),
     Metadata(String),
-    Timestamp(SystemTime),
 }
+
+impl SqlBind<'_> {
+    /// A timestamp bound in its stored form, [`timestamp_micros`].
+    pub fn timestamp(timestamp: SystemTime) -> Result<Self, RepositoryError> {
+        timestamp_micros(timestamp).map(Self::Integer)
+    }
+}
+
+/// Every framework table stores a timestamp as integer microseconds since the
+/// UNIX epoch (`bigint` on PostgreSQL, `INTEGER` on SQLite), so timestamps
+/// bind, compare and order as plain integers in both dialects. Sub-microsecond
+/// precision is truncated; a time before the epoch is refused.
+pub(crate) fn timestamp_micros(timestamp: SystemTime) -> Result<i64, RepositoryError> {
+    let micros = timestamp
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| {
+            RepositoryError::Model(format!(
+                "timestamp before the UNIX epoch cannot be stored: {error}"
+            ))
+        })?
+        .as_micros();
+    i64::try_from(micros).map_err(|_| {
+        RepositoryError::Model(format!(
+            "timestamp {micros} us after the UNIX epoch exceeds SQL integer storage"
+        ))
+    })
+}
+
+/// The inverse of [`timestamp_micros`].
+pub(crate) fn timestamp_from_micros(micros: i64) -> Result<SystemTime, RepositoryError> {
+    let micros = u64::try_from(micros).map_err(|_| {
+        RepositoryError::Model(format!(
+            "stored timestamp {micros} us is before the UNIX epoch"
+        ))
+    })?;
+    UNIX_EPOCH
+        .checked_add(Duration::from_micros(micros))
+        .ok_or_else(|| RepositoryError::Model(format!("stored timestamp {micros} us is invalid")))
+}
+
+/// Schedules and alarms count epoch milliseconds; their columns store
+/// microseconds like every other timestamp.
+pub(crate) fn millis_as_micros(millis: i64) -> Result<i64, RepositoryError> {
+    millis.checked_mul(1000).ok_or_else(|| {
+        RepositoryError::Model(format!("time {millis} ms exceeds SQL timestamp storage"))
+    })
+}
+
+/// The inverse of [`millis_as_micros`]; a stored time written from
+/// milliseconds divides exactly.
+pub(crate) fn micros_as_millis(micros: i64) -> i64 {
+    micros.div_euclid(1000)
+}
+
+/// A duration added to a stored timestamp in SQL. Half the integer range
+/// keeps `now + duration` from overflowing, which SQLite would silently turn
+/// into a REAL.
+pub(crate) fn duration_micros(duration: Duration) -> Result<i64, RepositoryError> {
+    i64::try_from(duration.as_micros())
+        .ok()
+        .filter(|micros| *micros <= i64::MAX / 2)
+        .ok_or_else(|| {
+            RepositoryError::Model(format!(
+                "duration {duration:?} exceeds SQL timestamp arithmetic"
+            ))
+        })
+}
+
+/// The database clock in the stored timestamp form. SQLite's clock has
+/// millisecond resolution; rounding there keeps the product exact.
+#[cfg(any(
+    feature = "sqlite",
+    all(feature = "cloudflare-workers", target_arch = "wasm32")
+))]
+macro_rules! sqlite_now {
+    () => {
+        "(CAST(round(unixepoch('now', 'subsec') * 1000) AS INTEGER) * 1000)"
+    };
+}
+#[cfg(any(
+    feature = "sqlite",
+    all(feature = "cloudflare-workers", target_arch = "wasm32")
+))]
+pub(crate) use sqlite_now;
+
+/// The database clock in the stored timestamp form. `clock_timestamp()`, not
+/// the transaction start, so time spent waiting for a row lock counts against
+/// a lease.
+#[cfg(feature = "postgres")]
+macro_rules! postgres_now {
+    () => {
+        "(EXTRACT(EPOCH FROM clock_timestamp()) * 1000000)::bigint"
+    };
+}
+#[cfg(feature = "postgres")]
+pub(crate) use postgres_now;
 
 impl From<&str> for SqlBind<'_> {
     fn from(value: &str) -> Self {
@@ -49,16 +144,7 @@ impl<'a> From<&'a [u8]> for SqlBind<'a> {
 pub(crate) enum SqlPart<'a> {
     Sql(String),
     Bind(SqlBind<'a>),
-    LedgerNow,
-    LedgerNowEpoch,
-    LedgerDeadline(Duration),
-    LedgerDeadlineIsLive(SystemTime),
     LedgerJson(String),
-    TimestampCompare {
-        column: &'static str,
-        operator: &'static str,
-        value: SystemTime,
-    },
 }
 
 /// Structural statements: values are never interpolated into SQL text. The
@@ -105,11 +191,17 @@ pub(crate) trait SqlRow: Send {
     fn integer(&self, column: &'static str) -> Result<i64, RepositoryError>;
     fn optional_integer(&self, column: &'static str) -> Result<Option<i64>, RepositoryError>;
     fn bytes(&self, column: &'static str) -> Result<Vec<u8>, RepositoryError>;
-    fn timestamp(&self, column: &'static str) -> Result<SystemTime, RepositoryError>;
+    fn timestamp(&self, column: &'static str) -> Result<SystemTime, RepositoryError> {
+        timestamp_from_micros(self.integer(column)?)
+    }
     fn optional_timestamp(
         &self,
         column: &'static str,
-    ) -> Result<Option<SystemTime>, RepositoryError>;
+    ) -> Result<Option<SystemTime>, RepositoryError> {
+        self.optional_integer(column)?
+            .map(timestamp_from_micros)
+            .transpose()
+    }
 }
 
 pub(crate) trait SqlExecutor: Send {
@@ -117,6 +209,8 @@ pub(crate) trait SqlExecutor: Send {
     const EVENT_SELECT: &'static str;
     const SNAPSHOT_SELECT: &'static str;
     const OUTBOX_SELECT: &'static str;
+    /// The database clock as a stored timestamp (`sqlite_now!`,
+    /// `postgres_now!`).
     const NOW: &'static str;
     const COMMAND_LEDGER_SELECT: &'static str;
     const COMMAND_LEDGER_LOCK_SUFFIX: &'static str;
@@ -176,7 +270,7 @@ pub(crate) fn event_inserts<'a>(
                 SqlBind::Text(event.payload_codec.to_string()),
                 SqlBind::Integer(i64::from(event.payload_codec_version)),
                 SqlBind::Metadata(serde_json::to_string(&event.metadata).map_err(json_error)?),
-                SqlBind::Timestamp(event.timestamp),
+                SqlBind::timestamp(event.timestamp)?,
             ];
             for (index, value) in values.into_iter().enumerate() {
                 if index != 0 {
@@ -358,7 +452,7 @@ pub(crate) async fn save_snapshot<E: SqlExecutor>(
         SqlBind::Text(record.payload_codec.clone()),
         SqlBind::Integer(i64::from(record.payload_codec_version)),
         SqlBind::Metadata(serde_json::to_string(&record.metadata).map_err(json_error)?),
-        SqlBind::Timestamp(record.recorded_at),
+        SqlBind::timestamp(record.recorded_at)?,
     ];
     let mut statement = Statement::new("INSERT INTO aggregate_snapshots (aggregate_type, aggregate_id, version, snapshot_version, payload, payload_codec, payload_codec_version, metadata, recorded_at) VALUES (");
     for (index, value) in values.into_iter().enumerate() {

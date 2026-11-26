@@ -2,17 +2,13 @@
 //!
 //! The event-store/snapshot/outbox/inbox logic lives once in
 //! [`crate::sqlx_repo::repo`]; this module carries only what is genuinely
-//! SQLite-specific: the schema SQL, the `"secs.nanos"` text timestamp codec,
-//! bind-parameter chunking, the unique-constraint predicate, and the
-//! candidate-scan outbox claim (SQLite has no row locks). It is feature-gated
-//! behind `sqlite` and async-only.
+//! SQLite-specific: the schema SQL, the database clock, bind-parameter
+//! chunking, the unique-constraint predicate, and the candidate-scan outbox
+//! claim (SQLite has no row locks). It is feature-gated behind `sqlite` and
+//! async-only.
 
-use crate::repository::sqlite_codec::{
-    decode as system_time_from_storage, decode_epoch as system_time_from_epoch_secs,
-    encode as system_time_to_storage,
-};
 use std::sync::LazyLock;
-use std::time::{Duration, SystemTime};
+use std::time::SystemTime;
 
 use sqlx::migrate::Migrator;
 use sqlx::query_builder::Separated;
@@ -24,7 +20,7 @@ use crate::outbox_worker::ClaimOutboxMessages;
 use crate::repository::RepositoryError;
 use crate::sqlx_repo::read_model::quote_identifier;
 use crate::sqlx_repo::repo::{
-    embedded_migrator, system_time_epoch_secs, SqlxOutboxStore, SqlxRepository, SQLITE_MIGRATIONS,
+    embedded_migrator, SqlxOutboxStore, SqlxRepository, SQLITE_MIGRATIONS,
 };
 use crate::sqlx_repo::{
     self, is_sqlite_unique_constraint, read_model_i64_from_u64 as sqlx_read_model_i64_from_u64,
@@ -53,26 +49,20 @@ impl crate::sqlx_repo::repo::SqlxRepoBackend for Sqlite {
     // SQLite does not abort the transaction on a constraint error, so conflict
     // recovery re-reads stream versions in the same transaction.
     const CONFLICT_REREAD_IN_TX: bool = true;
-    const NOW: &'static str = "CURRENT_TIMESTAMP";
+    const NOW: &'static str = crate::repository::sql::sqlite_now!();
     const BEGIN_READ_THEN_WRITE: &'static str = "BEGIN IMMEDIATE";
     const BEGIN_READ_SNAPSHOT: &'static str = "BEGIN";
     const OWNERSHIP_FENCE_WRITER_LOCK: &'static str = "";
     const OWNERSHIP_FENCE_REGISTRATION_LOCK: &'static str = "";
     const COMMAND_LEDGER_SELECT: &'static str =
-        crate::repository::sqlite_codec::COMMAND_LEDGER_SELECT;
+        crate::repository::sqlite_select::COMMAND_LEDGER_SELECT;
     const COMMAND_LEDGER_LOCK_SUFFIX: &'static str = "";
     const SCHEDULE_CLAIM_LOCK_SUFFIX: &'static str = "";
     const COMMAND_LEDGER_COMPACTION_LOCK_SUFFIX: &'static str = "";
-    const EVENT_SELECT: &'static str = crate::repository::sqlite_codec::EVENT_SELECT;
-    const SNAPSHOT_SELECT: &'static str = crate::repository::sqlite_codec::SNAPSHOT_SELECT;
-    const OUTBOX_SELECT: &'static str = crate::repository::sqlite_codec::OUTBOX_SELECT;
-    const ORDER_BY_CREATED_AT: &'static str = "CAST(created_at AS REAL)";
-    const OUTBOX_OLDEST_CREATED_AT_SELECT: &'static str =
-        "MIN(CAST(created_at AS REAL)) AS oldest_created_at";
+    const EVENT_SELECT: &'static str = crate::repository::sqlite_select::EVENT_SELECT;
+    const SNAPSHOT_SELECT: &'static str = crate::repository::sqlite_select::SNAPSHOT_SELECT;
+    const OUTBOX_SELECT: &'static str = crate::repository::sqlite_select::OUTBOX_SELECT;
     const TABLE_DIALECT: TableSqlDialect = TableSqlDialect::Sqlite;
-
-    /// `"secs.nanos"` text, sortable/comparable via `CAST(... AS REAL)`.
-    type TimestampValue = String;
 
     fn default_pool_size(database_url: &str) -> u32 {
         if database_url.contains(":memory:") {
@@ -86,97 +76,8 @@ impl crate::sqlx_repo::repo::SqlxRepoBackend for Sqlite {
         is_sqlite_unique_constraint(err)
     }
 
-    fn timestamp_value(timestamp: SystemTime) -> Result<String, RepositoryError> {
-        system_time_to_storage(timestamp)
-    }
-
-    fn push_timestamp(sep: &mut Separated<'_, Sqlite, &'static str>, value: &String) {
-        sep.push_bind(value.as_str());
-    }
-
-    fn push_optional_timestamp(
-        sep: &mut Separated<'_, Sqlite, &'static str>,
-        value: Option<&String>,
-    ) {
-        sep.push_bind(value.map(String::as_str));
-    }
-
-    fn push_timestamp_assign(builder: &mut QueryBuilder<Sqlite>, value: &String) {
-        builder.push_bind(value.as_str());
-    }
-
-    fn push_timestamp_cmp(
-        builder: &mut QueryBuilder<Sqlite>,
-        column: &'static str,
-        op: &'static str,
-        value: SystemTime,
-    ) -> Result<(), RepositoryError> {
-        builder.push("CAST(");
-        builder.push(column);
-        builder.push(" AS REAL) ");
-        builder.push(op);
-        builder.push(" ");
-        builder.push_bind(system_time_epoch_secs::<Sqlite>(value)?);
-        Ok(())
-    }
-
-    fn push_command_ledger_now(builder: &mut QueryBuilder<Sqlite>) {
-        builder.push("unixepoch('now','subsec')");
-    }
-
-    fn push_command_ledger_now_epoch(builder: &mut QueryBuilder<Sqlite>) {
-        builder.push("unixepoch('now','subsec')");
-    }
-
-    fn push_command_ledger_deadline(builder: &mut QueryBuilder<Sqlite>, duration: Duration) {
-        builder.push("(unixepoch('now','subsec') + ");
-        builder.push_bind(duration.as_secs_f64());
-        builder.push(")");
-    }
-
-    fn push_command_ledger_deadline_is_live(builder: &mut QueryBuilder<Sqlite>, deadline: &String) {
-        builder.push("CAST(");
-        builder.push_bind(deadline.as_str());
-        builder.push(" AS REAL) > unixepoch('now','subsec')");
-    }
-
     fn push_command_ledger_json(builder: &mut QueryBuilder<Sqlite>, json: &str) {
         builder.push_bind(json);
-    }
-
-    fn decode_timestamp(
-        row: &SqliteRow,
-        column: &'static str,
-    ) -> Result<SystemTime, RepositoryError> {
-        match row.try_get::<String, _>(column) {
-            Ok(value) => system_time_from_storage(&value),
-            Err(string_err) => {
-                let value = row.try_get::<f64, _>(column).map_err(|float_err| {
-                    RepositoryError::Model(format!(
-                        "decode {column} timestamp row failed as sqlite text ({string_err}) and real ({float_err})"
-                    ))
-                })?;
-                system_time_from_epoch_secs(value)
-            }
-        }
-    }
-
-    fn decode_optional_timestamp(
-        row: &SqliteRow,
-        column: &'static str,
-    ) -> Result<Option<SystemTime>, RepositoryError> {
-        match row.try_get::<Option<String>, _>(column) {
-            Ok(value) => value.as_deref().map(system_time_from_storage).transpose(),
-            Err(string_err) => row
-                .try_get::<Option<f64>, _>(column)
-                .map_err(|float_err| {
-                    RepositoryError::Model(format!(
-                        "decode {column} timestamp row failed as sqlite text ({string_err}) and real ({float_err})"
-                    ))
-                })?
-                .map(system_time_from_epoch_secs)
-                .transpose(),
-        }
     }
 
     fn push_metadata(sep: &mut Separated<'_, Sqlite, &'static str>, json: &str) {
@@ -194,17 +95,6 @@ impl crate::sqlx_repo::repo::SqlxRepoBackend for Sqlite {
             }
         }
         builder.push(")");
-    }
-
-    fn inbox_purge_query(age: Duration) -> QueryBuilder<Sqlite> {
-        // `processed_at` defaults to CURRENT_TIMESTAMP (UTC `YYYY-MM-DD
-        // HH:MM:SS`), so compare against the database clock via
-        // `datetime('now', '-N seconds')`.
-        let mut builder =
-            QueryBuilder::new("DELETE FROM consumer_inbox WHERE processed_at < datetime('now', ");
-        builder.push_bind(format!("-{} seconds", age.as_secs()));
-        builder.push(")");
-        builder
     }
 
     async fn claim_outbox(

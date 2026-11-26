@@ -19,8 +19,9 @@ NATS_URL ?= nats://localhost:4222
 
 REDIS_URL ?= redis://localhost:6379
 
-# Lib tests that write unscoped tables each get a database of their own,
-# recreated on every run so the suite is re-runnable.
+# Lib tests that write unscoped tables each get a database of their own.
+# Tests with fixed table names also take a throwaway schema in it, so a run
+# never depends on what an earlier one left; recreating starts CI clean.
 POSTGRES_ADMIN_URL ?= postgres://sourced:sourced@localhost:5432
 TEST_DATABASES = distributed_projection_protocol distributed_snapshots distributed_rebuild distributed_unique_key_test
 

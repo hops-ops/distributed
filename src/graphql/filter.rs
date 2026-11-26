@@ -952,8 +952,8 @@ impl FilterExpr {
 /// `left = right` as SQL decides it, or `None` when SQL says NULL or the
 /// pair has no portable equality.
 ///
-/// Text is compared byte for byte; the compiler pins the same on SQLite and
-/// Postgres text equality is bytewise under every deterministic collation.
+/// Text is compared byte for byte, as generated text columns are (`COLLATE
+/// "C"` on Postgres, SQLite's default `BINARY`).
 fn values_equal(column_type: &ColumnType, left: &JsonValue, right: &LitValue) -> Option<bool> {
     if left.is_null() || matches!(right, LitValue::Null) {
         return None;
@@ -981,7 +981,7 @@ fn values_equal(column_type: &ColumnType, left: &JsonValue, right: &LitValue) ->
 
 /// `left` against `right` as SQL orders them, or `None` when SQL says NULL or
 /// the pair has no portable order. Text orders by its UTF-8 bytes, the
-/// collation the compiler pins.
+/// collation of generated text columns.
 fn values_order(column_type: &ColumnType, left: &JsonValue, right: &LitValue) -> Option<Ordering> {
     match (column_type, right) {
         (ColumnType::Text, LitValue::String(right)) => Some(left.as_str()?.cmp(right.as_str())),
