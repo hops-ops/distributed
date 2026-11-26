@@ -34,7 +34,6 @@ pub enum SnapshotWrite {
 pub struct CommitBatch<'a> {
     pub streams: Vec<StreamWrite<'a>>,
     pub outbox_messages: Vec<OutboxMessage>,
-    pub read_model_plans: Vec<TableWritePlan>,
     pub snapshots: Vec<SnapshotWrite>,
     /// Consumer inbox receipts to record in the same transaction (the optional
     /// effectively-once effect fence). Empty for the default idempotent path.
@@ -49,7 +48,6 @@ impl<'a> CommitBatch<'a> {
         Self {
             streams,
             outbox_messages: Vec::new(),
-            read_model_plans: Vec::new(),
             snapshots: Vec::new(),
             inbox_receipts: Vec::new(),
             schedules: Vec::new(),

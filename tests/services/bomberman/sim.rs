@@ -8,8 +8,10 @@ use crate::bomberman::domain::tick_saga::TickSaga;
 use crate::bomberman::domain::types::Direction;
 use crate::bomberman::error::GameError;
 use crate::bomberman::handlers;
-use crate::bomberman::views::BoardView;
+use crate::bomberman::views::{project_board, BoardView};
 
+/// A test game. Each command it runs is followed by the board projection,
+/// standing in for the projector a deployment runs on the committed events.
 pub struct Game<'a, R> {
     repo: &'a R,
     pub game_id: String,
@@ -21,10 +23,16 @@ where
 {
     pub async fn new(repo: &'a R, game_id: &str, ascii: &str) -> Result<Self, GameError> {
         handlers::create_game(repo, game_id, ascii).await?;
-        Ok(Self {
+        let game = Self {
             repo,
             game_id: game_id.to_string(),
-        })
+        };
+        game.project().await?;
+        Ok(game)
+    }
+
+    async fn project(&self) -> Result<(), GameError> {
+        project_board(self.repo, &self.game_id).await.map(|_| ())
     }
 
     pub fn sim(&self, id: &str, name: &str) -> PlayerSim<'_, R> {
@@ -36,7 +44,9 @@ where
     }
 
     pub async fn tick(&self) -> Result<TickSaga, GameError> {
-        handlers::tick(self.repo, &self.game_id).await
+        let saga = handlers::tick(self.repo, &self.game_id).await?;
+        self.project().await?;
+        Ok(saga)
     }
 
     pub async fn board(&self) -> Result<Versioned<BoardView>, GameError> {
@@ -71,15 +81,18 @@ where
             &self.game.game_id,
             spawn_index,
         )
-        .await
+        .await?;
+        self.game.project().await
     }
 
     pub async fn move_dir(&self, dir: Direction) -> Result<(), GameError> {
-        handlers::move_player(self.game.repo, &self.id, dir, &self.game.game_id).await
+        handlers::move_player(self.game.repo, &self.id, dir, &self.game.game_id).await?;
+        self.game.project().await
     }
 
     pub async fn place_bomb(&self) -> Result<(), GameError> {
-        handlers::place_bomb(self.game.repo, &self.id, &self.game.game_id).await
+        handlers::place_bomb(self.game.repo, &self.id, &self.game.game_id).await?;
+        self.game.project().await
     }
 
     pub async fn is_alive(&self) -> Result<bool, GameError> {

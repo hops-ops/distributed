@@ -776,7 +776,7 @@ ctx.emit_keyed(killer, RecordKillInput { mob, tier }, &[&format_args!("m{id}"), 
   `command_sink::CommandFactSink<H: CommandHost>` dispatches each one as a
   command through a command host — `celld::CelldFactSink` to its celld cell
   (that player's cell, a match cell, ...) over the internal path, or a
-  `LocalCommandHost` to a service over any repository — with a command id
+  an in-process `Service` over any repository — with a command id
   derived from the fact key. A retry or a duplicate is
   therefore a harmless replay, never a double reward.
 - `on_fact_settled` reports the outcome on a later tick.
@@ -1200,7 +1200,7 @@ trait and its ABI (`run_abi`, `call_bytes`).
 | `runtime` | `spawn_fact_worker` on Tokio | `tokio` (rt, time, sync) |
 | `cell` | `cell::command_id_for` / `trusted_session` / `run_fact_batch`; `cell::fact_session_from_headers` / `session_stamp` for cells (also wasm32); `stamp_event_record`; the `world::zone_lease` and `world::zone_state` cell aggregates | `distributed`, `sha2`, `base64` |
 | `cell` (also) | `command_sink::CommandFactSink<H: FactHost>`: facts → commands through any fact host, routed by command (`FactRoute`); `world::zone_activity` | |
-| `command-host` | `FactHost` for `CelldCommandHost` / `LocalCommandHost` (`CelldFactSink`) | `cell` + `distributed/http` |
+| `command-host` | `FactHost` for `CelldCommandHost` / `Service` (`CelldFactSink`) | `cell` + `distributed/http` |
 | `celld-zone` | `celld_zone`: any `Zone` as a celld Durable Object (`ZoneObject`, `celld_zone_object!`, `forward_to_zone`), facts object to object (`CelldObjectHost`), `serve_cell` / `ZoneActivityCell` for the worker's cells (wasm32) | `cell`, `ticket`, `cloudflare-workers` + `js-sys`, `wasm-bindgen(-futures)` |
 | `ticket` | `ticket`: HS256 admission and transfer tickets without the axum server | `hmac`, `sha2`, `base64` |
 | `celld` | `celld::CelldFactSink` (the command sink over a remote-only `CelldCommandHost`): facts → celld cells over the internal HTTP path; `celld::CellZoneOwnership`: zone leases in celld `ZoneLease` cells; `celld::CellZoneStateStore`: hibernation snapshots in celld `ZoneState` cells | `command-host` + `reqwest`, `uuid` |
@@ -1270,8 +1270,8 @@ aggregates as commands through a `CommandHost`, with one
 by its command to an aggregate kind and shard (`FactRoute`: by principal,
 by input field, by zone, or a function of the input and trusted session).
 The same routes serve every host: `celld::CelldFactSink` (feature `celld`)
-addresses celld cells by kind and shard; over a `LocalCommandHost` a
-service routes by command and its handler picks the stream
+addresses celld cells by kind and shard; over an in-process `Service` it
+routes by command and its handler picks the stream
 (`tests/command_facts` runs the celld test's routes against an in-memory
 repository):
 
@@ -1280,7 +1280,7 @@ let sink = CelldFactSink::celld(celld_url, InternalHttpSecret::new(secret)?, "zo
     .route(FactRoute::by_principal::<RecordKillInput>("crawler"))            // Crawler:{principal}
     .route(FactRoute::by_input_field::<MatchResultInput>("match", "match_id"))
     .lifecycle_route("presence");                                            // zone.* → Presence:{account}
-// or: CommandFactSink::new(LocalCommandHost::new(service), "zone-server", "zone:pit-1")?.route(..)
+// or: CommandFactSink::new(service, "zone-server", "zone:pit-1")?.route(..)
 let (queue, feed) = fact_channel(capacity, RetryPolicy::until_settled(base, max));
 spawn_fact_worker(feed.with_max_concurrent_commits(n), sink);
 ```

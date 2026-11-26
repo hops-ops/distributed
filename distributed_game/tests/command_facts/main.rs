@@ -1,16 +1,15 @@
 //! The fact routes a zone server uses with celld (`tests/celld_facts`), on
-//! an ordinary service instead: `CommandFactSink<LocalCommandHost>` over an
+//! an ordinary service instead: `CommandFactSink<Service>` over an
 //! in-memory repository. Kills land in the killer's stream, match results in
 //! the match's stream, lifecycle facts in the player's — no cell involved —
 //! with the trusted principal and stamp, exactly once per fact key.
 
-use std::sync::Arc;
 
 use distributed::command::{typed_command, PreparedCommand, Succeeded};
 use distributed::microsvc::{
     CausalCommandContext, CausalRouteDependencies, HandlerError, PortableCommand, Routes, Service,
 };
-use distributed::{sourced, AggregateRepository, Entity, InMemoryRepository, LocalCommandHost};
+use distributed::{sourced, AggregateRepository, Entity, InMemoryRepository};
 use distributed_game::cell::session_stamp;
 use distributed_game::command_sink::{CommandFactSink, FactRoute};
 use distributed_game::lifecycle::{JoinVia, PlayerJoined, LIFECYCLE_COMMANDS};
@@ -196,19 +195,15 @@ fn fact<C: FactCommand + Serialize>(
 async fn the_celld_fact_routes_land_on_a_service_over_any_repository() {
     let repo = InMemoryRepository::new();
     let routes = Commands.install(Routes::new().with_repo(AggregateRepository::new(repo.clone())));
-    let service = Arc::new(Service::new().named("zone-server-test").routes(routes));
+    let service = Service::new().named("zone-server-test").routes(routes);
     // The same routes as the celld fact-routing test.
-    let sink = CommandFactSink::new(
-        LocalCommandHost::new(service),
-        "zone-server-test",
-        "zone:pit-1",
-    )
-    .unwrap()
-    .route(FactRoute::by_principal::<Kill>("kills"))
-    .route(FactRoute::by_input_field::<MatchResult>(
-        "match", "match_id",
-    ))
-    .lifecycle_route("presence");
+    let sink = CommandFactSink::new(service, "zone-server-test", "zone:pit-1")
+        .unwrap()
+        .route(FactRoute::by_principal::<Kill>("kills"))
+        .route(FactRoute::by_input_field::<MatchResult>(
+            "match", "match_id",
+        ))
+        .lifecycle_route("presence");
 
     let kill = fact("kill:1", &Kill { mob: "m1".into() }, Some("alice"), 1);
     let first = sink.commit(&kill).await.unwrap();

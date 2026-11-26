@@ -79,7 +79,7 @@ pub use application::{
 };
 #[cfg(feature = "http")]
 pub use command_dispatch::{CellRequestContext, HttpCommandHost, TrustedRequestMetadata};
-pub use command_dispatch::{CommandHost, LocalCommandHost, ProtocolAuthority, SharedCommandHost};
+pub use command_dispatch::{CommandHost, ProtocolAuthority, SharedCommandHost};
 
 // Domain events: typed outward contracts distinct from replay events/snapshots.
 pub use domain_event::{
@@ -393,10 +393,8 @@ pub use trace_context::{
     is_valid_traceparent, TraceContext, CAUSATION_ID, CORRELATION_ID, TRACEPARENT, TRACESTATE,
 };
 
-// CommitBuilder: transactional batches of read models, outbox, and aggregates
-pub use commit_builder::{
-    CommitBuilder, CommitBuilderExt, ReadModelWritePlanCommitExt, StagedCommitBuilder,
-};
+// CommitBuilder: transactional batches of outbox messages and aggregates
+pub use commit_builder::{CommitBuilder, CommitBuilderExt, StagedCommitBuilder};
 
 // Snapshot: state snapshot payloads and rebuildable cache records for hydration
 pub use snapshot::{hydrate_from_snapshot, InMemorySnapshotStore, SnapshotRecord, Snapshottable};

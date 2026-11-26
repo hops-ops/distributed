@@ -200,6 +200,9 @@ pub(crate) enum CausalWorkspaceError {
     DomainPublicationsAlreadyPrepared,
     DomainPublicationsNotPrepared,
     CommitBatchAlreadyPrepared,
+    /// A projected row was staged but never sealed into a direct projection:
+    /// read models are written only by projections.
+    UnsealedProjectedRow,
     Schedule(crate::schedule::ScheduleError),
 }
 
@@ -251,6 +254,9 @@ impl std::fmt::Display for CausalWorkspaceError {
             Self::CommitBatchAlreadyPrepared => {
                 formatter.write_str("causal workspace commit batch was already prepared")
             }
+            Self::UnsealedProjectedRow => formatter.write_str(
+                "a projected read-model row was staged without a direct projection to commit it",
+            ),
         }
     }
 }
@@ -273,7 +279,8 @@ impl std::error::Error for CausalWorkspaceError {
             | Self::DomainPublicationRequired(_)
             | Self::DomainPublicationsAlreadyPrepared
             | Self::DomainPublicationsNotPrepared
-            | Self::CommitBatchAlreadyPrepared => None,
+            | Self::CommitBatchAlreadyPrepared
+            | Self::UnsealedProjectedRow => None,
         }
     }
 }
@@ -500,27 +507,6 @@ impl<A> CausalWorkspace<'_, A> {
             ));
         }
         state.schedules.push(write);
-        Ok(())
-    }
-
-    pub(crate) fn stage_read_models(
-        &self,
-        builder: ReadModelWritePlanBuilder,
-    ) -> Result<(), CausalWorkspaceError> {
-        let plan = builder.into_write_plan()?;
-        self.stage_read_model_plan(plan)
-    }
-
-    pub(crate) fn stage_read_model_plan(
-        &self,
-        plan: TableWritePlan,
-    ) -> Result<(), CausalWorkspaceError> {
-        plan.validate()?;
-        self.state
-            .lock()
-            .map_err(|_| CausalWorkspaceError::Poisoned)?
-            .read_model_plans
-            .push(plan);
         Ok(())
     }
 
@@ -838,6 +824,11 @@ impl CausalWorkspaceParts {
         if self.batch_prepared {
             return Err(CausalWorkspaceError::CommitBatchAlreadyPrepared);
         }
+        // The only rows a workspace stages are the projected row of an
+        // `Atomic` result, which sealing moves into the direct projection.
+        if !self.read_model_plans.is_empty() {
+            return Err(CausalWorkspaceError::UnsealedProjectedRow);
+        }
         self.batch_prepared = true;
 
         // Preserve ordinary AggregateCommit source metadata for low-level
@@ -867,7 +858,6 @@ impl CausalWorkspaceParts {
             .collect();
         let mut batch = CommitBatch::new(streams);
         batch.outbox_messages = std::mem::take(&mut self.outbox_messages);
-        batch.read_model_plans = std::mem::take(&mut self.read_model_plans);
         batch.snapshots = std::mem::take(&mut self.snapshots);
         batch.schedules = std::mem::take(&mut self.schedules);
         Ok(batch)
@@ -1198,13 +1188,6 @@ mod tests {
         workspace
             .stage_outbox(OutboxMessage::create("m-1", "test.changed", vec![1]).unwrap())
             .unwrap();
-        let mut plan = ReadModelWritePlanBuilder::new();
-        plan.upsert(&TestView {
-            id: "v-1".into(),
-            title: "first".into(),
-        })
-        .unwrap();
-        workspace.stage_read_models(plan).unwrap();
 
         let mut parts = workspace.into_parts().unwrap();
         assert_eq!(parts.aggregate_count(), 1);
@@ -1212,7 +1195,6 @@ mod tests {
             let batch = parts.prepare_commit_batch().unwrap();
             assert_eq!(batch.streams.len(), 1);
             assert_eq!(batch.outbox_messages.len(), 1);
-            assert_eq!(batch.read_model_plans.len(), 1);
             assert_eq!(
                 batch.outbox_messages[0].source_aggregate_type.as_deref(),
                 Some(TestAggregate::aggregate_type())
@@ -1226,6 +1208,23 @@ mod tests {
         assert!(matches!(
             parts.prepare_commit_batch(),
             Err(CausalWorkspaceError::CommitBatchAlreadyPrepared)
+        ));
+    }
+
+    #[tokio::test]
+    async fn an_unsealed_projected_row_never_reaches_a_commit_batch() {
+        let repository = loaded_repo();
+        let workspace = CausalWorkspace::new(&repository);
+        workspace
+            .prepare_atomic(TestView {
+                id: "v-1".into(),
+                title: "staged".into(),
+            })
+            .unwrap();
+        let mut parts = workspace.into_parts().unwrap();
+        assert!(matches!(
+            parts.prepare_commit_batch(),
+            Err(CausalWorkspaceError::UnsealedProjectedRow)
         ));
     }
 
@@ -1370,37 +1369,6 @@ mod tests {
         assert!(matches!(
             parts.validate_prepared(&contract, &mut prepared),
             Err(CommandCommitProofError::DurableEventMissing)
-        ));
-    }
-
-    #[tokio::test]
-    async fn projected_proof_rejects_a_second_write_to_the_returned_key() {
-        let repository = loaded_repo();
-        let workspace = CausalWorkspace::new(&repository);
-        let mut prepared = workspace
-            .prepare_atomic(TestView {
-                id: "v-1".into(),
-                title: "returned".into(),
-            })
-            .unwrap();
-        workspace
-            .stage_outbox(OutboxMessage::create("projection-2", "test.changed", vec![]).unwrap())
-            .unwrap();
-        let mut conflicting = ReadModelWritePlanBuilder::new();
-        conflicting
-            .upsert(&TestView {
-                id: "v-1".into(),
-                title: "overwritten".into(),
-            })
-            .unwrap();
-        workspace.stage_read_models(conflicting).unwrap();
-        let mut parts = workspace.into_parts().unwrap();
-        let contract = crate::command::typed_command::<TestInput, Atomic<TestView>>("test.project")
-            .into_contract();
-
-        assert!(matches!(
-            parts.validate_prepared(&contract, &mut prepared),
-            Err(CommandCommitProofError::ProjectionWriteConflict { .. })
         ));
     }
 
@@ -1551,40 +1519,6 @@ mod tests {
             record.values().get("title"),
             Some(&RowValue::String("authoritative".into()))
         );
-    }
-
-    #[test]
-    fn modeled_direct_rejects_a_separate_same_transaction_read_model_plan() {
-        let repository = modeled_direct_repository();
-        let workspace = CausalWorkspace::new(&repository);
-        let mut aggregate = workspace.create();
-        aggregate
-            .create("direct-mixed".into(), "authoritative".into())
-            .unwrap();
-        workspace.stage(aggregate).unwrap();
-        let mut prepared = workspace
-            .prepare_modeled_atomic_from_executor::<ModeledDirectView>(
-                MODELED_DIRECT.server_executor().unwrap(),
-            )
-            .unwrap();
-        let mut separate = ReadModelWritePlanBuilder::new();
-        separate
-            .upsert(&TestView {
-                id: "separate".into(),
-                title: "not part of the modeled proof".into(),
-            })
-            .unwrap();
-        workspace.stage_read_models(separate).unwrap();
-
-        let mut parts = workspace.into_parts().unwrap();
-        parts
-            .prepare_domain_publications("modeled-direct-mixed")
-            .unwrap();
-        assert!(matches!(
-            parts.validate_prepared(&modeled_direct_contract(), &mut prepared),
-            Err(CommandCommitProofError::DirectProjection(message))
-                if message.contains("separate read-model mutations")
-        ));
     }
 
     #[test]

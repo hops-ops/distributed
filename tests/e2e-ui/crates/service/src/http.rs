@@ -16,7 +16,6 @@ pub fn gateway_router(
     service: Arc<Service>,
     options: &crate::HostOptions,
 ) -> Result<axum::Router, std::io::Error> {
-    use distributed::command_dispatch::LocalCommandHost;
     use distributed::gateway::{delivery::*, native::*, *};
     use distributed::graphql::identity::OidcGatewayProvider;
     let engine = service
@@ -74,7 +73,7 @@ pub fn gateway_router(
     let graphql = GraphqlBinding::Embedded(
         EmbeddedGraphql::new(
             engine.clone(),
-            Some(Arc::new(LocalCommandHost::new(service.clone()))),
+            Some(service.clone() as distributed::SharedCommandHost),
             capabilities,
         )
         .map_err(std::io::Error::other)?,

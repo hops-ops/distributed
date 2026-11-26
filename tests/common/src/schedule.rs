@@ -489,7 +489,7 @@ macro_rules! schedule_conformance_tests {
                 let service = service(repo.clone());
                 let started = Instant::now();
                 start(&service, "once", 1, 200, TICK).await;
-                let running = worker.spawn(Arc::clone(&service));
+                let running = worker.spawn(service.clone());
                 until("the first tick", Duration::from_secs(10), || async {
                     ticks(&repo, "once").await == 1
                 })
@@ -552,16 +552,16 @@ macro_rules! schedule_conformance_tests {
                 let flaky = format!("flaky-{}", command_id());
                 fail_once(&flaky);
                 start(&host, &flaky, 1, 0, FLAKY).await;
-                let report = worker.run_once(&host).await.unwrap();
+                let report = worker.run_once(host.as_ref()).await.unwrap();
                 assert_eq!(report.retried.len(), 1, "{report:?}");
                 let retry = <$backend>::armed(&repo, &owner(&flaky)).await;
                 assert_eq!(retry[0].attempts, 1);
                 assert!(
-                    worker.run_once(&host).await.unwrap().is_empty(),
+                    worker.run_once(host.as_ref()).await.unwrap().is_empty(),
                     "backing off"
                 );
                 tokio::time::sleep(Duration::from_millis(1_050)).await;
-                let report = worker.run_once(&host).await.unwrap();
+                let report = worker.run_once(host.as_ref()).await.unwrap();
                 assert_eq!(report.fired.len(), 1, "{report:?}");
                 assert_eq!(ticks(&repo, &flaky).await, 1);
                 assert!(<$backend>::armed(&repo, &owner(&flaky)).await.is_empty());
@@ -587,7 +587,7 @@ macro_rules! schedule_conformance_tests {
                 // commits), then dies before settling.
                 <$backend as SettleFaults>::refuse_settlement(&repo).await;
                 crashing
-                    .run_once(&crashed)
+                    .run_once(crashed.as_ref())
                     .await
                     .expect_err("the settlement fails: the worker crashed");
                 <$backend as SettleFaults>::allow_settlement(&repo).await;
@@ -600,19 +600,19 @@ macro_rules! schedule_conformance_tests {
                 let worker = worker.with_clock(Arc::new(clock.clone()));
                 let service = service(repo.clone());
                 clock.advance(claim_ttl - Duration::from_millis(1));
-                let held = worker.run_once(&service).await.unwrap();
+                let held = worker.run_once(service.as_ref()).await.unwrap();
                 assert!(held.is_empty(), "the crashed worker's claim holds: {held:?}");
                 assert_eq!(ticks(&repo, "crash").await, 1);
                 assert_eq!(<$backend>::armed(&repo, &owner("crash")).await.len(), 1);
 
                 // The claim lapses: the same command id replays and settles once.
                 clock.advance(Duration::from_millis(1));
-                let replay = worker.run_once(&service).await.unwrap();
+                let replay = worker.run_once(service.as_ref()).await.unwrap();
                 assert_eq!(replay.fired.len(), 1, "{replay:?}");
                 assert!(replay.fired[0].replayed, "the ledger replays the committed tick");
                 assert_eq!(ticks(&repo, "crash").await, 1, "exactly once across the crash");
                 assert!(<$backend>::armed(&repo, &owner("crash")).await.is_empty());
-                assert!(worker.run_once(&service).await.unwrap().is_empty());
+                assert!(worker.run_once(service.as_ref()).await.unwrap().is_empty());
             };
         }
         $crate::conformance_cases! { @if $clock $crate::schedule::ScheduleBackend, $backend, open;
@@ -626,16 +626,16 @@ macro_rules! schedule_conformance_tests {
                 let (repo, worker) = ScheduleWorker::attach(b.repository_on(clock.clone()), fast());
                 let host = service(repo.clone());
                 start(&host, "clocked", 2, 1_000, TICK).await;
-                assert!(worker.run_once(&host).await.unwrap().is_empty(), "not due yet");
+                assert!(worker.run_once(host.as_ref()).await.unwrap().is_empty(), "not due yet");
                 clock.advance(Duration::from_millis(1_000));
-                let first = worker.run_once(&host).await.unwrap();
+                let first = worker.run_once(host.as_ref()).await.unwrap();
                 assert_eq!(first.fired.len(), 1);
                 assert!(!first.fired[0].replayed);
-                assert!(worker.run_once(&host).await.unwrap().is_empty(), "re-armed for later");
+                assert!(worker.run_once(host.as_ref()).await.unwrap().is_empty(), "re-armed for later");
                 clock.advance(Duration::from_millis(1_000));
-                assert_eq!(worker.run_once(&host).await.unwrap().fired.len(), 1);
+                assert_eq!(worker.run_once(host.as_ref()).await.unwrap().fired.len(), 1);
                 clock.advance(Duration::from_secs(60));
-                assert!(worker.run_once(&host).await.unwrap().is_empty());
+                assert!(worker.run_once(host.as_ref()).await.unwrap().is_empty());
                 assert_eq!(ticks(&repo, "clocked").await, 2);
                 assert!(<$backend>::armed(&repo, &owner("clocked")).await.is_empty());
             };

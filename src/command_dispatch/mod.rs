@@ -1,5 +1,6 @@
-//! The command host: the one boundary GraphQL, the schedule worker and cell
-//! callers dispatch typed commands through, in process or over HTTP.
+//! The command host: the one boundary every ingress (GraphQL, the bus,
+//! Knative, the schedule worker, cell callers) dispatches typed commands
+//! through, in process or over HTTP.
 
 mod host;
 #[cfg(feature = "http")]
@@ -10,7 +11,7 @@ pub(crate) mod principal;
 pub(crate) use host::validate_principal_session;
 #[cfg(feature = "graphql")]
 pub(crate) use host::validate_principal_session_if_present;
-pub use host::{CommandHost, LocalCommandHost, ProtocolAuthority, SharedCommandHost};
+pub use host::{CommandHost, ProtocolAuthority, SharedCommandHost};
 #[cfg(feature = "http")]
 pub use http::{CellRequestContext, HttpCommandHost, TrustedRequestMetadata};
 pub use principal::{InvalidPrincipal, VerifiedPrincipal};

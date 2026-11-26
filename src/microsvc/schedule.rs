@@ -14,8 +14,10 @@
 //!    SQL) that no live claim holds, until `now + claim_ttl`. Concurrent
 //!    workers get disjoint rows: `FOR UPDATE SKIP LOCKED` on Postgres, the
 //!    single writer on SQLite.
-//! 2. **Dispatch** each through the [`Service`] with the trusted
-//!    [`schedule_session`] and a command id derived from the owning stream,
+//! 2. **Dispatch** each through a [`CommandHost`](crate::CommandHost) (the
+//!    [`Service`](crate::microsvc::Service) built over the repository) as the trusted schedule
+//!    principal, with [`schedule_session`] and a command id derived from the
+//!    owning stream,
 //!    the schedule name and its generation
 //!    ([`ScheduleWorker::command_id`]). The command ledger makes that id
 //!    exactly-once: a re-dispatch replays the committed receipt.
@@ -142,8 +144,8 @@ mod worker {
     use sha2::{Digest, Sha256};
 
     use super::{schedule_session, SCHEDULE_USER_ID};
-    use crate::command_dispatch::VerifiedPrincipal;
-    use crate::microsvc::{CausalDispatchError, Service};
+    use crate::command_dispatch::{CommandHost, SharedCommandHost, VerifiedPrincipal};
+    use crate::microsvc::CausalDispatchError;
     use crate::repository::RepositoryError;
     use crate::schedule::{
         retry_delay, system_time_to_ms, FailedSchedule, FiredSchedule, ScheduleFireReport,
@@ -196,7 +198,9 @@ mod worker {
         }
     }
 
-    /// Fires the due schedules of a shared repository through a [`Service`].
+    /// Fires the due schedules of a shared repository through a
+    /// [`CommandHost`] (usually the [`Service`](crate::microsvc::Service)
+    /// built over that repository).
     /// See the [module docs](super).
     #[must_use = "a schedule worker fires nothing until it runs: call `spawn`, `run` or `run_once`"]
     #[derive(Clone)]
@@ -266,11 +270,11 @@ mod worker {
         }
 
         /// One pass: claim the due schedules, dispatch each through
-        /// `service`, and settle it. Store errors abort the pass (claims
-        /// lapse and are retried).
+        /// `host` as the trusted schedule principal, and settle it. Store
+        /// errors abort the pass (claims lapse and are retried).
         pub async fn run_once(
             &self,
-            service: &Service,
+            host: &dyn CommandHost,
         ) -> Result<ScheduleFireReport, RepositoryError> {
             let now = match &self.clock {
                 Some(clock) => clock.now(),
@@ -289,14 +293,14 @@ mod worker {
             let mut report = ScheduleFireReport::default();
             for (owner, schedule) in claimed {
                 let command_id = Self::command_id(&owner, &schedule.name, schedule.generation);
-                let result = service
-                    .dispatch_causal_with_receipt(
+                let result = host
+                    .invoke(
                         &schedule.command,
                         &command_id,
                         schedule.input.clone(),
                         schedule_session(&schedule),
-                        VerifiedPrincipal::internal(SCHEDULE_USER_ID)
-                            .expect("the schedule subject is a non-empty constant"),
+                        VerifiedPrincipal::trusted_transport(SCHEDULE_USER_ID),
+                        None,
                     )
                     .await;
                 let settlement = match result {
@@ -346,7 +350,7 @@ mod worker {
         /// another.
         pub async fn run(
             self,
-            service: Arc<Service>,
+            host: SharedCommandHost,
             shutdown: impl std::future::Future<Output = ()>,
         ) {
             tokio::pin!(shutdown);
@@ -357,7 +361,7 @@ mod worker {
                     _ = &mut shutdown => return,
                     _ = tokio::time::sleep(sleep_for) => {}
                 }
-                sleep_for = match self.run_once(&service).await {
+                sleep_for = match self.run_once(host.as_ref()).await {
                     Ok(report)
                         if report.fired.len() + report.retried.len() + report.failed.len()
                             >= self.config.batch_size =>
@@ -374,9 +378,9 @@ mod worker {
         }
 
         /// Spawn [`run`](Self::run) on the current tokio runtime.
-        pub fn spawn(self, service: Arc<Service>) -> ScheduleWorkerHandle {
+        pub fn spawn(self, host: SharedCommandHost) -> ScheduleWorkerHandle {
             let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
-            let join = tokio::spawn(self.run(service, async move {
+            let join = tokio::spawn(self.run(host, async move {
                 let _ = stopped.await;
             }));
             ScheduleWorkerHandle {

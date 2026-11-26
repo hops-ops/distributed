@@ -1,13 +1,9 @@
 use distributed::{
-    Aggregate, CommitBatch, GetStream, OutboxMessage, ReadModelWritePlanStore,
-    RelationalReadModelQueryStore, RepositoryError, StreamIdentity, StreamWrite,
+    Aggregate, CommitBatch, GetStream, OutboxMessage, RepositoryError, StreamIdentity, StreamWrite,
     TransactionalCommit,
 };
 
-use super::shared::{
-    board_write_plan, build_board_from_aggregates, get_aggregate, load_board, load_board_bombs,
-    load_board_explosions, load_board_players,
-};
+use super::shared::{get_aggregate, load_active_explosions, load_game_players, load_live_bombs};
 use crate::bomberman::domain::bomb::Bomb;
 use crate::bomberman::domain::explosion::Explosion;
 use crate::bomberman::domain::game_map::GameMap;
@@ -53,23 +49,22 @@ struct KillAttribution {
 
 pub async fn tick<R>(repo: &R, game_id: &str) -> Result<TickSaga, GameError>
 where
-    R: GetStream + TransactionalCommit + ReadModelWritePlanStore + RelationalReadModelQueryStore,
+    R: GetStream + TransactionalCommit,
 {
     let mut map: GameMap = get_aggregate::<R, GameMap>(repo, game_id)
         .await?
         .ok_or(GameError::GameNotFound)?;
 
-    let board = load_board(repo, game_id).await?;
-    let mut bombs = load_board_bombs(repo, &board).await?;
-    let mut players = load_board_players(repo, &board).await?;
-    let mut explosions = load_board_explosions(repo, &board).await?;
+    let mut players = load_game_players(repo, &map).await?;
+    let mut bombs = load_live_bombs(repo, &players).await?;
+    let mut explosions = load_active_explosions(repo, &map).await?;
 
     let bombs_ticked = bombs.len();
     for bomb in &mut bombs {
         bomb.tick()?;
     }
 
-    let tick_num = board.turn + 1;
+    let tick_num = map.turn + 1;
 
     let mut saga = TickSaga::default();
     saga.start(
@@ -78,7 +73,7 @@ where
         bombs_ticked,
     )?;
 
-    let mut explosion_counter = board.explosions_created;
+    let mut explosion_counter = map.explosions_created;
     let mut kill_attributions = Vec::new();
 
     for explosion in &mut explosions {
@@ -185,19 +180,15 @@ where
 
     saga.complete(game_over, winner)?;
 
-    let board = build_board_from_aggregates(
-        game_id,
-        &map,
-        &players,
-        &bombs,
-        &explosions,
+    map.record_tick(
         tick_num,
         explosion_counter,
-    );
-
-    let read_model_plan = board_write_plan(&board)?
-        .into_write_plan()
-        .map_err(RepositoryError::from)?;
+        explosions
+            .iter()
+            .filter(|explosion| explosion.active)
+            .map(|explosion| explosion.entity.id().to_string())
+            .collect(),
+    )?;
 
     let mut outbox_messages = Vec::new();
     for killed_id in &saga.players_killed {
@@ -253,7 +244,6 @@ where
 
     let mut batch = CommitBatch::new(streams);
     batch.outbox_messages = outbox_messages;
-    batch.read_model_plans = vec![read_model_plan];
     repo.commit_batch(batch).await?;
 
     Ok(saga)

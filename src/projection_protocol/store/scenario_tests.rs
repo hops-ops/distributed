@@ -12,7 +12,7 @@ use std::future::Future;
 use std::sync::Arc;
 
 use super::*;
-use crate::repository::{CommitBatch, InboxStore, ReadModelWritePlanStore, TransactionalCommit};
+use crate::repository::{InboxStore, ReadModelWritePlanStore, TransactionalCommit};
 use crate::table::{
     ColumnType, DeleteTableRowMutation, ExpectedVersion, PatchMode, PatchTableRowMutation,
     PrimaryKey, RowPatch, RowValue, RowWriteMode, TableColumn, TableKind, TableRowMutation,
@@ -3406,12 +3406,6 @@ pub(crate) async fn owned_table_rejects_every_raw_write(scenario: impl Projectio
     assert!(matches!(
         repository.commit_write_plan(raw_plan()).await,
         Err(TableStoreError::CausalWriteRequired { table: ref refused }) if refused == table
-    ));
-    let mut raw_batch = CommitBatch::empty();
-    raw_batch.read_model_plans.push(raw_plan());
-    assert!(matches!(
-        repository.commit_batch(raw_batch).await,
-        Err(RepositoryError::CausalWriteRequired { table: ref refused }) if refused == table
     ));
 }
 

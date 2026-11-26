@@ -339,20 +339,11 @@ macro_rules! repository_conformance_tests {
             commit_batch_with_1000_events_round_trips(b) =>
                 $crate::repository::storage::commit_batch_with_1000_events_round_trips(b.repository());
             #[tokio::test]
-            conflict_rolls_back_other_stream_and_read_model_plan(b) =>
-                $crate::repository::storage::conflict_rolls_back_other_stream_and_read_model_plan(b.repository());
-            #[tokio::test]
             standalone_relational_write_plan_persists_row(b) =>
                 $crate::repository::read_models::standalone_relational_write_plan_persists_row(b.repository());
             #[tokio::test]
-            aggregate_commit_persists_read_model_plan(b) =>
-                $crate::repository::read_models::aggregate_commit_persists_read_model_plan(b.repository());
-            #[tokio::test]
-            aggregate_conflict_rolls_back_read_model_plan(b) =>
-                $crate::repository::read_models::aggregate_conflict_rolls_back_read_model_plan(b.repository());
-            #[tokio::test]
-            commit_lowers_relational_read_model_plan_into_registered_table(b) =>
-                $crate::repository::storage::commit_lowers_relational_read_model_plan_into_registered_table(b.repository());
+            write_plan_lowers_relational_read_model_into_registered_table(b) =>
+                $crate::repository::storage::write_plan_lowers_relational_read_model_into_registered_table(b.repository());
             #[tokio::test]
             read_model_plan_patches_and_deletes_relational_rows(b) =>
                 $crate::repository::storage::read_model_plan_patches_and_deletes_relational_rows(b.repository());
@@ -398,8 +389,8 @@ macro_rules! repository_conformance_tests {
         }
         $crate::conformance_cases! { @if $sql_faults $crate::repository::RepositoryBackend, $backend, open;
             #[tokio::test]
-            read_model_failure_mid_plan_rolls_back_events_and_outbox(b) =>
-                $crate::repository::storage::read_model_failure_mid_plan_rolls_back_events_and_outbox(&b);
+            read_model_failure_mid_plan_rolls_back_the_whole_plan(b) =>
+                $crate::repository::storage::read_model_failure_mid_plan_rolls_back_the_whole_plan(&b);
             #[tokio::test]
             unsupported_codec_rows_fail_on_read(b) =>
                 $crate::repository::storage::unsupported_codec_rows_fail_on_read(&b);

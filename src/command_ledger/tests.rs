@@ -13,7 +13,7 @@ use crate::projection_protocol::{
     ProjectionObservation, ProjectionObservationKind, ProjectionRecordMetadata,
     ProjectionRecordScope, ProjectorTopologyId, RecordRevision, SameTransactionProjectionEvidence,
 };
-use crate::read_model::{ReadModelWritePlanBuilder, RelationalReadModel};
+use crate::read_model::RelationalReadModel;
 use crate::repository::{
     CommitBatch, GetStream, InboxReceipt, InboxStore, RelationalReadModelQueryStore, SnapshotStore,
     SnapshotWrite, StreamIdentity, StreamWrite,
@@ -1033,14 +1033,6 @@ where
     )
     .unwrap();
 
-    let read_model_id = format!("ledger-stale-view-{}", Uuid::now_v7());
-    let view = LedgerConformanceView {
-        id: read_model_id.clone(),
-        marker: "must-roll-back".into(),
-    };
-    let mut read_models = ReadModelWritePlanBuilder::new();
-    read_models.upsert(&view).unwrap();
-
     let inbox_consumer = format!("ledger-consumer-{}", Uuid::now_v7());
     let inbox_message_id = format!("ledger-message-{}", Uuid::now_v7());
     let snapshot = SnapshotRecord::new(
@@ -1060,9 +1052,6 @@ where
         .unwrap();
     let mut domain = CommitBatch::new(vec![StreamWrite::new(identity.clone(), &mut entity)]);
     domain.outbox_messages.push(outbox_message);
-    domain
-        .read_model_plans
-        .push(read_models.into_write_plan().unwrap());
     domain.snapshots.push(SnapshotWrite::Save {
         identity: identity.clone(),
         record: snapshot,
@@ -1087,10 +1076,6 @@ where
         .await
         .unwrap();
     assert!(pending.iter().all(|message| message.id() != outbox_id));
-    let load = ReadModelWritePlanBuilder::new()
-        .load::<LedgerConformanceView>(RowKey::new([("id", RowValue::String(read_model_id))]))
-        .unwrap();
-    assert!(repo.load_graph(load).await.unwrap().root.is_none());
     assert!(repo.get_snapshot(&identity).await.unwrap().is_none());
     assert!(!repo
         .inbox_contains(&inbox_consumer, &inbox_message_id)

@@ -29,7 +29,7 @@ use crate::bus::{
     Message, MessageKind, OrderedDelivery, RunOptions, SubscriptionPlan, TransportError,
 };
 use crate::command::{TypedCommandContract, TypedServiceCommandBinding};
-use crate::command_dispatch::VerifiedPrincipal;
+use crate::command_dispatch::{CommandHost, VerifiedPrincipal};
 use crate::command_ledger::CommandLookup;
 #[cfg(feature = "http")]
 use crate::command_ledger::ExternalDispatchBinding;
@@ -1112,6 +1112,11 @@ impl Service {
         ordered: Option<&OrderedDelivery>,
         lane: Option<usize>,
     ) -> Result<Value, HandlerError> {
+        // A typed command is measured and traced by the typed dispatch it
+        // runs through.
+        if message.kind == MessageKind::Command {
+            return self.dispatch_transport_command(message, lane).await;
+        }
         #[cfg(feature = "metrics")]
         let started = Instant::now();
         let result = self.dispatch_message_inner(message, ordered, lane).await;
@@ -1166,64 +1171,62 @@ impl Service {
                 Err(err) => return Err(err),
             }
         };
-        // A command name has one route, and it runs through the ledger.
-        if message.kind == MessageKind::Command {
-            let declared = self.routes[route_indices[0]]
-                .typed_command_contract(&message.name)
-                .is_some_and(|contract| contract.roles.iter().any(|role| role == TRANSPORT_ROLE));
-            return self
-                .in_dispatch_span(
-                    message,
-                    self.dispatch_transport_command(message, input, declared),
-                )
-                .await
-                .map_err(transport_command_error);
-        }
         let session = message_to_session(message);
         self.in_dispatch_span(
             message,
-            self.invoke(message, input, session, ordered, route_indices),
+            self.run_event_routes(message, input, session, ordered, route_indices),
         )
         .await
     }
 
-    /// Run a typed command a transport delivered, as the transport identity.
+    /// Run a typed command a transport delivered (a bus consumer, the
+    /// Knative ingress) through [`CommandHost::invoke`], as the trusted
+    /// transport principal.
     ///
-    /// The command ID derives from the message ID, so a redelivery replays
-    /// the committed receipt and the handler does not run again.
+    /// The ledger command ID derives from the message ID, so a redelivery
+    /// replays the committed receipt and the handler does not run again.
     async fn dispatch_transport_command(
         &self,
         message: &Message,
-        input: Value,
-        declared: bool,
-    ) -> Result<Value, CausalDispatchError> {
+        lane: Option<usize>,
+    ) -> Result<Value, HandlerError> {
+        self.ensure_mutations_open()?;
+        let route_indices = self.lane_route_indices(message, lane)?;
+        let Some(route) = route_indices.first().map(|index| &self.routes[*index]) else {
+            return Err(HandlerError::UnknownCommand(message.name.clone()));
+        };
         // An undeclared role list admits any session, so the opt-in is
         // checked here rather than left to the role grant.
+        let declared = route
+            .typed_command_contract(&message.name)
+            .is_some_and(|contract| contract.roles.iter().any(|role| role == TRANSPORT_ROLE));
         if !declared {
-            return Err(CausalDispatchError::Forbidden);
+            return Err(transport_command_error(CausalDispatchError::Forbidden));
         }
         let message_id = message.id().filter(|id| !id.is_empty()).ok_or_else(|| {
-            CausalDispatchError::BadRequest(format!(
+            HandlerError::DecodeFailed(format!(
                 "command message `{}` has no id, so it cannot be deduplicated",
                 message.name
             ))
         })?;
         let service_id = self.name().ok_or_else(|| {
-            CausalDispatchError::Internal(
+            transport_command_error(CausalDispatchError::Internal(
                 "typed causal dispatch requires Service::named identity".into(),
-            )
+            ))
         })?;
-        self.execute_causal(
+        let input = message_to_json_input(message)?;
+        CommandHost::invoke(
+            self,
             &message.name,
             &transport_command_id(service_id, &message.name, message_id),
             input,
             transport_session(message, message_id),
-            VerifiedPrincipal::internal(TRANSPORT_USER_ID)
-                .expect("the transport subject is a non-empty constant"),
+            VerifiedPrincipal::trusted_transport(TRANSPORT_USER_ID),
             None,
         )
         .await
         .map(|result| result.payload)
+        .map_err(transport_command_error)
     }
 
     fn lane_route_indices(
@@ -1269,7 +1272,7 @@ impl Service {
         }
     }
 
-    async fn invoke(
+    async fn run_event_routes(
         &self,
         message: &Message,
         input: Value,

@@ -238,9 +238,7 @@ async fn spawn_server_mode(service: Arc<Service>, mode: GatewayMode) -> TestServ
                     GraphqlBinding::Embedded(
                         EmbeddedGraphql::new(
                             engine,
-                            Some(Arc::new(
-                                distributed::command_dispatch::LocalCommandHost::new(service),
-                            )),
+                            Some(service as distributed::SharedCommandHost),
                             caps,
                         )
                         .unwrap(),

@@ -22,7 +22,7 @@
 #[cfg(feature = "sqlite")]
 use common::sqlite as sqlite_support;
 
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
@@ -190,6 +190,20 @@ struct MoveOutcome {
     applied: bool,
 }
 
+/// How many times the handler ran for each saga command id, so a test can
+/// show a redelivery never reaches it. Keyed by saga command id, which is
+/// unique per test (each test starts its own saga ids).
+static HANDLER_RUNS: Mutex<Option<HashMap<String, usize>>> = Mutex::new(None);
+
+fn handler_runs(saga_command_id: &str) -> usize {
+    HANDLER_RUNS
+        .lock()
+        .unwrap()
+        .as_ref()
+        .and_then(|runs| runs.get(saga_command_id).copied())
+        .unwrap_or(0)
+}
+
 /// One saga command. The ledger has already settled whether this command id
 /// ran before, so the handler holds no dedupe of its own; what it decides
 /// from wallet state (funds, tombstones) is the domain's.
@@ -199,6 +213,12 @@ async fn handle_move(
 ) -> Result<PreparedCommand<Succeeded<MoveOutcome>>, HandlerError> {
     let reply = SagaReply::from_session(ctx.session())
         .map_err(|error| HandlerError::Rejected(error.to_string()))?;
+    *HANDLER_RUNS
+        .lock()
+        .unwrap()
+        .get_or_insert_with(HashMap::new)
+        .entry(reply.command_id().to_string())
+        .or_default() += 1;
     let mut wallet = ctx
         .get(&cmd.wallet)
         .await?
@@ -676,6 +696,11 @@ async fn redelivered_saga_command_applies_once_and_replies_once() {
     for _redelivery in 0..3 {
         world.source.handle(debit).await;
     }
+    assert_eq!(
+        handler_runs(debit.id()),
+        1,
+        "the ledger replayed every redelivery"
+    );
     assert_eq!(world.balances().await.0, 95, "debit applied once");
     let wallet = world.source.wallets.get("alice").await.unwrap().unwrap();
     assert_eq!(wallet.entity.version(), 2, "opened, then moved once");
@@ -692,6 +717,7 @@ async fn redelivered_saga_command_applies_once_and_replies_once() {
         .unwrap();
     world.source.handle(debit).await;
     world.source.handle(debit).await;
+    assert_eq!(handler_runs(debit.id()), 1, "a refusal is replayed too");
     let replies = world.take_due(&world.source.outbox).await;
     assert_eq!(replies.len(), 1);
     assert_eq!(world.balances().await.0, 100);
@@ -780,11 +806,11 @@ async fn saga_timeout_fires_through_its_schedule_after_restart_on_sqlite() {
     // Not due yet: nothing fires.
     let clock = ManualClock::new(deadline - Duration::from_millis(1));
     let worker = worker.with_clock(Arc::new(clock.clone()));
-    assert!(worker.run_once(&service).await.unwrap().fired.is_empty());
+    assert!(worker.run_once(&*service).await.unwrap().fired.is_empty());
 
     // At the deadline the restarted worker fires it and the step compensates.
     clock.advance(Duration::from_millis(1));
-    let report = worker.run_once(&service).await.unwrap();
+    let report = worker.run_once(&*service).await.unwrap();
     assert_eq!(report.fired.len(), 1, "{report:?}");
     let runner = SagaRunner::<_, Transfer>::new(repo.clone());
     let saga = runner.get("t-8").await.unwrap().unwrap();
@@ -801,5 +827,5 @@ async fn saga_timeout_fires_through_its_schedule_after_restart_on_sqlite() {
         ("debit", "compensation")
     );
     // The settled generation never fires again.
-    assert!(worker.run_once(&service).await.unwrap().fired.is_empty());
+    assert!(worker.run_once(&*service).await.unwrap().fired.is_empty());
 }

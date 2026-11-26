@@ -263,9 +263,9 @@ pub struct TodoView {
 
 Two update modes — pick deliberately:
 
-- **Atomic** (same service, response must reflect the write):
-  `repo.read_models(plan).commit(&mut agg).await?` commits rows and events in
-  one transaction.
+- **Atomic** (same service, response must reflect the write): declare the
+  command `Atomic<Model>`; its `projection!` program writes the row in the
+  command's transaction. Handlers never stage raw read-model rows.
 - **Eventual** (cross-service): a projector subscribes to published messages
   and commits through `ctx.read_model_store().workspace()`, which marks the
   message processed in the same transaction for idempotency.

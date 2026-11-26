@@ -326,12 +326,13 @@ impl<K: CommandOutcome> PreparedCommand<K> {
         Ok(())
     }
 
-    /// Remove the proof-matched projected upsert from ordinary table plans and
-    /// seal it as the repository's causal direct-projection participant.
+    /// Remove the proof-matched projected upsert from the workspace's staged
+    /// row and seal it as the repository's causal direct-projection
+    /// participant.
     ///
     /// Succeeded and Eventual commands return no participant. An Atomic command
-    /// must have exactly one resolved declaration-owned target; the extracted
-    /// mutation is never also submitted through the legacy/raw plan path.
+    /// must have exactly one resolved declaration-owned target; the staged row
+    /// commits only through that participant.
     pub(crate) fn seal_direct_projection(
         &self,
         target: Option<ResolvedDirectProjectionTarget>,

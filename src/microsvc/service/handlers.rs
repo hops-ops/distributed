@@ -18,7 +18,7 @@ use crate::microsvc::context::Context;
 use crate::microsvc::error::HandlerError;
 use crate::microsvc::session::Session;
 use crate::outbox::{OutboxMessage, PreparedDomainEvent};
-use crate::read_model::{ReadModelWritePlanBuilder, RelationalReadModel};
+use crate::read_model::RelationalReadModel;
 
 pub(super) type GuardFn<D> = dyn Fn(&Context<D>) -> bool + Send + Sync;
 pub(super) type HandlerFuture<'a> =
@@ -110,14 +110,6 @@ where
         self.context.publish(event)
     }
 
-    /// Start a unit of work with a multi-table read-model plan.
-    pub fn read_models(
-        &self,
-        writes: ReadModelWritePlanBuilder,
-    ) -> CausalCommitBuilder<'_, 'route, A, NoPublication, NoDirectProjection> {
-        self.context.read_models(writes)
-    }
-
     /// Stage one exact projected read-model row for same-transaction commit.
     ///
     /// Prefer materializing `row` with [`crate::Mutation::from_state`] so the
@@ -178,7 +170,6 @@ pub struct CausalCommitBuilder<
     explicit_events: Vec<PreparedDomainEvent>,
     external_events: Vec<crate::DomainEventOccurrence>,
     outbox_messages: Vec<OutboxMessage>,
-    read_model_plans: Vec<ReadModelWritePlanBuilder>,
     error: Option<HandlerError>,
     projection: Projection,
     _publication: PhantomData<fn() -> Publication>,
@@ -194,7 +185,6 @@ impl<'context, 'route, A>
             explicit_events: Vec::new(),
             external_events: Vec::new(),
             outbox_messages: Vec::new(),
-            read_model_plans: Vec::new(),
             error: None,
             projection: NoDirectProjection,
             _publication: PhantomData,
@@ -220,7 +210,6 @@ impl<'context, 'route, A, Publication, Projection>
             explicit_events: self.explicit_events,
             external_events: self.external_events,
             outbox_messages: self.outbox_messages,
-            read_model_plans: self.read_model_plans,
             error: self.error,
             projection: self.projection,
             _publication: PhantomData,
@@ -253,20 +242,10 @@ impl<'context, 'route, A, Publication, Projection>
             explicit_events: self.explicit_events,
             external_events: self.external_events,
             outbox_messages: self.outbox_messages,
-            read_model_plans: self.read_model_plans,
             error: self.error,
             projection: self.projection,
             _publication: PhantomData,
         }
-    }
-
-    /// Add an arbitrary existing multi-table relational write plan.
-    ///
-    /// This leg is strongly committed on the server but does not by itself
-    /// unlock the `projected` terminal.
-    pub fn read_models(mut self, plan: ReadModelWritePlanBuilder) -> Self {
-        self.read_model_plans.push(plan);
-        self
     }
 
     /// Move the staged legs into the workspace. Performs no repository I/O.
@@ -289,12 +268,6 @@ impl<'context, 'route, A, Publication, Projection>
                 .stage_outbox(message)
                 .map_err(workspace_handler_error)?;
         }
-        for plan in self.read_model_plans {
-            self.context
-                .workspace
-                .stage_read_models(plan)
-                .map_err(workspace_handler_error)?;
-        }
         Ok(PreparedCausalCommit {
             context: self.context,
             projection: self.projection,
@@ -307,7 +280,7 @@ impl<'context, 'route, Publication>
     CausalCommitBuilder<'context, 'route, (), Publication, NoDirectProjection>
 {
     /// Seal this unit of work of a route bundle without an aggregate: its
-    /// outbox messages and read-model plans commit with the command's ledger
+    /// outbox messages and external facts commit with the command's ledger
     /// receipt in one transaction, and no stream is written.
     ///
     /// This method is synchronous and performs no repository I/O.
@@ -337,7 +310,6 @@ where
             explicit_events: self.explicit_events,
             external_events: self.external_events,
             outbox_messages: self.outbox_messages,
-            read_model_plans: self.read_model_plans,
             error: self.error,
             projection: self.projection,
             _publication: PhantomData,
@@ -366,7 +338,6 @@ where
             explicit_events: self.explicit_events,
             external_events: self.external_events,
             outbox_messages: self.outbox_messages,
-            read_model_plans: self.read_model_plans,
             error: self.error,
             projection: self.projection,
             _publication: PhantomData,
@@ -390,7 +361,6 @@ where
             explicit_events: self.explicit_events,
             external_events: self.external_events,
             outbox_messages: self.outbox_messages,
-            read_model_plans: self.read_model_plans,
             error: self.error,
             projection: StagedProjectedRow(row),
             _publication: PhantomData,
@@ -557,15 +527,6 @@ impl<'a, A> CausalCommandContext<'a, A> {
 
     pub fn claim(&self, name: &str) -> Option<&str> {
         self.session.get(name)
-    }
-
-    /// Start a unit of work with an arbitrary existing multi-table relational
-    /// plan. This does not unlock the `projected` terminal.
-    pub fn read_models(
-        &self,
-        writes: ReadModelWritePlanBuilder,
-    ) -> CausalCommitBuilder<'_, 'a, A, NoPublication, NoDirectProjection> {
-        CausalCommitBuilder::empty(self).read_models(writes)
     }
 
     /// Start a low-level integration-envelope publication unit of work.

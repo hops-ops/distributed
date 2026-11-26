@@ -208,20 +208,3 @@ pub(in crate::in_memory_repo) struct InMemoryProjectionProtocolState {
     pub(super) observations: HashMap<ObservationKey, ProjectionObservation>,
     pub(super) failures: HashMap<String, ProjectionFailure>,
 }
-
-pub(in crate::in_memory_repo) fn reject_causal_owned_plans(
-    causal_tables: &HashSet<String>,
-    plans: &[TableWritePlan],
-) -> Result<(), TableStoreError> {
-    if let Some(table) = plans
-        .iter()
-        .flat_map(|plan| &plan.mutations)
-        .map(TableMutation::table_name)
-        .find(|table| causal_tables.contains(*table))
-    {
-        return Err(TableStoreError::CausalWriteRequired {
-            table: table.to_string(),
-        });
-    }
-    Ok(())
-}

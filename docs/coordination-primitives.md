@@ -249,11 +249,12 @@ Guarantees and obligations:
   because it was committed in the transaction that wrote the receipt. This
   covers one command id only. A retry of a compensation is a new attempt
   with a new command id, and the handler runs again.
-- **A participant that is not a typed command of a `Service`** (it consumes
-  the outbox row or bus message itself and builds the reply with
-  `SagaReply::from_outbox` / `from_bus`) gets none of that. It must dedupe on
-  the saga command id itself (an inbox receipt or aggregate state) and must
-  not emit a second reply on redelivery.
+- **Write every participant as a typed command.** The bus, Knative and
+  schedule ingresses all dispatch through `CommandHost::invoke` with a
+  trusted-transport principal and a ledger command id derived from the
+  message id, so the deduplication above is the framework's, not the
+  participant's. The command declares the `transport` role to be reachable
+  over the bus.
 - **A timeout means the outcome is unknown,** so the timed-out step is
   compensated as well. Compensations must be idempotent and must tolerate
   arriving *before* their action. The participant records a tombstone for

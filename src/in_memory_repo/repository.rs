@@ -8,7 +8,7 @@ use std::future::Future;
 use std::sync::{Arc, RwLock};
 
 use super::projection_protocol::{
-    reject_causal_owned_plans, stage_same_transaction_projection, InMemoryProjectionProtocolState,
+    stage_same_transaction_projection, InMemoryProjectionProtocolState,
 };
 use crate::command_ledger::{
     AttemptFence, CausalCommitBatch, CausalGetStream, CausalRepositoryIdentity,
@@ -21,7 +21,6 @@ use crate::outbox::OutboxMessage;
 use crate::projection_protocol::{
     ProjectionChangeRetention, ProjectionProtocolError, SameTransactionProjectionBatch,
 };
-use crate::read_model::in_memory::apply_read_model_write_plan;
 use crate::read_model::{InMemoryReadModelStore, ReadModelLoadGraph, ReadModelLoadRequest};
 use crate::repository::{
     validate_commit_batch, validate_snapshot_identity, CommitBatch, GetStream, InboxStore,
@@ -278,7 +277,6 @@ impl InMemoryRepository {
             .causal_tables
             .read()
             .map_err(|_| RepositoryError::LockPoisoned("projection ownership read"))?;
-        reject_causal_owned_plans(&causal_tables, &batch.read_model_plans)?;
         if let Some(unregistered) = direct_projection.as_ref().and_then(|direct| {
             direct
                 .mutations
@@ -357,27 +355,16 @@ impl InMemoryRepository {
         }
 
         // Read models can fail mid-application, so stage only touched rows.
-        let mut touched_rows: HashSet<String> = batch
-            .read_model_plans
+        let touched_rows: HashSet<String> = direct_projection
             .iter()
-            .flat_map(|plan| plan.mutations.iter().map(|mutation| mutation.lock_key()))
+            .flat_map(|direct| direct.mutations.iter())
+            .map(|mutation| mutation.mutation.lock_key())
             .collect();
-        if let Some(direct_projection) = &direct_projection {
-            touched_rows.extend(
-                direct_projection
-                    .mutations
-                    .iter()
-                    .map(|mutation| mutation.mutation.lock_key()),
-            );
-        }
         let mut staged_rows = HashMap::with_capacity(touched_rows.len());
         for key in &touched_rows {
             if let Some(row) = relational_rows.get(key) {
                 staged_rows.insert(key.clone(), row.clone());
             }
-        }
-        for plan in batch.read_model_plans.iter().cloned() {
-            apply_read_model_write_plan(plan, &mut staged_rows)?;
         }
         let mut staged_protocol = protocol.as_deref().cloned();
         let direct_evidence = match (&mut staged_protocol, &direct_projection) {

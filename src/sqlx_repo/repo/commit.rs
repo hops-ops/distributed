@@ -49,9 +49,6 @@ where
     if completion.is_none() {
         crate::repository::require_captured_events_are_published(&batch)?;
     }
-    for plan in &batch.read_model_plans {
-        plan.validate().map_err(RepositoryError::from)?;
-    }
     if let Some(direct_projection) = &direct_projection {
         direct_projection.validate().map_err(|error| {
             CommandLedgerError::Storage(RepositoryError::Model(error.to_string()))
@@ -77,16 +74,6 @@ where
     if let Some(completion) = completion.as_ref() {
         preflight_command_completion_in_tx(&mut tx, completion).await?;
     }
-
-    let requested_tables = batch
-        .read_model_plans
-        .iter()
-        .flat_map(|plan| plan.mutations.iter())
-        .map(|mutation| mutation.table_name().to_string())
-        .collect::<std::collections::BTreeSet<_>>();
-    reject_causal_table_writes_in_tx(&mut tx, &requested_tables)
-        .await
-        .map_err(RepositoryError::from)?;
 
     let versions = stream_versions_in_tx(&mut tx, &prepared).await?;
     for append in &prepared {
@@ -129,14 +116,6 @@ where
     }
 
     let mut changed_tables = std::collections::BTreeSet::new();
-    for plan in batch.read_model_plans {
-        for mutation in &plan.mutations {
-            changed_tables.insert(mutation.table_name().to_string());
-        }
-        apply_read_model_write_plan_in_tx(&mut tx, plan)
-            .await
-            .map_err(RepositoryError::from)?;
-    }
 
     if let Some(direct_projection) = &direct_projection {
         let evidence = apply_same_transaction_projection_in_tx(

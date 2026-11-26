@@ -15,7 +15,8 @@ use crate::projection_protocol::{
 use crate::repository::{CommitBatch, ReadModelWritePlanStore};
 use crate::table::{
     ColumnType, DeleteTableRowMutation, ExpectedVersion, PrimaryKey, RowKey, RowValue, RowValues,
-    RowWriteMode, TableColumn, TableKind, TableRowMutation, TableSchema,
+    RowWriteMode, TableColumn, TableKind, TableMutation, TableRowMutation, TableSchema,
+    TableStoreError,
 };
 
 fn topology() -> ProjectorTopologyId {

@@ -7,11 +7,10 @@ use std::time::{Duration, SystemTime};
 
 use distributed::read_model::ReadModelWritePlanBuilder;
 use distributed::{
-    Aggregate, AggregateBuilder, ClaimOutboxMessages, CommitBatch, Entity, GetStream,
-    OutboxClaimRef, OutboxMessage, OutboxMessageStatus, OutboxStore, ReadModel,
-    ReadModelWritePlanCommitExt, ReadModelWritePlanStore, RelationalReadModel,
-    RelationalReadModelQueryStore, RepositoryError, RowKey, RowPatch, RowValue, StreamIdentity,
-    StreamWrite, TransactionalCommit, Versioned,
+    AggregateBuilder, ClaimOutboxMessages, CommitBatch, Entity, GetStream, OutboxClaimRef,
+    OutboxMessage, OutboxMessageStatus, OutboxStore, ReadModel, ReadModelWritePlanStore,
+    RelationalReadModel, RelationalReadModelQueryStore, RepositoryError, RowKey, RowPatch,
+    RowValue, StreamIdentity, StreamWrite, TransactionalCommit, Versioned,
 };
 use serde::{Deserialize, Serialize};
 
@@ -170,86 +169,17 @@ where
     }
 }
 
-/// A stale stream fails the batch; the batch's other stream and its read-model
-/// plan roll back with it.
-pub async fn conflict_rolls_back_other_stream_and_read_model_plan<R>(repo: R)
+/// A write plan lowers into the registered table, JSON column included.
+pub async fn write_plan_lowers_relational_read_model_into_registered_table<R>(repo: R)
 where
-    R: GetStream
-        + RelationalReadModelQueryStore
-        + TransactionalCommit
-        + Clone
-        + Send
-        + Sync
-        + 'static,
-{
-    let seat_id = unique_id("conflict-seat");
-    let seats = repo.clone().aggregate::<Seat>();
-    let mut original = Seat::default();
-    original.add(seat_id.clone(), "floor".into()).unwrap();
-    seats.commit(&mut original).await.unwrap();
-
-    let mut stale = seats.get(&seat_id).await.unwrap().unwrap();
-    let mut winner = seats.get(&seat_id).await.unwrap().unwrap();
-    stale
-        .reserve(unique_id("stale"), seat_id.clone(), "floor".into())
-        .unwrap();
-    winner
-        .reserve(unique_id("winner"), seat_id.clone(), "floor".into())
-        .unwrap();
-    seats.commit(&mut winner).await.unwrap();
-
-    let other_id = unique_id("should-not-commit");
-    let mut other = todo(&other_id);
-    let mut read_models = ReadModelWritePlanBuilder::new();
-    read_models.upsert(&counter(&other_id, 99, &[])).unwrap();
-
-    let stale_identity = StreamIdentity::new(Seat::aggregate_type(), &seat_id).unwrap();
-    let other_identity = StreamIdentity::new(Todo::aggregate_type(), &other_id).unwrap();
-    let mut conflicting = batch(
-        vec![
-            StreamWrite::new(stale_identity, stale.entity_mut()),
-            StreamWrite::new(other_identity.clone(), other.entity_mut()),
-        ],
-        Vec::new(),
-    );
-    conflicting.read_model_plans = vec![read_models.into_write_plan().unwrap()];
-    let err = repo.commit_batch(conflicting).await.unwrap_err();
-
-    assert!(
-        matches!(err, RepositoryError::ConcurrentWrite { .. }),
-        "{err:?}"
-    );
-    assert!(repo.get_stream(&other_identity).await.unwrap().is_none());
-    assert!(load_counter(&repo, &other_id).await.is_none());
-    assert_eq!(stale.entity().committed_version(), 1);
-    assert_eq!(stale.entity().new_events().len(), 1);
-}
-
-/// A plan committed with an aggregate lowers into the registered table,
-/// JSON column included.
-pub async fn commit_lowers_relational_read_model_plan_into_registered_table<R>(repo: R)
-where
-    R: GetStream
-        + RelationalReadModelQueryStore
-        + TransactionalCommit
-        + Clone
-        + Send
-        + Sync
-        + 'static,
+    R: ReadModelWritePlanStore + RelationalReadModelQueryStore + Send + Sync,
 {
     let id = unique_id("relational-batch");
     let view = counter(&id, 7, &[("wins", 2)]);
     let mut read_models = ReadModelWritePlanBuilder::new();
     read_models.upsert(&view).unwrap();
-    let mut created = todo(&id);
+    read_models.commit(&repo).await.unwrap();
 
-    repo.read_models(read_models)
-        .commit(&mut created)
-        .await
-        .unwrap();
-
-    let identity = StreamIdentity::new(Todo::aggregate_type(), &id).unwrap();
-    assert!(repo.get_stream(&identity).await.unwrap().is_some());
     let loaded = load_counter(&repo, &id).await.expect("row should exist");
     assert_eq!(loaded.data, view);
     assert_eq!(loaded.version, 1);
@@ -287,13 +217,12 @@ where
     assert!(load_counter(&repo, &id).await.is_none());
 }
 
-/// One commit carries an event, an outbox row and a two-row plan whose second
-/// row violates a database constraint the read model does not declare. The
-/// whole transaction rolls back, the already-applied first row included, and
-/// the failure is permanent.
-pub async fn read_model_failure_mid_plan_rolls_back_events_and_outbox<B: SqlFaults>(backend: &B)
+/// A two-row plan whose second row violates a database constraint the read
+/// model does not declare. The whole transaction rolls back, the
+/// already-applied first row included, and the failure is permanent.
+pub async fn read_model_failure_mid_plan_rolls_back_the_whole_plan<B: SqlFaults>(backend: &B)
 where
-    B::Repository: GetStream + RelationalReadModelQueryStore + TransactionalCommit + Send + Sync,
+    B::Repository: ReadModelWritePlanStore + RelationalReadModelQueryStore + Send + Sync,
 {
     backend.reject_negative(COUNTER_VIEWS, "value").await;
     let repo = backend.repository();
@@ -303,21 +232,11 @@ where
     read_models.upsert(&counter(&good_id, 1, &[])).unwrap();
     read_models.upsert(&counter(&bad_id, -1, &[])).unwrap();
 
-    let aggregate_id = unique_id("midplan-aggregate");
-    let mut created = todo(&aggregate_id);
-    let identity = StreamIdentity::new(Todo::aggregate_type(), &aggregate_id).unwrap();
-    let outbox_id = unique_id("midplan-outbox");
-    let message = OutboxMessage::create(&outbox_id, "todo.initialized", b"{}".to_vec()).unwrap();
-
-    let mut failing = batch(
-        vec![StreamWrite::new(identity.clone(), created.entity_mut())],
-        vec![message],
-    );
-    failing.read_model_plans = vec![read_models.into_write_plan().unwrap()];
     let err = repo
-        .commit_batch(failing)
+        .commit_write_plan(read_models.into_write_plan().unwrap())
         .await
         .expect_err("a mid-plan constraint violation must fail the commit");
+    let err = RepositoryError::from(err);
     assert!(
         matches!(
             &err,
@@ -330,8 +249,6 @@ where
     );
     assert!(!err.is_retryable());
 
-    assert!(repo.get_stream(&identity).await.unwrap().is_none());
-    assert!(backend.outbox_message(&outbox_id).await.is_none());
     assert!(load_counter(&repo, &good_id).await.is_none());
     assert!(load_counter(&repo, &bad_id).await.is_none());
 }

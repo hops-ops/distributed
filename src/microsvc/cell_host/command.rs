@@ -18,7 +18,7 @@ use super::InternalHttpSecret;
 use crate::aggregate::Aggregate;
 use crate::command_dispatch::VerifiedPrincipal;
 use crate::command_dispatch::{
-    validate_principal_session, CellRequestContext, CommandHost, HttpCommandHost, LocalCommandHost,
+    validate_principal_session, CellRequestContext, CommandHost, HttpCommandHost,
     ProtocolAuthority, TrustedRequestMetadata,
 };
 use crate::command_ledger::ExternalDispatchBinding;
@@ -48,7 +48,7 @@ struct CellRoute {
 ///   is refused.
 pub struct CelldCommandHost {
     http: HttpCommandHost,
-    local: Option<LocalCommandHost>,
+    local: Option<Arc<Service>>,
     service_id: Option<String>,
     routes: Vec<CellRoute>,
     forwarded_prefixes: Vec<String>,
@@ -64,7 +64,7 @@ impl CelldCommandHost {
         let http = HttpCommandHost::new_internal(&celld_url, internal_secret)?;
         Ok(Self {
             http,
-            local: Some(LocalCommandHost::new(service)),
+            local: Some(service),
             service_id: None,
             routes: Vec::new(),
             forwarded_prefixes: Vec::new(),
@@ -116,7 +116,7 @@ impl CelldCommandHost {
                 "route_aggregate::<{kind}> needs the host's local service; a remote host routes with cell_route"
             ))
         })?;
-        let shards = local.service().aggregate_command_shards(TypeId::of::<A>());
+        let shards = local.aggregate_command_shards(TypeId::of::<A>());
         if shards.is_empty() {
             return Err(CausalDispatchError::Internal(format!(
                 "the service mounts no command of aggregate `{kind}`"
@@ -210,7 +210,7 @@ impl CelldCommandHost {
         }
         self.local
             .as_ref()
-            .and_then(|local| local.service().name())
+            .and_then(|local| local.name())
             .ok_or_else(|| {
                 CausalDispatchError::Internal(
                     "celld command host requires a named executable service".into(),
@@ -315,7 +315,6 @@ impl CommandHost for CelldCommandHost {
         let binding = ExternalDispatchBinding::new(&route.kind, &shard)
             .map_err(|error| CausalDispatchError::BadRequest(error.to_string()))?;
         let reservation = local
-            .service()
             .reserve_external_causal(
                 command,
                 command_id,
@@ -332,10 +331,7 @@ impl CommandHost for CelldCommandHost {
         let http = match self.http.retarget_segments(&[&route.kind, &shard]) {
             Ok(http) => http,
             Err(error) => {
-                let _ = local
-                    .service()
-                    .abandon_external_causal(command, attempt)
-                    .await;
+                let _ = local.abandon_external_causal(command, attempt).await;
                 return Err(error);
             }
         };
@@ -353,53 +349,35 @@ impl CommandHost for CelldCommandHost {
         {
             Ok(response) => response,
             Err(error) => {
-                let _ = local
-                    .service()
-                    .abandon_external_causal(command, attempt)
-                    .await;
+                let _ = local.abandon_external_causal(command, attempt).await;
                 return Err(error);
             }
         };
         if status >= 400 {
             let error = crate::microsvc::wait_path::wait_path_error(status, &body);
-            let _ = local
-                .service()
-                .abandon_external_causal(command, attempt)
-                .await;
+            let _ = local.abandon_external_causal(command, attempt).await;
             return Err(error);
         }
         let remote = match CausalDispatchResult::from_wait_path_wire(body) {
             Ok(remote) => remote,
             Err(error) => {
-                let _ = local
-                    .service()
-                    .abandon_external_causal(command, attempt)
-                    .await;
+                let _ = local.abandon_external_causal(command, attempt).await;
                 return Err(CausalDispatchError::Internal(format!(
                     "wait-path decode: {error}"
                 )));
             }
         };
         if let Err(error) = attempt.validate_remote(&remote) {
-            let _ = local
-                .service()
-                .abandon_external_causal(command, attempt)
-                .await;
+            let _ = local.abandon_external_causal(command, attempt).await;
             return Err(error);
         }
         #[cfg(feature = "graphql")]
         let remote = match authority {
             Some(authority) => {
-                match local
-                    .service()
-                    .seal_wait_path_dispatch(command, &authority.protocol, remote)
-                {
+                match local.seal_wait_path_dispatch(command, &authority.protocol, remote) {
                     Ok(remote) => remote,
                     Err(error) => {
-                        let _ = local
-                            .service()
-                            .abandon_external_causal(command, attempt)
-                            .await;
+                        let _ = local.abandon_external_causal(command, attempt).await;
                         return Err(error);
                     }
                 }
@@ -407,13 +385,12 @@ impl CommandHost for CelldCommandHost {
             None => remote,
         };
         local
-            .service()
             .complete_external_causal(command, attempt, &remote)
             .await?;
         Ok(remote)
     }
 
-    fn ledger(&self) -> Option<&Arc<Service>> {
-        self.local.as_ref().map(LocalCommandHost::service)
+    fn ledger(&self) -> Option<&Service> {
+        self.local.as_deref()
     }
 }

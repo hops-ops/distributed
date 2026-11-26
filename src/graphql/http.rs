@@ -14,7 +14,7 @@ use axum::routing::{get, post};
 use axum::Router;
 use futures_util::stream::BoxStream;
 
-use crate::command_dispatch::{LocalCommandHost, SharedCommandHost};
+use crate::command_dispatch::SharedCommandHost;
 use crate::microsvc::{Service, Session, MAX_HTTP_BODY_BYTES, USER_ID_KEY};
 
 use super::engine::GraphqlEngine;
@@ -233,13 +233,13 @@ pub fn graphql_router(engine: Arc<GraphqlEngine>) -> Router {
     router.with_state(engine)
 }
 
-/// GraphQL router that wait-dispatches through a local [`Service`] wrapped as
-/// a [`LocalCommandHost`]. Request data holds the host, not `Arc<Service>`.
+/// GraphQL router that wait-dispatches through a local [`Service`], the
+/// in-process command host. Request data holds it as a [`SharedCommandHost`].
 pub fn graphql_router_with_service(engine: Arc<GraphqlEngine>, service: Arc<Service>) -> Router {
     service
         .validate_graphql_engine(&engine)
         .unwrap_or_else(|error| panic!("cannot serve GraphQL with this service: {error}"));
-    graphql_router_with_host(engine, Arc::new(LocalCommandHost::new(service)))
+    graphql_router_with_host(engine, service)
 }
 
 /// GraphQL router that wait-dispatches through an explicit command host.
@@ -385,7 +385,7 @@ pub async fn microsvc_graphql_handler(
         Err(AuthError::Unauthorized) => return unauthorized_response(),
     };
     let (session, principal) = identity.into_parts();
-    let host: SharedCommandHost = Arc::new(LocalCommandHost::new(Arc::clone(&service)));
+    let host: SharedCommandHost = Arc::clone(&service) as SharedCommandHost;
     let request = request_with_principal(request, principal).data(host);
     let response = engine.execute_admitted(&session, request).await;
     GraphQLResponse::from(response).into_response()
@@ -430,7 +430,7 @@ pub async fn microsvc_graphql_ws(
         Some(e) => e,
         None => return StatusCode::NOT_FOUND.into_response(),
     };
-    let host: SharedCommandHost = Arc::new(LocalCommandHost::new(Arc::clone(&service)));
+    let host: SharedCommandHost = Arc::clone(&service) as SharedCommandHost;
     graphql_ws_upgrade(
         engine,
         Some(host),
@@ -720,7 +720,7 @@ mod connection_init_tests {
     #[test]
     fn websocket_request_context_retains_command_host_not_service() {
         let service = Arc::new(Service::new());
-        let host: SharedCommandHost = Arc::new(LocalCommandHost::new(Arc::clone(&service)));
+        let host: SharedCommandHost = Arc::clone(&service) as SharedCommandHost;
         let request = request_with_context(
             Request::new("{ __typename }"),
             None,

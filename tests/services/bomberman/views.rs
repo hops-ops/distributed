@@ -1,7 +1,13 @@
-use distributed::ReadModel;
+use distributed::read_model::ReadModelWritePlanBuilder;
+use distributed::{GetStream, ReadModel, ReadModelWritePlanStore, RepositoryError};
 use serde::{Deserialize, Serialize};
 
+use crate::bomberman::domain::game_map::GameMap;
 use crate::bomberman::domain::types::Tile;
+use crate::bomberman::error::GameError;
+use crate::bomberman::handlers::{
+    get_aggregate, load_active_explosions, load_game_players, load_live_bombs,
+};
 
 #[derive(Clone, Debug, Serialize, Deserialize, distributed::JsonType)]
 pub struct PlayerState {
@@ -28,7 +34,8 @@ pub struct ExplosionState {
     pub cells: Vec<(i32, i32)>,
 }
 
-/// Whole-board view stored in the `boards` read-model table.
+/// Whole-board view stored in the `boards` read-model table. Only
+/// [`project_board`] writes it; commands never read it.
 #[derive(Clone, Debug, Serialize, Deserialize, ReadModel)]
 #[table("boards")]
 pub struct BoardView {
@@ -111,4 +118,35 @@ pub fn build_board(
     }
 
     board
+}
+
+/// The board projection: rebuild the game's [`BoardView`] from its aggregates
+/// and write it. It derives everything from committed state, so running it
+/// again (a redelivery, a rebuild) writes the same row.
+pub async fn project_board<R>(repo: &R, game_id: &str) -> Result<BoardView, GameError>
+where
+    R: GetStream + ReadModelWritePlanStore,
+{
+    let map: GameMap = get_aggregate::<R, GameMap>(repo, game_id)
+        .await?
+        .ok_or(GameError::GameNotFound)?;
+    let players = load_game_players(repo, &map).await?;
+    let bombs = load_live_bombs(repo, &players).await?;
+    let explosions = load_active_explosions(repo, &map).await?;
+    let board = build_board(
+        game_id,
+        &map,
+        &players.iter().collect::<Vec<_>>(),
+        &bombs.iter().collect::<Vec<_>>(),
+        &explosions.iter().collect::<Vec<_>>(),
+        map.turn,
+        map.explosions_created,
+    );
+    let mut read_models = ReadModelWritePlanBuilder::new();
+    read_models.upsert(&board).map_err(RepositoryError::from)?;
+    read_models
+        .commit(repo)
+        .await
+        .map_err(RepositoryError::from)?;
+    Ok(board)
 }
