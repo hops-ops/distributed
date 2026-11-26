@@ -1023,6 +1023,74 @@ where
     assert!(ids("secondary", &after).is_empty());
 }
 
+/// An event handler that retries until a projector has projected the same
+/// event. The in-memory bus hands a failed delivery straight back, so the
+/// handler's consumer must still let the projector's consumer run.
+#[tokio::test]
+async fn a_retrying_handler_does_not_starve_the_projector_it_waits_for() {
+    let repository = InMemoryRepository::new();
+    let bus = InMemoryBus::new();
+    let projected = Arc::new(AtomicBool::new(false));
+    let retries = Arc::new(AtomicUsize::new(0));
+    let (mark_projected, wait_for_projection, count_retries) = (
+        Arc::clone(&projected),
+        Arc::clone(&projected),
+        Arc::clone(&retries),
+    );
+    let service = Service::new()
+        .named("task15-starvation")
+        .routes(
+            Routes::new()
+                .with_read_model_store(repository.clone())
+                .causal_projector::<TodoChanged>(primary_projector())
+                .model::<PrimaryView>()
+                .handle(move |context: CausalProjectorContext, fact: TodoChanged| {
+                    let projected = Arc::clone(&mark_projected);
+                    async move {
+                        context
+                            .project(&PrimaryView {
+                                id: fact.id,
+                                title: fact.title,
+                            })
+                            .await?;
+                        projected.store(true, Ordering::SeqCst);
+                        Ok(())
+                    }
+                }),
+        )
+        .routes(Routes::new().with_dependencies(()).event(FACT_NAME).handle(
+            move |_: &crate::microsvc::Context<()>| {
+                let projected = Arc::clone(&wait_for_projection);
+                let retries = Arc::clone(&count_retries);
+                async move {
+                    if projected.load(Ordering::SeqCst) {
+                        return Ok(serde_json::json!({}));
+                    }
+                    retries.fetch_add(1, Ordering::SeqCst);
+                    Err(HandlerError::Other("the row is not projected yet".into()))
+                }
+            },
+        ))
+        .with_bus(bus.clone());
+
+    bus.publish_message(fact_message("a", "awaited"))
+        .await
+        .unwrap();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        service.run(RunOptions::until_idle()),
+    )
+    .await
+    .expect("the retrying handler let the projector run")
+    .unwrap();
+
+    assert!(projected.load(Ordering::SeqCst));
+    assert!(
+        retries.load(Ordering::SeqCst) > 0,
+        "the handler ran before the projection and retried"
+    );
+}
+
 fn malformed_service(repository: InMemoryRepository, invoked: Arc<AtomicUsize>) -> Service {
     let projector = SurfaceProjector::new("task15_malformed")
         .facts(["task15.malformed"])

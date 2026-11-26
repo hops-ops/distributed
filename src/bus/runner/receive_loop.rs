@@ -107,13 +107,39 @@ async fn finish<S: MessageSource>(
     }
 }
 
+/// Give every other future of the task one turn.
+///
+/// A source may hand a failed delivery straight back (the in-memory bus
+/// ignores the redelivery delay, and [`RetryBackoff::immediate`] asks for
+/// none), so a consumer that keeps retrying would otherwise never return
+/// `Pending`: the consumers run beside it, and the timers that would stop
+/// it, would never be polled again.
+///
+/// [`RetryBackoff::immediate`]: crate::bus::RetryBackoff::immediate
+async fn yield_now() {
+    let mut yielded = false;
+    poll_fn(|cx| {
+        if yielded {
+            return Poll::Ready(());
+        }
+        yielded = true;
+        cx.waker().wake_by_ref();
+        Poll::Pending
+    })
+    .await
+}
+
 /// The next delivery, or `None` when the run should end.
+///
+/// Yields first, so a run returns to its executor at least once per delivery
+/// whatever the source does.
 async fn next_delivery<S: MessageSource>(
     source: &mut S,
     until: &RunUntil,
     service: Option<&str>,
     transport: &str,
 ) -> Result<Option<S::Received>, TransportError> {
+    yield_now().await;
     let recv_error = |error: TransportError| {
         record_transport_failure(
             service,
