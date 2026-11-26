@@ -10,8 +10,10 @@
 //! - the trace id from the incoming `traceparent` (context extraction), and
 //! - `parentSpanId` equal to the incoming parent span id (span parenting).
 //!
-//! Skips unless both env vars are set (see `.github/workflows/
-//! integration-observability.yaml` for the collector container setup):
+//! The test is live (`#[ignore = "live: ..."]`): it runs only under
+//! `--ignored` and fails unless both env vars are set (see
+//! `.github/workflows/integration-observability.yaml` for the collector
+//! container setup):
 //!
 //! - `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` — e.g. `http://localhost:4318/v1/traces`
 //! - `OTEL_COLLECTOR_TRACES_FILE` — host path of the collector's file-exporter
@@ -49,18 +51,14 @@ use common::env as env_support;
 const REMOTE_PARENT_SPAN_ID: &str = "00f067aa0ba902b7";
 
 #[tokio::test]
+#[ignore = "live: needs an OpenTelemetry Collector (OTEL_EXPORTER_OTLP_TRACES_ENDPOINT, OTEL_COLLECTOR_TRACES_FILE)"]
 async fn dispatch_span_reaches_collector_with_propagated_parent() {
-    let Some(endpoint) = env_support::require_service(
+    let endpoint = env_support::require_live(
         "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
         "otel collector export test",
-    ) else {
-        return;
-    };
-    let Some(traces_file) =
-        env_support::require_service("OTEL_COLLECTOR_TRACES_FILE", "otel collector export test")
-    else {
-        return;
-    };
+    );
+    let traces_file =
+        env_support::require_live("OTEL_COLLECTOR_TRACES_FILE", "otel collector export test");
 
     // A fresh trace id per run so stale collector output can never satisfy the
     // assertion.

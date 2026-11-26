@@ -327,7 +327,6 @@ PY
 fi
 
 cat > "$OUT" <<EOF
-AUTHENTIK_E2E=1
 OIDC_ISSUER=$ISSUER
 OIDC_AUDIENCE=$AUD
 OIDC_JWKS_URI=$JWKS_URI
@@ -340,4 +339,4 @@ EOF
 
 echo "==> Wrote $OUT"
 cat "$OUT"
-echo "==> Done. source $OUT && cargo test --test graphql --features graphql,sqlite,metrics graphql_oidc_authentik::"
+echo "==> Done. source $OUT && cargo test --test graphql --features graphql,sqlite,metrics graphql_oidc_authentik:: -- --ignored"

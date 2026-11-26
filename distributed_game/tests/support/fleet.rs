@@ -2,8 +2,9 @@
 //! (docker compose, its own project and port) holding the fleet bucket, the
 //! worker deployed to it with `celld deploy`, and N `celld` nodes in
 //! production mode. Kills only what it started; removes the container on
-//! drop. Skips (None) without docker / aws / a built worker unless env
-//! `required` is set.
+//! drop. The test that uses it is live (`#[ignore = "live: ..."]`, run with
+//! `--ignored`): without docker, aws or a built worker it panics with the
+//! reason.
 
 #![allow(dead_code)]
 
@@ -36,32 +37,23 @@ pub struct Fleet {
     pub nodes: Vec<Node>,
 }
 
-fn skip(required: &str, reason: String) -> Option<Fleet> {
-    assert!(
-        std::env::var_os(required).is_none(),
-        "{required} is set but the fleet is unavailable: {reason}"
-    );
-    eprintln!("skipping the celld fleet test: {reason}");
-    None
-}
-
 impl Fleet {
     /// Start `nodes` nodes serving the worker in `worker` with extra
     /// string `vars` (`{nodes}` in a value is replaced by the operator
     /// listeners, `node-a=127.0.0.1:p,…`).
-    pub fn start(
-        worker: &Path,
-        nodes: usize,
-        vars: &[(&str, &str)],
-        required: &str,
-    ) -> Option<Self> {
-        if !worker.join("build/worker/shim.mjs").exists() {
-            return skip(required, format!("build {} first", worker.display()));
-        }
+    /// Panics with the reason when the fleet cannot start; a fleet started
+    /// so far is torn down by its `Drop` while the panic unwinds.
+    pub fn start(worker: &Path, nodes: usize, vars: &[(&str, &str)]) -> Self {
+        assert!(
+            worker.join("build/worker/shim.mjs").exists(),
+            "live celld fleet test: build {} first",
+            worker.display()
+        );
         for tool in ["docker", "aws"] {
-            if Command::new(tool).arg("--version").output().is_err() {
-                return skip(required, format!("`{tool}` is not available"));
-            }
+            assert!(
+                Command::new(tool).arg("--version").output().is_ok(),
+                "live celld fleet test: `{tool}` is not available"
+            );
         }
         let binary = std::env::var("CELLD_BIN").unwrap_or_else(|_| "celld".into());
         // One name for the temp directory and the compose project (lowercase
@@ -86,7 +78,7 @@ impl Fleet {
             });
         }
         if let Err(reason) = fleet.s3_up() {
-            return skip(required, reason);
+            unavailable(reason);
         }
         let listeners = fleet
             .nodes
@@ -99,14 +91,14 @@ impl Fleet {
             .map(|(k, v)| (k.to_string(), v.replace("{nodes}", &listeners)))
             .collect();
         if let Err(reason) = fleet.deploy(worker, &vars) {
-            return skip(required, reason);
+            unavailable(reason);
         }
         for i in 0..fleet.nodes.len() {
             if let Err(reason) = fleet.start_node(i) {
-                return skip(required, reason);
+                unavailable(reason);
             }
         }
-        Some(fleet)
+        fleet
     }
 
     fn env(&self, command: &mut Command) {
@@ -288,6 +280,10 @@ impl Drop for Fleet {
             let _ = std::fs::remove_dir_all(&self.dir);
         }
     }
+}
+
+fn unavailable(reason: String) -> ! {
+    panic!("live celld fleet test: the fleet did not start: {reason}");
 }
 
 /// Drop `//` line comments (wrangler.jsonc).

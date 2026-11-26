@@ -126,7 +126,7 @@ cd ../e2e-celld && make run
 
 `make up-celld-nats` starts celld (version pinned in `/.celld-version`) with its persistent local store, the Queue
 relay, and NATS (`celld-nats-profile/`). `make test-celld-nats` only validates
-an already-running profile. Neither command is `make run`. GraphQL wait-dispatches
+an already-running profile (it runs the ignored live smoke with `--ignored`). Neither command is `make run`. GraphQL wait-dispatches
 Todo create/complete and `chat.post` to cells (one SQLite shard per todo or
 message). GraphQL `@live`, Eventual projectors, Blob, and identity stay in
 the GraphQL process.

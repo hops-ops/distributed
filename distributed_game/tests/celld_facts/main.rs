@@ -5,11 +5,12 @@
 //! the processes it starts. Build the worker first:
 //!
 //!   (cd tests/celld/fact-worker && worker-build --release)
-//!   cargo test -p distributed_game --features celld,runtime --test celld_facts
+//!   cargo test -p distributed_game --features celld,runtime --test celld_facts -- --ignored
 //!
-//! `CELLD` selects the binary (default `celld` on PATH); `celld dev` needs
-//! esbuild (`CELLD_ESBUILD`). Without a built worker the test skips, unless
-//! `CELLD_FACTS_REQUIRED=1` (CI), which turns that into a failure.
+//! `CELLD_BIN` selects the binary (default `celld` on PATH); `celld dev` needs
+//! esbuild (`CELLD_ESBUILD`). The test is live (`#[ignore = "live: ..."]`):
+//! it runs only under `--ignored`, and without a built worker or celld it
+//! fails.
 
 use std::time::{Duration, Instant};
 
@@ -108,10 +109,9 @@ fn committed(settlement: &FactSettlement) -> bool {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "live: needs a built tests/celld/fact-worker and celld"]
 async fn zone_facts_route_to_three_cell_kinds_and_survive_a_celld_outage() {
-    let Some(mut celld) = Celld::start_new() else {
-        return;
-    };
+    let mut celld = Celld::start_new();
     let base = celld.base();
     let policy = RetryPolicy::until_settled(Duration::from_millis(100), Duration::from_millis(500));
     let (mut queue, feed) = fact_channel(4, policy);

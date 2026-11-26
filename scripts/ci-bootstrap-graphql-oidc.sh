@@ -354,7 +354,6 @@ verify_roles "$ADMIN_KEY" "$ADMIN_UID"
 # **project id** in `aud` (not the OIDC app client id). Validate against that.
 umask 077
 cat > "$OUT" <<EOF
-ZITADEL_E2E=1
 OIDC_ISSUER=$ZITADEL_HOST
 OIDC_AUDIENCE=$PROJECT_ID
 OIDC_CLIENT_ID=$CLIENT_ID

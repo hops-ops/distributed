@@ -178,8 +178,10 @@ then delivered to the e2e-celld native host, accepted by NATS JetStream, and
 applied by the normal Todo projection. A deployed fleet can keep the producer
 and consumer deployments as separate scripts without changing the relay code.
 
-Without `CELLD_URL`, `cargo test --test services celld::` checks the fixtures and skips the
-live HTTP round trips.
+The live HTTP round trips in `tests/services/celld.rs` are ignored in the root
+suite (`#[ignore = "live: ..."]`). Run them against a running host with
+`CELLD_URL=… DISTRIBUTED_INTERNAL_SECRET=… cargo test --test services celld:: -- --ignored`
+(or `make -C tests/e2e-ui test-celld-http`); without `CELLD_URL` they fail.
 
 The independent storage proof owns a temporary celld fleet and deliberately
 kills only the processes it starts:
@@ -226,5 +228,9 @@ in-flight facts reach the cell exactly once):
 
 ```sh
 (cd tests/celld/zone-worker && worker-build --release)
-CELLD_BIN=… CELLD_ESBUILD=… cargo test -p distributed_game --features celld,net --test celld_zone
+CELLD_BIN=… CELLD_ESBUILD=… cargo test -p distributed_game --features celld,net --test celld_zone -- --ignored
 ```
+
+The five tests are live (`#[ignore = "live: ..."]`): they run only under
+`--ignored`, and fail without the built Worker or celld (`fleet` also
+without docker and the aws CLI).

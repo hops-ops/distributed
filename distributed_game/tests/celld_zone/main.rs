@@ -27,11 +27,12 @@
 //! ```text
 //! (cd tests/celld/zone-worker && worker-build --release)
 //! CELLD_BIN=… CELLD_ESBUILD=… cargo test -p distributed_game \
-//!   --features celld,net --test celld_zone
+//!   --features celld,net --test celld_zone -- --ignored
 //! ```
 //!
-//! Skips without a built worker / celld (and, for `fleet`, docker and the
-//! aws CLI) unless `CELLD_ZONE_REQUIRED=1`.
+//! Every test is live (`#[ignore = "live: ..."]`): run them with
+//! `-- --ignored`. Without a built worker or celld (and, for `fleet`, docker
+//! and the aws CLI) they fail.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -57,7 +58,6 @@ mod unique;
 
 const INTERNAL_SECRET: &str = "test-only-internal-secret-change-me-2026";
 const TICKET_SECRET: &str = "test-only-ticket-secret-change-me-2026";
-const REQUIRED: &str = "CELLD_ZONE_REQUIRED";
 
 /// One `celld dev` at a time: two starting together race for the bundler.
 /// This lock holds within one process; across processes the nextest
@@ -299,11 +299,10 @@ fn exactly_once(value: &Value, count: u64) -> bool {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "live: needs a built tests/celld/zone-worker and celld"]
 async fn single_node() {
     let _serial = serial();
-    let Some(celld) = celld_support::Celld::start_worker(&worker(), REQUIRED) else {
-        return;
-    };
+    let celld = celld_support::Celld::start_worker(&worker());
     let base = celld.base();
     let long = Duration::from_secs(30);
 
@@ -397,11 +396,10 @@ async fn single_node() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "live: needs a built tests/celld/zone-worker and celld"]
 async fn admission() {
     let _serial = serial();
-    let Some(celld) = celld_support::Celld::start_worker(&worker(), REQUIRED) else {
-        return;
-    };
+    let celld = celld_support::Celld::start_worker(&worker());
     let base = celld.base();
     let probe = base.clone();
     admission::run(admission::Target {
@@ -417,11 +415,10 @@ async fn admission() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "live: needs a built tests/celld/zone-worker and celld"]
 async fn watchers() {
     let _serial = serial();
-    let Some(celld) = celld_support::Celld::start_worker(&worker(), REQUIRED) else {
-        return;
-    };
+    let celld = celld_support::Celld::start_worker(&worker());
     let base = celld.base();
     let long = Duration::from_secs(30);
 
@@ -477,11 +474,10 @@ async fn watchers() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "live: needs a built tests/celld/zone-worker and celld"]
 async fn near_watchers() {
     let _serial = serial();
-    let Some(celld) = celld_support::Celld::start_worker(&worker(), REQUIRED) else {
-        return;
-    };
+    let celld = celld_support::Celld::start_worker(&worker());
     let base = celld.base();
     let long = Duration::from_secs(30);
     let zone = "room-n";
@@ -586,13 +582,10 @@ async fn near_watchers() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "live: needs a built tests/celld/zone-worker, celld, docker and the aws CLI"]
 async fn fleet() {
     let _serial = serial();
-    let Some(mut fleet) =
-        fleet::Fleet::start(&worker(), 3, &[("CELLD_ZONE_NODES", "{nodes}")], REQUIRED)
-    else {
-        return;
-    };
+    let mut fleet = fleet::Fleet::start(&worker(), 3, &[("CELLD_ZONE_NODES", "{nodes}")]);
     let long = Duration::from_secs(60);
     // First touch through node-a places the zone (celld: first touch).
     let a = fleet.base(0);

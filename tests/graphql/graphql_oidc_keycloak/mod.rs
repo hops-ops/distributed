@@ -1,22 +1,17 @@
-//! Keycloak live e2e — E1–E8. Gate: `KEYCLOAK_E2E=1`.
+//! Keycloak live e2e — E1–E8. Live (`#[ignore = "live: ..."]`): run with
+//! `--ignored` after `scripts/oidc-keycloak-up.sh`; fails without `OIDC_ISSUER`.
 //! Mint: client_credentials ([[specs/query-layer/oidc-keycloak]]).
 
+use common::env as env_support;
 use common::oidc;
 
 use distributed::graphql::OidcConfig;
 use serde_json::Value;
 
-fn e2e_enabled() -> bool {
-    oidc::gate_enabled("KEYCLOAK_E2E")
-}
-
 #[tokio::test]
+#[ignore = "live: needs a bootstrapped Keycloak (scripts/oidc-keycloak-up.sh, OIDC_ISSUER)"]
 async fn e1_through_e8_live() {
-    if !e2e_enabled() {
-        eprintln!("KEYCLOAK_E2E not set — skip");
-        return;
-    }
-    let iss = std::env::var("OIDC_ISSUER").expect("OIDC_ISSUER");
+    let iss = env_support::require_live("OIDC_ISSUER", "Keycloak OIDC e2e");
     assert!(
         oidc::discovery_ready(&iss).await,
         "Keycloak discovery not ready at {iss}"

@@ -190,28 +190,46 @@ return.
 
 A **live test** needs something `make test-local` cannot start (celld, an
 identity provider, an OTel collector, a browser). It is marked
-`#[ignore = "<what it needs>"]` and run by the job that provides the service,
-with `--ignored`. Example:
-`projected_candidate_keys_reach_chromium_over_http_and_websocket` in
-`tests/graphql/graphql_unique_key_live/mod.rs`. Some live tests still use the
-older form, an early return when their variable is unset: the celld tests in
-`tests/services`, the OIDC tests below, `tests/observability/otel_export`, and
-the celld tests of `distributed_game`. They are being converted; do not add
-new ones in that form.
+`#[ignore = "live: needs <what>"]`, so a local or services-job run reports
+it as ignored, never as passed, and it is run by the job that provides the
+service, with `-- --ignored`. A live test that reads its address does so
+with `common::env::require_live`, which panics when the variable is unset:
+under `--ignored` a missing service is a failure. The live tests and the
+jobs that own them:
+
+| Tests | Needs | Run by |
+|---|---|---|
+| `tests/services/celld.rs` (4) | a celld host at `CELLD_URL` | `make -C tests/e2e-ui test-celld-http` (`integration-celld.yaml`, job `live`) |
+| `tests/services/e2e_ui_celld_nats_profile` (1) | `CELLD_URL`, `NATS_URL` | `make -C tests/e2e-ui test-celld-nats` (same job) |
+| `graphql_oidc_{zitadel,keycloak,authentik}::e1_through_e8_live` (1 each) | a bootstrapped identity provider (`OIDC_ISSUER`) | `integration-graphql.yaml`, one job per provider |
+| `otel_export::dispatch_span_reaches_collector_with_propagated_parent` | an OTel Collector | `integration-observability.yaml` |
+| `distributed_game` `celld_facts`, `celld_zone_lease`, `celld_zone_state` (1 each), `world` (2 of 21), `celld_zone` (5) | a built test Worker and celld (`fleet` also docker and the aws CLI) | `integration-celld.yaml`, job `storage` |
+| the other ignored tests: `graphql_unique_key_live`, the gateway worker, load and Postgres-replica tests, the ignored `distributed_cli` tests | a browser, Node, wasm32, a Postgres replica | their own jobs (`integration-e2e-ui.yaml`, `integration-gateway.yaml`, `tests/gateway-postgres/run.py`, `integration-distributed-cli.yaml`) |
+
+Two more ignored tests are measurements run by hand, not live tests:
+`distributed_game` `alloc_report` and `replication::tests::dense_room_patch_build`.
+
+The celld, OIDC and OTel jobs run their live tests through
+`scripts/expect-tests-passed.sh <count>`,
+which fails unless exactly that many passed: under `--ignored` a filter that
+matches nothing is green with `0 passed`. A new live test in a job raises the
+job's count. Never write a test that returns early when its service is
+missing.
 
 ### First-class OIDC (Zitadel, Keycloak, Authentik)
 
 GraphQL identity is built into the engine (`OidcBearer`: JWKS, iss/aud/exp,
 claim → role/session). Live against three local IdPs — not mocks only:
 
-| Provider | Compose + bootstrap | Live test | Gate |
-|---|---|---|---|
-| **[Zitadel](../../tests/graphql/graphql_oidc_zitadel/)** (reference) | `./scripts/oidc-zitadel-up.sh` | `cargo test --test graphql --features graphql,sqlite graphql_oidc_zitadel::` | `ZITADEL_E2E=1` |
-| **[Keycloak](../../tests/graphql/graphql_oidc_keycloak/)** | `./scripts/oidc-keycloak-up.sh` | `cargo test --test graphql --features graphql,sqlite graphql_oidc_keycloak::` | `KEYCLOAK_E2E=1` |
-| **[Authentik](../../tests/graphql/graphql_oidc_authentik/)** | `./scripts/oidc-authentik-up.sh` | `cargo test --test graphql --features graphql,sqlite graphql_oidc_authentik::` | `AUTHENTIK_E2E=1` |
+| Provider | Compose + bootstrap (writes the env file) | Live test, after `set -a && source <env file> && set +a` |
+|---|---|---|
+| **[Zitadel](../../tests/graphql/graphql_oidc_zitadel/)** (reference) | `./scripts/oidc-zitadel-up.sh` (`graphql-oidc.env`) | `cargo test --test graphql --features graphql,sqlite,metrics graphql_oidc_zitadel:: -- --ignored` |
+| **[Keycloak](../../tests/graphql/graphql_oidc_keycloak/)** | `./scripts/oidc-keycloak-up.sh` (`graphql-oidc-keycloak.env`) | `cargo test --test graphql --features graphql,sqlite,metrics graphql_oidc_keycloak:: -- --ignored` |
+| **[Authentik](../../tests/graphql/graphql_oidc_authentik/)** | `./scripts/oidc-authentik-up.sh` (`graphql-oidc-authentik.env`) | `cargo test --test graphql --features graphql,sqlite,metrics graphql_oidc_authentik:: -- --ignored` |
 
 Shared **E1–E8** in [`tests/common/src/oidc.rs`](../../tests/common/src/oidc.rs).
-Gated binaries skip cleanly when unset. Offline (mock JWKS, no Docker):
+Each provider's test is live (ignored by default) and fails without
+`OIDC_ISSUER`. Offline (mock JWKS, no Docker):
 `cargo test --test graphql --features graphql,sqlite graphql_identity::`.
 CI runs the three providers in `.github/workflows/integration-graphql.yaml`.
 
@@ -229,7 +247,8 @@ make test-cli-lifecycle     # builds the CLI and runs distributed_cli/tests/bats
 make compose-up             # start postgres, rabbitmq, kafka, nats, redis (compose.yaml)
 make compose-down
 cargo test                  # default feature set
-cargo test --all-features   # all features; service tests skip without their env vars
+cargo test --all-features   # all features; service tests skip without their env vars,
+                            #   live tests are ignored
 ```
 
 By layer:
@@ -271,7 +290,7 @@ of their own run in a nextest test group with `max-threads = 1`:
 |---|---|---|
 | `compile-fail` | the trybuild and `rustc_fail` binaries of `distributed_macros` and `distributed_game_macros` | they build scratch crates in shared directories under `target/tests` |
 | `lifecycle-project` | the five ignored `distributed_cli::cli_lifecycle` tests that compile the lifecycle fixture project | one shared Cargo target directory |
-| `celld-dev` | `distributed_game::celld_zone` | `celld dev` instances race for the Worker bundler |
+| `celld-dev` | `distributed_game::celld_zone` (live, so only under `--run-ignored`; CI runs it with `cargo test`, where its in-process lock serializes) | `celld dev` instances race for the Worker bundler |
 | `postgres-projection-views` | `postgres_projection_protocol_runtime_conforms`, `postgres_redelivery_identity_is_atomic_across_partition_and_cursor_races` | NOTIFY channels are database-wide; both use the table name `postgres_projection_views` |
 
 ### Transport Integration Tests

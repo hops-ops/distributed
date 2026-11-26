@@ -4,7 +4,10 @@
 //! keep the lease, and a `GameServer` running a zone on it.
 //!
 //!   (cd tests/celld/fact-worker && worker-build --release)
-//!   cargo test -p distributed_game --features celld,runtime,net --test celld_zone_lease
+//!   cargo test -p distributed_game --features celld,runtime,net --test celld_zone_lease -- --ignored
+//!
+//! The test is live (`#[ignore = "live: ..."]`): without a built worker or
+//! celld it fails.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -66,10 +69,9 @@ async fn until(what: &str, within: Duration, mut check: impl AsyncFnMut() -> boo
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "live: needs a built tests/celld/fact-worker and celld"]
 async fn zone_leases_live_in_celld_cells() {
-    let Some(celld) = Celld::start_new() else {
-        return;
-    };
+    let celld = Celld::start_new();
     let base = celld.base();
     let own = ownership(&base, "host-a");
 

@@ -43,16 +43,6 @@ async fn items(rows: &[(&str, &str)]) -> GraphqlPoolSource {
     db.pool()
 }
 
-pub fn gate_enabled(name: &str) -> bool {
-    matches!(
-        std::env::var(name)
-            .unwrap_or_default()
-            .to_ascii_lowercase()
-            .as_str(),
-        "1" | "true" | "yes"
-    )
-}
-
 pub async fn discovery_ready(issuer: &str) -> bool {
     let base = issuer.trim_end_matches('/');
     let url = format!("{base}/.well-known/openid-configuration");

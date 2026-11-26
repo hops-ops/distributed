@@ -10,7 +10,11 @@ name: GraphQL Identity / OIDC Integration Tests
 # Local parity:
 #   ./scripts/oidc-{zitadel,keycloak,authentik}-up.sh
 #   set -a && source graphql-oidc[-keycloak|-authentik].env && set +a
-#   cargo test --test graphql --features graphql,sqlite,metrics graphql_oidc_<provider>::
+#   cargo test --test graphql --features graphql,sqlite,metrics graphql_oidc_<provider>:: -- --ignored
+#
+# Each provider's test is `#[ignore = "live: ..."]` (ignored in make
+# test-local) and fails without OIDC_ISSUER. scripts/expect-tests-passed.sh
+# fails a step unless exactly one test passed.
 on:
   workflow_call:
 
@@ -26,11 +30,6 @@ jobs:
     name: GraphQL Identity
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    env:
-      # Explicitly clear live gates so matrix cannot accidentally run live paths
-      ZITADEL_E2E: ""
-      KEYCLOAK_E2E: ""
-      AUTHENTIK_E2E: ""
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
         with:
@@ -75,11 +74,10 @@ jobs:
           # shellcheck disable=SC1091
           source graphql-oidc.env
           set +a
-          test -n "${ZITADEL_E2E:-}"
           test -n "${OIDC_ISSUER:-}"
           test -n "${GRAPHQL_E2E_CUSTOMER_KEY:-}"
-          echo "ZITADEL_E2E=$ZITADEL_E2E OIDC_ISSUER=$OIDC_ISSUER"
-          cargo test --test graphql --features graphql,sqlite,metrics --verbose graphql_oidc_zitadel:: -- --nocapture
+          echo "OIDC_ISSUER=$OIDC_ISSUER"
+          scripts/expect-tests-passed.sh 1 cargo test --test graphql --features graphql,sqlite,metrics --verbose graphql_oidc_zitadel:: -- --ignored --nocapture
       - name: Dump Zitadel logs on failure
         if: failure()
         run: |
@@ -117,10 +115,9 @@ jobs:
           # shellcheck disable=SC1091
           source graphql-oidc-keycloak.env
           set +a
-          test -n "${KEYCLOAK_E2E:-}"
           test -n "${OIDC_ISSUER:-}"
-          echo "KEYCLOAK_E2E=$KEYCLOAK_E2E OIDC_ISSUER=$OIDC_ISSUER OIDC_AUDIENCE=$OIDC_AUDIENCE"
-          cargo test --test graphql --features graphql,sqlite,metrics --verbose graphql_oidc_keycloak:: -- --nocapture
+          echo "OIDC_ISSUER=$OIDC_ISSUER OIDC_AUDIENCE=$OIDC_AUDIENCE"
+          scripts/expect-tests-passed.sh 1 cargo test --test graphql --features graphql,sqlite,metrics --verbose graphql_oidc_keycloak:: -- --ignored --nocapture
       - name: Dump Keycloak logs on failure
         if: failure()
         run: |
@@ -157,11 +154,10 @@ jobs:
           # shellcheck disable=SC1091
           source graphql-oidc-authentik.env
           set +a
-          test -n "${AUTHENTIK_E2E:-}"
           test -n "${OIDC_ISSUER:-}"
           test -n "${OIDC_JWKS_URI:-}"
-          echo "AUTHENTIK_E2E=$AUTHENTIK_E2E OIDC_ISSUER=$OIDC_ISSUER"
-          cargo test --test graphql --features graphql,sqlite,metrics --verbose graphql_oidc_authentik:: -- --nocapture
+          echo "OIDC_ISSUER=$OIDC_ISSUER"
+          scripts/expect-tests-passed.sh 1 cargo test --test graphql --features graphql,sqlite,metrics --verbose graphql_oidc_authentik:: -- --ignored --nocapture
       - name: Dump Authentik logs on failure
         if: failure()
         run: |

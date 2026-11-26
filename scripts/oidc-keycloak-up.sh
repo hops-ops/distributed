@@ -85,7 +85,6 @@ PY
 )
 
 cat > "$OUT" <<EOF
-KEYCLOAK_E2E=1
 OIDC_ISSUER=$ISSUER
 OIDC_AUDIENCE=$AUD
 OIDC_CLIENT_ID=graphql-e2e-customer
@@ -96,4 +95,4 @@ KEYCLOAK_E2E_ADMIN_CLIENT_SECRET=admin-secret-e2e
 EOF
 echo "==> Wrote $OUT"
 cat "$OUT"
-echo "==> Done. source $OUT && cargo test --test graphql --features graphql,sqlite,metrics graphql_oidc_keycloak::"
+echo "==> Done. source $OUT && cargo test --test graphql --features graphql,sqlite,metrics graphql_oidc_keycloak:: -- --ignored"

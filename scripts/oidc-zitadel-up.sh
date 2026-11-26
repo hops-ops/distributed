@@ -99,4 +99,4 @@ chmod +x "$ROOT/scripts/ci-bootstrap-graphql-oidc.sh"
 
 echo "==> Done. Source env and run tests:"
 echo "    set -a && source $ROOT/graphql-oidc.env && set +a"
-echo "    cargo test --test graphql --features graphql,sqlite,metrics graphql_oidc_zitadel::"
+echo "    cargo test --test graphql --features graphql,sqlite,metrics graphql_oidc_zitadel:: -- --ignored"
