@@ -1476,8 +1476,7 @@ fn causal_status_projection_failure_precedes_observed_and_pending_evidence() {
     let item = |obligation_index, state| CausalCommandProjectionEvidence {
         obligation_index,
         state,
-        incarnation: (state == CausalProjectionEvidenceState::Observed).then_some(1),
-        revision: (state == CausalProjectionEvidenceState::Observed).then_some(2),
+        record: None,
     };
 
     assert_eq!(

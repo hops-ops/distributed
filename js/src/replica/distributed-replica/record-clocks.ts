@@ -84,6 +84,17 @@ export class RecordClocks {
 		);
 	}
 
+	/** The record a server scope token names, and its clock. */
+	byScope(
+		scopeToken: DistributedOpaqueString
+	): { readonly key: string; readonly clock: RecordProtocolClock } | undefined {
+		const key = this.#keysByScope.get(scopeToken);
+		const clock = key === undefined ? undefined : this.#clocks.get(key);
+		return clock === undefined || clock.scopeToken !== scopeToken
+			? undefined
+			: { key: key!, clock };
+	}
+
 	projectedFences(): IterableIterator<[string, ProjectedRecordFence]> {
 		return this.#projectedFences.entries();
 	}

@@ -600,8 +600,10 @@ pub(crate) enum CausalProjectionEvidenceState {
 pub(crate) struct CausalCommandProjectionEvidence {
     pub(crate) obligation_index: usize,
     pub(crate) state: CausalProjectionEvidenceState,
-    pub(crate) incarnation: Option<u64>,
-    pub(crate) revision: Option<u64>,
+    /// The read-model record revision the projector wrote for this
+    /// causation, read from its own observation log. Present only for an
+    /// observed record obligation; a dependency observation names no row.
+    pub(crate) record: Option<crate::projection_protocol::RecordRevision>,
 }
 
 /// Authorized, non-enumerating status for a client-created command ID.
@@ -1168,8 +1170,7 @@ where
                             // obligation. Exact record positions are optional
                             // status detail and are not reconstructed from a
                             // later row head.
-                            incarnation: None,
-                            revision: None,
+                            record: None,
                         })
                         .collect(),
                 ),
@@ -1312,31 +1313,27 @@ where
                 CausalCommandProjectionEvidence {
                     obligation_index,
                     state: CausalProjectionEvidenceState::Pending,
-                    incarnation: None,
-                    revision: None,
+                    record: None,
                 }
             }
             crate::graphql::projection_delta::runtime::ModeledProjectionEvidence::TerminalFailure => {
                 CausalCommandProjectionEvidence {
                     obligation_index,
                     state: CausalProjectionEvidenceState::TerminalFailure,
-                    incarnation: None,
-                    revision: None,
+                    record: None,
                 }
             }
             crate::graphql::projection_delta::runtime::ModeledProjectionEvidence::Observed(
                 observation,
             ) => {
-                let (incarnation, revision) = match observation.revision.as_ref() {
+                let record = match observation.revision {
                     Some(record)
                         if observation.kind == ProjectionObservationKind::Record
                             && record.scope() == &observation.scope =>
                     {
-                        (Some(record.incarnation()), Some(record.revision()))
+                        Some(record)
                     }
-                    None if observation.kind == ProjectionObservationKind::Dependency => {
-                        (None, None)
-                    }
+                    None if observation.kind == ProjectionObservationKind::Dependency => None,
                     _ => {
                         return Err(CausalDispatchError::Internal(
                             "modeled projection store returned invalid observation revision"
@@ -1347,8 +1344,7 @@ where
                 CausalCommandProjectionEvidence {
                     obligation_index,
                     state: CausalProjectionEvidenceState::Observed,
-                    incarnation,
-                    revision,
+                    record,
                 }
             }
         }))

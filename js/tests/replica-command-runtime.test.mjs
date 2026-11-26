@@ -1271,6 +1271,247 @@ test('a created row a refetch already stored before its receipt is neither pendi
 	}
 });
 
+/*
+ * Command receipts carry record revisions. An atomic receipt names the row
+ * its own transaction wrote; an eventual receipt names only the write-side
+ * causation, and the read side's observation names the row revision the
+ * projector wrote. A layer retires once the base holds that row at or past
+ * that revision, and never hides a later one.
+ */
+function revisionReplica(initial = {}) {
+	const fetches = [];
+	const replica = createDistributedReplica({
+		transport: {
+			fetch(request) {
+				fetches.push(request);
+				return Promise.reject(new Error('no refetch expected'));
+			}
+		}
+	});
+	replica.writeResult(
+		CommandTodos,
+		{},
+		commandFrame(CommandTodos, [
+			{ id: 'todo-1', title: 'base', status: 'open', ...initial }
+		]),
+		'network'
+	);
+	const watch = replica.watch(CommandTodos, {});
+	return {
+		replica,
+		watch,
+		fetches,
+		row: () => watch.get().data.todos[0],
+		held: () => replica[replicaCommandLayerHeld](COMMAND_A),
+		serverRow(fields, position) {
+			replica.writeResult(
+				CommandTodos,
+				{},
+				commandFrame(
+					CommandTodos,
+					[{ id: 'todo-1', title: 'base', status: 'open', ...fields }],
+					{ position }
+				),
+				'network'
+			);
+		}
+	};
+}
+
+/** The status a read side reports once its projector wrote `revision`. */
+function observedAt(metadata, revision) {
+	return Object.freeze({
+		...metadata,
+		state: COMMAND_STATE.ATOMIC,
+		observations: Object.freeze(
+			metadata.expects.map((expectation) =>
+				Object.freeze({
+					...expectation,
+					causationId: metadata.causationId,
+					record: Object.freeze({
+						scopeToken: 'record:todo-1',
+						incarnation: '1',
+						revision
+					})
+				})
+			)
+		)
+	});
+}
+
+function eventualStatusRuntime(harness, observedRevision) {
+	let metadata;
+	const runtime = createReplicaCommandRuntime(
+		harness.replica,
+		{
+			dispatch(request) {
+				metadata = commandMetadata(request, {
+					model: TodoModel,
+					actualTitle: request.variables.input.title
+				});
+				return Promise.resolve(envelope(request, { command: metadata }));
+			},
+			status(request) {
+				return Promise.resolve(
+					statusEnvelope(request, observedAt(metadata, observedRevision))
+				);
+			}
+		},
+		{ change: artifact({ model: TodoModel }) },
+		{ status: STATUS }
+	);
+	return runtime;
+}
+
+for (const edit of ['done', 'reopen']) {
+	test(`an atomic ${edit} edit without live delivery retires on its receipt, without a refetch`, async () => {
+		const [from, to] = edit === 'done' ? ['open', 'completed'] : ['completed', 'open'];
+		const harness = revisionReplica({ status: from });
+		const runtime = createReplicaCommandRuntime(
+			harness.replica,
+			{
+				dispatch(request) {
+					// The same transaction wrote the row at revision 2.
+					return Promise.resolve(
+						envelope(request, {
+							command: {
+								commandId: request.commandId,
+								causationId: `cause:${request.commandId}`,
+								state: 'atomic',
+								consistency: COMMAND_CONSISTENCY.ATOMIC,
+								expects: [],
+								observations: [],
+								records: [
+									{
+										model: TodoModel.id,
+										scopeToken: 'record:todo-1',
+										incarnation: '1',
+										revision: '2',
+										tombstone: false
+									}
+								]
+							},
+							data: {
+								[request.mutationField]: {
+									id: 'todo-1',
+									title: 'base',
+									status: to
+								}
+							}
+						})
+					);
+				}
+			},
+			{
+				[edit]: Object.freeze({
+					...artifact({
+						name: `todo.${edit}`,
+						model: TodoModel,
+						consistency: COMMAND_CONSISTENCY.ATOMIC,
+						modeled: false,
+						directProjection: Object.freeze({
+							topology: Object.freeze({ version: 1, name: 'todos', digest: HASH_D }),
+							model: TodoModel.id,
+							identityFields: TodoModel.identityFields,
+							changeEpoch: 'todos-v1'
+						})
+					}),
+					output: Object.freeze({
+						kind: 'object',
+						definition: Object.freeze({
+							name: TodoModel.id,
+							fields: Object.freeze([
+								scalar('id', 'ID'),
+								scalar('title'),
+								scalar('status')
+							])
+						})
+					})
+				})
+			}
+		);
+		try {
+			const receipt = await runtime.commands[edit](
+				{ id: 'todo-1', title: 'base' },
+				{ commandId: COMMAND_A }
+			);
+			assert.equal(receipt.state, 'atomic');
+			assert.equal((await receipt.projected).state, 'atomic');
+			assert.equal(harness.held(), false);
+			assert.equal(harness.row().status, to);
+			assert.equal(harness.watch.get().pending.size, 0);
+			assert.deepEqual(harness.fetches, []);
+		} finally {
+			runtime.dispose();
+			harness.watch.destroy();
+		}
+	});
+}
+
+test('an eventual edit waits for a frame that shows its projected revision', async () => {
+	const harness = revisionReplica();
+	const runtime = eventualStatusRuntime(harness, '2');
+	try {
+		const receipt = await runtime.commands.change(
+			{ id: 'todo-1', title: 'edited' },
+			{ commandId: COMMAND_A }
+		);
+		assert.equal(receipt.state, 'succeeded_pending_projection');
+		// The read side wrote the row at revision 2; the base holds revision 1.
+		assert.equal((await receipt.status()).state, 'atomic');
+		assert.equal((await receipt.projected).state, 'atomic');
+		assert.equal(harness.held(), true);
+		assert.equal(harness.row().title, 'edited');
+
+		// A frame still at revision 1 proves nothing.
+		harness.serverRow({}, '1');
+		assert.equal(harness.held(), true);
+		assert.equal(harness.row().title, 'edited');
+
+		// A frame at revision 2 holds the write: the layer retires.
+		harness.serverRow({ title: 'edited' }, '2');
+		assert.equal(harness.held(), false);
+		assert.equal(harness.row().title, 'edited');
+		assert.deepEqual(harness.fetches, []);
+	} finally {
+		runtime.dispose();
+		harness.watch.destroy();
+	}
+});
+
+for (const order of ['frame-after-status', 'frame-before-status']) {
+	test(`a later concurrent server change is never masked (${order})`, async () => {
+		const harness = revisionReplica();
+		const runtime = eventualStatusRuntime(harness, '2');
+		try {
+			const receipt = await runtime.commands.change(
+				{ id: 'todo-1', title: 'edited' },
+				{ commandId: COMMAND_A }
+			);
+			// Someone else renamed the row after the projector applied this
+			// command: the frame is at revision 3.
+			if (order === 'frame-after-status') {
+				assert.equal((await receipt.status()).state, 'atomic');
+				assert.equal(harness.held(), true);
+				harness.serverRow({ title: 'renamed elsewhere' }, '3');
+			} else {
+				harness.serverRow({ title: 'renamed elsewhere' }, '3');
+				// Until the status names the projected revision, nothing
+				// relates revision 3 to this command.
+				assert.equal(harness.held(), true);
+				assert.equal((await receipt.status()).state, 'atomic');
+			}
+			assert.equal(harness.held(), false);
+			assert.equal(harness.row().title, 'renamed elsewhere');
+			assert.equal((await receipt.projected).state, 'atomic');
+			assert.deepEqual(harness.fetches, []);
+		} finally {
+			runtime.dispose();
+			harness.watch.destroy();
+		}
+	});
+}
+
 test('artifact v1 is rejected at the public boundary', () => {
 	assert.throws(
 		() =>

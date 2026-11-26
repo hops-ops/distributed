@@ -131,9 +131,10 @@ export function responsePathKey(path: readonly string[]): string {
 	return JSON.stringify(path);
 }
 
+/** Order two clocks of one record scope; the caller checks the scope. */
 export function compareRecordClock(
-	left: RecordProtocolClock,
-	right: RecordProtocolClock
+	left: { readonly incarnation: string; readonly revision: string },
+	right: { readonly incarnation: string; readonly revision: string }
 ): -1 | 0 | 1 {
 	const incarnation = compareDistributedDecimal(
 		left.incarnation,
@@ -149,15 +150,7 @@ export function compareEvidenceToProjectedFence(
 	fence: ProjectedRecordFence
 ): -1 | 0 | 1 | undefined {
 	if (evidence.scopeToken !== fence.clock.scopeToken) return undefined;
-	return compareRecordClock(
-		{
-			scopeToken: evidence.scopeToken,
-			incarnation: evidence.incarnation,
-			revision: evidence.revision,
-			tombstone: evidence.tombstone
-		},
-		fence.clock
-	);
+	return compareRecordClock(evidence, fence.clock);
 }
 
 export function sameRecordClock(

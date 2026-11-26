@@ -120,6 +120,33 @@ test('unsigned trusted presets accept only exact bounded integers', () => {
 	}
 });
 
+test('an observation may name the row revision its projector wrote', () => {
+	const record = {
+		scopeToken: 'opaque:record-scope',
+		incarnation: '1',
+		revision: '18446744073709551615'
+	};
+	const envelope = distributedEnvelope();
+	envelope.command.observations[0].record = record;
+	assert.deepEqual(
+		parseDistributedProtocolEnvelope(envelope).command.observations[0].record,
+		record
+	);
+	for (const invalid of [
+		null,
+		{ ...record, scopeToken: '' },
+		{ ...record, incarnation: '01' },
+		{ ...record, revision: 2 }
+	]) {
+		const malformed = distributedEnvelope();
+		malformed.command.observations[0].record = invalid;
+		assert.throws(
+			() => parseDistributedProtocolEnvelope(malformed),
+			DistributedProtocolError
+		);
+	}
+});
+
 test('protocol parser validates receipts while retaining future metadata opaquely', () => {
 	assert.deepEqual(COMMAND_CONSISTENCY, {
 		SUCCEEDED: 'succeeded',

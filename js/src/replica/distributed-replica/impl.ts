@@ -19,6 +19,7 @@ import {
 	DistributedProtocolError,
 	parseGraphqlResponseExtensions,
 	type DistributedCommandMetadata,
+	type DistributedObservedRecord,
 	type DistributedProtocolEnvelope,
 	type DistributedQuerySnapshot
 } from '../../protocol.js';
@@ -100,6 +101,7 @@ import type {
 	SharedIndexDisposition
 } from './types.js';
 import {
+	compareRecordClock,
 	compareSnapshotToOperationState,
 	isComparableHandoffDisposition,
 	protocolInvalid,
@@ -200,7 +202,11 @@ export class DistributedReplicaImpl implements DistributedReplicaApi {
 			generation: () => this.#authority.sequence,
 			receipt: (id) => this.#optimistic.receipt(id)
 		});
-		this.#optimistic = new OptimisticLayers(this.#engine, this.#diagnostics);
+		this.#optimistic = new OptimisticLayers(
+			this.#engine,
+			this.#diagnostics,
+			(revision) => this.#baseHolds(revision)
+		);
 		this.#operations = new OperationProtocols(this.#engine);
 		this.#live = new LiveCoordinator({
 			transport: options.transport,
@@ -1196,6 +1202,7 @@ export class DistributedReplicaImpl implements DistributedReplicaApi {
 		this.#live.resumeLive();
 		this.#live.emit(key, false);
 		this.#optimistic.flushDeferredConfirms();
+		this.#optimistic.retireHeld();
 		if (this.#diagnostics.enabled) {
 			this.#diagnostics.event(
 				Object.freeze({
@@ -1263,6 +1270,27 @@ export class DistributedReplicaImpl implements DistributedReplicaApi {
 		semanticChanges: readonly ReplicaIndexSemanticChange[] = Object.freeze([])
 	): void {
 		this.#optimistic.create(id, update, semanticChanges);
+	}
+
+	/**
+	 * Whether the authoritative base holds the row an observed revision names
+	 * at or past that revision. The record must be known by its scope token
+	 * and stored (or tombstoned) at a comparable clock; evidence that only
+	 * discarded a stale row proves nothing.
+	 */
+	#baseHolds(revision: DistributedObservedRecord): boolean {
+		const known = this.#clocks.byScope(revision.scopeToken);
+		if (known === undefined || compareRecordClock(known.clock, revision) < 0) {
+			return false;
+		}
+		if (known.clock.tombstone) return true;
+		const stored = this.#engine.readConfirmed((reader) =>
+			reader.record(known.key)
+		);
+		return (
+			stored !== undefined &&
+			compareRecordClock(stored, revision) >= 0
+		);
 	}
 
 	markOptimisticLayerAccepted(

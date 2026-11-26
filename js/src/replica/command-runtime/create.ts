@@ -1144,9 +1144,12 @@ export function createReplicaCommandRuntime<
 						 * An exact delta already shows the server's effect, and
 						 * every row it shows is one the base holds (or an open
 						 * live stream will deliver it). The proof settles the
-						 * projected wait; the accepted layer stays until a later
-						 * comparable authoritative result seals it, without
-						 * racing sibling commands with a command-triggered query.
+						 * projected wait without a command-triggered query. The
+						 * accepted layer stays until the base holds each row at
+						 * or past the revision the status observed (the replica
+						 * retires it on the frame or fetch that brings it), or,
+						 * without observed revisions, until a later comparable
+						 * authoritative result seals it.
 						 */
 						settleTrackedProjection(tracker, pending);
 					} else if (

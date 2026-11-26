@@ -7,7 +7,9 @@ import {
 } from '../../internal/cache-engine.js';
 import type {
 	DistributedCommandMetadata,
-	DistributedOpaqueString
+	DistributedObservedRecord,
+	DistributedOpaqueString,
+	DistributedProjectionObservation
 } from '../../protocol.js';
 
 import { cloneJsonValue } from '../identity/clone.js';
@@ -39,22 +41,68 @@ export function optimisticReceiptState(
 		}
 		expectations.set(key, true);
 	}
-	const observed = new Set<string>();
-	for (const observation of command.observations) {
-		if (observation.causationId !== command.causationId) {
-			protocolInvalid('extensions.distributed.command.observations');
-		}
-		const key = expectationKey(observation);
-		if (!expectations.has(key)) {
-			protocolInvalid('extensions.distributed.command.observations');
-		}
-		observed.add(key);
-	}
-	return {
+	const receipt: OptimisticReceiptState = {
 		causationId: command.causationId,
 		expectations,
-		observed
+		observed: new Set(),
+		revisions: new Map()
 	};
+	for (const observation of command.observations) {
+		if (
+			observation.causationId !== command.causationId ||
+			!expectations.has(expectationKey(observation))
+		) {
+			protocolInvalid('extensions.distributed.command.observations');
+		}
+		observeReceipt(receipt, observation);
+	}
+	return receipt;
+}
+
+/**
+ * Record one observation of this receipt's causation: the expectation it
+ * satisfies, and the row revision it names, if any. Observations of other
+ * causations or expectations are ignored.
+ */
+export function observeReceipt(
+	receipt: OptimisticReceiptState,
+	observation: DistributedProjectionObservation
+): void {
+	if (observation.causationId !== receipt.causationId) return;
+	const key = expectationKey(observation);
+	if (!receipt.expectations.has(key)) return;
+	receipt.observed.add(key);
+	if (observation.record !== undefined) {
+		receipt.revisions.set(key, observation.record);
+	}
+}
+
+/** Fold a later receipt's progress into the one already held. */
+export function mergeReceiptProgress(
+	into: OptimisticReceiptState,
+	from: OptimisticReceiptState
+): void {
+	for (const key of from.observed) into.observed.add(key);
+	for (const [key, revision] of from.revisions) {
+		into.revisions.set(key, revision);
+	}
+}
+
+/**
+ * Whether the base proves every expectation: each names the row revision its
+ * projection wrote, and `holds` finds the base at or past it. An expectation
+ * without a revision (a dependency) can prove the receipt only otherwise.
+ */
+export function receiptHeldByBase(
+	receipt: OptimisticReceiptState,
+	holds: (revision: DistributedObservedRecord) => boolean
+): boolean {
+	if (receipt.expectations.size === 0) return false;
+	for (const key of receipt.expectations.keys()) {
+		const revision = receipt.revisions.get(key);
+		if (revision === undefined || !holds(revision)) return false;
+	}
+	return true;
 }
 
 export function cloneOptimisticReceipt(
@@ -63,7 +111,8 @@ export function cloneOptimisticReceipt(
 	return {
 		causationId: receipt.causationId,
 		expectations: new Map(receipt.expectations),
-		observed: new Set(receipt.observed)
+		observed: new Set(receipt.observed),
+		revisions: new Map(receipt.revisions)
 	};
 }
 

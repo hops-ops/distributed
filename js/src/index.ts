@@ -26,6 +26,7 @@ export {
 	type DistributedLiveResumeExtensions,
 	type DistributedOpaqueString,
 	type DistributedProjectionExpectation,
+	type DistributedObservedRecord,
 	type DistributedProjectionObservation,
 	type DistributedProtocolValue,
 	type DistributedProtocolEnvelope,
