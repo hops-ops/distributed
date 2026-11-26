@@ -5,6 +5,8 @@
 mod admission;
 #[path = "../support/arena.rs"]
 mod arena;
+#[path = "../support/unique.rs"]
+mod unique;
 
 use std::time::Duration;
 

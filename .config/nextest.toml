@@ -1,0 +1,85 @@
+# cargo-nextest configuration. `make test-local` and `make test-cargo` run the
+# workspace with `cargo nextest run`, one process per test; doctests still run
+# under `cargo test --doc` (nextest does not run them).
+#
+# One process per test means an in-process `static Mutex` serializes nothing.
+# Tests that share a name, a directory or a channel across processes either
+# get a namespace of their own (see `tests/common/src/ids.rs`) or join one of
+# the test groups below. Each group says why it exists; do not add a test to
+# one to hide a failure whose cause is unknown.
+
+[profile.default]
+# A test that needs a retry to pass is broken: never retry.
+retries = 0
+# Report a test as slow after 60s; kill it after 5 minutes.
+slow-timeout = { period = "60s", terminate-after = 5 }
+
+# CI (`NEXTEST_PROFILE=ci make test-local`): run every test and write JUnit.
+[profile.ci]
+fail-fast = false
+
+[profile.ci.junit]
+# Written to target/nextest/ci/junit.xml.
+path = "junit.xml"
+
+[test-groups]
+# Compile-fail tests build scratch crates with a nested `cargo`. The three
+# trybuild binaries of `distributed_macros` share one trybuild project
+# directory, and both `rustc_fail` binaries build in the shared
+# `target/tests/rustc-fail/target` (`tests/support/rustc_fail.rs`). Run at
+# once, they overwrite each other's project files.
+compile-fail = { max-threads = 1 }
+# The lifecycle-project tests of `distributed_cli` build one fixture project
+# into one Cargo target directory (`CARGO_TARGET_TMPDIR/lifecycle-project`);
+# two at once wait on Cargo's lock inside their readiness deadlines. This
+# replaces the in-process `TURN` mutex in `tests/cli_lifecycle.rs`.
+lifecycle-project = { max-threads = 1 }
+# `celld dev` instances started together race for the Worker bundler. This
+# replaces the in-process `SERIAL` mutex in
+# `distributed_game/tests/celld_zone/main.rs`.
+celld-dev = { max-threads = 1 }
+# Postgres NOTIFY channels are database-wide, not per schema. The runtime
+# conformance test waits for change notifications naming
+# `postgres_projection_views` (and asserts that a rolled-back one never
+# arrives); the redelivery test registers a model of that table in its own
+# schema of the same database. This replaces, across processes, the
+# in-process `POSTGRES_PROJECTION_TEST_LOCK` both hold.
+postgres-projection-views = { max-threads = 1 }
+
+[[profile.default.overrides]]
+filter = '''
+binary_id(distributed_macros::compile_fail)
+| binary_id(distributed_macros::command_types_compile_fail)
+| binary_id(distributed_macros::command_input_defaults_compile_fail)
+| binary_id(distributed_macros::rustc_fail)
+| binary_id(distributed_game_macros::compile_fail)
+| binary_id(distributed_game_macros::rustc_fail)
+'''
+test-group = "compile-fail"
+# A cold scratch-crate build takes minutes.
+slow-timeout = { period = "120s", terminate-after = 10 }
+
+[[profile.default.overrides]]
+filter = '''
+binary_id(distributed_cli::cli_lifecycle)
+& (test(=dev_interrupted_leaves_no_descendant)
+  | test(=dev_terminated_leaves_no_descendant)
+  | test(=dev_hung_up_leaves_no_descendant)
+  | test(=build_terminated_leaves_no_descendant)
+  | test(=dev_keeps_running_while_a_watched_input_is_missing_and_says_so_once))
+'''
+test-group = "lifecycle-project"
+# Each compiles the fixture project.
+slow-timeout = { period = "120s", terminate-after = 10 }
+
+[[profile.default.overrides]]
+filter = "binary_id(distributed_game::celld_zone)"
+test-group = "celld-dev"
+
+[[profile.default.overrides]]
+filter = '''
+binary_id(distributed)
+& (test(=sqlx_repo::projection_protocol::postgres_tests::postgres_projection_protocol_runtime_conforms)
+  | test(=sqlx_repo::projection_protocol::postgres_tests::postgres_redelivery_identity_is_atomic_across_partition_and_cursor_races))
+'''
+test-group = "postgres-projection-views"

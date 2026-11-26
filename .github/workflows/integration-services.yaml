@@ -4,7 +4,8 @@ name: Workspace Tests Against Real Services
 #
 # Runs the whole workspace with all features against the services in
 # compose.yaml (Postgres, RabbitMQ, Kafka, NATS, Redis) through
-# `make test-local`, the same command a developer runs.
+# `make test-local`, the same command a developer runs: `cargo nextest run`
+# (one process per test) and the doctests under `cargo test --doc`.
 #
 # `make test-local` sets DISTRIBUTED_REQUIRE_SERVICES, so a test that cannot
 # reach its service fails here instead of returning early and reporting a
@@ -41,5 +42,19 @@ jobs:
       # curl/curl.h (the runner has libcurl's runtime but not its headers).
       - name: Install librdkafka build dependencies
         run: sudo apt-get update && sudo apt-get install -y libcurl4-openssl-dev
+      # cargo-nextest runs one process per test (.config/nextest.toml).
+      - uses: taiki-e/install-action@4a76afe23f9e08d2d9550fb56e556444e8611d21 # v2.90.4
+        with:
+          tool: cargo-nextest@0.9.140
       - name: Run the workspace against compose services
         run: make test-local CARGO_TEST_ARGS="--workspace --all-features --verbose"
+        env:
+          # No fail-fast, JUnit at target/nextest/ci/junit.xml.
+          NEXTEST_PROFILE: ci
+      - name: Upload the JUnit report
+        if: ${{ failure() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: workspace-services-junit
+          path: target/nextest/ci/junit.xml
+          if-no-files-found: ignore

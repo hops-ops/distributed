@@ -265,10 +265,7 @@ async fn live_independent_todo_cells_accept_bursts_while_queue_drain_is_busy() {
 
     wait_healthy(&client, &base).await;
 
-    let nonce = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .expect("clock")
-        .as_nanos();
+    let nonce = common::ids::token();
     let ids = (0..6)
         .map(|index| format!("todo-burst-{nonce}-{index}"))
         .collect::<Vec<_>>();
@@ -417,11 +414,8 @@ async fn live_chat_cell_post_and_isolate() {
 }
 
 fn unique_cell_pair(kind: &str) -> (String, String) {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .expect("clock")
-        .as_nanos();
-    (format!("{kind}-{nanos}-a"), format!("{kind}-{nanos}-b"))
+    let id = common::ids::unique_id(kind);
+    (format!("{id}-a"), format!("{id}-b"))
 }
 
 fn unix_millis() -> String {

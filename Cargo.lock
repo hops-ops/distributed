@@ -915,6 +915,7 @@ dependencies = [
  "sqlx",
  "tokio",
  "tower",
+ "uuid",
 ]
 
 [[package]]

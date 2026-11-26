@@ -64,17 +64,13 @@ impl Fleet {
             }
         }
         let binary = std::env::var("CELLD_BIN").unwrap_or_else(|_| "celld".into());
-        let stamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_millis();
-        let dir = std::env::temp_dir().join(format!(
-            "distributed-celld-fleet-{}-{stamp}",
-            std::process::id()
-        ));
+        // One name for the temp directory and the compose project (lowercase
+        // ASCII letters, digits and `-`, as compose requires).
+        let name = crate::unique::unique("dg-fleet");
+        let dir = std::env::temp_dir().join(&name);
         std::fs::create_dir_all(&dir).unwrap();
         let mut fleet = Self {
-            project: format!("dg-fleet-{}-{}", std::process::id(), stamp % 100_000),
+            project: name,
             s3_port: free_port(),
             bucket: "dg-fleet".into(),
             binary,

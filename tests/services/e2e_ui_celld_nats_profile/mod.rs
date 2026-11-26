@@ -174,13 +174,7 @@ mod live {
             .await
             .expect("NATS TCP");
 
-        let todo_id = format!(
-            "dcs6-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        );
+        let todo_id = common::ids::unique_id("dcs6");
         let celld = celld.trim_end_matches('/');
 
         let pool = sqlx::SqlitePool::connect_lazy("sqlite::memory:").unwrap();

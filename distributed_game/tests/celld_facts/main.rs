@@ -24,6 +24,8 @@ use serde_json::{json, Value};
 
 #[path = "../support/celld.rs"]
 mod celld_support;
+#[path = "../support/unique.rs"]
+mod unique;
 use celld_support::{Celld, SECRET};
 const SERVICE: &str = "zone-server-test";
 

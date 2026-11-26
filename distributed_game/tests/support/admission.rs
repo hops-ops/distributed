@@ -45,13 +45,7 @@ fn now() -> u64 {
 }
 
 fn claims(zone: &str, case: &str) -> TicketClaims {
-    let nonce = format!(
-        "{case}-{}",
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    );
+    let nonce = crate::unique::unique(case);
     TicketClaims::new("ana", zone, now() + 120, nonce, Role::Player)
 }
 

@@ -35,6 +35,9 @@ test: test-local
 .PHONY: test test-local test-cargo test-cli-lifecycle compose-up compose-down
 
 ## The whole workspace against real services. This is what CI runs.
+## Tests run under cargo-nextest, one process per test (.config/nextest.toml;
+## NEXTEST_PROFILE=ci for JUnit and no fail-fast); nextest does not run
+## doctests, so `cargo test --doc` follows.
 test-local:
 	set -eu; \
 	if [ "$(KEEP_COMPOSE)" != "1" ]; then \
@@ -59,11 +62,11 @@ test-local:
 	export DISTRIBUTED_REBUILD_TEST_POSTGRES_URL="$(POSTGRES_ADMIN_URL)/distributed_rebuild"; \
 	export DISTRIBUTED_UNIQUE_KEY_TEST_POSTGRES_URL="$(POSTGRES_ADMIN_URL)/distributed_unique_key_test"; \
 	export DISTRIBUTED_REQUIRE_SERVICES="$(REQUIRED_SERVICES)"; \
-	$(CARGO) test $(CARGO_TEST_ARGS) --all-targets; \
+	$(CARGO) nextest run $(CARGO_TEST_ARGS) --all-targets; \
 	$(CARGO) test $(CARGO_TEST_ARGS) --doc
 
 test-cargo:
-	$(CARGO) test $(CARGO_TEST_ARGS) --all-targets
+	$(CARGO) nextest run $(CARGO_TEST_ARGS) --all-targets
 	$(CARGO) test $(CARGO_TEST_ARGS) --doc
 
 test-cli-lifecycle:

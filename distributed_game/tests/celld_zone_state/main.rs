@@ -13,6 +13,8 @@ use distributed_game::world::{state_store_conformance, StoredZoneState, ZoneStat
 
 #[path = "../support/celld.rs"]
 mod celld_support;
+#[path = "../support/unique.rs"]
+mod unique;
 use celld_support::{Celld, SECRET};
 
 fn store(base: &str) -> CellZoneStateStore {

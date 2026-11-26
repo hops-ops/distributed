@@ -8,9 +8,8 @@
 //! expanded over the backend's concrete repository type rather than written
 //! as generic functions.
 
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant};
 
 use distributed::clock::ManualClock;
 use distributed::command::{typed_command, PreparedCommand, Succeeded};
@@ -233,19 +232,10 @@ where
     )
 }
 
-static NEXT_COMMAND: AtomicU64 = AtomicU64::new(1);
-
+/// A fresh command id (the UUIDv7 the ledger requires). Its 74 random bits
+/// keep ids of concurrent test processes apart.
 pub fn command_id() -> String {
-    let n = NEXT_COMMAND.fetch_add(1, Ordering::SeqCst);
-    let nanos = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos() as u64;
-    format!(
-        "0190a000-{:04x}-7000-8000-{:012x}",
-        n & 0xffff,
-        nanos & 0xffff_ffff_ffff
-    )
+    uuid::Uuid::now_v7().to_string()
 }
 
 /// Start ticker `id`: `limit` ticks of `command`, `period_ms` apart.

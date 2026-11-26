@@ -18,7 +18,7 @@
 //!   output (`/out/traces.json` in the container)
 
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use distributed::bus::{Message, MessageKind};
 use distributed::command::{typed_command, PreparedCommand, Succeeded};
@@ -64,7 +64,7 @@ async fn dispatch_span_reaches_collector_with_propagated_parent() {
 
     // A fresh trace id per run so stale collector output can never satisfy the
     // assertion.
-    let trace_id = fresh_trace_id(1);
+    let trace_id = fresh_trace_id();
     let traceparent = format!("00-{trace_id}-{REMOTE_PARENT_SPAN_ID}-01");
 
     // The exporter pipeline a service binary would install.
@@ -111,7 +111,7 @@ async fn dispatch_span_reaches_collector_with_propagated_parent() {
         .await
         .expect("dispatch succeeds");
 
-    let nested_trace_id = fresh_trace_id(17);
+    let nested_trace_id = fresh_trace_id();
     let nested_traceparent = format!("00-{nested_trace_id}-{REMOTE_PARENT_SPAN_ID}-01");
     let outer_span = tracing::info_span!("test.outer");
     let parent_context = opentelemetry_sdk::propagation::TraceContextPropagator::new().extract(
@@ -218,16 +218,10 @@ fn find_span(batch: &Value, trace_id: &str, span_name: &str) -> Option<Value> {
     None
 }
 
-fn fresh_trace_id(salt: u128) -> String {
-    format!(
-        "{:032x}",
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-            .wrapping_add(salt)
-            | 1
-    )
+/// A random, non-zero W3C trace id, so concurrent test processes and earlier
+/// runs against the same collector never share one.
+fn fresh_trace_id() -> String {
+    format!("{:032x}", rand::random::<u128>() | 1)
 }
 
 struct TraceparentExtractor<'a> {

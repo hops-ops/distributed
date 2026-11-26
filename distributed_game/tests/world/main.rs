@@ -9,6 +9,8 @@
 mod celld_support;
 #[path = "../support/realm.rs"]
 mod realm;
+#[path = "../support/unique.rs"]
+mod unique;
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;

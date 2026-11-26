@@ -46,7 +46,8 @@ same `OidcBearer` edge is not vendor-locked.
 ```bash
 make test                   # = make test-local: compose up, the whole workspace
                             #   with --all-features against real services
-make test-cargo             # the same cargo commands, no compose (bring your own services)
+                            #   (cargo nextest run, then cargo test --doc)
+make test-cargo             # the same commands, no compose (bring your own services)
 make test-cli-lifecycle     # builds the CLI and runs distributed_cli/tests/bats/lifecycle.bats
 make compose-up             # start postgres, rabbitmq, kafka, nats, redis (compose.yaml)
 make compose-down
@@ -60,6 +61,29 @@ Postgres databases, exports every service URL, and sets
 `DISTRIBUTED_REQUIRE_SERVICES`, so a test that cannot reach its service fails
 instead of skipping (see [`tests/common/src/env.rs`](../../tests/common/src/env.rs)).
 Set `KEEP_COMPOSE=1` to leave the services running afterwards.
+
+Both targets run the tests with [cargo-nextest](https://nexte.st)
+(`cargo install cargo-nextest --locked`), one process per test, then the
+doctests with `cargo test --doc`, which nextest does not run.
+`.config/nextest.toml` sets no retries and a slow-test timeout (reported at
+60 s, killed at 5 min). Its `ci` profile (`NEXTEST_PROFILE=ci make test-local`,
+what CI runs) does not stop at the first failure and writes
+`target/nextest/ci/junit.xml`, which the services job uploads when it fails.
+
+One process per test means an in-process lock serializes nothing, and a name
+made from the clock and a per-process counter repeats across processes.
+Build every generated test name (schema, temp file, subject, queue, stream,
+id) with `common::ids` (`token`, `unique`, `unique_id`), which mixes in the
+process id; `distributed_game` has the same rule in
+`distributed_game/tests/support/unique.rs`. Tests that cannot get a namespace
+of their own run in a nextest test group with `max-threads = 1`:
+
+| Group | Tests | Why |
+|---|---|---|
+| `compile-fail` | the trybuild and `rustc_fail` binaries of `distributed_macros` and `distributed_game_macros` | they build scratch crates in shared directories under `target/tests` |
+| `lifecycle-project` | the five ignored `distributed_cli::cli_lifecycle` tests that compile the lifecycle fixture project | one shared Cargo target directory |
+| `celld-dev` | `distributed_game::celld_zone` | `celld dev` instances race for the Worker bundler |
+| `postgres-projection-views` | `postgres_projection_protocol_runtime_conforms`, `postgres_redelivery_identity_is_atomic_across_partition_and_cursor_races` | NOTIFY channels are database-wide; both use the table name `postgres_projection_views` |
 
 The integration tests are eight binaries, one per area: `core`, `gateway`,
 `graphql`, `observability`, `read_models`, `repositories`, `services` and

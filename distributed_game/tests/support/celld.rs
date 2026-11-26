@@ -51,14 +51,7 @@ impl Celld {
             );
             return None;
         }
-        let project = std::env::temp_dir().join(format!(
-            "distributed-celld-facts-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let project = std::env::temp_dir().join(crate::unique::unique("distributed-celld-facts"));
         copy_dir(&build, &project.join("build"));
         std::fs::copy(dir.join("wrangler.jsonc"), project.join("wrangler.jsonc")).unwrap();
         let mut celld = Self {

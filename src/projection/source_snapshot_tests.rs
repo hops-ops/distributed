@@ -1123,9 +1123,15 @@ async fn sqlite_rebuild_statements_are_pinned() {
 async fn postgres_rebuild_statements_are_pinned() {
     use crate::sqlx_repo::statement_count_tests::{counted_postgres_pool, COUNTING};
     let counting = COUNTING.lock().await;
-    // Its own table in the shared protocol database: a rebuild inventories
+    // Its own schema of the shared protocol database: a rebuild inventories
     // the whole topology, and this history is the same on every run.
-    let Some(pool) = counted_postgres_pool(&counting, "DISTRIBUTED_TEST_POSTGRES_URL").await else {
+    let Some((_schema, pool)) = counted_postgres_pool(
+        &counting,
+        "DISTRIBUTED_TEST_POSTGRES_URL",
+        "rebuild_statements",
+    )
+    .await
+    else {
         return;
     };
     let store = crate::PostgresRepository::new(pool.clone());

@@ -45,6 +45,9 @@ use crate::table::{
 static RECORDED: Mutex<Vec<String>> = Mutex::new(Vec::new());
 /// Held by a test for as long as it counts: the record is process-wide, and
 /// a counted pool records everything it runs, its own migration included.
+/// It serializes counting tests of one process only; what they count must
+/// not depend on other tests, so a Postgres counted pool has a schema of its
+/// own.
 pub(crate) static COUNTING: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 /// Proof that the caller holds [`COUNTING`]; a counted pool cannot be made
 /// without it.
@@ -540,15 +543,26 @@ pub(crate) async fn counted_sqlite_pool(_counting: &Counting<'_>) -> sqlx::Sqlit
     pool
 }
 
-/// A counted pool on the Postgres test database, or `None` without one.
+/// A counted pool on a fresh schema (`prefix`) of the Postgres test database,
+/// or `None` without one. Keep the schema alive as long as the pool.
+///
+/// A schema of its own makes the count independent of what other tests,
+/// in this process or another, did to the shared database: every count is a
+/// first run on empty tables.
 #[cfg(feature = "postgres")]
 pub(crate) async fn counted_postgres_pool(
     _counting: &Counting<'_>,
     var: &str,
-) -> Option<sqlx::PgPool> {
+    prefix: &str,
+) -> Option<(common::postgres::PostgresTestSchema, sqlx::PgPool)> {
     use crate::sqlx_repo::repo::SqlxRepoBackend;
     use std::str::FromStr;
-    let url = crate::test_env::require_service(var, "Postgres statement count")?;
+    let (schema, url) = crate::sqlx_repo::postgres_test_schema::postgres_test_schema(
+        var,
+        "Postgres statement count",
+        prefix,
+    )
+    .await?;
     let pool =
         sqlx::Postgres::pool_options(sqlx::postgres::PgPoolOptions::new().max_connections(1))
             .connect_with(counted(
@@ -559,7 +573,7 @@ pub(crate) async fn counted_postgres_pool(
     crate::PostgresRepository::migrate_pool(&pool)
         .await
         .unwrap();
-    Some(pool)
+    Some((schema, pool))
 }
 
 #[cfg(feature = "sqlite")]
@@ -598,7 +612,13 @@ async fn sqlite_statements_per_operation_are_pinned() {
 #[tokio::test]
 async fn postgres_statements_per_operation_are_pinned() {
     let counting = COUNTING.lock().await;
-    let Some(pool) = counted_postgres_pool(&counting, "DISTRIBUTED_TEST_POSTGRES_URL").await else {
+    let Some((_schema, pool)) = counted_postgres_pool(
+        &counting,
+        "DISTRIBUTED_TEST_POSTGRES_URL",
+        "statement_count",
+    )
+    .await
+    else {
         return;
     };
     let fixture = Fixture::new();

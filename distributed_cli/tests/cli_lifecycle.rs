@@ -1057,7 +1057,9 @@ fn assert_no_survivors(pids: &[libc::pid_t]) {
 struct Project {
     _directory: TempDir,
     root: PathBuf,
-    /// Projects share one Cargo target directory, so they run one at a time.
+    /// Projects share one Cargo target directory, so they run one at a time:
+    /// this lock within one process, the nextest `lifecycle-project` test
+    /// group (`.config/nextest.toml`) across processes.
     _turn: std::sync::MutexGuard<'static, ()>,
 }
 

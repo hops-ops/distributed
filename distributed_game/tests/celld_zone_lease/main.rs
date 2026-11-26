@@ -21,6 +21,8 @@ use serde_json::Value;
 mod arena;
 #[path = "../support/celld.rs"]
 mod celld_support;
+#[path = "../support/unique.rs"]
+mod unique;
 use arena::{Arena, ArenaConfig};
 use celld_support::{Celld, SECRET};
 

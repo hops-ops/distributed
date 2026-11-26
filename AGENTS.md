@@ -45,7 +45,7 @@ unless `DISTRIBUTED_REQUIRE_SERVICES` names it, in which case they fail.
 
 | Target | What it does |
 |---|---|
-| `make test` (alias of `make test-local`) | Starts `compose.yaml`, recreates the test databases, and runs `cargo test --workspace --all-features --all-targets` and `--doc` against real services with `DISTRIBUTED_REQUIRE_SERVICES` set. The compose stack is torn down afterwards; `KEEP_COMPOSE=1` keeps it. This is what CI's services job runs. |
+| `make test` (alias of `make test-local`) | Starts `compose.yaml`, recreates the test databases, and runs `cargo nextest run --workspace --all-features --all-targets` (one process per test, `.config/nextest.toml`) and then `cargo test --workspace --all-features --doc` against real services with `DISTRIBUTED_REQUIRE_SERVICES` set. The compose stack is torn down afterwards; `KEEP_COMPOSE=1` keeps it. This is what CI's services job runs (with `NEXTEST_PROFILE=ci`). Needs `cargo-nextest`. |
 | `make test-cargo` | The same cargo commands without starting compose; set the service URLs yourself. |
 | `make test-cli-lifecycle` | Builds the CLI and runs the bats lifecycle suite (`distributed_cli/tests/bats/lifecycle.bats`). |
 | `make compose-up` / `make compose-down` | Start or stop the services alone. |

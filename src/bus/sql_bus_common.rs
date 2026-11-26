@@ -1859,7 +1859,9 @@ mod statement_count_tests {
     async fn postgres_bus_statements_are_pinned() {
         use crate::sqlx_repo::statement_count_tests::counted_postgres_pool;
         let counting = COUNTING.lock().await;
-        let Some(pool) = counted_postgres_pool(&counting, "DISTRIBUTED_TEST_POSTGRES_URL").await
+        let Some((_schema, pool)) =
+            counted_postgres_pool(&counting, "DISTRIBUTED_TEST_POSTGRES_URL", "bus_statements")
+                .await
         else {
             return;
         };

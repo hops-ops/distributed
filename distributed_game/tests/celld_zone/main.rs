@@ -52,12 +52,16 @@ mod admission;
 mod celld_support;
 #[path = "../support/fleet.rs"]
 mod fleet;
+#[path = "../support/unique.rs"]
+mod unique;
 
 const INTERNAL_SECRET: &str = "test-only-internal-secret-change-me-2026";
 const TICKET_SECRET: &str = "test-only-ticket-secret-change-me-2026";
 const REQUIRED: &str = "CELLD_ZONE_REQUIRED";
 
 /// One `celld dev` at a time: two starting together race for the bundler.
+/// This lock holds within one process; across processes the nextest
+/// `celld-dev` test group (`.config/nextest.toml`) does.
 static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 fn serial() -> std::sync::MutexGuard<'static, ()> {
@@ -80,13 +84,7 @@ fn ticket_as(principal: &str, zone: &str, role: Role) -> String {
         .unwrap()
         .as_secs()
         + 120;
-    let nonce = format!(
-        "{principal}-{zone}-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    );
+    let nonce = unique::unique(&format!("{principal}-{zone}"));
     TicketKey::new(TICKET_SECRET)
         .sign(&TicketClaims::new(principal, zone, exp, nonce, role).with_name(principal))
 }
@@ -98,13 +96,7 @@ fn wake_ticket(principal: &str, zone: &str) -> String {
         .unwrap()
         .as_secs()
         + 120;
-    let nonce = format!(
-        "{principal}-{zone}-wake-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    );
+    let nonce = unique::unique(&format!("{principal}-{zone}-wake"));
     TicketKey::new(TICKET_SECRET).sign(
         &TicketClaims::new(principal, zone, exp, nonce, Role::Observer)
             .with_name(principal)

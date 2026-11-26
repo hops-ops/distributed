@@ -31,3 +31,4 @@ bitcode = { version = "0.6.9", features = ["serde"] }
 sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "migrate", "json"], optional = true }
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync", "time"] }
 tower = { version = "0.5", features = ["util"], optional = true }
+uuid = { version = "1", features = ["v7"] }
