@@ -11,7 +11,9 @@ use crate::projection_protocol::{
     ProjectionInputCursor, ProjectionProtocolStore, ProjectionQuerySnapshotRequest,
 };
 #[cfg(feature = "graphql")]
-use crate::projection_protocol::{ProjectionEpoch, ProjectionScopeCodec, ProjectorTopologyId};
+use crate::projection_protocol::{
+    ProjectionProtocolError, ProjectionScopeCodec, ProjectorTopologyId,
+};
 use crate::table::{RowKey, RowValue};
 use crate::{InMemoryRepository, RelationalReadModel};
 
@@ -142,7 +144,6 @@ const GENERATED_MODELED_PROJECTOR: crate::projection::lower::ProjectionDescripto
 > = crate::projection::lower::ProjectionDescriptor::new(
     "task11-generated-multi-table",
     1,
-    "task11-generated-v1",
     || {
         static PROGRAM: crate::projection::lower::ProjectionProgramCell =
             crate::projection::lower::ProjectionProgramCell::new();
@@ -156,14 +157,12 @@ fn primary_projector() -> SurfaceProjector {
     SurfaceProjector::new("task15_a_primary")
         .facts([FACT_NAME])
         .models(["PrimaryView"])
-        .change_epoch("task15-primary-v1")
 }
 
 fn secondary_projector() -> SurfaceProjector {
     SurfaceProjector::new("task15_b_secondary")
         .facts([FACT_NAME])
         .models(["SecondaryView"])
-        .change_epoch("task15-secondary-v1")
 }
 
 fn fact_message(id: &str, title: &str) -> Message {
@@ -222,7 +221,6 @@ fn generated_modeled_projector(
             vec![ProjectionBindingActivation::new(
                 binding.id(),
                 binding.program_id(),
-                ProjectionEpoch::new("task11-generated-v1").unwrap(),
                 ProjectionBindingState::Active,
                 Some(route),
             )],
@@ -822,7 +820,6 @@ fn malformed_service(repository: InMemoryRepository, invoked: Arc<AtomicUsize>) 
     let projector = SurfaceProjector::new("task15_malformed")
         .facts(["task15.malformed"])
         .models(["MalformedView"])
-        .change_epoch("task15-malformed-v1")
         .partition_by(["tenant"]);
     Service::new().routes(
         Routes::new()
@@ -970,4 +967,232 @@ async fn unrecorded_permanent_projector_failure_retains_and_stops_under_drop_pol
         assert!(!error.to_string().contains("secret-tenant"));
         assert_eq!(invoked.load(Ordering::SeqCst), 0);
     }
+}
+
+/// A one-table modeled program. `revision` renames its operation, which
+/// changes the program identity and nothing else.
+#[cfg(feature = "graphql")]
+fn single_table_program(
+    name: &str,
+    model: &str,
+    table: &str,
+    revision: u32,
+) -> Result<crate::ProjectionProgram, crate::ProjectionProgramError> {
+    use crate::mutation::{
+        body_field_binding, compile_projection, MutationColumn, MutationKind, MutationOperation,
+        MutationProgram, ProjectionHandler,
+    };
+    use crate::projection::{
+        ProjectionEventSelector, ProjectionPartition, ProjectionTarget, ProjectionValueType,
+    };
+
+    let column = |name: &str| MutationColumn::try_new(name, ProjectionValueType::String, [name]);
+    let mutation = MutationProgram::try_new(
+        format!("{name}_mutation"),
+        1,
+        vec![MutationOperation::try_new(
+            format!("upsert-r{revision}"),
+            MutationKind::Upsert,
+            ProjectionTarget::try_new(model, table)?,
+            vec![column("id")?],
+            vec![column("id")?, column("title")?],
+        )?],
+    )?;
+    let selector =
+        ProjectionEventSelector::try_from_descriptor(&crate::DomainEventDescriptor::state::<
+            TodoChanged,
+        >(FACT_NAME, 1))?;
+    compile_projection(
+        name,
+        1,
+        ProjectionPartition::Unit,
+        [ProjectionHandler::try_new(
+            "changed",
+            selector,
+            vec![
+                body_field_binding(["id"], ["id"], ProjectionValueType::String)?,
+                body_field_binding(["title"], ["title"], ProjectionValueType::String)?,
+            ],
+            mutation,
+        )?],
+    )
+}
+
+#[cfg(feature = "graphql")]
+fn primary_inventory() -> Result<
+    crate::projection::lower::ProjectionOutputInventory,
+    crate::projection::lower::ProjectionLoweringError,
+> {
+    use crate::projection::lower::{ProjectionOutputInventory, ProjectionOutputModel};
+    Ok(ProjectionOutputInventory::new(
+        vec![ProjectionOutputModel::of::<PrimaryView>()?],
+        Vec::new(),
+    ))
+}
+
+#[cfg(feature = "graphql")]
+fn secondary_inventory() -> Result<
+    crate::projection::lower::ProjectionOutputInventory,
+    crate::projection::lower::ProjectionLoweringError,
+> {
+    use crate::projection::lower::{ProjectionOutputInventory, ProjectionOutputModel};
+    Ok(ProjectionOutputInventory::new(
+        vec![ProjectionOutputModel::of::<SecondaryView>()?],
+        Vec::new(),
+    ))
+}
+
+/// One release of a single-table projection: same name and topology in every
+/// release, a program that differs by `revision`.
+#[cfg(feature = "graphql")]
+macro_rules! epoch_release {
+    ($descriptor:ident, $name:literal, $model:literal, $table:literal, $revision:literal, $inventory:ident) => {
+        const $descriptor: crate::projection::lower::ProjectionDescriptor<
+            crate::projection::lower::EventualOnly,
+        > = crate::projection::lower::ProjectionDescriptor::new(
+            $name,
+            1,
+            || {
+                static PROGRAM: crate::projection::lower::ProjectionProgramCell =
+                    crate::projection::lower::ProjectionProgramCell::new();
+                PROGRAM.get_or_build(|| single_table_program($name, $model, $table, $revision))
+            },
+            generated_modeled_projector_lower,
+            $inventory,
+        );
+    };
+}
+
+#[cfg(feature = "graphql")]
+epoch_release!(
+    PRIMARY_R1,
+    "task15_a_primary",
+    "PrimaryView",
+    "task15_primary_views",
+    1,
+    primary_inventory
+);
+#[cfg(feature = "graphql")]
+epoch_release!(
+    PRIMARY_R2,
+    "task15_a_primary",
+    "PrimaryView",
+    "task15_primary_views",
+    2,
+    primary_inventory
+);
+#[cfg(feature = "graphql")]
+epoch_release!(
+    SECONDARY_R1,
+    "task15_b_secondary",
+    "SecondaryView",
+    "task15_secondary_views",
+    1,
+    secondary_inventory
+);
+#[cfg(feature = "graphql")]
+epoch_release!(
+    SECONDARY_R2,
+    "task15_b_secondary",
+    "SecondaryView",
+    "task15_secondary_views",
+    2,
+    secondary_inventory
+);
+
+/// Two modeled projections, each in its own route bundle, as one release
+/// mounts them.
+#[cfg(feature = "graphql")]
+fn release_service(
+    repository: &InMemoryRepository,
+    bus: &InMemoryBus,
+    primary: crate::projection::lower::ProjectionDescriptor<crate::projection::lower::EventualOnly>,
+    secondary: crate::projection::lower::ProjectionDescriptor<
+        crate::projection::lower::EventualOnly,
+    >,
+) -> Service {
+    let mounts = crate::LocalProjectionMounts::builder("task15-release", "ordered-domain-events")
+        .eventual(primary)
+        .eventual(secondary)
+        .build()
+        .unwrap();
+    Service::new()
+        .named("task15-release")
+        .routes(
+            Routes::new()
+                .with_read_model_store(repository.clone())
+                .consume_projection(mounts.projector(primary)),
+        )
+        .routes(
+            Routes::new()
+                .with_read_model_store(repository.clone())
+                .consume_projection(mounts.projector(secondary)),
+        )
+        .with_bus(bus.clone())
+}
+
+#[cfg(feature = "graphql")]
+#[tokio::test]
+async fn startup_names_every_projection_whose_program_changed() {
+    let repository = InMemoryRepository::new();
+    let bus = InMemoryBus::new();
+    bus.publish_message(modeled_fact_message("todo-1", "first release", 1))
+        .await
+        .unwrap();
+    release_service(&repository, &bus, PRIMARY_R1, SECONDARY_R1)
+        .run(RunOptions::until_idle())
+        .await
+        .unwrap();
+
+    // Same programs: the next start resumes.
+    release_service(&repository, &bus, PRIMARY_R1, SECONDARY_R1)
+        .bootstrap_projectors()
+        .await
+        .unwrap();
+
+    // Both programs changed, each in its own route bundle: one start names both.
+    let service = release_service(&repository, &bus, PRIMARY_R2, SECONDARY_R2);
+    let Err(HandlerError::Projection(ProjectionProtocolError::ChangeEpochMismatch(mismatches))) =
+        service.bootstrap_projectors().await
+    else {
+        panic!("a changed program over stored partitions must fail startup");
+    };
+    let named = mismatches
+        .iter()
+        .map(|mismatch| (mismatch.projection.as_str(), mismatch.stored.len()))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        named,
+        vec![("task15_a_primary", 1), ("task15_b_secondary", 1)]
+    );
+    for mismatch in &mismatches {
+        assert_ne!(mismatch.stored, vec![mismatch.declared.clone()]);
+    }
+    let message =
+        HandlerError::Projection(ProjectionProtocolError::ChangeEpochMismatch(mismatches))
+            .to_string();
+    assert!(message.contains("`task15_a_primary`"), "{message}");
+    assert!(message.contains("`task15_b_secondary`"), "{message}");
+    assert!(message.contains("reset"), "{message}");
+
+    // `run` fails the same way before consuming anything.
+    bus.publish_message(modeled_fact_message("todo-2", "next release", 1))
+        .await
+        .unwrap();
+    assert!(service.run(RunOptions::until_idle()).await.is_err());
+
+    // Resetting both lets the new release start on fresh partitions.
+    for descriptor in [PRIMARY_R2, SECONDARY_R2] {
+        let projector =
+            crate::LocalProjectionMounts::builder("task15-release", "ordered-domain-events")
+                .eventual(descriptor)
+                .build()
+                .unwrap()
+                .projector(descriptor);
+        assert_eq!(projector.reset_projection(&repository).await.unwrap(), 1);
+    }
+    release_service(&repository, &bus, PRIMARY_R2, SECONDARY_R2)
+        .bootstrap_projectors()
+        .await
+        .unwrap();
 }

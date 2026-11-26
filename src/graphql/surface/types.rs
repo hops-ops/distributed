@@ -356,9 +356,42 @@ impl SurfaceProjector {
         crate::projection::rebuild::SnapshotProjectionRebuild::begin(
             store,
             ProjectorTopologyId::new(physical.version(), physical.name(), physical.digest())?,
+            projection.epoch().clone(),
             executor,
         )
         .await
+    }
+
+    /// Reset this projector's one modeled projection: delete its partitions,
+    /// protocol state and every row of its tables in one transaction.
+    ///
+    /// Use it when startup refuses with `ChangeEpochMismatch` because the
+    /// projection's program changed. Stop the service first. On the next
+    /// start its partitions are created again under the new program's epoch
+    /// and fill from new input; a `source: aggregate_snapshot` projection can
+    /// then be refilled from retained history with `begin_snapshot_rebuild`.
+    /// Returns the number of partitions removed.
+    #[allow(private_bounds)]
+    pub async fn reset_projection(
+        &self,
+        store: &impl crate::projection_protocol::ProjectionProtocolStore,
+    ) -> Result<u64, crate::projection_protocol::ProjectionProtocolError> {
+        use crate::projection_protocol::{ProjectionProtocolError, ProjectorTopologyId};
+        let invalid = |message: &str| ProjectionProtocolError::InvalidBatch(message.into());
+        let [projection] = self.modeled.as_slice() else {
+            return Err(invalid(
+                "projection reset requires exactly one modeled binding",
+            ));
+        };
+        let physical = projection
+            .raw()
+            .ok_or_else(|| invalid("projection reset requires a generated binding"))?
+            .1
+            .physical_topology()
+            .ok_or_else(|| invalid("projection reset requires a physical topology"))?;
+        let topology =
+            ProjectorTopologyId::new(physical.version(), physical.name(), physical.digest())?;
+        store.reset_projection(&topology).await
     }
 
     pub fn new(name: impl Into<String>) -> Self {
@@ -392,15 +425,6 @@ impl SurfaceProjector {
     /// per program is accepted when the owner registry is attached.
     pub fn modeled(mut self, projection: SurfaceModeledProjection) -> Self {
         self.owner.modeled.push(projection);
-        self
-    }
-
-    /// Register the opaque change-log epoch owned by this projector topology.
-    ///
-    /// Epoch contents have no ordering meaning. They fence live resume and
-    /// same-transaction record-change evidence across projector rebuilds.
-    pub fn change_epoch(mut self, epoch: impl Into<String>) -> Self {
-        self.owner.change_epoch = Some(epoch.into());
         self
     }
 
@@ -487,12 +511,6 @@ impl SurfaceDirectProjection {
     /// Attach one exact same-transaction modeled projection.
     pub fn modeled(mut self, projection: SurfaceModeledProjection) -> Self {
         self.owner.modeled.push(projection);
-        self
-    }
-
-    /// Register the opaque change-log epoch for direct record evidence.
-    pub fn change_epoch(mut self, epoch: impl Into<String>) -> Self {
-        self.owner.change_epoch = Some(epoch.into());
         self
     }
 
@@ -951,6 +969,28 @@ impl Surface {
                 dependencies.insert(surface_model.table_name.clone());
             }
             projector.dependencies = dependencies.into_iter().collect();
+            if projector.modeled.is_empty() {
+                // A typed owner's epoch is its compiled topology, which already
+                // keys its partitions.
+                let schemas = projector
+                    .models
+                    .iter()
+                    .map(|model| &self.models[model].schema)
+                    .collect::<Vec<_>>();
+                let compiled =
+                    super::projections::compile_projection_owner_topology(&projector, schemas)
+                        .map_err(|error| {
+                            format!(
+                                "projector `{}` has invalid compiled topology: {error}",
+                                projector.name
+                            )
+                        })?;
+                projector.change_epoch = Some(
+                    crate::projection_protocol::ProjectionEpoch::for_topology(&compiled.0)
+                        .as_str()
+                        .to_owned(),
+                );
+            }
             out.push(projector);
         }
         out.sort_by(|a, b| a.name.cmp(&b.name));

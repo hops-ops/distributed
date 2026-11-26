@@ -277,12 +277,13 @@ impl SnapshotProjectionRebuild {
     /// Capture the current record inventory before reading the source archive.
     ///
     /// `topology` is the physical topology the generated `executor` is bound
-    /// to. The caller vouches that this binding is the active local eventual
+    /// to, and `epoch` that binding's change epoch. The caller vouches that this binding is the active local eventual
     /// one; `SurfaceProjector::begin_snapshot_rebuild` checks that for a
     /// mounted projector.
     pub async fn begin(
         store: &impl ProjectionProtocolStore,
         topology: ProjectorTopologyId,
+        epoch: ProjectionEpoch,
         executor: ProjectionServerExecutorDescriptor,
     ) -> Result<Self, ProjectionProtocolError> {
         if !executor.source_snapshots() {
@@ -298,10 +299,7 @@ impl SnapshotProjectionRebuild {
                 .iter()
                 .map(|o| (o.model.as_str(), o.storage.as_str(), &o.schema)),
         )?;
-        let context = RebuildContext {
-            compiled,
-            epoch: ProjectionEpoch::new(executor.epoch)?,
-        };
+        let context = RebuildContext { compiled, epoch };
         let expected = store.projection_rebuild_records(&context).await?;
         Ok(Self {
             context,

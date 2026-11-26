@@ -244,7 +244,7 @@ impl SurfaceModeledProjection {
     /// binding that will host it.
     ///
     /// This is the mountable form used by the projection service runtime.
-    /// Program digest, output schemas, route, and epoch are all validated
+    /// Program digest, output schemas and route are all validated
     /// before a transport subscription can be planned.
     pub fn try_from_descriptor<D>(
         descriptor: crate::projection::lower::ProjectionDescriptor<D>,
@@ -261,7 +261,6 @@ impl SurfaceModeledProjection {
             .raw()
             .ok_or_else(|| "mountable modeled projection lost its raw binding".to_owned())?;
         if executor.program_id != modeled.program_id
-            || executor.epoch != modeled.epoch.as_str()
             || executor.outputs.models.len() != binding.outputs().len()
             || executor.outputs.models.iter().any(|output| {
                 !binding.outputs().iter().any(|bound| {
@@ -272,7 +271,7 @@ impl SurfaceModeledProjection {
             })
         {
             return Err(
-                "generated projection executor differs from its exact binding digest, epoch, or outputs"
+                "generated projection executor differs from its exact binding digest or outputs"
                     .into(),
             );
         }
@@ -770,7 +769,6 @@ fn server_executor_eq(
         (Some(left), Some(right)) => {
             left.name == right.name
                 && left.version == right.version
-                && left.epoch == right.epoch
                 && left.program_id == right.program_id
                 && left.outputs == right.outputs
         }

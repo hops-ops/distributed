@@ -1432,8 +1432,18 @@ impl Service {
                 ));
             }
         }
+        // Every bundle is checked before failing, so one start names every
+        // projection whose stored partitions would refuse its input.
+        let mut mismatches = Vec::new();
         for routes in &self.routes {
-            routes.bootstrap_projectors().await?;
+            mismatches.extend(routes.bootstrap_projectors().await?);
+        }
+        if !mismatches.is_empty() {
+            return Err(HandlerError::Projection(
+                crate::projection_protocol::ProjectionProtocolError::ChangeEpochMismatch(
+                    mismatches,
+                ),
+            ));
         }
         Ok(())
     }

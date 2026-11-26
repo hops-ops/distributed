@@ -103,30 +103,88 @@ impl<'a> DirectModeledBinding<'a> {
 fn modeled_direct_projection(
     owner: &str,
     program_name: &str,
-    epoch: &str,
     schema: TableSchema,
     options: DirectModeledBinding<'_>,
 ) -> SurfaceModeledProjection {
-    modeled_projection_with_outputs(owner, program_name, epoch, vec![schema], options)
+    modeled_projection_with_outputs(owner, program_name, vec![schema], options)
 }
 
 fn modeled_projection_with_outputs(
     owner: &str,
     program_name: &str,
-    epoch: &str,
     schemas: Vec<TableSchema>,
     options: DirectModeledBinding<'_>,
 ) -> SurfaceModeledProjection {
+    let [modeled] = modeled_group(vec![(owner, program_name, schemas, options)])
+        .try_into()
+        .unwrap_or_else(|_| unreachable!());
+    modeled
+}
+
+/// Modeled projections activated together in one catalog, as an application
+/// mounts them: bindings sharing a physical topology share one change epoch.
+fn modeled_group(
+    specs: Vec<(&str, &str, Vec<TableSchema>, DirectModeledBinding<'_>)>,
+) -> Vec<SurfaceModeledProjection> {
     use crate::projection::catalog::{ProjectionBindingActivation, ProjectionCatalog};
+    use crate::projection::placement::ProjectionExecutorRoute;
+    let parts = specs
+        .into_iter()
+        .map(|(owner, program_name, schemas, options)| {
+            let (program, binding) = modeled_binding(owner, program_name, schemas, options);
+            (program, binding, options.state)
+        })
+        .collect::<Vec<_>>();
+    let catalog = ProjectionCatalog::try_new(
+        parts
+            .iter()
+            .map(|(_, binding, _)| binding.clone())
+            .collect(),
+    )
+    .unwrap();
+    let active = catalog
+        .activate(
+            parts
+                .iter()
+                .map(|(_, binding, state)| {
+                    ProjectionBindingActivation::new(
+                        binding.id(),
+                        binding.program_id(),
+                        *state,
+                        Some(ProjectionExecutorRoute::local("test-service").unwrap()),
+                    )
+                })
+                .collect(),
+            None,
+        )
+        .unwrap();
+    parts
+        .into_iter()
+        .map(|(program, binding, _)| {
+            SurfaceModeledProjection::try_from_catalog(program, &catalog, &active, binding.id())
+                .unwrap()
+        })
+        .collect()
+}
+
+fn modeled_binding(
+    owner: &str,
+    program_name: &str,
+    schemas: Vec<TableSchema>,
+    options: DirectModeledBinding<'_>,
+) -> (
+    crate::ProjectionProgram,
+    crate::projection::placement::ProjectionBinding,
+) {
     use crate::projection::placement::{
-        DirectProjectionPlacement, ProjectionBinding, ProjectionExecutionClass,
-        ProjectionExecutorRoute, ProjectionOutput, ProjectionOwner, ProjectionPhysicalTopology,
-        ProjectionSourceBinding, PROJECTION_PARTITION_CODEC_VERSION,
+        DirectProjectionPlacement, ProjectionBinding, ProjectionExecutionClass, ProjectionOutput,
+        ProjectionOwner, ProjectionPhysicalTopology, ProjectionSourceBinding,
+        PROJECTION_PARTITION_CODEC_VERSION,
     };
     use crate::projection::{
         ProjectionArm, ProjectionField, ProjectionOperation, ProjectionPartition, ProjectionTarget,
     };
-    use crate::projection_protocol::{ProjectionEpoch, ProjectorTopologyId};
+    use crate::projection_protocol::ProjectorTopologyId;
     use crate::{
         DomainEventBodyKind, MutationKind, ProjectionAssignment, ProjectionEventSelector,
         ProjectionExpression, ProjectionKeyField, ProjectionProgram, ProjectionValue,
@@ -222,20 +280,7 @@ fn modeled_projection_with_outputs(
         )
     }
     .unwrap();
-    let catalog = ProjectionCatalog::try_new(vec![binding.clone()]).unwrap();
-    let active = catalog
-        .activate(
-            vec![ProjectionBindingActivation::new(
-                binding.id(),
-                binding.program_id(),
-                ProjectionEpoch::new(epoch).unwrap(),
-                options.state,
-                Some(ProjectionExecutorRoute::local("test-service").unwrap()),
-            )],
-            None,
-        )
-        .unwrap();
-    SurfaceModeledProjection::try_from_catalog(program, &catalog, &active, binding.id()).unwrap()
+    (program, binding)
 }
 
 fn test_command(
@@ -433,7 +478,6 @@ fn direct_projection_owner_requires_models_but_not_facts() {
         .unwrap()
         .with_projection_owners([SurfaceDirectProjection::new("orders")
             .models(["OrderView"])
-            .change_epoch("orders-v1")
             .into()])
         .unwrap();
     let [owner] = surface.projection_owners() else {
@@ -445,28 +489,26 @@ fn direct_projection_owner_requires_models_but_not_facts() {
 
     let error = build_surface(&[orders()], &SurfaceOptions::sqlite())
         .unwrap()
-        .with_projection_owners([SurfaceDirectProjection::new("orders")
-            .change_epoch("orders-v1")
-            .into()])
+        .with_projection_owners([SurfaceDirectProjection::new("orders").into()])
         .unwrap_err();
     assert!(error.contains("must declare at least one model"));
 }
 
 #[test]
 fn direct_modeled_owner_rejects_mixed_active_epochs_before_command_binding() {
+    // Activated in separate catalogs, the two programs derive two epochs
+    // for one owner's partitions.
     let first = direct_model("FirstDirectView", "first_direct");
     let second = direct_model("SecondDirectView", "second_direct");
     let first_modeled = modeled_direct_projection(
         "shared-direct",
         "first-direct",
-        "direct-v1",
         first.clone(),
         DirectModeledBinding::active("shared-direct"),
     );
     let second_modeled = modeled_direct_projection(
         "shared-direct",
         "second-direct",
-        "direct-v2",
         second.clone(),
         DirectModeledBinding::active("shared-direct"),
     );
@@ -485,29 +527,31 @@ fn direct_modeled_owner_rejects_mixed_active_epochs_before_command_binding() {
         ),
         "{error}"
     );
-    assert!(error.contains("`direct-v1`"), "{error}");
-    assert!(error.contains("`direct-v2`"), "{error}");
 }
 
 #[test]
 fn direct_modeled_owner_accepts_distinct_models_with_one_active_epoch() {
     let first = direct_model("FirstDirectView", "first_direct");
     let second = direct_model("SecondDirectView", "second_direct");
-    let first_modeled = modeled_direct_projection(
-        "shared-direct",
-        "first-direct",
-        "direct-v1",
-        first.clone(),
-        DirectModeledBinding::active("shared-direct"),
-    );
-    let second_modeled = modeled_direct_projection(
-        "shared-direct",
-        "second-direct",
-        "direct-v1",
-        second.clone(),
-        DirectModeledBinding::active("shared-direct"),
-    );
+    let [first_modeled, second_modeled] = modeled_group(vec![
+        (
+            "shared-direct",
+            "first-direct",
+            vec![first.clone()],
+            DirectModeledBinding::active("shared-direct"),
+        ),
+        (
+            "shared-direct",
+            "second-direct",
+            vec![second.clone()],
+            DirectModeledBinding::active("shared-direct"),
+        ),
+    ])
+    .try_into()
+    .unwrap_or_else(|_| unreachable!());
 
+    let epoch = first_modeled.epoch().as_str().to_owned();
+    assert_eq!(epoch, second_modeled.epoch().as_str());
     let surface = build_surface(&[first, second], &SurfaceOptions::sqlite())
         .unwrap()
         .with_projection_owners([SurfaceDirectProjection::new("shared-direct")
@@ -524,24 +568,22 @@ fn direct_modeled_owner_accepts_distinct_models_with_one_active_epoch() {
         owner.models,
         vec!["FirstDirectView".to_owned(), "SecondDirectView".to_owned()]
     );
-    assert_eq!(owner.change_epoch.as_deref(), Some("direct-v1"));
+    assert_eq!(owner.change_epoch.as_deref(), Some(epoch.as_str()));
 }
 
 #[test]
-fn direct_modeled_owner_rejects_same_epoch_with_incompatible_physical_topology() {
+fn direct_modeled_owner_rejects_incompatible_physical_topology() {
     let first = direct_model("FirstDirectView", "first_direct");
     let second = direct_model("SecondDirectView", "second_direct");
     let first_modeled = modeled_direct_projection(
         "shared-direct",
         "first-direct",
-        "direct-v1",
         first.clone(),
         DirectModeledBinding::active("first-direct-topology"),
     );
     let second_modeled = modeled_direct_projection(
         "shared-direct",
         "second-direct",
-        "direct-v1",
         second.clone(),
         DirectModeledBinding {
             topology_name: "second-direct-topology",
@@ -558,33 +600,34 @@ fn direct_modeled_owner_rejects_same_epoch_with_incompatible_physical_topology()
             .into()])
         .unwrap_err();
 
-    assert!(
-        error.contains("incompatible active physical topologies"),
-        "{error}"
-    );
+    // The topology is part of the derived epoch, so two topologies under one
+    // owner are refused as mixed epochs.
+    assert!(error.contains("mixed active change epochs"), "{error}");
 }
 
 #[test]
 fn direct_modeled_owner_rejects_same_epoch_with_incompatible_partition_protocol() {
     let first = direct_model("FirstDirectView", "first_direct");
     let second = direct_model("SecondDirectView", "second_direct");
-    let first_modeled = modeled_direct_projection(
-        "shared-direct",
-        "first-direct",
-        "direct-v1",
-        first.clone(),
-        DirectModeledBinding::active("shared-direct"),
-    );
-    let second_modeled = modeled_direct_projection(
-        "shared-direct",
-        "second-direct",
-        "direct-v1",
-        second.clone(),
-        DirectModeledBinding {
-            partition_codec: "alternate-projection-partition",
-            ..DirectModeledBinding::active("shared-direct")
-        },
-    );
+    let [first_modeled, second_modeled] = modeled_group(vec![
+        (
+            "shared-direct",
+            "first-direct",
+            vec![first.clone()],
+            DirectModeledBinding::active("shared-direct"),
+        ),
+        (
+            "shared-direct",
+            "second-direct",
+            vec![second.clone()],
+            DirectModeledBinding {
+                partition_codec: "alternate-projection-partition",
+                ..DirectModeledBinding::active("shared-direct")
+            },
+        ),
+    ])
+    .try_into()
+    .unwrap_or_else(|_| unreachable!());
 
     let error = build_surface(&[first, second], &SurfaceOptions::sqlite())
         .unwrap()
@@ -607,14 +650,12 @@ fn direct_modeled_owner_ignores_draining_epoch_and_topology_for_active_contract(
     let current_modeled = modeled_direct_projection(
         "shared-direct",
         "current-direct",
-        "direct-v2",
         current.clone(),
         DirectModeledBinding::active("current-direct-topology"),
     );
     let previous_modeled = modeled_direct_projection(
         "shared-direct",
         "previous-direct",
-        "direct-v1",
         previous.clone(),
         DirectModeledBinding {
             topology_digest: 2,
@@ -624,6 +665,7 @@ fn direct_modeled_owner_ignores_draining_epoch_and_topology_for_active_contract(
         },
     );
 
+    let epoch = current_modeled.epoch().as_str().to_owned();
     let surface = build_surface(&[current, previous], &SurfaceOptions::sqlite())
         .unwrap()
         .with_projection_owners([SurfaceDirectProjection::new("shared-direct")
@@ -635,7 +677,7 @@ fn direct_modeled_owner_ignores_draining_epoch_and_topology_for_active_contract(
     let [owner] = surface.projection_owners() else {
         panic!("one direct owner should be retained");
     };
-    assert_eq!(owner.change_epoch.as_deref(), Some("direct-v2"));
+    assert_eq!(owner.change_epoch.as_deref(), Some(epoch.as_str()));
 }
 
 #[cfg(feature = "graphql")]
@@ -645,7 +687,6 @@ fn query_protocol_uses_exact_modeled_physical_topology() {
     let modeled = modeled_direct_projection(
         "exact-modeled-owner",
         "exact-modeled-program",
-        "exact-modeled-v1",
         model.clone(),
         DirectModeledBinding {
             topology_digest: 0x2a,
@@ -684,7 +725,6 @@ fn query_protocol_rejects_modeled_binding_without_physical_topology() {
     let modeled = modeled_direct_projection(
         "missing-topology-owner",
         "missing-topology-program",
-        "missing-topology-v1",
         model.clone(),
         DirectModeledBinding {
             physical_topology: false,
@@ -711,7 +751,6 @@ fn query_protocol_rejects_multiple_active_modeled_physical_topologies() {
     let first_modeled = modeled_direct_projection(
         "shared-eventual",
         "first-eventual",
-        "shared-eventual-v1",
         first.clone(),
         DirectModeledBinding {
             eventual: true,
@@ -721,7 +760,6 @@ fn query_protocol_rejects_multiple_active_modeled_physical_topologies() {
     let second_modeled = modeled_direct_projection(
         "shared-eventual",
         "second-eventual",
-        "shared-eventual-v1",
         second.clone(),
         DirectModeledBinding {
             topology_name: "second-eventual-topology",
@@ -752,20 +790,22 @@ fn query_protocol_merges_compatible_active_models_without_inventing_static_parti
         dynamic_partition: true,
         ..DirectModeledBinding::active("shared-dynamic-topology")
     };
-    let first_modeled = modeled_direct_projection(
-        "shared-dynamic",
-        "first-dynamic",
-        "shared-dynamic-v1",
-        first.clone(),
-        DirectModeledBinding { ..options },
-    );
-    let second_modeled = modeled_direct_projection(
-        "shared-dynamic",
-        "second-dynamic",
-        "shared-dynamic-v1",
-        second.clone(),
-        options,
-    );
+    let [first_modeled, second_modeled] = modeled_group(vec![
+        (
+            "shared-dynamic",
+            "first-dynamic",
+            vec![first.clone()],
+            DirectModeledBinding { ..options },
+        ),
+        (
+            "shared-dynamic",
+            "second-dynamic",
+            vec![second.clone()],
+            options,
+        ),
+    ])
+    .try_into()
+    .unwrap_or_else(|_| unreachable!());
     let surface = build_surface(&[first, second], &SurfaceOptions::sqlite())
         .unwrap()
         .with_projectors([SurfaceProjector::new("shared-dynamic")
@@ -794,7 +834,6 @@ fn query_protocol_preserves_one_semantic_identity_for_each_fanout_model() {
     let modeled = modeled_projection_with_outputs(
         "fanout-owner",
         "fanout-program",
-        "fanout-v1",
         vec![first.clone(), second.clone()],
         DirectModeledBinding {
             eventual: true,

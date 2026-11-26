@@ -26,7 +26,6 @@ distributed::projection! {
     pub const BLOB_GAMES: ProjectionDescriptor<DirectCandidate> = {
         name: "project_blob",
         version: 1,
-        epoch: "e2e-ui-blob-v3",
         model: BlobGames,
         on {
             events: [

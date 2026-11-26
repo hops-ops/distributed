@@ -27,7 +27,6 @@ distributed::projection! {
     pub const CHAT_MESSAGES: ProjectionDescriptor<DirectCandidate> = {
         name: "project_chat_messages",
         version: 1,
-        epoch: "e2e-ui-chat-v2",
         model: ChatMessages,
         on {
             events: [ChatMessagePostedDomainEvent],

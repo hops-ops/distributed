@@ -44,7 +44,7 @@ readmodels/     schemas + grants
 
 ### Mounts (compose)
 
-Each fact is stated once. A projection's name, epoch and model come from its
+Each fact is stated once. A projection's name and model come from its
 `projection!` descriptor; a read model's permissions live next to it
 (`impl AuthorizedReadModel`); a module is generic over one `ServiceStores`
 bound; the application's modules are the Service's command namespaces.
@@ -109,7 +109,7 @@ version, source binding, catalog activation ceremony.
 fn todo_system() -> SystemSlice {
     SystemSlice::new()
         .commands([/* … */])
-        .projection(TODOS).eventual().epoch("todos-v2")
+        .projection(TODOS).eventual()
 }
 
 // deployables
@@ -206,7 +206,7 @@ Primary write path for apps remains GraphQL commands. HTTP command routes stay o
 
 | Today | Target |
 |--------|--------|
-| Done: projection mounts read name, epoch and model from the descriptor | `LocalProjectionMounts::builder(..).eventual(TODOS)` |
+| Done: projection mounts read name and model from the descriptor; epochs are derived | `LocalProjectionMounts::builder(..).eventual(TODOS)` |
 | Done: commands are `command!` declarations mounted with `.mount(..)` | — |
 | Done: one `ReadModels` list and one `ClientSurface` table feed engine and export | — |
 | Done: one host path over `SqlStores`; `with_bus` drains the outbox | `Runtime::from_env().role(Full).app(...).run()` (process roles) |

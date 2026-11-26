@@ -108,6 +108,24 @@ pub(crate) trait ProjectionProtocolStore: Send + Sync {
            + Send
            + 'a;
 
+    /// Delete everything stored for `topology`'s partitions (generations,
+    /// input cursors and receipts, records, observations, failures and the
+    /// change log) and every row of the tables it owns, in one transaction.
+    /// Its registration and table ownership stay, so the next commit creates
+    /// fresh partitions under the projection's current epoch. Returns the
+    /// number of partitions removed.
+    fn reset_projection<'a>(
+        &'a self,
+        topology: &'a ProjectorTopologyId,
+    ) -> impl Future<Output = Result<u64, ProjectionProtocolError>> + Send + 'a;
+
+    /// Every distinct change epoch stored on this topology's partitions,
+    /// sorted. Empty when it has no partition yet.
+    fn projection_change_epochs<'a>(
+        &'a self,
+        topology: &'a ProjectorTopologyId,
+    ) -> impl Future<Output = Result<Vec<ProjectionEpoch>, ProjectionProtocolError>> + Send + 'a;
+
     #[cfg_attr(not(test), allow(dead_code))]
     fn projection_observation<'a>(
         &'a self,

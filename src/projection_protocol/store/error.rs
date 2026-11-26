@@ -50,6 +50,40 @@ pub enum ProjectionProtocolError {
     PositionOverflow {
         domain: &'static str,
     },
+    /// Stored partitions keep the change epoch they were created with, and
+    /// these projections now derive another one because their program
+    /// changed. Found at startup, before any delivery, with every changed
+    /// projection listed.
+    ChangeEpochMismatch(Vec<ProjectionEpochMismatch>),
+}
+
+/// One projection whose stored partitions carry a change epoch its current
+/// program no longer derives.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProjectionEpochMismatch {
+    /// The projection's topology name.
+    pub projection: String,
+    /// The epoch the running program derives.
+    pub declared: ProjectionEpoch,
+    /// The other epochs stored on this projection's partitions.
+    pub stored: Vec<ProjectionEpoch>,
+}
+
+impl fmt::Display for ProjectionEpochMismatch {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let stored = self
+            .stored
+            .iter()
+            .map(|epoch| format!("`{}`", epoch.as_str()))
+            .collect::<Vec<_>>()
+            .join(", ");
+        write!(
+            formatter,
+            "`{}` derives `{}` but its stored partitions have {stored}",
+            self.projection,
+            self.declared.as_str()
+        )
+    }
 }
 
 impl fmt::Display for ProjectionProtocolError {
@@ -73,6 +107,16 @@ impl fmt::Display for ProjectionProtocolError {
             Self::RecreateRequiresTombstone { model } => write!(formatter, "projection record `{model}` can only be recreated from its exact tombstone revision"),
             Self::CausalWriteRequired { table } => write!(formatter, "table `{table}` is causal-owned and requires the projection commit path"),
             Self::PositionOverflow { domain } => write!(formatter, "{domain} position overflow"),
+            Self::ChangeEpochMismatch(mismatches) => {
+                formatter.write_str("projection programs changed since their partitions were built: ")?;
+                for (index, mismatch) in mismatches.iter().enumerate() {
+                    if index > 0 {
+                        formatter.write_str("; ")?;
+                    }
+                    write!(formatter, "{mismatch}")?;
+                }
+                formatter.write_str(". Stop the service, reset each listed projection (`SurfaceProjector::reset_projection`) and start again; a `source: aggregate_snapshot` projection can then be refilled with a snapshot rebuild")
+            }
         }
     }
 }

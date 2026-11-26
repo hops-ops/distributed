@@ -49,7 +49,6 @@ distributed::projection! {
     pub const PLAYER_STATS: ProjectionDescriptor<EventualOnly> = {
         name: "project_player_stats",
         version: 1,
-        epoch: "mobpit-player-stats-v1",
         model: PlayerStats,
         on {
             events: [CrawlerMobKilledDomainEvent],

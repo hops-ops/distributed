@@ -221,7 +221,7 @@ mod client_contract {
     }
     distributed::projection! {
         const REVIEWS: ProjectionDescriptor<EventualOnly> = {
-            name: "flat_reviews", version: 1, epoch: "flat-reviews-v1",
+            name: "flat_reviews", version: 1,
             model: FlatReviews, source: aggregate_snapshot,
             on { events: [ReviewStatusRecordedDomainEvent, ReviewArchivedDomainEvent], mutation: SaveFlatReview,
                 input: {review: body}, },
@@ -248,7 +248,7 @@ mod client_contract {
 
     distributed::projection! {
         const MEMBERS: ProjectionDescriptor<EventualOnly> = {
-            name: "flat_members", version: 1, epoch: "flat-members-v1",
+            name: "flat_members", version: 1,
             model: FlatMembers, source: aggregate_snapshot,
             on { events: [ReviewMemberRemovedDomainEvent], mutation: DeleteFlatMember,
                 input: {member: body}, },

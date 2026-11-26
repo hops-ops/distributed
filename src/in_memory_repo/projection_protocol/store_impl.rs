@@ -775,6 +775,87 @@ impl ProjectionProtocolStore for InMemoryRepository {
         }
     }
 
+    fn reset_projection<'a>(
+        &'a self,
+        topology: &'a ProjectorTopologyId,
+    ) -> impl Future<Output = Result<u64, ProjectionProtocolError>> + Send + 'a {
+        async move {
+            // Same lock order as commits: rows, then protocol.
+            let mut rows = self
+                .model_store
+                .relational_rows
+                .write()
+                .map_err(|_| RepositoryError::LockPoisoned("projection reset rows"))?;
+            let mut protocol = self
+                .projection_protocol
+                .write()
+                .map_err(|_| RepositoryError::LockPoisoned("projection reset"))?;
+            let tables = protocol
+                .registered_models
+                .iter()
+                .filter(|(key, _)| &key.topology == topology)
+                .map(|(_, table)| format!("{table}:"))
+                .collect::<Vec<_>>();
+            rows.retain(|key, _| !tables.iter().any(|table| key.starts_with(table)));
+            let before = protocol.partitions.len();
+            protocol
+                .partitions
+                .retain(|key, _| &key.topology != topology);
+            let removed = (before - protocol.partitions.len()) as u64;
+            protocol
+                .generations
+                .retain(|key, _| &key.partition.topology != topology);
+            protocol
+                .inputs
+                .retain(|key, _| &key.partition.topology != topology);
+            protocol
+                .input_identities
+                .retain(|key, _| &key.partition.topology != topology);
+            protocol.messages.retain(|key, _| &key.topology != topology);
+            protocol
+                .applied_receipts
+                .retain(|key, _| &key.partition.topology != topology);
+            protocol
+                .ownership
+                .retain(|key, _| &key.partition.topology != topology);
+            protocol
+                .gap_free_capabilities
+                .retain(|key, _| &key.partition.topology != topology);
+            protocol
+                .records
+                .retain(|scope, _| scope.topology() != topology);
+            protocol
+                .observations
+                .retain(|key, _| key.scope.topology() != topology);
+            protocol
+                .failures
+                .retain(|_, failure| failure.input.topology() != topology);
+            Ok(removed)
+        }
+    }
+
+    fn projection_change_epochs<'a>(
+        &'a self,
+        topology: &'a ProjectorTopologyId,
+    ) -> impl Future<Output = Result<Vec<ProjectionEpoch>, ProjectionProtocolError>> + Send + 'a
+    {
+        async move {
+            let protocol = self
+                .projection_protocol
+                .read()
+                .map_err(|_| RepositoryError::LockPoisoned("projection change epochs read"))?;
+            let mut epochs = protocol
+                .partitions
+                .iter()
+                .filter(|(key, _)| &key.topology == topology)
+                .map(|(_, partition)| partition.change_epoch.clone())
+                .collect::<Vec<_>>();
+            epochs.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+            epochs.dedup();
+            Ok(epochs)
+        }
+    }
+
     fn projection_observation<'a>(
         &'a self,
         causation_id: &'a str,

@@ -587,3 +587,121 @@ where
         .map_err(|error| protocol_storage_error::<DB>("verify projection generation", error))?
         .is_some())
 }
+
+/// Every distinct change epoch stored on `topology`'s partitions, sorted.
+pub(super) async fn load_change_epochs<DB>(
+    pool: &Pool<DB>,
+    topology: &ProjectorTopologyId,
+) -> Result<Vec<ProjectionEpoch>, ProjectionProtocolError>
+where
+    DB: SqlxRepoBackend,
+    for<'c> &'c Pool<DB>: Executor<'c, Database = DB>,
+    DB::Arguments: IntoArguments<DB>,
+    for<'q> String: Type<DB> + sqlx::Decode<'q, DB>,
+    for<'q> Vec<u8>: Type<DB> + sqlx::Decode<'q, DB>,
+    for<'q> &'q [u8]: Encode<'q, DB> + Type<DB>,
+    for<'r> &'r str: sqlx::ColumnIndex<DB::Row>,
+{
+    let topology_hash = topology.digest();
+    let mut builder = QueryBuilder::<DB>::new(
+        "SELECT DISTINCT topology_bytes, change_epoch FROM projection_partitions \
+         WHERE topology_hash = ",
+    );
+    builder.push_bind(topology_hash.as_slice());
+    builder.push(" ORDER BY change_epoch");
+    let rows =
+        builder.build().fetch_all(pool).await.map_err(|error| {
+            protocol_storage_error::<DB>("load projection change epochs", error)
+        })?;
+    let mut epochs = Vec::with_capacity(rows.len());
+    for row in rows {
+        let topology_bytes: Vec<u8> = row.try_get("topology_bytes").map_err(|error| {
+            protocol_storage_error::<DB>("decode projection topology bytes", error)
+        })?;
+        verify_bytes(
+            &topology_bytes,
+            &topology.canonical_bytes(),
+            "projector topology",
+        )?;
+        let change_epoch: String = row.try_get("change_epoch").map_err(|error| {
+            protocol_storage_error::<DB>("decode projection change epoch", error)
+        })?;
+        epochs.push(ProjectionEpoch::new(change_epoch)?);
+    }
+    Ok(epochs)
+}
+
+/// Child tables first, so every foreign key is satisfied at each step.
+const RESET_PROJECTION_TABLES: [&str; 12] = [
+    "projection_input_delivery_aliases",
+    "projection_input_receipts",
+    "projection_input_cursors",
+    "projection_input_identities",
+    "projection_records",
+    "projection_observations",
+    "projection_failures",
+    "projection_changes",
+    "projection_source_capabilities",
+    "projection_model_ownership",
+    "projection_generations",
+    "projection_partitions",
+];
+
+/// Delete `topology`'s protocol state and the rows of its owned tables in one
+/// transaction. Returns the number of partitions removed.
+pub(super) async fn reset_projection_in_pool<DB>(
+    pool: &Pool<DB>,
+    topology: &ProjectorTopologyId,
+) -> Result<u64, ProjectionProtocolError>
+where
+    DB: SqlxRepoBackend,
+    for<'c> &'c mut DB::Connection: Executor<'c, Database = DB>,
+    DB::Arguments: IntoArguments<DB>,
+    for<'q> String: Type<DB> + sqlx::Decode<'q, DB>,
+    for<'q> &'q [u8]: Encode<'q, DB> + Type<DB>,
+    for<'r> &'r str: sqlx::ColumnIndex<DB::Row>,
+{
+    let topology_hash = topology.digest();
+    let mut tx = pool
+        .begin()
+        .await
+        .map_err(|error| protocol_storage_error::<DB>("begin projection reset", error))?;
+    let mut owned = QueryBuilder::<DB>::new(
+        "SELECT table_name FROM projection_registered_models WHERE topology_hash = ",
+    );
+    owned.push_bind(topology_hash.as_slice());
+    let tables = owned
+        .build()
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(|error| protocol_storage_error::<DB>("load projection owned tables", error))?
+        .into_iter()
+        .map(|row| row.try_get::<String, _>("table_name"))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| protocol_storage_error::<DB>("decode projection owned table", error))?;
+    for table in &tables {
+        QueryBuilder::<DB>::new(format!("DELETE FROM {}", quote_identifier(table)))
+            .build()
+            .execute(&mut *tx)
+            .await
+            .map_err(|error| protocol_storage_error::<DB>("delete projection owned rows", error))?;
+    }
+    let mut removed = 0;
+    for table in RESET_PROJECTION_TABLES {
+        let mut delete =
+            QueryBuilder::<DB>::new(format!("DELETE FROM {table} WHERE topology_hash = "));
+        delete.push_bind(topology_hash.as_slice());
+        let result = delete
+            .build()
+            .execute(&mut *tx)
+            .await
+            .map_err(|error| protocol_storage_error::<DB>("reset projection state", error))?;
+        if table == "projection_partitions" {
+            removed = DB::rows_affected(&result);
+        }
+    }
+    tx.commit()
+        .await
+        .map_err(|error| protocol_storage_error::<DB>("commit projection reset", error))?;
+    Ok(removed)
+}

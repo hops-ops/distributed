@@ -520,6 +520,49 @@ impl ProjectionEpoch {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    /// The epoch of a modeled projection: its compiled program's identity.
+    /// A changed program is a new epoch, so its stored partitions no longer
+    /// match and the service refuses to start until the projection is rebuilt.
+    pub fn for_program(program: &crate::ProjectionProgramId) -> Self {
+        Self(program.to_string())
+    }
+
+    /// The epoch of a modeled projection's partitions: a digest of their
+    /// physical topology and the sorted identities of every program writing
+    /// them. Changing any program is a new epoch; a binding change that keeps
+    /// the topology and programs is the same projection.
+    pub fn for_partition(
+        topology: &ProjectorTopologyId,
+        programs: &[crate::ProjectionProgramId],
+    ) -> Self {
+        use sha2::{Digest, Sha256};
+        let mut sorted = programs.to_vec();
+        sorted.sort_by_key(|program| *program.as_bytes());
+        sorted.dedup();
+        let mut digest = Sha256::new();
+        digest.update(b"distributed.projection.change-epoch.v1");
+        digest.update(topology.digest());
+        for program in &sorted {
+            digest.update(program.as_bytes());
+        }
+        let mut epoch = String::from("pe1:sha256:");
+        for byte in digest.finalize() {
+            epoch.push_str(&format!("{byte:02x}"));
+        }
+        Self(epoch)
+    }
+
+    /// The epoch of a projector whose output comes from handler code: its
+    /// topology, which already keys its partitions. It never changes for an
+    /// existing partition, so it never refuses.
+    pub fn for_topology(topology: &ProjectorTopologyId) -> Self {
+        let mut epoch = String::from("topology:");
+        for byte in topology.digest() {
+            epoch.push_str(&format!("{byte:02x}"));
+        }
+        Self(epoch)
+    }
 }
 
 impl Serialize for ProjectionEpoch {

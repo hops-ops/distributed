@@ -9,8 +9,8 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
-use crate::projection_protocol::canonical_projection_topology_bytes;
 pub use crate::projection_protocol::ProjectionEpoch;
+use crate::projection_protocol::{canonical_projection_topology_bytes, ProjectorTopologyId};
 
 use super::placement::{
     ProjectionBinding, ProjectionBindingId, ProjectionBindingState, ProjectionEventSchema,
@@ -137,18 +137,20 @@ impl ProjectionBindingActivation {
     /// Construct one exact activation candidate.
     ///
     /// `None` is accepted as input so service construction can report a typed
-    /// missing-route error before any executor starts.
+    /// missing-route error before any executor starts. The change epoch is
+    /// derived, never declared: [`ProjectionCatalog::activate`] sets it from
+    /// the programs of every activation sharing this binding's physical
+    /// topology, so a changed program is a new epoch.
     pub fn new(
         binding_id: ProjectionBindingId,
         program_id: ProjectionProgramId,
-        epoch: ProjectionEpoch,
         state: ProjectionBindingState,
         route: Option<ProjectionExecutorRoute>,
     ) -> Self {
         Self {
             binding_id,
             program_id,
-            epoch,
+            epoch: ProjectionEpoch::for_program(&program_id),
             state,
             route,
         }
@@ -206,6 +208,7 @@ impl ActiveProjectionBindings {
         }
         validate_primary_binding_uniqueness(catalog, &activations)?;
         validate_authoritative_writers(catalog, &activations)?;
+        derive_partition_epochs(catalog, &mut activations)?;
         if let Some((previous_catalog, previous_bindings)) = previous {
             validate_epoch_takeover(
                 catalog,
@@ -694,6 +697,48 @@ fn validate_authoritative_writers(
     Ok(())
 }
 
+/// Live activations (active or draining) sharing one physical topology write
+/// the same partitions, so they share one change epoch: the digest of that
+/// topology and their programs.
+fn derive_partition_epochs(
+    catalog: &ProjectionCatalog,
+    activations: &mut [ProjectionBindingActivation],
+) -> Result<(), ProjectionCatalogError> {
+    let mut topologies = Vec::with_capacity(activations.len());
+    for activation in activations.iter() {
+        let binding = catalog.binding(activation.binding_id).ok_or(
+            ProjectionCatalogError::UnknownBinding {
+                binding: activation.binding_id,
+            },
+        )?;
+        topologies.push(
+            binding
+                .physical_topology()
+                .map(|physical| {
+                    ProjectorTopologyId::new(physical.version(), physical.name(), physical.digest())
+                })
+                .transpose()
+                .map_err(|error| ProjectionCatalogError::Canonical(error.to_string()))?,
+        );
+    }
+    let epochs = (0..activations.len())
+        .map(|index| {
+            let Some(topology) = &topologies[index] else {
+                return ProjectionEpoch::for_program(&activations[index].program_id);
+            };
+            let programs = (0..activations.len())
+                .filter(|other| topologies[*other].as_ref() == Some(topology))
+                .map(|other| activations[other].program_id)
+                .collect::<Vec<_>>();
+            ProjectionEpoch::for_partition(topology, &programs)
+        })
+        .collect::<Vec<_>>();
+    for (activation, epoch) in activations.iter_mut().zip(epochs) {
+        activation.epoch = epoch;
+    }
+    Ok(())
+}
+
 fn validate_epoch_takeover(
     catalog: &ProjectionCatalog,
     activations: &[ProjectionBindingActivation],
@@ -894,7 +939,6 @@ mod tests {
         ProjectionDescriptor::new(
             "project_todos",
             1,
-            "todos-v1",
             || {
                 static PROGRAM: crate::projection::lower::ProjectionProgramCell =
                     crate::projection::lower::ProjectionProgramCell::new();
@@ -1057,6 +1101,15 @@ mod tests {
         owner: &str,
         execution_class: ProjectionExecutionClass,
     ) -> ProjectionBinding {
+        eventual_on(program, owner, execution_class, [0x44; 32])
+    }
+
+    fn eventual_on(
+        program: &ProjectionProgram,
+        owner: &str,
+        execution_class: ProjectionExecutionClass,
+        topology_digest: [u8; 32],
+    ) -> ProjectionBinding {
         ProjectionBinding::from_eventual_program(
             program,
             ProjectionSourceBinding::try_new("todo-domain", "ordered-domain-events", 1).unwrap(),
@@ -1067,7 +1120,7 @@ mod tests {
             vec![ProjectionOutput::try_new("Todos", "todos", todo_schema("todos")).unwrap()],
             vec![],
             Some(ProjectionPhysicalTopology::from_protocol(
-                &ProjectorTopologyId::new(1, "project_todos", [0x44; 32]).unwrap(),
+                &ProjectorTopologyId::new(1, "project_todos", topology_digest).unwrap(),
             )),
         )
         .unwrap()
@@ -1205,17 +1258,10 @@ mod tests {
 
     fn activation(
         binding: &ProjectionBinding,
-        epoch: &str,
         state: ProjectionBindingState,
         route: Option<ProjectionExecutorRoute>,
     ) -> ProjectionBindingActivation {
-        ProjectionBindingActivation::new(
-            binding.id(),
-            binding.program_id(),
-            ProjectionEpoch::new(epoch).unwrap(),
-            state,
-            route,
-        )
+        ProjectionBindingActivation::new(binding.id(), binding.program_id(), state, route)
     }
 
     #[test]
@@ -1312,7 +1358,7 @@ mod tests {
     }
 
     #[test]
-    fn route_relocation_and_epoch_rotation_leave_both_static_identities_stable() {
+    fn route_relocation_keeps_both_static_identities_and_the_epoch() {
         let program = program("project_todos", FINGERPRINT_A);
         let binding = eventual(&program, "todo-reads", ProjectionExecutionClass::Causal);
         let catalog = ProjectionCatalog::try_new(vec![binding.clone()]).unwrap();
@@ -1320,7 +1366,6 @@ mod tests {
             .activate(
                 vec![activation(
                     &binding,
-                    "todos-v1",
                     ProjectionBindingState::Active,
                     Some(ProjectionExecutorRoute::local("todo-api").unwrap()),
                 )],
@@ -1331,31 +1376,20 @@ mod tests {
             .activate(
                 vec![activation(
                     &binding,
-                    "todos-v1",
                     ProjectionBindingState::Active,
                     Some(ProjectionExecutorRoute::remote("todo-projector").unwrap()),
                 )],
                 Some((&catalog, &local)),
             )
             .unwrap();
-        let rotated = catalog
-            .activate(
-                vec![activation(
-                    &binding,
-                    "todos-v2",
-                    ProjectionBindingState::Active,
-                    Some(ProjectionExecutorRoute::remote("todo-projector").unwrap()),
-                )],
-                Some((&catalog, &remote)),
-            )
-            .unwrap();
 
         assert_eq!(binding.program_id(), program.id());
         assert_eq!(local.bindings()[0].binding_id(), binding.id());
         assert_eq!(remote.bindings()[0].binding_id(), binding.id());
-        assert_eq!(rotated.bindings()[0].binding_id(), binding.id());
         assert_ne!(local.bindings()[0].route(), remote.bindings()[0].route());
-        assert_ne!(remote.bindings()[0].epoch(), rotated.bindings()[0].epoch());
+        // The epoch is derived from topology and program, so a route change
+        // keeps the stored partitions.
+        assert_eq!(local.bindings()[0].epoch(), remote.bindings()[0].epoch());
     }
 
     #[test]
@@ -1385,18 +1419,17 @@ mod tests {
             ProjectionExecutionClass::Causal,
         );
         let catalog = ProjectionCatalog::try_new(vec![binding.clone()]).unwrap();
-        let epoch = ProjectionEpoch::new("todos-v1").unwrap();
         let active = catalog
             .activate(
                 vec![activation(
                     &binding,
-                    epoch.as_str(),
                     ProjectionBindingState::Active,
                     Some(ProjectionExecutorRoute::remote("todo-projector").unwrap()),
                 )],
                 None,
             )
             .unwrap();
+        let epoch = active.bindings()[0].epoch().clone();
 
         assert!(active.is_live(&catalog, binding.id(), binding.program_id(), &epoch));
         assert!(active.is_causally_eligible(&catalog, binding.id(), binding.program_id(), &epoch));
@@ -1418,7 +1451,6 @@ mod tests {
             .activate(
                 vec![activation(
                     &binding,
-                    "todos-v1",
                     ProjectionBindingState::Active,
                     Some(ProjectionExecutorRoute::remote("todo-projector").unwrap()),
                 )],
@@ -1446,18 +1478,17 @@ mod tests {
             ProjectionExecutionClass::Background,
         );
         let catalog = ProjectionCatalog::try_new(vec![binding.clone()]).unwrap();
-        let epoch = ProjectionEpoch::new("analytics-v1").unwrap();
         let active = catalog
             .activate(
                 vec![activation(
                     &binding,
-                    epoch.as_str(),
                     ProjectionBindingState::Active,
                     Some(ProjectionExecutorRoute::remote("analytics").unwrap()),
                 )],
                 None,
             )
             .unwrap();
+        let epoch = active.bindings()[0].epoch().clone();
 
         assert!(active.is_live(&catalog, binding.id(), binding.program_id(), &epoch));
         assert!(!active.is_causally_eligible(&catalog, binding.id(), binding.program_id(), &epoch));
@@ -1472,7 +1503,6 @@ mod tests {
             .activate(
                 vec![activation(
                     &binding,
-                    "todos-v7",
                     ProjectionBindingState::Active,
                     Some(ProjectionExecutorRoute::local("todo-api").unwrap()),
                 )],
@@ -1490,7 +1520,8 @@ mod tests {
             pins.operation_semantics_version(),
             PROJECTION_OPERATION_SEMANTICS_VERSION
         );
-        assert_eq!(pins.epoch().as_str(), "todos-v7");
+        assert_eq!(pins.epoch(), active.bindings()[0].epoch());
+        assert!(pins.epoch().as_str().starts_with("pe1:sha256:"));
     }
 
     #[test]
@@ -1504,13 +1535,11 @@ mod tests {
                 vec![
                     activation(
                         &first,
-                        "todos-v1",
                         ProjectionBindingState::Active,
                         Some(ProjectionExecutorRoute::local("worker-a").unwrap()),
                     ),
                     activation(
                         &second,
-                        "todos-v2",
                         ProjectionBindingState::Active,
                         Some(ProjectionExecutorRoute::remote("worker-b").unwrap()),
                     ),
@@ -1607,13 +1636,11 @@ mod tests {
                 vec![
                     activation(
                         &first,
-                        "ops-v1",
                         ProjectionBindingState::Active,
                         Some(ProjectionExecutorRoute::local("ops").unwrap()),
                     ),
                     activation(
                         &second,
-                        "analytics-v1",
                         ProjectionBindingState::Active,
                         Some(ProjectionExecutorRoute::local("analytics").unwrap()),
                     ),
@@ -1634,13 +1661,11 @@ mod tests {
                 vec![
                     activation(
                         &eventual,
-                        "todos-v1",
                         ProjectionBindingState::Active,
                         Some(ProjectionExecutorRoute::remote("todo-projector").unwrap()),
                     ),
                     activation(
                         &direct,
-                        "todos-v2",
                         ProjectionBindingState::Active,
                         Some(ProjectionExecutorRoute::local("todo-api").unwrap()),
                     ),
@@ -1681,13 +1706,11 @@ mod tests {
                 vec![
                     activation(
                         &first,
-                        "todos-v1",
                         ProjectionBindingState::Active,
                         Some(ProjectionExecutorRoute::local("worker-a").unwrap()),
                     ),
                     activation(
                         &second,
-                        "todos-v2",
                         ProjectionBindingState::Active,
                         Some(ProjectionExecutorRoute::remote("worker-b").unwrap()),
                     ),
@@ -1709,12 +1732,7 @@ mod tests {
         let catalog = ProjectionCatalog::try_new(vec![binding.clone()]).unwrap();
         let error = catalog
             .activate(
-                vec![activation(
-                    &binding,
-                    "todos-v1",
-                    ProjectionBindingState::Active,
-                    None,
-                )],
+                vec![activation(&binding, ProjectionBindingState::Active, None)],
                 None,
             )
             .unwrap_err();
@@ -1730,7 +1748,6 @@ mod tests {
             .activate(
                 vec![activation(
                     &binding,
-                    "todos-v1",
                     ProjectionBindingState::Active,
                     Some(ProjectionExecutorRoute::remote("other-service").unwrap()),
                 )],
@@ -1802,7 +1819,6 @@ mod tests {
             .activate(
                 vec![activation(
                     &previous_binding,
-                    "todos-rebuild-1",
                     ProjectionBindingState::Active,
                     Some(ProjectionExecutorRoute::remote("projector-v1").unwrap()),
                 )],
@@ -1815,7 +1831,6 @@ mod tests {
             .activate(
                 vec![activation(
                     &next_binding,
-                    "todos-rebuild-1",
                     ProjectionBindingState::Active,
                     Some(ProjectionExecutorRoute::remote("projector-v2").unwrap()),
                 )],
@@ -1830,7 +1845,7 @@ mod tests {
     }
 
     #[test]
-    fn semantic_program_replacement_requires_epoch_rotation_before_replay() {
+    fn semantic_program_replacement_is_a_new_epoch() {
         let previous_program = program_with_kind_and_partition(
             "project_todos",
             FINGERPRINT_A,
@@ -1873,7 +1888,6 @@ mod tests {
             .activate(
                 vec![activation(
                     &previous_binding,
-                    "todos-rebuild-1",
                     ProjectionBindingState::Active,
                     Some(ProjectionExecutorRoute::remote("projector-v1").unwrap()),
                 )],
@@ -1882,39 +1896,29 @@ mod tests {
             .unwrap();
         let replacement_catalog =
             ProjectionCatalog::try_new(vec![replacement_binding.clone()]).unwrap();
-        let same_epoch = replacement_catalog
+        let replaced = replacement_catalog
             .activate(
                 vec![activation(
                     &replacement_binding,
-                    "todos-rebuild-1",
-                    ProjectionBindingState::Active,
-                    Some(ProjectionExecutorRoute::remote("projector-v2").unwrap()),
-                )],
-                Some((&previous_catalog, &previous_active)),
-            )
-            .unwrap_err();
-        assert!(matches!(
-            same_epoch,
-            ProjectionCatalogError::SameEpochTakeover { .. }
-        ));
-
-        let rotated = replacement_catalog
-            .activate(
-                vec![activation(
-                    &replacement_binding,
-                    "todos-rebuild-2",
                     ProjectionBindingState::Active,
                     Some(ProjectionExecutorRoute::remote("projector-v2").unwrap()),
                 )],
                 Some((&previous_catalog, &previous_active)),
             )
             .unwrap();
-        assert_eq!(rotated.bindings()[0].program_id(), replacement_program.id());
-        assert_eq!(rotated.bindings()[0].epoch().as_str(), "todos-rebuild-2");
+        assert_eq!(
+            replaced.bindings()[0].program_id(),
+            replacement_program.id()
+        );
+        assert_ne!(
+            replaced.bindings()[0].epoch(),
+            previous_active.bindings()[0].epoch(),
+            "a changed program over the same partitions is a new epoch"
+        );
     }
 
     #[test]
-    fn new_epoch_allows_rollout_then_draining_stops_new_obligations() {
+    fn new_topology_allows_rollout_then_draining_stops_new_obligations() {
         let program = program("project_todos", FINGERPRINT_A);
         let previous_binding =
             eventual(&program, "todo-reads-v1", ProjectionExecutionClass::Causal);
@@ -1923,20 +1927,25 @@ mod tests {
             .activate(
                 vec![activation(
                     &previous_binding,
-                    "todos-rebuild-1",
                     ProjectionBindingState::Active,
                     Some(ProjectionExecutorRoute::remote("projector-v1").unwrap()),
                 )],
                 None,
             )
             .unwrap();
-        let next_binding = eventual(&program, "todo-reads-v2", ProjectionExecutionClass::Causal);
+        // A new owner over the same program needs new partitions: a new
+        // physical topology, which is a new epoch.
+        let next_binding = eventual_on(
+            &program,
+            "todo-reads-v2",
+            ProjectionExecutionClass::Causal,
+            [0x45; 32],
+        );
         let next_catalog = ProjectionCatalog::try_new(vec![next_binding.clone()]).unwrap();
         let next_active = next_catalog
             .activate(
                 vec![activation(
                     &next_binding,
-                    "todos-rebuild-2",
                     ProjectionBindingState::Active,
                     Some(ProjectionExecutorRoute::remote("projector-v2").unwrap()),
                 )],
@@ -1947,26 +1956,25 @@ mod tests {
             .activate(
                 vec![activation(
                     &next_binding,
-                    "todos-rebuild-2",
                     ProjectionBindingState::Draining,
                     Some(ProjectionExecutorRoute::remote("projector-v2").unwrap()),
                 )],
                 Some((&next_catalog, &next_active)),
             )
             .unwrap();
-        let epoch = ProjectionEpoch::new("todos-rebuild-2").unwrap();
+        let epoch = draining.bindings()[0].epoch().clone();
         let rolled_back = previous_catalog
             .activate(
                 vec![activation(
                     &previous_binding,
-                    "todos-rebuild-1",
                     ProjectionBindingState::Active,
                     Some(ProjectionExecutorRoute::remote("projector-v1").unwrap()),
                 )],
                 Some((&next_catalog, &draining)),
             )
             .unwrap();
-        let previous_epoch = ProjectionEpoch::new("todos-rebuild-1").unwrap();
+        let previous_epoch = rolled_back.bindings()[0].epoch().clone();
+        assert_ne!(epoch, previous_epoch);
 
         assert!(draining.is_live(
             &next_catalog,
@@ -2039,13 +2047,11 @@ mod tests {
         let catalog = ProjectionCatalog::try_new(vec![first.clone(), second.clone()]).unwrap();
         let first_activation = activation(
             &first,
-            "todos-v1",
             ProjectionBindingState::Active,
             Some(ProjectionExecutorRoute::local("todo-api").unwrap()),
         );
         let second_activation = activation(
             &second,
-            "archive-v1",
             ProjectionBindingState::Active,
             Some(ProjectionExecutorRoute::remote("archive-projector").unwrap()),
         );

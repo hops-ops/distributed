@@ -13,20 +13,20 @@ fn SaveDerived() -> crate::Mutation<()> {
 use crate::projection::lower::{EventualOnly, ProjectionDescriptor};
 crate::projection! {
     const DERIVED_ROWS: ProjectionDescriptor<EventualOnly> = {
-        name: "derived-rows", version: 1, epoch: "derived-v1", model: DerivedRows,
+        name: "derived-rows", version: 1, model: DerivedRows,
         on { events: [Indexed], mutation: SaveDerived, input: { row: body }, },
     };
 }
 crate::projection! {
     const SNAPSHOT_ROWS: ProjectionDescriptor<EventualOnly> = {
-        name: "derived-snapshot-rejection", version: 1, epoch: "snapshot-v1", model: DerivedRows,
+        name: "derived-snapshot-rejection", version: 1, model: DerivedRows,
         source: aggregate_snapshot,
         on { events: [Indexed], mutation: SaveDerived, input: { row: body }, },
     };
 }
 crate::projection! {
     const EXTERNAL_ROWS: ProjectionDescriptor<EventualOnly> = {
-        name: "external-source-rows", version: 1, epoch: "external-v1", model: DerivedRows,
+        name: "external-source-rows", version: 1, model: DerivedRows,
         source: external_snapshot,
         on { events: [Indexed], mutation: SaveDerived, input: { row: body }, },
     };

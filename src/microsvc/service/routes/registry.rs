@@ -738,10 +738,12 @@ where
 
     fn bootstrap_projectors(&self) -> ProjectorBootstrapFuture<'_> {
         Box::pin(async move {
+            let mut mismatches = Vec::new();
             for projector in &self.projectors {
                 projector.bootstrap(&self.dependencies).await?;
+                mismatches.extend(projector.epoch_mismatch(&self.dependencies).await?);
             }
-            Ok(())
+            Ok(mismatches)
         })
     }
 

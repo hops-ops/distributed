@@ -330,19 +330,12 @@ impl ResolvedDirectProjectionTarget {
     pub(crate) fn validate_modeled_owner(
         &self,
         projection_name: &str,
-        projection_epoch: &str,
         program_id: ProjectionProgramId,
     ) -> Result<(), ProjectionProtocolError> {
         if self.codec.topology().name() != projection_name {
             return Err(ProjectionProtocolError::InvalidBatch(format!(
                 "modeled direct projection `{projection_name}` does not match compiled owner `{}`",
                 self.codec.topology().name()
-            )));
-        }
-        if self.change_epoch.as_str() != projection_epoch {
-            return Err(ProjectionProtocolError::InvalidBatch(format!(
-                "modeled direct projection epoch `{projection_epoch}` does not match compiled owner epoch `{}`",
-                self.change_epoch.as_str()
             )));
         }
         match self.modeled_program_id {

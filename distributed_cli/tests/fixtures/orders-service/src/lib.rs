@@ -158,8 +158,7 @@ pub fn distributed_client_surface() -> DistributedClientSurfaceExport {
         .expect("fixture typed service should bind")
         .with_projectors([SurfaceProjector::new("project_orders")
             .facts(["order.projected"])
-            .models(["OrderView"])
-            .change_epoch("orders-v1")])
+            .models(["OrderView"])])
         .expect("fixture projector should bind");
     let grants = std::collections::BTreeMap::from([(
         "OrderView".to_string(),

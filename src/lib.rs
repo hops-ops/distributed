@@ -129,7 +129,6 @@ pub use mutation::{
 ///     pub const TODOS: ProjectionDescriptor<EventualOnly> = {
 ///         name: "project_todos",
 ///         version: 1,
-///         epoch: "e2e-ui-todos-v2",
 ///         model: Todos,
 ///         on {
 ///             events: [
@@ -157,7 +156,6 @@ macro_rules! projection {
         $vis:vis const $id:ident : $desc_ty:ty = {
             name: $name:literal,
             version: $version:expr,
-            epoch: $epoch:literal,
             model: $model:ty,
             $(source: $source:ident,)?
             $(
@@ -206,7 +204,7 @@ macro_rules! projection {
                     Ok(program)
                 })
             }
-            $crate::__projection_descriptor!($name, $version, $epoch, $model, __program)
+            $crate::__projection_descriptor!($name, $version, $model, __program)
         };
     };
 
@@ -216,7 +214,6 @@ macro_rules! projection {
         $vis:vis const $id:ident : $desc_ty:ty = {
             name: $name:literal,
             version: $version:expr,
-            epoch: $epoch:literal,
             model: $model:ty,
             program: $program:path $(,)?
         } $(;)?
@@ -230,7 +227,7 @@ macro_rules! projection {
                     $crate::projection::lower::ProjectionProgramCell::new();
                 PROGRAM.get_or_build($program)
             }
-            $crate::__projection_descriptor!($name, $version, $epoch, $model, __program)
+            $crate::__projection_descriptor!($name, $version, $model, __program)
         };
     };
 }
@@ -239,7 +236,7 @@ macro_rules! projection {
 #[doc(hidden)]
 #[macro_export]
 macro_rules! __projection_descriptor {
-    ($name:expr, $version:expr, $epoch:expr, $model:ty, $program:ident) => {{
+    ($name:expr, $version:expr, $model:ty, $program:ident) => {{
         fn __lower(
             plan: &$crate::ResolvedProjectionPlan,
         ) -> ::core::result::Result<
@@ -257,7 +254,6 @@ macro_rules! __projection_descriptor {
         $crate::projection::lower::ProjectionDescriptor::new(
             $name,
             $version,
-            $epoch,
             $program,
             __lower,
             __inventory,

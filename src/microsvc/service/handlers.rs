@@ -23,8 +23,19 @@ use crate::read_model::RelationalReadModel;
 pub(super) type GuardFn<D> = dyn Fn(&Context<D>) -> bool + Send + Sync;
 pub(super) type HandlerFuture<'a> =
     Pin<Box<dyn Future<Output = Result<Value, HandlerError>> + Send + 'a>>;
-pub(super) type ProjectorBootstrapFuture<'a> =
-    Pin<Box<dyn Future<Output = Result<(), HandlerError>> + Send + 'a>>;
+/// Bootstraps a bundle's projectors and returns the ones whose declared
+/// change epoch differs from their stored partitions.
+pub(super) type ProjectorBootstrapFuture<'a> = Pin<
+    Box<
+        dyn Future<
+                Output = Result<
+                    Vec<crate::projection_protocol::ProjectionEpochMismatch>,
+                    HandlerError,
+                >,
+            > + Send
+            + 'a,
+    >,
+>;
 pub(super) type HandlerFn<D> =
     dyn for<'a> Fn(&'a Context<'a, D>) -> HandlerFuture<'a> + Send + Sync;
 

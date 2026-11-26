@@ -39,7 +39,6 @@ subscription WatchFilteredRows {
 const EMBEDDED_SERVICE_ID: &str = "embedded-query-protocol-fixture";
 const EMBEDDED_FACT_NAME: &str = "query_protocol.embedded_item_changed";
 const EMBEDDED_PROJECTOR_NAME: &str = "project_embedded_query_protocol_items";
-const EMBEDDED_CHANGE_EPOCH: &str = "embedded-query-protocol-items-v1";
 
 #[derive(Clone, Debug, Deserialize)]
 struct ItemChanged {
@@ -83,14 +82,12 @@ fn projector() -> SurfaceProjector {
     SurfaceProjector::new(PROJECTOR_NAME)
         .facts([FACT_NAME])
         .models(["CausalQueryView"])
-        .change_epoch(CHANGE_EPOCH)
 }
 
 fn embedded_projector() -> SurfaceProjector {
     SurfaceProjector::new(EMBEDDED_PROJECTOR_NAME)
         .facts([EMBEDDED_FACT_NAME])
         .models(["EmbeddedQueryView"])
-        .change_epoch(EMBEDDED_CHANGE_EPOCH)
 }
 
 fn user_session() -> Session {

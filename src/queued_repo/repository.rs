@@ -20,7 +20,7 @@ use crate::projection::rebuild::{RebuildContext, SnapshotProjectionRebuildPlan};
 use crate::projection_protocol::{
     PartitionId, ProjectionCausationEvidenceBatch, ProjectionCausationEvidenceRequest,
     ProjectionChangeCursor, ProjectionChangeRead, ProjectionCheckpoint, ProjectionCommitBatch,
-    ProjectionCommitResult, ProjectionExecutionSnapshotBatch,
+    ProjectionCommitResult, ProjectionEpoch, ProjectionExecutionSnapshotBatch,
     ProjectionExecutionSnapshotBatchRequest, ProjectionFailure, ProjectionFailureBatch,
     ProjectionFailureLocation, ProjectionGeneration, ProjectionInputCursor,
     ProjectionInputDisposition, ProjectionModelOwnership, ProjectionObservation,
@@ -368,6 +368,10 @@ impl<R: ProjectionProtocolStore, L: LockManager> ProjectionProtocolStore
             topology: &'a ProjectorTopologyId,
             partition: &'a PartitionId,
         ) -> impl Future<Output = Result<Option<ProjectionPartitionRuntimeState>, ProjectionProtocolError>> + Send + 'a;
+        fn reset_projection<'a>(&'a self, topology: &'a ProjectorTopologyId)
+            -> impl Future<Output = Result<u64, ProjectionProtocolError>> + Send + 'a;
+        fn projection_change_epochs<'a>(&'a self, topology: &'a ProjectorTopologyId)
+            -> impl Future<Output = Result<Vec<ProjectionEpoch>, ProjectionProtocolError>> + Send + 'a;
         fn projection_observation<'a>(
             &'a self,
             causation_id: &'a str,

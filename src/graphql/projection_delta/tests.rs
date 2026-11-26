@@ -31,7 +31,7 @@ use crate::projection::placement::{
 use crate::projection::{
     ProjectionArm, ProjectionField, ProjectionOperation, ProjectionPartition, ProjectionTarget,
 };
-use crate::projection_protocol::{ProjectionEpoch, ProjectorTopologyId};
+use crate::projection_protocol::ProjectorTopologyId;
 use crate::table::{
     ColumnType, PrimaryKey, RelationshipDef, RelationshipKind, TableColumn, TableKind, TableSchema,
 };
@@ -3521,7 +3521,6 @@ fn modeled_direct_fixture() -> ModeledFixture {
             vec![ProjectionBindingActivation::new(
                 binding.id(),
                 binding.program_id(),
-                ProjectionEpoch::new("projection-delta-direct-v1").unwrap(),
                 ProjectionBindingState::Active,
                 Some(ProjectionExecutorRoute::local("delta-service").unwrap()),
             )],
@@ -3609,7 +3608,6 @@ fn modeled_join_fixture() -> ModeledFixture {
             vec![ProjectionBindingActivation::new(
                 binding.id(),
                 binding.program_id(),
-                ProjectionEpoch::new("projection-delta-join-v1").unwrap(),
                 ProjectionBindingState::Active,
                 Some(ProjectionExecutorRoute::local("delta-service").unwrap()),
             )],
@@ -3788,7 +3786,6 @@ fn modeled_fixture_deployment(
             vec![ProjectionBindingActivation::new(
                 binding.id(),
                 binding.program_id(),
-                ProjectionEpoch::new("projection-delta-v1").unwrap(),
                 state,
                 Some(ProjectionExecutorRoute::local(route).unwrap()),
             )],
@@ -3914,14 +3911,12 @@ fn fanout_fixture_states(
                 ProjectionBindingActivation::new(
                     todo_binding.id(),
                     todo_binding.program_id(),
-                    ProjectionEpoch::new("projection-delta-fanout-v1").unwrap(),
                     todo_state,
                     Some(ProjectionExecutorRoute::local("delta-service").unwrap()),
                 ),
                 ProjectionBindingActivation::new(
                     user_binding.id(),
                     user_binding.program_id(),
-                    ProjectionEpoch::new("projection-delta-fanout-v1").unwrap(),
                     user_state,
                     Some(ProjectionExecutorRoute::local("delta-service").unwrap()),
                 ),

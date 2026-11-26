@@ -64,7 +64,7 @@ pub(crate) use decisions::{
     sort_causation_evidence, validate_input_identity, validate_pending_retry,
     validate_physical_row,
 };
-pub use error::ProjectionProtocolError;
+pub use error::{ProjectionEpochMismatch, ProjectionProtocolError};
 pub(super) use helpers::domain_separated_digest;
 pub use identity::{
     ProjectionChangeRetention, ProjectionGeneration, ProjectionInputFingerprint,

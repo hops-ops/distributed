@@ -28,9 +28,9 @@ use distributed::microsvc::{
 use distributed::projection::catalog::{ProjectionBindingActivation, ProjectionCatalog};
 use distributed::projection::lower::{DirectCandidate, EventualOnly, ProjectionDescriptor};
 use distributed::projection::placement::{
-    ProjectionBinding, ProjectionBindingState, ProjectionEpoch, ProjectionExecutionClass,
-    ProjectionExecutorRoute, ProjectionOutput, ProjectionOwner, ProjectionPhysicalTopology,
-    ProjectionSourceBinding, PROJECTION_PARTITION_CODEC_VERSION,
+    ProjectionBinding, ProjectionBindingState, ProjectionExecutionClass, ProjectionExecutorRoute,
+    ProjectionOutput, ProjectionOwner, ProjectionPhysicalTopology, ProjectionSourceBinding,
+    PROJECTION_PARTITION_CODEC_VERSION,
 };
 use distributed::projection::ProjectionEventSelector;
 use distributed::projection_protocol::ProjectorTopologyId;
@@ -467,7 +467,6 @@ distributed::projection! {
     const PLAN_PROJECTION: ProjectionDescriptor<DirectCandidate> = {
         name: "typed_commands_plan",
         version: 1,
-        epoch: "typed-commands-plan-v1",
         model: PlanView,
         program: plan_projection_program,
     };
@@ -486,7 +485,6 @@ distributed::projection! {
     const PLAN_TITLE_PROJECTION: ProjectionDescriptor<EventualOnly> = {
         name: "typed_commands_plan_title",
         version: 1,
-        epoch: "typed-commands-plan-title-v1",
         model: PlanView,
         on {
             events: [PlanChangedDomainEvent],
@@ -517,7 +515,6 @@ distributed::projection! {
     const PLAN_CLOSE_PROJECTION: ProjectionDescriptor<EventualOnly> = {
         name: "typed_commands_plan_close",
         version: 1,
-        epoch: "typed-commands-plan-close-v1",
         model: PlanView,
         program: plan_close_program,
     };
@@ -541,7 +538,6 @@ distributed::projection! {
     const JSON_PROJECTION: ProjectionDescriptor<EventualOnly> = {
         name: "typed_commands_json",
         version: 1,
-        epoch: "typed-commands-json-v1",
         model: JsonView,
         on {
             events: [JsonChangedDomainEvent],
@@ -574,7 +570,6 @@ distributed::projection! {
     const COMPOSITE_PROJECTION: ProjectionDescriptor<EventualOnly> = {
         name: "typed_commands_composite",
         version: 1,
-        epoch: "typed-commands-composite-v1",
         model: CompositeKeyView,
         on {
             events: [CompositeChangedDomainEvent],
@@ -599,7 +594,6 @@ distributed::projection! {
     const BIGINT_PROJECTION: ProjectionDescriptor<DirectCandidate> = {
         name: "typed_commands_bigint",
         version: 1,
-        epoch: "typed-commands-bigint-v1",
         model: BigIntKeyView,
         on {
             events: [BigIntChangedDomainEvent],
@@ -635,7 +629,6 @@ distributed::projection! {
     const FLOAT_CLEAR_PROJECTION: ProjectionDescriptor<EventualOnly> = {
         name: "typed_commands_float_clear",
         version: 1,
-        epoch: "typed-commands-float-clear-v1",
         model: FloatEffectView,
         program: float_clear_program,
     };
@@ -665,7 +658,6 @@ distributed::projection! {
     const JSON_FLOAT_CLEAR_PROJECTION: ProjectionDescriptor<EventualOnly> = {
         name: "typed_commands_json_float_clear",
         version: 1,
-        epoch: "typed-commands-json-float-clear-v1",
         model: JsonFloatEffectView,
         program: json_float_clear_program,
     };
@@ -904,7 +896,6 @@ where
             vec![ProjectionBindingActivation::new(
                 binding.id(),
                 binding.program_id(),
-                ProjectionEpoch::new(descriptor.epoch()).unwrap(),
                 ProjectionBindingState::Active,
                 Some(ProjectionExecutorRoute::local("typed-commands").unwrap()),
             )],
@@ -918,9 +909,7 @@ where
 }
 
 fn direct_plan_projection() -> SurfaceDirectProjection {
-    SurfaceDirectProjection::new("project_plan")
-        .model::<PlanView>()
-        .change_epoch("plan-direct-v1")
+    SurfaceDirectProjection::new("project_plan").model::<PlanView>()
 }
 
 fn plan_input_defaults() -> distributed::command::CompiledInputDefaults<PlanInput> {

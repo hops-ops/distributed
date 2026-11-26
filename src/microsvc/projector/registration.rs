@@ -187,18 +187,6 @@ where
                 self.declaration.name
             );
         }
-        let change_epoch = self.declaration.change_epoch.as_ref().unwrap_or_else(|| {
-            panic!(
-                "causal projector `{}` requires a change-log epoch",
-                self.declaration.name
-            )
-        });
-        let change_epoch = ProjectionEpoch::new(change_epoch.clone()).unwrap_or_else(|error| {
-            panic!(
-                "causal projector `{}` has an invalid change-log epoch: {error}",
-                self.declaration.name
-            )
-        });
         let compiled = CompiledProjectionTopology::compile(
             &self.declaration.name,
             &self.declaration.facts,
@@ -212,6 +200,7 @@ where
                 self.declaration.name
             )
         });
+        let change_epoch = ProjectionEpoch::for_topology(compiled.topology());
         let spec = HandlerSpec::projector(self.declaration.facts.clone());
         self.routes.register_projector(
             spec,

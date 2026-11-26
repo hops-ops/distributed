@@ -962,6 +962,21 @@ where
         load_partition_runtime_state(self.pool(), topology, partition)
     }
 
+    fn reset_projection<'a>(
+        &'a self,
+        topology: &'a ProjectorTopologyId,
+    ) -> impl Future<Output = Result<u64, ProjectionProtocolError>> + Send + 'a {
+        reset_projection_in_pool(self.pool(), topology)
+    }
+
+    fn projection_change_epochs<'a>(
+        &'a self,
+        topology: &'a ProjectorTopologyId,
+    ) -> impl Future<Output = Result<Vec<ProjectionEpoch>, ProjectionProtocolError>> + Send + 'a
+    {
+        load_change_epochs(self.pool(), topology)
+    }
+
     fn projection_observation<'a>(
         &'a self,
         causation_id: &'a str,

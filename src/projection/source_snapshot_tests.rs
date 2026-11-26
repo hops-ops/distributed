@@ -48,7 +48,7 @@ impl DomainEventContract for ExternalRow {
 }
 crate::projection! {
     const EXTERNAL_SNAPSHOTS: ProjectionDescriptor<EventualOnly> = {
-        name: "external-rebuild-test", version: 1, epoch: "external-rebuild-v1", model: SnapshotRow,
+        name: "external-rebuild-test", version: 1, model: SnapshotRow,
         source: external_snapshot,
         on { events: [ExternalRow], mutation: SaveSnapshot, input: { row: body }, },
     };
@@ -99,7 +99,6 @@ crate::projection! {
     const SNAPSHOTS: ProjectionDescriptor<EventualOnly> = {
         name: "source-snapshot-test",
         version: 1,
-        epoch: "snapshot-v1",
         model: SnapshotRow,
         source: aggregate_snapshot,
         on { events: [Changed], mutation: SaveSnapshot, input: { row: body }, },
@@ -145,6 +144,7 @@ fn occurrence(
 
 struct Harness {
     codec: Arc<ProjectionScopeCodec>,
+    epoch: ProjectionEpoch,
 }
 impl Harness {
     async fn new(store: &impl ProjectionProtocolStore) -> Self {
@@ -163,7 +163,10 @@ impl Harness {
             )
             .await
             .unwrap();
-        Self { codec }
+        Self {
+            codec,
+            epoch: ProjectionEpoch::new("snapshot-v1").unwrap(),
+        }
     }
 
     async fn prepare(
@@ -191,13 +194,8 @@ impl Harness {
             false,
         )
         .unwrap();
-        let mut workspace = ProjectionWorkspace::new(
-            self.codec.clone(),
-            None,
-            input,
-            ProjectionEpoch::new("snapshot-v1").unwrap(),
-        )
-        .unwrap();
+        let mut workspace =
+            ProjectionWorkspace::new(self.codec.clone(), None, input, self.epoch.clone()).unwrap();
         let lowered = SNAPSHOTS
             .server_executor()
             .unwrap()
@@ -585,6 +583,7 @@ async fn rebuild_matrix(store: &impl ProjectionProtocolStore) {
         .unwrap();
     let h = Harness {
         codec: compiled.codec(),
+        epoch: projector.modeled[0].epoch().clone(),
     };
     let first = event("a", 1, "old", false);
     let second = event("a", 2, "new", false);
@@ -693,6 +692,7 @@ async fn rebuild_rollback(store: &impl ProjectionProtocolStore) {
     let before = projector.begin_snapshot_rebuild(store).await.unwrap();
     let h = Harness {
         codec: before.context.compiled.codec(),
+        epoch: before.context.epoch.clone(),
     };
     let original_a = h.read(store, "a").await;
     let original_b = h.read(store, "b").await;
@@ -793,6 +793,7 @@ async fn snapshot_rebuild_original_private_log_coverage() {
         .unwrap();
     let harness = Harness {
         codec: read.context.compiled.codec(),
+        epoch: read.context.epoch.clone(),
     };
     assert_eq!(
         harness

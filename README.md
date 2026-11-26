@@ -179,7 +179,6 @@ distributed::projection! {
     pub const TODOS: ProjectionDescriptor<EventualOnly> = {
         name: "project_todos",
         version: 1,
-        epoch: "e2e-ui-todos-v2",
         model: Todos,
         on {
             events: [
@@ -219,7 +218,6 @@ distributed::projection! {
     pub const TODOS: ProjectionDescriptor<EventualOnly> = {
         name: "project_todos",
         version: 2,
-        epoch: "todos-source-snapshots-v1",
         model: Todos,
         source: aggregate_snapshot,
         on {
@@ -256,7 +254,7 @@ source versions with conflicting occurrence content fail closed.
 Migration `0005_projection_source_snapshots` persists the fence alongside each
 record, including tombstones; compaction does not remove it. Enabling this on
 an existing unversioned projection requires an explicit read-model rebuild
-from retained canonical events. Merely changing the projection version or epoch
+from retained canonical events. Merely changing the projection program
 does not infer a source version for existing rows. The normal ordered-delivery
 contract and transport identity checks still apply; this is not a replacement
 for reliable broker delivery or an incremental-event reorder buffer.
@@ -304,6 +302,29 @@ whose publication sequences have gaps. It does not migrate schemas/topologies,
 perform online shadow swaps, or make several independent projections one
 transaction. Keep services stopped if a multi-projection maintenance run fails;
 capture fresh inventories and rerun before resuming them.
+
+#### Changing a projection program
+
+Projections declare no epoch. The framework derives each partition's change
+epoch from its physical topology and the canonical programs of every binding
+that shares it, so changing a projection's program changes its epoch. Rows
+written by the old program are never resumed under the new one: at startup a
+service whose stored partitions have another epoch refuses to start and names
+every changed projection in one error.
+
+To move a changed projection forward, stop the service, reset it and start
+again:
+
+```rust,ignore
+// One transaction: partitions, cursors, owned rows and change history.
+let partitions = projector.reset_projection(&repository).await?;
+```
+
+The next start creates fresh partitions under the new epoch. A
+`source: aggregate_snapshot` projection can then be refilled with the snapshot
+rebuild above; other projections refill from new input. Registration and model
+ownership stay. A consumer inbox may still remember message ids it already
+handled, so replayed input must carry new message ids.
 
 Handlers stay thin. The shortest form is the command on the aggregate
 method itself: `#[command]` inside the `#[sourced]` impl generates the

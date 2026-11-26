@@ -387,7 +387,6 @@ pub type ProjectionInventoryFactory =
 pub struct ProjectionDescriptor<D = EventualOnly> {
     name: &'static str,
     version: u64,
-    epoch: &'static str,
     program: ProjectionProgramFactory,
     lower: ProjectionLowerer,
     inventory: ProjectionInventoryFactory,
@@ -400,7 +399,6 @@ impl<D> fmt::Debug for ProjectionDescriptor<D> {
             .debug_struct("ProjectionDescriptor")
             .field("name", &self.name)
             .field("version", &self.version)
-            .field("epoch", &self.epoch)
             .finish_non_exhaustive()
     }
 }
@@ -411,7 +409,6 @@ impl<D> ProjectionDescriptor<D> {
     pub const fn new(
         name: &'static str,
         version: u64,
-        epoch: &'static str,
         program: ProjectionProgramFactory,
         lower: ProjectionLowerer,
         inventory: ProjectionInventoryFactory,
@@ -419,7 +416,6 @@ impl<D> ProjectionDescriptor<D> {
         Self {
             name,
             version,
-            epoch,
             program,
             lower,
             inventory,
@@ -435,14 +431,6 @@ impl<D> ProjectionDescriptor<D> {
     /// Return the independently evolving declaration version.
     pub fn version(&self) -> u64 {
         self.version
-    }
-
-    /// Return the rebuild/ownership incarnation.
-    ///
-    /// Epoch is binding metadata and is intentionally excluded from
-    /// [`ProjectionProgramId`].
-    pub fn epoch(&self) -> &'static str {
-        self.epoch
     }
 
     /// Return the compiled program. It is built on the first call and shared
@@ -510,7 +498,6 @@ impl<D> ProjectionDescriptor<D> {
         Ok(ProjectionServerExecutorDescriptor {
             name: self.name,
             version: self.version,
-            epoch: self.epoch,
             program_id: program.id(),
             outputs: self.output_inventory()?,
             selectors: program
@@ -532,8 +519,6 @@ pub struct ProjectionServerExecutorDescriptor {
     pub name: &'static str,
     /// Declaration version.
     pub version: u64,
-    /// Rebuild/ownership epoch.
-    pub epoch: &'static str,
     /// Canonical portable program identity.
     pub program_id: ProjectionProgramId,
     /// Canonical output inventory.

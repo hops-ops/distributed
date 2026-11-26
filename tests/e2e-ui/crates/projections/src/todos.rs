@@ -33,7 +33,6 @@ distributed::projection! {
     pub const TODOS: ProjectionDescriptor<EventualOnly> = {
         name: "project_todos",
         version: 1,
-        epoch: "e2e-ui-todos-v2",
         model: Todos,
         on {
             events: [

@@ -238,6 +238,7 @@ pub(in crate::microsvc) fn projection_error_is_retryable(error: &ProjectionProto
         | ProjectionProtocolError::RecordTombstoned { .. }
         | ProjectionProtocolError::RecreateRequiresTombstone { .. }
         | ProjectionProtocolError::CausalWriteRequired { .. }
-        | ProjectionProtocolError::PositionOverflow { .. } => false,
+        | ProjectionProtocolError::PositionOverflow { .. }
+        | ProjectionProtocolError::ChangeEpochMismatch(_) => false,
     }
 }

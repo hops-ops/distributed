@@ -1286,6 +1286,88 @@ pub(crate) async fn change_epoch_is_fixed_per_partition(scenario: impl Projectio
     ));
 }
 
+/// Resetting a projection removes its partitions, records and owned rows, so
+/// the next commit starts a fresh partition under another change epoch.
+pub(crate) async fn reset_projection_starts_a_fresh_partition(
+    scenario: impl ProjectionProtocolScenario,
+) {
+    let repository = scenario.repository().await;
+    let mutation = scenario.mutation(
+        ProjectionRecordExpectation::Missing,
+        RecordTransition::Upsert,
+    );
+    let record_scope = mutation.scope.clone();
+    repository
+        .commit_projection(scenario.batch(
+            scenario.input(
+                1,
+                b"reset-one",
+                "reset-message-1",
+                "reset-cause-1",
+                ProjectionGeneration::initial(),
+            ),
+            vec![mutation],
+            Vec::new(),
+        ))
+        .await
+        .unwrap();
+    assert!(scenario.row_exists(&repository).await);
+    assert_eq!(
+        repository
+            .projection_change_epochs(&scenario.topology())
+            .await
+            .unwrap(),
+        vec![scenario.change_epoch()]
+    );
+
+    assert_eq!(
+        repository
+            .reset_projection(&scenario.topology())
+            .await
+            .unwrap(),
+        1
+    );
+    assert!(!scenario.row_exists(&repository).await);
+    assert!(repository
+        .projection_record(&record_scope)
+        .await
+        .unwrap()
+        .is_none());
+    assert!(repository
+        .projection_change_epochs(&scenario.topology())
+        .await
+        .unwrap()
+        .is_empty());
+
+    // Message identities stay topology-wide across a reset: the broker never
+    // redelivers what it already acknowledged, so fresh input has a new id.
+    let other_epoch = ProjectionEpoch::new("another-change-epoch").unwrap();
+    let mut batch = scenario.batch(
+        scenario.input(
+            1,
+            b"reset-two",
+            "reset-message-2",
+            "reset-cause-2",
+            ProjectionGeneration::initial(),
+        ),
+        vec![scenario.mutation(
+            ProjectionRecordExpectation::Missing,
+            RecordTransition::Upsert,
+        )],
+        Vec::new(),
+    );
+    batch.change_epoch = other_epoch.clone();
+    repository.commit_projection(batch).await.unwrap();
+    assert!(scenario.row_exists(&repository).await);
+    assert_eq!(
+        repository
+            .projection_change_epochs(&scenario.topology())
+            .await
+            .unwrap(),
+        vec![other_epoch]
+    );
+}
+
 fn assert_query_snapshot_is_coherent(snapshot: &ProjectionQuerySnapshot) {
     let row = snapshot.row.as_ref().expect("physical row");
     let record = snapshot.record.as_ref().expect("record metadata");
@@ -3477,6 +3559,7 @@ macro_rules! projection_protocol_scenario_tests {
             another_partition_cannot_create_an_owned_row,
             source_capability_mismatch_outranks_message_id_reuse,
             change_epoch_is_fixed_per_partition,
+            reset_projection_starts_a_fresh_partition,
             query_snapshot_never_mixes_row_revision_checkpoint_or_resume_head,
             execution_snapshot_echoes_every_requested_scope_across_tables,
             one_four_table_occurrence_commits_rows_and_every_causal_artifact,

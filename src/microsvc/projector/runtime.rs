@@ -6,9 +6,10 @@ use serde_json::Value;
 
 use crate::bus::{Message, MessageKind, OrderedDelivery};
 use crate::projection_protocol::{
-    CompiledProjectionTopology, ProjectionEpoch, ProjectionGeneration, ProjectionInputCursor,
-    ProjectionInputDisposition, ProjectionModelOwnership, ProjectionProtocolError,
-    ProjectionProtocolStore, ProjectionWorkspace, ProjectorTopologyId, TrustedProjectionInput,
+    CompiledProjectionTopology, ProjectionEpoch, ProjectionEpochMismatch, ProjectionGeneration,
+    ProjectionInputCursor, ProjectionInputDisposition, ProjectionModelOwnership,
+    ProjectionProtocolError, ProjectionProtocolStore, ProjectionWorkspace, ProjectorTopologyId,
+    TrustedProjectionInput,
 };
 
 use super::super::dependencies::CausalProjectionRouteDependencies;
@@ -26,6 +27,30 @@ use super::registration::{ModeledProjection, ModeledProjectorHandlerFn};
 
 pub(in crate::microsvc) type ProjectorDispatchFuture<'a> =
     Pin<Box<dyn Future<Output = Result<(), HandlerError>> + Send + 'a>>;
+pub(in crate::microsvc) type ProjectorEpochCheckFuture<'a> = Pin<
+    Box<dyn Future<Output = Result<Option<ProjectionEpochMismatch>, HandlerError>> + Send + 'a>,
+>;
+
+/// The epochs stored on `topology`'s partitions other than `declared` (the
+/// epoch the running program derives), if any.
+async fn change_epoch_mismatch<S: ProjectionProtocolStore>(
+    store: &S,
+    topology: &ProjectorTopologyId,
+    declared: &ProjectionEpoch,
+) -> Result<Option<ProjectionEpochMismatch>, HandlerError> {
+    let stored = store
+        .projection_change_epochs(topology)
+        .await?
+        .into_iter()
+        .filter(|epoch| epoch != declared)
+        .collect::<Vec<_>>();
+    Ok((!stored.is_empty()).then(|| ProjectionEpochMismatch {
+        projection: topology.name().to_string(),
+        declared: declared.clone(),
+        stored,
+    }))
+}
+
 pub(in crate::microsvc) type ProjectorRepairFuture<'a> =
     Pin<Box<dyn Future<Output = Result<Option<ProjectionGeneration>, HandlerError>> + Send + 'a>>;
 pub(in crate::microsvc) type ProjectorRepairLookupFuture<'a> =
@@ -42,6 +67,10 @@ pub(in crate::microsvc) trait ErasedProjectorHandler<D>: Send + Sync {
     fn registration(&self) -> ProjectorRegistration;
 
     fn bootstrap<'a>(&'a self, dependencies: &'a D) -> ProjectorDispatchFuture<'a>;
+
+    /// This projector's declared change epoch against the epochs stored on
+    /// its partitions, checked at startup before any delivery.
+    fn epoch_mismatch<'a>(&'a self, dependencies: &'a D) -> ProjectorEpochCheckFuture<'a>;
 
     fn repair<'a>(
         &'a self,
@@ -96,6 +125,14 @@ where
                 .await?;
             Ok(())
         })
+    }
+
+    fn epoch_mismatch<'a>(&'a self, dependencies: &'a D) -> ProjectorEpochCheckFuture<'a> {
+        Box::pin(change_epoch_mismatch(
+            dependencies.__causal_projection_store(),
+            self.compiled.topology(),
+            &self.change_epoch,
+        ))
     }
 
     fn repair<'a>(
@@ -415,6 +452,14 @@ where
                 .await?;
             Ok(())
         })
+    }
+
+    fn epoch_mismatch<'a>(&'a self, dependencies: &'a D) -> ProjectorEpochCheckFuture<'a> {
+        Box::pin(change_epoch_mismatch(
+            dependencies.__causal_projection_store(),
+            self.compiled.topology(),
+            &self.change_epoch,
+        ))
     }
 
     fn repair<'a>(

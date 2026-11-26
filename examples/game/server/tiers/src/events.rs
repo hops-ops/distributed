@@ -47,7 +47,6 @@ distributed::projection! {
     pub const BOROUGHS: ProjectionDescriptor<EventualOnly> = {
         name: "project_boroughs",
         version: 1,
-        epoch: "mobpit-boroughs-v1",
         model: Boroughs,
         on {
             events: [

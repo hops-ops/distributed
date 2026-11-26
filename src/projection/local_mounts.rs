@@ -1,7 +1,7 @@
 //! Framework-owned local projection mount compilation.
 //!
-//! Applications declare program descriptors, read models, and epochs. Physical
-//! topology, partition codecs, catalog activation, and Surface packaging are
+//! Applications declare program descriptors and read models. Change epochs,
+//! physical topology, partition codecs, catalog activation, and Surface packaging are
 //! derived here.
 
 #![allow(missing_docs)]
@@ -12,8 +12,8 @@ use crate::projection::catalog::{
 };
 use crate::projection::lower::ProjectionDescriptor;
 use crate::projection::placement::{
-    ProjectionBinding, ProjectionBindingState, ProjectionEpoch, ProjectionExecutorRoute,
-    ProjectionOutput, ProjectionOwner, ProjectionPhysicalTopology, ProjectionSourceBinding,
+    ProjectionBinding, ProjectionBindingState, ProjectionExecutorRoute, ProjectionOutput,
+    ProjectionOwner, ProjectionPhysicalTopology, ProjectionSourceBinding,
     PROJECTION_PARTITION_CODEC_VERSION,
 };
 use crate::projection_protocol::ProjectorTopologyId;
@@ -97,7 +97,6 @@ type ModeledFactory = Box<
 
 struct Pending {
     owner: String,
-    epoch: String,
     binding: ProjectionBinding,
     modeled_factory: ModeledFactory,
 }
@@ -106,8 +105,8 @@ struct Pending {
 /// hosting.
 ///
 /// Each projection is mounted from its `projection!` descriptor alone: the
-/// owner is the descriptor's `name`, the binding epoch its `epoch` and the
-/// outputs its `model`, so no identity is restated. Errors are kept until
+/// owner is the descriptor's `name` and the outputs its `model` (the
+/// binding epoch is its program identity), so no identity is restated. Errors are kept until
 /// [`build`](Self::build).
 pub struct LocalProjectionMountsBuilder {
     service_id: String,
@@ -216,7 +215,6 @@ impl LocalProjectionMountsBuilder {
         .map_err(|error| format!("projection `{owner}`: {error}"))?;
         Ok(Pending {
             owner,
-            epoch: descriptor.epoch().to_string(),
             binding,
             modeled_factory: Box::new(move |catalog, active, binding| {
                 SurfaceModeledProjection::try_from_descriptor(
@@ -244,7 +242,7 @@ impl LocalProjectionMountsBuilder {
             ProjectionCatalog::try_new(pending().map(|entry| entry.binding.clone()).collect())
                 .map_err(|e| e.to_string())?;
         let activations = pending()
-            .map(|entry| activation(&entry.binding, &entry.epoch, &self.service_id))
+            .map(|entry| activation(&entry.binding, &self.service_id))
             .collect::<Result<Vec<_>, _>>()?;
         let active = catalog
             .activate(activations, None)
@@ -271,13 +269,11 @@ impl LocalProjectionMountsBuilder {
 
 fn activation(
     binding: &ProjectionBinding,
-    epoch: &str,
     service_id: &str,
 ) -> Result<ProjectionBindingActivation, String> {
     Ok(ProjectionBindingActivation::new(
         binding.id(),
         binding.program_id(),
-        ProjectionEpoch::new(epoch).map_err(|e| e.to_string())?,
         ProjectionBindingState::Active,
         Some(ProjectionExecutorRoute::local(service_id).map_err(|e| e.to_string())?),
     ))

@@ -168,13 +168,6 @@ impl TypedCommandInventory {
                     ));
                 }
             };
-            let binding_change_epoch = projector.binding_change_epoch();
-            if binding_change_epoch.is_none() {
-                return Err(format!(
-                    "typed projected command `{name}` owner `{}` has no registered change-log epoch",
-                    projector.name
-                ));
-            }
             let registered_schema = model_schemas
                 .get(&projected.model)
                 .expect("projector ownership above requires a registered model schema");
@@ -196,6 +189,13 @@ impl TypedCommandInventory {
             let (protocol_topology, ownership) = compiled_projectors
                 .get(&projector.name)
                 .expect("every registered projector was compiled above");
+            // Typed projectors have no compiled program: their epoch is the
+            // topology, which already keys their partitions.
+            let binding_change_epoch = projector.binding_change_epoch().unwrap_or_else(|| {
+                crate::projection_protocol::ProjectionEpoch::for_topology(protocol_topology)
+                    .as_str()
+                    .to_owned()
+            });
             let binding_facts = projector.binding_facts();
             let binding_models = projector.binding_models();
             contract.direct_projection = Some(projected.bind(
@@ -203,7 +203,7 @@ impl TypedCommandInventory {
                 &binding_facts,
                 &binding_models,
                 &projector.partition,
-                binding_change_epoch.as_deref(),
+                Some(binding_change_epoch.as_str()),
                 ownership.clone(),
                 Some(protocol_topology.clone()),
                 projector.active_modeled_program_id_for(&projected.model),

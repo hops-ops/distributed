@@ -754,7 +754,6 @@ mod tests {
     > = crate::projection::lower::ProjectionDescriptor::new(
         "executor-generated-multi-table",
         1,
-        "executor-generated-v1",
         || {
             static PROGRAM: crate::projection::lower::ProjectionProgramCell =
                 crate::projection::lower::ProjectionProgramCell::new();
