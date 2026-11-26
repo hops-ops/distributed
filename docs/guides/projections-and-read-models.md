@@ -248,7 +248,9 @@ rebuild them explicitly (see above).
 A projection declares no epoch. The store gives each partition's change log
 a random identity when the first write creates the partition, and every
 later reader and writer uses the stored one. A partition created by an
-earlier release keeps the epoch it was created with.
+earlier release keeps the epoch it was created with. A live query opened
+before that first write is positioned before it: it receives the first write
+as an ordinary update, with no reset.
 
 ### Atomic Commits (Read Model + Aggregate)
 

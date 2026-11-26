@@ -166,7 +166,7 @@ impl QueryProtocolRuntime {
     }
 
     /// Build one conservative vector over every physical dependency touched by
-    /// an exact query plan. Missing, denied, dynamic, epochless, or ambiguous
+    /// an exact query plan. Missing, denied, dynamic, or ambiguous
     /// ownership makes the vector incomparable; no scalar maximum is invented.
     ///
     /// Tables with **zero** surface projectors are skipped rather than failing
@@ -1018,12 +1018,7 @@ fn wire_query_snapshot(
             .map(|cursor| cursor.position())
             .unwrap_or(0);
         let scope_token = accumulator
-            .issue_index_scope_parts(
-                &snapshot_scope,
-                projector.codec.topology(),
-                partition,
-                epoch,
-            )
+            .issue_index_scope_parts(&snapshot_scope, projector.codec.topology(), partition)
             .map_err(|error| ProjectionProtocolError::InvalidBatch(error.to_string()))?;
         let resume = if issue_index_resumes {
             Some(
