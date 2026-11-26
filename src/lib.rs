@@ -77,11 +77,9 @@ pub use application::{
     FrameworkCompatibility, LogicalId, Module, ModuleManifest, ProjectionSpec, SurfaceSpec,
     APPLICATION_MANIFEST_SCHEMA_VERSION,
 };
-#[cfg(feature = "graphql")]
-pub use command_dispatch::{
-    CellRequestContext, CommandHost, HttpCommandHost, LocalCommandHost, SharedCommandHost,
-    TrustedRequestMetadata,
-};
+#[cfg(feature = "http")]
+pub use command_dispatch::{CellRequestContext, HttpCommandHost, TrustedRequestMetadata};
+pub use command_dispatch::{CommandHost, LocalCommandHost, ProtocolAuthority, SharedCommandHost};
 
 // Domain events: typed outward contracts distinct from replay events/snapshots.
 pub use domain_event::{

@@ -1200,7 +1200,7 @@ trait and its ABI (`run_abi`, `call_bytes`).
 | `runtime` | `spawn_fact_worker` on Tokio | `tokio` (rt, time, sync) |
 | `cell` | `cell::command_id_for` / `trusted_session` / `run_fact_batch`; `cell::fact_session_from_headers` / `session_stamp` for cells (also wasm32); `stamp_event_record`; the `world::zone_lease` and `world::zone_state` cell aggregates | `distributed`, `sha2`, `base64` |
 | `cell` (also) | `command_sink::CommandFactSink<H: FactHost>`: facts → commands through any fact host, routed by command (`FactRoute`); `world::zone_activity` | |
-| `command-host` | `FactHost` for `CelldCommandHost` / `LocalCommandHost` (`CelldFactSink`) | `cell` + `distributed/graphql` |
+| `command-host` | `FactHost` for `CelldCommandHost` / `LocalCommandHost` (`CelldFactSink`) | `cell` + `distributed/http` |
 | `celld-zone` | `celld_zone`: any `Zone` as a celld Durable Object (`ZoneObject`, `celld_zone_object!`, `forward_to_zone`), facts object to object (`CelldObjectHost`), `serve_cell` / `ZoneActivityCell` for the worker's cells (wasm32) | `cell`, `ticket`, `cloudflare-workers` + `js-sys`, `wasm-bindgen(-futures)` |
 | `ticket` | `ticket`: HS256 admission and transfer tickets without the axum server | `hmac`, `sha2`, `base64` |
 | `celld` | `celld::CelldFactSink` (the command sink over a remote-only `CelldCommandHost`): facts → celld cells over the internal HTTP path; `celld::CellZoneOwnership`: zone leases in celld `ZoneLease` cells; `celld::CellZoneStateStore`: hibernation snapshots in celld `ZoneState` cells | `command-host` + `reqwest`, `uuid` |

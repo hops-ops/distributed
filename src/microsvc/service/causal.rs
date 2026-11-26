@@ -9,7 +9,7 @@ use crate::command_ledger::{
     CommandLedgerError, CommandLedgerKey, CommandLedgerState, CommandLedgerStore, CommandLookup,
     CommandLookupScope, CommandReplay, CommandReservation, PrincipalPartitionId,
 };
-#[cfg(feature = "graphql")]
+#[cfg(feature = "http")]
 use crate::command_ledger::{CommandAttempt, TerminalCommandState};
 use crate::microsvc::cell_host::{CellCommandIdentity, CellProjectionEventWireItem};
 use crate::microsvc::error::HandlerError;
@@ -197,7 +197,7 @@ pub struct CausalDispatchResult {
 /// Gateway-side capability for one externally dispatched command. The attempt
 /// owns the durable reservation and is consumed only by terminal completion or
 /// retryable-unknown recovery; it is never reconstructed from the wire.
-#[cfg(feature = "graphql")]
+#[cfg(feature = "http")]
 pub(crate) struct ExternalCausalAttempt {
     pub(crate) command_name: String,
     /// The command's declared output: a cell's payload must match it.
@@ -206,13 +206,13 @@ pub(crate) struct ExternalCausalAttempt {
     pub(crate) retention: Duration,
 }
 
-#[cfg(feature = "graphql")]
+#[cfg(feature = "http")]
 pub(crate) enum ExternalCausalReservation {
     Acquired(ExternalCausalAttempt),
     Replay(CausalDispatchResult),
 }
 
-#[cfg(feature = "graphql")]
+#[cfg(feature = "http")]
 impl ExternalCausalAttempt {
     pub(crate) fn command_id(&self) -> &str {
         self.attempt.key().command_id()
@@ -279,6 +279,7 @@ impl ExternalCausalAttempt {
                 "external command attempt lost its immutable route binding".into(),
             )
         })?;
+        #[cfg(feature = "graphql")]
         if let Some(metadata) = result.receipt.projection_metadata.as_ref() {
             let bytes = metadata.canonical_bytes().map_err(|error| {
                 CausalDispatchError::Internal(format!(
@@ -897,7 +898,7 @@ pub(super) fn internal_ledger_error(error: CommandLedgerError) -> CausalDispatch
     CausalDispatchError::Internal(error.to_string())
 }
 
-#[cfg(feature = "graphql")]
+#[cfg(feature = "http")]
 pub(super) async fn abandon_external_attempt<R>(
     repository: &R,
     attempt: ExternalCausalAttempt,
