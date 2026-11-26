@@ -17,10 +17,8 @@ Once a matching release is published, `cargo install distributed_cli
 --version <x.y.z>` installs the `distributed` binary.
 
 It is also a library, so another CLI can mount its commands instead of
-reimplementing them. `hops`, for example, exposes the same surface under
-`hops service` by depending on this crate, mounting `DistributedArgs` and
-dispatching with `distributed_cli::run(&args, &["service"])`. **Everything below documented as `distributed <cmd>` is also
-available as `hops service <cmd>`.**
+reimplementing them: depend on this crate, mount `DistributedArgs` under a
+command of its own, and dispatch with `distributed_cli::run(&args, &["<command>"])`.
 
 ## `distributed build` — one coherent application generation
 

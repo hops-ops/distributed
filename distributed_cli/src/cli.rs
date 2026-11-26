@@ -3,7 +3,7 @@
 //! `describe`/`schema` harness in `manifest_harness`; this module maps flags
 //! onto those types and owns filesystem / process side effects.
 //!
-//! A host CLI (for example `hops`) mounts the same [`DistributedArgs`] under
+//! A host CLI mounts the same [`DistributedArgs`] under
 //! its own command and dispatches with [`run`], naming that command so `build`
 //! and `dev` can call back into the host executable.
 
@@ -422,7 +422,7 @@ pub enum SchemaFormat {
 ///
 /// `command_prefix` is how this command tree is reached from the running
 /// executable: empty for the `distributed` binary, `["service"]` for a host
-/// that mounts it as `hops service`. `build` and `dev` start the executable
+/// that mounts it as `<host> service`. `build` and `dev` start the executable
 /// again with that prefix for their internal commands.
 pub fn run(args: &DistributedArgs, command_prefix: &[&str]) -> Result<(), Box<dyn Error>> {
     match &args.command {
