@@ -13,7 +13,12 @@ use distributed::clock::ManualClock;
 use distributed::lease::InMemoryLeaseStore;
 use distributed::lease::{Fence, FencingToken, Lease, LeaseError, LeaseStore};
 
-const TTL: Duration = Duration::from_secs(30);
+/// The TTL of a lease a test expects to stay alive: longer than any test
+/// runs. The SQL stores expire on the database clock, so a shorter TTL is a
+/// race with the host's load: `second_process` migrates a fresh schema, and
+/// with a 30s TTL a 157s run on a loaded host saw the lease expired where it
+/// asserted `Held`. Expiry itself is tested with [`LeaseBackend::short_ttl`].
+const TTL: Duration = Duration::from_secs(3600);
 
 /// Racers per race: as many as one store's pool can put in the database at
 /// once, so the database decides the race. A racer beyond that only queues in
