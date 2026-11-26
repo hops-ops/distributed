@@ -2,9 +2,8 @@
 //!
 //! It bundles pure generation (`atlas`, `skills`), the build/dev lifecycle
 //! (`lifecycle`, over the catalog records in `contracts`), and the clap
-//! command surface (`cli`). The standalone binary parses [`DistributedArgs`]
-//! and dispatches with [`run`]. A host CLI can mount the same
-//! arguments under one of its commands and pass that command to [`run`].
+//! command surface (`cli`). The binary parses [`DistributedArgs`] and
+//! dispatches with [`run`].
 
 mod atlas;
 mod cli;

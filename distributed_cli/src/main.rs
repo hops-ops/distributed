@@ -12,7 +12,7 @@ struct Cli {
 
 fn main() {
     let cli = Cli::parse();
-    if let Err(err) = distributed_cli::run(&cli.args, &[]) {
+    if let Err(err) = distributed_cli::run(&cli.args) {
         if matches!(
             &cli.args.command,
             DistributedCommands::Build(args) if matches!(args.output, LifecycleOutput::Json)

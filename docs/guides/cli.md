@@ -4,8 +4,7 @@
 
 The [`distributed_cli`](../../distributed_cli/) crate ships `distributed` — tooling to build and run an
 application, inspect a service's logical application artifact, and render physical
-read-model schema artifacts. It is
-also a library, so another CLI can mount the same commands under one of its own.
+read-model schema artifacts.
 
 The CLI exists to keep the generated and handwritten parts of a back-end service
 separate. A Distributed service should usually reduce to a small custom surface:

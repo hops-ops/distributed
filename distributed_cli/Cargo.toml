@@ -1,6 +1,6 @@
 [package]
 name = "distributed_cli"
-description = "The `distributed` CLI for Distributed applications: build and dev lifecycle, describe manifests, compile clients, and render schema artifacts. Also a library so other CLIs can mount its commands."
+description = "The `distributed` CLI for Distributed applications: build and dev lifecycle, describe manifests, compile clients, and render schema artifacts."
 version.workspace = true
 edition.workspace = true
 license.workspace = true

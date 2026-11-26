@@ -2,10 +2,6 @@
 //! Generation lives in the crate's `generate`/`atlas` modules and the
 //! `describe`/`schema` harness in `manifest_harness`; this module maps flags
 //! onto those types and owns filesystem / process side effects.
-//!
-//! A host CLI mounts the same [`DistributedArgs`] under
-//! its own command and dispatches with [`run`], naming that command so `build`
-//! and `dev` can call back into the host executable.
 
 use clap::{ArgGroup, Args, Subcommand, ValueEnum};
 use std::collections::BTreeMap;
@@ -37,8 +33,7 @@ use crate::{render_atlas_schema, AtlasDatabaseUrl, AtlasSchemaSpec, FileMode, Ge
 
 const DISTRIBUTED_MANIFEST_SCHEMA_VERSION: u64 = 3;
 
-/// The command tree, for the `distributed` binary and for a host CLI that
-/// mounts it under one of its own commands.
+/// The `distributed` command tree.
 #[derive(Args, Debug)]
 pub struct DistributedArgs {
     #[command(subcommand)]
@@ -419,15 +414,10 @@ pub enum SchemaFormat {
 }
 
 /// Dispatch a parsed command.
-///
-/// `command_prefix` is how this command tree is reached from the running
-/// executable: empty for the `distributed` binary, `["service"]` for a host
-/// that mounts it as `<host> service`. `build` and `dev` start the executable
-/// again with that prefix for their internal commands.
-pub fn run(args: &DistributedArgs, command_prefix: &[&str]) -> Result<(), Box<dyn Error>> {
+pub fn run(args: &DistributedArgs) -> Result<(), Box<dyn Error>> {
     match &args.command {
-        DistributedCommands::Build(build) => run_build(build, command_prefix),
-        DistributedCommands::Dev(dev) => run_dev(dev, command_prefix),
+        DistributedCommands::Build(build) => run_build(build),
+        DistributedCommands::Dev(dev) => run_dev(dev),
         DistributedCommands::Describe(describe) => run_describe(describe),
         DistributedCommands::Client(client) => run_client(client),
         DistributedCommands::ClientManifest(client) => run_client_manifest(client),
@@ -477,7 +467,6 @@ fn run_probe(args: &ProbeArgs) -> Result<(), Box<dyn Error>> {
 fn resolve_lifecycle_project(
     project: Option<&Path>,
     out: Option<&Path>,
-    command_prefix: &[&str],
 ) -> Result<DiscoveredLifecycleProject, Box<dyn Error>> {
     let requested = project.unwrap_or_else(|| Path::new("."));
     let project = requested.canonicalize().map_err(|error| {
@@ -495,12 +484,7 @@ fn resolve_lifecycle_project(
     }
     load_project_environment(&project)?;
     let executable = std::env::current_exe()?;
-    Ok(discover_lifecycle_project(
-        &project,
-        executable,
-        command_prefix,
-        out,
-    )?)
+    Ok(discover_lifecycle_project(&project, executable, out)?)
 }
 
 fn load_project_environment(project: &Path) -> Result<(), Box<dyn Error>> {
@@ -537,9 +521,8 @@ fn stop_on_signals() -> Result<Arc<AtomicBool>, Box<dyn Error>> {
     Ok(stop)
 }
 
-fn run_build(args: &BuildArgs, command_prefix: &[&str]) -> Result<(), Box<dyn Error>> {
-    let project =
-        resolve_lifecycle_project(args.project.as_deref(), args.out.as_deref(), command_prefix)?;
+fn run_build(args: &BuildArgs) -> Result<(), Box<dyn Error>> {
+    let project = resolve_lifecycle_project(args.project.as_deref(), args.out.as_deref())?;
     let project = &project;
     let stop = stop_on_signals()?;
     if args.check {
@@ -854,9 +837,8 @@ fn finish_project_command(
     }
 }
 
-fn run_dev(args: &DevArgs, command_prefix: &[&str]) -> Result<(), Box<dyn Error>> {
-    let project =
-        resolve_lifecycle_project(args.project.as_deref(), args.out.as_deref(), command_prefix)?;
+fn run_dev(args: &DevArgs) -> Result<(), Box<dyn Error>> {
+    let project = resolve_lifecycle_project(args.project.as_deref(), args.out.as_deref())?;
     let stop = stop_on_signals()?;
     prepare_project_javascript(&project, false, &stop)?;
     if let Some(ui) = &project.ui {
