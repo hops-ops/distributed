@@ -33,9 +33,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 #[cfg(feature = "command-host")]
-use distributed::cell_host::{CelldCommandHost, InternalHttpSecret};
-#[cfg(feature = "command-host")]
 use distributed::command_dispatch::{CommandHost, VerifiedPrincipal};
+#[cfg(feature = "command-host")]
+use distributed::microsvc::cell_host::{CelldCommandHost, InternalHttpSecret};
 #[cfg(feature = "command-host")]
 #[cfg(feature = "command-host")]
 use distributed::microsvc::CausalDispatchError;

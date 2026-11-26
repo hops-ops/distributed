@@ -112,7 +112,7 @@ CREATE TABLE IF NOT EXISTS bus_log_identity (
 )";
 
 /// Postgres [`Bus`](super::Bus) + [`BusConsumer`](super::BusConsumer). Cheap to
-/// clone (the pool is an `Arc`). Build it with [`SqlBus::new`] over a `PgPool`.
+/// clone (the pool is an `Arc`). Build it with `SqlBus::new` over a `PgPool`.
 pub type PostgresBus = SqlBus<Postgres>;
 
 /// A claimed Postgres `bus_queue` row: `ack` deletes it (done); `nack` makes it

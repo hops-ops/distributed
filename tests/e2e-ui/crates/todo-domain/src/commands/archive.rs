@@ -5,7 +5,7 @@ use serde::Deserialize;
 use super::TodoStatusPayload;
 use crate::{domain_commands, Todo};
 
-#[derive(Debug, Deserialize, distributed::CommandInput)]
+#[derive(Debug, Deserialize, distributed::command::CommandInput)]
 pub struct TodoArchiveInput {
     pub todo_id: String,
 }

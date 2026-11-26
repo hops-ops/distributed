@@ -176,7 +176,7 @@ fn same_shaped_upcast_precedes_guard_and_preserves_stored_history() {
 
 #[tokio::test]
 async fn cell_repository_rejects_incompatible_tail_without_changing_storage() {
-    use distributed::cell_host::CellStreamStore;
+    use distributed::microsvc::cell_host::CellStreamStore;
 
     for version in [1, 2, 3] {
         let store = CellStreamStore::new(Versioned::aggregate_type(), "item").unwrap();

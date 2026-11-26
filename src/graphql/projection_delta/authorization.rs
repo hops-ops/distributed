@@ -1,6 +1,6 @@
 use super::types::{AuthorizationTransition, ProjectionDeltaVisibility, ProjectionMutationSource};
 use super::{DeltaKeyField, DeltaValue, ProjectionDeltaError, ProjectionDeltaPartition};
-use crate::{
+use crate::projection::{
     ResolvedProjectionKey, ResolvedProjectionMutation, ResolvedProjectionPartition,
     ResolvedProjectionPartitionRef, ResolvedProjectionRelationshipEffect,
 };

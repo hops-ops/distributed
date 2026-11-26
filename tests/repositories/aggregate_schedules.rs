@@ -6,8 +6,8 @@
 
 use std::time::{Duration, SystemTime};
 
-use distributed::repository::{CommitBatch, StreamWrite};
 use distributed::schedule::{Schedule, ScheduleWrite};
+use distributed::{CommitBatch, StreamWrite};
 use distributed::{Entity, SqliteRepository, StreamIdentity, TransactionalCommit};
 
 fn event(entity: &mut Entity, id: &str) {

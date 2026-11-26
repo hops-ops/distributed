@@ -139,7 +139,7 @@ impl<M> ModelPermissions<M> {
 ///     }
 /// }
 /// ```
-pub trait AuthorizedReadModel: crate::RelationalReadModelIncludes {
+pub trait AuthorizedReadModel: crate::read_model::RelationalReadModelIncludes {
     /// Who may read this model, which columns and which rows.
     fn permissions() -> ModelPermissions<Self>;
 }
@@ -152,7 +152,7 @@ pub trait AuthorizedReadModel: crate::RelationalReadModelIncludes {
 /// ([`grants`](Self::grants)) and table names ([`table_names`](Self::table_names)).
 #[derive(Clone)]
 pub struct ReadModels {
-    catalog: crate::ReadModelCatalog,
+    catalog: crate::table::ReadModelCatalog,
     models: Vec<RegisteredReadModel>,
 }
 
@@ -175,7 +175,7 @@ impl ReadModels {
     /// An empty catalog named `name`.
     pub fn new(name: impl Into<String>) -> Self {
         Self {
-            catalog: crate::ReadModelCatalog::new(name),
+            catalog: crate::table::ReadModelCatalog::new(name),
             models: Vec::new(),
         }
     }
@@ -197,7 +197,7 @@ impl ReadModels {
     }
 
     /// The physical tables, for schema bootstrap and Surface building.
-    pub fn catalog(&self) -> &crate::ReadModelCatalog {
+    pub fn catalog(&self) -> &crate::table::ReadModelCatalog {
         &self.catalog
     }
 

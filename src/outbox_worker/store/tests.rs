@@ -1,8 +1,8 @@
 use super::api::BACKLOG_STATS_SCAN_LIMIT;
 use super::*;
+use crate::outbox::{OutboxMessage, OutboxMessageStatus};
 use crate::{
-    CommitBatch, InMemoryOutboxStore, InMemoryRepository, OutboxMessage, OutboxMessageStatus,
-    RepositoryError, TransactionalCommit,
+    CommitBatch, InMemoryOutboxStore, InMemoryRepository, RepositoryError, TransactionalCommit,
 };
 use std::future::Future;
 use std::sync::{Arc, Barrier};

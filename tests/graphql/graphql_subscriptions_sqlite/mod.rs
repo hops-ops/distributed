@@ -6,11 +6,12 @@ use std::time::Duration;
 use async_graphql::Request;
 use distributed::graphql::{claim, col, read, GraphqlEngine, ModelPermissions};
 use distributed::microsvc::{Session, ROLE_KEY, USER_ID_KEY};
-use distributed::{
-    ColumnType, ExpectedVersion, PrimaryKey, ReadModelChange, ReadModelWritePlanStore, RowKey,
-    RowValue, RowValues, RowWriteMode, TableColumn, TableKind, TableMutation, TableRowMutation,
-    TableSchema, TableWritePlan,
+use distributed::read_model::ReadModelChange;
+use distributed::table::{
+    ColumnType, ExpectedVersion, PrimaryKey, RowKey, RowValue, RowValues, RowWriteMode,
+    TableColumn, TableKind, TableMutation, TableRowMutation, TableSchema, TableWritePlan,
 };
+use distributed::ReadModelWritePlanStore;
 use futures_util::StreamExt;
 use sqlx::sqlite::SqlitePoolOptions;
 
@@ -55,7 +56,7 @@ async fn setup_fixed() -> (
 
     let change_rx = repo.read_model_changes();
 
-    let manifest = distributed::ReadModelCatalog::new("items").table_schema(items_schema());
+    let manifest = distributed::table::ReadModelCatalog::new("items").table_schema(items_schema());
     let engine = GraphqlEngine::from_schema_catalog(&manifest, pool.clone())
         .unwrap()
         .identity(IdentityConfig::dev_headers())
@@ -226,7 +227,7 @@ fn response_hash_stable() {
 /// on the initial push and after a cross-tenant write.
 #[tokio::test]
 async fn subscription_claim_isolation_across_tenants() {
-    use distributed::{ReadModel, RelationalReadModel};
+    use distributed::read_model::{ReadModel, RelationalReadModel};
     use serde::{Deserialize, Serialize};
 
     #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, ReadModel)]
@@ -352,7 +353,7 @@ async fn subscription_claim_isolation_across_tenants() {
 /// two sessions with the same claims share one.
 #[tokio::test]
 async fn sessions_share_a_live_producer_only_when_their_binds_match() {
-    use distributed::ReadModel;
+    use distributed::read_model::ReadModel;
     use serde::{Deserialize, Serialize};
 
     #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, ReadModel)]

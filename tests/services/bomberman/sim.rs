@@ -1,6 +1,8 @@
+use distributed::read_model::{ReadModelWorkspaceExt, Versioned};
+use distributed::table::{RowKey, RowValue};
 use distributed::{
-    GetStream, ReadModelWorkspaceExt, ReadModelWritePlanStore, RelationalReadModelQueryStore,
-    RepositoryError, RowKey, RowValue, TransactionalCommit, Versioned,
+    GetStream, ReadModelWritePlanStore, RelationalReadModelQueryStore, RepositoryError,
+    TransactionalCommit,
 };
 
 use crate::bomberman::domain::player::Player;

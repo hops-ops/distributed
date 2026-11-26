@@ -12,10 +12,11 @@ use crate::projection::catalog::{
 };
 use crate::projection::lower::ProjectionDescriptor;
 use crate::projection::placement::{
-    ProjectionBinding, ProjectionBindingState, ProjectionEpoch, ProjectionExecutorRoute,
-    ProjectionOutput, ProjectionOwner, ProjectionPhysicalTopology, ProjectionSourceBinding,
+    ProjectionBinding, ProjectionBindingState, ProjectionExecutorRoute, ProjectionOutput,
+    ProjectionOwner, ProjectionPhysicalTopology, ProjectionSourceBinding,
     PROJECTION_PARTITION_CODEC_VERSION,
 };
+use crate::projection_protocol::ProjectionEpoch;
 use crate::projection_protocol::ProjectorTopologyId;
 use sha2::{Digest, Sha256};
 

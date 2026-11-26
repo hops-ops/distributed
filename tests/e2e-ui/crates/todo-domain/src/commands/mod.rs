@@ -77,7 +77,7 @@ mod tests {
 
     #[tokio::test]
     async fn cell_host_dispatches_complete_with_the_same_handle_as_soa() {
-        use distributed::cell_host::{AggregateCell, CellCommandIdentity};
+        use distributed::microsvc::cell_host::{AggregateCell, CellCommandIdentity};
         use distributed::microsvc::{Session, USER_ID_KEY};
 
         let cell = AggregateCell::<Todo>::new("todo-1")

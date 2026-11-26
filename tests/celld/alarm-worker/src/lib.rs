@@ -12,13 +12,14 @@
 
 use std::time::Duration;
 
-use distributed::cell_host::{
-    AggregateCell, CausalDispatchError, CellCommandIdentity, CellWaitPathRequest, CelldOutbox,
-    InternalHttpSecret, CELL_INTERNAL_SECRET_ENV, CELL_INTERNAL_SECRET_HEADER,
-    CELL_PRINCIPAL_PARTITION_HEADER, CELL_SERVICE_ID_HEADER,
-};
 use distributed::command::{typed_command, PreparedCommand, Succeeded};
+use distributed::microsvc::cell_host::{
+    AggregateCell, CellCommandIdentity, CellWaitPathRequest, CelldOutbox, InternalHttpSecret,
+    CELL_INTERNAL_SECRET_ENV, CELL_INTERNAL_SECRET_HEADER, CELL_PRINCIPAL_PARTITION_HEADER,
+    CELL_SERVICE_ID_HEADER,
+};
 use distributed::microsvc::schedule::schedule_guard;
+use distributed::microsvc::CausalDispatchError;
 use distributed::microsvc::{
     CausalCommandContext, CausalRouteDependencies, HandlerError, PortableCommand, Routes, Session,
     ROLE_KEY, USER_ID_KEY,
@@ -60,7 +61,7 @@ impl Ticker {
     }
 }
 
-#[derive(Debug, Deserialize, distributed::CommandInput)]
+#[derive(Debug, Deserialize, distributed::command::CommandInput)]
 pub struct StartInput {
     pub id: String,
     pub limit: u32,
@@ -68,12 +69,12 @@ pub struct StartInput {
     pub fail_after_arming: bool,
 }
 
-#[derive(Debug, Serialize, Deserialize, distributed::CommandInput)]
+#[derive(Debug, Serialize, Deserialize, distributed::command::CommandInput)]
 pub struct TickerInput {
     pub id: String,
 }
 
-#[derive(Debug, Serialize, distributed::CommandOutput)]
+#[derive(Debug, Serialize, distributed::command::CommandOutput)]
 pub struct TickerPayload {
     pub id: String,
     pub ticks: u32,

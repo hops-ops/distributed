@@ -231,11 +231,12 @@ pub async fn run(args: MobPitArgs) -> std::io::Result<()> {
         .data_dir
         .clone()
         .unwrap_or_else(|| std::env::temp_dir().join("game-demos-mobpit"));
-    let secret = std::env::var(distributed::cell_host::CELL_INTERNAL_SECRET_ENV).map_err(|_| {
-        std::io::Error::other(
-            "DISTRIBUTED_INTERNAL_SECRET is required (shared with the celld cells worker)",
-        )
-    })?;
+    let secret = std::env::var(distributed::microsvc::cell_host::CELL_INTERNAL_SECRET_ENV)
+        .map_err(|_| {
+            std::io::Error::other(
+                "DISTRIBUTED_INTERNAL_SECRET is required (shared with the celld cells worker)",
+            )
+        })?;
     let celld = store::CelldOptions::new(&args.celld_url, secret).map_err(std::io::Error::other)?;
     let mut options = WorldOptions::new(&data_dir, celld);
     options.redis_url = args.redis_url.clone();

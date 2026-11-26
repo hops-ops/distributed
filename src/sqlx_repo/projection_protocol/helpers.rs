@@ -100,10 +100,10 @@ pub(super) fn decode_observation_kind(
 
 pub(super) fn decode_program_id(
     value: Option<String>,
-) -> Result<Option<crate::ProjectionProgramId>, ProjectionProtocolError> {
+) -> Result<Option<crate::projection::ProjectionProgramId>, ProjectionProtocolError> {
     value
         .map(|value| {
-            crate::ProjectionProgramId::parse(&value).map_err(|error| {
+            crate::projection::ProjectionProgramId::parse(&value).map_err(|error| {
                 corrupt_storage(format!(
                     "invalid stored projection program identity: {error}"
                 ))

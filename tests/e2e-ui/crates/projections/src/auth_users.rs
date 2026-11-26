@@ -1,8 +1,8 @@
 //! Auth users: the Zitadel profile fact + its projection into `auth_users`.
 
+use distributed::mutation::Mutation;
 use distributed::mutation_file;
 use distributed::projection::lower::{EventualOnly, ProjectionDescriptor};
-use distributed::Mutation;
 use e2e_readmodels::AuthUsers;
 use serde::{Deserialize, Serialize};
 
@@ -11,7 +11,9 @@ use serde::{Deserialize, Serialize};
 /// An external fact: the ingestor publishes it with
 /// `publish_external`, identified by the provider delivery it came from, and
 /// [`AUTH_USERS`] writes it to `auth_users` as it is (the row is the profile).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, distributed::DomainEvent)]
+#[derive(
+    Debug, Clone, PartialEq, Eq, Serialize, Deserialize, distributed::domain_event::DomainEvent,
+)]
 #[domain_event(name = "zitadel.user_profile", version = 1)]
 pub struct ZitadelUserProfile {
     /// Zitadel subject (OIDC `sub`, session `x-user-id`).
@@ -76,7 +78,9 @@ distributed::projection! {
 
 #[cfg(test)]
 mod tests {
-    use distributed::{DomainEventOccurrence, ExternalEventSource, MutationKind, RowValue};
+    use distributed::domain_event::{DomainEventOccurrence, ExternalEventSource};
+    use distributed::projection::MutationKind;
+    use distributed::table::RowValue;
 
     use super::*;
 

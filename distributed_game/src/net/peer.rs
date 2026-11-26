@@ -6,7 +6,7 @@
 use std::sync::OnceLock;
 use std::time::Duration;
 
-use distributed::cell_host::{InternalHttpSecret, CELL_INTERNAL_SECRET_HEADER};
+use distributed::microsvc::cell_host::{InternalHttpSecret, CELL_INTERNAL_SECRET_HEADER};
 use serde_json::Value;
 
 /// POST `body` to `{admin_url}{path}`; returns the status and the JSON

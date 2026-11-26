@@ -65,12 +65,13 @@ fn direct_model(model_name: &str, table_name: &str) -> TableSchema {
     }
 }
 
-struct TestProjectionDescriptor(crate::ProjectionProgram);
+struct TestProjectionDescriptor(crate::projection::ProjectionProgram);
 
 impl crate::projection::placement::ProjectionProgramDescriptor for TestProjectionDescriptor {
     fn projection_program(
         &self,
-    ) -> Result<crate::ProjectionProgram, crate::ProjectionProgramError> {
+    ) -> Result<crate::projection::ProjectionProgram, crate::projection::ProjectionProgramError>
+    {
         Ok(self.0.clone())
     }
 }
@@ -117,6 +118,9 @@ fn modeled_projection_with_outputs(
     schemas: Vec<TableSchema>,
     options: DirectModeledBinding<'_>,
 ) -> SurfaceModeledProjection {
+    use crate::domain_event::{
+        DomainEventBodyKind, DOMAIN_EVENT_BODY_CODEC, DOMAIN_EVENT_BODY_CODEC_VERSION,
+    };
     use crate::projection::catalog::{ProjectionBindingActivation, ProjectionCatalog};
     use crate::projection::placement::{
         DirectProjectionPlacement, ProjectionBinding, ProjectionExecutionClass,
@@ -124,14 +128,13 @@ fn modeled_projection_with_outputs(
         ProjectionSourceBinding, PROJECTION_PARTITION_CODEC_VERSION,
     };
     use crate::projection::{
+        MutationKind, ProjectionAssignment, ProjectionEventSelector, ProjectionExpression,
+        ProjectionKeyField, ProjectionProgram, ProjectionValue,
+    };
+    use crate::projection::{
         ProjectionArm, ProjectionField, ProjectionOperation, ProjectionPartition, ProjectionTarget,
     };
     use crate::projection_protocol::{ProjectionEpoch, ProjectorTopologyId};
-    use crate::{
-        DomainEventBodyKind, MutationKind, ProjectionAssignment, ProjectionEventSelector,
-        ProjectionExpression, ProjectionKeyField, ProjectionProgram, ProjectionValue,
-        DOMAIN_EVENT_BODY_CODEC, DOMAIN_EVENT_BODY_CODEC_VERSION,
-    };
 
     let selector = ProjectionEventSelector::try_new(
         1,
@@ -298,17 +301,17 @@ fn causal_surface_commands_accept_modeled_event_selectors_but_not_empty_authorit
     let mut modeled = test_command("order.modeled", "order_modeled", output());
     modeled.consistency = CommandConsistency::Eventual;
     modeled.projections.selectors.push(
-        crate::ProjectionEventSelector::try_new(
+        crate::projection::ProjectionEventSelector::try_new(
             1,
             "order.changed",
             1,
-            crate::DomainEventBodyKind::State,
+            crate::domain_event::DomainEventBodyKind::State,
             "OrderState",
             1,
             "urn:test:order-state:v1",
             "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-            crate::DOMAIN_EVENT_BODY_CODEC,
-            crate::DOMAIN_EVENT_BODY_CODEC_VERSION,
+            crate::domain_event::DOMAIN_EVENT_BODY_CODEC,
+            crate::domain_event::DOMAIN_EVENT_BODY_CODEC_VERSION,
         )
         .unwrap(),
     );

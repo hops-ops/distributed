@@ -137,7 +137,7 @@ pub trait OutboxStore: Send + Sync {
     /// override this with `COUNT`/`MIN(created_at)` or equivalent (both
     /// in-tree stores do).
     ///
-    /// The default pages up to [`BACKLOG_STATS_SCAN_LIMIT`] pending rows —
+    /// The default pages up to `BACKLOG_STATS_SCAN_LIMIT` pending rows —
     /// never the whole outbox, per the bound contract on
     /// [`messages_by_status`]. The count saturates at that limit; the oldest
     /// creation time stays exact because pending listings are in claim

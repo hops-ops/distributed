@@ -1309,8 +1309,11 @@ mod tests {
             .bootstrap_table_schema_for_dev(&table_registry)
             .await
             .unwrap();
-        let program_id =
-            crate::ProjectionProgramId::parse(&format!("pp1:sha256:{}", "4".repeat(64))).unwrap();
+        let program_id = crate::projection::ProjectionProgramId::parse(&format!(
+            "pp1:sha256:{}",
+            "4".repeat(64)
+        ))
+        .unwrap();
         let ownership = ProjectionModelOwnership::new("WireView", "wire_views")
             .unwrap()
             .with_program_id(program_id);

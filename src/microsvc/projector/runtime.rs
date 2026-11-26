@@ -169,44 +169,45 @@ where
                 )
             })?;
             let store = dependencies.__causal_projection_store();
-            let occurrence =
-                match crate::DomainEventOccurrence::from_canonical_bytes(&message.payload) {
-                    Ok(occurrence)
-                        if occurrence.id() == message_id
-                            && occurrence.descriptor().name == message.name
-                            && occurrence.causation_id() == Some(causation_id) =>
-                    {
-                        occurrence
-                    }
-                    Ok(_) => {
-                        return record_ingress_failure(
-                            store,
-                            &self.compiled,
-                            self.change_epoch.clone(),
-                            message,
-                            ordered,
-                            message_id,
-                            causation_id,
-                            HandlerError::DecodeFailed(
-                                "domain occurrence differs from its transport envelope".into(),
-                            ),
-                        )
-                        .await
-                    }
-                    Err(error) => {
-                        return record_ingress_failure(
-                            store,
-                            &self.compiled,
-                            self.change_epoch.clone(),
-                            message,
-                            ordered,
-                            message_id,
-                            causation_id,
-                            HandlerError::Other(Box::new(error)),
-                        )
-                        .await
-                    }
-                };
+            let occurrence = match crate::domain_event::DomainEventOccurrence::from_canonical_bytes(
+                &message.payload,
+            ) {
+                Ok(occurrence)
+                    if occurrence.id() == message_id
+                        && occurrence.descriptor().name == message.name
+                        && occurrence.causation_id() == Some(causation_id) =>
+                {
+                    occurrence
+                }
+                Ok(_) => {
+                    return record_ingress_failure(
+                        store,
+                        &self.compiled,
+                        self.change_epoch.clone(),
+                        message,
+                        ordered,
+                        message_id,
+                        causation_id,
+                        HandlerError::DecodeFailed(
+                            "domain occurrence differs from its transport envelope".into(),
+                        ),
+                    )
+                    .await
+                }
+                Err(error) => {
+                    return record_ingress_failure(
+                        store,
+                        &self.compiled,
+                        self.change_epoch.clone(),
+                        message,
+                        ordered,
+                        message_id,
+                        causation_id,
+                        HandlerError::Other(Box::new(error)),
+                    )
+                    .await
+                }
+            };
             let lowered = if self.executor.matches(&occurrence) {
                 match self.executor.plan(&occurrence) {
                     Ok(lowered) => Some(lowered),

@@ -122,8 +122,8 @@ pub struct DurableAggregateCellState {
 ///
 /// ```compile_fail
 /// fn two_cell_transaction_does_not_exist(
-///     left: &distributed::cell_host::CellStreamStore,
-///     right: &distributed::cell_host::CellStreamStore,
+///     left: &distributed::microsvc::cell_host::CellStreamStore,
+///     right: &distributed::microsvc::cell_host::CellStreamStore,
 ///     batch: distributed::CommitBatch<'_>,
 /// ) {
 ///     let _ = left.commit_across(right, batch);
@@ -134,7 +134,7 @@ pub struct CellStreamStore {
     ownership: CellOwnership,
     inner: CellRepository,
     /// Resolves relative alarm due times at commit and drives alarm firing.
-    clock: Arc<dyn crate::Clock>,
+    clock: Arc<dyn crate::clock::Clock>,
     #[cfg(not(all(feature = "cloudflare-workers", target_arch = "wasm32")))]
     sealed_row: Arc<Mutex<Option<Value>>>,
     #[cfg(not(all(feature = "cloudflare-workers", target_arch = "wasm32")))]
@@ -154,7 +154,7 @@ impl CellStreamStore {
         Ok(Self {
             ownership: CellOwnership::Exclusive(identity),
             inner: CellSqlRepository::from_state(state)?,
-            clock: Arc::new(crate::SystemClock),
+            clock: Arc::new(crate::clock::SystemClock),
         })
     }
 
@@ -173,7 +173,7 @@ impl CellStreamStore {
                 owns: Arc::new(owns),
             },
             inner: CellSqlRepository::from_state(state)?,
-            clock: Arc::new(crate::SystemClock),
+            clock: Arc::new(crate::clock::SystemClock),
         })
     }
 
@@ -207,7 +207,7 @@ impl CellStreamStore {
         Self {
             ownership,
             inner,
-            clock: Arc::new(crate::SystemClock),
+            clock: Arc::new(crate::clock::SystemClock),
             sealed_row: Arc::new(Mutex::new(None)),
             sealed_row_reducer: None,
             alarms: Arc::new(Mutex::new(Default::default())),
@@ -270,12 +270,12 @@ impl CellStreamStore {
     }
 
     /// Replace the cell clock (default: the system clock). The reference host
-    /// takes a [`ManualClock`](crate::ManualClock) so alarm tests are
+    /// takes a [`ManualClock`](crate::clock::ManualClock) so alarm tests are
     /// deterministic; it resolves [`Schedule::after`](super::Schedule::after)
     /// at commit and is what [`AggregateCell::fire_due_schedules`] reads.
     ///
     /// [`AggregateCell::fire_due_schedules`]: super::AggregateCell::fire_due_schedules
-    pub fn with_clock(mut self, clock: impl crate::Clock + 'static) -> Self {
+    pub fn with_clock(mut self, clock: impl crate::clock::Clock + 'static) -> Self {
         self.clock = Arc::new(clock);
         self
     }

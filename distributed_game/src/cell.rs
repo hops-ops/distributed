@@ -1,5 +1,5 @@
 //! Helpers for committing facts as idempotent commands into a
-//! `distributed` [`AggregateCell`](distributed::cell_host::AggregateCell)
+//! `distributed` [`AggregateCell`](distributed::microsvc::cell_host::AggregateCell)
 //! (the sinks themselves are `CommandFactSink` and `CelldFactSink`):
 //!
 //! - the principal comes **only** from [`Fact::principal`] — bound by the
@@ -15,12 +15,13 @@
 //!   instead of committing twice;
 //! - [`run_fact_batch`] answers a celld object host's fact batch.
 
-use distributed::cell_host::{
-    AggregateCell, CausalDispatchError, CellBatchCommand, CellCommandIdentity, CellWaitPathRequest,
+use distributed::microsvc::cell_host::{
+    AggregateCell, CellBatchCommand, CellCommandIdentity, CellWaitPathRequest,
 };
+use distributed::microsvc::CausalDispatchError;
 use distributed::microsvc::Session;
+use distributed::microsvc::USER_ID_KEY;
 use distributed::Aggregate;
-use distributed::USER_ID_KEY;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 

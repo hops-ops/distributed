@@ -6,13 +6,13 @@ use serde::{Deserialize, Serialize};
 use crate::{domain_commands, Todo, TodoState};
 use distributed::microsvc::guards;
 
-#[derive(Debug, Deserialize, distributed::CommandInput)]
+#[derive(Debug, Deserialize, distributed::command::CommandInput)]
 pub struct TodoCreateInput {
     pub todo_id: String,
     pub title: String,
 }
 
-#[derive(Debug, Serialize, distributed::CommandOutput)]
+#[derive(Debug, Serialize, distributed::command::CommandOutput)]
 pub struct TodoCreatePayload {
     pub todo_id: String,
     pub owner_id: String,

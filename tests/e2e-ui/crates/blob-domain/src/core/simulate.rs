@@ -6,7 +6,7 @@ use super::{Direction, Tile};
 
 /// The game columns a move changes, named as `BlobGames` columns so the
 /// client preview patches them directly.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, distributed::JsonType)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, distributed::table::JsonType)]
 pub struct MovePreview {
     pub map: Vec<Vec<Tile>>,
     /// Directions that stay on the board from the new position.

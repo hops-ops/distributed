@@ -48,11 +48,12 @@
 //! is at-least-once with stable message ids; the projector deduplicates.
 
 use distributed::bus::{CelldQueueEnvelope, CelldQueueHttpPublisher, CelldQueueRelay};
-use distributed::cell_host::{
-    AggregateCell, CausalDispatchError, CelldOutbox, InternalHttpSecret, CELL_INTERNAL_SECRET_ENV,
+use distributed::command::{typed_command, PreparedCommand, Succeeded};
+use distributed::microsvc::cell_host::{
+    AggregateCell, CelldOutbox, InternalHttpSecret, CELL_INTERNAL_SECRET_ENV,
     CELL_INTERNAL_SECRET_HEADER, CELL_PRINCIPAL_PARTITION_HEADER, CELL_SERVICE_ID_HEADER,
 };
-use distributed::command::{typed_command, PreparedCommand, Succeeded};
+use distributed::microsvc::CausalDispatchError;
 use distributed::microsvc::{
     CausalCommandContext, CausalRouteDependencies, HandlerError, PortableCommand, Routes, Session,
 };
@@ -151,7 +152,7 @@ impl PlayerPresence {
 
 /// Any lifecycle fact input (the union of `distributed_game::lifecycle`'s
 /// inputs; decoded per command with `Lifecycle::decode`).
-#[derive(Debug, Serialize, Deserialize, distributed::CommandInput)]
+#[derive(Debug, Serialize, Deserialize, distributed::command::CommandInput)]
 pub struct LifecycleInput {
     pub zone: String,
     pub via: Option<String>,
@@ -161,7 +162,7 @@ pub struct LifecycleInput {
     pub cause: Option<String>,
 }
 
-#[derive(Debug, Serialize, distributed::CommandOutput)]
+#[derive(Debug, Serialize, distributed::command::CommandOutput)]
 pub struct PresenceApplied {
     /// False when a later-emitted fact already set the entry.
     pub applied: bool,
@@ -359,10 +360,10 @@ distributed_game::celld_zone_object!(PitRoom, mobpit_rooms::MobPit);
 
 /// Tier saga steps run only for the worker's own session.
 fn saga_session(header: &dyn Fn(&str) -> Option<String>) -> Option<Session> {
-    let principal = header(distributed::USER_ID_KEY)?;
+    let principal = header(distributed::microsvc::USER_ID_KEY)?;
     (principal == SAGA_PRINCIPAL).then(|| {
         let mut session = Session::new();
-        session.set(distributed::USER_ID_KEY, principal);
+        session.set(distributed::microsvc::USER_ID_KEY, principal);
         session
     })
 }
@@ -517,7 +518,7 @@ async fn saga(env: &Env, envelope: &CelldQueueEnvelope) -> std::result::Result<(
     set(CELL_INTERNAL_SECRET_HEADER, &secret)?;
     set(CELL_SERVICE_ID_HEADER, "mobpit-tiers")?;
     set(CELL_PRINCIPAL_PARTITION_HEADER, SAGA_PRINCIPAL)?;
-    set(distributed::USER_ID_KEY, SAGA_PRINCIPAL)?;
+    set(distributed::microsvc::USER_ID_KEY, SAGA_PRINCIPAL)?;
     set("content-type", "application/json")?;
     let body = json!({
         "commandId": distributed_game::cell::command_id_for("mobpit-tiers", id),
@@ -567,11 +568,11 @@ pub const ADMIN_PREFIX: &str = "admin:";
 /// internal path); it gets the content-admin role here. The rollout's own
 /// schedule needs no session.
 fn admin_session(header: &dyn Fn(&str) -> Option<String>) -> Option<Session> {
-    let principal = header(distributed::USER_ID_KEY)?;
+    let principal = header(distributed::microsvc::USER_ID_KEY)?;
     principal.starts_with(ADMIN_PREFIX).then(|| {
         let mut session = Session::new();
-        session.set(distributed::USER_ID_KEY, principal);
-        session.set(distributed::ROLE_KEY, CONTENT_ADMIN_ROLE);
+        session.set(distributed::microsvc::USER_ID_KEY, principal);
+        session.set(distributed::microsvc::ROLE_KEY, CONTENT_ADMIN_ROLE);
         session
     })
 }

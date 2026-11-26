@@ -2,7 +2,7 @@
 //!
 //! The type lives here so durable dispatch does not depend on the `graphql`
 //! feature. Verifying a bearer token into a principal is OIDC's job
-//! (`graphql::identity`).
+//! (`graphql::OidcValidator`).
 
 use serde_json::Value;
 use sha2::{Digest, Sha256};

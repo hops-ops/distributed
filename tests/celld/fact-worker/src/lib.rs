@@ -17,12 +17,13 @@
 //! is rebuilt from the trusted fact headers (`fact_session_from_headers`):
 //! the principal and the `FactStamp`; handlers refuse anything else.
 
-use distributed::cell_host::{
-    AggregateCell, CausalDispatchError, CellCommandIdentity, CellWaitPathRequest, CelldOutbox,
-    InternalHttpSecret, CELL_INTERNAL_SECRET_ENV, CELL_INTERNAL_SECRET_HEADER,
-    CELL_PRINCIPAL_PARTITION_HEADER, CELL_SERVICE_ID_HEADER,
-};
 use distributed::command::{typed_command, PreparedCommand, Succeeded};
+use distributed::microsvc::cell_host::{
+    AggregateCell, CellCommandIdentity, CellWaitPathRequest, CelldOutbox, InternalHttpSecret,
+    CELL_INTERNAL_SECRET_ENV, CELL_INTERNAL_SECRET_HEADER, CELL_PRINCIPAL_PARTITION_HEADER,
+    CELL_SERVICE_ID_HEADER,
+};
+use distributed::microsvc::CausalDispatchError;
 use distributed::microsvc::{
     CausalCommandContext, CausalRouteDependencies, HandlerError, PortableCommand, Routes, Session,
 };
@@ -43,7 +44,7 @@ fn is_fact<A: Aggregate + Send + Sync + 'static>(ctx: &CausalCommandContext<'_, 
     ctx.session().user_id().is_some() && session_stamp(ctx.session()).is_some()
 }
 
-#[derive(Debug, Serialize, distributed::CommandOutput)]
+#[derive(Debug, Serialize, distributed::command::CommandOutput)]
 pub struct Recorded {
     pub count: u32,
 }
@@ -67,7 +68,7 @@ impl Kills {
     }
 }
 
-#[derive(Debug, Deserialize, distributed::CommandInput)]
+#[derive(Debug, Deserialize, distributed::command::CommandInput)]
 pub struct KillInput {
     pub mob: String,
 }
@@ -120,7 +121,7 @@ impl Match {
     }
 }
 
-#[derive(Debug, Deserialize, distributed::CommandInput)]
+#[derive(Debug, Deserialize, distributed::command::CommandInput)]
 pub struct MatchResultInput {
     pub match_id: String,
     pub winner_slot: u32,
@@ -175,14 +176,14 @@ impl Presence {
     }
 }
 
-#[derive(Debug, Deserialize, distributed::CommandInput)]
+#[derive(Debug, Deserialize, distributed::command::CommandInput)]
 pub struct JoinedInput {
     pub zone: String,
     pub via: String,
     pub from_zone: Option<String>,
 }
 
-#[derive(Debug, Deserialize, distributed::CommandInput)]
+#[derive(Debug, Deserialize, distributed::command::CommandInput)]
 pub struct LeftInput {
     pub zone: String,
     pub reason: String,
@@ -285,7 +286,10 @@ where
     // user and role. Both arrive only on the authenticated internal path.
     let session = fact_session_from_headers(header).unwrap_or_else(|| {
         let mut session = Session::new();
-        for key in [distributed::USER_ID_KEY, distributed::microsvc::ROLE_KEY] {
+        for key in [
+            distributed::microsvc::USER_ID_KEY,
+            distributed::microsvc::ROLE_KEY,
+        ] {
             if let Some(value) = header(key) {
                 session.set(key, value);
             }

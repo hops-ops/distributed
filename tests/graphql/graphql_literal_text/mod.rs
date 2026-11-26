@@ -4,11 +4,9 @@ use common::env as env_support;
 
 use async_graphql::{Request, Variables};
 use distributed::graphql::IdentityConfig;
-use distributed::{
-    graphql::{claim, col, read, GraphqlEngine, ModelPermissions},
-    microsvc::Session,
-    ReadModel, ROLE_KEY, USER_ID_KEY,
-};
+use distributed::graphql::{claim, col, read, GraphqlEngine, ModelPermissions};
+use distributed::microsvc::{Session, ROLE_KEY, USER_ID_KEY};
+use distributed::read_model::ReadModel;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 

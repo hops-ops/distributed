@@ -4,12 +4,14 @@
 //! generated registration matches the hand-written form (command specs,
 //! GraphQL SDL and the client manifest).
 
-use distributed::cell_host::{AggregateCell, CausalDispatchError, CellCommandIdentity};
 use distributed::command::{Eventual, PreparedCommand, Succeeded};
+use distributed::domain_event::DomainState;
+use distributed::microsvc::cell_host::{AggregateCell, CellCommandIdentity};
+use distributed::microsvc::CausalDispatchError;
 use distributed::microsvc::{
     require_loaded, CausalCommandContext, HandlerError, Session, USER_ID_KEY,
 };
-use distributed::{sourced, DomainState, Entity};
+use distributed::{sourced, Entity};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
@@ -44,14 +46,14 @@ impl From<&Hero> for HeroState {
     }
 }
 
-#[derive(Debug, Deserialize, distributed::CommandInput)]
+#[derive(Debug, Deserialize, distributed::command::CommandInput)]
 #[serde(deny_unknown_fields)]
 pub struct CreateHero {
     pub hero_id: String,
     pub name: String,
 }
 
-#[derive(Debug, Deserialize, distributed::CommandInput)]
+#[derive(Debug, Deserialize, distributed::command::CommandInput)]
 #[serde(deny_unknown_fields)]
 pub struct EquipInput {
     pub hero_id: String,
@@ -59,20 +61,20 @@ pub struct EquipInput {
     pub item: String,
 }
 
-#[derive(Debug, Deserialize, distributed::CommandInput)]
+#[derive(Debug, Deserialize, distributed::command::CommandInput)]
 #[serde(deny_unknown_fields)]
 pub struct NapInput {
     pub minutes: u32,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, distributed::CommandOutput)]
+#[derive(Debug, Clone, PartialEq, Serialize, distributed::command::CommandOutput)]
 pub struct HeroPayload {
     pub hero_id: String,
     pub name: String,
     pub items: u32,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, distributed::CommandOutput)]
+#[derive(Debug, Clone, PartialEq, Serialize, distributed::command::CommandOutput)]
 pub struct NapReceipt {
     pub hero_id: String,
     pub naps: u32,

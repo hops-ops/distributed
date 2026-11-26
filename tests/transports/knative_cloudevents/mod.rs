@@ -11,9 +11,8 @@ use distributed::bus::{Bus, KnativeBus};
 use distributed::microsvc::{cloud_events_router, decode_cloud_event};
 
 use crate::transport_in_memory::IN_MEMORY;
-use distributed::microsvc::{
-    Context, HandlerError, Message, MessageKind, Routes, Service, SubscriptionPlan,
-};
+use distributed::bus::{Message, MessageKind, SubscriptionPlan};
+use distributed::microsvc::{Context, HandlerError, Routes, Service};
 use serde_json::json;
 
 async fn spawn_server() -> (String, Arc<Mutex<Vec<String>>>) {

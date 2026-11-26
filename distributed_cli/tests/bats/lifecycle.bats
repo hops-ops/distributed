@@ -119,7 +119,7 @@ SCRIPT
     ZERO_CONFIG_REAL_NPM="$ZERO_CONFIG_REAL_NPM" \
     "$DISTRIBUTED_BIN" build "$PROJECT"
   [ "$status" -ne 0 ]
-  if [[ "$output" != *'must publicly export a zero-argument function returning `distributed::ApplicationManifest`'* ]]; then
+  if [[ "$output" != *'must publicly export a zero-argument function returning `distributed::application::ApplicationManifest`'* ]]; then
     printf 'unexpected invalid-export diagnostic:\n%s\n' "$output" >&2
     false
   fi

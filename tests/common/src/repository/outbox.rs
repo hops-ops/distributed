@@ -2,10 +2,13 @@ use std::sync::Mutex;
 use std::time::{Duration, SystemTime};
 
 use distributed::bus::{Message, MessagePublisher, TransportError};
+use distributed::outbox::{OutboxMessage, OutboxMessageStatus};
+use distributed::outbox_worker::{
+    ClaimOutboxMessages, OutboxClaimRef, OutboxDispatcher, OutboxPublishFailureAction, OutboxStore,
+    OUTBOX_RETRY,
+};
 use distributed::{
-    Aggregate, AggregateBuilder, ClaimOutboxMessages, GetStream, OutboxClaimRef, OutboxDispatcher,
-    OutboxMessage, OutboxMessageStatus, OutboxPublishFailureAction, OutboxStore, RepositoryError,
-    StreamIdentity, TransactionalCommit, OUTBOX_RETRY,
+    Aggregate, AggregateBuilder, GetStream, RepositoryError, StreamIdentity, TransactionalCommit,
 };
 
 use super::scenario::unique_id;

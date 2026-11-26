@@ -6,14 +6,14 @@ use serde::Deserialize;
 use super::{simulate_move, Direction, MovePreview, Tile};
 
 /// The `BlobGames` columns a move reads.
-#[derive(Debug, Deserialize, distributed::JsonType)]
+#[derive(Debug, Deserialize, distributed::table::JsonType)]
 pub struct MoveRow {
     pub map: Vec<Vec<Tile>>,
     pub score: i64,
 }
 
 /// The `blob.move` input the preview needs.
-#[derive(Debug, Deserialize, distributed::JsonType)]
+#[derive(Debug, Deserialize, distributed::table::JsonType)]
 pub struct MoveArgs {
     pub direction: Direction,
 }

@@ -1,4 +1,4 @@
-//! Saga timeouts are [`Schedule`](crate::Schedule)s.
+//! Saga timeouts are [`Schedule`](crate::schedule::Schedule)s.
 //!
 //! Each saga stream owns one schedule, [`SAGA_TIMEOUT_SCHEDULE`]. Every
 //! dispatch re-arms it at the awaited command's deadline (a new generation
@@ -26,7 +26,7 @@ pub const SAGA_TIMEOUT_SCHEDULE: &str = "saga.timeout";
 
 /// Input of a fired saga timeout: the dispatch it times out. The saga
 /// ignores it unless that dispatch is still the one it awaits.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, crate::CommandInput)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, crate::command::CommandInput)]
 pub struct SagaTimeout {
     pub saga_id: String,
     pub step: String,
@@ -35,7 +35,7 @@ pub struct SagaTimeout {
     pub attempt: u32,
 }
 
-#[derive(Debug, Serialize, crate::CommandOutput)]
+#[derive(Debug, Serialize, crate::command::CommandOutput)]
 struct SagaTimedOut {
     /// The timeout changed the saga (false: it had moved on).
     applied: bool,

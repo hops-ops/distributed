@@ -59,13 +59,13 @@ pub(crate) fn expand_domain_event(input: DeriveInput) -> syn::Result<proc_macro2
     let fingerprint = LitStr::new(&fingerprint, Span::call_site());
 
     Ok(quote! {
-        impl #framework::DomainEvent for #name {
-            const DESCRIPTOR: #framework::DomainEventDescriptor =
-                #framework::DomainEventDescriptor {
+        impl #framework::domain_event::DomainEvent for #name {
+            const DESCRIPTOR: #framework::domain_event::DomainEventDescriptor =
+                #framework::domain_event::DomainEventDescriptor {
                     name: std::borrow::Cow::Borrowed(#event_name),
                     version: #version,
-                    body: #framework::DomainEventBodyDescriptor::distributed_json(
-                        #framework::DomainEventBodyKind::Event,
+                    body: #framework::domain_event::DomainEventBodyDescriptor::distributed_json(
+                        #framework::domain_event::DomainEventBodyKind::Event,
                         #type_name,
                         #version,
                         #schema,
@@ -78,8 +78,8 @@ pub(crate) fn expand_domain_event(input: DeriveInput) -> syn::Result<proc_macro2
             const EVENT_NAME: &'static str = #event_name;
             const EVENT_VERSION: u64 = #version;
 
-            fn descriptor() -> #framework::DomainEventDescriptor {
-                <Self as #framework::DomainEvent>::DESCRIPTOR.clone()
+            fn descriptor() -> #framework::domain_event::DomainEventDescriptor {
+                <Self as #framework::domain_event::DomainEvent>::DESCRIPTOR.clone()
             }
         }
 
@@ -89,8 +89,8 @@ pub(crate) fn expand_domain_event(input: DeriveInput) -> syn::Result<proc_macro2
             fn command_projection_descriptor(
                 _: &'static str,
                 _: u64,
-            ) -> #framework::DomainEventDescriptor {
-                <Self as #framework::DomainEvent>::DESCRIPTOR.clone()
+            ) -> #framework::domain_event::DomainEventDescriptor {
+                <Self as #framework::domain_event::DomainEvent>::DESCRIPTOR.clone()
             }
         }
 

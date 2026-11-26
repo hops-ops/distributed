@@ -225,8 +225,9 @@ pub async fn d7_concurrent_with_timeout_bound_terminates(db: Db) {
 /// staying under max_depth (proves weights, not only depth).
 pub async fn d8_two_level_default_nest_exceeds_row_budget(db: Db) {
     use distributed::graphql::{read, GraphqlEngine};
-    use distributed::ReadModel;
-    use distributed::{ReadModelCatalog, RelationalReadModel, RelationshipDef, RelationshipKind};
+    use distributed::read_model::ReadModel;
+    use distributed::read_model::RelationalReadModel;
+    use distributed::table::{ReadModelCatalog, RelationshipDef, RelationshipKind};
     use serde::{Deserialize, Serialize};
 
     #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, ReadModel)]
@@ -332,8 +333,9 @@ pub async fn d8_two_level_default_nest_exceeds_row_budget(db: Db) {
 /// One default nest stays under the default row budget (100 × 101 = 10,100).
 pub async fn d8_shallow_nested_has_many_within_budget(db: Db) {
     use distributed::graphql::{read, GraphqlEngine};
-    use distributed::ReadModel;
-    use distributed::{ReadModelCatalog, RelationalReadModel, RelationshipDef, RelationshipKind};
+    use distributed::read_model::ReadModel;
+    use distributed::read_model::RelationalReadModel;
+    use distributed::table::{ReadModelCatalog, RelationshipDef, RelationshipKind};
     use serde::{Deserialize, Serialize};
 
     #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, ReadModel)]
@@ -396,8 +398,9 @@ pub async fn d8_shallow_nested_has_many_within_budget(db: Db) {
 /// Explicit low max_rows rejects modest nests (budget knob works).
 pub async fn d8_low_max_rows_rejects_single_nest(db: Db) {
     use distributed::graphql::{read, GraphqlEngine};
-    use distributed::ReadModel;
-    use distributed::{ReadModelCatalog, RelationalReadModel, RelationshipDef, RelationshipKind};
+    use distributed::read_model::ReadModel;
+    use distributed::read_model::RelationalReadModel;
+    use distributed::table::{ReadModelCatalog, RelationshipDef, RelationshipKind};
     use serde::{Deserialize, Serialize};
 
     #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, ReadModel)]
@@ -470,8 +473,9 @@ pub async fn d8_low_max_rows_rejects_single_nest(db: Db) {
 /// to a product within budget is accepted.
 pub async fn d8_explicit_limits_multiply_into_the_row_budget(db: Db) {
     use distributed::graphql::{read, GraphqlEngine};
-    use distributed::ReadModel;
-    use distributed::{ReadModelCatalog, RelationalReadModel, RelationshipDef, RelationshipKind};
+    use distributed::read_model::ReadModel;
+    use distributed::read_model::RelationalReadModel;
+    use distributed::table::{ReadModelCatalog, RelationshipDef, RelationshipKind};
     use serde::{Deserialize, Serialize};
 
     #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, ReadModel)]

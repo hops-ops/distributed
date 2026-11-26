@@ -5,8 +5,8 @@ use async_graphql::Request;
 use distributed::graphql::IdentityConfig;
 use distributed::graphql::{read, FilterExpr, GraphqlEngine, LitValue, ModelPermissions, Truth};
 use distributed::microsvc::{Session, ROLE_KEY};
+use distributed::read_model::{ReadModel, RelationalReadModel};
 use distributed::table::ColumnType;
-use distributed::{ReadModel, RelationalReadModel};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 

@@ -14,7 +14,7 @@
 //!    SQL) that no live claim holds, until `now + claim_ttl`. Concurrent
 //!    workers get disjoint rows: `FOR UPDATE SKIP LOCKED` on Postgres, the
 //!    single writer on SQLite.
-//! 2. **Dispatch** each through a [`CommandHost`](crate::CommandHost) (the
+//! 2. **Dispatch** each through a [`CommandHost`](crate::command_dispatch::CommandHost) (the
 //!    [`Service`](crate::microsvc::Service) built over the repository) as the trusted schedule
 //!    principal, with [`schedule_session`] and a command id derived from the
 //!    owning stream,
@@ -48,8 +48,8 @@
 
 use std::time::SystemTime;
 
+use crate::microsvc::{ROLE_KEY, USER_ID_KEY};
 use crate::schedule::{ms_to_system_time, system_time_to_ms, ArmedSchedule};
-use crate::{ROLE_KEY, USER_ID_KEY};
 
 use super::{CausalCommandContext, Session};
 
@@ -207,7 +207,7 @@ mod worker {
     pub struct ScheduleWorker {
         store: Arc<dyn ScheduleStore>,
         config: ScheduleWorkerConfig,
-        clock: Option<Arc<dyn crate::Clock>>,
+        clock: Option<Arc<dyn crate::clock::Clock>>,
     }
 
     impl std::fmt::Debug for ScheduleWorker {
@@ -247,7 +247,7 @@ mod worker {
         /// Test hook: measure due times and claims by `clock` instead of the
         /// store clock, so a test can cross `claim_ttl` without sleeping.
         #[doc(hidden)]
-        pub fn with_clock(mut self, clock: Arc<dyn crate::Clock>) -> Self {
+        pub fn with_clock(mut self, clock: Arc<dyn crate::clock::Clock>) -> Self {
             self.clock = Some(clock);
             self
         }

@@ -9,9 +9,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
 use base64::Engine as _;
-use distributed::cell_host::{
-    AggregateCell, CausalDispatchError, CellCommandIdentity, CellStreamStore,
-};
+use distributed::microsvc::cell_host::{AggregateCell, CellCommandIdentity, CellStreamStore};
+use distributed::microsvc::CausalDispatchError;
 use distributed::microsvc::{Session, ROLE_KEY, USER_ID_KEY};
 use distributed::StreamIdentity;
 use distributed_game::cell::command_id_for;

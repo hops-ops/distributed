@@ -203,8 +203,8 @@ pub async fn handle(
 }
 ```
 
-`CreateTodo` derives `Deserialize` + `distributed::CommandInput`; `TodoCreated`
-derives `Serialize` + `distributed::CommandOutput`. Register on the route
+`CreateTodo` derives `Deserialize` + `distributed::command::CommandInput`; `TodoCreated`
+derives `Serialize` + `distributed::command::CommandOutput`. Register on the route
 bundle and serve — the same handlers work over in-process dispatch
 (`Service::dispatch_causal`), HTTP (`microsvc::serve`, feature `http`; body
 `{ "commandId", "input" }`), gRPC (feature `grpc`), and the bus (the command
@@ -341,8 +341,8 @@ Every service should export `read_model_catalog()` registering its read
 models — `distributed describe` and `distributed schema` compile the crate and call it:
 
 ```rust
-pub fn read_model_catalog() -> distributed::ReadModelCatalog {
-    distributed::ReadModelCatalog::new("todos").read_model::<TodoView>()
+pub fn read_model_catalog() -> distributed::table::ReadModelCatalog {
+    distributed::table::ReadModelCatalog::new("todos").read_model::<TodoView>()
 }
 ```
 

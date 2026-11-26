@@ -9,12 +9,11 @@ use std::fmt;
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-pub use crate::projection_protocol::ProjectionEpoch;
+use crate::domain_event::DomainEventBodyKind;
 use crate::projection_protocol::{
     canonical_projection_topology_bytes, digest_projection_binding, ProjectorTopologyId,
 };
 use crate::table::TableSchema;
-use crate::DomainEventBodyKind;
 
 use super::lower::{DirectCandidate, ProjectionDescriptor};
 use super::{

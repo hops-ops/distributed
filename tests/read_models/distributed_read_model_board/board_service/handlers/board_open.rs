@@ -7,7 +7,7 @@ use crate::distributed_read_model_board::board_service::{Board, OpenBoard};
 
 pub const COMMAND: &str = "board.open";
 
-#[derive(Debug, Serialize, distributed::CommandOutput)]
+#[derive(Debug, Serialize, distributed::command::CommandOutput)]
 pub struct Output {
     pub id: String,
 }

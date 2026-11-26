@@ -7,6 +7,7 @@ use super::effects::EffectExpression;
 use super::projection_proof::canonical_json;
 use crate::microsvc::Session;
 use crate::projection::executor::resolved_partition_json;
+use crate::projection::{ProjectionProgramId, ResolvedProjectionPlan};
 use crate::projection_protocol::{
     PartitionId, ProjectionEpoch, ProjectionModelOwnership, ProjectionPartitionSpec,
     ProjectionProtocolError, ProjectionScopeCodec, ProjectorTopologyId,
@@ -14,7 +15,6 @@ use crate::projection_protocol::{
 };
 use crate::read_model::RelationalReadModel;
 use crate::table::{TableMutation, TableSchema};
-use crate::{ProjectionProgramId, ResolvedProjectionPlan};
 
 /// Compiler-retained relational identity for one ordinary `Atomic<M>`
 /// declaration before the GraphQL Surface resolves its unique physical owner.
@@ -460,7 +460,7 @@ impl ResolvedDirectProjectionTarget {
         if plan
             .occurrence()
             .metadata()
-            .get(crate::CAUSATION_ID)
+            .get(crate::trace_context::CAUSATION_ID)
             .map(String::as_str)
             != Some(causation_id)
         {

@@ -84,7 +84,7 @@ use tokio::time::Instant;
 
 pub use crate::facts::BoxFuture;
 /// The hosts' shared secret for peer calls ([`ServerConfig::admin_secret`]).
-pub use distributed::cell_host::InternalHttpSecret;
+pub use distributed::microsvc::cell_host::InternalHttpSecret;
 pub use inbox::{InboxError, ZoneInboxClient, ZONE_MESSAGE_PATH};
 pub use ticket::{
     decode_hs256, NonceCache, SharedTicketVerifier, TicketError, TicketKey, TicketVerifier,
@@ -163,7 +163,7 @@ pub struct ServerConfig {
     /// The hosts' shared internal secret: enables the `/admin/*` routes
     /// (which require it in [`CELL_INTERNAL_SECRET_HEADER`]) and peer calls.
     ///
-    /// [`CELL_INTERNAL_SECRET_HEADER`]: distributed::cell_host::CELL_INTERNAL_SECRET_HEADER
+    /// [`CELL_INTERNAL_SECRET_HEADER`]: distributed::microsvc::cell_host::CELL_INTERNAL_SECRET_HEADER
     pub admin_secret: Option<InternalHttpSecret>,
     /// Peer (host-to-host) request timeout.
     pub peer_timeout: Duration,

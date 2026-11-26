@@ -24,8 +24,8 @@
 //! `node` and `isolate` are debug details (which celld node and V8 isolate
 //! ran the activation, when known); nothing may route by them.
 
-use distributed::cell_host::AggregateCell;
 use distributed::command::{typed_command, PreparedCommand, Succeeded};
+use distributed::microsvc::cell_host::AggregateCell;
 use distributed::microsvc::{
     CausalCommandContext, CausalRouteDependencies, HandlerError, PortableCommand, Routes,
 };
@@ -110,7 +110,9 @@ impl StampKey {
 
 /// The public state carried by `zone.activity_changed`: one
 /// `zone_activity` read-model row.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, distributed::DomainState)]
+#[derive(
+    Clone, Debug, PartialEq, Eq, Serialize, Deserialize, distributed::domain_event::DomainState,
+)]
 #[domain_state(version = 1)]
 pub struct ZoneActivityStatus {
     /// Zone (the cell's stream id).
@@ -196,7 +198,7 @@ impl ZoneActivity {
     Default,
     Serialize,
     Deserialize,
-    distributed::CommandInput,
+    distributed::command::CommandInput,
     crate::FactCommand,
 )]
 #[fact(command = "zone_activity.record")]
@@ -216,7 +218,7 @@ pub struct RecordActivity {
 }
 
 /// The applied (or ignored) report.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, distributed::CommandOutput)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, distributed::command::CommandOutput)]
 pub struct ActivityApplied {
     /// False when a later-emitted report already set the status.
     pub applied: bool,

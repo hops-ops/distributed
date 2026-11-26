@@ -3,7 +3,8 @@ pub(super) mod board_move_card;
 pub(super) mod board_open;
 pub(super) mod board_remove_card;
 
-use distributed::{OutboxMessage, SourcedResult};
+use distributed::outbox::OutboxMessage;
+use distributed::SourcedResult;
 
 use crate::distributed_read_model_board::board_service::Board;
 

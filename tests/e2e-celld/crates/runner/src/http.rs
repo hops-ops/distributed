@@ -13,10 +13,10 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use distributed::bus::{CelldQueueEnvelope, CelldQueueRelayHandler, CELLD_QUEUE_RELAY_PATH};
-use distributed::cell_host::{InternalHttpSecret, CELL_INTERNAL_SECRET_HEADER};
 use distributed::command_dispatch::SharedCommandHost;
 use distributed::gateway::{native::*, *};
-use distributed::graphql::identity::OidcGatewayProvider;
+use distributed::graphql::OidcGatewayProvider;
+use distributed::microsvc::cell_host::{InternalHttpSecret, CELL_INTERNAL_SECRET_HEADER};
 use distributed::microsvc::{self, Service};
 use serde_json::json;
 

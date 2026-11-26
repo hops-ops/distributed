@@ -1,7 +1,7 @@
 //! Todo bounded-context module: command mounts + eventual projection.
 
 use distributed::microsvc::{AggregateDependencies, Routes, ServiceStores};
-use distributed::LocalProjectionMounts;
+use distributed::projection::LocalProjectionMounts;
 use e2e_projections::TODOS;
 use todo_domain::Todo;
 

@@ -14,12 +14,10 @@ use distributed::bus::{
     run_source, MessageSource, PostgresBus, ReceivedMessage, RunOptions, TransportError,
 };
 use distributed::microsvc::{Context, Routes, Service};
+use distributed::outbox::{OutboxMessage, OutboxMessageStatus};
+use distributed::outbox_worker::OutboxSource;
 use distributed::projection_protocol::ProjectionEpoch;
-use distributed::OutboxSource;
-use distributed::{
-    CommitBatch, OutboxMessage, OutboxMessageStatus, PostgresOutboxStore, PostgresRepository,
-    TransactionalCommit,
-};
+use distributed::{CommitBatch, PostgresOutboxStore, PostgresRepository, TransactionalCommit};
 use serde_json::json;
 
 use crate::sql_bus_conformance::{sql_bus_conformance_tests, SqlBackend};

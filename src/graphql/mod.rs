@@ -5,11 +5,11 @@
 //! feature. Execution, the dynamic schema, and the axum router sit behind
 //! `feature = "graphql"`.
 
-pub mod client_manifest;
+pub(crate) mod client_manifest;
 pub mod naming;
 pub mod projection_delta;
-pub mod sdl;
-pub mod surface;
+pub(crate) mod sdl;
+pub(crate) mod surface;
 
 // These modules are structural GraphQL metadata and deliberately remain
 // pool/server independent. `distributed` and the runtime engine must compile the same
@@ -20,18 +20,14 @@ mod filter;
 mod permissions;
 
 pub use client_manifest::*;
-pub use naming::{
-    aggregate_field, by_pk_field, comparison_op_fields, include_postgres_json_comparison_ops,
-    is_valid_graphql_name, mutation_delete_by_pk_field, mutation_insert_one_field,
-    mutation_update_by_pk_field, mutation_upsert_field, object_type_name, root_list_field,
-    scalar_type_name, PORTABLE_COMPARISON_OPS, POSTGRES_JSON_COMPARISON_OPS, STRING_COMPARISON_OPS,
-};
 pub use sdl::{
     graphql_sdl_for_role, graphql_sdl_for_tables, graphql_sdl_for_tables_with_options,
     graphql_sdl_from_surface, SdlOptions,
 };
 pub use surface::{
-    build_surface, surface_for_application, surface_for_role, RootField, RootKind, Surface,
+    build_surface, surface_for_application, surface_for_role, ColumnField, ExternalField,
+    ExternalReadError, ExternalReadErrorKind, ExternalReadExecutor, ExternalReadResult,
+    ExternalReadSource, ExternalRoot, ExternalType, RelField, RootField, RootKind, Surface,
     SurfaceArgument, SurfaceArgumentKind, SurfaceCommand, SurfaceCommandShape, SurfaceDialect,
     SurfaceDirectProjection, SurfaceModel, SurfaceModeledProjection, SurfaceOptions,
     SurfaceProjectionOwner, SurfaceProjector, SurfaceRelationshipAggregate,
@@ -54,13 +50,13 @@ mod external_roots;
 #[cfg(feature = "graphql")]
 pub mod http;
 #[cfg(feature = "graphql")]
-pub mod identity;
+pub(crate) mod identity;
 #[cfg(feature = "graphql")]
 pub mod protocol;
 #[cfg(feature = "graphql")]
 pub(crate) mod query_protocol;
 #[cfg(feature = "graphql")]
-pub mod read_store;
+pub(crate) mod read_store;
 #[cfg(feature = "graphql")]
 mod schema;
 #[cfg(feature = "graphql")]
@@ -71,11 +67,6 @@ pub use engine::{
     GraphqlEngineBuilder, GraphqlPool, GraphqlPoolSource, WebsocketLimits,
 };
 #[cfg(feature = "graphql")]
-pub use http::{
-    graphiql_page, graphql_router, graphql_router_composed, graphql_router_with_host,
-    graphql_router_with_service, GraphqlOperationFilter,
-};
-#[cfg(feature = "graphql")]
 pub use identity::{
     extract_bearer, map_claims_to_session, public_oidc_identity_from_env,
     public_oidc_identity_from_env_vars, AuthError, ClaimMapConfig, GatewaySecret, IdentityConfig,
@@ -84,11 +75,11 @@ pub use identity::{
 };
 #[cfg(feature = "graphql")]
 pub use read_store::{CellByKeyGetter, HttpCellByKey, MapCellByKey, ReadStore};
-#[cfg(feature = "graphql")]
-pub use subscribe::ChangeHub;
 
 #[cfg(all(feature = "graphql", feature = "gateway"))]
 pub use engine::ReadRouting;
+#[cfg(all(feature = "graphql", feature = "gateway"))]
+pub use identity::OidcGatewayProvider;
 
 #[cfg(all(feature = "graphql", feature = "gateway"))]
 pub mod delivery;

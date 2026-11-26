@@ -4,7 +4,8 @@
 //! snapshots under out-of-order delivery.
 
 use distributed::microsvc::{Context, HandlerError};
-use distributed::{BitcodePayloadCodec, ReadModelWorkspaceExt};
+use distributed::read_model::ReadModelWorkspaceExt;
+use distributed::BitcodePayloadCodec;
 use serde_json::{json, Value};
 
 use crate::distributed_read_model_board::board_service::BoardSnapshot;

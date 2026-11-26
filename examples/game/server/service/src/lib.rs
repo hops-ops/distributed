@@ -34,8 +34,9 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
+use distributed::application::{Application, ApplicationManifest, SurfaceSpec};
 use distributed::bus::{BusConsumer, RunOptions, SqliteBus};
-use distributed::graphql::surface::ExternalReadSource;
+use distributed::graphql::ExternalReadSource;
 use distributed::graphql::{
     build_surface, read, surface_for_application, DistributedClientSurfaceExport, GraphqlEngine,
     IdentityConfig, ModelPermissions, OidcConfig, ReadPermission, Surface, SurfaceOptions,
@@ -44,9 +45,8 @@ use distributed::microsvc::{
     spawn_service_consumer_loop, CausalProjectorContext, HandlerError, LifecycleGate,
     ModeledProjection, Routes, Service,
 };
-use distributed::{
-    Application, ApplicationManifest, RelationalReadModel, SqliteRepository, SurfaceSpec,
-};
+use distributed::read_model::RelationalReadModel;
+use distributed::SqliteRepository;
 use distributed_leaderboard::{
     Board, LeaderboardGrant, LeaderboardRoots, LeaderboardStore, LeaderboardSurface,
     RedisLeaderboard,
@@ -64,7 +64,7 @@ pub use mobpit_crawler::stats::{
 pub use mobpit_tiers::events::{Boroughs, BOROUGHS};
 
 /// The tables: `player_stats`, `zone_activities` and `boroughs`.
-pub fn read_model_catalog() -> distributed::ReadModelCatalog {
+pub fn read_model_catalog() -> distributed::table::ReadModelCatalog {
     mobpit_crawler::stats::read_model_catalog()
         .table_schema(ZoneActivities::schema().clone())
         .table_schema(Boroughs::schema().clone())

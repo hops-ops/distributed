@@ -83,7 +83,7 @@ impl CelldQueueEnvelope {
 
 /// Relays Queue bodies through any Distributed publisher.
 ///
-/// Wrap a [`crate::BusPublisher`] to recover the bus topology split: commands
+/// Wrap a [`crate::outbox_worker::BusPublisher`] to recover the bus topology split: commands
 /// go to `send_message`, while events go to `publish_message` for fanout.
 #[derive(Clone)]
 pub struct CelldQueueRelay<P> {
@@ -394,7 +394,7 @@ mod tests {
     use super::*;
     use crate::bus::{Bus, MessageKind};
     use crate::outbox_worker::testing::block_on;
-    use crate::BusPublisher;
+    use crate::outbox_worker::BusPublisher;
     use std::sync::{Arc, Mutex};
 
     #[cfg(feature = "cloudflare-workers")]

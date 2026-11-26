@@ -4,9 +4,10 @@
 
 use distributed::graphql::IdentityConfig;
 use distributed::graphql::{read, GraphqlEngine};
-use distributed::{
-    ColumnType, PrimaryKey, ReadModel, ReadModelCatalog, RelationalReadModel, RelationshipDef,
-    RelationshipKind, TableColumn, TableKind, TableSchema,
+use distributed::read_model::{ReadModel, RelationalReadModel};
+use distributed::table::{
+    ColumnType, PrimaryKey, ReadModelCatalog, RelationshipDef, RelationshipKind, TableColumn,
+    TableKind, TableSchema,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;

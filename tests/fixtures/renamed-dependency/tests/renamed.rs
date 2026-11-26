@@ -1,8 +1,10 @@
 //! Compiling is the test: the dependency is called `framework`, so a macro
 //! that still writes `distributed::` does not build here.
 
-use framework::command::Succeeded;
-use framework::{command, Aggregate, Entity, ReadModel, RelationalReadModel, Snapshot};
+use framework::command::{CommandInput, CommandOutput, Succeeded};
+use framework::domain_event::DomainState;
+use framework::read_model::{ReadModel, RelationalReadModel};
+use framework::{command, Aggregate, Entity, Snapshot};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, Snapshot)]
@@ -14,7 +16,7 @@ struct Note {
     body: String,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, framework::DomainState)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, DomainState)]
 #[domain_state(version = 1)]
 struct NoteState {
     note_id: String,
@@ -44,13 +46,13 @@ impl Note {
     }
 }
 
-#[derive(Debug, Deserialize, framework::CommandInput)]
+#[derive(Debug, Deserialize, CommandInput)]
 struct WriteInput {
     note_id: String,
     body: String,
 }
 
-#[derive(Debug, Serialize, framework::CommandOutput)]
+#[derive(Debug, Serialize, CommandOutput)]
 struct WritePayload {
     note_id: String,
 }

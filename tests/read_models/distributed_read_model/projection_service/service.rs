@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use distributed::microsvc::{Routes, Service};
-use distributed::InMemoryReadModelStore;
+use distributed::read_model::InMemoryReadModelStore;
 
 use super::handlers;
 

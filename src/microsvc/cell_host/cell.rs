@@ -13,15 +13,15 @@ use super::store::CellStreamStore;
 use super::store::{
     DurableAggregateCellState, DurableCellCommand, DurableCellEvents, DurableCellSnapshot,
 };
-use super::{CausalDispatchError, CausalDispatchResult};
 use crate::aggregate::{Aggregate, AggregateRepository};
 use crate::entity::EventRecord;
 use crate::microsvc::service::{PortableCommand, Routes};
 use crate::microsvc::session::Session;
 use crate::microsvc::HasOutboxStore;
+use crate::microsvc::{CausalDispatchError, CausalDispatchResult};
+use crate::outbox_worker::OutboxDispatcher;
 use crate::repository::{GetStream, RepositoryError, SnapshotStore, StreamIdentity};
 use crate::snapshot::{SnapshotRecord, Snapshottable};
-use crate::OutboxDispatcher;
 
 /// Cell class for aggregate `A`. Equivalent to
 /// `#[distributed::cell(aggregate = A)]`: mount the same domain
@@ -31,7 +31,7 @@ use crate::OutboxDispatcher;
 /// (`PCH-REQ-005`).
 ///
 /// ```compile_fail
-/// fn projectors_are_not_cell_methods<A>(cell: distributed::cell_host::AggregateCell<A>)
+/// fn projectors_are_not_cell_methods<A>(cell: distributed::microsvc::cell_host::AggregateCell<A>)
 /// where
 ///     A: distributed::Aggregate + Send + Sync + 'static,
 /// {
@@ -40,7 +40,7 @@ use crate::OutboxDispatcher;
 /// ```
 ///
 /// ```compile_fail
-/// fn graphql_is_not_a_cell_method<A>(cell: distributed::cell_host::AggregateCell<A>)
+/// fn graphql_is_not_a_cell_method<A>(cell: distributed::microsvc::cell_host::AggregateCell<A>)
 /// where
 ///     A: distributed::Aggregate + Send + Sync + 'static,
 /// {
@@ -294,7 +294,7 @@ where
     /// Fire this cell's alarms that are due now by the cell clock.
     ///
     /// The in-process reference host has no timer: tests give the store a
-    /// [`ManualClock`](crate::ManualClock) ([`CellStreamStore::with_clock`]),
+    /// [`ManualClock`](crate::clock::ManualClock) ([`CellStreamStore::with_clock`]),
     /// advance it, and call this, exactly as the celld alarm handler does on
     /// every Durable Object wake.
     pub async fn fire_due_schedules(&self) -> Result<ScheduleFireReport, RepositoryError> {
@@ -421,7 +421,7 @@ where
 
     /// Outbox rows committed with the aggregate (same cell SQLite).
     #[cfg(not(all(feature = "cloudflare-workers", target_arch = "wasm32")))]
-    pub fn durable_outbox(&self) -> Result<Vec<crate::OutboxMessage>, RepositoryError> {
+    pub fn durable_outbox(&self) -> Result<Vec<crate::outbox::OutboxMessage>, RepositoryError> {
         self.routes.repo().repo().durable_outbox()
     }
 
@@ -577,7 +577,7 @@ where
     #[cfg(not(all(feature = "cloudflare-workers", target_arch = "wasm32")))]
     pub fn restore_durable_outbox(
         &self,
-        messages: Vec<crate::OutboxMessage>,
+        messages: Vec<crate::outbox::OutboxMessage>,
     ) -> Result<(), RepositoryError> {
         self.routes.repo().repo().restore_durable_outbox(messages)
     }

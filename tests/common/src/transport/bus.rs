@@ -28,7 +28,7 @@ use std::time::Duration;
 use distributed::bus::{
     Bus, BusConsumer, DeadLetter, Handlers, RunOptions, Shutdown, TransportError, DEAD_LETTER_EVENT,
 };
-use distributed::microsvc::{Message, MessageKind};
+use distributed::bus::{Message, MessageKind};
 use distributed::outbox_worker::{SOURCE_AGGREGATE_ID, SOURCE_AGGREGATE_TYPE};
 
 /// How a test target connects its transport.
@@ -705,7 +705,7 @@ macro_rules! bus_conformance_tests {
     ($harness:ty) => {
         mod bus_conformance {
             use super::*;
-            use distributed::microsvc::MessageKind;
+            use distributed::bus::MessageKind;
             use $crate::transport::bus::{self as suite, BusHarness};
 
             macro_rules! scenario {

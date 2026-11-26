@@ -9,8 +9,7 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
-use crate::projection_protocol::canonical_projection_topology_bytes;
-pub use crate::projection_protocol::ProjectionEpoch;
+use crate::projection_protocol::{canonical_projection_topology_bytes, ProjectionEpoch};
 
 use super::placement::{
     ProjectionBinding, ProjectionBindingId, ProjectionBindingState, ProjectionEventSchema,
@@ -833,12 +832,13 @@ mod program_id_serde {
 
 #[cfg(test)]
 mod tests {
+    use crate::domain_event::{DomainEventBodyKind, DOMAIN_EVENT_OCCURRENCE_VERSION};
     use crate::projection::lower::{
         DirectCandidate, EventualOnly, LoweredProjectionPlan, ProjectionDescriptor,
         ProjectionLoweringError, ProjectionOutputInventory,
     };
     use crate::projection::placement::{
-        DirectProjectionPlacement, ProjectionBinding, ProjectionBindingState, ProjectionEpoch,
+        DirectProjectionPlacement, ProjectionBinding, ProjectionBindingState,
         ProjectionExecutionClass, ProjectionExecutorRoute, ProjectionOutput, ProjectionOwner,
         ProjectionPhysicalTopology, ProjectionProgramDescriptor, ProjectionRelationshipBinding,
         ProjectionSourceBinding, ProjectionTopologyError, PROJECTION_PARTITION_CODEC_VERSION,
@@ -849,6 +849,7 @@ mod tests {
         ProjectionTarget, ProjectionValue, PROJECTION_OPERATION_SEMANTICS_VERSION,
         PROJECTION_PROGRAM_IR_VERSION,
     };
+    use crate::projection_protocol::ProjectionEpoch;
     use crate::projection_protocol::{
         PartitionId, ProjectionInputCursor, ProjectionSource, ProjectorTopologyId,
     };
@@ -856,7 +857,6 @@ mod tests {
         ColumnType, PrimaryKey, RelationshipDef, RelationshipKind, TableColumn, TableKind,
         TableSchema,
     };
-    use crate::{DomainEventBodyKind, DOMAIN_EVENT_OCCURRENCE_VERSION};
 
     use super::{
         ActiveProjectionBindings, ProjectionBindingActivation, ProjectionCatalog,
@@ -871,17 +871,19 @@ mod tests {
     struct TestDescriptor(ProjectionProgram);
 
     impl ProjectionProgramDescriptor for TestDescriptor {
-        fn projection_program(&self) -> Result<ProjectionProgram, crate::ProjectionProgramError> {
+        fn projection_program(
+            &self,
+        ) -> Result<ProjectionProgram, crate::projection::ProjectionProgramError> {
             Ok(self.0.clone())
         }
     }
 
-    fn generated_program() -> Result<ProjectionProgram, crate::ProjectionProgramError> {
+    fn generated_program() -> Result<ProjectionProgram, crate::projection::ProjectionProgramError> {
         Ok(program("project_todos", FINGERPRINT_A))
     }
 
     fn generated_lower(
-        _: &crate::ResolvedProjectionPlan,
+        _: &crate::projection::ResolvedProjectionPlan,
     ) -> Result<LoweredProjectionPlan, ProjectionLoweringError> {
         unreachable!("placement selection never lowers a plan")
     }

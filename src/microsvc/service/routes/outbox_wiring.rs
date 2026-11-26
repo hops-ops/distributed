@@ -105,7 +105,7 @@ pub(in crate::microsvc::service) fn configure_outbox_for<D>(
     // publish failure leaves the rows pending for a separately run dispatcher.
     #[cfg(not(any(feature = "runtime-tokio", test)))]
     let config = {
-        let mut dispatcher = crate::OutboxDispatcher::new(
+        let mut dispatcher = crate::outbox_worker::OutboxDispatcher::new(
             dependencies.outbox_store(),
             publisher,
             worker_id,

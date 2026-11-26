@@ -216,7 +216,7 @@ pub(crate) fn validate_external_sources(
             return Err(format!("duplicate or unnamed external read source {id}"));
         }
         for ty in source.types() {
-            if !crate::graphql::is_valid_graphql_name(&ty.name)
+            if !crate::graphql::naming::is_valid_graphql_name(&ty.name)
                 || existing_types.contains(&ty.name.as_str())
             {
                 return Err(format!(
@@ -237,7 +237,7 @@ pub(crate) fn validate_external_sources(
             }
         }
         for root in source.roots() {
-            if !crate::graphql::is_valid_graphql_name(&root.name)
+            if !crate::graphql::naming::is_valid_graphql_name(&root.name)
                 || !roots.insert(root.name.clone())
             {
                 return Err(format!(
@@ -260,7 +260,7 @@ pub(crate) fn validate_external_sources(
 }
 
 fn validate_field(id: &str, field: &ExternalField) -> Result<(), String> {
-    if !crate::graphql::is_valid_graphql_name(&field.name)
+    if !crate::graphql::naming::is_valid_graphql_name(&field.name)
         || !SCALARS.contains(&field.type_name.as_str())
     {
         return Err(format!(

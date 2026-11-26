@@ -4,9 +4,8 @@
 
 use std::sync::Arc;
 
-use distributed::microsvc::grpc::{
-    CommandServiceClient, GrpcRequest, GrpcServeError, HealthRequest,
-};
+use distributed::microsvc::grpc::command_service_client::CommandServiceClient;
+use distributed::microsvc::grpc::{GrpcRequest, GrpcServeError, HealthRequest};
 use distributed::microsvc::{Routes, Service};
 use distributed::{AggregateBuilder, InMemoryRepository, Queueable};
 use serde_json::json;
@@ -59,7 +58,7 @@ async fn start_server(service: Arc<Service>) -> CommandServiceClient<tonic::tran
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
 
-    let grpc_svc = distributed::microsvc::grpc_server(service);
+    let grpc_svc = distributed::microsvc::grpc::grpc_server(service);
     tokio::spawn(async move {
         tonic::transport::Server::builder()
             .add_service(grpc_svc)
@@ -87,7 +86,7 @@ async fn health_check() {
 
 #[tokio::test]
 async fn serve_grpc_returns_error_for_invalid_address() {
-    let err = distributed::microsvc::serve_grpc(counter_service(), "not an address")
+    let err = distributed::microsvc::grpc::serve_grpc(counter_service(), "not an address")
         .await
         .expect_err("invalid gRPC bind address should return an error");
 

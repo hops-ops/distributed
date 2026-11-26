@@ -1,5 +1,6 @@
 //! Compile event→mutation projections for service registration.
 
+use crate::domain_event::DomainEventDescriptor;
 use crate::projection::lower::{
     finish_lowering, lower_model_mutation, LoweredProjectionPlan, ProjectionLoweringError,
     ProjectionOutputInventory, ProjectionOutputModel, ProjectionReadModelMetadata,
@@ -10,7 +11,6 @@ use crate::projection::{
     ResolvedProjectionPlan,
 };
 use crate::read_model::RelationalReadModel;
-use crate::DomainEventDescriptor;
 
 use super::bind::{envelope_binding, MutationInputBinding, ProjectionHandler};
 use super::program::{complete_row, MutationColumn, MutationOperation, MutationProgram};

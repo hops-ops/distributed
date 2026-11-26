@@ -34,8 +34,8 @@ pub mod events;
 use std::collections::BTreeMap;
 use std::time::{Duration, SystemTime};
 
-use distributed::cell_host::AggregateCell;
 use distributed::command::{typed_command, PreparedCommand, Succeeded};
+use distributed::microsvc::cell_host::AggregateCell;
 use distributed::microsvc::schedule::schedule_guard;
 use distributed::microsvc::{
     CausalCommandContext, CausalRouteDependencies, HandlerError, PortableCommand, Routes,
@@ -116,7 +116,9 @@ pub struct Hood {
 }
 
 /// A hood as its outward events carry it (and rooms read it).
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, distributed::DomainState)]
+#[derive(
+    Clone, Debug, PartialEq, Eq, Serialize, Deserialize, distributed::domain_event::DomainState,
+)]
 #[domain_state(version = 1)]
 pub struct HoodState {
     /// `hx.hy`.
@@ -181,7 +183,12 @@ impl Hood {
 /// [`BOSS_DEFEATED`]: what the boss room reports (which hood and room,
 /// which life of the boss, who landed the blow — cosmetic). No reward.
 #[derive(
-    Debug, Clone, Serialize, Deserialize, distributed::CommandInput, distributed_game::FactCommand,
+    Debug,
+    Clone,
+    Serialize,
+    Deserialize,
+    distributed::command::CommandInput,
+    distributed_game::FactCommand,
 )]
 #[fact(command = BOSS_DEFEATED)]
 pub struct BossDefeatedInput {
@@ -196,14 +203,14 @@ pub struct BossDefeatedInput {
 }
 
 /// [`BOSS_RESPAWN`] input (the hood's own schedule).
-#[derive(Debug, Clone, Serialize, Deserialize, distributed::CommandInput)]
+#[derive(Debug, Clone, Serialize, Deserialize, distributed::command::CommandInput)]
 pub struct RespawnInput {
     /// `hx.hy`.
     pub hood: String,
 }
 
 /// A hood command's answer.
-#[derive(Debug, Clone, Serialize, Deserialize, distributed::CommandOutput)]
+#[derive(Debug, Clone, Serialize, Deserialize, distributed::command::CommandOutput)]
 pub struct HoodReceipt {
     /// The boss is down after the command.
     pub boss_down: bool,
@@ -350,7 +357,9 @@ pub const EVENT_END: &str = "borough.event_end";
 const EVENT_ALARM: &str = "event";
 
 /// A borough as its outward events carry it (and rooms read it).
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, distributed::DomainState)]
+#[derive(
+    Clone, Debug, PartialEq, Eq, Serialize, Deserialize, distributed::domain_event::DomainState,
+)]
 #[domain_state(version = 1)]
 pub struct BoroughState {
     /// `bx.by`.
@@ -438,7 +447,12 @@ impl Borough {
 
 /// [`ROOM_AWAKE`]: a room of the borough woke (zone fact of that room).
 #[derive(
-    Debug, Clone, Serialize, Deserialize, distributed::CommandInput, distributed_game::FactCommand,
+    Debug,
+    Clone,
+    Serialize,
+    Deserialize,
+    distributed::command::CommandInput,
+    distributed_game::FactCommand,
 )]
 #[fact(command = ROOM_AWAKE)]
 pub struct RoomAwakeInput {
@@ -449,7 +463,7 @@ pub struct RoomAwakeInput {
 }
 
 /// [`EVENT_START`] / [`EVENT_END`] input (the borough's own schedule).
-#[derive(Debug, Clone, Serialize, Deserialize, distributed::CommandInput)]
+#[derive(Debug, Clone, Serialize, Deserialize, distributed::command::CommandInput)]
 pub struct EventInput {
     /// `bx.by`.
     pub borough: String,
@@ -555,7 +569,7 @@ async fn handle_event_end(
 }
 
 /// [`HOOD_CHANGED`] (saga step).
-#[derive(Debug, Clone, Serialize, Deserialize, distributed::CommandInput)]
+#[derive(Debug, Clone, Serialize, Deserialize, distributed::command::CommandInput)]
 pub struct HoodChangedInput {
     /// `bx.by`.
     pub borough: String,
@@ -570,7 +584,7 @@ pub struct HoodChangedInput {
 }
 
 /// A borough or city command's answer.
-#[derive(Debug, Clone, Serialize, Deserialize, distributed::CommandOutput)]
+#[derive(Debug, Clone, Serialize, Deserialize, distributed::command::CommandOutput)]
 pub struct TierReceipt {
     /// The command changed the tier.
     pub changed: bool,
@@ -640,7 +654,9 @@ pub struct City {
 }
 
 /// The city as its outward events carry it (and rooms read it).
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, distributed::DomainState)]
+#[derive(
+    Clone, Debug, PartialEq, Eq, Serialize, Deserialize, distributed::domain_event::DomainState,
+)]
 #[domain_state(version = 1)]
 pub struct CityState {
     /// Bosses down anywhere.
@@ -698,7 +714,7 @@ impl City {
 }
 
 /// [`BOROUGH_CHANGED`] (saga step).
-#[derive(Debug, Clone, Serialize, Deserialize, distributed::CommandInput)]
+#[derive(Debug, Clone, Serialize, Deserialize, distributed::command::CommandInput)]
 pub struct BoroughChangedInput {
     /// Always [`CITY_SHARD`].
     pub city: String,
@@ -903,7 +919,8 @@ pub fn saga_step(name: &str, payload: &[u8]) -> Option<SagaStep> {
     if !matches!(name, HOOD_EVENT | "hood.boss_returned" | BOROUGH_EVENT) {
         return None;
     }
-    let occurrence = distributed::DomainEventOccurrence::from_canonical_bytes(payload).ok()?;
+    let occurrence =
+        distributed::domain_event::DomainEventOccurrence::from_canonical_bytes(payload).ok()?;
     let sequence = occurrence.aggregate_sequence();
     if name == BOROUGH_EVENT {
         let state: BoroughState = occurrence.decode_body().ok()?;

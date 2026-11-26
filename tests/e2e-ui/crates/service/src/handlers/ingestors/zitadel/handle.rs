@@ -5,10 +5,10 @@
 use axum::http::HeaderMap;
 use distributed::command::{typed_command, PreparedCommand, Succeeded, TypedCommand};
 use distributed::command_dispatch::deterministic_command_id;
+use distributed::domain_event::ExternalEventSource;
 use distributed::microsvc::{
     CausalCommandContext, CausalDispatchError, HandlerError, HttpCommandDispatch,
 };
-use distributed::ExternalEventSource;
 use serde::Serialize;
 use serde_json::Value;
 
@@ -20,7 +20,7 @@ use super::map::{
 /// Command name, and the path of its HTTP edge (POST `/{COMMAND}`).
 pub const COMMAND: &str = "zitadel.ingress.v1";
 
-#[derive(Debug, Serialize, distributed::CommandOutput)]
+#[derive(Debug, Serialize, distributed::command::CommandOutput)]
 pub struct ZitadelIngressPayload {
     /// Provider event the delivery was; `None` when the event type maps to
     /// none, and nothing was published.
@@ -128,7 +128,8 @@ mod tests {
     use super::super::auth::SECRET_HEADER;
     use super::*;
     use distributed::microsvc::{self, Routes, Service};
-    use distributed::{InMemoryRepository, OutboxStore};
+    use distributed::outbox_worker::OutboxStore;
+    use distributed::InMemoryRepository;
     use e2e_projections::ZitadelUserProfile;
     use serde_json::json;
 

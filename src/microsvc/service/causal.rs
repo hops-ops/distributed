@@ -769,8 +769,8 @@ pub(super) struct ModeledProjectionMetadata {
 pub(super) type SealModeledProjection<'a> = dyn Fn(
         CausationId,
         Duration,
-        &[crate::DomainEventOccurrence],
-        &[crate::ProjectionEventSelector],
+        &[crate::domain_event::DomainEventOccurrence],
+        &[crate::projection::ProjectionEventSelector],
     ) -> Result<ModeledProjectionMetadata, String>
     + Send
     + Sync

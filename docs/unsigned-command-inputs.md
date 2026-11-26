@@ -3,7 +3,7 @@
 Use the Rust type that expresses the domain boundary:
 
 ```rust,ignore
-#[derive(serde::Deserialize, distributed::CommandInput)]
+#[derive(serde::Deserialize, distributed::command::CommandInput)]
 pub struct UpdateDocumentInput {
     pub document_id: String,
     pub expected_revision: u64,

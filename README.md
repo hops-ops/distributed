@@ -719,6 +719,15 @@ itself. The `distributed_cli` crate installs the `distributed` tooling
 and is not needed as a runtime dependency unless you are embedding the
 CLI in another command such as `hops service`.
 
+Every public item has one path. The crate root holds the event-sourcing
+core (`Entity`, `Aggregate`, `AggregateRepository`, the `Repository`
+traits and backends, snapshots) and the attribute and function-like macros
+(`#[sourced]`, `#[command]`, `mutation!`, `projection!`). Everything else
+lives in its module, and a derive lives with the trait it implements:
+`distributed::read_model::ReadModel`, `distributed::domain_event::DomainEvent`,
+`distributed::command::CommandInput`. `use distributed::prelude::*;` brings
+in what a typical aggregate, command or read-model file needs.
+
 The rest of this README is the API reference for each piece.
 
 ---
@@ -1160,7 +1169,8 @@ SQLx lease lock (feature `postgres` or `sqlite`). It implements the same
 `LockManager` trait, so it's a drop-in via `queued_with`:
 
 ```rust,ignore
-use distributed::{PostgresLockManager, PostgresRepository};
+use distributed::lock::PostgresLockManager;
+use distributed::PostgresRepository;
 
 let repo = PostgresRepository::connect_and_migrate(&database_url).await?;
 // The `aggregate_locks` lease table is created by the repository's migrations.
@@ -1242,7 +1252,7 @@ For an explicitly authored outward DTO, use `publish(event)`. For low-level
 integration envelopes or custom IDs, use `encode_for_entity`:
 
 ```rust,ignore
-use distributed::OutboxMessage;
+use distributed::outbox::OutboxMessage;
 
 let message = OutboxMessage::encode_for_entity(
     format!("{}:init", todo.entity.id()),
@@ -1259,7 +1269,7 @@ decision—for example, extracting document metadata after an upload. Derive a
 typed fact from the incoming canonical occurrence:
 
 ```rust,ignore
-#[derive(serde::Serialize, distributed::DomainEvent)]
+#[derive(serde::Serialize, distributed::domain_event::DomainEvent)]
 #[domain_event(name = "document.indexed", version = 1)]
 struct DocumentIndexed {
     document_id: String,
@@ -1323,7 +1333,7 @@ The polling worker is the durable backstop in both cases. It is the same
 service process or as a separate worker, against the same outbox store:
 
 ```rust,ignore
-use distributed::{BusPublisher, OutboxDispatcher};
+use distributed::outbox_worker::{BusPublisher, OutboxDispatcher};
 use std::{sync::Arc, time::Duration};
 
 let dispatcher = OutboxDispatcher::new(
@@ -1593,7 +1603,7 @@ those contracts; GraphQL naming restrictions are checked when exposing them.
 
 ```rust
 # use distributed::command;
-use distributed::{CommandInput, CommandOutput};
+use distributed::command::{CommandInput, CommandOutput};
 use distributed::command::{typed_command, Succeeded};
 use serde::{Deserialize, Serialize};
 
@@ -1682,7 +1692,7 @@ let _result = service
     .await?;
 ```
 
-`CreateCounter` and `IncrementCounter` derive `Deserialize` and `distributed::CommandInput`; `CounterValue` derives `Serialize` and `distributed::CommandOutput`. The handler stages its commit and returns; the framework writes it with the ledger receipt in one transaction, so dispatching the same command ID again replays the receipt instead of running the handler.
+`CreateCounter` and `IncrementCounter` derive `Deserialize` and `distributed::command::CommandInput`; `CounterValue` derives `Serialize` and `distributed::command::CommandOutput`. The handler stages its commit and returns; the framework writes it with the ledger receipt in one transaction, so dispatching the same command ID again replays the receipt instead of running the handler.
 
 ### Roles and Guards
 
@@ -1710,10 +1720,10 @@ use crate::models::counter::Counter;
 
 pub const COMMAND: &str = "counter.initialize";
 
-#[derive(Debug, Deserialize, distributed::CommandInput)]
+#[derive(Debug, Deserialize, distributed::command::CommandInput)]
 pub struct Input { pub id: String }
 
-#[derive(Debug, Serialize, distributed::CommandOutput)]
+#[derive(Debug, Serialize, distributed::command::CommandOutput)]
 pub struct Output { pub id: String }
 
 pub fn command() -> TypedCommand<Input, Succeeded<Output>> {
@@ -1859,10 +1869,10 @@ The `grpc` feature adds a tonic-based gRPC transport using standard protobuf wir
 
 ```rust,ignore
 // Get a CommandServiceServer to compose with other tonic routes
-let grpc_svc = microsvc::grpc_server(service.clone());
+let grpc_svc = microsvc::grpc::grpc_server(service.clone());
 
 // Or serve directly
-microsvc::serve_grpc(service, "[::1]:50051").await?;
+microsvc::grpc::serve_grpc(service, "[::1]:50051").await?;
 ```
 
 | RPC | Input | Output | Description |
@@ -1940,7 +1950,7 @@ Read models are query-optimized relational projections derived from aggregates, 
 
 ```rust,ignore
 use serde::{Deserialize, Serialize};
-use distributed::ReadModel;
+use distributed::read_model::ReadModel;
 
 #[derive(Clone, Debug, Serialize, Deserialize, ReadModel)]
 #[table("game_views")]
@@ -1963,7 +1973,7 @@ clients type the column from it instead of `unknown`: a
 `readonly (readonly ("hole" | "player" | …)[])[]`. Derive it next to Serde:
 
 ```rust,ignore
-#[derive(Clone, Copy, Serialize, Deserialize, distributed::JsonType)]
+#[derive(Clone, Copy, Serialize, Deserialize, distributed::table::JsonType)]
 #[serde(rename_all = "snake_case")]
 pub enum Tile { Hole, Unvisited, Visited, DeadBySuicide, DeadByHole, Player }
 ```
@@ -1999,7 +2009,7 @@ consistent outbox/projector pattern instead.
 Distributed projectors subscribe to published messages and commit read-model rows through a workspace, marking the message processed in the same adapter transaction for SQL idempotency:
 
 ```rust,ignore
-use distributed::ReadModelWorkspaceExt;
+use distributed::read_model::ReadModelWorkspaceExt;
 
 let mut workspace = ctx.read_model_store().workspace();
 workspace.upsert(&row)?;
@@ -2009,7 +2019,8 @@ workspace.commit().await?;
 ### Loading
 
 ```rust,ignore
-use distributed::{ReadModelWorkspaceExt, RowKey, RowValue};
+use distributed::read_model::ReadModelWorkspaceExt;
+use distributed::table::{RowKey, RowValue};
 
 let loaded = repo
     .workspace()
@@ -2603,7 +2614,7 @@ For an existing typed `Service`, derive the logical application from its command
 inventory and the same full GraphQL `Surface` used by the runtime:
 
 ```rust,ignore
-let surface = distributed::SurfaceSpec::from_surface("catalog", &full_surface)?;
+let surface = distributed::application::SurfaceSpec::from_surface("catalog", &full_surface)?;
 let application = service.application("catalog", surface)?;
 let manifest = application.manifest();
 ```
@@ -2760,8 +2771,8 @@ or raw command input (unknown commands bucket as `message=unknown`).
 tables defining physical schema:
 
 ```rust,ignore
-pub fn read_model_catalog() -> distributed::ReadModelCatalog {
-    distributed::ReadModelCatalog::new("orders").read_model::<OrderView>()
+pub fn read_model_catalog() -> distributed::table::ReadModelCatalog {
+    distributed::table::ReadModelCatalog::new("orders").read_model::<OrderView>()
 }
 ```
 

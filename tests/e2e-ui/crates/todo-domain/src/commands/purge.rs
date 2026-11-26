@@ -4,12 +4,12 @@ use serde::{Deserialize, Serialize};
 
 use crate::{domain_commands, Todo};
 
-#[derive(Debug, Deserialize, distributed::CommandInput)]
+#[derive(Debug, Deserialize, distributed::command::CommandInput)]
 pub struct TodoPurgeInput {
     pub todo_id: String,
 }
 
-#[derive(Debug, Serialize, distributed::CommandOutput)]
+#[derive(Debug, Serialize, distributed::command::CommandOutput)]
 pub struct TodoPurgePayload {
     pub todo_id: String,
     pub purged: bool,

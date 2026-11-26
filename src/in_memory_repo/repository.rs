@@ -66,7 +66,7 @@ pub struct InMemoryRepository {
     /// A schedule worker was attached: [`Capability::Scheduling`](crate::schedule::Capability::Scheduling).
     schedule_dispatch: bool,
     /// The store clock: `ctx.now()` and relative schedules.
-    clock: Arc<dyn crate::Clock>,
+    clock: Arc<dyn crate::clock::Clock>,
 }
 
 /// In-memory outbox table handle.
@@ -100,13 +100,13 @@ impl InMemoryRepository {
             causal_storage_identity: CausalStorageIdentity::new(),
             schedules: Arc::new(RwLock::new(HashMap::new())),
             schedule_dispatch: false,
-            clock: Arc::new(crate::SystemClock),
+            clock: Arc::new(crate::clock::SystemClock),
         }
     }
 
     /// Use `clock` as the store clock (`ctx.now()`, relative schedules),
-    /// e.g. a [`ManualClock`](crate::ManualClock) in tests.
-    pub fn with_clock(mut self, clock: impl crate::Clock + 'static) -> Self {
+    /// e.g. a [`ManualClock`](crate::clock::ManualClock) in tests.
+    pub fn with_clock(mut self, clock: impl crate::clock::Clock + 'static) -> Self {
         self.clock = Arc::new(clock);
         self
     }
@@ -1006,7 +1006,7 @@ mod tests {
 
 /// Stores schedules; dispatches them once a schedule worker is attached
 /// (`ScheduleWorker::attach`). The store clock is the injected
-/// [`Clock`](crate::Clock).
+/// [`Clock`](crate::clock::Clock).
 impl crate::schedule::BackendHost for InMemoryRepository {
     fn capabilities(&self) -> crate::schedule::Capabilities {
         crate::schedule::Capabilities {

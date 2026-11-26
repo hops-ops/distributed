@@ -11,7 +11,8 @@ pub use service::start_grpc_service;
 #[cfg(feature = "http")]
 pub use service::start_http_service;
 
-use distributed::{AggregateRepository, InMemoryLockManager, InMemoryRepository, QueuedRepository};
+use distributed::lock::InMemoryLockManager;
+use distributed::{AggregateRepository, InMemoryRepository, QueuedRepository};
 
 pub type CheckoutRepo =
     AggregateRepository<QueuedRepository<InMemoryRepository, InMemoryLockManager>, CheckoutSaga>;

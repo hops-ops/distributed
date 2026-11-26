@@ -26,10 +26,10 @@
 //! );
 //!
 //! // Get the server to compose with other tonic routes
-//! let grpc_svc = microsvc::grpc_server(service.clone());
+//! let grpc_svc = microsvc::grpc::grpc_server(service.clone());
 //!
 //! // Or serve directly
-//! microsvc::serve_grpc(service, "[::1]:50051").await?;
+//! microsvc::grpc::serve_grpc(service, "[::1]:50051").await?;
 //! ```
 
 use std::collections::HashMap;
@@ -86,8 +86,7 @@ include!(concat!(
     "/sourced.microsvc.CommandService.rs"
 ));
 
-pub use command_service_client::CommandServiceClient;
-pub use command_service_server::{CommandService, CommandServiceServer};
+use command_service_server::{CommandService, CommandServiceServer};
 
 /// Error returned when serving the gRPC transport fails.
 #[derive(Debug)]

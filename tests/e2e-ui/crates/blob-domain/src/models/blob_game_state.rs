@@ -1,4 +1,4 @@
-use distributed::DomainState;
+use distributed::domain_event::DomainState;
 use serde::{Deserialize, Serialize};
 
 use super::BlobGame;

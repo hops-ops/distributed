@@ -131,7 +131,7 @@ impl GraphqlEngineBuilder {
     /// only relationship metadata may differ. This lets independently owned
     /// model crates form a GraphQL relationship graph without introducing
     /// circular Rust dependencies or a second projection model.
-    pub fn model_schema<M: crate::RelationalReadModel>(
+    pub fn model_schema<M: crate::read_model::RelationalReadModel>(
         mut self,
         schema: TableSchema,
         perms: ModelPermissions<M>,
@@ -509,9 +509,9 @@ impl GraphqlEngineBuilder {
     }
 
     /// Mount a [`crate::graphql::ReadStore`] for one model. Default is SQL scan.
-    /// Does not record the store on the [`crate::RelationalReadModel`] type
+    /// Does not record the store on the [`crate::read_model::RelationalReadModel`] type
     /// (`DCS-DEC-008`).
-    pub fn read_store<M: crate::RelationalReadModel>(
+    pub fn read_store<M: crate::read_model::RelationalReadModel>(
         mut self,
         store: crate::graphql::ReadStore,
     ) -> Self {

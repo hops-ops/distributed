@@ -1,9 +1,12 @@
 use std::collections::HashMap;
 
 use distributed::read_model::ReadModelWritePlanBuilder;
-use distributed::{
-    ExpectedVersion, InMemoryReadModelStore, PatchMode, ReadModel, ReadModelWorkspaceExt, RowKey,
-    RowPatch, RowValue, RowWriteMode, TableMutation, TableStoreError, Versioned,
+use distributed::read_model::{
+    InMemoryReadModelStore, ReadModel, ReadModelWorkspaceExt, Versioned,
+};
+use distributed::table::{
+    ExpectedVersion, PatchMode, RowKey, RowPatch, RowValue, RowWriteMode, TableMutation,
+    TableStoreError,
 };
 use serde::{Deserialize, Serialize};
 

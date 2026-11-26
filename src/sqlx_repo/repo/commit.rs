@@ -162,7 +162,7 @@ where
         .map_err(|err| repository_storage_error::<DB>("commit transaction", err))?;
 
     if !changed_tables.is_empty() {
-        repository.publish_read_model_change(crate::ReadModelChange {
+        repository.publish_read_model_change(crate::read_model::ReadModelChange {
             tables: changed_tables,
         });
     }

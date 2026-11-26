@@ -12,35 +12,42 @@ use crate::projection_protocol::{
 };
 #[cfg(feature = "graphql")]
 use crate::projection_protocol::{ProjectionEpoch, ProjectionScopeCodec, ProjectorTopologyId};
+use crate::read_model::RelationalReadModel;
 use crate::table::{RowKey, RowValue};
-use crate::{InMemoryRepository, RelationalReadModel};
+use crate::InMemoryRepository;
 
 use crate::microsvc::Service;
 
 const FACT_NAME: &str = "task15.todo_changed";
 
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, crate::DomainState)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, crate::domain_event::DomainState)]
 #[domain_state(version = 1)]
 struct TodoChanged {
     id: String,
     title: String,
 }
 
-#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize, crate::ReadModel)]
+#[derive(
+    Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize, crate::read_model::ReadModel,
+)]
 #[readmodel(table = "task15_primary_views", primary_key = ["id"])]
 struct PrimaryView {
     id: String,
     title: String,
 }
 
-#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize, crate::ReadModel)]
+#[derive(
+    Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize, crate::read_model::ReadModel,
+)]
 #[readmodel(table = "task15_secondary_views", primary_key = ["id"])]
 struct SecondaryView {
     id: String,
     title: String,
 }
 
-#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize, crate::ReadModel)]
+#[derive(
+    Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize, crate::read_model::ReadModel,
+)]
 #[readmodel(table = "task15_malformed_views", primary_key = ["id"])]
 struct MalformedView {
     id: String,
@@ -48,11 +55,12 @@ struct MalformedView {
 
 #[cfg(feature = "graphql")]
 fn generated_modeled_projector_program(
-) -> Result<crate::ProjectionProgram, crate::ProjectionProgramError> {
+) -> Result<crate::projection::ProjectionProgram, crate::projection::ProjectionProgramError> {
     use crate::mutation::{
-        body_field_binding, compile_projection, MutationColumn, MutationKind, MutationOperation,
-        MutationProgram, ProjectionHandler,
+        body_field_binding, compile_projection, MutationColumn, MutationOperation, MutationProgram,
+        ProjectionHandler,
     };
+    use crate::projection::MutationKind;
     use crate::projection::{
         ProjectionEventSelector, ProjectionPartition, ProjectionTarget, ProjectionValueType,
     };
@@ -78,10 +86,9 @@ fn generated_modeled_projector_program(
             )?,
         ],
     )?;
-    let selector =
-        ProjectionEventSelector::try_from_descriptor(&crate::DomainEventDescriptor::state::<
-            TodoChanged,
-        >("task15.todo_changed", 1))?;
+    let selector = ProjectionEventSelector::try_from_descriptor(
+        &crate::domain_event::DomainEventDescriptor::state::<TodoChanged>("task15.todo_changed", 1),
+    )?;
     compile_projection(
         "task11-generated-multi-table",
         1,
@@ -100,7 +107,7 @@ fn generated_modeled_projector_program(
 
 #[cfg(feature = "graphql")]
 fn generated_modeled_projector_lower(
-    plan: &crate::ResolvedProjectionPlan,
+    plan: &crate::projection::ResolvedProjectionPlan,
 ) -> Result<
     crate::projection::lower::LoweredProjectionPlan,
     crate::projection::lower::ProjectionLoweringError,
@@ -113,7 +120,7 @@ fn generated_modeled_projector_lower(
             "SecondaryView" => records.push(lower_model_mutation::<SecondaryView>(mutation)?),
             other => {
                 return Err(crate::projection::lower::ProjectionLoweringError::Table(
-                    crate::TableStoreError::Metadata(format!("unknown model `{other}`")),
+                    crate::table::TableStoreError::Metadata(format!("unknown model `{other}`")),
                 ));
             }
         }
@@ -314,9 +321,9 @@ async fn explicit_modeled_projector_handler_applies_the_compiled_projection() {
 
 #[cfg(feature = "graphql")]
 fn modeled_fact_message(id: &str, title: &str, event_version: u64) -> Message {
-    let mut occurrence = crate::DomainEventOccurrence::capture(
-        crate::DomainEventDescriptor::state::<TodoChanged>(FACT_NAME, event_version),
-        crate::DomainEventEnvelope {
+    let mut occurrence = crate::domain_event::DomainEventOccurrence::capture(
+        crate::domain_event::DomainEventDescriptor::state::<TodoChanged>(FACT_NAME, event_version),
+        crate::domain_event::DomainEventEnvelope {
             aggregate_type: "todo".into(),
             aggregate_id: id.into(),
             aggregate_sequence: 1,

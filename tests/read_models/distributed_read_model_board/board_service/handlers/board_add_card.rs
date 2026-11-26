@@ -7,7 +7,7 @@ use crate::distributed_read_model_board::board_service::{AddCard, Board};
 
 pub const COMMAND: &str = "board.add_card";
 
-#[derive(Debug, Serialize, distributed::CommandOutput)]
+#[derive(Debug, Serialize, distributed::command::CommandOutput)]
 pub struct Output {
     pub id: String,
     pub card_id: String,

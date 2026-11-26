@@ -4,7 +4,6 @@
 //! the match's stream, lifecycle facts in the player's — no cell involved —
 //! with the trusted principal and stamp, exactly once per fact key.
 
-
 use distributed::command::{typed_command, PreparedCommand, Succeeded};
 use distributed::microsvc::{
     CausalCommandContext, CausalRouteDependencies, HandlerError, PortableCommand, Routes, Service,
@@ -48,18 +47,18 @@ impl Log {
     }
 }
 
-#[derive(Debug, Deserialize, distributed::CommandInput)]
+#[derive(Debug, Deserialize, distributed::command::CommandInput)]
 struct KillInput {
     mob: String,
 }
 
-#[derive(Debug, Deserialize, distributed::CommandInput)]
+#[derive(Debug, Deserialize, distributed::command::CommandInput)]
 struct ResultInput {
     match_id: String,
     winner_slot: u32,
 }
 
-#[derive(Debug, Deserialize, distributed::CommandInput)]
+#[derive(Debug, Deserialize, distributed::command::CommandInput)]
 #[allow(dead_code)]
 struct LifecycleInput {
     zone: String,
@@ -70,7 +69,7 @@ struct LifecycleInput {
     cause: Option<String>,
 }
 
-#[derive(Debug, Serialize, distributed::CommandOutput)]
+#[derive(Debug, Serialize, distributed::command::CommandOutput)]
 struct Recorded {
     stream: String,
     entries: usize,

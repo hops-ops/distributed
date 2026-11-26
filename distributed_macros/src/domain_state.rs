@@ -58,9 +58,9 @@ pub(crate) fn expand_domain_state(input: DeriveInput) -> syn::Result<proc_macro2
     let fingerprint = LitStr::new(&fingerprint, Span::call_site());
 
     Ok(quote! {
-        impl #framework::DomainState for #name {
-            const DESCRIPTOR: #framework::DomainStateDescriptor =
-                #framework::DomainStateDescriptor::distributed_json(
+        impl #framework::domain_event::DomainState for #name {
+            const DESCRIPTOR: #framework::domain_event::DomainStateDescriptor =
+                #framework::domain_event::DomainStateDescriptor::distributed_json(
                     #type_name,
                     #version,
                     #schema,

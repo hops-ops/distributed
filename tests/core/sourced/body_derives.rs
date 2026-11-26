@@ -3,11 +3,11 @@
 //! field metadata, held against what serde actually writes.
 
 use distributed::domain_event::DomainEventContract;
-use distributed::projection::lower::{ProjectionBodyMetadata, ProjectionPortableType};
-use distributed::{
+use distributed::domain_event::{
     DomainEvent, DomainEventBodyKind, DomainEventDescriptor, DomainState, DOMAIN_EVENT_BODY_CODEC,
     DOMAIN_EVENT_BODY_CODEC_VERSION,
 };
+use distributed::projection::lower::{ProjectionBodyMetadata, ProjectionPortableType};
 use serde::Serialize;
 
 #[derive(Serialize, distributed_macros::DomainState)]

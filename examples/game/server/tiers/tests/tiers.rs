@@ -6,11 +6,11 @@
 
 use std::time::{Duration, SystemTime};
 
-use distributed::cell_host::{
-    AggregateCell, CausalDispatchError, CellCommandIdentity, CellStreamStore,
-};
+use distributed::clock::ManualClock;
+use distributed::microsvc::cell_host::{AggregateCell, CellCommandIdentity, CellStreamStore};
+use distributed::microsvc::CausalDispatchError;
 use distributed::microsvc::{Session, USER_ID_KEY};
-use distributed::{ManualClock, StreamIdentity};
+use distributed::StreamIdentity;
 use mobpit_tiers::*;
 use serde_json::{json, Value};
 

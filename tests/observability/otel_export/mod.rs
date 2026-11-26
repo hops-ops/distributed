@@ -20,23 +20,22 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use distributed::bus::{Message, MessageKind};
 use distributed::command::{typed_command, PreparedCommand, Succeeded};
-use distributed::microsvc::{
-    CausalCommandContext, HandlerError, Message, MessageKind, Routes, Service, TRANSPORT_ROLE,
-};
+use distributed::microsvc::{CausalCommandContext, HandlerError, Routes, Service, TRANSPORT_ROLE};
 use distributed::InMemoryRepository;
 use opentelemetry::propagation::{Extractor, TextMapPropagator as _};
 use opentelemetry::trace::TracerProvider as _;
 use opentelemetry_otlp::WithExportConfig as _;
 use serde_json::Value;
 
-#[derive(Debug, serde::Deserialize, distributed::CommandInput)]
+#[derive(Debug, serde::Deserialize, distributed::command::CommandInput)]
 struct CreateOrder {
     #[allow(dead_code)] // the payload shape; the handler ignores it
     id: String,
 }
 
-#[derive(Debug, serde::Serialize, distributed::CommandOutput)]
+#[derive(Debug, serde::Serialize, distributed::command::CommandOutput)]
 struct OrderCreated {
     ok: bool,
 }

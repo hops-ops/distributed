@@ -2,7 +2,7 @@
 
 use chat_domain::ChatMessage;
 use distributed::microsvc::{AggregateDependencies, Routes, ServiceStores};
-use distributed::LocalProjectionMounts;
+use distributed::projection::LocalProjectionMounts;
 use e2e_projections::CHAT_MESSAGES;
 
 /// Mount chat commands and the chat projection.

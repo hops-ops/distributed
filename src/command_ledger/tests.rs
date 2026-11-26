@@ -1451,7 +1451,7 @@ fn modeled_projection_metadata_and_ledger_share_one_absolute_retention_deadline(
 fn modeled_projection_metadata_bounds_fail_before_completion() {
     for metadata in [
         Vec::new(),
-        vec![b'x'; crate::MAX_DOMAIN_EVENT_BODY_BYTES + 1],
+        vec![b'x'; crate::domain_event::MAX_DOMAIN_EVENT_BODY_BYTES + 1],
     ] {
         assert!(matches!(
             fresh_attempt().complete_with_projection_metadata(

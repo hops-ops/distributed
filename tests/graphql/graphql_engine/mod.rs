@@ -1,9 +1,9 @@
 //! GraphqlEngine builder validation tests.
 
+use distributed::graphql::GraphqlEngine;
 use distributed::graphql::IdentityConfig;
-use distributed::{
-    graphql::GraphqlEngine, ColumnType, PrimaryKey, RelationshipDef, RelationshipKind, TableColumn,
-    TableKind, TableSchema,
+use distributed::table::{
+    ColumnType, PrimaryKey, RelationshipDef, RelationshipKind, TableColumn, TableKind, TableSchema,
 };
 use sqlx::sqlite::SqlitePoolOptions;
 
@@ -109,7 +109,7 @@ async fn isolated_multi_column_primary_key_builds_with_full_by_pk_tuple() {
         relationships: Vec::new(),
         kind: TableKind::ReadModel,
     };
-    let manifest = distributed::ReadModelCatalog::new("t").table_schema(schema);
+    let manifest = distributed::table::ReadModelCatalog::new("t").table_schema(schema);
     let engine = GraphqlEngine::from_schema_catalog(&manifest, pool().await)
         .unwrap()
         .identity(IdentityConfig::dev_headers())
@@ -127,7 +127,7 @@ async fn isolated_multi_column_primary_key_builds_with_full_by_pk_tuple() {
 #[tokio::test]
 async fn grant_all_builds_and_sdl_for_role() {
     let schema = simple_schema("Item", "items");
-    let manifest = distributed::ReadModelCatalog::new("t").table_schema(schema);
+    let manifest = distributed::table::ReadModelCatalog::new("t").table_schema(schema);
     let engine = GraphqlEngine::from_schema_catalog(&manifest, pool().await)
         .unwrap()
         .identity(IdentityConfig::dev_headers())
@@ -160,7 +160,7 @@ async fn duplicate_table_name_errors() {
 
 #[tokio::test]
 async fn build_handles_bidirectional_relationship_schemas() {
-    let manifest = distributed::ReadModelCatalog::new("t")
+    let manifest = distributed::table::ReadModelCatalog::new("t")
         .table_schema(bidirectional_parent_schema())
         .table_schema(bidirectional_child_schema());
     let engine = GraphqlEngine::from_schema_catalog(&manifest, pool().await)

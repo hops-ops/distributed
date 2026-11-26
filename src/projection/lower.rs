@@ -2,7 +2,7 @@
 //!
 //! Portable declarations resolve through [`super::ProjectionPlanTemplate`].
 //! This module then maps each resolved mutation's logical field names through
-//! the existing [`crate::RelationalReadModel`] schema into one
+//! the existing [`crate::read_model::RelationalReadModel`] schema into one
 //! [`LoweredRecord`]. The executor turns each record into its table mutation
 //! once it knows the record's current state.
 
@@ -12,6 +12,16 @@ use std::marker::PhantomData;
 use std::sync::{OnceLock, RwLock};
 
 use super::ResolvedProjectionField;
+use crate::domain_event::{DomainEvent, DomainEventOccurrence, DomainState};
+use crate::projection::{
+    MutationKind, ProjectionArm, ProjectionAssignment, ProjectionEventSelector, ProjectionEventSet,
+    ProjectionExpression, ProjectionField, ProjectionInvalidation, ProjectionKeyField,
+    ProjectionOperation, ProjectionPartition, ProjectionPlanTemplate, ProjectionProgram,
+    ProjectionProgramError, ProjectionProgramId, ProjectionRelationship,
+    ProjectionRelationshipEffect, ProjectionTarget, ProjectionValue, ProjectionValueRef,
+    ProjectionValueType, ResolvedProjectionKey, ResolvedProjectionMutation, ResolvedProjectionPlan,
+    ResolvedProjectionValue,
+};
 use crate::read_model::{ReadModelWritePlanBuilder, RelationalReadModel};
 #[cfg(any(feature = "graphql", test))]
 use crate::table::PatchTableRowMutation;
@@ -19,19 +29,12 @@ use crate::table::{
     sort_writes, validate_key, validate_row_values, DeleteTableRowMutation, TableMutation,
     TableRowMutation, WritePosition,
 };
-use crate::{
-    ColumnType, DomainEvent, DomainEventOccurrence, DomainState, ExpectedVersion, MutationKind,
-    ProjectionArm, ProjectionAssignment, ProjectionEventSelector, ProjectionEventSet,
-    ProjectionExpression, ProjectionField, ProjectionInvalidation, ProjectionKeyField,
-    ProjectionOperation, ProjectionPartition, ProjectionPlanTemplate, ProjectionProgram,
-    ProjectionProgramError, ProjectionProgramId, ProjectionRelationship,
-    ProjectionRelationshipEffect, ProjectionTarget, ProjectionValue, ProjectionValueRef,
-    ProjectionValueType, ResolvedProjectionKey, ResolvedProjectionMutation, ResolvedProjectionPlan,
-    ResolvedProjectionValue, RowKey, RowValue, RowValues, RowWriteMode, TableSchema,
+use crate::table::{
+    ColumnType, ExpectedVersion, RowKey, RowValue, RowValues, RowWriteMode, TableSchema,
     TableStoreError,
 };
 #[cfg(any(feature = "graphql", test))]
-use crate::{PatchMode, RowPatch};
+use crate::table::{PatchMode, RowPatch};
 
 /// Flat portable Rust field category emitted by the domain-state/event derives.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -888,9 +891,9 @@ pub fn state_selector<S>(
 where
     S: DomainState,
 {
-    ProjectionEventSelector::try_from_descriptor(&crate::DomainEventDescriptor::state::<S>(
-        name, version,
-    ))
+    ProjectionEventSelector::try_from_descriptor(
+        &crate::domain_event::DomainEventDescriptor::state::<S>(name, version),
+    )
 }
 
 /// Build an exact typed domain-event selector.
@@ -919,11 +922,11 @@ pub fn deletion_selector<I>(
 where
     I: ProjectionDeletionMetadata,
 {
-    ProjectionEventSelector::try_from_descriptor(&crate::DomainEventDescriptor {
+    ProjectionEventSelector::try_from_descriptor(&crate::domain_event::DomainEventDescriptor {
         name: std::borrow::Cow::Borrowed(name),
         version,
-        body: crate::DomainEventBodyDescriptor::distributed_json(
-            crate::DomainEventBodyKind::Deletion,
+        body: crate::domain_event::DomainEventBodyDescriptor::distributed_json(
+            crate::domain_event::DomainEventBodyKind::Deletion,
             I::BODY_TYPE_NAME,
             1,
             I::BODY_SCHEMA,
@@ -1074,9 +1077,9 @@ where
     }
     let effect_kind = match kind {
         MutationKind::InsertRelated | MutationKind::UpsertRelated => {
-            Some(crate::ProjectionRelationshipEffectKind::Link)
+            Some(crate::projection::ProjectionRelationshipEffectKind::Link)
         }
-        MutationKind::Delete => Some(crate::ProjectionRelationshipEffectKind::Unlink),
+        MutationKind::Delete => Some(crate::projection::ProjectionRelationshipEffectKind::Unlink),
         _ => None,
     }
     .ok_or_else(|| ProjectionProgramError::InvalidOperation {
@@ -1104,19 +1107,23 @@ where
         child_schema.model_name.clone(),
     )?;
     let effect = match effect_kind {
-        crate::ProjectionRelationshipEffectKind::Link => ProjectionRelationshipEffect::link(
-            0,
-            relationship,
-            parent.key().to_vec(),
-            built.key().to_vec(),
-        )?,
-        crate::ProjectionRelationshipEffectKind::Unlink => ProjectionRelationshipEffect::unlink(
-            0,
-            relationship,
-            parent.key().to_vec(),
-            built.key().to_vec(),
-        )?,
-        crate::ProjectionRelationshipEffectKind::Invalidate => unreachable!(),
+        crate::projection::ProjectionRelationshipEffectKind::Link => {
+            ProjectionRelationshipEffect::link(
+                0,
+                relationship,
+                parent.key().to_vec(),
+                built.key().to_vec(),
+            )?
+        }
+        crate::projection::ProjectionRelationshipEffectKind::Unlink => {
+            ProjectionRelationshipEffect::unlink(
+                0,
+                relationship,
+                parent.key().to_vec(),
+                built.key().to_vec(),
+            )?
+        }
+        crate::projection::ProjectionRelationshipEffectKind::Invalidate => unreachable!(),
     };
     ProjectionOperation::try_new(
         built.operation_id().to_owned(),
@@ -1275,7 +1282,7 @@ pub fn finish_lowering(
     })
 }
 
-fn projection_schema<M>() -> Result<&'static crate::TableSchema, ProjectionProgramError>
+fn projection_schema<M>() -> Result<&'static crate::table::TableSchema, ProjectionProgramError>
 where
     M: ProjectionReadModelMetadata,
 {
@@ -1454,7 +1461,7 @@ fn unique_authoring_fields(
 
 fn operation_expression_for_column(
     operation: &ProjectionOperation,
-    schema: &crate::TableSchema,
+    schema: &crate::table::TableSchema,
     column: &str,
 ) -> Result<ProjectionExpression, ProjectionProgramError> {
     let logical_name = schema

@@ -165,9 +165,9 @@ mod tests {
         ProjectionModelOwnership::new("SqlTodoView", "sql_todo_views").unwrap()
     }
 
-    fn semantic_program_id(fill: char) -> crate::ProjectionProgramId {
+    fn semantic_program_id(fill: char) -> crate::projection::ProjectionProgramId {
         let hex = std::iter::repeat_n(fill, 64).collect::<String>();
-        crate::ProjectionProgramId::parse(&format!("pp1:sha256:{hex}"))
+        crate::projection::ProjectionProgramId::parse(&format!("pp1:sha256:{hex}"))
             .expect("test semantic program ID is canonical")
     }
 

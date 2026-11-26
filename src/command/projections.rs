@@ -1,11 +1,9 @@
 use serde::Serialize;
 
+use crate::domain_event::{DomainEvent, DomainEventBodyKind, DomainEventDescriptor, DomainState};
 use crate::domain_event::{DomainEventBodyContract, DomainEventContract};
 use crate::projection::lower::{ProjectionBodyMetadata, ProjectionPortableType};
-use crate::{
-    DomainEvent, DomainEventBodyKind, DomainEventDescriptor, DomainState, ProjectionEnvelopeField,
-    ProjectionEventSelector, ProjectionValue,
-};
+use crate::projection::{ProjectionEnvelopeField, ProjectionEventSelector, ProjectionValue};
 
 /// One preview-time source for an emitted domain-event body field.
 ///
@@ -215,9 +213,9 @@ pub struct WasmPure {
     pub export: &'static str,
     /// The declaring Cargo package, which the CLI builds with `--features wasm`.
     pub rust_package: &'static str,
-    pub row: fn() -> crate::JsonShape,
-    pub args: fn() -> crate::JsonShape,
-    pub output: fn() -> crate::JsonShape,
+    pub row: fn() -> crate::table::JsonShape,
+    pub args: fn() -> crate::table::JsonShape,
+    pub output: fn() -> crate::table::JsonShape,
 }
 
 /// Run a typed pure over JSON: the bridge behind every `wasm_pure!` export.
@@ -240,7 +238,7 @@ where
 
 /// Declare a browser pure function over a known read-model row.
 ///
-/// ```ignore
+/// ```text
 /// pub fn simulate_move(row: MoveRow, args: MoveArgs) -> Option<MovePatch> { … }
 ///
 /// distributed::wasm_pure! {
@@ -253,7 +251,7 @@ where
 /// built with its `wasm` feature, a wasm-bindgen export named after the
 /// function that decodes the row and arguments, calls it and encodes the
 /// result. The row, argument and output types derive
-/// [`JsonType`](crate::JsonType) and Serde. The package needs a `wasm` feature
+/// [`JsonType`](crate::table::JsonType) and Serde. The package needs a `wasm` feature
 /// that enables `wasm-bindgen`.
 #[macro_export]
 macro_rules! wasm_pure {
@@ -265,9 +263,9 @@ macro_rules! wasm_pure {
         $vis const $name: $crate::command::WasmPure = $crate::command::WasmPure {
             export: ::core::stringify!($pure),
             rust_package: ::core::env!("CARGO_PKG_NAME"),
-            row: <$row as $crate::JsonType>::json_shape,
-            args: <$args as $crate::JsonType>::json_shape,
-            output: <$output as $crate::JsonType>::json_shape,
+            row: <$row as $crate::table::JsonType>::json_shape,
+            args: <$args as $crate::table::JsonType>::json_shape,
+            output: <$output as $crate::table::JsonType>::json_shape,
         };
         // The declared types are the function's types, with or without `wasm`.
         const _: fn($row, $args) -> ::core::option::Option<$output> = $pure;
@@ -327,7 +325,7 @@ impl CommandProjectionPureReduce {
         let mut errors = Vec::new();
         let pure_name = format!("{}::{}", pure.rust_package, pure.export);
         for (role, shape) in [("row", &row), ("arguments", &args), ("output", &output)] {
-            if !matches!(shape, crate::JsonShape::Object { fields } if !fields.is_empty()) {
+            if !matches!(shape, crate::table::JsonShape::Object { fields } if !fields.is_empty()) {
                 errors.push(format!(
                     "pure `{pure_name}` {role} must be a struct with named fields"
                 ));

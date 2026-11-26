@@ -21,8 +21,8 @@ use distributed::bus::{
     celld_queue_relay_handler, Bus, CelldQueueEnvelope, CelldQueueRelayHandler, Message,
     MessagePublisher, SqliteBus, TransportError, CELLD_QUEUE_RELAY_PATH,
 };
-use distributed::cell_host::{InternalHttpSecret, CELL_INTERNAL_SECRET_HEADER};
-use distributed::BusPublisher;
+use distributed::microsvc::cell_host::{InternalHttpSecret, CELL_INTERNAL_SECRET_HEADER};
+use distributed::outbox_worker::BusPublisher;
 use serde_json::{json, Value};
 
 /// Open (creating) a SQLite database another process may share: WAL and a

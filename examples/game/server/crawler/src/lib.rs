@@ -27,7 +27,8 @@
 
 pub mod stats;
 
-use distributed::{sourced, DomainState, Entity};
+use distributed::domain_event::DomainState;
+use distributed::{sourced, Entity};
 use serde::{Deserialize, Serialize};
 
 /// Aggregate type (cell instance names are `Crawler:{principal}`).
@@ -204,7 +205,12 @@ pub type MobKilledArgs = (String, String, String, u8, u32);
 /// RecordKillInput { .. }, &[mob, generation])` — and the derive rejects
 /// identity or reward fields at compile time.
 #[derive(
-    Debug, Clone, Serialize, Deserialize, distributed::CommandInput, distributed_game::FactCommand,
+    Debug,
+    Clone,
+    Serialize,
+    Deserialize,
+    distributed::command::CommandInput,
+    distributed_game::FactCommand,
 )]
 #[fact(command = RECORD_KILL)]
 pub struct RecordKillInput {
@@ -217,7 +223,7 @@ pub struct RecordKillInput {
 }
 
 /// [`RECORD_KILL`] result, replayed verbatim for a repeated fact key.
-#[derive(Debug, Clone, Serialize, Deserialize, distributed::CommandOutput)]
+#[derive(Debug, Clone, Serialize, Deserialize, distributed::command::CommandOutput)]
 pub struct KillReceipt {
     /// Principal credited.
     pub crawler: String,

@@ -9,11 +9,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use distributed::cell_host::{
+use distributed::microsvc::cell_host::{
     CELL_INTERNAL_SECRET_ENV, CELL_INTERNAL_SECRET_HEADER, CELL_PRINCIPAL_PARTITION_HEADER,
     CELL_SERVICE_ID_HEADER,
 };
-use distributed::USER_ID_KEY;
+use distributed::microsvc::USER_ID_KEY;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use worker::send::{SendFuture, SendWrapper};

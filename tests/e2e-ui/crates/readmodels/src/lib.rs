@@ -20,7 +20,7 @@ pub fn read_models() -> distributed::graphql::ReadModels {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use distributed::RelationalReadModel;
+    use distributed::read_model::RelationalReadModel;
 
     #[test]
     fn referencing_models_own_one_way_auth_user_relationships() {

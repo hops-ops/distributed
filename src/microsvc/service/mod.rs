@@ -12,7 +12,8 @@
 //! awaited:
 //!
 //! ```ignore
-//! use distributed::microsvc::{self, Message, MessageKind};
+//! use distributed::bus::{Message, MessageKind};
+//! use distributed::microsvc;
 //! use serde_json::json;
 //!
 //! let routes = microsvc::Routes::new()

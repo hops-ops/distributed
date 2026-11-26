@@ -11,7 +11,7 @@ Contexts are in-process assertions and have no client deserializer.
 The gateway does not translate a cookie or `x-user-id` into a credential.
 A configured session provider may resolve an Auth.js session and supply its
 access token; the backend must still validate that token and authorize the
-operation. With `graphql` enabled, `graphql::identity::OidcGatewayProvider`
+operation. With `graphql` enabled, `graphql::OidcGatewayProvider`
 reuses the existing JWT validator, JWKS cache and role mapping. This optional
 adapter does not make the portable gateway depend on GraphQL.
 

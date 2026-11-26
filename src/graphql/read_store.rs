@@ -149,7 +149,7 @@ mod tests {
     };
     use crate::graphql::{claim, col, read, GraphqlEngine, ModelPermissions, ReadStore};
     use crate::microsvc::Session;
-    use crate::ReadModel;
+    use crate::read_model::ReadModel;
     use async_graphql::Request;
     use serde::{Deserialize, Serialize};
     use serde_json::json;

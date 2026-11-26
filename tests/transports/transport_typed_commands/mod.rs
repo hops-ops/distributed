@@ -42,7 +42,7 @@ impl Counter {
     }
 }
 
-#[derive(Debug, Deserialize, distributed::CommandInput)]
+#[derive(Debug, Deserialize, distributed::command::CommandInput)]
 struct BumpInput {
     id: String,
     /// `ok`, `reject` (a business refusal) or `flaky` (fails once per id
@@ -50,7 +50,7 @@ struct BumpInput {
     mode: String,
 }
 
-#[derive(Debug, Serialize, distributed::CommandOutput)]
+#[derive(Debug, Serialize, distributed::command::CommandOutput)]
 struct BumpPayload {
     count: u32,
     user: String,

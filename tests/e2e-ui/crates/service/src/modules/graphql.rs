@@ -1,12 +1,11 @@
+use distributed::application::{Application, ApplicationError, ApplicationManifest, SurfaceSpec};
 use distributed::graphql::{
     build_surface, surface_for_application, DistributedClientSurfaceExport, GraphqlEngine,
     GraphqlPoolSource, IdentityConfig, OidcConfig, Surface, SurfaceOptions,
 };
+use distributed::lock::InMemoryLockManager;
 use distributed::microsvc::{Service, Stores};
-use distributed::{
-    Application, ApplicationError, ApplicationManifest, InMemoryLockManager, InMemoryRepository,
-    SurfaceSpec,
-};
+use distributed::InMemoryRepository;
 use e2e_readmodels::read_models;
 
 use crate::application::{
@@ -25,7 +24,7 @@ pub fn build_graphql_engine(
     pool: impl Into<GraphqlPoolSource>,
     service: &Service,
     identity: IdentityConfig,
-    change_rx: Option<tokio::sync::broadcast::Receiver<distributed::ReadModelChange>>,
+    change_rx: Option<tokio::sync::broadcast::Receiver<distributed::read_model::ReadModelChange>>,
 ) -> Result<GraphqlEngine, String> {
     build_graphql_engine_with_graphiql(pool, service, identity, change_rx, graphiql_enabled())
 }
@@ -34,7 +33,7 @@ pub(crate) fn build_graphql_engine_with_graphiql(
     pool: impl Into<GraphqlPoolSource>,
     service: &Service,
     identity: IdentityConfig,
-    change_rx: Option<tokio::sync::broadcast::Receiver<distributed::ReadModelChange>>,
+    change_rx: Option<tokio::sync::broadcast::Receiver<distributed::read_model::ReadModelChange>>,
     graphiql: bool,
 ) -> Result<GraphqlEngine, String> {
     build_engine(pool, service, identity, change_rx, graphiql, None)
@@ -44,7 +43,7 @@ pub(crate) fn build_graphql_engine_with_delivery(
     pool: impl Into<GraphqlPoolSource>,
     service: &Service,
     identity: IdentityConfig,
-    change_rx: Option<tokio::sync::broadcast::Receiver<distributed::ReadModelChange>>,
+    change_rx: Option<tokio::sync::broadcast::Receiver<distributed::read_model::ReadModelChange>>,
     versions: Option<distributed::graphql::delivery::GatewayVersionStore>,
 ) -> Result<GraphqlEngine, String> {
     build_engine(
@@ -61,7 +60,7 @@ fn build_engine(
     pool: impl Into<GraphqlPoolSource>,
     service: &Service,
     identity: IdentityConfig,
-    change_rx: Option<tokio::sync::broadcast::Receiver<distributed::ReadModelChange>>,
+    change_rx: Option<tokio::sync::broadcast::Receiver<distributed::read_model::ReadModelChange>>,
     graphiql: bool,
     versions: Option<distributed::graphql::delivery::GatewayVersionStore>,
 ) -> Result<GraphqlEngine, String> {
@@ -590,7 +589,7 @@ mod client_surface_tests {
         let repository = distributed::PostgresRepository::new(pool.clone());
         let service = build_service(&Stores::new(
             repository.clone(),
-            distributed::PostgresLockManager::new(pool),
+            distributed::lock::PostgresLockManager::new(pool),
             repository.clone(),
         ));
         let engine = crate::modules::graphql::build_graphql_engine_with_graphiql(

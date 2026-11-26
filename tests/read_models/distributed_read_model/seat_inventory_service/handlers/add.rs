@@ -9,7 +9,7 @@ use crate::distributed_read_model::seat_inventory_service::Seat;
 
 pub const COMMAND: &str = seat_command::ADD;
 
-#[derive(Debug, Serialize, distributed::CommandOutput)]
+#[derive(Debug, Serialize, distributed::command::CommandOutput)]
 pub struct Output {
     pub seat_id: String,
 }

@@ -9,7 +9,7 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
-pub fn application_manifest() -> distributed::ApplicationManifest {
+pub fn application_manifest() -> distributed::application::ApplicationManifest {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .expect("the service is a member of the project");
@@ -38,5 +38,5 @@ pub fn application_manifest() -> distributed::ApplicationManifest {
             std::thread::sleep(Duration::from_millis(20));
         }
     }
-    distributed::ApplicationManifest::new(include_str!("name.txt").trim())
+    distributed::application::ApplicationManifest::new(include_str!("name.txt").trim())
 }

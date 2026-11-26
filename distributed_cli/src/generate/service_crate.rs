@@ -213,9 +213,8 @@ async fn main() -> Result<(), {error_type}> {{
             .map(|model| format!("        .read_model::<{}>()\n", model.view_ident))
             .collect::<String>();
         format!(
-            r#"use distributed::{{
-    Application, ApplicationManifest, ReadModelCatalog, SurfaceSpec,
-}};
+            r#"use distributed::application::{{Application, ApplicationManifest, SurfaceSpec}};
+use distributed::table::ReadModelCatalog;
 
 {read_model_import}pub fn application_manifest() -> ApplicationManifest {{
     let catalog = read_model_catalog();
@@ -255,24 +254,22 @@ pub fn service_descriptor() -> distributed::microsvc::ServiceDescriptor {{
         } else {
             "InMemoryRepository"
         };
-        let mut manifest_imports = vec![
-            if self.commands.is_empty() && self.events.is_empty() {
-                "microsvc::Service"
-            } else {
-                "microsvc::{Routes, Service}"
-            },
-            repo_import,
-            "ServiceDescriptor",
-        ];
+        let mut microsvc_imports = Vec::new();
         if self.metrics == Some(MetricsTarget::Prometheus) {
-            manifest_imports.push("MetricsEndpointDescriptor");
+            microsvc_imports.push("MetricsEndpointDescriptor");
         }
+        if !(self.commands.is_empty() && self.events.is_empty()) {
+            microsvc_imports.push("Routes");
+        }
+        microsvc_imports.extend(["Service", "ServiceDescriptor"]);
         if self.tracing {
-            manifest_imports.push("TracingDescriptor");
+            microsvc_imports.push("TracingDescriptor");
         }
+        let mut manifest_imports = vec![format!("microsvc::{{{}}}", microsvc_imports.join(", "))];
         if !self.commands.is_empty() {
-            manifest_imports.push("AggregateRepository");
+            manifest_imports.push("AggregateRepository".into());
         }
+        manifest_imports.push(repo_import.into());
         let manifest_imports = manifest_imports.join(", ");
         let event_registrations = self
             .events
@@ -514,13 +511,13 @@ impl CommandAggregate {
             ""
         };
 
-        let command_types = r#"#[derive(Clone, Debug, Deserialize, distributed::CommandInput)]
+        let command_types = r#"#[derive(Clone, Debug, Deserialize, distributed::command::CommandInput)]
 pub struct CommandInput {
     pub id: String,
     pub name: Option<String>,
 }
 
-#[derive(Clone, Debug, Serialize, distributed::CommandOutput)]
+#[derive(Clone, Debug, Serialize, distributed::command::CommandOutput)]
 pub struct CommandOutput {
     pub command: String,
     pub id: String,
@@ -671,7 +668,7 @@ pub struct {view_struct} {{
             .join("\n");
 
         format!(
-            r#"use distributed::ReadModel;
+            r#"use distributed::read_model::ReadModel;
 use serde::{{Deserialize, Serialize}};
 
 {views}

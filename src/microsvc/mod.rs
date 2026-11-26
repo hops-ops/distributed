@@ -85,7 +85,6 @@ mod stores;
 #[cfg(feature = "runtime-tokio")]
 mod workers;
 
-pub use crate::bus::{Message, MessageKind, PayloadDecodeError, SubscriptionPlan};
 pub use causal::AggregateCheckout;
 pub use context::Context;
 pub use dependencies::{
@@ -175,8 +174,6 @@ pub use knative_ingress::{cloud_events_router, decode_cloud_event};
 // gRPC transport (requires "grpc" feature)
 #[cfg(feature = "grpc")]
 pub mod grpc;
-#[cfg(feature = "grpc")]
-pub use grpc::{grpc_server, serve_grpc, GrpcServeError};
 
 /// Register event handler modules with a route bundle using the convention
 /// pattern.

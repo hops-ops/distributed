@@ -316,25 +316,54 @@ struct IncludeSpec {
 }
 
 impl RelationalReadModelQueryStore for InMemoryReadModelStore {
-    fn scan_read_model(&self, request: super::ReadModelScanRequest)
-        -> impl Future<Output = Result<super::ReadModelScanPage, TableStoreError>> + Send + '_ {
+    fn scan_read_model(
+        &self,
+        request: super::ReadModelScanRequest,
+    ) -> impl Future<Output = Result<super::ReadModelScanPage, TableStoreError>> + Send + '_ {
         async move {
             request.validate()?;
-            let registry = self.schema_registry.read().map_err(|_| TableStoreError::Storage("schema registry lock poisoned".into()))?;
-            if registry.schema_for_model(&request.schema.model_name).is_some_and(|s| s != &request.schema) {
-                return Err(TableStoreError::Metadata("scan schema differs from registered model".into()));
+            let registry = self
+                .schema_registry
+                .read()
+                .map_err(|_| TableStoreError::Storage("schema registry lock poisoned".into()))?;
+            if registry
+                .schema_for_model(&request.schema.model_name)
+                .is_some_and(|s| s != &request.schema)
+            {
+                return Err(TableStoreError::Metadata(
+                    "scan schema differs from registered model".into(),
+                ));
             }
-            let rows = self.relational_rows.read().map_err(|_| TableStoreError::Storage("row lock poisoned".into()))?;
+            let rows = self
+                .relational_rows
+                .read()
+                .map_err(|_| TableStoreError::Storage("row lock poisoned".into()))?;
             let prefix = format!("{}:", request.schema.table_name);
             let mut selected = BTreeMap::new();
             for (storage_key, row) in rows.iter() {
-                if !storage_key.starts_with(&prefix) || !request.matches(&row.values) { continue; }
-                let Some(RowValue::String(key)) = row.values.get(request.key_column()) else { return Err(TableStoreError::Metadata("invalid scan row key".into())); };
-                if request.after().is_some_and(|after| key.as_str() <= after) { continue; }
+                if !storage_key.starts_with(&prefix) || !request.matches(&row.values) {
+                    continue;
+                }
+                let Some(RowValue::String(key)) = row.values.get(request.key_column()) else {
+                    return Err(TableStoreError::Metadata("invalid scan row key".into()));
+                };
+                if request.after().is_some_and(|after| key.as_str() <= after) {
+                    continue;
+                }
                 selected.insert(key, row);
-                if selected.len() > usize::from(request.limit) + 1 { selected.pop_last(); }
+                if selected.len() > usize::from(request.limit) + 1 {
+                    selected.pop_last();
+                }
             }
-            request.finish(selected.into_values().map(|row| Versioned { data: row.values.clone(), version: row.version }).collect())
+            request.finish(
+                selected
+                    .into_values()
+                    .map(|row| Versioned {
+                        data: row.values.clone(),
+                        version: row.version,
+                    })
+                    .collect(),
+            )
         }
     }
 
@@ -343,7 +372,6 @@ impl RelationalReadModelQueryStore for InMemoryReadModelStore {
         request: ReadModelLoadRequest,
     ) -> impl Future<Output = Result<ReadModelLoadGraph, TableStoreError>> + Send + '_ {
         async move {
-
             let (root_schema, include_specs) = {
                 let registry = self.schema_registry.read().map_err(|_| {
                     TableStoreError::Storage("schema registry lock poisoned".into())
@@ -543,7 +571,7 @@ fn rows_matching_column(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
+    use crate::table::{
         ColumnType, DeleteTableRowMutation, PatchTableRowMutation, PrimaryKey, RowPatch,
         TableColumn, TableRowMutation,
     };
@@ -558,7 +586,7 @@ mod tests {
                 version_column: None,
                 indexes: Vec::new(),
                 relationships: Vec::new(),
-                kind: crate::TableKind::ReadModel,
+                kind: crate::table::TableKind::ReadModel,
             });
         &SCHEMA
     }
@@ -605,7 +633,7 @@ mod tests {
             nullable: true,
             ..TableColumn::new("slug", "slug", ColumnType::Text)
         });
-        target.indexes.push(crate::TableIndex {
+        target.indexes.push(crate::table::TableIndex {
             name: None,
             columns: vec!["slug".into()],
             unique: true,

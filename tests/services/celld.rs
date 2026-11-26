@@ -6,7 +6,7 @@
 
 use std::time::Duration;
 
-use distributed::cell_host::{
+use distributed::microsvc::cell_host::{
     CELL_INTERNAL_SECRET_ENV, CELL_INTERNAL_SECRET_HEADER, CELL_PRINCIPAL_PARTITION_HEADER,
     CELL_SERVICE_ID_HEADER,
 };

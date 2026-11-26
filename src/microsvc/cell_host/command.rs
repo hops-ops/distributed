@@ -100,7 +100,7 @@ impl CelldCommandHost {
     /// Route every command of aggregate `A` mounted on this host's service
     /// to `{kind}/{shard}/{command}`: `kind` is `A::aggregate_type()`, `shard`
     /// the command's declared shard of its input (`shard:` in
-    /// [`command!`](crate::command), or the id of `load_by` / `create_by`).
+    /// [`command!`](macro@crate::command), or the id of `load_by` / `create_by`).
     ///
     /// The cell's payload is returned as-is, after it is checked against the
     /// command's declared output: a missing, undeclared or mistyped field

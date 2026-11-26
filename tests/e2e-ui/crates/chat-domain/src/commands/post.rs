@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{domain_commands, ChatMessage, ChatMessagePostedDomainEvent, ChatMessageState};
 
-#[derive(Debug, Deserialize, distributed::CommandInput)]
+#[derive(Debug, Deserialize, distributed::command::CommandInput)]
 pub struct ChatPostInput {
     pub message_id: String,
     pub body: String,
@@ -17,7 +17,7 @@ pub struct ChatPostInput {
     pub created_at: String,
 }
 
-#[derive(Debug, Serialize, distributed::CommandOutput)]
+#[derive(Debug, Serialize, distributed::command::CommandOutput)]
 pub struct ChatPostPayload {
     pub message_id: String,
     pub room_id: String,

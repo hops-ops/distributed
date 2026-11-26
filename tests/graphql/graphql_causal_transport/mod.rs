@@ -3,12 +3,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use base64::Engine as _;
 use distributed::command::{typed_command, PreparedCommand, Succeeded};
+use distributed::command::{CommandInput, CommandOutput};
 use distributed::graphql::{GraphqlEngine, IdentityConfig, OidcConfig};
 use distributed::microsvc::{CausalCommandContext, HandlerError, Routes, Service};
-use distributed::{
-    Aggregate, AggregateRepository, CommandInput, CommandOutput, Entity, EventRecord,
-    InMemoryRepository,
-};
+use distributed::{Aggregate, AggregateRepository, Entity, EventRecord, InMemoryRepository};
 use futures_util::{SinkExt, StreamExt};
 use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
 use rand::thread_rng;
@@ -219,7 +217,7 @@ async fn spawn_server_mode(service: Arc<Service>, mode: GatewayMode) -> TestServ
         mode => {
             use distributed::gateway::{native::*, *};
             let engine = service.graphql_engine().unwrap();
-            let provider = Arc::new(distributed::graphql::identity::OidcGatewayProvider::new(
+            let provider = Arc::new(distributed::graphql::OidcGatewayProvider::new(
                 engine.identity_config().oidc().cloned().unwrap(),
                 "causal-fixture-v1",
             ));
@@ -238,7 +236,7 @@ async fn spawn_server_mode(service: Arc<Service>, mode: GatewayMode) -> TestServ
                     GraphqlBinding::Embedded(
                         EmbeddedGraphql::new(
                             engine,
-                            Some(service as distributed::SharedCommandHost),
+                            Some(service as distributed::command_dispatch::SharedCommandHost),
                             caps,
                         )
                         .unwrap(),

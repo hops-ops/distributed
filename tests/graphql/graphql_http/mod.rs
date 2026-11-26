@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use distributed::graphql::{graphiql_enabled_from_env_vars, read, GraphqlEngine, ModelPermissions};
 use distributed::microsvc::{router, Service};
-use distributed::ReadModel;
+use distributed::read_model::ReadModel;
 use serde::{Deserialize, Serialize};
 use tower::util::ServiceExt;
 

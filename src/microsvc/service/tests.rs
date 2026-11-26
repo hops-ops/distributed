@@ -29,6 +29,7 @@ use crate::microsvc::cell_host::{CelldCommandHost, InternalHttpSecret};
 use crate::microsvc::HasOutboxStore;
 use crate::microsvc::{Context, HandlerError, RepoReadModelDependencies, Routes, Service, Session};
 use crate::outbox::OutboxMessage;
+use crate::outbox_worker::OutboxStore;
 use crate::projection_protocol::{
     PartitionId, ProjectionCausationEvidenceBatch, ProjectionCausationEvidenceRequest,
     ProjectionChangeCursor, ProjectionChangeRead, ProjectionCheckpoint, ProjectionCommitBatch,
@@ -40,11 +41,11 @@ use crate::projection_protocol::{
     ProjectionProtocolStore, ProjectionQuerySnapshot, ProjectionQuerySnapshotRequest,
     ProjectionRecordMetadata, ProjectionRecordScope, ProjectorTopologyId, TrustedProjectionInput,
 };
+use crate::GetStream;
 use crate::{
     sourced, AggregateBuilder, AggregateRepository, Entity, InMemoryRepository, Queueable,
     QueuedRepository,
 };
-use crate::{GetStream, OutboxStore};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use serde_json::Value;
@@ -130,7 +131,7 @@ impl CommandInputType for CausalTestInput {
 }
 
 #[cfg(feature = "graphql")]
-#[derive(Clone, Deserialize, crate::CommandInput)]
+#[derive(Clone, Deserialize, crate::command::CommandInput)]
 struct CausalProjectionInput {
     #[serde(rename = "todoId")]
     id: String,
@@ -138,7 +139,7 @@ struct CausalProjectionInput {
     partition: String,
 }
 
-#[derive(Clone, Serialize, Deserialize, crate::ReadModel)]
+#[derive(Clone, Serialize, Deserialize, crate::read_model::ReadModel)]
 #[readmodel(
         table = "causal_projection_obligation_views",
         primary_key = ["id"]
@@ -147,20 +148,20 @@ struct CausalProjectionObligationView {
     id: String,
 }
 
-#[derive(Clone, Serialize, Deserialize, crate::ReadModel)]
+#[derive(Clone, Serialize, Deserialize, crate::read_model::ReadModel)]
 #[readmodel(table = "causal_projection_sibling_views", primary_key = ["id"])]
 struct CausalProjectionSiblingView {
     id: String,
 }
 
-#[derive(Clone, Serialize, crate::DomainEvent)]
+#[derive(Clone, Serialize, crate::domain_event::DomainEvent)]
 #[domain_event(name = "causal.lifecycle-recorded", version = 1)]
 struct CausalLifecycleRecorded {
     id: String,
     label: String,
 }
 
-#[derive(Clone, Serialize, Deserialize, crate::ReadModel)]
+#[derive(Clone, Serialize, Deserialize, crate::read_model::ReadModel)]
 #[readmodel(table = "causal_lifecycle_views", primary_key = ["id"])]
 struct CausalLifecycleView {
     id: String,
@@ -168,7 +169,7 @@ struct CausalLifecycleView {
 }
 
 #[cfg(feature = "graphql")]
-#[derive(Clone, Serialize, Deserialize, crate::DomainState)]
+#[derive(Clone, Serialize, Deserialize, crate::domain_event::DomainState)]
 #[domain_state(version = 1)]
 struct CausalDirectState {
     id: String,
@@ -179,7 +180,7 @@ fn causal_direct_program(
     name: &'static str,
     version: u64,
     event_name: &'static str,
-) -> Result<crate::ProjectionProgram, crate::ProjectionProgramError> {
+) -> Result<crate::projection::ProjectionProgram, crate::projection::ProjectionProgramError> {
     use crate::mutation::{
         bind_event_apply_mutation, compile_projection, state_upsert_program_for_model,
     };
@@ -190,18 +191,25 @@ fn causal_direct_program(
         "upsert-view",
         "view",
     )?;
-    let descriptor = crate::DomainEventDescriptor::state::<CausalDirectState>(event_name, 1);
+    let descriptor =
+        crate::domain_event::DomainEventDescriptor::state::<CausalDirectState>(event_name, 1);
     let handler = bind_event_apply_mutation(
         &descriptor,
         program,
         "view",
-        crate::ProjectionInputSource::Body,
+        crate::mutation::ProjectionInputSource::Body,
     )?;
-    compile_projection(name, version, crate::ProjectionPartition::Unit, [handler])
+    compile_projection(
+        name,
+        version,
+        crate::projection::ProjectionPartition::Unit,
+        [handler],
+    )
 }
 
 #[cfg(feature = "graphql")]
-fn causal_direct_v1_program() -> Result<crate::ProjectionProgram, crate::ProjectionProgramError> {
+fn causal_direct_v1_program(
+) -> Result<crate::projection::ProjectionProgram, crate::projection::ProjectionProgramError> {
     causal_direct_program("project_causal_direct", 1, "causal.direct-recorded")
 }
 
@@ -217,7 +225,8 @@ crate::projection! {
 }
 
 #[cfg(feature = "graphql")]
-fn causal_direct_v2_program() -> Result<crate::ProjectionProgram, crate::ProjectionProgramError> {
+fn causal_direct_v2_program(
+) -> Result<crate::projection::ProjectionProgram, crate::projection::ProjectionProgramError> {
     causal_direct_program("project_causal_direct", 2, "causal.direct-recorded")
 }
 
@@ -233,7 +242,8 @@ crate::projection! {
 }
 
 #[cfg(feature = "graphql")]
-fn causal_sibling_program() -> Result<crate::ProjectionProgram, crate::ProjectionProgramError> {
+fn causal_sibling_program(
+) -> Result<crate::projection::ProjectionProgram, crate::projection::ProjectionProgramError> {
     use crate::mutation::{
         bind_event_apply_mutation, compile_projection, state_upsert_program_for_model,
     };
@@ -244,7 +254,7 @@ fn causal_sibling_program() -> Result<crate::ProjectionProgram, crate::Projectio
         "upsert-view",
         "view",
     )?;
-    let descriptor = crate::DomainEventDescriptor::state::<CausalDirectState>(
+    let descriptor = crate::domain_event::DomainEventDescriptor::state::<CausalDirectState>(
         "causal.direct-sibling-recorded",
         1,
     );
@@ -252,12 +262,12 @@ fn causal_sibling_program() -> Result<crate::ProjectionProgram, crate::Projectio
         &descriptor,
         program,
         "view",
-        crate::ProjectionInputSource::Body,
+        crate::mutation::ProjectionInputSource::Body,
     )?;
     compile_projection(
         "project_causal_direct_sibling",
         1,
-        crate::ProjectionPartition::Unit,
+        crate::projection::ProjectionPartition::Unit,
         [handler],
     )
 }
@@ -274,7 +284,8 @@ crate::projection! {
 }
 
 #[cfg(feature = "graphql")]
-fn causal_lifecycle_program() -> Result<crate::ProjectionProgram, crate::ProjectionProgramError> {
+fn causal_lifecycle_program(
+) -> Result<crate::projection::ProjectionProgram, crate::projection::ProjectionProgramError> {
     use crate::domain_event::DomainEventContract;
     use crate::mutation::{
         bind_event_apply_mutation, compile_projection, state_upsert_program_for_model,
@@ -290,12 +301,12 @@ fn causal_lifecycle_program() -> Result<crate::ProjectionProgram, crate::Project
         &CausalLifecycleRecorded::descriptor(),
         program,
         "view",
-        crate::ProjectionInputSource::Body,
+        crate::mutation::ProjectionInputSource::Body,
     )?;
     compile_projection(
         "project_causal_lifecycle",
         1,
-        crate::ProjectionPartition::Unit,
+        crate::projection::ProjectionPartition::Unit,
         [handler],
     )
 }
@@ -524,7 +535,7 @@ impl CausalDispatcherAggregate {
         self.entity
             .capture_domain_state(
                 Self::aggregate_type(),
-                crate::DomainEventDescriptor::state::<CausalDirectState>(
+                crate::domain_event::DomainEventDescriptor::state::<CausalDirectState>(
                     "causal.direct-recorded",
                     1,
                 ),
@@ -950,10 +961,10 @@ fn command_service(routes: Routes<StoreDeps>) -> Service {
     Service::new().named("tests").routes(routes)
 }
 
-#[derive(Deserialize, crate::CommandInput)]
+#[derive(Deserialize, crate::command::CommandInput)]
 struct NoInput {}
 
-#[derive(Serialize, crate::CommandOutput)]
+#[derive(Serialize, crate::command::CommandOutput)]
 struct Pong {
     pong: bool,
 }
@@ -1051,7 +1062,7 @@ fn service_compiles_exact_application_modules_from_command_namespaces() {
         .retain(|command| command.id != "access.grant");
     assert!(matches!(
         service.application("catalog", missing),
-        Err(crate::ApplicationError::Missing { kind: "surface command", identity })
+        Err(crate::application::ApplicationError::Missing { kind: "surface command", identity })
             if identity == "access.grant"
     ));
     assert!(
@@ -3017,7 +3028,7 @@ async fn projected_command_auto_binds_bootstraps_and_replays_exact_direct_eviden
     let repository = crate::SqliteRepository::connect_and_migrate("sqlite::memory:")
         .await
         .expect("framework migrations should apply");
-    let mut registry = crate::TableSchemaRegistry::new();
+    let mut registry = crate::table::TableSchemaRegistry::new();
     registry
         .register::<CausalProjectionObligationView>()
         .unwrap()
@@ -4209,7 +4220,7 @@ async fn dispatch_message_always_exposes_message_metadata() {
 
 #[tokio::test]
 async fn dispatch_exposes_trace_context_from_session_metadata() {
-    #[derive(Serialize, crate::CommandOutput)]
+    #[derive(Serialize, crate::command::CommandOutput)]
     struct Trace {
         traceparent: Option<String>,
         tracestate: Option<String>,
@@ -4770,13 +4781,13 @@ async fn a_closed_lifecycle_gate_refuses_writes_on_every_transport() {
     );
 }
 
-#[derive(Debug, Deserialize, crate::CommandInput)]
+#[derive(Debug, Deserialize, crate::command::CommandInput)]
 struct StampedInput {
     id: String,
     at: String,
 }
 
-#[derive(Serialize, crate::CommandOutput)]
+#[derive(Serialize, crate::command::CommandOutput)]
 struct StampedOutput {
     id: String,
     at: String,
@@ -4786,7 +4797,8 @@ struct StampedOutput {
 async fn now_input_default_is_the_host_clock_never_the_callers_value() {
     use std::time::{Duration, UNIX_EPOCH};
 
-    let clock = crate::ManualClock::new(UNIX_EPOCH + Duration::from_millis(1_700_000_000_123));
+    let clock =
+        crate::clock::ManualClock::new(UNIX_EPOCH + Duration::from_millis(1_700_000_000_123));
     let repository = InMemoryRepository::new().with_clock(clock.clone());
     let routes = Routes::for_stores(repository.clone(), repository)
         .typed_command(

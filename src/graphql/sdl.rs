@@ -58,7 +58,7 @@ impl SdlOptions {
 
 /// Render GraphQL SDL for the given tables (ReadModel only; operational filtered).
 ///
-/// Builds the shared [[surface]] IR first, then emits SDL only from that IR so
+/// Builds the shared [`Surface`](super::Surface) IR first, then emits SDL only from that IR so
 /// dialect ops and model set cannot diverge from `build_surface`.
 pub fn graphql_sdl_for_tables(tables: &[TableSchema]) -> Result<String, String> {
     graphql_sdl_for_tables_with_options(tables, &SdlOptions::default())

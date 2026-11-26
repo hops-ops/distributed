@@ -602,7 +602,9 @@ fn on_celld(
     Arc<distributed_game::celld::CellZoneOwnership>,
     Arc<distributed_game::celld::CellZoneStateStore>,
 ) {
-    let secret = || distributed::cell_host::InternalHttpSecret::new(celld_support::SECRET).unwrap();
+    let secret = || {
+        distributed::microsvc::cell_host::InternalHttpSecret::new(celld_support::SECRET).unwrap()
+    };
     (
         Arc::new(
             distributed_game::celld::CellZoneOwnership::new(
@@ -701,7 +703,7 @@ async fn hibernation_saves_succeed_after_a_host_restart_on_the_same_store() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn fenced_lease_keeps_zone_on_one_host_and_loss_stops_it() {
-    let clock = distributed::ManualClock::starting_now();
+    let clock = distributed::clock::ManualClock::starting_now();
     let leases = InMemoryLeaseStore::with_clock(clock.clone());
     let ownership: Arc<dyn ZoneOwnership> = Arc::new(FencedLeaseOwnership::new(leases));
     let config = || {
@@ -1253,7 +1255,7 @@ impl ZoneOwnership for Severable {
 /// run's and are dropped as replays.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_restarted_host_outranks_its_previous_incarnation() {
-    let clock = distributed::ManualClock::starting_now();
+    let clock = distributed::clock::ManualClock::starting_now();
     let store: Arc<dyn ZoneOwnership> = Arc::new(FencedLeaseOwnership::new(
         InMemoryLeaseStore::with_clock(clock.clone()),
     ));
@@ -1304,7 +1306,7 @@ async fn a_restarted_host_outranks_its_previous_incarnation() {
 
 #[tokio::test]
 async fn fenced_lease_ownership_passes_the_restart_conformance_suite() {
-    let clock = distributed::ManualClock::starting_now();
+    let clock = distributed::clock::ManualClock::starting_now();
     let ownership = FencedLeaseOwnership::new(InMemoryLeaseStore::with_clock(clock.clone()));
     let ttl = Duration::from_secs(10);
     distributed_game::world::restart_conformance(&ownership, "restart", ttl, async {

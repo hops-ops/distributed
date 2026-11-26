@@ -23,17 +23,19 @@ use serde_json::json;
 
 use distributed::command::{typed_command, PreparedCommand, Succeeded};
 use distributed::command_dispatch::{deterministic_command_id, VerifiedPrincipal};
+use distributed::domain_event::ExternalEventSource;
 use distributed::microsvc::{
     CausalCommandContext, CausalDispatchError, CausalDispatchResult, HandlerError, HasOutboxStore,
     Routes, Service, Session, ROLE_KEY, USER_ID_KEY,
 };
-use distributed::{ExternalEventSource, OutboxMessage, OutboxStore};
+use distributed::outbox::OutboxMessage;
+use distributed::outbox_worker::OutboxStore;
 
 const RECEIVE: &str = "webhook.receive";
 const SUBJECT: &str = "system:webhook";
 const ROLE: &str = "webhook";
 
-#[derive(Debug, Deserialize, distributed::CommandInput)]
+#[derive(Debug, Deserialize, distributed::command::CommandInput)]
 struct ReceiveInput {
     /// The id of the outbox message the handler stages.
     delivery: String,
@@ -43,7 +45,9 @@ struct ReceiveInput {
 }
 
 /// The external fact the `external` mode publishes.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, distributed::DomainEvent)]
+#[derive(
+    Clone, Debug, PartialEq, Serialize, Deserialize, distributed::domain_event::DomainEvent,
+)]
 #[domain_event(name = "webhook.received", version = 1)]
 struct WebhookReceived {
     delivery: String,
@@ -59,7 +63,7 @@ fn webhook_source(delivery: &str) -> ExternalEventSource {
     }
 }
 
-#[derive(Debug, Serialize, distributed::CommandOutput)]
+#[derive(Debug, Serialize, distributed::command::CommandOutput)]
 struct ReceivePayload {
     published: bool,
     command_id: String,

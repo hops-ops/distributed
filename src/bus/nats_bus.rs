@@ -227,7 +227,7 @@ impl NatsBus {
     /// stop producers and drain outboxes before using this for maintenance.
     pub async fn retained_domain_events(
         &self,
-    ) -> Result<Vec<crate::DomainEventOccurrence>, TransportError> {
+    ) -> Result<Vec<crate::domain_event::DomainEventOccurrence>, TransportError> {
         let namespace = self.validated_namespace()?;
         let mut stream = self
             .jetstream
@@ -281,10 +281,11 @@ impl NatsBus {
             {
                 continue;
             }
-            let event = crate::DomainEventOccurrence::from_canonical_bytes(&message.payload)
-                .map_err(|e| {
-                    TransportError::permanent(format!("invalid archived occurrence: {e}"))
-                })?;
+            let event =
+                crate::domain_event::DomainEventOccurrence::from_canonical_bytes(&message.payload)
+                    .map_err(|e| {
+                        TransportError::permanent(format!("invalid archived occurrence: {e}"))
+                    })?;
             if event.descriptor().name != name
                 || !super::nats::archived_identity_matches(
                     &event,
@@ -536,7 +537,7 @@ mod archive_tests {
             .unwrap();
     }
 
-    #[derive(serde::Serialize, serde::Deserialize, crate::DomainState)]
+    #[derive(serde::Serialize, serde::Deserialize, crate::domain_event::DomainState)]
     #[domain_state(version = 1)]
     struct ArchiveState {
         title: String,
@@ -554,9 +555,12 @@ mod archive_tests {
         let bus = NatsBus::connect(&url).namespace(&namespace).await.unwrap();
         let mut stream = bus.ensure_stream().await.unwrap();
         for sequence in 1..=3 {
-            let event = crate::DomainEventOccurrence::capture(
-                crate::DomainEventDescriptor::state::<ArchiveState>("archive.changed", 1),
-                crate::DomainEventEnvelope {
+            let event = crate::domain_event::DomainEventOccurrence::capture(
+                crate::domain_event::DomainEventDescriptor::state::<ArchiveState>(
+                    "archive.changed",
+                    1,
+                ),
+                crate::domain_event::DomainEventEnvelope {
                     aggregate_type: "archive-item".into(),
                     aggregate_id: "a".into(),
                     aggregate_sequence: sequence,

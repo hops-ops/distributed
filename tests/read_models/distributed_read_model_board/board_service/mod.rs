@@ -6,7 +6,8 @@ pub mod models;
 mod handlers;
 mod service;
 
-use distributed::{AggregateRepository, InMemoryLockManager, InMemoryRepository, QueuedRepository};
+use distributed::lock::InMemoryLockManager;
+use distributed::{AggregateRepository, InMemoryRepository, QueuedRepository};
 
 pub use models::{AddCard, Board, BoardSnapshot, MoveCard, OpenBoard, RemoveCard};
 pub use service::model_service;

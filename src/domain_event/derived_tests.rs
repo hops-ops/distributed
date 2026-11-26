@@ -1,13 +1,13 @@
 use super::*;
 use serde::Serialize;
 
-#[derive(Clone, serde::Serialize, serde::Deserialize, crate::ReadModel)]
+#[derive(Clone, serde::Serialize, serde::Deserialize, crate::read_model::ReadModel)]
 #[readmodel(table = "derived_rows", primary_key = ["bytes"])]
 struct DerivedRows {
     bytes: u64,
 }
 #[allow(non_snake_case)]
-fn SaveDerived() -> crate::Mutation<()> {
+fn SaveDerived() -> crate::mutation::Mutation<()> {
     crate::mutation_file!("tests/fixtures/derived_event_save.graphql")
 }
 use crate::projection::lower::{EventualOnly, ProjectionDescriptor};
@@ -67,7 +67,7 @@ fn external_occurrence_has_no_aggregate_and_stable_content_independent_identity(
         DomainEventOccurrence::from_canonical_bytes(&first.canonical_bytes().unwrap()).unwrap(),
         first
     );
-    let outbox = crate::OutboxMessage::from_domain_event_occurrence(&first).unwrap();
+    let outbox = crate::outbox::OutboxMessage::from_domain_event_occurrence(&first).unwrap();
     assert_eq!(outbox.domain_event_occurrence().unwrap(), first);
     let derived = first
         .derive("indexer", "summary", &Indexed { bytes: 12 })

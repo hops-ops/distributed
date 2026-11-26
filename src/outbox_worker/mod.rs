@@ -16,7 +16,7 @@
 //! ## Example
 //!
 //! ```ignore
-//! use distributed::OutboxDispatcher;
+//! use distributed::outbox_worker::OutboxDispatcher;
 //! use std::time::Duration;
 //!
 //! let dispatcher =

@@ -29,8 +29,8 @@
 
 use std::time::{Duration, SystemTime};
 
-use distributed::cell_host::AggregateCell;
 use distributed::command::{typed_command, PreparedCommand, Succeeded};
+use distributed::microsvc::cell_host::AggregateCell;
 use distributed::microsvc::schedule::schedule_guard;
 use distributed::microsvc::{
     CausalCommandContext, CausalRouteDependencies, HandlerError, PortableCommand, Routes,
@@ -83,7 +83,9 @@ pub struct ZoneLease {
 
 /// The public state of a lease carried by its outward events (versioned
 /// independently of the replay events): one `zone_leases` read-model row.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, distributed::DomainState)]
+#[derive(
+    Clone, Debug, PartialEq, Eq, Serialize, Deserialize, distributed::domain_event::DomainState,
+)]
 #[domain_state(version = 1)]
 pub struct ZoneLeaseStatus {
     /// Zone (the cell's stream id).
@@ -168,7 +170,7 @@ impl ZoneLease {
 }
 
 /// `zone_lease.acquire` input.
-#[derive(Debug, Serialize, Deserialize, distributed::CommandInput)]
+#[derive(Debug, Serialize, Deserialize, distributed::command::CommandInput)]
 pub struct AcquireInput {
     pub zone_id: String,
     pub holder: String,
@@ -176,7 +178,7 @@ pub struct AcquireInput {
 }
 
 /// `zone_lease.renew` input.
-#[derive(Debug, Serialize, Deserialize, distributed::CommandInput)]
+#[derive(Debug, Serialize, Deserialize, distributed::command::CommandInput)]
 pub struct RenewInput {
     pub zone_id: String,
     pub holder: String,
@@ -185,7 +187,7 @@ pub struct RenewInput {
 }
 
 /// `zone_lease.release` input.
-#[derive(Debug, Serialize, Deserialize, distributed::CommandInput)]
+#[derive(Debug, Serialize, Deserialize, distributed::command::CommandInput)]
 pub struct ReleaseInput {
     pub zone_id: String,
     pub holder: String,
@@ -193,13 +195,15 @@ pub struct ReleaseInput {
 }
 
 /// `zone_lease.expire` input (scheduled by the lease itself).
-#[derive(Debug, Serialize, Deserialize, distributed::CommandInput)]
+#[derive(Debug, Serialize, Deserialize, distributed::command::CommandInput)]
 pub struct ExpireInput {
     pub zone_id: String,
 }
 
 /// A held (or released) claim.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, distributed::CommandOutput)]
+#[derive(
+    Debug, Clone, PartialEq, Eq, Serialize, Deserialize, distributed::command::CommandOutput,
+)]
 pub struct ClaimPayload {
     pub zone_id: String,
     pub holder: String,
@@ -208,7 +212,7 @@ pub struct ClaimPayload {
 }
 
 /// What an expiry schedule did.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, distributed::CommandOutput)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, distributed::command::CommandOutput)]
 pub struct ExpiryPayload {
     pub expired: bool,
 }

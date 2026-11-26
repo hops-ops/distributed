@@ -11,7 +11,7 @@
 //! read_models.commit(&read_store)?;
 //! ```
 
-pub mod change;
+pub(crate) mod change;
 pub(crate) mod in_memory;
 mod load;
 mod plan;
@@ -19,6 +19,7 @@ mod scan;
 mod workspace;
 
 pub use change::ReadModelChange;
+pub use distributed_macros::ReadModel;
 
 use serde::{de::DeserializeOwned, Serialize};
 

@@ -1,10 +1,9 @@
 //! Consumer inbox conformance: identical observable semantics across the
 //! in-memory, SQLite, and Postgres backends.
 
-use distributed::{
-    CommitBatch, InboxReceipt, InboxStore, OutboxMessage, OutboxStore, RepositoryError,
-    TransactionalCommit,
-};
+use distributed::outbox::OutboxMessage;
+use distributed::outbox_worker::OutboxStore;
+use distributed::{CommitBatch, InboxReceipt, InboxStore, RepositoryError, TransactionalCommit};
 
 use super::scenario::unique_id;
 use crate::outbox::find_outbox_by_id;

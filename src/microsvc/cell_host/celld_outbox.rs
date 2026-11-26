@@ -70,7 +70,7 @@ impl CelldOutboxDrainOutcome {
     }
 }
 
-/// celld Queue binding and drain policy attached to an [`AggregateCell`].
+/// celld Queue binding and drain policy attached to an [`AggregateCell`](super::AggregateCell).
 ///
 /// Domain aggregates remain transport-independent. The infrastructure-facing
 /// cell host selects this binding once. Dispatch arms the watchdog before
@@ -354,8 +354,8 @@ async fn has_pending<A>(cell: &AggregateCell<A>) -> Result<bool, TransportError>
 where
     A: Aggregate + Send + Sync + 'static,
 {
+    use crate::outbox::OutboxMessageStatus;
     use crate::outbox_worker::OutboxStore;
-    use crate::OutboxMessageStatus;
     let store = cell.outbox_store();
     for status in [OutboxMessageStatus::Pending, OutboxMessageStatus::InFlight] {
         if !store
@@ -376,8 +376,8 @@ where
 mod tests {
     use super::*;
     use crate::entity::{Entity, EventRecord};
+    use crate::outbox::{OutboxMessage, OutboxMessageStatus};
     use crate::outbox_worker::{testing::block_on, OutboxStore};
-    use crate::{OutboxMessage, OutboxMessageStatus};
     use std::sync::Mutex;
 
     #[derive(Default)]

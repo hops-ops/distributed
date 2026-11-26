@@ -10,6 +10,8 @@ mod derived_tests;
 mod descriptor;
 mod occurrence;
 
+pub use distributed_macros::{DomainEvent, DomainState};
+
 pub use canonical::{
     DOMAIN_EVENT_BODY_CODEC, DOMAIN_EVENT_BODY_CODEC_VERSION, MAX_DOMAIN_EVENT_BODY_BYTES,
     MAX_DOMAIN_EVENT_OCCURRENCE_WIRE_BYTES,

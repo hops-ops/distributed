@@ -12,9 +12,11 @@ use distributed::command::{typed_command, PreparedCommand, Succeeded, TypedComma
 use distributed::microsvc::{
     CausalCommandContext, HandlerError, HasOutboxStore, Routes, Service, Session, TRANSPORT_ROLE,
 };
+use distributed::outbox::{OutboxMessage, OutboxMessageStatus};
+use distributed::outbox_worker::OutboxStore;
 use distributed::{
-    sourced, AggregateBuilder, AggregateRepository, Entity, OutboxMessage, OutboxMessageStatus,
-    OutboxStore, Queueable, QueuedRepository, SqliteRepository,
+    sourced, AggregateBuilder, AggregateRepository, Entity, Queueable, QueuedRepository,
+    SqliteRepository,
 };
 use std::sync::{Arc, Mutex};
 
@@ -37,10 +39,10 @@ type Repo = AggregateRepository<QueuedRepository<SqliteRepository>, Counter>;
 
 use common::commands;
 
-#[derive(Debug, Deserialize, distributed::CommandInput)]
+#[derive(Debug, Deserialize, distributed::command::CommandInput)]
 struct Touch {}
 
-#[derive(Debug, Serialize, distributed::CommandOutput)]
+#[derive(Debug, Serialize, distributed::command::CommandOutput)]
 struct Touched {
     value: i64,
 }

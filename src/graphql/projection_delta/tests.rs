@@ -18,6 +18,10 @@ use super::types::{
 };
 use super::*;
 
+use crate::domain_event::{
+    DomainEventBodyDescriptor, DomainEventBodyKind, DomainEventDescriptor, DomainEventEnvelope,
+    DomainEventOccurrence, DOMAIN_EVENT_BODY_CODEC, DOMAIN_EVENT_BODY_CODEC_VERSION,
+};
 use crate::graphql::{
     build_surface, read, surface_for_role, DistributedClientSurfaceExport, SurfaceDirectProjection,
     SurfaceOptions, SurfaceProjector,
@@ -29,19 +33,17 @@ use crate::projection::placement::{
     ProjectionSourceBinding, PROJECTION_PARTITION_CODEC_VERSION,
 };
 use crate::projection::{
+    MutationKind, ProjectionAssignment, ProjectionExpression, ProjectionInvalidation,
+    ProjectionKeyField, ProjectionProgram, ProjectionRelationship, ProjectionRelationshipEffect,
+    ProjectionValue, ProjectionValueType, ResolvedProjectionMutation,
+    ResolvedProjectionRelationshipEffect, MAX_PROJECTION_EXPRESSION_DEPTH,
+};
+use crate::projection::{
     ProjectionArm, ProjectionField, ProjectionOperation, ProjectionPartition, ProjectionTarget,
 };
 use crate::projection_protocol::{ProjectionEpoch, ProjectorTopologyId};
 use crate::table::{
     ColumnType, PrimaryKey, RelationshipDef, RelationshipKind, TableColumn, TableKind, TableSchema,
-};
-use crate::{
-    DomainEventBodyDescriptor, DomainEventBodyKind, DomainEventDescriptor, DomainEventEnvelope,
-    DomainEventOccurrence, MutationKind, ProjectionAssignment, ProjectionExpression,
-    ProjectionInvalidation, ProjectionKeyField, ProjectionProgram, ProjectionRelationship,
-    ProjectionRelationshipEffect, ProjectionValue, ProjectionValueType, ResolvedProjectionMutation,
-    ResolvedProjectionRelationshipEffect, DOMAIN_EVENT_BODY_CODEC, DOMAIN_EVENT_BODY_CODEC_VERSION,
-    MAX_PROJECTION_EXPRESSION_DEPTH,
 };
 
 const BODY_FINGERPRINT: &str =
@@ -51,12 +53,12 @@ const FOREIGN_CAUSATION_ID: &str = "0190a000-0000-7000-8000-000000000018";
 const TEST_COMMAND_NAME: &str = "todo.modeled";
 
 #[allow(dead_code)]
-#[derive(Deserialize, crate::CommandInput)]
+#[derive(Deserialize, crate::command::CommandInput)]
 struct ModeledCommandInput {
     todo_id: String,
 }
 
-#[derive(Serialize, crate::CommandOutput)]
+#[derive(Serialize, crate::command::CommandOutput)]
 struct ModeledCommandOutput {
     accepted: bool,
 }
@@ -178,7 +180,7 @@ fn value_depth_key_partition_and_body_limits_fail_closed() {
         oversized_partition.validate(),
         Err(ProjectionDeltaError::PartitionTooLarge { .. })
     ));
-    let oversized_body = vec![b' '; crate::MAX_DOMAIN_EVENT_BODY_BYTES + 1];
+    let oversized_body = vec![b' '; crate::domain_event::MAX_DOMAIN_EVENT_BODY_BYTES + 1];
     assert!(matches!(
         ProjectionDelta::from_json(&oversized_body),
         Err(ProjectionDeltaError::BodyTooLarge { .. })
@@ -196,12 +198,12 @@ fn sealed_authority_lowers_actual_full_state_and_memoizes_partition() {
     let authority = ProjectionDeltaAuthority::try_new(&selected, &request).unwrap();
     let modeled = selected.surface().projectors[0].modeled[0].clone();
     let source = authority.source(&modeled).unwrap();
-    let first = crate::ResolvedProjectionPlan::resolve(
+    let first = crate::projection::ResolvedProjectionPlan::resolve(
         &fixture.program,
         &state_occurrence(7, "todo-1", "Résumé 🚀"),
     )
     .unwrap();
-    let second = crate::ResolvedProjectionPlan::resolve(
+    let second = crate::projection::ResolvedProjectionPlan::resolve(
         &fixture.program,
         &state_occurrence(8, "todo-1", "Résumé 🚀"),
     )
@@ -285,7 +287,7 @@ fn production_authority_binds_partition_and_obligation_tokens_to_request_scope()
     let authority = ProjectionDeltaAuthority::try_new(request.export(), &request).unwrap();
     let modeled = request.export().surface().projectors[0].modeled[0].clone();
     let source = authority.source(&modeled).unwrap();
-    let plan = crate::ResolvedProjectionPlan::resolve(
+    let plan = crate::projection::ResolvedProjectionPlan::resolve(
         &fixture.program,
         &state_occurrence(7, "todo-1", "title"),
     )
@@ -524,7 +526,8 @@ fn lower_under_row_policy(
     let authority = ProjectionDeltaAuthority::try_new(request.export(), &request).unwrap();
     let modeled = request.export().surface().projectors[0].modeled[0].clone();
     let source = authority.source(&modeled).unwrap();
-    let plan = crate::ResolvedProjectionPlan::resolve(&fixture.program, &occurrence).unwrap();
+    let plan =
+        crate::projection::ResolvedProjectionPlan::resolve(&fixture.program, &occurrence).unwrap();
     let occurrence = ProjectionDeltaPlanOccurrence::actual(vec![(&source, &plan)]).unwrap();
     authority.lower(&[occurrence]).unwrap()
 }
@@ -722,7 +725,8 @@ fn application_wire_surface_uses_authenticated_role_policy_for_actual_rows() {
     let modeled = request.export().surface().projectors[0].modeled[0].clone();
     let source = authority.source(&modeled).unwrap();
     let occurrence = state_occurrence(10, "todo-app", "visible through role policy");
-    let plan = crate::ResolvedProjectionPlan::resolve(&fixture.program, &occurrence).unwrap();
+    let plan =
+        crate::projection::ResolvedProjectionPlan::resolve(&fixture.program, &occurrence).unwrap();
     let occurrence = ProjectionDeltaPlanOccurrence::actual(vec![(&source, &plan)]).unwrap();
     let delta = authority.lower(&[occurrence]).unwrap();
 
@@ -822,7 +826,8 @@ fn zero_obligation_modeled_metadata_is_revalidated_on_every_receipt_emission() {
         .unwrap();
     let occurrence = state_occurrence(11, "todo-status", "status");
     let selector =
-        crate::ProjectionEventSelector::try_from_descriptor(occurrence.descriptor()).unwrap();
+        crate::projection::ProjectionEventSelector::try_from_descriptor(occurrence.descriptor())
+            .unwrap();
     let metadata = seed
         .metadata_for_actual_at(
             codec.clone(),
@@ -1095,7 +1100,7 @@ fn zero_occurrence_metadata_is_classified_from_the_current_causal_command_contra
 fn wait_path_fixture() -> (
     crate::graphql::protocol::ProtocolResponseAccumulator,
     crate::command::TypedCommandContract,
-    crate::OutboxMessage,
+    crate::outbox::OutboxMessage,
 ) {
     use std::sync::Arc;
 
@@ -1134,7 +1139,7 @@ fn wait_path_fixture() -> (
     );
     accumulator.bind_projection_request(seed).unwrap();
     let occurrence = state_occurrence(13, "todo-wait-path", "wait-path");
-    let event = crate::OutboxMessage::from_domain_event_occurrence(&occurrence).unwrap();
+    let event = crate::outbox::OutboxMessage::from_domain_event_occurrence(&occurrence).unwrap();
     let contract = crate::command::typed_command::<
         ModeledCommandInput,
         crate::command::Eventual<ModeledCommandOutput>,
@@ -1224,12 +1229,12 @@ fn wait_path_observation_proof_requires_the_persisted_semantic_program_identity(
         CausalCommandProjectionEvidence, CausalCommandPublicState, CausalCommandPublicStatus,
         CausalCommandReceiptSource, CausalDispatchResult, CausalProjectionEvidenceState,
     };
+    use crate::projection::ProjectionProgramId;
     use crate::projection_protocol::{
         ProjectionCausationEvidenceBatch, ProjectionChangeCursor, ProjectionEpoch,
         ProjectionObservation, ProjectionObservationKind, ProjectionScopeCodec,
         ProjectorTopologyId, RecordRevision,
     };
-    use crate::ProjectionProgramId;
 
     let (protocol, contract, event) = wait_path_fixture();
     let result = CausalDispatchResult {
@@ -1521,7 +1526,7 @@ fn wait_path_sealing_keeps_atomic_and_unselected_commands_without_metadata() {
 
     let (protocol, contract, event) = wait_path_fixture();
     let result_for = |contract: crate::command::TypedCommandContract,
-                      events: Vec<crate::OutboxMessage>|
+                      events: Vec<crate::outbox::OutboxMessage>|
      -> CausalDispatchResult {
         CausalDispatchResult {
             replayed: false,
@@ -1581,7 +1586,8 @@ fn opaque_fallback_hint_does_not_hide_empty_draining_modeled_work() {
     let codec = ProtocolTokenCodec::new([0x6e; 32]);
     let occurrence = state_occurrence(12, "todo-opaque-fallback", "opaque");
     let selector =
-        crate::ProjectionEventSelector::try_from_descriptor(occurrence.descriptor()).unwrap();
+        crate::projection::ProjectionEventSelector::try_from_descriptor(occurrence.descriptor())
+            .unwrap();
 
     let active = modeled_fixture_with_opaque_fallback(ProjectionBindingState::Active);
     let active_seed = ProtocolProjectionRequestSeed::new(
@@ -1714,7 +1720,8 @@ fn mounted_registry_derives_one_exact_physical_obligation_from_actual_fanout_ops
     .unwrap();
     let occurrence = state_occurrence(11, "todo-registry", "actual");
     let selector =
-        crate::ProjectionEventSelector::try_from_descriptor(&event_descriptor()).unwrap();
+        crate::projection::ProjectionEventSelector::try_from_descriptor(&event_descriptor())
+            .unwrap();
     let metadata = registry
         .metadata_for_actual(
             &request,
@@ -1775,7 +1782,7 @@ fn draining_actual_delta_can_apply_but_cannot_mint_new_obligations() {
     let authority = ProjectionDeltaAuthority::try_new(request.export(), &request).unwrap();
     let modeled = request.export().surface().projectors[0].modeled[0].clone();
     let source = authority.source(&modeled).unwrap();
-    let plan = crate::ResolvedProjectionPlan::resolve(
+    let plan = crate::projection::ResolvedProjectionPlan::resolve(
         &fixture.program,
         &state_occurrence(7, "todo-1", "title"),
     )
@@ -1834,7 +1841,8 @@ fn active_metadata_revalidates_but_remains_queryable_while_projection_is_drainin
     .unwrap();
     let occurrence = state_occurrence(11, "todo-draining-status", "active");
     let selector =
-        crate::ProjectionEventSelector::try_from_descriptor(occurrence.descriptor()).unwrap();
+        crate::projection::ProjectionEventSelector::try_from_descriptor(occurrence.descriptor())
+            .unwrap();
     let metadata = active_seed
         .metadata_for_actual_at(
             codec.clone(),
@@ -2158,7 +2166,8 @@ fn lifecycle_status_rejects_changed_deployment_identity_and_mixed_fanout_tamperi
     .unwrap();
     let occurrence = state_occurrence(21, "todo-lifecycle-hostile", "active");
     let selector =
-        crate::ProjectionEventSelector::try_from_descriptor(occurrence.descriptor()).unwrap();
+        crate::projection::ProjectionEventSelector::try_from_descriptor(occurrence.descriptor())
+            .unwrap();
     let metadata = active_seed
         .metadata_for_actual_at(
             codec.clone(),
@@ -2345,9 +2354,10 @@ fn lifecycle_status_rejects_changed_deployment_identity_and_mixed_fanout_tamperi
     )
     .unwrap();
     let fanout_occurrence = state_occurrence(22, "todo-lifecycle-fanout", "active");
-    let fanout_selector =
-        crate::ProjectionEventSelector::try_from_descriptor(fanout_occurrence.descriptor())
-            .unwrap();
+    let fanout_selector = crate::projection::ProjectionEventSelector::try_from_descriptor(
+        fanout_occurrence.descriptor(),
+    )
+    .unwrap();
     let fanout_metadata = fanout_active_seed
         .metadata_for_actual_at(
             codec.clone(),
@@ -2424,7 +2434,7 @@ fn full_state_preview_lowers_to_upsert() {
     let authority = ProjectionDeltaAuthority::try_new(&selected, &request).unwrap();
     let modeled = selected.surface().projectors[0].modeled[0].clone();
     let source = authority.source(&modeled).unwrap();
-    let plan = crate::ResolvedProjectionPlan::resolve(
+    let plan = crate::projection::ResolvedProjectionPlan::resolve(
         &fixture.program,
         &state_occurrence(7, "todo-1", "preview"),
     )
@@ -2450,7 +2460,7 @@ fn sparse_patch_program_preview_lowers_to_conditional_patch_with_missing_record_
     let authority = ProjectionDeltaAuthority::try_new(&selected, &request).unwrap();
     let modeled = selected.surface().projectors[0].modeled[0].clone();
     let source = authority.source(&modeled).unwrap();
-    let plan = crate::ResolvedProjectionPlan::resolve(
+    let plan = crate::projection::ResolvedProjectionPlan::resolve(
         &fixture.program,
         &partial_state_occurrence(7, "todo-1"),
     )
@@ -2495,7 +2505,7 @@ fn selected_manifest_exposes_partition_expression_and_projection_field_slots() {
         &arm.partition,
         ClientProjectionPartition::Expression {
             expression: ClientProjectionExpression::Constant { value }
-        } if value == &crate::ProjectionValue::string("tenant-a")
+        } if value == &crate::projection::ProjectionValue::string("tenant-a")
     ));
 
     let operation = &arm.operations[0];
@@ -2548,7 +2558,9 @@ fn plan_occurrence_rejects_missing_or_foreign_command_causation() {
     for causation in [None, Some(FOREIGN_CAUSATION_ID)] {
         let occurrence =
             state_occurrence_with_metadata(7, "todo-1", "title", causation, BTreeMap::new());
-        let plan = crate::ResolvedProjectionPlan::resolve(&fixture.program, &occurrence).unwrap();
+        let plan =
+            crate::projection::ResolvedProjectionPlan::resolve(&fixture.program, &occurrence)
+                .unwrap();
         assert!(matches!(
             ProjectionDeltaPlanOccurrence::actual(vec![(&source, &plan)]),
             Err(ProjectionDeltaError::ProjectionIdentityMismatch)
@@ -2578,9 +2590,11 @@ fn fanout_requires_the_same_exact_sealed_occurrence_not_only_the_same_id() {
     assert_eq!(first_occurrence.id(), second_occurrence.id());
     assert_ne!(first_occurrence, second_occurrence);
     let first =
-        crate::ResolvedProjectionPlan::resolve(&fixture.program, &first_occurrence).unwrap();
+        crate::projection::ResolvedProjectionPlan::resolve(&fixture.program, &first_occurrence)
+            .unwrap();
     let second =
-        crate::ResolvedProjectionPlan::resolve(&fixture.program, &second_occurrence).unwrap();
+        crate::projection::ResolvedProjectionPlan::resolve(&fixture.program, &second_occurrence)
+            .unwrap();
 
     assert!(matches!(
         ProjectionDeltaPlanOccurrence::actual(vec![(&source, &first), (&source, &second)]),
@@ -2600,7 +2614,8 @@ fn one_delta_cannot_mix_actual_and_preview_occurrence_layers() {
     let modeled = selected.surface().projectors[0].modeled[0].clone();
     let source = authority.source(&modeled).unwrap();
     let occurrence = state_occurrence(7, "todo-1", "title");
-    let plan = crate::ResolvedProjectionPlan::resolve(&fixture.program, &occurrence).unwrap();
+    let plan =
+        crate::projection::ResolvedProjectionPlan::resolve(&fixture.program, &occurrence).unwrap();
     let actual = ProjectionDeltaPlanOccurrence::actual(vec![(&source, &plan)]).unwrap();
     let preview = ProjectionDeltaPlanOccurrence::preview(vec![(&source, &plan)]).unwrap();
 
@@ -2640,8 +2655,12 @@ fn reversed_nonconflicting_fanout_plan_input_produces_identical_delta_bytes() {
         )
         .unwrap();
     let occurrence = state_occurrence(7, "todo-1", "title");
-    let todo = crate::ResolvedProjectionPlan::resolve(&fixture.todo_program, &occurrence).unwrap();
-    let user = crate::ResolvedProjectionPlan::resolve(&fixture.user_program, &occurrence).unwrap();
+    let todo =
+        crate::projection::ResolvedProjectionPlan::resolve(&fixture.todo_program, &occurrence)
+            .unwrap();
+    let user =
+        crate::projection::ResolvedProjectionPlan::resolve(&fixture.user_program, &occurrence)
+            .unwrap();
     let forward =
         ProjectionDeltaPlanOccurrence::actual(vec![(&todo_source, &todo), (&user_source, &user)])
             .unwrap();
@@ -2679,7 +2698,7 @@ fn value_partition_encoder_cannot_collapse_scope_to_unit() {
     let authority = ProjectionDeltaAuthority::try_new(&selected, &request).unwrap();
     let modeled = selected.surface().projectors[0].modeled[0].clone();
     let source = authority.source(&modeled).unwrap();
-    let plan = crate::ResolvedProjectionPlan::resolve(
+    let plan = crate::projection::ResolvedProjectionPlan::resolve(
         &fixture.program,
         &state_occurrence(7, "todo-1", "title"),
     )
@@ -2706,7 +2725,7 @@ fn unknown_visibility_emits_only_model_recovery_without_record_or_endpoint_keys(
     let authority = ProjectionDeltaAuthority::try_new(&selected, &request).unwrap();
     let modeled = selected.surface().projectors[0].modeled[0].clone();
     let source = authority.source(&modeled).unwrap();
-    let plan = crate::ResolvedProjectionPlan::resolve(
+    let plan = crate::projection::ResolvedProjectionPlan::resolve(
         &fixture.program,
         &state_occurrence(7, "todo-secret", "secret-title"),
     )
@@ -2738,7 +2757,7 @@ fn hidden_relationship_target_transforms_link_into_source_invalidation() {
     let authority = ProjectionDeltaAuthority::try_new(&selected, &request).unwrap();
     let modeled = selected.surface().projectors[0].modeled[0].clone();
     let source = authority.source(&modeled).unwrap();
-    let plan = crate::ResolvedProjectionPlan::resolve(
+    let plan = crate::projection::ResolvedProjectionPlan::resolve(
         &fixture.program,
         &state_occurrence(7, "todo-1", "title"),
     )
@@ -2766,7 +2785,7 @@ fn explicit_relationship_invalidation_survives_removed_keyed_effect_as_model_rec
     let authority = ProjectionDeltaAuthority::try_new(&selected, &request).unwrap();
     let modeled = selected.surface().projectors[0].modeled[0].clone();
     let source = authority.source(&modeled).unwrap();
-    let plan = crate::ResolvedProjectionPlan::resolve(
+    let plan = crate::projection::ResolvedProjectionPlan::resolve(
         &fixture.program,
         &state_occurrence(7, "todo-1", "secret-title"),
     )
@@ -2808,7 +2827,7 @@ fn hidden_relationship_source_emits_no_keyed_consequence() {
     let authority = ProjectionDeltaAuthority::try_new(&selected, &request).unwrap();
     let modeled = selected.surface().projectors[0].modeled[0].clone();
     let source = authority.source(&modeled).unwrap();
-    let plan = crate::ResolvedProjectionPlan::resolve(
+    let plan = crate::projection::ResolvedProjectionPlan::resolve(
         &fixture.program,
         &state_occurrence(7, "todo-secret", "secret-title"),
     )
@@ -2909,7 +2928,7 @@ fn relationship_crossing_authorization_never_serializes_target_values() {
     let authority = ProjectionDeltaAuthority::try_new(&selected, &request).unwrap();
     let modeled = selected.surface().projectors[0].modeled[0].clone();
     let source = authority.source(&modeled).unwrap();
-    let plan = crate::ResolvedProjectionPlan::resolve(
+    let plan = crate::projection::ResolvedProjectionPlan::resolve(
         &fixture.program,
         &state_occurrence(7, "todo-secret", "safe-title"),
     )
@@ -2953,7 +2972,7 @@ fn draining_accepts_actual_but_rejects_preview_and_background_rejects_all() {
     let authority = ProjectionDeltaAuthority::try_new(&selected, &request).unwrap();
     let modeled = selected.surface().projectors[0].modeled[0].clone();
     let source = authority.source(&modeled).unwrap();
-    let plan = crate::ResolvedProjectionPlan::resolve(
+    let plan = crate::projection::ResolvedProjectionPlan::resolve(
         &draining.program,
         &state_occurrence(7, "todo-1", "title"),
     )
@@ -3159,7 +3178,7 @@ fn all_visible_explicit_relationship_invalidation_lowers_to_the_narrow_scope() {
     let authority = ProjectionDeltaAuthority::try_new(&selected, &request).unwrap();
     let modeled = selected.surface().projectors[0].modeled[0].clone();
     let source = authority.source(&modeled).unwrap();
-    let plan = crate::ResolvedProjectionPlan::resolve(
+    let plan = crate::projection::ResolvedProjectionPlan::resolve(
         &fixture.program,
         &state_occurrence(7, "todo-1", "title"),
     )
@@ -3196,7 +3215,7 @@ fn placement_and_binding_state_matrix_is_explicit() {
     let authority = ProjectionDeltaAuthority::try_new(&selected, &request).unwrap();
     let modeled = selected.surface().projectors[0].modeled[0].clone();
     let source = authority.source(&modeled).unwrap();
-    let plan = crate::ResolvedProjectionPlan::resolve(
+    let plan = crate::projection::ResolvedProjectionPlan::resolve(
         &active.program,
         &state_occurrence(7, "todo-1", "title"),
     )
@@ -3214,7 +3233,7 @@ fn placement_and_binding_state_matrix_is_explicit() {
     let authority = ProjectionDeltaAuthority::try_new(&selected, &request).unwrap();
     let modeled = selected.surface().projectors[0].modeled[0].clone();
     let source = authority.source(&modeled).unwrap();
-    let plan = crate::ResolvedProjectionPlan::resolve(
+    let plan = crate::projection::ResolvedProjectionPlan::resolve(
         &draining.program,
         &state_occurrence(8, "todo-1", "title"),
     )
@@ -3259,7 +3278,7 @@ fn lowerer_rejects_wrong_program_binding_arm_occurrence_and_duplicate_program_so
     let authority = ProjectionDeltaAuthority::try_new(&selected, &request).unwrap();
     let modeled = selected.surface().projectors[0].modeled[0].clone();
     let source = authority.source(&modeled).unwrap();
-    let plan = crate::ResolvedProjectionPlan::resolve(
+    let plan = crate::projection::ResolvedProjectionPlan::resolve(
         &fixture.program,
         &state_occurrence(7, "todo-1", "title"),
     )
@@ -3270,7 +3289,7 @@ fn lowerer_rejects_wrong_program_binding_arm_occurrence_and_duplicate_program_so
         ProjectionExecutionClass::Causal,
         MutationKind::Patch,
     );
-    let wrong_program_plan = crate::ResolvedProjectionPlan::resolve(
+    let wrong_program_plan = crate::projection::ResolvedProjectionPlan::resolve(
         &other.program,
         &state_occurrence(7, "todo-1", "title"),
     )
@@ -3287,7 +3306,7 @@ fn lowerer_rejects_wrong_program_binding_arm_occurrence_and_duplicate_program_so
         Err(ProjectionDeltaError::ProjectionIdentityMismatch)
     ));
 
-    let other_occurrence = crate::ResolvedProjectionPlan::resolve(
+    let other_occurrence = crate::projection::ResolvedProjectionPlan::resolve(
         &fixture.program,
         &state_occurrence(8, "todo-1", "title"),
     )
@@ -3355,7 +3374,7 @@ fn explicit_fk_and_join_row_provenance_lower_to_edges_without_physical_names() {
     let authority = ProjectionDeltaAuthority::try_new(&selected, &request).unwrap();
     let modeled = selected.surface().projectors[0].modeled[0].clone();
     let source = authority.source(&modeled).unwrap();
-    let plan = crate::ResolvedProjectionPlan::resolve(
+    let plan = crate::projection::ResolvedProjectionPlan::resolve(
         &join.program,
         &state_occurrence(7, "todo-1", "title"),
     )
@@ -3390,7 +3409,10 @@ fn logical_partition_boundary_accepts_4k_and_rejects_the_next_byte() {
             )),
             fixture.program.arms().to_vec(),
         )?;
-        crate::ResolvedProjectionPlan::resolve(&program, &state_occurrence(7, "todo-1", "title"))
+        crate::projection::ResolvedProjectionPlan::resolve(
+            &program,
+            &state_occurrence(7, "todo-1", "title"),
+        )
     };
     let limit = crate::projection_protocol::MAX_PROJECTION_PARTITION_BYTES;
     let mut low = 0;
@@ -3407,7 +3429,7 @@ fn logical_partition_boundary_accepts_4k_and_rejects_the_next_byte() {
     assert_eq!(accepted.partition().canonical_bytes().len(), limit);
     assert!(matches!(
         resolve(low + 1),
-        Err(crate::ProjectionProgramError::ValueTooLarge {
+        Err(crate::projection::ProjectionProgramError::ValueTooLarge {
             kind: "projection partition",
             len: 4097,
             max: 4096
@@ -3464,7 +3486,7 @@ fn lower_with_transitions(
     let authority = ProjectionDeltaAuthority::try_new(&selected, &request)?;
     let modeled = selected.surface().projectors[0].modeled[0].clone();
     let source = authority.source(&modeled)?;
-    let plan = crate::ResolvedProjectionPlan::resolve(
+    let plan = crate::projection::ResolvedProjectionPlan::resolve(
         &fixture.program,
         &state_occurrence(7, "todo-1", "title"),
     )
@@ -3476,7 +3498,9 @@ fn lower_with_transitions(
 struct TestProgramDescriptor(ProjectionProgram);
 
 impl crate::projection::placement::ProjectionProgramDescriptor for TestProgramDescriptor {
-    fn projection_program(&self) -> Result<ProjectionProgram, crate::ProjectionProgramError> {
+    fn projection_program(
+        &self,
+    ) -> Result<ProjectionProgram, crate::projection::ProjectionProgramError> {
         Ok(self.0.clone())
     }
 }
@@ -3485,7 +3509,8 @@ fn modeled_direct_fixture() -> ModeledFixture {
     let todo_schema = todos();
     let user_schema = users();
     let selector =
-        crate::ProjectionEventSelector::try_from_descriptor(&event_descriptor()).unwrap();
+        crate::projection::ProjectionEventSelector::try_from_descriptor(&event_descriptor())
+            .unwrap();
     let operation = ProjectionOperation::try_new(
         "upsert-todo-direct",
         0,
@@ -3560,7 +3585,8 @@ fn modeled_join_fixture() -> ModeledFixture {
     let user_schema = users();
     let join_schema = todo_owner_links();
     let selector =
-        crate::ProjectionEventSelector::try_from_descriptor(&event_descriptor()).unwrap();
+        crate::projection::ProjectionEventSelector::try_from_descriptor(&event_descriptor())
+            .unwrap();
     let relationship = ProjectionRelationship::try_new("TodoView", "owner", "UserView").unwrap();
     let operation = ProjectionOperation::try_new(
         "insert-todo-owner-link",
@@ -3719,7 +3745,8 @@ fn modeled_fixture_deployment(
     let todo_schema = todos();
     let user_schema = users();
     let descriptor = event_descriptor();
-    let selector = crate::ProjectionEventSelector::try_from_descriptor(&descriptor).unwrap();
+    let selector =
+        crate::projection::ProjectionEventSelector::try_from_descriptor(&descriptor).unwrap();
     let relationship = ProjectionRelationship::try_new("TodoView", "owner", "UserView").unwrap();
     let (relationship_effects, invalidations) = if invalidate_relationship {
         (
@@ -3834,7 +3861,8 @@ fn fanout_fixture_states(
     let todo_schema = todos();
     let user_schema = users();
     let descriptor = event_descriptor();
-    let selector = crate::ProjectionEventSelector::try_from_descriptor(&descriptor).unwrap();
+    let selector =
+        crate::projection::ProjectionEventSelector::try_from_descriptor(&descriptor).unwrap();
     let todo_operation = ProjectionOperation::try_new(
         "fanout-todo",
         0,
@@ -4298,7 +4326,7 @@ impl ProjectionPartitionScopeEncoder for TestRequestAuthority {
     fn encode(
         &self,
         authority: ProjectionPartitionAuthority<'_>,
-        partition: &crate::ResolvedProjectionPartition,
+        partition: &crate::projection::ResolvedProjectionPartition,
     ) -> Result<Option<ProjectionDeltaPartition>, ProjectionDeltaError> {
         self.calls.set(self.calls.get() + 1);
         assert_eq!(

@@ -1,5 +1,5 @@
 use distributed::graphql::{read, AuthorizedReadModel, ModelPermissions};
-use distributed::ReadModel;
+use distributed::read_model::ReadModel;
 use serde::{Deserialize, Serialize};
 
 use super::AuthUsers;

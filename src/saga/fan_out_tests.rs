@@ -12,9 +12,10 @@ use super::{
     SagaReply, SagaRunner, SagaStatus, SagaStep, SagaTimeout, SagaTransition, MAX_SAGA_FAN_OUT,
     META_MEMBER, SAGA_TIMEOUT_SCHEDULE,
 };
+use crate::clock::ManualClock;
 use crate::outbox::OutboxMessage;
 use crate::schedule::ScheduleWrite;
-use crate::{InMemoryRepository, ManualClock, StreamIdentity};
+use crate::{InMemoryRepository, StreamIdentity};
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 struct MatchStart {

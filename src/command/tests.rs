@@ -64,14 +64,14 @@ struct Payload {
     id: String,
 }
 
-#[derive(Clone, Serialize, Deserialize, crate::ReadModel)]
+#[derive(Clone, Serialize, Deserialize, crate::read_model::ReadModel)]
 #[readmodel(table = "projected_owners", primary_key = ["id"])]
 struct ProjectedOwner {
     #[readmodel(id)]
     id: String,
 }
 
-#[derive(Clone, Serialize, Deserialize, crate::ReadModel)]
+#[derive(Clone, Serialize, Deserialize, crate::read_model::ReadModel)]
 #[readmodel(table = "projected_rows", primary_key = ["id"])]
 struct ProjectedRow {
     #[readmodel(id)]
@@ -83,28 +83,28 @@ struct ProjectedRow {
     owner: Option<ProjectedOwner>,
 }
 
-#[derive(Serialize, crate::DomainEvent)]
+#[derive(Serialize, crate::domain_event::DomainEvent)]
 #[domain_event(name = "todo.completed", version = 1)]
 struct TodoCompleted {
     todo_id: String,
     status: String,
 }
 
-#[derive(Serialize, crate::DomainEvent)]
+#[derive(Serialize, crate::domain_event::DomainEvent)]
 #[domain_event(name = "todo.completed", version = 1)]
 struct ConflictingTodoCompleted {
     todo_id: String,
     completed_at: String,
 }
 
-#[derive(Serialize, crate::DomainEvent)]
+#[derive(Serialize, crate::domain_event::DomainEvent)]
 #[domain_event(name = "todo.renamed", version = 1)]
 struct TodoRenamed {
     todo_id: String,
     title: String,
 }
 
-#[derive(Serialize, crate::DomainState)]
+#[derive(Serialize, crate::domain_event::DomainState)]
 #[domain_state(version = 1)]
 struct TodoState {
     todo_id: String,
@@ -117,8 +117,11 @@ impl crate::domain_event::DomainEventContract for TodoStateChanged {
     const EVENT_NAME: &'static str = "todo.state-changed";
     const EVENT_VERSION: u64 = 1;
 
-    fn descriptor() -> crate::DomainEventDescriptor {
-        crate::DomainEventDescriptor::state::<TodoState>(Self::EVENT_NAME, Self::EVENT_VERSION)
+    fn descriptor() -> crate::domain_event::DomainEventDescriptor {
+        crate::domain_event::DomainEventDescriptor::state::<TodoState>(
+            Self::EVENT_NAME,
+            Self::EVENT_VERSION,
+        )
     }
 }
 
@@ -130,8 +133,8 @@ impl crate::domain_event::DomainEventContract for DishonestEventContract {
     const EVENT_NAME: &'static str = "todo.lied";
     const EVENT_VERSION: u64 = 1;
 
-    fn descriptor() -> crate::DomainEventDescriptor {
-        <TodoCompleted as crate::DomainEvent>::DESCRIPTOR.clone()
+    fn descriptor() -> crate::domain_event::DomainEventDescriptor {
+        <TodoCompleted as crate::domain_event::DomainEvent>::DESCRIPTOR.clone()
     }
 }
 
@@ -143,8 +146,8 @@ impl crate::domain_event::DomainEventContract for DishonestStateContract {
     const EVENT_NAME: &'static str = "todo.completed";
     const EVENT_VERSION: u64 = 1;
 
-    fn descriptor() -> crate::DomainEventDescriptor {
-        <TodoCompleted as crate::DomainEvent>::DESCRIPTOR.clone()
+    fn descriptor() -> crate::domain_event::DomainEventDescriptor {
+        <TodoCompleted as crate::domain_event::DomainEvent>::DESCRIPTOR.clone()
     }
 }
 
@@ -290,7 +293,7 @@ fn authenticated_user_field_reuses_generated_event_schema_metadata() {
     assert_eq!(contract.projections.inferred_values[0].preview, previous);
 }
 
-#[derive(Serialize, crate::DomainEvent)]
+#[derive(Serialize, crate::domain_event::DomainEvent)]
 #[domain_event(name = "membership.removed", version = 1)]
 struct MembershipRemoved {
     #[serde(rename = "memberId")]
@@ -371,7 +374,9 @@ fn authenticated_user_field_merges_with_known_values_and_rejects_unknown_fields(
         TodoState,
     >(vec![(
         "todo_id",
-        CommandProjectionPreviewSource::constant(crate::ProjectionValue::string("todo-1")),
+        CommandProjectionPreviewSource::constant(crate::projection::ProjectionValue::string(
+            "todo-1",
+        )),
     )]));
     projections.add_authenticated_user_field(
         "status",
@@ -629,7 +634,7 @@ mod wasm_pure_declarations {
     use super::super::{CommandProjectionEvents, CommandProjectionPureReduce};
     use serde::{Deserialize, Serialize};
 
-    #[derive(Clone, Default, Serialize, Deserialize, crate::ReadModel)]
+    #[derive(Clone, Default, Serialize, Deserialize, crate::read_model::ReadModel)]
     #[readmodel(primary_key = ["board_id"])]
     struct Boards {
         board_id: String,
@@ -637,17 +642,17 @@ mod wasm_pure_declarations {
         moves: Vec<String>,
     }
 
-    #[derive(Deserialize, crate::JsonType)]
+    #[derive(Deserialize, crate::table::JsonType)]
     struct Row {
         cells: Vec<Vec<u8>>,
     }
 
-    #[derive(Deserialize, crate::JsonType)]
+    #[derive(Deserialize, crate::table::JsonType)]
     struct Args {
         step: String,
     }
 
-    #[derive(Serialize, crate::JsonType)]
+    #[derive(Serialize, crate::table::JsonType)]
     struct Patch {
         cells: Vec<Vec<u8>>,
         moves: Vec<String>,
@@ -661,7 +666,7 @@ mod wasm_pure_declarations {
         const STEP = step(Row, Args) -> Patch;
     }
 
-    #[derive(Serialize, crate::JsonType)]
+    #[derive(Serialize, crate::table::JsonType)]
     struct WrongPatch {
         cells: Vec<String>,
         inventory: Vec<String>,

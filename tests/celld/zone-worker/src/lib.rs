@@ -11,8 +11,8 @@
 //! - `GET|POST /tally/{principal}[/command]`, `/zone-activity/{zone}[/command]`:
 //!   the cells (internal secret).
 
-use distributed::cell_host::CelldOutbox;
 use distributed::command::{typed_command, PreparedCommand, Succeeded};
+use distributed::microsvc::cell_host::CelldOutbox;
 use distributed::microsvc::{
     CausalCommandContext, CausalRouteDependencies, HandlerError, PortableCommand, Routes,
 };
@@ -148,13 +148,13 @@ impl Tally {
     }
 }
 
-#[derive(Debug, Deserialize, distributed::CommandInput)]
+#[derive(Debug, Deserialize, distributed::command::CommandInput)]
 pub struct HitInput {
     pub hit: u64,
     pub zone: String,
 }
 
-#[derive(Debug, Serialize, distributed::CommandOutput)]
+#[derive(Debug, Serialize, distributed::command::CommandOutput)]
 pub struct Counted {
     pub count: u32,
 }
@@ -194,7 +194,7 @@ async fn handle_hit(
 }
 
 async fn read_tally(
-    cell: &distributed::cell_host::AggregateCell<Tally>,
+    cell: &distributed::microsvc::cell_host::AggregateCell<Tally>,
 ) -> std::result::Result<Value, String> {
     let tally = cell.load().await.map_err(|e| e.to_string())?;
     let hits = tally.map(|t| t.hits).unwrap_or_default();
@@ -203,7 +203,7 @@ async fn read_tally(
 
 #[durable_object]
 pub struct TallyCell {
-    cell: distributed::cell_host::AggregateCell<Tally>,
+    cell: distributed::microsvc::cell_host::AggregateCell<Tally>,
     env: Env,
 }
 
@@ -211,10 +211,12 @@ impl DurableObject for TallyCell {
     fn new(state: State, env: Env) -> Self {
         console_error_panic_hook::set_once();
         let cell =
-            distributed::cell_host::AggregateCell::<Tally>::from_state_with_snapshots(state, 50)
-                .expect("tally cell identity")
-                .mount(RecordHit)
-                .with_celld_outbox(CelldOutbox::from_env(&env, "OUTBOX").expect("OUTBOX Queue"));
+            distributed::microsvc::cell_host::AggregateCell::<Tally>::from_state_with_snapshots(
+                state, 50,
+            )
+            .expect("tally cell identity")
+            .mount(RecordHit)
+            .with_celld_outbox(CelldOutbox::from_env(&env, "OUTBOX").expect("OUTBOX Queue"));
         Self { cell, env }
     }
 

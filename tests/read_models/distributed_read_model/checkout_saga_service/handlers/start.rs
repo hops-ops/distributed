@@ -9,7 +9,7 @@ use crate::distributed_read_model::checkout_saga_service::CheckoutSaga;
 
 pub const COMMAND: &str = checkout_command::START;
 
-#[derive(Debug, Serialize, distributed::CommandOutput)]
+#[derive(Debug, Serialize, distributed::command::CommandOutput)]
 pub struct Output {
     pub checkout_id: String,
 }

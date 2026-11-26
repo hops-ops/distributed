@@ -125,7 +125,7 @@ pub struct OutboxMessage {
     /// Earliest time a worker may claim this message again after a failed
     /// publish was released with a backoff (`next_available_at` in SQL).
     /// Worker-owned delivery state: a new message is always claimable at
-    /// once. Durable timers are [`Schedule`](crate::Schedule)s.
+    /// once. Durable timers are [`Schedule`](crate::schedule::Schedule)s.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) available_at: Option<SystemTime>,
 }

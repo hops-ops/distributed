@@ -9,8 +9,9 @@
 
 use std::time::Duration;
 
+use distributed::clock::ManualClock;
+use distributed::lease::InMemoryLeaseStore;
 use distributed::lease::{Fence, FencingToken, Lease, LeaseError, LeaseStore};
-use distributed::{InMemoryLeaseStore, ManualClock};
 
 const TTL: Duration = Duration::from_secs(30);
 
@@ -296,7 +297,8 @@ pub use self::sqlite::Sqlite;
 mod sqlite {
     use std::time::Duration;
 
-    use distributed::{SqliteLeaseStore, SqliteRepository};
+    use distributed::lease::SqliteLeaseStore;
+    use distributed::SqliteRepository;
 
     use super::{wait_out, LeaseBackend, StandaloneMigration, SQL_SHORT_TTL};
     use crate::sqlite::TempDb;
@@ -358,7 +360,7 @@ pub use self::postgres::Postgres;
 mod postgres {
     use std::time::Duration;
 
-    use distributed::PostgresLeaseStore;
+    use distributed::lease::PostgresLeaseStore;
 
     use super::{wait_out, LeaseBackend, StandaloneMigration, SQL_SHORT_TTL};
     use crate::postgres::PostgresTestSchema;

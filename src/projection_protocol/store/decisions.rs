@@ -13,8 +13,8 @@ use super::{
     ProjectionRecordMetadata, ProjectionRecordScope, ProjectorTopologyId, RecordRevision,
     RecordTransition, TrustedProjectionInput,
 };
+use crate::projection::ProjectionProgramId;
 use crate::projection_protocol::RevisionComparison;
-use crate::ProjectionProgramId;
 
 /// Stored protocol data that contradicts itself. Never caused by a caller.
 pub(crate) fn corrupt_storage(message: impl Into<String>) -> ProjectionProtocolError {

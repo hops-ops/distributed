@@ -117,7 +117,7 @@ impl CommandTypeDef {
 
 /// Structural description of the serialized input accepted by a command.
 ///
-/// Prefer deriving [`CommandInput`](crate::CommandInput). Field names follow
+/// Prefer deriving [`CommandInput`](crate::command::CommandInput). Field names follow
 /// Serde's deserialization direction. Transport-specific naming restrictions
 /// are checked when an adapter exposes the declaration.
 pub trait CommandInputType {
@@ -154,7 +154,7 @@ pub const fn __input_has_field(fields: &[&str], name: &str) -> bool {
 
 /// Structural description of a command result, following Serde serialization.
 ///
-/// Prefer deriving [`CommandOutput`](crate::CommandOutput). Atomic read-model
+/// Prefer deriving [`CommandOutput`](crate::command::CommandOutput). Atomic read-model
 /// outcomes derive their shape directly from the relational schema instead.
 pub trait CommandOutputType {
     fn command_type() -> CommandTypeDef;

@@ -7,8 +7,9 @@ use base64::Engine as _;
 use serde::de::{Error as _, IgnoredAny, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
 
+use crate::domain_event::MAX_DOMAIN_EVENT_BODY_BYTES;
+use crate::projection::MAX_PROJECTION_EXPRESSION_DEPTH;
 use crate::projection_protocol::{MAX_PROJECTION_PARTITION_BYTES, MAX_PROJECTION_RECORD_KEY_BYTES};
-use crate::{MAX_DOMAIN_EVENT_BODY_BYTES, MAX_PROJECTION_EXPRESSION_DEPTH};
 
 /// Version of the role-safe projection-delta wire contract.
 pub const PROJECTION_DELTA_WIRE_VERSION: u16 = 1;
@@ -533,7 +534,7 @@ impl ProjectionDeltaProjectionIdentity {
                 actual: self.operation_semantics_version,
             });
         }
-        crate::ProjectionProgramId::parse(&self.program_id).map_err(|_| {
+        crate::projection::ProjectionProgramId::parse(&self.program_id).map_err(|_| {
             ProjectionDeltaError::InvalidIdentity {
                 field: "program_id",
             }
@@ -649,26 +650,26 @@ pub enum DeltaValue {
 impl DeltaValue {
     #[cfg(any(feature = "graphql", test))]
     pub(crate) fn try_from_projection_ref(
-        value: crate::ProjectionValueRef<'_>,
+        value: crate::projection::ProjectionValueRef<'_>,
     ) -> Result<Self, ProjectionDeltaError> {
         let value = match value {
-            crate::ProjectionValueRef::Null => Self::Null,
-            crate::ProjectionValueRef::Boolean(value) => Self::Boolean(value),
-            crate::ProjectionValueRef::I64(value) => Self::I64(value.to_owned()),
-            crate::ProjectionValueRef::U64(value) => Self::U64(value.to_owned()),
-            crate::ProjectionValueRef::F64(value) => Self::F64(value.to_owned()),
-            crate::ProjectionValueRef::String(value) => Self::String(value.to_owned()),
-            crate::ProjectionValueRef::Enum { enum_type, variant } => Self::Enum {
+            crate::projection::ProjectionValueRef::Null => Self::Null,
+            crate::projection::ProjectionValueRef::Boolean(value) => Self::Boolean(value),
+            crate::projection::ProjectionValueRef::I64(value) => Self::I64(value.to_owned()),
+            crate::projection::ProjectionValueRef::U64(value) => Self::U64(value.to_owned()),
+            crate::projection::ProjectionValueRef::F64(value) => Self::F64(value.to_owned()),
+            crate::projection::ProjectionValueRef::String(value) => Self::String(value.to_owned()),
+            crate::projection::ProjectionValueRef::Enum { enum_type, variant } => Self::Enum {
                 enum_type: enum_type.to_owned(),
                 variant: variant.to_owned(),
             },
-            crate::ProjectionValueRef::List(values) => Self::List(
+            crate::projection::ProjectionValueRef::List(values) => Self::List(
                 values
                     .iter()
                     .map(|value| Self::try_from_projection_ref(value.as_ref()))
                     .collect::<Result<Vec<_>, _>>()?,
             ),
-            crate::ProjectionValueRef::Object(fields) => Self::Object(
+            crate::projection::ProjectionValueRef::Object(fields) => Self::Object(
                 fields
                     .iter()
                     .map(|field| {

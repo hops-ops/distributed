@@ -28,7 +28,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
-use distributed::{DomainEventOccurrence, ExternalEventSource};
+use distributed::domain_event::{DomainEventOccurrence, ExternalEventSource};
 use distributed_game::GameRecord;
 use distributed_leaderboard::{
     Board, InMemoryLeaderboard, LeaderboardChange, LeaderboardChangeListener, LeaderboardEntry,
@@ -126,7 +126,9 @@ pub struct BoardSnapshot {
 }
 
 /// Leaderboard projection input: one committed kill.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, distributed::DomainEvent)]
+#[derive(
+    Debug, Clone, PartialEq, Serialize, Deserialize, distributed::domain_event::DomainEvent,
+)]
 #[domain_event(name = "mobpit.mob_killed", version = 1)]
 pub struct MobKilled {
     /// Principal credited.
@@ -163,7 +165,9 @@ pub fn kill_occurrence(
 
 /// Live projection input: a crawler's totals after a kill (the post-kill
 /// state its cell published), monotonic in `kills`.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, distributed::DomainEvent)]
+#[derive(
+    Debug, Clone, PartialEq, Serialize, Deserialize, distributed::domain_event::DomainEvent,
+)]
 #[domain_event(name = "mobpit.crawler_totals", version = 1)]
 pub struct CrawlerTotals {
     /// Principal.
@@ -208,15 +212,18 @@ impl KillProjection {
 
 impl LeaderboardProjection for KillProjection {
     fn handles(&self, event_name: &str) -> bool {
-        event_name == <MobKilled as distributed::DomainEvent>::DESCRIPTOR.name
-            || event_name == <CrawlerTotals as distributed::DomainEvent>::DESCRIPTOR.name
+        event_name == <MobKilled as distributed::domain_event::DomainEvent>::DESCRIPTOR.name
+            || event_name
+                == <CrawlerTotals as distributed::domain_event::DomainEvent>::DESCRIPTOR.name
     }
 
     fn project(
         &self,
         event: &DomainEventOccurrence,
     ) -> Result<Vec<LeaderboardChange>, LeaderboardError> {
-        if event.descriptor().name == <CrawlerTotals as distributed::DomainEvent>::DESCRIPTOR.name {
+        if event.descriptor().name
+            == <CrawlerTotals as distributed::domain_event::DomainEvent>::DESCRIPTOR.name
+        {
             let totals: CrawlerTotals = event
                 .decode_body()
                 .map_err(|e| LeaderboardError::invalid(format!("crawler_totals body: {e:?}")))?;

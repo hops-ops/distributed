@@ -417,7 +417,7 @@ mod tests {
 
     #[test]
     fn force_archive_and_purge_are_distinct_state_and_deletion_occurrences() {
-        use distributed::DomainEventBodyKind;
+        use distributed::domain_event::DomainEventBodyKind;
 
         let mut todo = open_todo();
         todo.force_archive().unwrap();

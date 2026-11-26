@@ -2,11 +2,12 @@
 
 use async_graphql::Request;
 use distributed::graphql::IdentityConfig;
-use distributed::{
-    graphql::{col, read, rel, GraphqlEngine, GraphqlPoolSource, ModelPermissions},
-    microsvc::Session,
-    ColumnType, ForeignKey, PrimaryKey, ReadModel, RelationalReadModel, RelationshipDef,
-    RelationshipKind, TableColumn, TableKind, TableSchema, ROLE_KEY, USER_ID_KEY,
+use distributed::graphql::{col, read, rel, GraphqlEngine, GraphqlPoolSource, ModelPermissions};
+use distributed::microsvc::{Session, ROLE_KEY, USER_ID_KEY};
+use distributed::read_model::{ReadModel, RelationalReadModel};
+use distributed::table::{
+    ColumnType, ForeignKey, PrimaryKey, RelationshipDef, RelationshipKind, TableColumn, TableKind,
+    TableSchema,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -169,7 +170,7 @@ fn m2m_link_schema() -> TableSchema {
 async fn list_filter_and_by_pk() {
     let schema = orders_schema();
 
-    let manifest = distributed::ReadModelCatalog::new("orders").table_schema(schema);
+    let manifest = distributed::table::ReadModelCatalog::new("orders").table_schema(schema);
     let pool = setup_pool().await;
     let engine = GraphqlEngine::from_schema_catalog(&manifest, pool)
         .unwrap()
@@ -363,7 +364,7 @@ async fn sqlite_binds_follow_projection_then_where_order_for_relationships() {
     .await;
     let pool = db.pool();
 
-    let manifest = distributed::ReadModelCatalog::new("rel")
+    let manifest = distributed::table::ReadModelCatalog::new("rel")
         .table_schema(parent_schema())
         .table_schema(child_schema());
     let engine = GraphqlEngine::from_schema_catalog(&manifest, pool)
@@ -563,7 +564,7 @@ async fn belongs_to_joins_source_fk_to_target_primary_key() {
         .await;
     let pool = db.pool();
 
-    let manifest = distributed::ReadModelCatalog::new("posts")
+    let manifest = distributed::table::ReadModelCatalog::new("posts")
         .table_schema(author_schema())
         .table_schema(post_schema());
     let engine = GraphqlEngine::from_schema_catalog(&manifest, pool)
@@ -590,7 +591,7 @@ async fn belongs_to_joins_source_fk_to_target_primary_key() {
 #[tokio::test]
 async fn permissions_filter_by_claim() {
     let schema = orders_schema();
-    let manifest = distributed::ReadModelCatalog::new("orders").table_schema(schema.clone());
+    let manifest = distributed::table::ReadModelCatalog::new("orders").table_schema(schema.clone());
     let pool = setup_pool().await;
 
     // Value-based path: grant_all then we need typed permission — use builder
@@ -647,7 +648,7 @@ async fn domain_service_shaped_fixture() {
         });
     }
     let db = Db::sqlite().await;
-    let mut manifest = distributed::ReadModelCatalog::new("domain");
+    let mut manifest = distributed::table::ReadModelCatalog::new("domain");
     for (table, row) in tables.into_iter().zip([
         json!([["ns1", "acme"]]),
         json!([["u1", "ada"]]),

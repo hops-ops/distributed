@@ -72,7 +72,7 @@ fn filter_fields(
                 .comparison_ops_for_scalar(&field.scalar)
                 .into_iter()
                 .filter(|op| {
-                    crate::graphql::comparison_op_fields(&field.scalar, false).contains(op)
+                    crate::graphql::naming::comparison_op_fields(&field.scalar, false).contains(op)
                 })
                 .map(str::to_string)
                 .collect(),
@@ -305,7 +305,7 @@ pub(super) fn protocol_material() -> ProtocolMaterial {
 }
 
 /// Fingerprint of the client protocol family this crate speaks: the hash of
-/// [`protocol_material`].
+/// `protocol_material`.
 ///
 /// # Errors
 ///

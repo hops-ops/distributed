@@ -17,7 +17,7 @@ pub fn gateway_router(
     options: &crate::HostOptions,
 ) -> Result<axum::Router, std::io::Error> {
     use distributed::gateway::{delivery::*, native::*, *};
-    use distributed::graphql::identity::OidcGatewayProvider;
+    use distributed::graphql::OidcGatewayProvider;
     let engine = service
         .graphql_engine()
         .ok_or_else(|| std::io::Error::other("application GraphQL engine missing"))?;
@@ -73,7 +73,7 @@ pub fn gateway_router(
     let graphql = GraphqlBinding::Embedded(
         EmbeddedGraphql::new(
             engine.clone(),
-            Some(service.clone() as distributed::SharedCommandHost),
+            Some(service.clone() as distributed::command_dispatch::SharedCommandHost),
             capabilities,
         )
         .map_err(std::io::Error::other)?,

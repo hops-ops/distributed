@@ -182,7 +182,7 @@ pub(super) fn expand_relational_read_model(
         });
 
         column_defs.push(quote! {
-            #framework::TableColumn {
+            #framework::table::TableColumn {
                 field_name: #field_name.to_string(),
                 column_name: #column_name.to_string(),
                 column_type: #column_type,
@@ -201,7 +201,7 @@ pub(super) fn expand_relational_read_model(
             row_inserts.push(quote! {
                 row.insert(
                     #column_name,
-                    #framework::RowValue::from_text_serde(
+                    #framework::table::RowValue::from_text_serde(
                         &self.#ident,
                         #nullable,
                         #column_name,
@@ -226,7 +226,7 @@ pub(super) fn expand_relational_read_model(
                 key_inserts.push(quote! {
                     key.values.insert(
                         #column_name.to_string(),
-                        #framework::RowValue::from_text_serde(
+                        #framework::table::RowValue::from_text_serde(
                             &self.#ident,
                             #nullable,
                             #column_name,
@@ -241,7 +241,7 @@ pub(super) fn expand_relational_read_model(
                 key_inserts.push(quote! {
                     key.values.insert(
                         #column_name.to_string(),
-                        #framework::RowValue::from_serde(&self.#ident)?,
+                        #framework::table::RowValue::from_serde(&self.#ident)?,
                     );
                 });
             }
@@ -286,37 +286,37 @@ pub(super) fn expand_relational_read_model(
     Ok(quote! {
         #(#effect_markers)*
 
-        impl #framework::RelationalReadModel for #name {
-            fn schema() -> &'static #framework::TableSchema {
-                static SCHEMA: ::std::sync::LazyLock<#framework::TableSchema> =
-                    ::std::sync::LazyLock::new(|| #framework::TableSchema {
+        impl #framework::read_model::RelationalReadModel for #name {
+            fn schema() -> &'static #framework::table::TableSchema {
+                static SCHEMA: ::std::sync::LazyLock<#framework::table::TableSchema> =
+                    ::std::sync::LazyLock::new(|| #framework::table::TableSchema {
                         model_name: #model_name.to_string(),
                         table_name: #table_name.to_string(),
                         columns: vec![#(#column_defs),*],
-                        primary_key: #framework::PrimaryKey {
+                        primary_key: #framework::table::PrimaryKey {
                             columns: vec![#(#primary_key_columns),*],
                         },
-                        version_column: Some(#framework::DEFAULT_TABLE_VERSION_COLUMN.to_string()),
+                        version_column: Some(#framework::table::DEFAULT_TABLE_VERSION_COLUMN.to_string()),
                         indexes: vec![#(#indexes),*],
                         relationships: vec![#(#relationships),*],
-                        kind: #framework::TableKind::ReadModel,
+                        kind: #framework::table::TableKind::ReadModel,
                     });
                 &SCHEMA
             }
 
-            fn primary_key(&self) -> Result<#framework::RowKey, #framework::TableStoreError> {
-                let mut key = #framework::RowKey::default();
+            fn primary_key(&self) -> Result<#framework::table::RowKey, #framework::table::TableStoreError> {
+                let mut key = #framework::table::RowKey::default();
                 #(#key_inserts)*
                 Ok(key)
             }
 
-            fn to_row(&self) -> Result<#framework::RowValues, #framework::TableStoreError> {
-                let mut row = #framework::RowValues::new();
+            fn to_row(&self) -> Result<#framework::table::RowValues, #framework::table::TableStoreError> {
+                let mut row = #framework::table::RowValues::new();
                 #(#row_inserts)*
                 Ok(row)
             }
 
-            fn from_row(row: #framework::RowValues) -> Result<Self, #framework::TableStoreError> {
+            fn from_row(row: #framework::table::RowValues) -> Result<Self, #framework::table::TableStoreError> {
                 Ok(Self {
                     #(#row_fields),*
                 })
@@ -331,15 +331,15 @@ pub(super) fn expand_relational_read_model(
                 #projection_schema_fingerprint;
         }
 
-        impl #framework::RelationalReadModelIncludes for #name {
+        impl #framework::read_model::RelationalReadModelIncludes for #name {
             fn hydrate_include(
                 &mut self,
                 include: &str,
-                rows: Vec<#framework::RowValues>,
-            ) -> Result<(), #framework::TableStoreError> {
+                rows: Vec<#framework::table::RowValues>,
+            ) -> Result<(), #framework::table::TableStoreError> {
                 match include {
                     #(#hydrate_include_arms,)*
-                    _ => Err(#framework::TableStoreError::Metadata(format!(
+                    _ => Err(#framework::table::TableStoreError::Metadata(format!(
                         "read model `{}` has no hydratable relationship `{}`",
                         #model_name,
                         include
@@ -350,10 +350,10 @@ pub(super) fn expand_relational_read_model(
             fn include_rows(
                 &self,
                 include: &str,
-            ) -> Result<Vec<#framework::RowValues>, #framework::TableStoreError> {
+            ) -> Result<Vec<#framework::table::RowValues>, #framework::table::TableStoreError> {
                 match include {
                     #(#include_rows_arms,)*
-                    _ => Err(#framework::TableStoreError::Metadata(format!(
+                    _ => Err(#framework::table::TableStoreError::Metadata(format!(
                         "read model `{}` has no tracked relationship `{}`",
                         #model_name,
                         include
@@ -363,10 +363,10 @@ pub(super) fn expand_relational_read_model(
 
             fn include_target_schema(
                 include: &str,
-            ) -> Result<&'static #framework::TableSchema, #framework::TableStoreError> {
+            ) -> Result<&'static #framework::table::TableSchema, #framework::table::TableStoreError> {
                 match include {
                     #(#include_schema_arms,)*
-                    _ => Err(#framework::TableStoreError::Metadata(format!(
+                    _ => Err(#framework::table::TableStoreError::Metadata(format!(
                         "read model `{}` has no tracked relationship `{}`",
                         #model_name,
                         include
@@ -436,7 +436,7 @@ fn index_def_tokens(
         .collect::<Vec<_>>();
 
     quote! {
-        #framework::TableIndex {
+        #framework::table::TableIndex {
             name: Some(#index_name.to_string()),
             columns: vec![#(#columns),*],
             unique: #unique,

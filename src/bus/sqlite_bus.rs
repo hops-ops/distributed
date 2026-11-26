@@ -95,7 +95,7 @@ CREATE TABLE IF NOT EXISTS bus_log_identity (
 )";
 
 /// SQLite [`Bus`](super::Bus) + [`BusConsumer`](super::BusConsumer). Cheap to
-/// clone (the pool is an `Arc`). Build it with [`SqlBus::new`] over a
+/// clone (the pool is an `Arc`). Build it with `SqlBus::new` over a
 /// `SqlitePool`.
 pub type SqliteBus = SqlBus<Sqlite>;
 

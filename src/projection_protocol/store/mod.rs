@@ -21,11 +21,11 @@ use super::{
     RecordRevision, MAX_PROJECTION_PARTITION_BYTES, MAX_PROJECTION_POSITION,
     MAX_PROJECTION_RECORD_KEY_BYTES,
 };
+use crate::projection::ProjectionProgramId;
 use crate::repository::{InboxReceipt, RepositoryError};
 use crate::table::{
     RowKey, RowValues, TableMutation, TableSchema, TableStoreError, TableWritePlan,
 };
-use crate::ProjectionProgramId;
 
 mod backend_helpers;
 mod commit;

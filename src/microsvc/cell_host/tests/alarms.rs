@@ -12,6 +12,7 @@ use serde_json::json;
 
 use super::super::{AggregateCell, CellCommandIdentity, CellStreamStore};
 use super::owner_session;
+use crate::clock::{Clock, ManualClock};
 use crate::command::{typed_command, PreparedCommand, Succeeded};
 use crate::entity::Entity;
 use crate::microsvc::schedule::{schedule_guard, schedule_session, HOST_NOW_CLAIM};
@@ -19,7 +20,7 @@ use crate::microsvc::service::{CausalCommandContext, PortableCommand, Routes};
 use crate::microsvc::HandlerError;
 use crate::repository::{CommitBatch, StreamIdentity, TransactionalCommit};
 use crate::schedule::{Capability, Schedule, ScheduleWrite, SCHEDULE_RETRY_BASE};
-use crate::{sourced, Clock, InMemoryRepository, ManualClock};
+use crate::{sourced, InMemoryRepository};
 
 #[derive(Clone, Default, Serialize, Deserialize, crate::Snapshot)]
 struct Ticker {
@@ -44,7 +45,7 @@ impl Ticker {
     }
 }
 
-#[derive(Debug, Deserialize, crate::CommandInput)]
+#[derive(Debug, Deserialize, crate::command::CommandInput)]
 struct StartInput {
     id: String,
     limit: u32,
@@ -53,12 +54,12 @@ struct StartInput {
     tick_command: String,
 }
 
-#[derive(Debug, Serialize, Deserialize, crate::CommandInput)]
+#[derive(Debug, Serialize, Deserialize, crate::command::CommandInput)]
 struct TickInput {
     id: String,
 }
 
-#[derive(Debug, Serialize, crate::CommandOutput)]
+#[derive(Debug, Serialize, crate::command::CommandOutput)]
 struct TickerPayload {
     id: String,
     ticks: u32,

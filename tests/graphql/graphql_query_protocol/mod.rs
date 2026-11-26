@@ -14,7 +14,7 @@ use distributed::microsvc::{
     CausalProjectorContext, HandlerError, Routes, Service, Session, ROLE_KEY,
 };
 use distributed::projection_protocol::ProjectionChangeRetention;
-use distributed::{ReadModel, RelationalReadModel};
+use distributed::read_model::{ReadModel, RelationalReadModel};
 use futures_util::{stream::BoxStream, SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -858,7 +858,9 @@ pub async fn live_subscription_frames_keep_data_and_metadata_in_fifo_order(db: D
 
     fixture
         .repository
-        .publish_read_model_change(distributed::ReadModelChange::new(["causal_query_views"]));
+        .publish_read_model_change(distributed::read_model::ReadModelChange::new([
+            "causal_query_views",
+        ]));
     assert!(
         tokio::time::timeout(Duration::from_millis(350), stream.next())
             .await
@@ -1016,7 +1018,9 @@ pub async fn live_subscription_refresh_failure_is_terminal_and_never_takes_later
     .await;
     fixture
         .repository
-        .publish_read_model_change(distributed::ReadModelChange::new(["causal_query_views"]));
+        .publish_read_model_change(distributed::read_model::ReadModelChange::new([
+            "causal_query_views",
+        ]));
     // Leave the failure unconsumed while storage recovers and a new projection
     // commits. A producer that kept running would enqueue that result's
     // snapshot/live metadata ahead of the failure response's envelope.
@@ -1561,9 +1565,9 @@ async fn exercise_query_transport(db: Db, mode: QueryGatewayMode) {
             );
         }
         frames.push(frame["payload"].clone());
-        fixture
-            .repository
-            .publish_read_model_change(distributed::ReadModelChange::new(["causal_query_views"]));
+        fixture.repository.publish_read_model_change(
+            distributed::read_model::ReadModelChange::new(["causal_query_views"]),
+        );
         let redundant = tokio::time::timeout(Duration::from_millis(350), socket.next()).await;
         if position == 1 {
             assert!(
@@ -1581,11 +1585,9 @@ async fn exercise_query_transport(db: Db, mode: QueryGatewayMode) {
                 distributed_envelope(&proof["payload"])["snapshot"]["observations"],
                 json!([])
             );
-            fixture
-                .repository
-                .publish_read_model_change(distributed::ReadModelChange::new([
-                    "causal_query_views",
-                ]));
+            fixture.repository.publish_read_model_change(
+                distributed::read_model::ReadModelChange::new(["causal_query_views"]),
+            );
             assert!(
                 tokio::time::timeout(Duration::from_millis(350), socket.next())
                     .await
@@ -2456,7 +2458,7 @@ async fn hundred_subscribers_one_upstream(db: Db, remote: bool) {
             live: true,
             ..Default::default()
         };
-        let origin = serve(distributed::graphql::graphql_router_composed(
+        let origin = serve(distributed::graphql::http::graphql_router_composed(
             engine.clone(),
             None,
             None,
@@ -2758,7 +2760,7 @@ async fn worker_live_coordinator_uses_actual_oidc_origin() {
             .build()
             .unwrap(),
     );
-    let router = distributed::graphql::graphql_router_composed(engine.clone(), None, None);
+    let router = distributed::graphql::http::graphql_router_composed(engine.clone(), None, None);
     let repository = fixture.repository.clone();
     let bus = fixture.bus.clone();
     let control=Router::new().route("/__metrics",axum::routing::get(move ||{let engine=engine.clone();let versions=versions.clone();async move{let metrics=versions.metrics();axum::Json(json!({"subscribers":engine.live_subscriber_count(),"producers":engine.live_producer_count(),"validations":metrics.validations,"resultExecutions":metrics.result_executions}))}}))

@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use distributed::bus::{Message, TransportError};
-use distributed::DomainEventOccurrence;
+use distributed::domain_event::DomainEventOccurrence;
 
 use crate::{ApplyKey, ApplyOutcome, Board, LeaderboardError, LeaderboardStore, ScoreSubmission};
 
@@ -308,14 +308,14 @@ mod tests {
     use distributed::bus::MessageKind;
     use std::time::{Duration, UNIX_EPOCH};
 
-    #[derive(serde::Serialize, serde::Deserialize, distributed::DomainEvent)]
+    #[derive(serde::Serialize, serde::Deserialize, distributed::domain_event::DomainEvent)]
     #[domain_event(name = "test.monster_slain", version = 1)]
     struct MonsterSlain {
         player: String,
         xp: u32,
     }
 
-    #[derive(serde::Serialize, serde::Deserialize, distributed::DomainEvent)]
+    #[derive(serde::Serialize, serde::Deserialize, distributed::domain_event::DomainEvent)]
     #[domain_event(name = "test.chat_sent", version = 1)]
     struct ChatSent {
         text: String,
@@ -323,7 +323,7 @@ mod tests {
 
     fn slain(position: u64, player: &str, xp: u32) -> DomainEventOccurrence {
         DomainEventOccurrence::capture_external(
-            distributed::ExternalEventSource {
+            distributed::domain_event::ExternalEventSource {
                 producer: "zone.sim".into(),
                 stream: "zone-1".into(),
                 position,
@@ -341,7 +341,7 @@ mod tests {
 
     fn chat(position: u64) -> DomainEventOccurrence {
         DomainEventOccurrence::capture_external(
-            distributed::ExternalEventSource {
+            distributed::domain_event::ExternalEventSource {
                 producer: "zone.sim".into(),
                 stream: "zone-1".into(),
                 position,

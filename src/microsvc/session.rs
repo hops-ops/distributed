@@ -127,7 +127,7 @@ impl Session {
     }
 
     /// Singleton convenience: the sole asserted role, or `None` when the set
-    /// is empty or multi-valued. Prefer [`roles`] / [`has_role`].
+    /// is empty or multi-valued. Prefer [`roles`](Self::roles) / [`has_role`](Self::has_role).
     pub fn role(&self) -> Option<&str> {
         let raw = self.get(ROLE_KEY).or_else(|| self.get("X-Roles"))?;
         let mut parts = raw

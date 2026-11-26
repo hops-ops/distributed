@@ -8,9 +8,9 @@
 //! partition-wide resume cursors.
 
 use chat_domain::ChatMessagePostedDomainEvent;
+use distributed::mutation::Mutation;
 use distributed::mutation_file;
 use distributed::projection::lower::{DirectCandidate, ProjectionDescriptor};
-use distributed::Mutation;
 use e2e_readmodels::ChatMessages;
 
 /// Mutation: complete-row upsert for chat messages.
@@ -40,7 +40,9 @@ distributed::projection! {
 #[cfg(test)]
 mod tests {
     use distributed::domain_event::DomainEventContract;
-    use distributed::{MutationKind, RelationalReadModel, RowValue};
+    use distributed::projection::MutationKind;
+    use distributed::read_model::RelationalReadModel;
+    use distributed::table::RowValue;
 
     use super::*;
     use chat_domain::{ChatMessage, ChatMessagePostedDomainEvent};

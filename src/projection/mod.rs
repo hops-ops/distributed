@@ -10,6 +10,7 @@
 mod canonical;
 mod error;
 mod expression;
+mod macros;
 mod plan;
 mod program;
 mod provenance;
@@ -19,7 +20,7 @@ mod provenance;
 // contract before their owning tasks define one.
 pub mod catalog;
 pub mod executor;
-pub mod local_mounts;
+pub(crate) mod local_mounts;
 pub mod lower;
 pub mod placement;
 pub mod rebuild;

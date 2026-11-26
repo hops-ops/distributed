@@ -6,11 +6,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use base64::Engine as _;
+use distributed::graphql::http::graphql_router;
 use distributed::graphql::{
-    graphql_router, read, AuthError, GraphqlEngine, GraphqlPoolSource, IdentityConfig,
-    IdentityResolver, ModelPermissions, OidcConfig, OidcValidator, ValidationError,
+    read, AuthError, GraphqlEngine, GraphqlPoolSource, IdentityConfig, IdentityResolver,
+    ModelPermissions, OidcConfig, OidcValidator, ValidationError,
 };
-use distributed::ReadModel;
+use distributed::read_model::ReadModel;
 use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
 use rsa::pkcs1::EncodeRsaPrivateKey;
 use rsa::traits::PublicKeyParts;

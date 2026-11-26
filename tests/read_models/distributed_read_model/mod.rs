@@ -23,15 +23,19 @@ use checkout::{
 };
 use checkout_saga_service::CheckoutSaga;
 use distributed::microsvc::{Context, Routes, Service, Session};
+use distributed::outbox::OutboxMessage;
+use distributed::outbox_worker::OutboxStore;
+use distributed::read_model::InMemoryReadModelStore;
 use distributed::read_model::ReadModelWritePlanBuilder;
+use distributed::read_model::{RelationalReadModel, RelationalReadModelIncludes};
+use distributed::table::TableStoreError;
 #[cfg(feature = "sqlite")]
 use distributed::SqliteRepository;
 use distributed::{
-    AggregateBuilder, GetStream, OutboxMessage, OutboxStore, ReadModelWritePlanStore,
-    RelationalReadModel, RelationalReadModelIncludes, RelationalReadModelQueryStore,
-    TableStoreError, TransactionalCommit,
+    AggregateBuilder, GetStream, ReadModelWritePlanStore, RelationalReadModelQueryStore,
+    TransactionalCommit,
 };
-use distributed::{InMemoryReadModelStore, InMemoryRepository, Queueable};
+use distributed::{InMemoryRepository, Queueable};
 use projection_service::service as projection_service;
 use query_service::CheckoutQueryService;
 use read_models::{register_schemas, CheckoutView};
@@ -454,7 +458,7 @@ async fn publish_pending_outbox(
     bus: &distributed::bus::InMemoryBus,
 ) {
     let claimed = outbox
-        .claim(distributed::ClaimOutboxMessages::new(
+        .claim(distributed::outbox_worker::ClaimOutboxMessages::new(
             "matrix-outbox-bridge",
             64,
             Duration::from_secs(60),
@@ -471,7 +475,7 @@ async fn publish_pending_outbox(
         bus.publish_message(bus_message)
             .await
             .expect("outbox event should publish to the bus");
-        let claim = distributed::OutboxClaimRef::from_message(&message)
+        let claim = distributed::outbox_worker::OutboxClaimRef::from_message(&message)
             .expect("claimed message should yield a claim ref");
         outbox
             .complete(&claim)
@@ -731,7 +735,7 @@ use std::collections::HashMap as StdHashMap;
 use std::sync::{Arc as StdArc, Mutex as StdMutex};
 
 use distributed::bus::{Bus, BusConsumer, RunOptions};
-use distributed::microsvc::{Message, MessageKind};
+use distributed::bus::{Message, MessageKind};
 
 const FLOW_EVENT_TYPES: [&str; 4] = [
     seat_event::ADDED,

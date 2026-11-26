@@ -11,17 +11,17 @@ fn not_mallory(ctx: &CausalCommandContext<'_, Hero>) -> bool {
 }
 
 /// The row a hero's client preview reads (a subset of [`Heroes`]).
-#[derive(Deserialize, distributed::JsonType)]
+#[derive(Deserialize, distributed::table::JsonType)]
 pub struct HeroRow {
     pub items: Vec<String>,
 }
 
-#[derive(Deserialize, distributed::JsonType)]
+#[derive(Deserialize, distributed::table::JsonType)]
 pub struct HeroArgs {
     pub item: String,
 }
 
-#[derive(Serialize, distributed::JsonType)]
+#[derive(Serialize, distributed::table::JsonType)]
 pub struct HeroPatch {
     pub items: Vec<String>,
 }
@@ -36,7 +36,7 @@ distributed::wasm_pure! {
     pub const EQUIP_PREVIEW = equip_preview(HeroRow, HeroArgs) -> HeroPatch;
 }
 
-#[derive(Clone, Default, Serialize, Deserialize, distributed::ReadModel)]
+#[derive(Clone, Default, Serialize, Deserialize, distributed::read_model::ReadModel)]
 #[readmodel(primary_key = ["hero_id"])]
 pub struct Heroes {
     pub hero_id: String,
@@ -160,12 +160,12 @@ impl distributed::command::CommandEventSet for Bumped {
     }
 }
 
-#[derive(Debug, Deserialize, distributed::CommandInput)]
+#[derive(Debug, Deserialize, distributed::command::CommandInput)]
 pub struct BumpInput {
     pub tally_id: String,
 }
 
-#[derive(Debug, Serialize, distributed::CommandOutput)]
+#[derive(Debug, Serialize, distributed::command::CommandOutput)]
 pub struct TallyPayload {
     pub count: u32,
 }

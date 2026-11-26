@@ -8,7 +8,8 @@
 //! Registration is `.typed_command(module::command()).handle(module::handle)`.
 
 use distributed::microsvc::{CausalDispatchError, Routes, Service};
-use distributed::{AggregateBuilder, InMemoryRepository, OutboxStore, Queueable};
+use distributed::outbox_worker::OutboxStore;
+use distributed::{AggregateBuilder, InMemoryRepository, Queueable};
 use serde_json::json;
 
 use crate::microsvc::commands::dispatch;

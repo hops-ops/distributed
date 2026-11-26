@@ -13,34 +13,43 @@ use distributed::command::{
     typed_command, Atomic, CommandInputType, CommandOutputType, CommandTypeDef, CommandTypeField,
     EffectInputFieldMarker, EffectModelFieldMarker, Eventual, PreparedCommand, Succeeded,
 };
+use distributed::command::{CommandInput, CommandOutput};
 use distributed::domain_event::DomainEventContract;
+use distributed::domain_event::DomainEventDescriptor;
+use distributed::graphql::http::graphql_router_with_service;
 use distributed::graphql::{
-    build_surface, graphql_router_with_service, read, surface_for_role, ClientProjectionAssignment,
-    ClientProjectionExpression, ClientProjectionFallback, ClientProjectionInvalidation,
-    ClientProjectionMutationKind, ClientProjectionPartition, ClientProjectionPreviewSource,
-    DistributedClientSurfaceExport, GraphqlEngine, ModelPermissions, SurfaceDirectProjection,
-    SurfaceModeledProjection, SurfaceOptions, SurfaceProjector,
+    build_surface, read, surface_for_role, ClientProjectionAssignment, ClientProjectionExpression,
+    ClientProjectionFallback, ClientProjectionInvalidation, ClientProjectionMutationKind,
+    ClientProjectionPartition, ClientProjectionPreviewSource, DistributedClientSurfaceExport,
+    GraphqlEngine, ModelPermissions, SurfaceDirectProjection, SurfaceModeledProjection,
+    SurfaceOptions, SurfaceProjector,
 };
 use distributed::microsvc::Session;
 use distributed::microsvc::{
     CausalCommandContext, GraphqlServiceBindError, HandlerError, Routes, Service,
 };
+use distributed::mutation::{
+    bind_event_apply_mutation, compile_projection, Mutation, ProjectionInputSource,
+};
 use distributed::projection::catalog::{ProjectionBindingActivation, ProjectionCatalog};
 use distributed::projection::lower::{DirectCandidate, EventualOnly, ProjectionDescriptor};
 use distributed::projection::placement::{
-    ProjectionBinding, ProjectionBindingState, ProjectionEpoch, ProjectionExecutionClass,
-    ProjectionExecutorRoute, ProjectionOutput, ProjectionOwner, ProjectionPhysicalTopology,
-    ProjectionSourceBinding, PROJECTION_PARTITION_CODEC_VERSION,
+    ProjectionBinding, ProjectionBindingState, ProjectionExecutionClass, ProjectionExecutorRoute,
+    ProjectionOutput, ProjectionOwner, ProjectionPhysicalTopology, ProjectionSourceBinding,
+    PROJECTION_PARTITION_CODEC_VERSION,
 };
 use distributed::projection::ProjectionEventSelector;
+use distributed::projection::{
+    MutationKind, ProjectionArm, ProjectionAssignment, ProjectionExpression, ProjectionField,
+    ProjectionKeyField, ProjectionOperation, ProjectionPartition, ProjectionProgram,
+    ProjectionProgramError, ProjectionValue, ProjectionValueType,
+};
+use distributed::projection_protocol::ProjectionEpoch;
 use distributed::projection_protocol::ProjectorTopologyId;
+use distributed::read_model::{ReadModel, RelationalReadModel};
 use distributed::{
-    bind_event_apply_mutation, command_input_defaults, compile_projection, Aggregate,
-    AggregateRepository, CommandInput, CommandOutput, DomainEventDescriptor, Entity, EventRecord,
-    InMemoryRepository, Mutation, MutationKind, ProjectionArm, ProjectionAssignment,
-    ProjectionExpression, ProjectionField, ProjectionInputSource, ProjectionKeyField,
-    ProjectionOperation, ProjectionPartition, ProjectionProgram, ProjectionProgramError,
-    ProjectionValue, ProjectionValueType, ReadModel, RelationalReadModel, SqliteRepository,
+    command_input_defaults, Aggregate, AggregateRepository, Entity, EventRecord,
+    InMemoryRepository, SqliteRepository,
 };
 use serde::{Deserialize, Serialize};
 use tower::util::ServiceExt;
@@ -115,7 +124,7 @@ struct PlanOutput {
     id: String,
 }
 
-#[derive(Clone, Serialize, Deserialize, ReadModel, distributed::DomainState)]
+#[derive(Clone, Serialize, Deserialize, ReadModel, distributed::domain_event::DomainState)]
 #[readmodel(table = "plan_views", primary_key = ["id"])]
 #[domain_state(version = 1)]
 struct PlanView {
@@ -192,7 +201,7 @@ struct ForgedView {
     count: i64,
 }
 
-#[derive(Clone, Serialize, Deserialize, CommandInput, distributed::JsonType)]
+#[derive(Clone, Serialize, Deserialize, CommandInput, distributed::table::JsonType)]
 struct JsonDocument {
     label: String,
 }
@@ -204,7 +213,7 @@ struct JsonPatchInput {
     details: JsonDocument,
 }
 
-#[derive(Clone, Serialize, Deserialize, ReadModel, distributed::DomainState)]
+#[derive(Clone, Serialize, Deserialize, ReadModel, distributed::domain_event::DomainState)]
 #[readmodel(table = "json_views", primary_key = ["id"])]
 #[domain_state(version = 1)]
 struct JsonView {
@@ -221,7 +230,7 @@ struct BigIntKeyInput {
     title: String,
 }
 
-#[derive(Clone, Serialize, Deserialize, ReadModel, distributed::DomainState)]
+#[derive(Clone, Serialize, Deserialize, ReadModel, distributed::domain_event::DomainState)]
 #[readmodel(table = "bigint_key_views", primary_key = ["key"])]
 #[domain_state(version = 1)]
 struct BigIntKeyView {
@@ -276,7 +285,7 @@ struct CompositeKeyInput {
     title: String,
 }
 
-#[derive(Clone, Serialize, Deserialize, ReadModel, distributed::DomainState)]
+#[derive(Clone, Serialize, Deserialize, ReadModel, distributed::domain_event::DomainState)]
 #[readmodel(
     table = "composite_key_views",
     primary_key = ["tenant_id", "id"]
@@ -300,12 +309,12 @@ struct FloatEffectView {
     value: Option<f64>,
 }
 
-#[derive(Clone, Serialize, Deserialize, distributed::JsonType)]
+#[derive(Clone, Serialize, Deserialize, distributed::table::JsonType)]
 struct NestedJsonFloat {
     value: f64,
 }
 
-#[derive(Clone, Serialize, Deserialize, distributed::JsonType)]
+#[derive(Clone, Serialize, Deserialize, distributed::table::JsonType)]
 struct NestedJsonDocument {
     nested: NestedJsonFloat,
 }
@@ -368,8 +377,8 @@ macro_rules! state_event_contract {
             const EVENT_NAME: &'static str = $name;
             const EVENT_VERSION: u64 = 1;
 
-            fn descriptor() -> distributed::DomainEventDescriptor {
-                <$state as distributed::DomainState>::DESCRIPTOR
+            fn descriptor() -> distributed::domain_event::DomainEventDescriptor {
+                <$state as distributed::domain_event::DomainState>::DESCRIPTOR
                     .clone()
                     .event(Self::EVENT_NAME, Self::EVENT_VERSION)
             }
@@ -382,7 +391,7 @@ macro_rules! state_event_contract {
 state_event_contract!(PlanChangedDomainEvent, PlanView, "plan.changed");
 state_event_contract!(PlanRenamedDomainEvent, PlanView, "plan.renamed");
 
-fn state_selector<S: distributed::DomainState>(
+fn state_selector<S: distributed::domain_event::DomainState>(
     name: &'static str,
     version: u64,
 ) -> Result<ProjectionEventSelector, ProjectionProgramError> {
@@ -421,7 +430,7 @@ fn patch_program(
         format!("patch-{name}"),
         0,
         MutationKind::Patch,
-        distributed::ProjectionTarget::try_new(model, table)?,
+        distributed::projection::ProjectionTarget::try_new(model, table)?,
         key,
         fields,
         Vec::new(),
@@ -609,7 +618,7 @@ distributed::projection! {
     };
 }
 
-#[derive(Clone, Serialize, distributed::DomainState)]
+#[derive(Clone, Serialize, distributed::domain_event::DomainState)]
 #[domain_state(version = 1)]
 struct FloatClearState {
     id: String,
@@ -1224,7 +1233,7 @@ async fn matched_typed_inventory_attaches_while_unverified_mutations_fail_closed
             Request::new(
                 "mutation { todo_create(commandId: \"0190a000-0000-7000-8000-000000000001\", input: { id: \"todo-1\" }) { id } }",
             )
-            .data(Arc::clone(&service) as distributed::SharedCommandHost),
+            .data(Arc::clone(&service) as distributed::command_dispatch::SharedCommandHost),
         )
         .await;
     assert_eq!(mutation.errors.len(), 1, "{mutation:?}");
@@ -1703,7 +1712,7 @@ async fn embedded_primary_keys_reject_keyed_effects_while_composite_keys_remain_
     assert!(
         matches!(
             &schema_error,
-            distributed::TableStoreError::Metadata(message)
+            distributed::table::TableStoreError::Metadata(message)
                 if message.contains("primary-key column `key` must be non-null")
         ),
         "{schema_error:?}"

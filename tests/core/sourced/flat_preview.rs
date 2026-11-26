@@ -185,32 +185,32 @@ mod client_contract {
         DistributedClientSurfaceExport, SurfaceOptions,
     };
     use distributed::microsvc::{CausalCommandContext, HandlerError, Routes, Service};
+    use distributed::mutation::Mutation;
     use distributed::projection::lower::{EventualOnly, ProjectionDescriptor};
-    use distributed::{
-        AggregateRepository, InMemoryRepository, LocalProjectionMounts, Mutation,
-        RelationalReadModel,
-    };
+    use distributed::projection::LocalProjectionMounts;
+    use distributed::read_model::RelationalReadModel;
+    use distributed::{AggregateRepository, InMemoryRepository};
     use serde::{Deserialize, Serialize};
 
-    #[derive(Clone, Default, Serialize, Deserialize, distributed::ReadModel)]
+    #[derive(Clone, Default, Serialize, Deserialize, distributed::read_model::ReadModel)]
     #[readmodel(table = "flat_reviews", primary_key = ["id"])]
     struct FlatReviews {
         id: String,
         status: String,
     }
 
-    #[derive(Clone, Default, Serialize, Deserialize, distributed::ReadModel)]
+    #[derive(Clone, Default, Serialize, Deserialize, distributed::read_model::ReadModel)]
     #[readmodel(table = "flat_members", primary_key = ["id", "user_id"])]
     struct FlatMembers {
         id: String,
         user_id: String,
     }
 
-    #[derive(Deserialize, distributed::CommandInput)]
+    #[derive(Deserialize, distributed::command::CommandInput)]
     struct Input {
         id: String,
     }
-    #[derive(Serialize, distributed::CommandOutput)]
+    #[derive(Serialize, distributed::command::CommandOutput)]
     struct Output {
         id: String,
     }

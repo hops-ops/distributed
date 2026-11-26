@@ -152,7 +152,7 @@ wire forms fail closed; applications do not need a polling or reload workaround.
 ## External read sources and leaderboard roots
 
 Roots that are not read-model roots come from an external read source
-(`distributed::graphql::surface::ExternalReadSource`, attached to a catalog
+(`distributed::graphql::ExternalReadSource`, attached to a catalog
 Surface with `Surface::with_external_sources` and served with
 `GraphqlEngineBuilder::external_read_source(executor)`). The source declares
 its roots, result object types, per-role grants, the session claims it reads,

@@ -66,7 +66,7 @@ impl JsonShape {
 }
 
 /// A type with a fixed serialized JSON shape. Derive it with
-/// `#[derive(distributed::JsonType)]`.
+/// `#[derive(distributed::table::JsonType)]`.
 pub trait JsonType {
     fn json_shape() -> JsonShape;
 }
@@ -164,7 +164,7 @@ impl<V: JsonType, S> JsonType for HashMap<String, V, S> {
 mod tests {
     use super::*;
 
-    #[derive(Clone, Serialize, Deserialize, crate::JsonType)]
+    #[derive(Clone, Serialize, Deserialize, crate::table::JsonType)]
     #[serde(rename_all = "snake_case")]
     #[allow(dead_code)]
     enum Tile {
@@ -174,7 +174,7 @@ mod tests {
         Player,
     }
 
-    #[derive(Serialize, crate::JsonType)]
+    #[derive(Serialize, crate::table::JsonType)]
     #[allow(dead_code)]
     struct Board {
         cells: Vec<Vec<Tile>>,
@@ -210,7 +210,7 @@ mod tests {
         );
     }
 
-    #[derive(Clone, Default, Serialize, Deserialize, crate::ReadModel)]
+    #[derive(Clone, Default, Serialize, Deserialize, crate::read_model::ReadModel)]
     #[readmodel(primary_key = ["id"])]
     struct Boards {
         id: String,
@@ -220,7 +220,7 @@ mod tests {
 
     #[test]
     fn read_model_json_columns_carry_their_shape() {
-        use crate::RelationalReadModel;
+        use crate::read_model::RelationalReadModel;
         let schema = Boards::schema();
         let column = |name: &str| {
             schema

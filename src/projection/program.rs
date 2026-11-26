@@ -4,8 +4,8 @@ use std::marker::PhantomData;
 
 use serde::{Deserialize, Serialize, Serializer};
 
+use crate::domain_event::DomainEventOccurrence;
 use crate::projection_protocol::{MAX_PROJECTION_PARTITION_BYTES, MAX_PROJECTION_RECORD_KEY_BYTES};
-use crate::DomainEventOccurrence;
 
 use super::canonical::{canonical_json_bytes, digest_program};
 use super::expression::{

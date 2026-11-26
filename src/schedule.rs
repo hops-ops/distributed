@@ -34,7 +34,7 @@
 //! *dispatch* them ([`Capability::Scheduling`]): a host that fires its own
 //! rows, and a shared store (SQL, in-memory) once a schedule worker is
 //! attached to it. Every backend has a clock ([`Capability::Clock`]): the
-//! in-memory repository's injected [`Clock`](crate::Clock), the database
+//! in-memory repository's injected [`Clock`](crate::clock::Clock), the database
 //! clock on SQL, the host clock elsewhere. Routes declare what they need
 //! (`.requires(Capability::Scheduling)`); registering one on a host without
 //! it fails at service construction, never at the first commit.
@@ -220,7 +220,7 @@ impl Schedule {
     }
 
     /// Schedule `name` to fire `delay` after the command commits, measured by
-    /// the backend's clock (the injected [`Clock`](crate::Clock) in memory,
+    /// the backend's clock (the injected [`Clock`](crate::clock::Clock) in memory,
     /// the database clock on SQL, the host clock elsewhere).
     pub fn after(
         name: impl Into<String>,

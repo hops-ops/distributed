@@ -220,7 +220,8 @@ async fn player_killed_by_bomb() {
         .contains(&"player:p2".to_string()));
 
     // Verify outbox message was created (PlayerKilled)
-    use distributed::{OutboxMessageStatus, OutboxStore};
+    use distributed::outbox::OutboxMessageStatus;
+    use distributed::outbox_worker::OutboxStore;
     let pending = repo2
         .outbox_store()
         .messages_by_status(OutboxMessageStatus::Pending, usize::MAX)
@@ -355,7 +356,8 @@ async fn bob_move_to_position<R>(
 
 #[tokio::test]
 async fn concurrent_bomb_placement() {
-    use distributed::{ReadModelWorkspaceExt, RowKey, RowValue};
+    use distributed::read_model::ReadModelWorkspaceExt;
+    use distributed::table::{RowKey, RowValue};
     use std::sync::Arc;
 
     // InMemoryRepository uses Arc<RwLock<...>> internally, safe to share across tasks

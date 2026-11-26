@@ -10,16 +10,14 @@ use std::sync::Arc;
 use std::time::{Duration, UNIX_EPOCH};
 
 use async_graphql::Request;
-use distributed::graphql::client_manifest::{
-    DistributedClientManifest, DistributedClientSurfaceExport,
-};
-use distributed::graphql::sdl::graphql_sdl_from_surface;
-use distributed::graphql::surface::{
+use distributed::domain_event::{DomainEventOccurrence, ExternalEventSource};
+use distributed::graphql::graphql_sdl_from_surface;
+use distributed::graphql::GraphqlEngine;
+use distributed::graphql::{
     build_surface, surface_for_role, ExternalReadSource, SurfaceDialect, SurfaceOptions,
 };
-use distributed::graphql::GraphqlEngine;
+use distributed::graphql::{DistributedClientManifest, DistributedClientSurfaceExport};
 use distributed::microsvc::{Session, ROLE_KEY, USER_ID_KEY};
-use distributed::{DomainEventOccurrence, ExternalEventSource};
 use distributed_leaderboard::{
     Board, ClientLeaderboard, InMemoryLeaderboard, LeaderboardChange, LeaderboardError,
     LeaderboardGrant, LeaderboardProjector, LeaderboardRoots, LeaderboardStore, LeaderboardSurface,
@@ -51,7 +49,7 @@ async fn engine(store: Arc<InMemoryLeaderboard>) -> GraphqlEngine {
     let repo = distributed::SqliteRepository::connect_and_migrate("sqlite::memory:")
         .await
         .unwrap();
-    let catalog = distributed::ReadModelCatalog::new("leaderboards");
+    let catalog = distributed::table::ReadModelCatalog::new("leaderboards");
     GraphqlEngine::from_schema_catalog(&catalog, repo.pool().clone())
         .unwrap()
         .identity(IdentityConfig::dev_headers())
@@ -205,7 +203,7 @@ async fn arguments_are_validated() {
     );
 }
 
-#[derive(serde::Serialize, serde::Deserialize, distributed::DomainEvent)]
+#[derive(serde::Serialize, serde::Deserialize, distributed::domain_event::DomainEvent)]
 #[domain_event(name = "test.xp_gained", version = 1)]
 struct XpGained {
     player: String,
@@ -289,7 +287,7 @@ async fn live_top_n_updates_after_an_applied_score_change() {
     );
 }
 
-fn surfaces() -> distributed::graphql::surface::Surface {
+fn surfaces() -> distributed::graphql::Surface {
     let options = SurfaceOptions {
         dialect: SurfaceDialect::Sqlite,
         aggregates: false,
@@ -403,7 +401,7 @@ async fn protocol_envelopes_mark_leaderboards_as_snapshot_only() {
     let repo = distributed::SqliteRepository::connect_and_migrate("sqlite::memory:")
         .await
         .unwrap();
-    let catalog = distributed::ReadModelCatalog::new("leaderboards");
+    let catalog = distributed::table::ReadModelCatalog::new("leaderboards");
     let engine = GraphqlEngine::from_schema_catalog(&catalog, repo.pool().clone())
         .unwrap()
         .identity(IdentityConfig::dev_headers())
@@ -447,21 +445,29 @@ fn the_cli_compiles_a_framework_leaderboard_manifest_into_the_ts_client() {
         compile_client, ClientCompileInput, ClientDocument, ClientSurfaceIdentity,
     };
 
-    let items = distributed::TableSchema {
+    let items = distributed::table::TableSchema {
         model_name: "ItemView".into(),
         table_name: "items".into(),
         columns: vec![
-            distributed::TableColumn {
+            distributed::table::TableColumn {
                 primary_key: true,
-                ..distributed::TableColumn::new("id", "id", distributed::ColumnType::Text)
+                ..distributed::table::TableColumn::new(
+                    "id",
+                    "id",
+                    distributed::table::ColumnType::Text,
+                )
             },
-            distributed::TableColumn::new("name", "name", distributed::ColumnType::Text),
+            distributed::table::TableColumn::new(
+                "name",
+                "name",
+                distributed::table::ColumnType::Text,
+            ),
         ],
-        primary_key: distributed::PrimaryKey::new(["id"]),
+        primary_key: distributed::table::PrimaryKey::new(["id"]),
         version_column: Some("_sourced_version".into()),
         indexes: Vec::new(),
         relationships: Vec::new(),
-        kind: distributed::TableKind::ReadModel,
+        kind: distributed::table::TableKind::ReadModel,
     };
     let options = SurfaceOptions {
         dialect: SurfaceDialect::Sqlite,
@@ -598,9 +604,9 @@ async fn live_boards_follow_a_projector_in_another_process_over_the_bus() {
 
 #[test]
 fn an_application_manifest_carries_and_validates_its_leaderboards() {
-    let spec = distributed::SurfaceSpec::from_surface("boards", &surfaces()).unwrap();
+    let spec = distributed::application::SurfaceSpec::from_surface("boards", &surfaces()).unwrap();
     assert_eq!(spec.contract.external[LEADERBOARDS_SECTION].len(), 2);
-    let built = distributed::Application::new("boards")
+    let built = distributed::application::Application::new("boards")
         .surface(spec.clone())
         .build()
         .expect("a surface with leaderboards validates");
@@ -615,17 +621,17 @@ fn an_application_manifest_carries_and_validates_its_leaderboards() {
         .get_mut(LEADERBOARDS_SECTION)
         .unwrap()
         .pop();
-    assert!(distributed::Application::new("boards")
+    assert!(distributed::application::Application::new("boards")
         .surface(tampered)
         .build()
         .is_err());
 
     // Without leaderboards the section is absent (existing manifests keep
     // their bytes).
-    let plain = distributed::SurfaceSpec::from_surface(
+    let plain = distributed::application::SurfaceSpec::from_surface(
         "plain",
         &build_surface(
-            &distributed::ReadModelCatalog::new("plain").tables,
+            &distributed::table::ReadModelCatalog::new("plain").tables,
             &SurfaceOptions::sqlite(),
         )
         .unwrap(),

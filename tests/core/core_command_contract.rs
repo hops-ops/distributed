@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 
 mod neutral {
     use super::*;
-    use distributed::{CommandInput, CommandOutput};
+    use distributed::command::{CommandInput, CommandOutput};
 
     #[derive(Deserialize, CommandInput)]
     #[serde(rename_all = "camelCase")]
@@ -60,7 +60,7 @@ fn neutral_declarations_match_the_frozen_artifact() {
     );
 }
 
-#[derive(Deserialize, distributed::CommandInput)]
+#[derive(Deserialize, distributed::command::CommandInput)]
 #[serde(rename_all(deserialize = "kebab-case", serialize = "camelCase"))]
 struct NonGraphqlInput {
     record_id: String,
@@ -80,7 +80,7 @@ fn graphql_representability_is_checked_only_when_exposing_the_command() {
     assert!(result.unwrap_err().contains("record-id"));
 }
 
-#[derive(Deserialize, distributed::CommandInput)]
+#[derive(Deserialize, distributed::command::CommandInput)]
 #[serde(rename_all(deserialize = "camelCase", serialize = "SCREAMING_SNAKE_CASE"))]
 struct DirectionalInput {
     record_id: String,
@@ -89,7 +89,7 @@ struct DirectionalInput {
     values: Option<Vec<Option<String>>>,
 }
 
-#[derive(Serialize, distributed::CommandOutput)]
+#[derive(Serialize, distributed::command::CommandOutput)]
 #[serde(rename_all(deserialize = "camelCase", serialize = "SCREAMING_SNAKE_CASE"))]
 struct DirectionalOutput {
     record_id: String,

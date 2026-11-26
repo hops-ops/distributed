@@ -1,12 +1,14 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use distributed::application::ApplicationManifest;
 use distributed::application::{
     admit_command_session, command_roles_require_principal, Application, ApplicationExtension,
     CommandDefinition, CommandMount, CommandSpec, CommandTypeField, CommandTypeSpec,
     ContractCompiler, Module, ProjectionSpec, SurfaceSelectionSpec, SurfaceSpec,
 };
 use distributed::command::{typed_command, CommandConsistency, Succeeded};
+use distributed::command::{CommandInput, CommandOutput};
 use distributed::graphql::{
     build_surface, col, prune_client_manifest, read, surface_for_application, surface_for_role,
     ClientCommandPureReduce, ClientProjectionArm, ClientProjectionEventRef,
@@ -18,9 +20,7 @@ use distributed::graphql::{
 use distributed::projection::{
     PROJECTION_OPERATION_SEMANTICS_VERSION, PROJECTION_PROGRAM_IR_VERSION,
 };
-use distributed::{
-    ApplicationManifest, CommandInput, CommandOutput, ReadModel, RelationalReadModel,
-};
+use distributed::read_model::{ReadModel, RelationalReadModel};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Default, Deserialize, ReadModel, Serialize)]

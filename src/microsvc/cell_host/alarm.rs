@@ -10,7 +10,8 @@
 
 pub(crate) use crate::schedule::*;
 
-use super::{CausalDispatchError, CellCommandIdentity};
+use super::CellCommandIdentity;
+use crate::microsvc::CausalDispatchError;
 
 impl ArmedSchedule {
     /// Stable command-ledger identity of this arm in its cell's own ledger.
