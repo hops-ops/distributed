@@ -1,49 +1,36 @@
-//! In-memory reference run of the async-transport conformance harness.
-//!
-//! Runs the bus contract against `InMemoryBus` and the outbox dispatcher
-//! contract against adapter-neutral fakes, with no external broker.
+//! The bus contract over `InMemoryBus`, with no external service.
 
-use common::transport as conformance;
-
+use common::transport::bus::{BusCapabilities, BusHarness, KindCapabilities};
 use distributed::bus::InMemoryBus;
 
-/// Every bus is a clone of one in-memory bus; it has no consumer groups.
+/// One queue for commands and one log for events, both in publish order. A
+/// nacked command goes back to the head of the queue; the queue keeps every
+/// send, the log stores a stable id once.
+pub(crate) const IN_MEMORY: BusCapabilities = BusCapabilities {
+    commands: KindCapabilities {
+        dedupes_ids: false,
+        ..KindCapabilities::LOG
+    },
+    events: KindCapabilities::LOG,
+    rebalance_may_redeliver: false,
+    added_metadata: &[],
+};
+
+/// Every bus is a clone of one in-memory bus.
 struct InMemory(InMemoryBus);
 
-impl conformance::bus::BusHarness for InMemory {
+impl BusHarness for InMemory {
     type Bus = InMemoryBus;
+
+    const CAPABILITIES: BusCapabilities = IN_MEMORY;
 
     async fn start() -> Option<Self> {
         Some(Self(InMemoryBus::new()))
     }
 
-    async fn bus(&self, _group: &str) -> InMemoryBus {
+    async fn bus(&self) -> InMemoryBus {
         self.0.clone()
     }
 }
 
 common::bus_conformance_tests!(InMemory);
-
-// --- publisher / outbox dispatcher contract ---------------------------------
-
-#[tokio::test]
-async fn dispatcher_completes_only_after_publish_success() {
-    conformance::dispatcher_completes_only_after_publish_success().await;
-}
-
-#[tokio::test]
-async fn dispatcher_unknown_outcome_stays_retryable() {
-    conformance::dispatcher_unknown_outcome_stays_retryable().await;
-}
-
-#[tokio::test]
-async fn dispatcher_claims_explicit_ids_before_publish() {
-    conformance::dispatcher_claims_explicit_ids_before_publish().await;
-}
-
-// --- composed at-least-once: crash between publish and complete ---------------
-
-#[tokio::test]
-async fn publish_then_crash_republishes_and_consumer_inbox_dedupes() {
-    conformance::publish_then_crash_republishes_and_consumer_inbox_dedupes().await;
-}

@@ -3,18 +3,21 @@
 //! Kafka shines as a partitioned, replayable log, and the point-to-point vs
 //! fan-out distinction is entirely a **consumer-group** choice:
 //!
-//! - **`send` / `listen` (point-to-point, competing):** commands go to topics
-//!   `{ns}.cmd.{name}`. `listen` joins a **shared** consumer group
+//! - **`send` / `listen` (point-to-point, competing):** commands go to the
+//!   topic `{ns}.cmd`. `listen` joins a **shared** consumer group
 //!   `{ns}.{group}.cmd`, so Kafka distributes the topic partitions across the
 //!   group's members — each record is handled by exactly one replica.
-//! - **`publish` / `subscribe` (fan-out):** events go to topics `{ns}.evt.{name}`.
+//! - **`publish` / `subscribe` (fan-out):** events go to the topic `{ns}.evt`.
 //!   `subscribe` joins a group **per service** (`{ns}.{group}.evt`). Kafka
 //!   delivers every record to every group, so each distinct `group` sees every
 //!   event (replicas within a group still share its partitions → competing).
 //!
-//! The dispatched message name is the topic with its `{ns}.cmd.`/`{ns}.evt.`
-//! prefix stripped. `{ns}` (namespace) scopes topics and groups so runs/apps
-//! don't collide.
+//! One topic per kind, keyed by stream id, keeps one aggregate's messages in
+//! order across names (`created` before `shipped`). The message name travels
+//! in the [`WireEnvelope::NAME`](super::WireEnvelope::NAME) header; a consumer
+//! receives every name of its kind and acknowledges the ones it does not
+//! handle. `{ns}` (namespace) scopes topics and groups so runs/apps don't
+//! collide.
 //!
 //! Requires the `kafka` feature. Integration-tested in `tests/transports/kafka_transport`.
 
@@ -25,8 +28,8 @@ use std::time::Duration;
 
 use super::kafka::{KafkaPublisher, KafkaSource};
 use super::{
-    run_source, Bus, BusConsumer, BusTopologyConfig, MessagePublisher, MessageRouter,
-    PublishDeadLetters, RunOptions, TransportError,
+    run_source, Bus, BusConsumer, BusTopologyConfig, MessageRouter, PublishDeadLetters, RunOptions,
+    TransportError,
 };
 use super::{Message, MessageKind};
 
@@ -139,21 +142,18 @@ impl KafkaBus {
         self
     }
 
-    fn validated_namespace(&self) -> Result<String, TransportError> {
-        self.topology.namespace_for("kafka")
-    }
-
-    fn command_prefix(&self) -> Result<String, TransportError> {
-        Ok(format!("{}.cmd.", self.validated_namespace()?))
-    }
-
-    fn event_prefix(&self) -> Result<String, TransportError> {
-        Ok(format!("{}.evt.", self.validated_namespace()?))
+    /// The topic every message of `kind` goes to.
+    fn topic(&self, kind: MessageKind) -> Result<String, TransportError> {
+        Ok(format!(
+            "{}.{}",
+            self.topology.namespace_for("kafka")?,
+            kind_suffix(kind)
+        ))
     }
 
     /// Shared consume path for `listen` (commands) and `subscribe` (events):
-    /// join group `{ns}.{group}.{cmd|evt}` on topics `{ns}.{cmd|evt}.{name}`.
-    /// An empty plan returns `Ok(())` before any namespace/group resolution.
+    /// join group `{ns}.{group}.{cmd|evt}` on topic `{ns}.{cmd|evt}`. An empty
+    /// plan returns `Ok(())` before any namespace/group resolution.
     async fn consume<R: MessageRouter>(
         &self,
         router: Arc<R>,
@@ -161,40 +161,46 @@ impl KafkaBus {
         kind: MessageKind,
     ) -> Result<(), TransportError> {
         let plan = router.subscription_plan();
-        let (names, suffix) = match kind {
-            MessageKind::Command => (plan.commands, "cmd"),
-            MessageKind::Event => (plan.events, "evt"),
+        let names = match kind {
+            MessageKind::Command => plan.commands,
+            MessageKind::Event => plan.events,
         };
         if names.is_empty() {
             return Ok(());
         }
-        let namespace = self.validated_namespace()?;
-        let prefix = format!("{namespace}.{suffix}.");
-        let topics: Vec<String> = names.iter().map(|name| format!("{prefix}{name}")).collect();
+        let topic = self.topic(kind)?;
         let group = self
             .topology
             .resolve_consumer_group(router.as_ref(), "kafka")?;
-        let group_id = format!("{namespace}.{group}.{suffix}");
-        let topic_refs: Vec<&str> = topics.iter().map(String::as_str).collect();
-        let source = KafkaSource::connect(&self.brokers, &group_id, &topic_refs)
+        let group_id = format!(
+            "{}.{group}.{}",
+            self.topology.namespace_for("kafka")?,
+            kind_suffix(kind)
+        );
+        let source = KafkaSource::connect(&self.brokers, &group_id, &[&topic])
             .await?
-            .with_fetch_timeout(self.fetch_timeout)
-            .with_strip_prefix(prefix);
+            .with_fetch_timeout(self.fetch_timeout);
         let options = options.or_dead_letters(|| Arc::new(PublishDeadLetters(self.clone())));
         run_source(router, source, options).await
     }
 }
 
+fn kind_suffix(kind: MessageKind) -> &'static str {
+    match kind {
+        MessageKind::Command => "cmd",
+        MessageKind::Event => "evt",
+    }
+}
+
 impl Bus for KafkaBus {
-    async fn send_message(&self, mut message: Message) -> Result<(), TransportError> {
-        // The publisher uses the message name as the topic; namespace it.
-        message.name = format!("{}{}", self.command_prefix()?, message.name);
-        self.publisher.publish(message).await
+    async fn send_message(&self, message: Message) -> Result<(), TransportError> {
+        let topic = self.topic(MessageKind::Command)?;
+        self.publisher.send_to(&topic, message).await
     }
 
-    async fn publish_message(&self, mut message: Message) -> Result<(), TransportError> {
-        message.name = format!("{}{}", self.event_prefix()?, message.name);
-        self.publisher.publish(message).await
+    async fn publish_message(&self, message: Message) -> Result<(), TransportError> {
+        let topic = self.topic(MessageKind::Event)?;
+        self.publisher.send_to(&topic, message).await
     }
 }
 

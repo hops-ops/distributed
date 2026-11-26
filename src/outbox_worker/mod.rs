@@ -24,6 +24,8 @@
 //! let outcome = dispatcher.dispatch_batch(10).await?;
 //! ```
 
+#[cfg(test)]
+mod at_least_once_tests;
 mod bus_publisher;
 #[cfg(any(feature = "runtime-tokio", test))]
 mod drain;
@@ -46,7 +48,10 @@ pub use drain::{
     DEFAULT_DRAIN_BATCH_SIZE, DEFAULT_DRAIN_ERROR_BACKOFF, DEFAULT_DRAIN_LEASE,
     DEFAULT_DRAIN_MAX_ERROR_BACKOFF, DEFAULT_DRAIN_POLL_INTERVAL, DEFAULT_OUTBOX_HINT_CAPACITY,
 };
-pub use outbox_dispatch::{OutboxDispatchOutcome, OutboxDispatcher, SOURCED_METADATA_PREFIX};
+pub use outbox_dispatch::{
+    OutboxDispatchOutcome, OutboxDispatcher, SOURCED_METADATA_PREFIX, SOURCE_AGGREGATE_ID,
+    SOURCE_AGGREGATE_TYPE,
+};
 pub use outbox_source::{
     OutboxSource, ReceivedOutboxMessage, DEFAULT_OUTBOX_SOURCE_BATCH, DEFAULT_OUTBOX_SOURCE_LEASE,
 };

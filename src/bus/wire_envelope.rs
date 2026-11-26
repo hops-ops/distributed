@@ -38,8 +38,13 @@ impl WireEnvelope {
     pub const KIND: &'static str = "x-distributed-kind";
     /// Header carrying [`Message::content_type`].
     pub const CONTENT_TYPE: &'static str = "x-distributed-content-type";
+    /// Header carrying [`Message::name`] on a transport whose address does
+    /// not name the message (Kafka's one topic per kind). [`encode`](Self::encode)
+    /// never writes it: an adapter that needs it adds it. When a delivery
+    /// carries it, [`decode`](Self::decode) takes the name from it.
+    pub const NAME: &'static str = "x-distributed-name";
     /// Every reserved header.
-    pub const RESERVED: [&'static str; 3] = [Self::ID, Self::KIND, Self::CONTENT_TYPE];
+    pub const RESERVED: [&'static str; 4] = [Self::ID, Self::KIND, Self::CONTENT_TYPE, Self::NAME];
 
     /// Whether `key` names a reserved header (ASCII case-insensitive).
     pub fn is_reserved(key: &str) -> bool {
@@ -127,6 +132,7 @@ impl WireEnvelope {
                 Self::KIND => {
                     parse_kind(value)?;
                 }
+                Self::NAME => check_name(value)?,
                 _ => check_content_type(value)?,
             }
         }
@@ -143,6 +149,8 @@ impl WireEnvelope {
                 message.kind = parse_kind(&value).unwrap_or(MessageKind::Event);
             } else if key.eq_ignore_ascii_case(Self::CONTENT_TYPE) {
                 message.content_type = value;
+            } else if key.eq_ignore_ascii_case(Self::NAME) {
+                message.name = value;
             } else {
                 message.metadata.push((key, value));
             }
@@ -239,6 +247,7 @@ mod tests {
             "x-distributed-id",
             "X-Distributed-Kind",
             "X-DISTRIBUTED-CONTENT-TYPE",
+            "x-distributed-Name",
         ] {
             let error = WireEnvelope::encode(message().with_metadata(key, "forged")).unwrap_err();
             assert!(error.is_permanent(), "{key}");
@@ -328,6 +337,27 @@ mod tests {
             assert_eq!(raw.payload(), b"kept");
             assert_eq!(raw.metadata, headers);
         }
+    }
+
+    #[test]
+    fn a_name_header_names_the_message() {
+        let (decoded, error) = WireEnvelope {
+            name: "app.evt".into(),
+            headers: vec![(WireEnvelope::NAME.into(), "order.placed".into())],
+            payload: Vec::new(),
+        }
+        .decode();
+        assert!(error.is_none());
+        assert_eq!(decoded.name(), "order.placed");
+        assert!(decoded.metadata.is_empty());
+
+        let (_, error) = WireEnvelope {
+            name: "app.evt".into(),
+            headers: vec![(WireEnvelope::NAME.into(), "orders.>".into())],
+            payload: Vec::new(),
+        }
+        .decode();
+        assert!(error.expect("refused").is_permanent());
     }
 
     #[test]

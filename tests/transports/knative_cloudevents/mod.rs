@@ -6,8 +6,11 @@
 
 use std::sync::{Arc, Mutex};
 
+use common::transport::bus::{BusCapabilities, BusHarness};
 use distributed::bus::{Bus, KnativeBus};
-use distributed::microsvc::cloud_events_router;
+use distributed::microsvc::{cloud_events_router, decode_cloud_event};
+
+use crate::transport_in_memory::IN_MEMORY;
 use distributed::microsvc::{
     Context, HandlerError, Message, MessageKind, Routes, Service, SubscriptionPlan,
 };
@@ -288,3 +291,127 @@ fn knative_bus_manifests_pure_consumer_local_variant() {
         "local flag points the subscriber at the kubefwd address"
     );
 }
+
+// ---- the bus contract over a broker emulator ----
+
+/// A stand-in for a Knative broker: `KnativeBus` POSTs real CloudEvents to
+/// it, it decodes them with the ingress decoder (`decode_cloud_event`) and
+/// keeps them in an `InMemoryBus`, from which consumers read.
+///
+/// Knative itself delivers by HTTP push through Triggers, so it has no
+/// in-process consumer; what the suite proves for Knative is the produce
+/// path and the CloudEvent encoding round trip. Delivery semantics are the
+/// emulator's, the in-memory bus's.
+#[derive(Clone)]
+struct KnativeLoopback {
+    produce: KnativeBus,
+    broker: distributed::bus::InMemoryBus,
+}
+
+impl Bus for KnativeLoopback {
+    async fn send_message(&self, message: Message) -> Result<(), distributed::bus::TransportError> {
+        self.produce.send_message(message).await
+    }
+
+    async fn publish_message(
+        &self,
+        message: Message,
+    ) -> Result<(), distributed::bus::TransportError> {
+        self.produce.publish_message(message).await
+    }
+}
+
+impl distributed::bus::BusConsumer for KnativeLoopback {
+    async fn listen<R: distributed::bus::MessageRouter>(
+        &self,
+        router: Arc<R>,
+        options: distributed::bus::RunOptions,
+    ) -> Result<(), distributed::bus::TransportError> {
+        self.broker.listen(router, self.dead_letters(options)).await
+    }
+
+    async fn subscribe<R: distributed::bus::MessageRouter>(
+        &self,
+        router: Arc<R>,
+        options: distributed::bus::RunOptions,
+    ) -> Result<(), distributed::bus::TransportError> {
+        self.broker
+            .subscribe(router, self.dead_letters(options))
+            .await
+    }
+}
+
+impl KnativeLoopback {
+    /// Dead letters go back through the broker, as a published event.
+    fn dead_letters(&self, options: distributed::bus::RunOptions) -> distributed::bus::RunOptions {
+        let this = self.clone();
+        options.or_dead_letters(move || Arc::new(distributed::bus::PublishDeadLetters(this)))
+    }
+}
+
+/// One emulated broker per test.
+struct Knative {
+    bus: KnativeLoopback,
+}
+
+impl BusHarness for Knative {
+    type Bus = KnativeLoopback;
+
+    // The emulator's, which are the in-memory bus's. The CloudEvent
+    // `source` attribute (the producing service) arrives as metadata.
+    const CAPABILITIES: BusCapabilities = BusCapabilities {
+        added_metadata: &["source"],
+        ..IN_MEMORY
+    };
+
+    async fn start() -> Option<Self> {
+        let broker = distributed::bus::InMemoryBus::new();
+        let store = broker.clone();
+        let ingress = axum::Router::new().route(
+            "/{broker}",
+            axum::routing::post(
+                move |headers: axum::http::HeaderMap, body: axum::body::Bytes| {
+                    let store = store.clone();
+                    async move {
+                        let message = match decode_cloud_event(&headers, &body) {
+                            Ok(message) => message,
+                            Err(error) => return (axum::http::StatusCode::BAD_REQUEST, error),
+                        };
+                        let stored = match message.kind {
+                            MessageKind::Command => store.send_message(message).await,
+                            MessageKind::Event => store.publish_message(message).await,
+                        };
+                        match stored {
+                            Ok(()) => (axum::http::StatusCode::ACCEPTED, String::new()),
+                            Err(error) => (
+                                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                                error.to_string(),
+                            ),
+                        }
+                    }
+                },
+            ),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, ingress).await });
+        Some(Self {
+            bus: KnativeLoopback {
+                produce: KnativeBus::new(
+                    format!("http://{address}"),
+                    "",
+                    "conformance",
+                    "commands",
+                    "events",
+                ),
+                broker,
+            },
+        })
+    }
+
+    async fn bus(&self) -> KnativeLoopback {
+        self.bus.clone()
+    }
+}
+
+common::bus_conformance_tests!(Knative);

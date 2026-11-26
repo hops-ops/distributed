@@ -15,6 +15,8 @@ mod postgres_transport;
 mod rabbitmq_transport;
 #[cfg(feature = "redis-streams")]
 mod redis_streams;
+#[cfg(any(feature = "sqlite", feature = "postgres"))]
+mod sql_bus_conformance;
 #[cfg(feature = "sqlite")]
 mod sqlite_transport;
 mod transport_in_memory;

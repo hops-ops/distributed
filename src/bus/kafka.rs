@@ -1,10 +1,18 @@
 //! Kafka transport adapter.
 //!
-//! [`KafkaPublisher`] sends a canonical [`Message`] to a topic named by the
-//! message name, awaiting the producer ack (the durable publish threshold, per
-//! the configured `acks`). [`KafkaSource`] consumes with a consumer group
-//! (auto-commit disabled) and settles by offset: ack→commit the offset,
-//! nack→seek back so the record is re-read, dead-letter/park→commit (skip).
+//! [`KafkaPublisher`] sends a canonical [`Message`] to a topic, awaiting the
+//! producer ack (the durable publish threshold, per the configured `acks`).
+//! As a [`MessagePublisher`] the topic is the message name; [`KafkaBus`]
+//! sends every message of a kind to one topic and carries the name in the
+//! [`WireEnvelope::NAME`] header. A record's key is its stream id (the
+//! [`SOURCE_AGGREGATE_ID`] metadata), so one aggregate's messages share a
+//! partition and keep their order; without one the key is the message id.
+//! [`KafkaSource`] consumes with a consumer group (auto-commit disabled) and
+//! settles by offset: ack→commit the offset, nack→seek back so the record is
+//! re-read.
+//!
+//! [`KafkaBus`]: super::KafkaBus
+//! [`SOURCE_AGGREGATE_ID`]: crate::outbox_worker::SOURCE_AGGREGATE_ID
 //!
 //! Offset commits use `CommitMode::Async` so settling never blocks the tokio
 //! worker; this is at-least-once: a crash before an async commit lands redelivers
@@ -25,7 +33,8 @@ use rdkafka::{Message as KafkaMessageTrait, Offset, TopicPartitionList};
 
 use super::source::{MessageSource, ReceivedMessage};
 use super::{retryable, MessagePublisher, TransportError};
-use super::{strip_address_prefix, Message, WireEnvelope};
+use super::{Message, WireEnvelope};
+use crate::outbox_worker::{SOURCE_AGGREGATE_ID, SOURCE_AGGREGATE_TYPE};
 
 /// Publishes canonical messages to a Kafka topic named by the message name.
 pub struct KafkaPublisher {
@@ -43,11 +52,14 @@ impl KafkaPublisher {
     }
 
     /// Connect a producer to `brokers` (comma-separated `host:port`), waiting for
-    /// `acks=all` so a successful send is durably replicated.
+    /// `acks=all` so a successful send is durably replicated. The producer is
+    /// idempotent, so a retried send neither duplicates nor reorders records
+    /// within a partition.
     pub async fn connect(brokers: &str) -> Result<Self, TransportError> {
         let producer: FutureProducer = ClientConfig::new()
             .set("bootstrap.servers", brokers)
             .set("acks", "all")
+            .set("enable.idempotence", "true")
             .set("message.timeout.ms", "10000")
             .create()
             .map_err(|err| retryable("kafka producer", err))?;
@@ -55,18 +67,30 @@ impl KafkaPublisher {
     }
 }
 
-impl MessagePublisher for KafkaPublisher {
-    async fn publish(&self, message: Message) -> Result<(), TransportError> {
-        let key = message.id().unwrap_or(message.name()).to_string();
+impl KafkaPublisher {
+    /// Send `message` to `topic`, carrying its name in the
+    /// [`WireEnvelope::NAME`] header, so one topic can hold many names.
+    pub async fn send_to(&self, topic: &str, message: Message) -> Result<(), TransportError> {
+        self.send(Some(topic), message).await
+    }
+
+    async fn send(&self, topic: Option<&str>, message: Message) -> Result<(), TransportError> {
+        let key = partition_key(&message);
         let envelope = WireEnvelope::encode(message)?;
-        let mut headers = OwnedHeaders::new_with_capacity(envelope.headers.len());
+        let mut headers = OwnedHeaders::new_with_capacity(envelope.headers.len() + 1);
+        if topic.is_some() {
+            headers = headers.insert(Header {
+                key: WireEnvelope::NAME,
+                value: Some(envelope.name.as_str()),
+            });
+        }
         for (key, value) in &envelope.headers {
             headers = headers.insert(Header {
                 key: key.as_str(),
                 value: Some(value.as_str()),
             });
         }
-        let record = FutureRecord::to(&envelope.name)
+        let record = FutureRecord::to(topic.unwrap_or(&envelope.name))
             .payload(&envelope.payload)
             .key(&key)
             .headers(headers);
@@ -78,11 +102,30 @@ impl MessagePublisher for KafkaPublisher {
     }
 }
 
+/// The record key: the stream the message belongs to, so Kafka keeps one
+/// stream's messages in one partition, in order. A message from no stream is
+/// keyed by its id, or else its name.
+fn partition_key(message: &Message) -> String {
+    match message.metadata(SOURCE_AGGREGATE_ID) {
+        Some(id) => match message.metadata(SOURCE_AGGREGATE_TYPE) {
+            Some(kind) => format!("{kind}/{id}"),
+            None => id.to_string(),
+        },
+        None => message.id().unwrap_or(message.name()).to_string(),
+    }
+}
+
+impl MessagePublisher for KafkaPublisher {
+    /// Send to the topic named by the message name.
+    async fn publish(&self, message: Message) -> Result<(), TransportError> {
+        self.send(None, message).await
+    }
+}
+
 /// Consumes a topic with a consumer group, committing offsets on ack.
 pub struct KafkaSource {
     consumer: Arc<StreamConsumer>,
     fetch_timeout: Duration,
-    strip_prefix: Option<String>,
     /// Receive errors in a row with no record in between.
     consecutive_errors: u32,
     redelivery: Redelivery,
@@ -102,7 +145,6 @@ impl KafkaSource {
         Self {
             consumer,
             fetch_timeout: Duration::from_secs(5),
-            strip_prefix: None,
             consecutive_errors: 0,
             redelivery: Redelivery::default(),
         }
@@ -112,14 +154,6 @@ impl KafkaSource {
     /// available.
     pub fn with_fetch_timeout(mut self, timeout: Duration) -> Self {
         self.fetch_timeout = timeout;
-        self
-    }
-
-    /// Strip `prefix` from each record's topic when deriving the message name, so
-    /// a topic `app.cmd.account.debit` becomes the name `account.debit`. Used by
-    /// [`KafkaBus`](super::KafkaBus); default: no stripping (the topic is the name).
-    pub fn with_strip_prefix(mut self, prefix: impl Into<String>) -> Self {
-        self.strip_prefix = Some(prefix.into());
         self
     }
 
@@ -210,7 +244,6 @@ impl MessageSource for KafkaSource {
                     return Ok(Some(KafkaReceived::from_borrowed(
                         &borrowed,
                         self.consumer.clone(),
-                        self.strip_prefix.as_deref(),
                         self.redelivery.clone(),
                     )));
                 }
@@ -243,12 +276,12 @@ impl KafkaReceived {
     fn from_borrowed(
         borrowed: &rdkafka::message::BorrowedMessage<'_>,
         consumer: Arc<StreamConsumer>,
-        strip_prefix: Option<&str>,
         redelivery: Redelivery,
     ) -> Self {
         let payload = borrowed.payload().map(|p| p.to_vec()).unwrap_or_default();
         let topic = borrowed.topic().to_string();
-        let name = strip_address_prefix(topic.clone(), strip_prefix);
+        // The topic names the message unless a name header does.
+        let name = topic.clone();
         let headers: Vec<(String, String)> = borrowed
             .headers()
             .into_iter()
@@ -374,6 +407,19 @@ mod tests {
             .create()
             .unwrap();
         KafkaSource::new(Arc::new(consumer))
+    }
+
+    #[test]
+    fn records_are_keyed_by_stream_then_id_then_name() {
+        let base = Message::new("order.placed", crate::bus::MessageKind::Event, Vec::new());
+        let streamed = base
+            .clone()
+            .with_id("m-1")
+            .with_metadata(SOURCE_AGGREGATE_TYPE, "order")
+            .with_metadata(SOURCE_AGGREGATE_ID, "o-1");
+        assert_eq!(partition_key(&streamed), "order/o-1");
+        assert_eq!(partition_key(&base.clone().with_id("m-1")), "m-1");
+        assert_eq!(partition_key(&base), "order.placed");
     }
 
     #[tokio::test]
