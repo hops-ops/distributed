@@ -87,6 +87,12 @@ does not cover internal changes.
 - Kafka topics are keyed by stream id and the topic layout changed;
   `with_strip_prefix` is removed. `MessageSource` has a `finish()` method.
 - The `redis` feature is `redis-streams` (`bus::RedisStreamBus`).
+- Every projector consumes through a consumer group of its own,
+  `<group>-<projector>`. These groups are new: on its first start each
+  projector reads the event stream from the beginning once. Nothing carries
+  an older consumer position over, so reset the environment when moving to
+  v5; a stream that holds messages written before the header rename must be
+  recreated.
 
 ## Storage
 
