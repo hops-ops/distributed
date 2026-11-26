@@ -7,23 +7,18 @@
 
 #![allow(dead_code)]
 
-use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
+// Picked outside the ephemeral ranges. A node's ports are deployed into
+// the worker's vars (`{nodes}`) before the nodes start, so a taken port is
+// not retried here: that would mean a redeploy.
+use super::celld_support::ports::free_port;
 use super::celld_support::{blocking_get, copy_dir};
 
 const ACCESS_KEY: &str = "fleettest";
 const SECRET_KEY: &str = "fleettestsecret123";
-
-fn free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
-}
 
 pub struct Node {
     pub name: String,
