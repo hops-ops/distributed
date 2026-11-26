@@ -467,11 +467,28 @@ async fn bots_fight_in_a_room_on_celld_and_the_room_sleeps_and_restores() {
     // A new player wakes the room: restored from its snapshot.
     let summary = run_bots(bot_config(&celld, room, 1, Duration::from_secs(2)), spin).await;
     assert_eq!(summary.joined(), 1);
-    eventually("room restored", Duration::from_secs(20), || async {
+    // The room object itself restored (no projection involved)…
+    let info = room_info(&celld, room).await;
+    assert_eq!(
+        info["restored"], true,
+        "the wake restored no snapshot: {info}"
+    );
+    // …and the room status read model follows it. A timeout names both
+    // sides: the projected row and the object's own state (reports in
+    // flight, facts spooled).
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
         let row = room_status(services.addr, room).await;
-        row["restored"] == true && row["activations"].as_i64().unwrap_or(0) >= 2
-    })
-    .await;
+        if row["restored"] == true && row["activations"].as_i64().unwrap_or(0) >= 2 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for room restored: row {row}, room {}",
+            room_info(&celld, room).await
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 
     stop.send(()).unwrap();
     services.task.await.unwrap().unwrap();

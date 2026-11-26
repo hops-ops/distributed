@@ -76,6 +76,16 @@ jobs:
           REDIS_URL: redis://127.0.0.1:6379
           MOBPIT_FLEET_REQUIRED: "1"
         run: examples/game/run.sh smoke
+      # The smoke keeps each celld's state and logs under /tmp; upload them
+      # so a failed run can be diagnosed instead of re-run.
+      - name: Upload celld artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: game-demo-celld
+          path: /tmp/game-demo-celld-*
+          if-no-files-found: ignore
+          retention-days: 7
       - name: Leaderboard conformance and GraphQL boards against real Redis
         env:
           REDIS_URL: redis://127.0.0.1:6379
