@@ -167,6 +167,7 @@ fn snapshot(
                         &record_scope(rows[0].id),
                     )
                     .unwrap(),
+                record: None,
             })
             .collect(),
     }

@@ -8,6 +8,7 @@ import type {
 import type {
 	DistributedDecimalString,
 	DistributedLiveCursor,
+	DistributedObservedRecord,
 	DistributedOpaqueString,
 	DistributedTrustedPreset
 } from '../../protocol.js';
@@ -179,6 +180,12 @@ export type OptimisticReceiptState = {
 	causationId: DistributedOpaqueString;
 	expectations: ReadonlyMap<string, true>;
 	observed: Set<string>;
+	/**
+	 * Per observed expectation, the row revision the projector wrote for this
+	 * causation. Once the base holds every one at or past it, the layer is
+	 * proven and retires.
+	 */
+	revisions: Map<string, DistributedObservedRecord>;
 };
 
 export type IndexDisposition = 'fresh' | 'equal' | 'higher' | 'lower' | 'incomparable';

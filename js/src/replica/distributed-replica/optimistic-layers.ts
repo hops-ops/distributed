@@ -5,6 +5,7 @@ import type {
 import {
 	DistributedProtocolError,
 	type DistributedCommandMetadata,
+	type DistributedObservedRecord,
 	type DistributedProjectionObservation
 } from '../../protocol.js';
 import { replicaRecordKey } from '../identity/keys.js';
@@ -21,8 +22,10 @@ import {
 	assertReplicaOptimisticLayerId,
 	captureReplicaOptimisticUpdate,
 	cloneOptimisticReceipt,
-	expectationKey,
+	mergeReceiptProgress,
+	observeReceipt,
 	optimisticReceiptState,
+	receiptHeldByBase,
 	replayReplicaOptimisticUpdate,
 	sameReceipt
 } from './optimistic.js';
@@ -42,6 +45,8 @@ type OptimisticReceiptPlan = {
 export class OptimisticLayers {
 	readonly #engine: CacheEngine;
 	readonly #diagnostics: DiagnosticsReporter;
+	/** Whether the base holds a row at or past an observed revision. */
+	readonly #holds: (revision: DistributedObservedRecord) => boolean;
 	readonly #receipts = new Map<string, OptimisticReceiptState>();
 	/**
 	 * Record keys inserted by Eventual projection-delta. A later complete
@@ -56,9 +61,14 @@ export class OptimisticLayers {
 		{ generation: number; plan: ReplicaRevalidationPlan }
 	>();
 
-	constructor(engine: CacheEngine, diagnostics: DiagnosticsReporter) {
+	constructor(
+		engine: CacheEngine,
+		diagnostics: DiagnosticsReporter,
+		holds: (revision: DistributedObservedRecord) => boolean
+	) {
 		this.#engine = engine;
 		this.#diagnostics = diagnostics;
+		this.#holds = holds;
 	}
 
 	receipt(id: string): OptimisticReceiptState | undefined {
@@ -125,6 +135,11 @@ export class OptimisticLayers {
 		);
 	}
 
+	/**
+	 * Accept a command's layer and fold in its receipt or status. Returns
+	 * whether the layer remains: one whose every observed row revision the
+	 * base already holds is proven, and retires here.
+	 */
 	markAccepted(id: string, receipt?: DistributedCommandMetadata): boolean {
 		if (receipt !== undefined && receipt.commandId !== id) {
 			throw new TypeError('optimistic layer id must equal the causal command id');
@@ -145,10 +160,34 @@ export class OptimisticLayers {
 				'extensions.distributed.command'
 			);
 		}
+		if (current !== undefined) mergeReceiptProgress(next, current);
 		this.#receipts.set(id, next);
 		this.#diagnostics.receiptAccepted(id, next);
 		this.#diagnostics.sync();
-		return true;
+		this.#retireIfHeld(id, next);
+		return this.#engine.optimisticLayerState(id) !== undefined;
+	}
+
+	/**
+	 * Retire every accepted layer the base now proves: a frame or fetch
+	 * stored each row its receipt names at or past the projected revision.
+	 * A later revision replaces the layer rather than sitting under it.
+	 */
+	retireHeld(): void {
+		for (const [id, receipt] of [...this.#receipts]) {
+			this.#retireIfHeld(id, receipt);
+		}
+	}
+
+	#retireIfHeld(id: string, receipt: OptimisticReceiptState): void {
+		if (
+			this.#deferredConfirms.has(id) ||
+			this.#engine.optimisticLayerState(id) === undefined ||
+			!receiptHeldByBase(receipt, this.#holds)
+		) {
+			return;
+		}
+		this.confirm(id, () => undefined);
 	}
 
 	/**
@@ -214,10 +253,8 @@ export class OptimisticLayers {
 			if (current !== undefined && !sameReceipt(current, proposed)) {
 				protocolInvalid('extensions.distributed.command');
 			}
-			updates.set(
-				command.commandId,
-				cloneOptimisticReceipt(current ?? proposed)
-			);
+			if (current !== undefined) mergeReceiptProgress(proposed, current);
+			updates.set(command.commandId, proposed);
 		}
 		for (const [id, receipt] of this.#receipts) {
 			if (!updates.has(id)) {
@@ -226,20 +263,26 @@ export class OptimisticLayers {
 		}
 		for (const receipt of updates.values()) {
 			for (const observation of observations) {
-				if (observation.causationId !== receipt.causationId) continue;
-				const key = expectationKey(observation);
-				if (receipt.expectations.has(key)) receipt.observed.add(key);
+				observeReceipt(receipt, observation);
 			}
 		}
+		/*
+		 * An observation proves the read model has the write, not that this
+		 * result shows it: a fetch can start before the projector commits.
+		 * A receipt whose every expectation names its projected revision is
+		 * therefore left to `retireHeld`, which compares that revision with
+		 * the row the base holds once this result committed.
+		 */
 		const satisfied = satisfactionAdmissible
 			? [...updates]
-					.filter(
-						([, receipt]) =>
-							receipt.expectations.size > 0 &&
-							[...receipt.expectations.keys()].every((key) =>
-								receipt.observed.has(key)
-							)
-					)
+					.filter(([, receipt]) => {
+						const keys = [...receipt.expectations.keys()];
+						return (
+							keys.length > 0 &&
+							keys.every((key) => receipt.observed.has(key)) &&
+							!keys.every((key) => receipt.revisions.has(key))
+						);
+					})
 					.map(([id]) => id)
 			: [];
 		return { updates, satisfied };
@@ -265,6 +308,7 @@ export class OptimisticLayers {
 		if (command === undefined) return;
 		const plan = this.planReceipts(command, command.observations, true);
 		for (const [id, receipt] of plan.updates) this.#accept(id, receipt);
+		this.retireHeld();
 	}
 
 	#accept(id: string, receipt: OptimisticReceiptState): void {

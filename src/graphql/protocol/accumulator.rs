@@ -8,7 +8,7 @@ use serde::Serialize;
 use super::{
     DistributedCommandConsistency, DistributedCommandMetadata, DistributedCommandState,
     DistributedEnvelopeV1, DistributedLiveCursor, DistributedLiveMetadata,
-    DistributedProjectionDisposition, DistributedProjectionExpectation,
+    DistributedObservedRecord, DistributedProjectionDisposition, DistributedProjectionExpectation,
     DistributedProjectionObservation, DistributedQuerySnapshot, DistributedRecordRevision,
     OpaqueProtocolToken, ProtocolTokenCodec, ProtocolTokenError, ProtocolTokenPurpose,
     RequestedLiveResume,
@@ -695,8 +695,10 @@ impl ProtocolResponseAccumulator {
             .projection_metadata
             .as_ref()
             .map_or(0, |metadata| metadata.obligations.len());
+        // A receipt comes from the write side, which never reads the read
+        // model: it names no projected row revision for an observation.
         let observed = if receipt.state == CommandLedgerState::Atomic {
-            (0..obligation_count).collect::<Vec<_>>()
+            (0..obligation_count).map(|index| (index, None)).collect()
         } else {
             Vec::new()
         };
@@ -732,7 +734,7 @@ impl ProtocolResponseAccumulator {
             .evidence
             .iter()
             .filter(|evidence| evidence.state == CausalProjectionEvidenceState::Observed)
-            .map(|evidence| evidence.obligation_index)
+            .map(|evidence| (evidence.obligation_index, evidence.record.as_ref()))
             .collect::<Vec<_>>();
         self.record_command(
             self.metadata(
@@ -764,7 +766,7 @@ impl ProtocolResponseAccumulator {
         consistency: CommandConsistency,
         projection_metadata: Option<&super::CommandProjectionMetadataV1>,
         direct_projection: Option<&crate::projection_protocol::SameTransactionProjectionEvidence>,
-        observed_obligation_indices: &[usize],
+        observed_obligations: &[(usize, Option<&crate::projection_protocol::RecordRevision>)],
         projection_disposition: Option<DistributedProjectionDisposition>,
     ) -> Result<DistributedCommandMetadata, ProtocolAccumulatorError> {
         if let Some(metadata) = projection_metadata {
@@ -828,9 +830,9 @@ impl ProtocolResponseAccumulator {
             .transpose()?
             .unwrap_or_default();
         let mut seen_observations = std::collections::BTreeSet::new();
-        let observations = observed_obligation_indices
+        let observations = observed_obligations
             .iter()
-            .map(|index| {
+            .map(|(index, record)| {
                 if !seen_observations.insert(*index) {
                     return Err(ProtocolAccumulatorError::Encoding);
                 }
@@ -840,11 +842,24 @@ impl ProtocolResponseAccumulator {
                     .get(*index)
                     .ok_or(ProtocolAccumulatorError::Encoding)?;
                 let (projection, model) = modeled_obligation_label(metadata, obligation)?;
+                let record = record
+                    .map(|record| {
+                        if record.scope().model() != obligation.model {
+                            return Err(ProtocolAccumulatorError::Encoding);
+                        }
+                        Ok(DistributedObservedRecord {
+                            scope_token: self.issue_record_scope(record.scope())?,
+                            incarnation: record.incarnation().to_string(),
+                            revision: record.revision().to_string(),
+                        })
+                    })
+                    .transpose()?;
                 Ok(DistributedProjectionObservation {
                     causation_id: causation_id.to_string(),
                     projection,
                     model,
                     scope_token: obligation.scope_token.clone(),
+                    record,
                 })
             })
             .collect::<Result<Vec<_>, ProtocolAccumulatorError>>()?;

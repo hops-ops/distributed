@@ -377,6 +377,7 @@ fn query_snapshot_merge_discards_index_evidence_when_any_index_is_incomparable()
         projection: "todos".into(),
         model: "TodoView".into(),
         scope_token: incomparable.indexes[0].scope_token.clone(),
+        record: None,
     }];
 
     accumulator.record_query_metadata(comparable, None).unwrap();

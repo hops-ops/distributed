@@ -1154,6 +1154,8 @@ fn wire_query_snapshot(
                             .map_err(|error| {
                                 ProjectionProtocolError::InvalidBatch(error.to_string())
                             })?,
+                        // The frame's own record evidence carries the row clock.
+                        record: None,
                     };
                     if observation_tokens.insert((
                         observation.projection.clone(),
@@ -1192,6 +1194,8 @@ fn wire_query_snapshot(
                             .map_err(|error| {
                                 ProjectionProtocolError::InvalidBatch(error.to_string())
                             })?,
+                        // The frame's own record evidence carries the row clock.
+                        record: None,
                     };
                     if observation_tokens.insert((
                         observation.projection.clone(),

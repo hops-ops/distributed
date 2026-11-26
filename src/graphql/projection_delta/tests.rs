@@ -1486,8 +1486,7 @@ fn wait_path_observation_proof_requires_the_persisted_semantic_program_identity(
         evidence: vec![CausalCommandProjectionEvidence {
             obligation_index: 0,
             state: CausalProjectionEvidenceState::Observed,
-            incarnation: Some(1),
-            revision: Some(1),
+            record: candidate.revision.clone(),
         }],
         direct_projection: None,
     };
@@ -1498,6 +1497,19 @@ fn wait_path_observation_proof_requires_the_persisted_semantic_program_identity(
         command["observations"][0]["causationId"],
         result.causation_id()
     );
+    // The observation names the row clock the projector wrote, under the same
+    // record token a query frame uses for that row, so the client can compare
+    // it with the row it holds. The write-side receipt never carries it.
+    let observed = candidate.revision.as_ref().unwrap();
+    assert_eq!(
+        command["observations"][0]["record"],
+        json!({
+            "scopeToken": protocol.issue_record_scope(observed.scope()).unwrap().as_str(),
+            "incarnation": observed.incarnation().to_string(),
+            "revision": observed.revision().to_string(),
+        })
+    );
+    assert!(command.get("records").is_none());
 }
 
 #[test]
@@ -2015,8 +2027,7 @@ fn active_metadata_revalidates_but_remains_queryable_while_projection_is_drainin
             evidence: vec![CausalCommandProjectionEvidence {
                 obligation_index: 0,
                 state: CausalProjectionEvidenceState::Pending,
-                incarnation: None,
-                revision: None,
+                record: None,
             }],
             direct_projection: None,
         })

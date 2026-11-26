@@ -100,6 +100,19 @@ export type DistributedRecordRevision = Readonly<
 	}
 >;
 
+/**
+ * One row clock, comparable with a {@link DistributedRecordRevision} that
+ * carries the same `scopeToken`. "At or past" compares `(incarnation,
+ * revision)` only, so it carries no tombstone flag.
+ */
+export type DistributedObservedRecord = Readonly<
+	Record<string, unknown> & {
+		scopeToken: DistributedOpaqueString;
+		incarnation: DistributedDecimalString;
+		revision: DistributedDecimalString;
+	}
+>;
+
 /** Exact observation of one command causation in one projection obligation. */
 export type DistributedProjectionObservation = Readonly<
 	Record<string, unknown> & {
@@ -107,6 +120,12 @@ export type DistributedProjectionObservation = Readonly<
 		projection: string;
 		model: string;
 		scopeToken: DistributedOpaqueString;
+		/**
+		 * The row revision the projector wrote for this causation, read from
+		 * its own observation log. A replica holding that row at or past it
+		 * has the command's effect.
+		 */
+		record?: DistributedObservedRecord;
 	}
 >;
 
@@ -697,12 +716,26 @@ function parseProjectionObservation(
 	path: string
 ): DistributedProjectionObservation {
 	const item = record(value, path);
+	let observed: DistributedObservedRecord | undefined;
+	if (item.record !== undefined) {
+		const row = record(item.record, `${path}.record`);
+		observed = Object.freeze({
+			...row,
+			scopeToken: opaqueString(row.scopeToken, `${path}.record.scopeToken`),
+			incarnation: canonicalDecimal(
+				row.incarnation,
+				`${path}.record.incarnation`
+			),
+			revision: canonicalDecimal(row.revision, `${path}.record.revision`)
+		}) as DistributedObservedRecord;
+	}
 	return Object.freeze({
 		...item,
 		causationId: opaqueString(item.causationId, `${path}.causationId`),
 		projection: publicString(item.projection, `${path}.projection`),
 		model: publicString(item.model, `${path}.model`),
-		scopeToken: opaqueString(item.scopeToken, `${path}.scopeToken`)
+		scopeToken: opaqueString(item.scopeToken, `${path}.scopeToken`),
+		...(observed === undefined ? {} : { record: observed })
 	}) as DistributedProjectionObservation;
 }
 

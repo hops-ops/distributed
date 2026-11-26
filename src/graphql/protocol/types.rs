@@ -64,8 +64,11 @@ pub(crate) struct DistributedCommandMetadata {
     /// can retire optimism without reconstructing any hidden scope material.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) observations: Vec<DistributedProjectionObservation>,
-    /// Exact same-transaction revision evidence retained in the durable replay
-    /// envelope. Async commands leave this empty and confirm through expects.
+    /// Revisions of the read-model rows an atomic command wrote in its own
+    /// transaction, retained in the durable replay envelope. An eventual
+    /// command's write side cannot know a row revision without reading the
+    /// read model, so it leaves this empty: its token is `causationId`, and
+    /// each observation names the row revision the projector produced.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) records: Vec<DistributedRecordRevision>,
 }
@@ -96,6 +99,23 @@ pub(crate) struct DistributedProjectionObservation {
     pub(crate) projection: String,
     pub(crate) model: String,
     pub(crate) scope_token: OpaqueProtocolToken,
+    /// The row revision the projector wrote for this causation, from its own
+    /// observation log. A client holding that row at or past this clock has
+    /// the command's effect. Absent for dependency observations, which name
+    /// no row, and where the server did not read the revision.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) record: Option<DistributedObservedRecord>,
+}
+
+/// One row clock, comparable with a [`DistributedRecordRevision`] carrying the
+/// same `scopeToken`. It omits the tombstone flag: "at or past" compares only
+/// `(incarnation, revision)`, and a deletion's observation does not record it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct DistributedObservedRecord {
+    pub(crate) scope_token: OpaqueProtocolToken,
+    pub(crate) incarnation: String,
+    pub(crate) revision: String,
 }
 
 /// Client-returned live cursor. `projection` selects one finite, role-visible
