@@ -15,7 +15,7 @@ This project tracks its work in GitKB; see `.kb/AGENTS.md` for that workflow.
 | `distributed_cli/` | The `distributed` CLI (`build`, `dev`, `scaffold`, `describe`, …) and its library. |
 | `distributed_game/`, `distributed_game_macros/` | The multiplayer zone runtime. |
 | `distributed_leaderboard/` | Leaderboards as a projection target. |
-| `tests/common/` | Shared test support, including the bus conformance suite. |
+| `tests/common/` | Shared test support: fixtures (the Todo aggregate, ids, service guard) and the conformance suites every backend instantiates (repository, bus, lock, lease, schedule, GraphQL dialects). |
 | `tests/{core,gateway,graphql,observability,read_models,repositories,services,transports}/` | The eight integration test binaries of the `distributed` crate (`cargo test --test <name>`). |
 | `examples/quickstart/` | The no-Docker quickstart crate (workspace member). |
 | `js/` | `@hops-ops/distributed`, the JS/TS client. |
@@ -40,6 +40,18 @@ cargo fmt --all --check
 
 Tests that need a broker or Postgres return early when their URL is unset,
 unless `DISTRIBUTED_REQUIRE_SERVICES` names it, in which case they fail.
+
+### Where a test goes
+
+Each behaviour has one owning layer; add a case there, not a test at every
+layer. Pure logic: a unit test beside the code. A contract with several
+backends: a case in its conformance suite (`tests/common`), never a test on
+one backend. Components wired together: a scenario module in
+`tests/<area>/`. What only a deployed app shows: `tests/e2e-ui`. Inputs that
+differ only in data are one table-driven test. A test needing a service
+`make test-local` cannot start is `#[ignore = "<what it needs>"]`. The table
+of layers and examples is in
+[docs/guides/testing.md](docs/guides/testing.md#where-does-my-test-go).
 
 ### Root Makefile
 

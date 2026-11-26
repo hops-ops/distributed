@@ -1,27 +1,203 @@
 # Testing
 
-### Tests in this repo
+**One behaviour, one owner.** Each behaviour is asserted in detail by exactly
+one layer of the suite. Other layers may pass through it; they do not assert
+it again. Before you add a test, name the behaviour, find the layer that owns
+it (the table below), and add a case there.
 
-| Suite | Focus |
-|---|---|
-| `tests/graphql/` | Engine, HTTP, SDL, dialects, harden (authz/DoS/inject), causal transport |
-| `tests/graphql/graphql_identity` | Always-on OIDC/JWT matrix (mock JWKS; no Docker) |
-| `tests/graphql/graphql_oidc_{zitadel,keycloak,authentik}` | **Live** multi-IdP e2e (compose + real JWKS; gated) |
-| `tests/core/typed_commands` | Eventual / Atomic / Succeeded command registration |
-| `tests/e2e-ui` | Multi-crate product template + SvelteKit + Zitadel UI login + Playwright |
-| `js/tests` | Replica, command runtime, adapters |
-| `examples/graphiql.rs` | Seeded local playground |
+## Where does my test go
 
-```bash
-cargo test --test graphql --features "graphql,sqlite" graphql_engine::
-cargo test --test graphql --features "graphql,sqlite" graphql_identity::
-cargo test --test graphql --features "graphql,sqlite" graphql_harden::
-cd js && npm run quality
-# Live IdPs (optional):
-#   ./scripts/oidc-zitadel-up.sh && set -a && source graphql-oidc.env && set +a
-#   cargo test --test graphql --features graphql,sqlite graphql_oidc_zitadel::
-# Full UI matrix: cd tests/e2e-ui && make test
-```
+| You are testing | It goes in | Example in this repo |
+|---|---|---|
+| Pure logic: parsing, validation, state transitions, codecs, planners | a unit test beside the code (`#[cfg(test)]` module or `*tests.rs` under `src/`) | `src/bus/wire_envelope.rs` (`encode_then_decode_round_trips_every_field`); `src/graphql/projection_delta/canonical.rs` |
+| A contract with several implementations: repository, bus, lock, lease, schedule | a case in the shared conformance suite in `tests/common`, which every backend instantiates | `tests/common/src/repository/`, instantiated in `tests/repositories/sqlite_repository_conformance/mod.rs` and its in-memory and Postgres siblings |
+| The same, for the projection store | a scenario in `src/projection_protocol/store/scenario_tests.rs` | instantiated in `src/in_memory_repo/projection_protocol/tests.rs` and `src/sqlx_repo/projection_protocol/{tests,postgres_tests}.rs` |
+| A GraphQL behaviour that must hold on SQLite and Postgres | a case in an `on_each_dialect!` list | `tests/graphql/graphql_harden/mod.rs` (`authz::claim_row_filter_isolates_tenants`) |
+| Something only one backend has | that backend's module in the area binary | `tests/repositories/postgres_repository/mod.rs` (`backend_termination_mid_commit_rolls_back_and_nothing_persists`) |
+| Two or more components wired together: command to outbox to bus to projection, GraphQL over HTTP, a transport into the command ledger | a scenario module in the area binary, `tests/<area>/` | `tests/transports/transport_typed_commands`; `tests/graphql/graphql_http`; `tests/services/saga_transfer` |
+| What only a deployed application shows: login through a real identity provider, the browser, lifecycle tooling | `tests/e2e-ui` (Rust suite and Playwright), the demos | `tests/e2e-ui/e2e/todos.user.spec.ts`; `tests/e2e-ui/crates/suite/tests/behavioral.rs`; `distributed_cli/tests/bats/lifecycle.bats` |
+| What a derive or attribute macro generates | behavioural tests on real derived types, in a crate that uses the macro | `tests/core/sourced_snapshot`; `tests/read_models/read_model_metadata` |
+| A macro must reject an input with a clear error | a compile-fail fixture with a pinned `.stderr` | `distributed_macros/tests/compile_fail/` |
+| Macro argument parsing | a unit test in the macro crate | `distributed_macros/src/entry_tests.rs` |
+| A wire format or schema that must not drift | a golden test against a fixture in `tests/fixtures/` | `tests/core/core_command_contract.rs` with `tests/fixtures/core-command-contract-v1.json` |
+| What the CLI writes | a unit test of the generator | `distributed_cli/src/generate/` |
+| What the CLI does when run: arguments, exit codes, files on disk | an integration test that runs the built binary | `distributed_cli/tests/cli_scaffold.rs` |
+| JS client logic | `js/tests/*.test.mjs`; a contract with several implementations is a conformance file there | `js/tests/cache-engine-conformance.test.mjs`; `js/tests/island-adapter-conformance.test.mjs` |
+
+Add a test at a second layer only for a different trust boundary (a test that
+calls the public API from outside the crate, or the HTTP edge) or for a
+failure the owner cannot produce. Say which in the test's doc comment.
+
+## The rules
+
+1. **One owner.** A behaviour has one layer that asserts it in detail.
+   Others pass through it.
+2. **Which layer owns what.**
+   - Pure logic with no I/O: unit tests beside the code. Edge cases and error
+     cases live here.
+   - A contract with more than one implementation: one conformance suite,
+     instantiated for every implementation with the same case list. A
+     difference between backends is a declared capability, never a missing
+     case.
+   - Behaviour that needs two or more components wired together: a scenario
+     in the area binary, one happy path plus the failures that only exist at
+     that seam.
+   - What only a deployed application can show: e2e-ui and the demos. Few
+     tests, each a user-visible journey.
+   - Macro output: behavioural tests on real derived types plus compile-fail
+     fixtures. Argument parsing is pure logic and is unit-tested in the macro
+     crate. Do not assert on expanded token text.
+3. **Before adding a test**, find the owner and add a case there. A second
+   layer needs one of the two reasons under the table, named in the test's
+   doc comment.
+4. **Shape.** Inputs that differ only in data are one table-driven test with
+   a named case per row: a slice of a small struct with a `name` field, the
+   name in every assertion message, no new dependency. A test name states the
+   behaviour and the expected result. Fixtures for integration tests come from
+   `tests/common` (the Todo aggregate is `tests/common/src/todo.rs`; do not
+   copy it).
+5. **Honesty.** A test that reports PASS has run. See
+   [Live tests and services](#live-tests-and-services). No sleeps for
+   ordering; wait on the event. No retries: `.config/nextest.toml` sets
+   `retries = 0`, and a flaky test is a broken test.
+6. **Protected tests.** Never removed for overlap alone: security negatives
+   (authorization, spoofing, injection, resource limits) and any test whose
+   doc comment names a trust boundary; wire-format, golden-file and
+   frozen-fingerprint tests; fail-closed protocol cases; ordering, fencing and
+   idempotency tests; tests of macro-generated code; a backend's instance of a
+   conformance suite; a regression test that an incident or a commit message
+   names. Line coverage cannot see what a macro expands into the test crate,
+   so two such tests can share every covered line and still test different
+   things.
+
+## The layers
+
+Counts are approximate (attributes and macro instances counted with `rg`,
+2026-11-26).
+
+### Unit tests (`src/**`)
+
+`#[cfg(test)]` modules and `*tests.rs` files beside the code: about 1,250 in
+the root crate, 250 in `distributed_cli`, 125 in `distributed_game`, a few
+dozen in the macro crates and `distributed_leaderboard`.
+`cargo test -p distributed --lib` runs the root crate's.
+
+A unit test may use a real database or broker when it needs crate-private
+items; it reads the address through `crate::test_env::require_service`, the
+same guard as the integration tests (`tests/common/src/env.rs`). Examples:
+`src/sqlx_repo/statement_count_tests.rs`, `src/projection/source_snapshot_tests.rs`.
+Unit tests may use `common` only for helpers that name no `distributed` type:
+`common` is built against the non-test build of the crate, so its domain types
+do not unify with `crate::` types.
+
+### Conformance suites
+
+One case list per contract, expanded once per implementation. Every
+expansion skips (returns early) only when its constructor returns `None`,
+which goes through `require_service`.
+
+| Contract | Suite | Expander | Instances |
+|---|---|---|---|
+| Repository | `tests/common/src/repository/` | `repository_conformance_tests!` | `tests/repositories/{in_memory,sqlite,postgres}_repository_conformance` (each also through `QueuedRepository`) |
+| Lock | `tests/common/src/lock.rs` | `lock_conformance_tests!` | `tests/repositories/sql_lock_manager` |
+| Lease | `tests/common/src/lease.rs` | `lease_conformance_tests!` | `tests/repositories/coordination_lease` |
+| Schedule worker | `tests/common/src/schedule.rs` | `schedule_conformance_tests!` | `tests/repositories/schedule_worker` |
+| Bus | `tests/common/src/transport/bus.rs` | `bus_conformance_tests!` | `tests/transports/*/mod.rs`: in-memory, SQLite, Postgres, NATS, Kafka, RabbitMQ, Redis Streams, Knative |
+| SQL bus | `tests/transports/sql_bus_conformance/` | `sql_bus_conformance_tests!` | `tests/transports/{sqlite,postgres}_transport` |
+| GraphQL dialect | the invoking module's scenarios | `on_each_dialect!` (`tests/common/src/graphql.rs`) | `tests/graphql/{graphql_harden,graphql_query_protocol,graphql_compile}` |
+| Projection store | `src/projection_protocol/store/scenario_tests.rs` | `projection_protocol_scenario_tests!` | `src/in_memory_repo/projection_protocol/tests.rs`, `src/sqlx_repo/projection_protocol/tests.rs`, `src/sqlx_repo/projection_protocol/postgres_tests.rs` |
+
+The repository, lock, lease and schedule macros expand through
+`conformance_cases!` (`tests/common/src/lib.rs`), where a capability
+(`sql_faults: true`, `controlled_clock: false`, ...) is how a backend leaves
+cases out: it must be stated for every backend, and claiming one the backend
+does not implement does not compile. A new backend contract uses
+`conformance_cases!`.
+
+Two suites live outside `tests/common`, for reasons:
+
+- **The SQL bus suite** is in the `transports` binary because only that binary
+  uses it.
+- **The projection store suite** is in `src/` because it cannot be written
+  against the public API. It starts with `use super::*` and its backend
+  trait, `ProjectionProtocolScenario`, is `pub(crate)` and requires
+  `ProjectionProtocolStore`, which is also `pub(crate)`. Its scenarios build
+  `TrustedProjectionInput`, `ProjectionCommitBatch`, `ProjectionFailureBatch`,
+  `RecordTransition`, `ProjectionRecordExpectation` and other `pub(crate)`
+  items of `src/projection_protocol/store`. Moving it would mean widening
+  that visibility, which is not done for tests.
+
+`on_each_dialect!` is its own mechanism on purpose: it generates `sqlite::`
+and `postgres::` modules from a nested case list whose scenarios take a
+`Db`, and no case is dialect-gated. Its Postgres constructor goes through
+`require_service` like every other suite.
+
+### Area binaries (`tests/<area>/`)
+
+The root crate's integration tests are eight binaries, one per area: `core`,
+`gateway`, `graphql`, `observability`, `read_models`, `repositories`,
+`services` and `transports` (`tests/<area>/main.rs`). Each former test
+target is a module, so `cargo test --test <area> <module>::` runs one of them.
+They hold the conformance instances above, backend-specific modules, and
+scenarios across components. `tests/services` holds the demo-style scenarios
+(`todos`, `bomberman`, `sagas`, `saga_transfer`, `microsvc`).
+
+`distributed_cli/tests`, `distributed_game/tests` and
+`distributed_leaderboard/tests` are the same layer for those crates.
+
+### Full stack
+
+Outside the workspace's `cargo test`: `tests/e2e-ui` (its own workspace: the
+Rust suite in `tests/e2e-ui/crates/suite`, Playwright specs in
+`tests/e2e-ui/e2e`, UI node tests in `tests/e2e-ui/ui/tests`),
+`tests/e2e-celld`, `examples/game/server`, and the bats lifecycle suite. They
+are kept for wiring, not line coverage.
+
+### Macros and compile-fail
+
+Behavioural tests of generated code are in the area binaries, because
+generated code names `distributed::…` paths and only works from another
+crate. Compile-fail tests are trybuild fixtures (`distributed_macros/tests/`,
+`distributed_game_macros/tests/compile_fail/`) and `rustc_fail` fixtures
+sharing the harness `tests/support/rustc_fail.rs`. Regenerate trybuild
+snapshots with `TRYBUILD=overwrite cargo test -p distributed_macros`.
+
+### JavaScript
+
+The same rules. `js/tests/*.test.mjs` is the unit and conformance layer of
+`@hops-ops/distributed` (`cd js && npm test`); a contract with several
+implementations has a `*-conformance.test.mjs` file. Playwright in
+`tests/e2e-ui` is the full-stack layer.
+
+### Fixtures
+
+- Crates: `tests/gateway-{portable,native,worker,postgres}`,
+  `tests/fixtures/renamed-dependency`, `tests/fixtures/wasm32-native-domain`.
+- A JS fixture: `tests/gateway-auth`.
+- Golden wire-format data: the rest of `tests/fixtures/` (`*-v1.json`,
+  `*.graphql`, `migrations/`). A golden file changes only with a deliberate
+  format change.
+
+## Live tests and services
+
+`make test-local` starts Postgres, RabbitMQ, Kafka, NATS and Redis. A test
+that needs one of them reads its address through `require_service`
+(`tests/common/src/env.rs`): without the variable it prints `SKIPPED` and
+returns, unless `DISTRIBUTED_REQUIRE_SERVICES` names the variable, in which
+case it fails. `make test-local` names all of them, so in that run (and in
+CI's services job) such a test cannot pass without running. No other early
+return.
+
+A **live test** needs something `make test-local` cannot start (celld, an
+identity provider, an OTel collector, a browser). It is marked
+`#[ignore = "<what it needs>"]` and run by the job that provides the service,
+with `--ignored`. Example:
+`projected_candidate_keys_reach_chromium_over_http_and_websocket` in
+`tests/graphql/graphql_unique_key_live/mod.rs`. Some live tests still use the
+older form, an early return when their variable is unset: the celld tests in
+`tests/services`, the OIDC tests below, `tests/observability/otel_export`, and
+the celld tests of `distributed_game`. They are being converted; do not add
+new ones in that form.
 
 ### First-class OIDC (Zitadel, Keycloak, Authentik)
 
@@ -35,8 +211,9 @@ claim → role/session). Live against three local IdPs — not mocks only:
 | **[Authentik](../../tests/graphql/graphql_oidc_authentik/)** | `./scripts/oidc-authentik-up.sh` | `cargo test --test graphql --features graphql,sqlite graphql_oidc_authentik::` | `AUTHENTIK_E2E=1` |
 
 Shared **E1–E8** in [`tests/common/src/oidc.rs`](../../tests/common/src/oidc.rs).
-Gated binaries skip cleanly when unset. Offline:
+Gated binaries skip cleanly when unset. Offline (mock JWKS, no Docker):
 `cargo test --test graphql --features graphql,sqlite graphql_identity::`.
+CI runs the three providers in `.github/workflows/integration-graphql.yaml`.
 
 e2e-ui boots **Zitadel** for the browser path; the three stacks prove the
 same `OidcBearer` edge is not vendor-locked.
@@ -53,6 +230,18 @@ make compose-up             # start postgres, rabbitmq, kafka, nats, redis (comp
 make compose-down
 cargo test                  # default feature set
 cargo test --all-features   # all features; service tests skip without their env vars
+```
+
+By layer:
+
+```bash
+cargo test -p distributed --lib                          # root crate unit tests
+cargo test --all-features --test repositories            # one area binary
+cargo test --all-features --test graphql graphql_harden::   # one module of it
+cargo test -p distributed_cli -- --include-ignored       # CLI (needs wasm32-unknown-unknown and Node)
+cargo test -p distributed_macros                         # macro unit and compile-fail tests
+cd js && npm test                                        # JS unit and conformance
+cd tests/e2e-ui && make test                             # full stack, offline
 ```
 
 `make test-local` is what CI's services job runs
@@ -84,11 +273,6 @@ of their own run in a nextest test group with `max-threads = 1`:
 | `lifecycle-project` | the five ignored `distributed_cli::cli_lifecycle` tests that compile the lifecycle fixture project | one shared Cargo target directory |
 | `celld-dev` | `distributed_game::celld_zone` | `celld dev` instances race for the Worker bundler |
 | `postgres-projection-views` | `postgres_projection_protocol_runtime_conforms`, `postgres_redelivery_identity_is_atomic_across_partition_and_cursor_races` | NOTIFY channels are database-wide; both use the table name `postgres_projection_views` |
-
-The integration tests are eight binaries, one per area: `core`, `gateway`,
-`graphql`, `observability`, `read_models`, `repositories`, `services` and
-`transports` (`tests/<area>/main.rs`). Each former test target is a module, so
-`cargo test --test <area> <module>::` runs one of them.
 
 ### Transport Integration Tests
 
