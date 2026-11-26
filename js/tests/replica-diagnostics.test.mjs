@@ -411,7 +411,7 @@ test('default snapshots redact identities, arguments, field values, and scope ma
 	assert.equal(encoded.includes('cacheScope'), false);
 });
 
-test('snapshot identity is stable for Svelte stores and React external stores', () => {
+test('snapshot identity is stable for Svelte stores and external-store readers', () => {
 	const diagnostics = createReplicaDiagnostics({ now: () => 10 });
 	const initial = diagnostics.snapshot();
 	assert.equal(diagnostics.snapshot(), initial);
@@ -421,8 +421,8 @@ test('snapshot identity is stable for Svelte stores and React external stores', 
 	const unsubscribe = subscribe((snapshot) =>
 		svelteEmissions.push(snapshot)
 	);
-	const reactSnapshot = getSnapshot();
-	assert.equal(svelteEmissions[0], reactSnapshot);
+	const externalSnapshot = getSnapshot();
+	assert.equal(svelteEmissions[0], externalSnapshot);
 
 	diagnostics.event({ kind: 'gc', records: 0 });
 	const changed = diagnostics.snapshot();

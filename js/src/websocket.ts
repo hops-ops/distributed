@@ -6,7 +6,6 @@ import {
 	unrefTimer,
 	type Scheduler
 } from './lib/backoff.js';
-import { documentToString, type GqlDocument } from './document.js';
 import {
 	DistributedProtocolError,
 	distributedLiveResumeExtensions,
@@ -146,7 +145,7 @@ export type GraphqlWsConnection = Readonly<{
 	 * its owner decides whether and with which cursors to subscribe again.
 	 */
 	subscribe<TData = unknown, TVariables extends GraphqlVariables = GraphqlVariables>(
-		document: GqlDocument<TData, TVariables>,
+		document: string,
 		handlers: GqlWsHandlers<TData>,
 		options?: SubscribeOptions<TVariables>
 	): () => void;
@@ -429,7 +428,7 @@ export function createGraphqlWsConnection(
 
 	return Object.freeze({
 		subscribe<TData, TVariables extends GraphqlVariables>(
-			document: GqlDocument<TData, TVariables>,
+			document: string,
 			handlers: GqlWsHandlers<TData>,
 			subscribeOptions: SubscribeOptions<TVariables> = {}
 		): () => void {
@@ -450,7 +449,7 @@ export function createGraphqlWsConnection(
 				// Never reused, so a frame of an ended operation matches nothing.
 				id: String(nextId),
 				payload: Object.freeze({
-					query: documentToString(document),
+					query: document,
 					variables: subscribeOptions.variables ?? {},
 					...(extensions === undefined ? {} : { extensions })
 				}),

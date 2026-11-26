@@ -1,7 +1,7 @@
 {
   "name": "@hops-ops/distributed",
   "version": "0.1.0",
-  "description": "Typed GraphQL client, causal replica, command runtime, and framework adapters for Distributed services",
+  "description": "Typed GraphQL client, causal replica, command runtime, and SvelteKit adapter for Distributed services",
   "type": "module",
   "license": "UNLICENSED",
   "sideEffects": false,
@@ -38,10 +38,6 @@
       "types": "./dist/sveltekit/game/server.d.ts",
       "import": "./dist/sveltekit/game/server.js"
     },
-    "./react": {
-      "types": "./dist/react/index.d.ts",
-      "import": "./dist/react/index.js"
-    },
     "./game": {
       "types": "./dist/game/index.d.ts",
       "import": "./dist/game/index.js"
@@ -69,19 +65,11 @@
     "quality": "npm run check && npm test && npm run pack:smoke && npm run publint",
     "prepack": "npm run build"
   },
-  "dependencies": {
-    "@graphql-typed-document-node/core": "^3.2.0",
-    "graphql": "^17.0.0"
-  },
   "peerDependencies": {
-    "react": "^18.2.0 || ^19.0.0",
     "svelte": "^5.7.0",
     "wasm-pack": "0.15.0"
   },
   "peerDependenciesMeta": {
-    "react": {
-      "optional": true
-    },
     "svelte": {
       "optional": true
     },
@@ -91,12 +79,8 @@
   },
   "devDependencies": {
     "@types/node": "^24.0.0",
-    "@types/react": "19.3.0",
     "esbuild": "^0.28.0",
     "publint": "^0.3.22",
-    "react": "19.3.0",
-    "react-dom": "19.3.0",
-    "react-test-renderer": "19.3.0",
     "svelte": "5.57.1",
     "typescript": "5.9.3",
     "wasm-pack": "0.15.0"

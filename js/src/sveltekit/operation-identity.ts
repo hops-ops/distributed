@@ -1,5 +1,5 @@
-import type { ReplicaOperationArtifact } from './replica/index.js';
-import type { GraphqlVariables } from './types.js';
+import type { ReplicaOperationArtifact } from '../replica/index.js';
+import type { GraphqlVariables } from '../types.js';
 
 /** Build the canonical identity shared by SSR scheduling and browser retention. */
 export function boundaryOperationIdentity(

@@ -2105,7 +2105,7 @@ mutations derived from the executable `Service` (including `Atomic<T>` and
 This is the public query/command edge for full-stack apps. The companion
 TypeScript package [`@hops-ops/distributed`](js/) (see
 [`js/README.md`](js/README.md)) supplies transport, a normalized causal replica,
-command runtime, diagnostics, and SvelteKit/React adapters. End-to-end template:
+command runtime, diagnostics, and a SvelteKit adapter. End-to-end template:
 [`tests/e2e-ui/`](tests/e2e-ui/). Scaffold with `distributed scaffold … --query-api`.
 Example playground: `cargo run --example graphiql --features "graphql,sqlite"`.
 
@@ -2413,10 +2413,9 @@ make up-celld-nats && cd ../e2e-celld && make run
 
 | Export | Purpose |
 |---|---|
-| `@hops-ops/distributed` | Typed documents, HTTP GraphQL client, identity helpers |
+| `@hops-ops/distributed` | HTTP/WebSocket GraphQL client, protocol and identity helpers |
 | `…/replica` | Normalized causal replica, command runtime, projected fences |
 | `…/sveltekit` | Vite virtual modules, SSR load/hydrate, app shells |
-| `…/react` | Optional React hooks adapter |
 | `…/diagnostics` | Client diagnostics helpers |
 
 The lifecycle internally lowers the Rust surface through:
@@ -2911,7 +2910,7 @@ e2e-celld (`tests/e2e-celld`), Blob game, live chat, GraphiQL.
 |---|---|
 | [`tests/e2e-ui/`](tests/e2e-ui/) | Full-stack CQRS + GraphQL + OIDC + SvelteKit (todos, chat, blob) |
 | [`tests/e2e-celld/`](tests/e2e-celld/) | Same application and UI on another command host: Todo + `chat.post` wait-dispatch to celld; `@live` stays on GraphQL |
-| [`js/`](js/) | `@hops-ops/distributed` — transport, causal replica, SvelteKit/React |
+| [`js/`](js/) | `@hops-ops/distributed` — transport, causal replica, SvelteKit |
 | [`examples/graphiql.rs`](examples/graphiql.rs) | Seeded GraphQL playground (`--features "graphql,sqlite"`) |
 | `tests/graphql/` | Engine, HTTP/WS, harden, identity, multi-IdP OIDC |
 | `tests/core/typed_commands/` | Eventual / `Atomic` / `Succeeded` command registration |

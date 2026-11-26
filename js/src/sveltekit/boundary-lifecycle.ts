@@ -1,9 +1,9 @@
-import type { DistributedReplica, ReplicaWatch } from './replica/index.js';
-import type { GraphqlVariables } from './types.js';
+import type { DistributedReplica, ReplicaWatch } from '../replica/index.js';
+import type { GraphqlVariables } from '../types.js';
 import type {
 	DistributedBoundaryOperation,
 	DistributedBoundaryVariableContext
-} from './sveltekit/boundary-variables.js';
+} from './boundary-variables.js';
 import { boundaryOperationIdentity } from './operation-identity.js';
 
 const MAX_BOUNDARY_INSTANCES = 4_096;

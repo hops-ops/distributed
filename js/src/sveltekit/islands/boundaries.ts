@@ -11,6 +11,9 @@ import {
 	sep
 } from 'node:path';
 import { pathToFileURL } from 'node:url';
+
+import { parse } from 'svelte/compiler';
+
 import { fnv1a64 } from '../../lib/fnv1a64.js';
 import { isMissing, isWithin } from '../../lib/node-fs.js';
 
@@ -830,10 +833,6 @@ async function loadComponents(
 		);
 	}
 	const components = new Map<string, ComponentModule>();
-	if (paths.size === 0) return components;
-	// Loaded only when there is a component to parse: this module is also behind
-	// the games-only Vite plugin, whose apps need not have `svelte` installed.
-	const { parse } = await import('svelte/compiler');
 	for (const path of [...paths].sort()) {
 		const metadata = await lstat(path);
 		if (!metadata.isFile() || metadata.isSymbolicLink()) continue;
@@ -847,7 +846,7 @@ async function loadComponents(
 			);
 		}
 		const source = await readFile(path, 'utf8');
-		components.set(path, parseComponent(parse, path, source, cwd));
+		components.set(path, parseComponent(path, source, cwd));
 	}
 	return components;
 }
@@ -872,12 +871,7 @@ async function collectSvelteFiles(
 	}
 }
 
-function parseComponent(
-	parse: typeof import('svelte/compiler').parse,
-	path: string,
-	source: string,
-	cwd: string
-): ComponentModule {
+function parseComponent(path: string, source: string, cwd: string): ComponentModule {
 	let ast: AstNode;
 	try {
 		ast = parse(source, { filename: projectPath(cwd, path), modern: true }) as unknown as AstNode;

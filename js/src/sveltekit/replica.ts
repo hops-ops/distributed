@@ -2,9 +2,9 @@ import {
 	createDistributedClient,
 	prefetchReplicaOperation,
 	type CreateDistributedClientOptions,
-	type SveltekitReplicaAuthority,
-	type SveltekitReplicaHydration,
-	type SveltekitSessionSource
+	type DistributedHydration,
+	type DistributedHydrationAuthority,
+	type DistributedSessionSource
 } from '../client.js';
 import type {
 	DistributedReplica,
@@ -28,12 +28,14 @@ import {
 	type DistributedBoundaryVariableSources,
 	type DistributedBoundaryVariableContext
 } from './boundary-variables.js';
-import type {
-	DistributedSvelteKitBoundaryInstance,
-	DistributedSvelteKitBoundaryLocation,
-	DistributedSvelteKitLocationContext,
-	SveltekitBoundaryRetention
-} from '../boundary-lifecycle.js';
+import {
+	DistributedSvelteKitBoundaryController,
+	type DistributedSvelteKitBoundaryInstance,
+	type DistributedSvelteKitBoundaryLocation,
+	type DistributedSvelteKitLocationContext,
+	type SveltekitBoundaryLifecycleDiagnostic,
+	type SveltekitBoundaryRetention
+} from './boundary-lifecycle.js';
 import {
 	SveltekitWindowStoreImpl,
 	type SveltekitWindowStore,
@@ -52,20 +54,24 @@ export type SveltekitPageDataSource<TData extends PageGraphqlData> = Readonly<{
 
 export type SveltekitPageDataSessionSource<TData extends PageGraphqlData> =
 	Readonly<{
-		session: SveltekitSessionSource;
+		session: DistributedSessionSource;
 		get(): TData;
 		set(next: TData): void;
 	}>;
 
 export type SveltekitDistributedPageData = PageGraphqlData &
 	Readonly<{
-		distributed?: SveltekitReplicaHydration;
-		distributedAuthority?: SveltekitReplicaAuthority;
+		distributed?: DistributedHydration;
+		distributedAuthority?: DistributedHydrationAuthority;
 	}>;
 
 export type CreateDistributedSvelteKitOptions<TCommands = Readonly<Record<never, never>>> =
-	Omit<CreateDistributedClientOptions<TCommands>, 'lifecycle'> &
+	Omit<CreateDistributedClientOptions<TCommands>, 'lifecycle' | 'acceptsHydration'> &
 		Readonly<{
+			/** Generated boundary operations accepted by this component-tree client. */
+			boundaries: readonly DistributedBoundaryOperation[];
+			/** Redacted structural lifecycle events for boundary ownership diagnostics. */
+			onBoundaryDiagnostic?: (event: SveltekitBoundaryLifecycleDiagnostic) => void;
 			/**
 			 * Set to SvelteKit's `$app/environment` `browser` flag. When false,
 			 * store subscriptions remain side-effect-free during component SSR.
@@ -204,8 +210,8 @@ export type DistributedSvelteKitClient<TCommands> = Readonly<{
 	 * generation and returns false so the bound operation refetches.
 	 */
 	hydrate(
-		hydration: SveltekitReplicaHydration,
-		authority: SveltekitReplicaAuthority
+		hydration: DistributedHydration,
+		authority: DistributedHydrationAuthority
 	): boolean;
 	prefetch(
 		artifact: ReplicaOperationArtifact<unknown, GraphqlVariables>,
@@ -240,13 +246,8 @@ export type SveltekitBoundBoundaryOperation<
 }>;
 
 /**
- * Bind the framework-neutral replica to Svelte's readable-store lifecycle.
- *
- * Generated `$distributed` modules call this once, then export
- * `client.operation(Operation_Todos)` and `client.commands`.
- */
-/**
- * Bind the framework-neutral client to Svelte's readable-store lifecycle.
+ * Bind the framework-neutral client to Svelte's readable-store lifecycle and
+ * to the generated page/layout boundaries this component tree owns.
  *
  * Generated `$distributed` modules call this once, then export
  * `client.operation(Operation_Todos)` and `client.commands`.
@@ -254,9 +255,27 @@ export type SveltekitBoundBoundaryOperation<
 export function createDistributedSvelteKit<TCommands = Readonly<Record<never, never>>>(
 	options: CreateDistributedSvelteKitOptions<TCommands>
 ): DistributedSvelteKitClient<TCommands> {
+	if (!Array.isArray(options?.boundaries)) {
+		throw new TypeError('Distributed SvelteKit requires generated boundary operations');
+	}
+	const boundaryIds = Object.freeze(
+		[...new Set(options.boundaries.map(({ binding }) => binding.id))].sort()
+	);
+	// Boundary retention ends with every authorization generation; the replica
+	// announces each one, including those the client itself closes.
+	let boundaries: DistributedSvelteKitBoundaryController | undefined;
 	const reload = options.browser === true ? options.reload : undefined;
 	const client = createDistributedClient<TCommands>({
 		...options,
+		acceptsHydration: (hydration) =>
+			(hydration.bindings ?? []).every((id) => boundaryIds.includes(id)),
+		replica: {
+			...options.replica,
+			onAuthorizationGenerationDispose: () => {
+				boundaries?.disposeScope();
+				options.replica?.onAuthorizationGenerationDispose?.();
+			}
+		},
 		lifecycle:
 			reload === undefined
 				? undefined
@@ -266,6 +285,15 @@ export function createDistributedSvelteKit<TCommands = Readonly<Record<never, ne
 							registerDistributedReloadClient(replica, runtime, reload)
 					}
 	});
+	boundaries = new DistributedSvelteKitBoundaryController(
+		client.replica,
+		options.boundaries,
+		options.onBoundaryDiagnostic
+	);
+	const controller = boundaries;
+	const assertAlive = (): void => {
+		if (!client.alive()) throw new Error('Distributed SvelteKit client is destroyed');
+	};
 	const lifecycle: SveltekitStoreLifecycle = Object.freeze({
 		isAlive: client.alive,
 		activateWatches: () => options.browser ?? true,
@@ -284,7 +312,7 @@ export function createDistributedSvelteKit<TCommands = Readonly<Record<never, ne
 	>(
 		binding: DistributedBoundaryOperation<TData, TVariables, TSession, TProps>
 	): SveltekitBoundBoundaryOperation<TData, TVariables, TSession, TProps> => {
-		if (!client.accepts(binding)) {
+		if (!boundaryIds.includes(binding.binding.id)) {
 			throw new TypeError(
 				'Distributed boundary operation was not registered with this SvelteKit client'
 			);
@@ -318,14 +346,29 @@ export function createDistributedSvelteKit<TCommands = Readonly<Record<never, ne
 		commands: client.commands,
 		operation,
 		boundary,
-		retainBoundary: client.retainBoundary,
-		retainLocation: client.retainLocation,
-		prefetchLocation: client.prefetchLocation,
+		retainBoundary(instance, context) {
+			assertAlive();
+			return controller.retain(instance, context);
+		},
+		retainLocation(location, context) {
+			assertAlive();
+			return controller.retainLocation(location, context);
+		},
+		prefetchLocation(pathname, context) {
+			if (!client.alive()) {
+				return Promise.reject(new Error('Distributed SvelteKit client is destroyed'));
+			}
+			return controller.prefetchLocation(pathname, context);
+		},
 		hydrate: client.hydrate,
 		prefetch: client.prefetch,
 		preloadCommands: client.preloadCommands,
 		invalidateAuthorization: client.invalidateAuthorization,
-		destroy: client.destroy
+		destroy(): void {
+			if (!client.alive()) return;
+			controller.destroy();
+			client.destroy();
+		}
 	});
 }
 
@@ -371,7 +414,7 @@ export function bindSveltekitOperation<
 /** Map SvelteKit page data into the one shared transport/session source. */
 export function sessionSourceFromPageData<TData extends PageGraphqlData>(
 	source: SveltekitPageDataSource<TData>
-): SveltekitSessionSource {
+): DistributedSessionSource {
 	if (
 		source === null ||
 		typeof source !== 'object' ||

@@ -45,8 +45,6 @@ export { ReplicaCommandContractError } from './commands/errors.js';
 export { verifyReplicaCommandReceipt } from './commands/receipt.js';
 export { createReplicaCommandRuntime } from './command-runtime/create.js';
 export { ReplicaCommandRuntimeError } from './command-runtime/errors.js';
-export { createReplicaIndexedDbPersistence } from './persistence/idb.js';
-export { REPLICA_OFFLINE_COMMAND_OUTBOX_SUPPORTED } from './persistence/types.js';
 export type {
 	ReplicaBoundCommand,
 	ReplicaBoundCommands,
@@ -64,23 +62,6 @@ export type {
 	ReplicaCommandTransportRequest,
 	ReplicaCommandTransportResult
 } from './command-runtime/types.js';
-export type {
-	ReplicaIndexedDbFactory,
-	ReplicaIndexedDbPersistence,
-	ReplicaIndexedDbPersistenceOptions,
-	ReplicaPersistenceModelPolicy,
-	ReplicaPersistencePolicy
-} from './persistence/types.js';
-export type {
-	ReplicaCommandOutbox,
-	ReplicaCommandOutboxCommandPolicy,
-	ReplicaCommandOutboxDrainReport,
-	ReplicaCommandOutboxEntrySummary,
-	ReplicaCommandOutboxOptions,
-	ReplicaCommandOutboxOutcome,
-	ReplicaCommandOutboxPolicy,
-	ReplicaCommandOutboxSettlement
-} from './persistence/outbox.js';
 export type {
 	PrepareReplicaCommandOptions,
 	ReplicaCommandArtifact,

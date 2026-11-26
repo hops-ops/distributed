@@ -10,7 +10,7 @@ import {
 	defineDistributedBoundaryOperation
 } from '../dist/sveltekit/index.js';
 import {
-	REACT_FIXTURE_SCHEMA,
+	FIXTURE_SCHEMA,
 	TodosArtifact,
 	TodoModel,
 	todoFrame
@@ -135,7 +135,7 @@ function serverHarness(mode = 'resumable') {
 			calls.push({ url, init, body, authorization });
 			assert.deepEqual(body.extensions.distributed.client, {
 				surface: { kind: 'role', name: 'user' },
-				schemaHash: REACT_FIXTURE_SCHEMA
+				schemaHash: FIXTURE_SCHEMA
 			});
 			assert.equal(authorization, `Bearer ${token}`);
 			return jsonResponse(

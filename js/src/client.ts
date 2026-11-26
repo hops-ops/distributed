@@ -15,31 +15,18 @@ import type {
 import type { GqlAuth, GraphqlVariables } from './types.js';
 import type { WebSocketConstructor } from './websocket.js';
 import type { FetchLike } from './request.js';
-import {
-	DistributedSvelteKitBoundaryController,
-	type DistributedSvelteKitBoundaryInstance,
-	type DistributedSvelteKitBoundaryLocation,
-	type DistributedSvelteKitLocationContext,
-	type SveltekitBoundaryLifecycleDiagnostic,
-	type SveltekitBoundaryRetention
-} from './boundary-lifecycle.js';
-import type {
-	DistributedBoundaryOperation,
-	DistributedBoundaryVariableContext
-} from './sveltekit/boundary-variables.js';
 
-// The `Sveltekit*` names below are the published types of the SvelteKit entry;
-// they describe framework-neutral contracts and are defined here so every
-// adapter composes the same client.
+// Framework adapters publish these contracts under their own entry point;
+// the SvelteKit entry names them `Sveltekit*`.
 
 type UnknownCommandEntries = Readonly<Record<string, never>>;
 
 type SessionHydration = Readonly<{
-	hydration: SveltekitReplicaHydration;
-	authority: SveltekitReplicaAuthority;
+	hydration: DistributedHydration;
+	authority: DistributedHydrationAuthority;
 }>;
 
-export type SveltekitSessionSource = Readonly<{
+export type DistributedSessionSource = Readonly<{
 	/** Current credential. HTTP, WS, and commands all call this exact source. */
 	getAuth(): GqlAuth | Promise<GqlAuth>;
 	/**
@@ -51,16 +38,19 @@ export type SveltekitSessionSource = Readonly<{
 	/**
 	 * Notify on token, logout, role, tenant, or session changes.
 	 *
-	 * The adapter re-reads `getAuth`; callers never label a cache scope.
+	 * The client re-reads `getAuth`; callers never label a cache scope.
 	 */
 	subscribe?(listener: () => void): () => void;
 }>;
 
-export type SveltekitReplicaHydration = Readonly<{
+export type DistributedHydration = Readonly<{
 	version: 1;
 	state: ReplicaDehydratedState;
 	readonly operations?: readonly string[];
-	/** Exact variable-binding fingerprints used to create this SSR seed. */
+	/**
+	 * Exact variable-binding fingerprints used to create this SSR seed; the
+	 * adapter refuses a seed through `acceptsHydration`.
+	 */
 	readonly bindings?: readonly string[];
 }>;
 
@@ -68,14 +58,14 @@ export type SveltekitReplicaHydration = Readonly<{
  * Independently trusted SSR/session authority for one hydration transfer.
  *
  * Do not persist this beside replica state. State never authorizes its own
- * scope; the adapter compares its embedded scope to this server-owned value.
+ * scope; the client compares its embedded scope to this server-owned value.
  */
-export type SveltekitReplicaAuthority = Readonly<{
+export type DistributedHydrationAuthority = Readonly<{
 	version: 1;
 	scope: ReplicaAuthoritativeScope;
 }>;
 
-export type SveltekitCommandRuntimeLike<TCommands> = Pick<
+export type DistributedCommandRuntimeLike<TCommands> = Pick<
 	ReplicaCommandRuntime<UnknownCommandEntries>,
 	'dispose' | 'pendingCommandIds'
 > &
@@ -84,32 +74,33 @@ export type SveltekitCommandRuntimeLike<TCommands> = Pick<
 		preload?(): Promise<void>;
 	}>;
 
-export type SveltekitCommandRuntimeFactory<TCommands> = (
+export type DistributedCommandRuntimeFactory<TCommands> = (
 	replica: DistributedReplica,
 	transport: ReplicaGraphqlTransport,
-	options: SveltekitCommandRuntimeFactoryOptions
-) => SveltekitCommandRuntimeLike<TCommands>;
+	options: DistributedCommandRuntimeFactoryOptions
+) => DistributedCommandRuntimeLike<TCommands>;
 
-export type SveltekitCommandRuntimeFactoryOptions = Pick<
+export type DistributedCommandRuntimeFactoryOptions = Pick<
 	ReplicaCommandRuntimeOptions,
 	'diagnostics' | 'lifecycle'
 >;
 
 export type CreateDistributedClientOptions<TCommands> = Readonly<{
-	session: SveltekitSessionSource;
+	session: DistributedSessionSource;
 	/** Same-origin `/graphql` by default. */
 	url?: string | (() => string);
 	fetch?: FetchLike;
 	webSocket?: WebSocketConstructor;
-	hydration?: SveltekitReplicaHydration;
+	hydration?: DistributedHydration;
 	/** Required with `hydration`; must come from current trusted SSR page data. */
-	authority?: SveltekitReplicaAuthority;
-	createCommands?: SveltekitCommandRuntimeFactory<TCommands>;
+	authority?: DistributedHydrationAuthority;
+	/**
+	 * Adapter veto on a seed, initial or carried by a session refresh. A refused
+	 * seed is treated as a mismatched one: the generation closes.
+	 */
+	acceptsHydration?: (hydration: DistributedHydration) => boolean;
+	createCommands?: DistributedCommandRuntimeFactory<TCommands>;
 	replica?: Omit<DistributedReplicaOptions, 'transport'>;
-	/** Generated boundary operations accepted by this component-tree client. */
-	boundaries: readonly DistributedBoundaryOperation[];
-	/** Redacted structural lifecycle events for boundary ownership diagnostics. */
-	onBoundaryDiagnostic?: (event: SveltekitBoundaryLifecycleDiagnostic) => void;
 	onAuthError?: (error: unknown) => void;
 	/**
 	 * Page lifecycle participation (the browser reload transaction). Read after
@@ -117,44 +108,30 @@ export type CreateDistributedClientOptions<TCommands> = Readonly<{
 	 * disposer runs on `destroy`.
 	 */
 	lifecycle?: Readonly<{
-		commands(): NonNullable<SveltekitCommandRuntimeFactoryOptions['lifecycle']>;
+		commands(): NonNullable<DistributedCommandRuntimeFactoryOptions['lifecycle']>;
 		register(
 			replica: DistributedReplica,
-			runtime: SveltekitCommandRuntimeLike<TCommands> | undefined
+			runtime: DistributedCommandRuntimeLike<TCommands> | undefined
 		): () => void;
 	}>;
 }>;
 
 /**
  * The framework-neutral client one adapter wraps: transport, replica, command
- * runtime, authorization fence, hydration, generated boundary retention, and
- * the observers destroyed with it. Adapters add their reactive bindings.
+ * runtime, authorization fence, hydration, and the observers destroyed with
+ * it. Adapters add their reactive bindings and component ownership.
  */
 export type DistributedClient<TCommands> = Readonly<{
 	replica: DistributedReplica;
 	transport: ReplicaGraphqlTransport;
 	commands: TCommands;
 	alive(): boolean;
-	/** Ensure a generated boundary operation was registered with this client. */
-	accepts(operation: Readonly<{ binding: Readonly<{ id: string }> }>): boolean;
 	/** Destroy `observer` with the client unless it is released first. */
 	track(observer: Readonly<{ destroy(): void }>): void;
 	release(observer: Readonly<{ destroy(): void }>): void;
-	retainBoundary<TSession, TProps>(
-		instance: DistributedSvelteKitBoundaryInstance,
-		context: DistributedBoundaryVariableContext<TSession, TProps>
-	): SveltekitBoundaryRetention;
-	retainLocation<TSession, TProps>(
-		location: DistributedSvelteKitBoundaryLocation,
-		context: DistributedSvelteKitLocationContext<TSession, TProps>
-	): SveltekitBoundaryRetention;
-	prefetchLocation<TSession, TProps>(
-		pathname: string,
-		context: DistributedSvelteKitLocationContext<TSession, TProps>
-	): Promise<void>;
 	hydrate(
-		hydration: SveltekitReplicaHydration,
-		authority: SveltekitReplicaAuthority
+		hydration: DistributedHydration,
+		authority: DistributedHydrationAuthority
 	): boolean;
 	prefetch(
 		artifact: ReplicaOperationArtifact<unknown, GraphqlVariables>,
@@ -173,31 +150,23 @@ export function createDistributedClient<TCommands>(
 		typeof options.session !== 'object' ||
 		typeof options.session.getAuth !== 'function'
 	) {
-		throw new TypeError('Distributed SvelteKit requires one session source');
-	}
-	if (!Array.isArray(options.boundaries)) {
-		throw new TypeError('Distributed SvelteKit requires generated boundary operations');
+		throw new TypeError('Distributed client requires one session source');
 	}
 	if (
 		(options.hydration === undefined) !==
 		(options.authority === undefined)
 	) {
 		throw new TypeError(
-			'Distributed SvelteKit hydration requires separate trusted SSR authority'
+			'Distributed client hydration requires separate trusted SSR authority'
 		);
 	}
 
 	let replica: DistributedReplica | undefined;
-	let boundaryController: DistributedSvelteKitBoundaryController | undefined;
-	const boundaryIds = Object.freeze(
-		[...new Set(options.boundaries.map(({ binding }) => binding.id))].sort()
-	);
+	const accepts = (hydration: DistributedHydration): boolean =>
+		options.acceptsHydration?.(hydration) ?? true;
 	const auth = createAuthorizationFence(
 		options.session,
-		() => {
-			boundaryController?.disposeScope();
-			replica?.invalidateAuthorization();
-		},
+		() => replica?.invalidateAuthorization(),
 		options.onAuthError,
 		(transfer) => {
 			const active = replica?.scope;
@@ -205,9 +174,7 @@ export function createDistributedClient<TCommands>(
 				active === undefined ||
 				!sameReplicaScope(active, validatedHydrationAuthority(transfer.authority))
 			) return false;
-			if ((transfer.hydration.bindings ?? []).some(value => !boundaryIds.includes(value))) {
-				return false;
-			}
+			if (!accepts(transfer.hydration)) return false;
 			return transfer.hydration.version === 1 && replica!.reauthorize(
 				transfer.hydration.state,
 				validatedHydrationAuthority(transfer.authority)
@@ -226,51 +193,27 @@ export function createDistributedClient<TCommands>(
 			? {}
 			: { webSocket: options.webSocket })
 	});
-	replica = createDistributedReplica({
-		transport,
-		...(options.replica ?? {}),
-		onAuthorizationGenerationDispose: () => {
-			boundaryController?.disposeScope();
-			options.replica?.onAuthorizationGenerationDispose?.();
-		}
-	});
-	boundaryController = new DistributedSvelteKitBoundaryController(
-		replica,
-		options.boundaries,
-		options.onBoundaryDiagnostic
-	);
+	replica = createDistributedReplica({ transport, ...(options.replica ?? {}) });
 
 	const observers = new Set<Readonly<{ destroy(): void }>>();
 	let destroyed = false;
 	const hydrate = (
-		hydration: SveltekitReplicaHydration,
-		authority: SveltekitReplicaAuthority
+		hydration: DistributedHydration,
+		authority: DistributedHydrationAuthority
 	): boolean => {
 		let accepted = false;
 		try {
 			const expected = validatedHydrationAuthority(authority);
-			const hydrationBindings = [...(hydration.bindings ?? [])].sort();
-			if (hydrationBindings.some((value) => !boundaryIds.includes(value))) {
-				throw new TypeError(
-					'Distributed SvelteKit hydration boundary binding fingerprint changed'
-				);
-			}
 			const active = replica!.scope;
-			if (active !== undefined && !sameReplicaScope(active, expected)) {
-				throw new TypeError(
-					'Distributed SvelteKit hydration authority changed before session invalidation'
-				);
-			}
 			accepted =
+				(active === undefined || sameReplicaScope(active, expected)) &&
 				hydration?.version === 1 &&
+				accepts(hydration) &&
 				replica!.hydrate(hydration.state, expected);
 		} catch {
 			accepted = false;
 		}
-		if (!accepted) {
-			boundaryController!.disposeScope();
-			replica!.invalidateAuthorization();
-		}
+		if (!accepted) replica!.invalidateAuthorization();
 		return accepted;
 	};
 	if (options.hydration !== undefined && options.authority !== undefined) {
@@ -313,57 +256,32 @@ export function createDistributedClient<TCommands>(
 		commandRuntime === undefined
 			? (Object.freeze({}) as TCommands)
 			: commandRuntime.commands;
-	const assertAlive = (): void => {
-		if (destroyed) throw new Error('Distributed SvelteKit client is destroyed');
-	};
-
 	return Object.freeze({
 		replica,
 		transport,
 		commands,
 		alive: () => !destroyed,
-		accepts: (operation) => boundaryIds.includes(operation.binding.id),
 		track(observer) {
 			observers.add(observer);
 		},
 		release(observer) {
 			observers.delete(observer);
 		},
-		retainBoundary(instance, context) {
-			assertAlive();
-			return boundaryController!.retain(instance, context);
-		},
-		retainLocation(location, context) {
-			assertAlive();
-			return boundaryController!.retainLocation(location, context);
-		},
-		prefetchLocation(pathname, context) {
-			if (destroyed) {
-				return Promise.reject(
-					new Error('Distributed SvelteKit client is destroyed')
-				);
-			}
-			return boundaryController!.prefetchLocation(pathname, context);
-		},
 		hydrate,
 		prefetch(artifact, variables) {
 			return prefetchReplicaOperation(replica!, artifact, variables);
 		},
 		preloadCommands(): Promise<void> {
-			if (destroyed) return Promise.reject(new Error('Distributed SvelteKit client is destroyed'));
+			if (destroyed) return Promise.reject(new Error('Distributed client is destroyed'));
 			return commandRuntime?.preload?.() ?? Promise.resolve();
 		},
 		invalidateAuthorization(): void {
-			if (!destroyed) {
-				boundaryController!.disposeScope();
-				replica!.invalidateAuthorization();
-			}
+			if (!destroyed) replica!.invalidateAuthorization();
 		},
 		destroy(): void {
 			if (destroyed) return;
 			destroyed = true;
 			auth.dispose();
-			boundaryController!.destroy();
 			for (const observer of [...observers]) observer.destroy();
 			observers.clear();
 			unregister?.();
@@ -385,14 +303,14 @@ export function prefetchReplicaOperation<TData, TVariables extends GraphqlVariab
 }
 
 function createAuthorizationFence(
-	source: SveltekitSessionSource,
+	source: DistributedSessionSource,
 	invalidate: () => void,
 	onError: ((error: unknown) => void) | undefined,
 	refresh: (transfer: SessionHydration) => boolean
 ): Readonly<{ read(): Promise<GqlAuth>; dispose(): void }> {
 	let current: Readonly<GqlAuth> | undefined;
-	const seenHydrations = new WeakSet<SveltekitReplicaHydration>();
-	const seenAuthorities = new WeakSet<SveltekitReplicaAuthority>();
+	const seenHydrations = new WeakSet<DistributedHydration>();
+	const seenAuthorities = new WeakSet<DistributedHydrationAuthority>();
 	let queue = Promise.resolve();
 	let disposed = false;
 	const read = (): Promise<GqlAuth> => {
@@ -453,7 +371,7 @@ function createAuthorizationFence(
 }
 
 function validatedHydrationAuthority(
-	value: SveltekitReplicaAuthority
+	value: DistributedHydrationAuthority
 ): ReplicaAuthoritativeScope {
 	const scope = value?.scope;
 	if (
@@ -468,7 +386,7 @@ function validatedHydrationAuthority(
 		typeof scope.cacheScope !== 'string' ||
 		scope.cacheScope.length === 0
 	) {
-		throw new TypeError('Distributed SvelteKit hydration authority is invalid');
+		throw new TypeError('Distributed client hydration authority is invalid');
 	}
 	return scope;
 }
