@@ -49,7 +49,7 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(
             versions,
-            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]
+            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
         );
         assert_eq!(
             descriptions,
@@ -68,6 +68,7 @@ mod tests {
                 "aggregate schedules",
                 "schedule claims",
                 "hot path indexes",
+                "outbox without published",
             ]
         );
         assert_eq!(
@@ -129,6 +130,10 @@ mod tests {
                     env!("CARGO_MANIFEST_DIR"),
                     "/migrations/sqlite/0014_hot_path_indexes.sql"
                 )),
+                include_str!(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/migrations/sqlite/0015_outbox_without_published.sql"
+                )),
             ]
         );
     }
@@ -150,7 +155,7 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(
             versions,
-            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]
+            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
         );
         assert_eq!(
             descriptions,
@@ -169,6 +174,7 @@ mod tests {
                 "aggregate schedules",
                 "schedule claims",
                 "hot path indexes",
+                "outbox without published",
             ]
         );
         assert_eq!(
@@ -229,6 +235,10 @@ mod tests {
                 include_str!(concat!(
                     env!("CARGO_MANIFEST_DIR"),
                     "/migrations/postgres/0014_hot_path_indexes.sql"
+                )),
+                include_str!(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/migrations/postgres/0015_outbox_without_published.sql"
                 )),
             ]
         );

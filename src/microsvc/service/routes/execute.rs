@@ -4,22 +4,20 @@ use super::super::causal::{
     CommandIngress, ModeledProjectionMetadata, SealModeledProjection,
 };
 #[cfg(feature = "graphql")]
-use super::super::causal::{
-    evaluate_causal_command_status, replay_result, CausalCommandPublicStatus,
-    ExternalCausalAttempt, ExternalCausalReservation,
-};
+use super::super::causal::{evaluate_causal_command_status, CausalCommandPublicStatus};
+#[cfg(feature = "http")]
+use super::super::causal::{replay_result, ExternalCausalAttempt, ExternalCausalReservation};
 use super::super::handlers::{CausalCommandContext, CausalGuardFn, PreparedHandlerFn};
 use super::builder::CommandShard;
-#[cfg(feature = "graphql")]
+#[cfg(feature = "http")]
 use super::erased::ErasedCommandShard;
 #[cfg(any(feature = "graphql", feature = "runtime-tokio"))]
 use super::erased::LedgerCompaction;
 use super::erased::{CausalCommandPolicy, CausalHandlerFuture, ErasedCausalHandler};
 #[cfg(feature = "graphql")]
-use super::erased::{
-    CausalStatusFuture, CausalStatusRoute, ExternalAbandonFuture, ExternalCompletionFuture,
-    ExternalReservationFuture,
-};
+use super::erased::{CausalStatusFuture, CausalStatusRoute};
+#[cfg(feature = "http")]
+use super::erased::{ExternalAbandonFuture, ExternalCompletionFuture, ExternalReservationFuture};
 use crate::bus::{Message, MessageKind};
 use crate::command::input::canonicalize_command_input;
 use crate::command::{CommandConsistency, CommandOutcome, TypedCommandContract};
@@ -34,7 +32,7 @@ use crate::command_ledger::{CausalTransactionalCommit, CommandLedgerStore};
 use crate::command_ledger::{
     CommandId, CommandLedgerKey, CommandLookup, CommandLookupScope, PrincipalPartitionId,
 };
-#[cfg(feature = "graphql")]
+#[cfg(feature = "http")]
 use crate::command_ledger::{CommandReservation, ExternalDispatchBinding};
 use crate::microsvc::causal::CausalWorkspace;
 use crate::microsvc::cell_host::CellCommandIdentity;
@@ -69,7 +67,7 @@ where
     /// only then may its handler stage schedule writes.
     requires_scheduling: bool,
     /// The declared shard, over the wire input.
-    #[cfg(feature = "graphql")]
+    #[cfg(feature = "http")]
     shard: Option<ErasedCommandShard>,
     /// Retryable, fail-closed bootstrap for the bound projector's complete
     /// model/table ownership inventory. `get_or_try_init` leaves the cell empty
@@ -95,9 +93,9 @@ where
     where
         I: serde::de::DeserializeOwned + 'static,
     {
-        #[cfg(not(feature = "graphql"))]
+        #[cfg(not(feature = "http"))]
         let _ = shard;
-        #[cfg(feature = "graphql")]
+        #[cfg(feature = "http")]
         let shard = shard.map(|shard| {
             let input = contract.input.clone();
             Arc::new(move |wire: &Value| {
@@ -111,7 +109,7 @@ where
         Ok(Self {
             fingerprint: CommandContractFingerprint::new(contract.fingerprint_bytes()?),
             contract,
-            #[cfg(feature = "graphql")]
+            #[cfg(feature = "http")]
             shard,
             guard,
             handle,
@@ -628,12 +626,12 @@ where
         &self.contract
     }
 
-    #[cfg(feature = "graphql")]
+    #[cfg(feature = "http")]
     fn aggregate(&self) -> std::any::TypeId {
         std::any::TypeId::of::<A>()
     }
 
-    #[cfg(feature = "graphql")]
+    #[cfg(feature = "http")]
     fn shard(&self) -> Option<ErasedCommandShard> {
         self.shard.clone()
     }
@@ -775,7 +773,7 @@ where
         })
     }
 
-    #[cfg(feature = "graphql")]
+    #[cfg(feature = "http")]
     fn reserve_external<'a>(
         &'a self,
         dependencies: &'a D,
@@ -840,7 +838,7 @@ where
         })
     }
 
-    #[cfg(feature = "graphql")]
+    #[cfg(feature = "http")]
     fn complete_external<'a>(
         &'a self,
         dependencies: &'a D,
@@ -886,7 +884,7 @@ where
         })
     }
 
-    #[cfg(feature = "graphql")]
+    #[cfg(feature = "http")]
     fn abandon_external<'a>(
         &'a self,
         dependencies: &'a D,

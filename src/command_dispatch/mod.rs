@@ -1,17 +1,18 @@
 //! The command host: the one boundary GraphQL, the schedule worker and cell
 //! callers dispatch typed commands through, in process or over HTTP.
 
-#[cfg(feature = "graphql")]
 mod host;
+#[cfg(feature = "http")]
+mod http;
 pub(crate) mod principal;
 
+#[cfg(feature = "http")]
+pub(crate) use host::validate_principal_session;
 #[cfg(feature = "graphql")]
-pub(crate) use host::{validate_principal_session, validate_principal_session_if_present};
-#[cfg(feature = "graphql")]
-pub use host::{
-    CellRequestContext, CommandHost, HttpCommandHost, LocalCommandHost, SharedCommandHost,
-    TrustedRequestMetadata,
-};
+pub(crate) use host::validate_principal_session_if_present;
+pub use host::{CommandHost, LocalCommandHost, ProtocolAuthority, SharedCommandHost};
+#[cfg(feature = "http")]
+pub use http::{CellRequestContext, HttpCommandHost, TrustedRequestMetadata};
 pub use principal::{InvalidPrincipal, VerifiedPrincipal};
 
 /// The command ID of work an ingress starts from a request that can be

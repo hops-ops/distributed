@@ -18,16 +18,14 @@ use std::time::{Duration, Instant};
 
 use rdkafka::config::ClientConfig;
 use rdkafka::consumer::{Consumer, StreamConsumer};
+use rdkafka::error::{KafkaError, RDKafkaErrorCode};
 use rdkafka::message::{Header, Headers, OwnedHeaders};
 use rdkafka::producer::{FutureProducer, FutureRecord};
 use rdkafka::{Message as KafkaMessageTrait, Offset, TopicPartitionList};
 
 use super::source::{MessageSource, ReceivedMessage};
-use super::{message_from_wire, strip_address_prefix, Message, CONTENT_TYPE_HEADER};
 use super::{retryable, MessagePublisher, TransportError};
-
-const MESSAGE_ID_HEADER: &str = "x-sourced-id";
-const MESSAGE_KIND_HEADER: &str = "x-sourced-kind";
+use super::{strip_address_prefix, Message, WireEnvelope};
 
 /// Publishes canonical messages to a Kafka topic named by the message name.
 pub struct KafkaPublisher {
@@ -57,38 +55,19 @@ impl KafkaPublisher {
     }
 }
 
-fn owned_headers(message: &Message) -> OwnedHeaders {
-    let mut headers = OwnedHeaders::new()
-        .insert(Header {
-            key: MESSAGE_KIND_HEADER,
-            value: Some(message.kind.as_str()),
-        })
-        .insert(Header {
-            key: CONTENT_TYPE_HEADER,
-            value: Some(message.content_type.as_str()),
-        });
-    if let Some(id) = message.id() {
-        headers = headers.insert(Header {
-            key: MESSAGE_ID_HEADER,
-            value: Some(id),
-        });
-    }
-    for (key, value) in &message.metadata {
-        headers = headers.insert(Header {
-            key: key.as_str(),
-            value: Some(value.as_str()),
-        });
-    }
-    headers
-}
-
 impl MessagePublisher for KafkaPublisher {
     async fn publish(&self, message: Message) -> Result<(), TransportError> {
-        let topic = message.name().to_string();
         let key = message.id().unwrap_or(message.name()).to_string();
-        let headers = owned_headers(&message);
-        let record = FutureRecord::to(&topic)
-            .payload(&message.payload)
+        let envelope = WireEnvelope::encode(message)?;
+        let mut headers = OwnedHeaders::new_with_capacity(envelope.headers.len());
+        for (key, value) in &envelope.headers {
+            headers = headers.insert(Header {
+                key: key.as_str(),
+                value: Some(value.as_str()),
+            });
+        }
+        let record = FutureRecord::to(&envelope.name)
+            .payload(&envelope.payload)
             .key(&key)
             .headers(headers);
         self.producer
@@ -165,6 +144,48 @@ impl KafkaSource {
     }
 }
 
+impl KafkaSource {
+    /// Account for one receive error: `Err` when `recv` must fail now (an
+    /// error retrying cannot fix, or [`MAX_CONSECUTIVE_RECV_ERRORS`] in a
+    /// row), else a logged retry.
+    fn recv_failed(&mut self, error: KafkaError) -> Result<(), TransportError> {
+        if recv_error_is_permanent(&error) {
+            self.consecutive_errors = 0;
+            tracing::error!(%error, "kafka receive failed permanently");
+            return Err(
+                TransportError::permanent(format!("kafka receive: {error}")).with_source(error)
+            );
+        }
+        self.consecutive_errors += 1;
+        if self.consecutive_errors >= MAX_CONSECUTIVE_RECV_ERRORS {
+            self.consecutive_errors = 0;
+            tracing::error!(%error, "kafka receive kept failing");
+            return Err(retryable("kafka receive", error));
+        }
+        tracing::warn!(%error, "kafka receive failed; retrying");
+        Ok(())
+    }
+}
+
+/// Whether a receive error will come back however often the consumer retries:
+/// refused credentials or permissions, and librdkafka's fatal errors. An
+/// unknown topic is not one: a consumer may start before the first record is
+/// produced to it.
+fn recv_error_is_permanent(error: &KafkaError) -> bool {
+    matches!(
+        error.rdkafka_error_code(),
+        Some(
+            RDKafkaErrorCode::Fatal
+                | RDKafkaErrorCode::Authentication
+                | RDKafkaErrorCode::SaslAuthenticationFailed
+                | RDKafkaErrorCode::TopicAuthorizationFailed
+                | RDKafkaErrorCode::GroupAuthorizationFailed
+                | RDKafkaErrorCode::ClusterAuthorizationFailed
+                | RDKafkaErrorCode::InvalidConfig
+        )
+    )
+}
+
 impl MessageSource for KafkaSource {
     type Received = KafkaReceived;
 
@@ -194,12 +215,7 @@ impl MessageSource for KafkaSource {
                     )));
                 }
                 Ok(Err(error)) => {
-                    self.consecutive_errors += 1;
-                    if self.consecutive_errors >= MAX_CONSECUTIVE_RECV_ERRORS {
-                        self.consecutive_errors = 0;
-                        return Err(retryable("kafka receive", error));
-                    }
-                    tracing::warn!(%error, "kafka receive failed; retrying");
+                    self.recv_failed(error)?;
                     tokio::time::sleep(Duration::from_millis(100)).await;
                 }
                 Err(_elapsed) => {
@@ -218,6 +234,7 @@ pub struct KafkaReceived {
     partition: i32,
     offset: i64,
     message: Message,
+    decode_error: Option<TransportError>,
     attempts: u32,
     redelivery: Redelivery,
 }
@@ -244,13 +261,12 @@ impl KafkaReceived {
                 (header.key.to_string(), value)
             })
             .collect();
-        let message = message_from_wire(
+        let (message, decode_error) = WireEnvelope {
             name,
-            payload,
-            Some(MESSAGE_ID_HEADER),
-            MESSAGE_KIND_HEADER,
             headers,
-        );
+            payload,
+        }
+        .decode();
         let key = (topic.clone(), borrowed.partition(), borrowed.offset());
         let attempts = match redelivery.lock() {
             Ok(slot) => match slot.as_ref() {
@@ -265,6 +281,7 @@ impl KafkaReceived {
             partition: borrowed.partition(),
             offset: borrowed.offset(),
             message,
+            decode_error,
             attempts,
             redelivery,
         }
@@ -296,6 +313,10 @@ impl ReceivedMessage for KafkaReceived {
 
     fn attempts(&self) -> u32 {
         self.attempts
+    }
+
+    fn decode_error(&self) -> Option<&TransportError> {
+        self.decode_error.as_ref()
     }
 
     async fn ack(self) -> Result<(), TransportError> {
@@ -334,5 +355,57 @@ impl ReceivedMessage for KafkaReceived {
         .await
         .map_err(|err| retryable("kafka seek task", err))?
         .map_err(|err| retryable("kafka seek", err))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn consumption(code: RDKafkaErrorCode) -> KafkaError {
+        KafkaError::MessageConsumption(code)
+    }
+
+    /// A consumer that never connects: creating one contacts no broker.
+    fn offline_source() -> KafkaSource {
+        let consumer: StreamConsumer = ClientConfig::new()
+            .set("bootstrap.servers", "127.0.0.1:1")
+            .set("group.id", "offline")
+            .create()
+            .unwrap();
+        KafkaSource::new(Arc::new(consumer))
+    }
+
+    #[tokio::test]
+    async fn refused_credentials_fail_the_receive_at_once_as_permanent() {
+        for code in [
+            RDKafkaErrorCode::SaslAuthenticationFailed,
+            RDKafkaErrorCode::TopicAuthorizationFailed,
+            RDKafkaErrorCode::GroupAuthorizationFailed,
+            RDKafkaErrorCode::Fatal,
+        ] {
+            let error = offline_source()
+                .recv_failed(consumption(code))
+                .expect_err("surfaced");
+            assert!(error.is_permanent(), "{code:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn transient_errors_are_retried_then_surface_when_they_keep_coming() {
+        let mut source = offline_source();
+        for _ in 1..MAX_CONSECUTIVE_RECV_ERRORS {
+            source
+                .recv_failed(consumption(RDKafkaErrorCode::BrokerTransportFailure))
+                .unwrap();
+        }
+        let error = source
+            .recv_failed(consumption(RDKafkaErrorCode::UnknownTopicOrPartition))
+            .expect_err("surfaced");
+        assert!(error.is_retryable());
+        // The count starts again after the failure is reported.
+        source
+            .recv_failed(consumption(RDKafkaErrorCode::BrokerTransportFailure))
+            .unwrap();
     }
 }

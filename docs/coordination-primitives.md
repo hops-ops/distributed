@@ -1,4 +1,4 @@
-# Coordination primitives: sagas, durable timers and fenced leases
+# Coordination primitives: sagas, schedules and fenced leases
 
 A cell has one atomic boundary. Work that spans cells, or must happen later,
 or must be owned by exactly one process at a time needs explicit
@@ -9,7 +9,7 @@ twice.
 | Need | Primitive | Module |
 |------|-----------|--------|
 | Change state in two cells with rollback | Saga / process manager | `distributed::saga` |
-| Run something at a time in the future, across restarts | `OutboxMessage::deliver_at` | `distributed::outbox` |
+| Run something at a time in the future, across restarts | `Schedule` (`ctx.schedule`) | `distributed::schedule` |
 | A cell schedules its own future or recurring work | Re-armable cell alarm | `distributed::cell_host` |
 | One owner per key, with stale writers rejected | Lease with fencing token | `distributed::lease` |
 | Deterministic time in tests | `Clock`, `ManualClock` | `distributed::clock` |
@@ -18,38 +18,14 @@ All three are dependency-free in core. The SQL lease stores follow the
 existing `sqlite` / `postgres` features. No new cargo feature was added and
 default features are unchanged.
 
-## Durable timers: `deliver_at`
-
-```rust
-let timer = OutboxMessage::create_to(id, "settle-encounter", "encounters", payload)?
-    .deliver_after(now, Duration::from_secs(10));
-repo.outbox(timer).commit(&mut encounter).await?;
-```
-
-A scheduled outbox row is committed with the change that arms it, so it is
-exactly as durable as that change. Every claim path skips it until it is due:
-
-- the in-memory store (`OutboxMessage::is_claimable_at`);
-- the SQLite and Postgres claim queries, which already filtered on the
-  `next_available_at` column. That column now stores `deliver_at` and falls
-  back to `created_at`, so **no schema change was needed** and existing rows
-  (and `None`) stay immediately deliverable;
-- explicit-id claims (`ClaimOutboxMessages::for_ids`), so the after-commit
-  immediate publisher cannot bypass the schedule.
-
-The drain worker (`OutboxDrainRunner`) picks a due row up on its next poll,
-so a timer fires within one poll interval of its deadline. `release` (a
-retry) sets availability to now plus the retry backoff (250 ms doubling to
-one minute), so a timer that failed to publish is retried soon, without a
-tight loop while the broker is down. `OutboxMessage.deliver_at` is
-`#[serde(default)]`.
-
 ## Schedules: an aggregate schedules its own work
 
-`deliver_at` leaves the aggregate and needs a consumer to send a command
-back. When an aggregate must act on itself later (a matchmaking tick, an
-invite expiry, a daily reset, a lease expiry), a causal command handler
-**schedules** it with its events (`distributed::schedule`):
+`Schedule` is the one durable timer. When an aggregate must act on itself
+later (a matchmaking tick, an invite expiry, a daily reset, a lease expiry, a
+saga step's timeout), a causal command handler **schedules** it with its
+events (`distributed::schedule`). Outbox rows are never delayed except by a
+publish retry's backoff; work that must happen later is a schedule whose
+handler emits the message then.
 
 ```rust
 // on the route: what the command needs from its host
@@ -203,11 +179,33 @@ start ─► dispatch(step 0) ─► reply ok ─► dispatch(step 1) ─► rep
                      (or Stuck after MAX_COMPENSATION_ATTEMPTS)
 ```
 
-Each transition returns outbox messages that are committed **with** the
-saga's events: the participant command, plus a `saga-timeout` timer to the
-saga's own `REPLY_TO` queue, scheduled with `deliver_at = now + step.timeout`.
-A crash between deciding and sending is impossible. A timer for a step that
-already finished arrives later and is `Ignored`.
+Each transition returns what is committed **with** the saga's events: the
+participant commands (outbox rows) and the saga's timeout schedule
+(`SagaTransition::timer`). A crash between deciding and sending is
+impossible.
+
+**Timeouts are a `Schedule`.** Each saga stream owns one schedule,
+`saga.timeout` (`SAGA_TIMEOUT_SCHEDULE`). Every dispatch re-arms it at
+`now + step.timeout`, which bumps its generation, so the previous step's
+timeout never fires; a terminal saga cancels it. When due, the host dispatches
+`SagaDefinition::TIMEOUT_COMMAND` with a `SagaTimeout { saga_id, step, phase,
+attempt }` into the saga through the `SagaTimeouts<D>` route, which calls
+`Saga::time_out`. Mount that route on a service over the saga repository and
+attach a schedule worker (or run on a host that fires its own schedules):
+
+```rust
+let (repo, worker) = ScheduleWorker::attach(repo, ScheduleWorkerConfig::default());
+let service = Arc::new(Service::new().named("transfer-saga").routes(
+    Routes::new()
+        .with_repo(repo.clone().aggregate::<Saga<Transfer>>())
+        .mount(SagaTimeouts::<Transfer>::new()),
+));
+let _timeouts = worker.spawn(service);
+let runner = SagaRunner::<_, Transfer>::new(repo);
+```
+
+The timeout runs through the command ledger once per generation; a timeout
+whose `(step, phase, attempt)` the saga no longer awaits is `Ignored`.
 
 A participant is a typed command of a `Service`, delivered by the bus. It
 declares the transport role (`.roles([TRANSPORT_ROLE])`); a typed command
@@ -230,15 +228,16 @@ A step the participant refuses is still a committed command: stage
 `reply.failed(reason)` and return `Ok`. Returning `Err` records the rejection
 in the ledger but stages no reply, so the saga would wait for its timeout.
 
-Inbound replies and timers become `SagaMessage::from_outbox` / `from_bus` and
-go to `SagaRunner::handle`. Inside a `microsvc` handler you can also call
-`Saga::handle` and commit with `ctx.repo().outbox(..)`.
+Inbound replies become `SagaMessage::from_outbox` / `from_bus` and go to
+`SagaRunner::handle`. Inside a `microsvc` handler you can also call
+`Saga::handle` and commit the transition's messages and timer through `ctx`
+(`ctx.outbox(..)`, `ctx.schedule(..)` / `ctx.cancel_schedule(..)`).
 
 Guarantees and obligations:
 
 - **Idempotent.** The saga records every message id that changed its state,
-  so a redelivery is `Duplicate`. Late replies and superseded timers are
-  `Ignored`. Concurrent handlers are fenced by the saga stream's optimistic
+  so a redelivery is `Duplicate`. Late replies and timeouts of a dispatch
+  the saga no longer awaits are `Ignored`. Concurrent handlers are fenced by the saga stream's optimistic
   version, and `SagaRunner` reloads and retries on `ConcurrentWrite`.
 - **Deterministic ids.** Command ids are `type:saga:step:phase:attempt` and a
   reply id is `<command id>:reply`.
@@ -294,23 +293,24 @@ fn compensation(step: &str, member: usize, saga_id: &str, d: &MatchStart)
 
 - 1 to `MAX_SAGA_FAN_OUT` (64) members; an empty or larger fan-out is a
   `Definition` error. Membership must be a deterministic function of the data.
-- Every member gets its own command and timeout timer, both carrying
-  `saga-member` metadata. Command ids are
-  `type:saga:step:phase:attempt:member`, so retries dedupe per member.
+- Every member gets its own command, carrying `saga-member` metadata. Command
+  ids are `type:saga:step:phase:attempt:member`, so retries dedupe per
+  member. The members share the step's deadline, so one timeout schedule
+  covers them: when it fires, every member that has not replied times out.
 - The step **succeeds** when every member replies `succeeded`. It
   **settles** only after every member has replied or timed out, so the saga
   knows which members applied. On any rejection or timeout the step fails and
   only the members that applied, or timed out (outcome unknown), are
   compensated, one at a time, highest index first. Members that rejected are
   not compensated.
-- A reply arriving after its member timed out is `Ignored`; the timeout
-  already settled that member and it will be compensated.
+- A reply arriving after the deadline is `Ignored`; the timeout already
+  settled that member and it will be compensated.
 - Events: `saga.member_succeeded`, `saga.member_failed`,
   `saga.fan_out_settled`. Replaying the stream reproduces the per-member
   state (`Saga::fan_out`, `Saga::applied_members`).
 
 The tests are in `src/saga/fan_out_tests.rs` (N = 1..16, partial failure,
-per-member timeouts and late replies, per-member compensation retries,
+the shared deadline and late replies, per-member compensation retries,
 bounds, and replay from a repository).
 
 ### Worked example
@@ -318,10 +318,11 @@ bounds, and replay from a repository).
 `tests/services/saga_transfer/mod.rs` moves value between wallets in two separate
 cells. The `debit` step goes to the source cell (compensated by `refund`) and
 the `credit` step goes to the target cell (compensated by `reverse_credit`).
-A test network delivers outbox rows whose `deliver_at` is due on a
-`ManualClock`, so timeouts fire without sleeping. The scenarios are:
+A test network delivers outbox rows, and a `ScheduleWorker` on the saga
+store's `ManualClock` fires the timeout schedules into the saga service, so
+timeouts fire without sleeping. The scenarios are:
 
-- the happy path, including an idempotent restart and ignored leftover timers;
+- the happy path, including an idempotent restart and a cancelled timeout;
 - target rejection, where the debit is refunded;
 - source rejection, where nothing needs compensating;
 - target timeout, where both steps are compensated and the late credit is
@@ -330,12 +331,15 @@ A test network delivers outbox rows whose `deliver_at` is due on a
   rejects the credit;
 - compensation timeouts that are retried and then marked `Stuck`;
 - duplicate command delivery and duplicate replies;
-- saga state and its timer surviving a restart on a SQLite file database.
+- a settled timeout generation that never fires again and a stale timeout
+  that is ignored;
+- the saga and its timeout schedule surviving a restart on a SQLite file
+  database, then firing through a new worker at the deadline.
 
 ## Tests
 
 ```sh
-cargo test --features sqlite,postgres --test services --test repositories -- saga_transfer:: coordination_lease:: scheduled_outbox::
+cargo test --features sqlite,postgres --test services --test repositories -- saga_transfer:: coordination_lease:: schedule_worker::
 cargo test --features sqlite --lib -- outbox lease clock
 cargo test --features cloudflare-workers --lib cell_host
 (cd tests/celld/alarm-worker && worker-build --release) && node tests/celld/alarms.mjs

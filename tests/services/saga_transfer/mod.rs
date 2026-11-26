@@ -9,8 +9,9 @@
 //! A target rejection compensates the debit; a target timeout compensates
 //! both (the credit may have applied), and participants tombstone a
 //! compensated transfer so a late action is rejected. Time is a
-//! `ManualClock`; the test "network" delivers outbox rows whose `deliver_at`
-//! is due on that clock, so timeouts fire without sleeping.
+//! `ManualClock` on the saga store; a timeout is the saga's `Schedule`, fired
+//! by a `ScheduleWorker` into the saga service's `SagaTimeouts` route when
+//! that clock reaches its deadline, so timeouts fire without sleeping.
 //!
 //! Each participant is a `Service` of typed commands that declare the
 //! transport role. The network hands a saga command to it as a bus message,
@@ -22,22 +23,23 @@
 use common::sqlite as sqlite_support;
 
 use std::collections::{BTreeSet, HashSet};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
 use serde::{Deserialize, Serialize};
 
 use distributed::bus::Message;
 use distributed::command::{typed_command, PreparedCommand, Succeeded};
+use distributed::microsvc::schedule::{ScheduleWorker, ScheduleWorkerConfig};
 use distributed::microsvc::{
     CausalCommandContext, HandlerError, PortableCommand, Routes, Service, TRANSPORT_ROLE,
 };
-use distributed::saga::SagaCursor;
+use distributed::saga::{SagaCursor, SagaTimeout, SagaTimeouts, SAGA_TIMEOUT_SCHEDULE};
 use distributed::{
-    sourced, AggregateBuilder, AggregateRepository, ClaimOutboxMessages, Entity,
+    sourced, Aggregate, AggregateBuilder, AggregateRepository, ClaimOutboxMessages, Entity,
     InMemoryOutboxStore, InMemoryRepository, ManualClock, OutboxClaimRef, OutboxMessage,
     OutboxStore, Saga, SagaAction, SagaCommand, SagaDefinition, SagaError, SagaMessage,
-    SagaOutcome, SagaReply, SagaRunner, SagaStatus, SagaStep,
+    SagaOutcome, SagaReply, SagaRunner, SagaStatus, SagaStep, StreamIdentity,
 };
 
 // ===========================================================================
@@ -111,6 +113,7 @@ const TARGET_CELL: &str = "target-cell";
 impl SagaDefinition for Transfer {
     const SAGA_TYPE: &'static str = "example.transfer";
     const REPLY_TO: &'static str = "transfer-saga";
+    const TIMEOUT_COMMAND: &'static str = "example.transfer.timeout";
     const MAX_COMPENSATION_ATTEMPTS: u32 = 3;
     type Data = TransferData;
 
@@ -310,7 +313,11 @@ impl Cell {
 struct World {
     clock: ManualClock,
     saga: SagaRunner<InMemoryRepository, Transfer, ManualClock>,
+    saga_repo: InMemoryRepository,
     saga_outbox: InMemoryOutboxStore,
+    /// Fires the saga's timeout schedules into `saga_service`.
+    timeouts: ScheduleWorker,
+    saga_service: Service,
     source: Cell,
     target: Cell,
     /// Destinations that are currently unreachable (messages stay queued).
@@ -322,10 +329,23 @@ impl World {
         // Start the manual clock in the past so the in-memory store's
         // wall-clock claim never hides a row the manual clock says is due.
         let clock = ManualClock::new(SystemTime::now() - Duration::from_secs(3600));
-        let saga_repo = InMemoryRepository::new();
+        // The store clock is what the worker compares deadlines with and
+        // what the timeout route's `ctx.now()` reads.
+        let (saga_repo, timeouts) = ScheduleWorker::attach(
+            InMemoryRepository::new().with_clock(clock.clone()),
+            ScheduleWorkerConfig::default(),
+        );
+        let saga_service = Service::new().named("transfer-saga").routes(
+            Routes::new()
+                .with_repo(saga_repo.clone().aggregate::<Saga<Transfer>>())
+                .mount(SagaTimeouts::<Transfer>::new()),
+        );
         let world = Self {
             saga_outbox: saga_repo.outbox_store(),
-            saga: SagaRunner::with_clock(saga_repo, clock.clone()),
+            saga: SagaRunner::with_clock(saga_repo.clone(), clock.clone()),
+            saga_repo,
+            timeouts,
+            saga_service,
             clock,
             source: Cell::new(SOURCE_CELL),
             target: Cell::new(TARGET_CELL),
@@ -356,14 +376,12 @@ impl World {
 
     /// Claim every due, reachable row from one outbox.
     async fn take_due(&self, store: &InMemoryOutboxStore) -> Vec<OutboxMessage> {
-        let now = distributed::Clock::now(&self.clock);
         let down = self.down.lock().unwrap().clone();
         let ids: Vec<String> = store
             .pending(1000)
             .await
             .unwrap()
             .into_iter()
-            .filter(|m| m.is_due_at(now))
             .filter(|m| !down.contains(m.destination.as_deref().unwrap_or_default()))
             .map(|m| m.id().to_string())
             .collect();
@@ -387,7 +405,17 @@ impl World {
         claimed
     }
 
-    /// Deliver until quiescent; returns saga outcomes observed.
+    /// Fire the saga timeouts due on the manual clock; returns how many fired.
+    async fn fire_timeouts(&self) -> usize {
+        let report = self.timeouts.run_once(&self.saga_service).await.unwrap();
+        assert!(
+            report.retried.is_empty() && report.failed.is_empty(),
+            "a saga timeout failed: {report:?}"
+        );
+        report.fired.len()
+    }
+
+    /// Deliver and fire until quiescent; returns the reply outcomes observed.
     async fn pump(&self) -> Vec<SagaOutcome> {
         let mut outcomes = Vec::new();
         loop {
@@ -395,7 +423,8 @@ impl World {
             for store in [&self.saga_outbox, &self.source.outbox, &self.target.outbox] {
                 batch.extend(self.take_due(store).await);
             }
-            if batch.is_empty() {
+            let fired = self.fire_timeouts().await;
+            if batch.is_empty() && fired == 0 {
                 return outcomes;
             }
             for message in batch {
@@ -416,6 +445,12 @@ impl World {
         self.saga.get(id).await.unwrap().unwrap()
     }
 
+    fn armed_timeouts(&self, id: &str) -> Vec<distributed::schedule::ArmedSchedule> {
+        self.saga_repo
+            .armed_schedules(&StreamIdentity::new(Transfer::SAGA_TYPE, id).unwrap())
+            .unwrap()
+    }
+
     async fn balances(&self) -> (i64, i64) {
         (
             self.source.balance("alice").await,
@@ -433,9 +468,12 @@ async fn happy_path_moves_value_between_cells() {
     let world = World::new(true).await;
     let started = world.saga.start("t-1", World::data(30)).await.unwrap();
     assert_eq!(started.outcome, SagaOutcome::Applied);
-    // Debit command + its durable timeout timer.
-    assert_eq!(started.messages.len(), 2);
-    assert!(started.messages[1].deliver_at.is_some());
+    // The debit command, committed with the saga's armed timeout.
+    assert_eq!(started.messages.len(), 1);
+    let armed = world.armed_timeouts("t-1");
+    assert_eq!(armed.len(), 1);
+    assert_eq!(armed[0].name, SAGA_TIMEOUT_SCHEDULE);
+    assert_eq!(armed[0].command, Transfer::TIMEOUT_COMMAND);
 
     world.pump().await;
     let saga = world.saga_state("t-1").await;
@@ -452,10 +490,10 @@ async fn happy_path_moves_value_between_cells() {
     let again = world.saga.start("t-1", World::data(30)).await.unwrap();
     assert_eq!(again.outcome, SagaOutcome::Duplicate);
 
-    // The leftover timers fire later and are ignored.
+    // The finished saga cancelled its timeout: nothing fires later.
+    assert!(world.armed_timeouts("t-1").is_empty());
     world.clock.advance(Duration::from_secs(60));
-    let outcomes = world.pump().await;
-    assert_eq!(outcomes, vec![SagaOutcome::Ignored, SagaOutcome::Ignored]);
+    assert_eq!(world.fire_timeouts().await, 0);
     assert_eq!(world.balances().await, (70, 30));
 }
 
@@ -499,7 +537,12 @@ async fn target_timeout_compensates_and_tombstones_late_credit() {
     assert_eq!((step, attempt), (1, 1));
     assert_eq!(world.balances().await.0, 75);
 
-    // No reply within 10s: the durable timer fires (manual clock, no sleep).
+    // No reply within 10s: the timeout schedule fires (manual clock, no
+    // sleep). Each dispatch re-armed it, so only the credit's deadline is left.
+    let armed = world.armed_timeouts("t-4");
+    assert_eq!(armed.len(), 1);
+    let timeout: SagaTimeout = serde_json::from_value(armed[0].input.clone()).unwrap();
+    assert_eq!((timeout.step.as_str(), timeout.attempt), ("credit", 1));
     world.clock.advance(Duration::from_secs(9));
     world.pump().await;
     assert_eq!(world.saga_state("t-4").await.status(), SagaStatus::Running);
@@ -579,6 +622,36 @@ async fn compensation_timeouts_retry_then_mark_stuck() {
     world.clock.advance(Duration::from_secs(11));
     world.pump().await;
     assert_eq!(world.saga_state("t-5").await.status(), SagaStatus::Stuck);
+    assert!(world.armed_timeouts("t-5").is_empty());
+}
+
+/// A fired timeout is settled: its generation never fires again, and a stale
+/// timeout input delivered anyway is ignored by the saga.
+#[tokio::test]
+async fn a_settled_or_stale_timeout_changes_nothing() {
+    let world = World::new(true).await;
+    world.set_down(TARGET_CELL, true);
+    world.saga.start("t-11", World::data(5)).await.unwrap();
+    world.pump().await;
+    let armed = world.armed_timeouts("t-11").remove(0);
+    let stale: SagaTimeout = serde_json::from_value(armed.input.clone()).unwrap();
+    world.clock.advance(Duration::from_secs(11));
+    assert_eq!(world.fire_timeouts().await, 1);
+    let compensating = world.saga_state("t-11").await;
+    assert_eq!(compensating.status(), SagaStatus::Compensating);
+    let version = compensating.entity().version();
+
+    // The superseded generation does not fire again.
+    assert_eq!(world.fire_timeouts().await, 0);
+    // Delivered anyway (a stale schedule input), the saga ignores it.
+    let mut saga = world.saga_state("t-11").await;
+    let outcome = saga.time_out(&stale, SystemTime::now()).unwrap();
+    assert_eq!(outcome.outcome, SagaOutcome::Ignored);
+    assert_eq!(world.saga_state("t-11").await.entity().version(), version);
+    assert_eq!(
+        world.armed_timeouts("t-11")[0].generation,
+        armed.generation + 1
+    );
 }
 
 /// The ledger makes a redelivered saga command a replay: the wallet changes
@@ -674,46 +747,59 @@ async fn saga_aggregate_replays_to_the_same_state() {
 
 #[cfg(feature = "sqlite")]
 #[tokio::test]
-async fn saga_and_its_timer_survive_restart_on_sqlite() {
+async fn saga_timeout_fires_through_its_schedule_after_restart_on_sqlite() {
     use crate::saga_transfer::sqlite_support::TempDb;
-    use distributed::{SqliteRepository, SystemClock};
+    use distributed::SqliteRepository;
 
     let db = TempDb::new("saga_restart");
-    let clock = ManualClock::new(SystemTime::now());
+    let started_at = SystemTime::now();
+    let owner = StreamIdentity::new(Transfer::SAGA_TYPE, "t-8").unwrap();
     {
         let repo = SqliteRepository::new(db.pool().await);
         repo.migrate().await.unwrap();
-        let runner = SagaRunner::<_, Transfer, _>::with_clock(repo, clock.clone());
+        let runner = SagaRunner::<_, Transfer, _>::with_clock(repo, ManualClock::new(started_at));
         runner.start("t-8", World::data(10)).await.unwrap();
     } // "crash": every handle dropped
 
-    let repo = SqliteRepository::new(db.pool().await);
-    let store = repo.outbox_store();
-    let pending = store.pending(10).await.unwrap();
-    assert_eq!(pending.len(), 2);
-    let timer = pending
-        .iter()
-        .find(|m| m.event_type == distributed::saga::SAGA_TIMEOUT)
-        .unwrap();
-    let deadline = timer.deliver_at.expect("timer keeps its schedule");
+    let (repo, worker) = ScheduleWorker::attach(
+        SqliteRepository::new(db.pool().await),
+        ScheduleWorkerConfig::default(),
+    );
+    let armed = repo.armed_schedules(&owner).await.unwrap();
+    assert_eq!(armed.len(), 1, "the timeout survived the restart");
+    assert_eq!(armed[0].name, SAGA_TIMEOUT_SCHEDULE);
+    let deadline = armed[0].due();
+    let service = Arc::new(
+        Service::new().named("transfer-saga").routes(
+            Routes::new()
+                .with_repo(repo.clone().aggregate::<Saga<Transfer>>())
+                .mount(SagaTimeouts::<Transfer>::new()),
+        ),
+    );
 
-    // Only the debit command is claimable now; the timer is not yet due.
-    let claimed = store
-        .claim(ClaimOutboxMessages::new("w", 10, Duration::from_secs(60)))
-        .await
-        .unwrap();
-    assert_eq!(claimed.len(), 1);
-    assert_eq!(claimed[0].event_type, "wallet.debit");
+    // Not due yet: nothing fires.
+    let clock = ManualClock::new(deadline - Duration::from_millis(1));
+    let worker = worker.with_clock(Arc::new(clock.clone()));
+    assert!(worker.run_once(&service).await.unwrap().fired.is_empty());
 
-    // Once due (the timer was armed 10s after the manual start time, which
-    // is ~now), the restarted runner times the step out and compensates.
-    let saga_message = SagaMessage::from_outbox(timer).unwrap();
-    let runner = SagaRunner::<_, Transfer, _>::with_clock(repo, SystemClock);
-    let saga = runner.get("t-8").await.unwrap().unwrap();
-    assert_eq!(saga.cursor().unwrap().deadline, deadline);
-    let outcome = runner.handle(&saga_message).await.unwrap();
-    assert_eq!(outcome.outcome, SagaOutcome::Applied);
+    // At the deadline the restarted worker fires it and the step compensates.
+    clock.advance(Duration::from_millis(1));
+    let report = worker.run_once(&service).await.unwrap();
+    assert_eq!(report.fired.len(), 1, "{report:?}");
+    let runner = SagaRunner::<_, Transfer>::new(repo.clone());
     let saga = runner.get("t-8").await.unwrap().unwrap();
     assert_eq!(saga.status(), SagaStatus::Compensating);
+    assert!(saga.failure().unwrap().timed_out);
     assert_eq!(saga.applied_steps(), vec!["debit"]);
+    // The refund's deadline re-armed the same schedule, one generation on.
+    let rearmed = repo.armed_schedules(&owner).await.unwrap();
+    assert_eq!(rearmed.len(), 1);
+    assert_eq!(rearmed[0].generation, armed[0].generation + 1);
+    let timeout: SagaTimeout = serde_json::from_value(rearmed[0].input.clone()).unwrap();
+    assert_eq!(
+        (timeout.step.as_str(), timeout.phase.as_str()),
+        ("debit", "compensation")
+    );
+    // The settled generation never fires again.
+    assert!(worker.run_once(&service).await.unwrap().fired.is_empty());
 }

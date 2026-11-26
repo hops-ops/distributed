@@ -1,8 +1,8 @@
 #[cfg(feature = "graphql")]
-use super::super::causal::{
-    CausalCommandPublicStatus, ExternalCausalAttempt, ExternalCausalReservation,
-};
+use super::super::causal::CausalCommandPublicStatus;
 use super::super::causal::{CausalDispatchError, CausalDispatchResult, SealModeledProjection};
+#[cfg(feature = "http")]
+use super::super::causal::{ExternalCausalAttempt, ExternalCausalReservation};
 use super::super::handlers::{HandlerFuture, ProjectorBootstrapFuture};
 use super::outbox_wiring::DynBusPublisher;
 use super::spec::HandlerSpec;
@@ -12,12 +12,12 @@ use crate::command::CommandConsistency;
 use crate::command::TypedCommandContract;
 use crate::command_dispatch::VerifiedPrincipal;
 use crate::command_ledger::CommandLookup;
+#[cfg(feature = "http")]
+use crate::command_ledger::ExternalDispatchBinding;
 #[cfg(any(feature = "graphql", feature = "runtime-tokio"))]
 use crate::command_ledger::{CausalStorageIdentity, CommandLedgerError};
 #[cfg(feature = "graphql")]
-use crate::command_ledger::{
-    CommandContractFingerprint, CommandId, CommandLedgerKey, ExternalDispatchBinding,
-};
+use crate::command_ledger::{CommandContractFingerprint, CommandId, CommandLedgerKey};
 use crate::microsvc::cell_host::CellCommandIdentity;
 use crate::microsvc::projector::{
     ProjectionRepairHandle, ProjectorRegistration, ProjectorRepairFuture,
@@ -63,16 +63,16 @@ pub(in crate::microsvc::service) type CausalStatusFuture<'a> = Pin<
 pub(in crate::microsvc::service) type CausalStatusRoute<'a> =
     dyn Fn(&str, &[u8; 32]) -> Option<CommandConsistency> + Send + Sync + 'a;
 
-#[cfg(feature = "graphql")]
+#[cfg(feature = "http")]
 pub(in crate::microsvc::service) type ExternalReservationFuture<'a> = Pin<
     Box<dyn Future<Output = Result<ExternalCausalReservation, CausalDispatchError>> + Send + 'a>,
 >;
 
-#[cfg(feature = "graphql")]
+#[cfg(feature = "http")]
 pub(in crate::microsvc::service) type ExternalCompletionFuture<'a> =
     Pin<Box<dyn Future<Output = Result<(), CausalDispatchError>> + Send + 'a>>;
 
-#[cfg(feature = "graphql")]
+#[cfg(feature = "http")]
 pub(in crate::microsvc::service) type ExternalAbandonFuture<'a> =
     Pin<Box<dyn Future<Output = Result<(), CausalDispatchError>> + Send + 'a>>;
 
@@ -87,7 +87,7 @@ pub(crate) type LedgerCompaction = Arc<
 
 /// A command's declared shard over its wire input: the input is validated
 /// and decoded as the command's own input type first.
-#[cfg(feature = "graphql")]
+#[cfg(feature = "http")]
 pub(crate) type ErasedCommandShard =
     Arc<dyn Fn(&Value) -> Result<String, CausalDispatchError> + Send + Sync>;
 
@@ -97,11 +97,11 @@ pub(in crate::microsvc::service) trait ErasedCausalHandler<D>:
     fn contract(&self) -> &TypedCommandContract;
 
     /// The aggregate type the command commits to.
-    #[cfg(feature = "graphql")]
+    #[cfg(feature = "http")]
     fn aggregate(&self) -> std::any::TypeId;
 
     /// The declared shard, when the command declares one.
-    #[cfg(feature = "graphql")]
+    #[cfg(feature = "http")]
     fn shard(&self) -> Option<ErasedCommandShard>;
 
     /// The ledger fingerprint of [`Self::contract`].
@@ -167,7 +167,7 @@ pub(in crate::microsvc::service) trait ErasedCausalHandler<D>:
         protocol: Option<crate::graphql::protocol::ProtocolResponseAccumulator>,
     ) -> CausalStatusFuture<'a>;
 
-    #[cfg(feature = "graphql")]
+    #[cfg(feature = "http")]
     fn reserve_external<'a>(
         &'a self,
         dependencies: &'a D,
@@ -180,7 +180,7 @@ pub(in crate::microsvc::service) trait ErasedCausalHandler<D>:
         binding: ExternalDispatchBinding,
     ) -> ExternalReservationFuture<'a>;
 
-    #[cfg(feature = "graphql")]
+    #[cfg(feature = "http")]
     fn complete_external<'a>(
         &'a self,
         dependencies: &'a D,
@@ -188,7 +188,7 @@ pub(in crate::microsvc::service) trait ErasedCausalHandler<D>:
         result: &'a CausalDispatchResult,
     ) -> ExternalCompletionFuture<'a>;
 
-    #[cfg(feature = "graphql")]
+    #[cfg(feature = "http")]
     fn abandon_external<'a>(
         &'a self,
         dependencies: &'a D,
@@ -209,7 +209,7 @@ pub(in crate::microsvc::service) trait ErasedRoutes:
 
     /// Every typed command of this bundle that commits to `aggregate`, with
     /// its declared shard.
-    #[cfg(feature = "graphql")]
+    #[cfg(feature = "http")]
     fn aggregate_command_shards(
         &self,
         aggregate: std::any::TypeId,
@@ -298,7 +298,7 @@ pub(in crate::microsvc::service) trait ErasedRoutes:
         protocol: Option<crate::graphql::protocol::ProtocolResponseAccumulator>,
     ) -> CausalStatusFuture<'a>;
 
-    #[cfg(feature = "graphql")]
+    #[cfg(feature = "http")]
     fn reserve_external<'a>(
         &'a self,
         command: &'a str,
@@ -311,7 +311,7 @@ pub(in crate::microsvc::service) trait ErasedRoutes:
         binding: ExternalDispatchBinding,
     ) -> ExternalReservationFuture<'a>;
 
-    #[cfg(feature = "graphql")]
+    #[cfg(feature = "http")]
     fn complete_external<'a>(
         &'a self,
         command: &'a str,
@@ -319,7 +319,7 @@ pub(in crate::microsvc::service) trait ErasedRoutes:
         result: &'a CausalDispatchResult,
     ) -> ExternalCompletionFuture<'a>;
 
-    #[cfg(feature = "graphql")]
+    #[cfg(feature = "http")]
     fn abandon_external<'a>(
         &'a self,
         command: &'a str,

@@ -18,7 +18,6 @@ mod queued_repo;
 mod repository_api;
 #[cfg(any(feature = "sqlite", feature = "postgres"))]
 mod schedule_worker;
-mod scheduled_outbox;
 #[cfg(feature = "sqlite")]
 mod snapshot_sqlite_hardening;
 #[cfg(any(feature = "sqlite", feature = "postgres"))]

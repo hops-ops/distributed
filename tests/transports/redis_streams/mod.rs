@@ -34,8 +34,8 @@ async fn redis_stream_publisher_appends_and_dedupes_by_message_id() {
     )
     .with_id("msg-1")
     .with_metadata("correlation_id", "corr-1");
-    assert!(publisher.publish_entry(&message).await.unwrap());
-    assert!(!publisher.publish_entry(&message).await.unwrap());
+    assert!(publisher.publish_entry(message.clone()).await.unwrap());
+    assert!(!publisher.publish_entry(message.clone()).await.unwrap());
     publisher.publish(message.clone()).await.unwrap();
     publisher
         .publish(Message::new(
@@ -62,16 +62,36 @@ async fn redis_stream_publisher_appends_and_dedupes_by_message_id() {
         .await
         .unwrap();
     let fields: std::collections::HashMap<_, _> = entries[0].1.iter().cloned().collect();
-    assert_eq!(fields["id"], b"msg-1");
-    assert_eq!(fields["kind"], b"event");
+    assert_eq!(fields["name"], b"dungeon.gold_looted");
+    assert_eq!(fields["header:x-distributed-id"], b"msg-1");
+    assert_eq!(fields["header:x-distributed-kind"], b"event");
+    assert_eq!(
+        fields["header:x-distributed-content-type"],
+        b"application/json"
+    );
     assert_eq!(fields["payload"], b"\x00bin");
-    assert_eq!(fields["meta:correlation_id"], b"corr-1");
+    assert_eq!(fields["header:correlation_id"], b"corr-1");
     let _: i64 = redis::cmd("DEL")
         .arg(&stream)
         .arg(RedisStreamPublisher::dedupe_key(&stream, "msg-1"))
         .query_async(&mut conn)
         .await
         .unwrap();
+}
+
+#[tokio::test]
+async fn reserved_header_override_is_refused_before_contacting_redis() {
+    // Port 1 is never a Redis server: a refusal proves nothing was sent.
+    let publisher = RedisStreamPublisher::connect("redis://127.0.0.1:1").unwrap();
+    let err = publisher
+        .publish(
+            Message::new("dungeon.gold_looted", MessageKind::Event, vec![])
+                .with_id("x")
+                .with_metadata("X-Distributed-Kind", "command"),
+        )
+        .await
+        .unwrap_err();
+    assert!(err.is_permanent(), "{err}");
 }
 
 #[tokio::test]

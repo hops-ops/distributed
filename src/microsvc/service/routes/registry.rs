@@ -1,24 +1,25 @@
 #[cfg(feature = "graphql")]
 use super::super::causal::ensure_causal_grant;
 #[cfg(feature = "graphql")]
-use super::super::causal::GraphqlServiceBindError;
+use super::super::causal::CausalCommandPublicStatus;
+#[cfg(feature = "http")]
+use super::super::causal::ExternalCausalAttempt;
 #[cfg(feature = "graphql")]
-use super::super::causal::{CausalCommandPublicStatus, ExternalCausalAttempt};
+use super::super::causal::GraphqlServiceBindError;
 use super::super::causal::{CausalDispatchError, CausalDispatchResult, SealModeledProjection};
 use super::super::handlers::{
     CausalGuardFn, GuardFn, HandlerFn, HandlerFuture, PreparedHandlerFn, ProjectorBootstrapFuture,
 };
 use super::builder::{CommandShard, EventRouteBuilder, PortableCommand, TypedRouteBuilder};
-#[cfg(feature = "graphql")]
+#[cfg(feature = "http")]
 use super::erased::ErasedCommandShard;
 #[cfg(any(feature = "graphql", feature = "runtime-tokio"))]
 use super::erased::LedgerCompaction;
 use super::erased::{CausalCommandPolicy, CausalHandlerFuture, ErasedCausalHandler, ErasedRoutes};
 #[cfg(feature = "graphql")]
-use super::erased::{
-    CausalStatusFuture, CausalStatusRoute, ExternalAbandonFuture, ExternalCompletionFuture,
-    ExternalReservationFuture,
-};
+use super::erased::{CausalStatusFuture, CausalStatusRoute};
+#[cfg(feature = "http")]
+use super::erased::{ExternalAbandonFuture, ExternalCompletionFuture, ExternalReservationFuture};
 use super::execute::RegisteredCausalHandler;
 use super::outbox_wiring::{DynBusPublisher, OutboxConfigurator};
 use super::spec::HandlerSpec;
@@ -34,8 +35,10 @@ use crate::command_dispatch::VerifiedPrincipal;
 #[cfg(any(feature = "graphql", feature = "runtime-tokio"))]
 use crate::command_ledger::CausalStorageIdentity;
 use crate::command_ledger::CommandLookup;
+#[cfg(feature = "http")]
+use crate::command_ledger::ExternalDispatchBinding;
 #[cfg(feature = "graphql")]
-use crate::command_ledger::{CommandId, CommandLedgerKey, ExternalDispatchBinding};
+use crate::command_ledger::{CommandId, CommandLedgerKey};
 use crate::graphql::SurfaceProjector;
 use crate::microsvc::cell_host::CellCommandIdentity;
 use crate::microsvc::context::Context;
@@ -708,7 +711,7 @@ where
             .map(|handler| handler.contract())
     }
 
-    #[cfg(feature = "graphql")]
+    #[cfg(feature = "http")]
     fn aggregate_command_shards(
         &self,
         aggregate: std::any::TypeId,
@@ -961,7 +964,7 @@ where
         }
     }
 
-    #[cfg(feature = "graphql")]
+    #[cfg(feature = "http")]
     fn reserve_external<'a>(
         &'a self,
         command: &'a str,
@@ -988,7 +991,7 @@ where
         }
     }
 
-    #[cfg(feature = "graphql")]
+    #[cfg(feature = "http")]
     fn complete_external<'a>(
         &'a self,
         command: &'a str,
@@ -1001,7 +1004,7 @@ where
         }
     }
 
-    #[cfg(feature = "graphql")]
+    #[cfg(feature = "http")]
     fn abandon_external<'a>(
         &'a self,
         command: &'a str,

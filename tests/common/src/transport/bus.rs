@@ -128,14 +128,30 @@ pub async fn message_round_trips_unchanged<H: BusHarness>(harness: &H, kind: Mes
     assert_eq!(received.id(), Some("m1"));
     assert_eq!(received.payload(), br#"{"n":1}"#);
     assert_eq!(received.content_type, "application/vnd.conformance+json");
-    assert!(
-        received
-            .metadata
-            .iter()
-            .any(|(key, value)| key.eq_ignore_ascii_case("x-tenant") && value == "acme"),
-        "user metadata survives: {:?}",
-        received.metadata
+    assert_eq!(
+        received.metadata,
+        vec![("x-tenant".to_string(), "acme".to_string())],
+        "user metadata survives and no wire header leaks into it"
     );
+}
+
+/// Metadata naming a reserved wire header is refused at the publish
+/// boundary, in any letter case, before anything reaches the transport.
+pub async fn reserved_header_override_is_refused<H: BusHarness>(harness: &H, kind: MessageKind) {
+    let bus = harness.bus(GROUP).await;
+    for key in [
+        "x-distributed-id",
+        "X-Distributed-Kind",
+        "x-distributed-content-type",
+    ] {
+        let forged = message(kind, "forged").with_metadata(key, "command");
+        let error = match kind {
+            MessageKind::Command => bus.send_message(forged).await,
+            MessageKind::Event => bus.publish_message(forged).await,
+        }
+        .expect_err("a reserved metadata key is refused");
+        assert!(error.is_permanent(), "{key}: {error}");
+    }
 }
 
 /// A retryable failure is delivered again, and the messages behind it are
@@ -306,6 +322,16 @@ macro_rules! bus_conformance_tests {
             scenario!(
                 event_round_trips_unchanged,
                 message_round_trips_unchanged,
+                Event
+            );
+            scenario!(
+                command_reserved_header_override_is_refused,
+                reserved_header_override_is_refused,
+                Command
+            );
+            scenario!(
+                event_reserved_header_override_is_refused,
+                reserved_header_override_is_refused,
                 Event
             );
             scenario!(

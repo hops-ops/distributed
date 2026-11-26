@@ -1037,7 +1037,9 @@ async fn resolve_command(
             input,
             session,
             principal,
-            Some(protocol.clone()),
+            Some(crate::command_dispatch::ProtocolAuthority::new(
+                protocol.clone(),
+            )),
         )
         .await
         .map_err(|error| {
@@ -1086,6 +1088,14 @@ async fn resolve_command_status(
             "command host not configured (use graphql_router_with_host or graphql_router_with_service)",
         )
     })?;
+    // Status is read from the command ledger, which only an in-process host
+    // holds; a remote writer answers status through its own GraphQL.
+    let ledger = host.ledger().ok_or_else(|| {
+        client_error(
+            "INTERNAL",
+            "command status needs the service that owns the command ledger; this endpoint dispatches to a remote writer",
+        )
+    })?;
     let command_id = ctx
         .args
         .get("commandId")
@@ -1093,8 +1103,11 @@ async fn resolve_command_status(
         .deserialize::<String>()
         .map_err(|_| client_error("BAD_REQUEST", "invalid commandId"))?;
 
-    let status = host
-        .status(&command_id, &session, principal, Some(protocol.clone()))
+    crate::command_dispatch::validate_principal_session_if_present(&session, &principal).map_err(
+        |error| client_error_with_status(error.code(), error.status_code(), error.client_message()),
+    )?;
+    let status = ledger
+        .causal_command_status(&command_id, &session, principal, Some(protocol.clone()))
         .await
         .map_err(|error| {
             client_error_with_status(error.code(), error.status_code(), error.client_message())

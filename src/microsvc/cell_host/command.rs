@@ -1,4 +1,4 @@
-//! GraphQL [`CommandHost`] for the celld wait-path.
+//! [`CommandHost`] for the celld wait-path.
 //!
 //! [`CelldCommandHost::route_aggregate`] routes an aggregate's mounted
 //! commands to its cells: the cell kind is the aggregate's
@@ -18,14 +18,12 @@ use super::InternalHttpSecret;
 use crate::aggregate::Aggregate;
 use crate::command_dispatch::VerifiedPrincipal;
 use crate::command_dispatch::{
-    validate_principal_session, validate_principal_session_if_present, CellRequestContext,
-    CommandHost, HttpCommandHost, LocalCommandHost, TrustedRequestMetadata,
+    validate_principal_session, CellRequestContext, CommandHost, HttpCommandHost, LocalCommandHost,
+    ProtocolAuthority, TrustedRequestMetadata,
 };
 use crate::command_ledger::ExternalDispatchBinding;
-use crate::graphql::protocol::ProtocolResponseAccumulator;
 use crate::microsvc::{
-    CausalCommandPublicStatus, CausalDispatchError, CausalDispatchResult,
-    ExternalCausalReservation, Service, Session,
+    CausalDispatchError, CausalDispatchResult, ExternalCausalReservation, Service, Session,
 };
 
 type CellShardFn =
@@ -283,14 +281,14 @@ impl CommandHost for CelldCommandHost {
         input: Value,
         session: Session,
         principal: VerifiedPrincipal,
-        protocol: Option<ProtocolResponseAccumulator>,
+        authority: Option<ProtocolAuthority>,
     ) -> Result<CausalDispatchResult, CausalDispatchError> {
         validate_principal_session(&session, &principal)?;
         let Some(route) = self.route_for(command).cloned() else {
             return match &self.local {
                 Some(local) => {
                     local
-                        .invoke(command, command_id, input, session, principal, protocol)
+                        .invoke(command, command_id, input, session, principal, authority)
                         .await
                 }
                 None => Err(CausalDispatchError::BadRequest(format!(
@@ -370,7 +368,7 @@ impl CommandHost for CelldCommandHost {
                 .await;
             return Err(error);
         }
-        let mut remote = match CausalDispatchResult::from_wait_path_wire(body) {
+        let remote = match CausalDispatchResult::from_wait_path_wire(body) {
             Ok(remote) => remote,
             Err(error) => {
                 let _ = local
@@ -389,21 +387,25 @@ impl CommandHost for CelldCommandHost {
                 .await;
             return Err(error);
         }
-        if let Some(protocol) = protocol {
-            remote = match local
-                .service()
-                .seal_wait_path_dispatch(command, &protocol, remote)
-            {
-                Ok(remote) => remote,
-                Err(error) => {
-                    let _ = local
-                        .service()
-                        .abandon_external_causal(command, attempt)
-                        .await;
-                    return Err(error);
+        #[cfg(feature = "graphql")]
+        let remote = match authority {
+            Some(authority) => {
+                match local
+                    .service()
+                    .seal_wait_path_dispatch(command, &authority.protocol, remote)
+                {
+                    Ok(remote) => remote,
+                    Err(error) => {
+                        let _ = local
+                            .service()
+                            .abandon_external_causal(command, attempt)
+                            .await;
+                        return Err(error);
+                    }
                 }
-            };
-        }
+            }
+            None => remote,
+        };
         local
             .service()
             .complete_external_causal(command, attempt, &remote)
@@ -411,17 +413,7 @@ impl CommandHost for CelldCommandHost {
         Ok(remote)
     }
 
-    async fn status(
-        &self,
-        command_id: &str,
-        session: &Session,
-        principal: VerifiedPrincipal,
-        protocol: Option<ProtocolResponseAccumulator>,
-    ) -> Result<CausalCommandPublicStatus, CausalDispatchError> {
-        validate_principal_session_if_present(session, &principal)?;
-        match &self.local {
-            Some(local) => local.status(command_id, session, principal, protocol).await,
-            None => Ok(CausalCommandPublicStatus::unknown(command_id)),
-        }
+    fn ledger(&self) -> Option<&Arc<Service>> {
+        self.local.as_ref().map(LocalCommandHost::service)
     }
 }

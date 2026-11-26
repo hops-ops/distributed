@@ -21,10 +21,8 @@ use lapin::types::{AMQPValue, FieldTable, ShortString};
 use lapin::{BasicProperties, Channel, Connection, ConnectionProperties};
 
 use super::source::{MessageSource, ReceivedMessage};
-use super::{message_from_wire, strip_address_prefix, Message};
 use super::{retryable, MessagePublisher, TransportError};
-
-const MESSAGE_KIND_HEADER: &str = "x-sourced-kind";
+use super::{strip_address_prefix, Message, WireEnvelope};
 
 fn settle_result(context: &str, settled: bool) -> Result<(), TransportError> {
     if settled {
@@ -68,47 +66,44 @@ impl RabbitPublisher {
     }
 }
 
-pub(super) fn message_properties(message: &Message) -> BasicProperties {
+/// Publish `message` to `exchange` with `routing_key` and wait for the
+/// publisher confirm. The message travels as a [`WireEnvelope`]: its headers
+/// are the AMQP header table, its payload the body.
+pub(super) async fn publish_confirmed(
+    channel: &Channel,
+    exchange: &str,
+    routing_key: &str,
+    message: Message,
+) -> Result<(), TransportError> {
+    let envelope = WireEnvelope::encode(message)?;
     let mut headers = FieldTable::default();
-    headers.insert(
-        ShortString::from(MESSAGE_KIND_HEADER),
-        AMQPValue::LongString(message.kind.as_str().into()),
-    );
-    for (key, value) in &message.metadata {
-        headers.insert(
-            ShortString::from(key.as_str()),
-            AMQPValue::LongString(value.as_str().into()),
-        );
+    for (key, value) in envelope.headers {
+        headers.insert(ShortString::from(key), AMQPValue::LongString(value.into()));
     }
-    let mut properties = BasicProperties::default()
-        .with_headers(headers)
-        .with_content_type(ShortString::from(message.content_type.as_str()));
-    if let Some(id) = message.id() {
-        properties = properties.with_message_id(ShortString::from(id));
+    let confirm = channel
+        .basic_publish(
+            ShortString::from(exchange),
+            ShortString::from(routing_key),
+            BasicPublishOptions::default(),
+            &envelope.payload,
+            BasicProperties::default().with_headers(headers),
+        )
+        .await
+        .map_err(|err| retryable("amqp publish", err))?;
+    let confirmation = confirm
+        .await
+        .map_err(|err| retryable("amqp publisher confirm", err))?;
+    if confirmation.is_nack() {
+        return Err(TransportError::retryable("amqp publisher confirm: nack"));
     }
-    properties
+    Ok(())
 }
 
 impl MessagePublisher for RabbitPublisher {
     async fn publish(&self, message: Message) -> Result<(), TransportError> {
-        let confirm = self
-            .channel
-            .basic_publish(
-                ShortString::from(""), // default exchange: routes to the queue named by the routing key
-                ShortString::from(message.name()),
-                BasicPublishOptions::default(),
-                &message.payload,
-                message_properties(&message),
-            )
-            .await
-            .map_err(|err| retryable("amqp publish", err))?;
-        let confirmation = confirm
-            .await
-            .map_err(|err| retryable("amqp publisher confirm", err))?;
-        if confirmation.is_nack() {
-            return Err(TransportError::retryable("amqp publisher confirm: nack"));
-        }
-        Ok(())
+        // The default exchange routes to the queue named by the routing key.
+        let routing_key = message.name.clone();
+        publish_confirmed(&self.channel, "", &routing_key, message).await
     }
 }
 
@@ -215,6 +210,7 @@ impl MessageSource for RabbitSource {
 pub struct RabbitReceived {
     delivery: Delivery,
     message: Message,
+    decode_error: Option<TransportError>,
 }
 
 impl RabbitReceived {
@@ -231,19 +227,17 @@ impl RabbitReceived {
             .flat_map(|headers| headers.inner())
             .map(|(key, value)| (key.to_string(), amqp_value_to_string(value)))
             .collect();
-        // The id rides in the AMQP `message_id` property, not a header.
-        let mut message = message_from_wire(name, payload, None, MESSAGE_KIND_HEADER, headers);
-        message.id = delivery
-            .properties
-            .message_id()
-            .as_ref()
-            .map(|s| s.to_string());
-        // Preserve the publisher's content type instead of the Message::new
-        // default, so non-JSON payloads survive the round-trip.
-        if let Some(content_type) = delivery.properties.content_type().as_ref() {
-            message.content_type = content_type.to_string();
+        let (message, decode_error) = WireEnvelope {
+            name,
+            headers,
+            payload,
         }
-        Self { delivery, message }
+        .decode();
+        Self {
+            delivery,
+            message,
+            decode_error,
+        }
     }
 }
 
@@ -260,6 +254,10 @@ impl ReceivedMessage for RabbitReceived {
         } else {
             1
         }
+    }
+
+    fn decode_error(&self) -> Option<&TransportError> {
+        self.decode_error.as_ref()
     }
 
     async fn ack(self) -> Result<(), TransportError> {

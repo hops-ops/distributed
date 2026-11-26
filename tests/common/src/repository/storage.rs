@@ -409,97 +409,51 @@ where
 
 const LEASE: Duration = Duration::from_secs(60);
 
-/// Due rows are claimable, by poll and by explicit id; a row scheduled for
-/// later is listed as pending with its schedule but never claimed.
-pub async fn outbox_honours_deliver_at<R, S>(repo: R, outbox: S)
-where
-    R: TransactionalCommit,
-    S: OutboxStore,
-{
-    let now = SystemTime::now();
-    let messages = vec![
-        OutboxMessage::create_to("immediate", "Ping", "q", vec![1]).unwrap(),
-        OutboxMessage::create_to("past", "Ping", "q", vec![2])
-            .unwrap()
-            .deliver_at(now - Duration::from_secs(5)),
-        OutboxMessage::create_to("future", "Ping", "q", vec![3])
-            .unwrap()
-            .deliver_after(now, Duration::from_secs(3600)),
-    ];
-    repo.commit_batch(batch(Vec::new(), messages))
-        .await
-        .unwrap();
-
-    let pending = outbox.pending(10).await.unwrap();
-    assert_eq!(pending.len(), 3);
-    let scheduled = |id: &str| pending.iter().find(|m| m.id() == id).unwrap().deliver_at;
-    assert!(scheduled("future").is_some());
-    assert!(scheduled("immediate").is_none());
-
-    let by_id = outbox
-        .claim(ClaimOutboxMessages::for_ids(
-            "w",
-            vec!["future".into()],
-            LEASE,
-        ))
-        .await
-        .unwrap();
-    assert!(
-        by_id.is_empty(),
-        "an explicit-id claim must not bypass the schedule"
-    );
-
-    let mut claimed: Vec<String> = outbox
-        .claim(ClaimOutboxMessages::new("w", 10, LEASE).to_destination("q"))
-        .await
-        .unwrap()
-        .iter()
-        .map(|m| m.id().to_string())
-        .collect();
-    claimed.sort();
-    assert_eq!(claimed, ["immediate", "past"]);
-}
-
-/// `at` truncated to a whole millisecond, which every backend round-trips.
-fn whole_millis(at: SystemTime) -> SystemTime {
-    let since = at.duration_since(SystemTime::UNIX_EPOCH).unwrap();
-    SystemTime::UNIX_EPOCH + Duration::from_millis(since.as_millis() as u64)
-}
-
-/// A scheduled row outlives the process that wrote it and fires once due; a
-/// row released with no delay is claimable again at once.
-pub async fn scheduled_message_survives_restart_and_fires_when_due<B: Durable>(backend: &B)
+/// A released row keeps its backoff across a restart: no claim takes it
+/// before the delay ends, and the next claim after it does.
+pub async fn released_row_keeps_its_backoff_across_restart<B: Durable>(backend: &B)
 where
     B::Repository: TransactionalCommit,
 {
+    let repo = backend.repository();
+    let id = unique_id("retry");
+    repo.commit_batch(batch(
+        Vec::new(),
+        vec![OutboxMessage::create_to(&id, "Retry", "q", b"r".to_vec()).unwrap()],
+    ))
+    .await
+    .unwrap();
+    let outbox = B::outbox_store(&repo);
+    let claimed = outbox
+        .claim(ClaimOutboxMessages::new("w", 10, LEASE))
+        .await
+        .unwrap();
+    assert_eq!(claimed.len(), 1);
     // Long enough that the reopen below is done before the row is due on a
     // loaded machine; an early claim is still told apart from a late one.
     let delay = Duration::from_secs(2);
-    let timer_id = unique_id("timer");
-    let timer = OutboxMessage::create_to(&timer_id, "Timeout", "saga", b"t".to_vec())
-        .unwrap()
-        .deliver_after(whole_millis(SystemTime::now()), delay);
-    let due_at = timer.deliver_at.unwrap();
-    backend
-        .repository()
-        .commit_batch(batch(Vec::new(), vec![timer]))
+    let before = SystemTime::now();
+    outbox
+        .release(
+            &OutboxClaimRef::from_message(&claimed[0]).unwrap(),
+            "transient",
+            delay,
+        )
         .await
         .unwrap();
+    let after = SystemTime::now();
 
     let reopened = backend.reopen().await;
     let outbox = B::outbox_store(&reopened);
-    let pending = outbox.pending(10).await.unwrap();
-    assert_eq!(pending.len(), 1);
-    // Exact: every backend stores at least microsecond resolution, and the
-    // schedule above is a whole millisecond.
-    assert_eq!(pending[0].deliver_at, Some(due_at), "schedule persisted");
     let early = outbox
         .claim(ClaimOutboxMessages::new("w", 10, LEASE))
         .await
         .unwrap();
-    let fired = if early.is_empty() {
+    let retried = if early.is_empty() {
         // The one unavoidable wait: the claim compares against wall time.
-        let remaining = due_at.duration_since(SystemTime::now()).unwrap_or_default();
+        let remaining = (after + delay)
+            .duration_since(SystemTime::now())
+            .unwrap_or_default();
         tokio::time::sleep(remaining + Duration::from_millis(50)).await;
         outbox
             .claim(ClaimOutboxMessages::new("w", 10, LEASE))
@@ -507,38 +461,12 @@ where
             .unwrap()
     } else {
         assert!(
-            SystemTime::now() >= due_at,
-            "claimed before it was due: {early:?}"
+            SystemTime::now() >= before + delay,
+            "claimed before its backoff ended: {early:?}"
         );
         early
     };
-    assert_eq!(fired.len(), 1);
-    assert_eq!(fired[0].payload, b"t");
-    outbox
-        .complete(&OutboxClaimRef::from_message(&fired[0]).unwrap())
-        .await
-        .unwrap();
-
-    let retry = OutboxMessage::create_to(unique_id("timer"), "Timeout", "saga", vec![])
-        .unwrap()
-        .deliver_at(SystemTime::now() - Duration::from_millis(1));
-    reopened
-        .commit_batch(batch(Vec::new(), vec![retry]))
-        .await
-        .unwrap();
-    let claimed = outbox
-        .claim(ClaimOutboxMessages::new("w", 10, LEASE))
-        .await
-        .unwrap();
-    let claim = OutboxClaimRef::from_message(&claimed[0]).unwrap();
-    outbox
-        .release(&claim, "transient", Duration::ZERO)
-        .await
-        .unwrap();
-    let again = outbox
-        .claim(ClaimOutboxMessages::new("w", 10, LEASE))
-        .await
-        .unwrap();
-    assert_eq!(again.len(), 1);
-    assert_eq!(again[0].attempts, 2);
+    assert_eq!(retried.len(), 1);
+    assert_eq!(retried[0].id(), id);
+    assert_eq!(retried[0].attempts, 2);
 }

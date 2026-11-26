@@ -160,13 +160,25 @@ export async function walkTo(pit, obstacles, [tx, ty], seen = { max: 0 }, timeou
  * player is predicted there again. Returns the new room and the own world
  * position sampled every frame on the way (`{ t, room, x, y }`). `along`
  * is how far off the side's middle to cross (an open side: anywhere).
+ *
+ * Arrived means the next room bound the player (the predictor is active
+ * again), not only that it is drawn there: from the Handoff on, the client
+ * draws its own player in the next room, predicted, before that room has
+ * even welcomed it (the handoff bridge). A slow room can still refuse the
+ * handoff then (and a gate reloads a stale client first), so a walk that
+ * stopped on the bridge could leave the player elsewhere. Until the room
+ * binds it the walk goes on, through the doorway again if it came back.
  */
 export async function walkThroughDoor(pit, [dx, dy], timeoutMs = 30_000, along = 1.7) {
 	const { client } = pit;
 	const from = pit.room();
 	const deadline = Date.now() + timeoutMs;
 	const trace = [];
-	const settled = () => pit.room() !== from && pit.me()?.predicted === true && pit.me()?.zoneId === pit.room();
+	const settled = () => {
+		const room = pit.room();
+		const me = pit.me();
+		return room !== from && client.predictor?.active === true && me?.predicted === true && me.zoneId === room;
+	};
 	for (let after = 0; after < 10; after += settled() ? 1 : 0) {
 		if (Date.now() > deadline) throw new Error(`walk through door ${dx},${dy} timed out`);
 		const me = pit.me();

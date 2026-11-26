@@ -408,8 +408,122 @@ pub async fn query_plan_corpus_matches_server_semantics(db: Db) {
     }
 }
 
+/// The keyset `where` a `@window` operation sends: rows after the cursor in
+/// `priority desc, id asc` order (the server appends the primary key ASC).
+const KEYSET_PAGE: &str = r#"query Page($limit: Int!, $cursor_priority: BigInt, $cursor_id: String) {
+  client_plan_rows(
+    where: {_or: [{priority: {_lt: $cursor_priority}}, {priority: {_eq: $cursor_priority}, id: {_gt: $cursor_id}}]}
+    order_by: [{priority: desc}]
+    limit: $limit
+  ) { id }
+}"#;
+
+async fn keyset_ids(engine: &GraphqlEngine, variables: JsonValue) -> Vec<String> {
+    let request =
+        Request::new(KEYSET_PAGE).variables(async_graphql::Variables::from_json(variables));
+    let response = engine.execute(&user(), request).await;
+    assert!(!response.is_err(), "{:?}", response.errors);
+    serde_json::to_value(response.data).unwrap()["client_plan_rows"]
+        .as_array()
+        .expect("rows")
+        .iter()
+        .map(|row| row["id"].as_str().expect("string id").to_string())
+        .collect()
+}
+
+/// GraphQL resolves an omitted nullable variable to `null`; a `null`
+/// comparison operand adds no predicate, so the head page (no cursor) is the
+/// first page of the ordered result, as the client replica computes it.
+pub async fn omitted_cursor_variables_select_the_head_page(db: Db) {
+    let corpus: ClientPlanCorpus =
+        serde_json::from_str(&std::fs::read_to_string(CORPUS_PATH).expect("read corpus"))
+            .expect("parse corpus");
+    db.seed(corpus.records).await;
+    let engine = corpus_engine(&db, None);
+    let head = keyset_ids(&engine, serde_json::json!({"limit": 3})).await;
+    assert_eq!(head, ["2", "8", "5"]);
+    let explicit_null = keyset_ids(
+        &engine,
+        serde_json::json!({"limit": 3, "cursor_priority": null, "cursor_id": null}),
+    )
+    .await;
+    assert_eq!(explicit_null, head);
+    // Each page continues after the previous page's last row; the tie on
+    // priority 3 (ids 3 and 7) and on 5 (ids 2 and 8) is split by id.
+    let mut pages = vec![head];
+    loop {
+        let last = pages.last().unwrap().last().cloned();
+        let Some(last) = last else { break };
+        let row = corpus_row(&last);
+        let page = keyset_ids(
+            &engine,
+            serde_json::json!({"limit": 3, "cursor_priority": row.0, "cursor_id": row.1}),
+        )
+        .await;
+        let done = page.len() < 3;
+        pages.push(page);
+        if done {
+            break;
+        }
+    }
+    assert_eq!(
+        pages.concat(),
+        ["2", "8", "5", "3", "7", "1", "6", "4", "9"],
+        "keyset pages concatenate to the ordered result: {pages:?}"
+    );
+}
+
+fn corpus_row(id: &str) -> (i64, String) {
+    let priority = match id {
+        "4" | "9" => 1,
+        "1" | "6" => 2,
+        "3" | "7" => 3,
+        "5" => 4,
+        "2" | "8" => 5,
+        other => panic!("no corpus row `{other}`"),
+    };
+    (priority, id.to_string())
+}
+
+/// A read policy and a cursor compose: the cursor narrows the rows the
+/// privilege may read and never widens them.
+pub async fn keyset_cursor_composes_with_a_row_policy(db: Db) {
+    let corpus: ClientPlanCorpus =
+        serde_json::from_str(&std::fs::read_to_string(CORPUS_PATH).expect("read corpus"))
+            .expect("parse corpus");
+    db.seed(corpus.records).await;
+    // Only `ana`'s rows (1, 2, 5, 8) are readable.
+    let policy = distributed::graphql::col("owner").eq("ana");
+    let engine = corpus_engine(&db, Some(policy));
+    // `ana` in `priority desc, id asc`: 2 (5), 8 (5), 5 (4), 1 (2).
+    assert_eq!(
+        keyset_ids(&engine, serde_json::json!({"limit": 10})).await,
+        ["2", "8", "5", "1"]
+    );
+    // After (5, "2"): 8 shares the priority and sorts after by id; 3 and 7
+    // (priority 3, `bo`/`cy`) would follow 5 without the policy.
+    assert_eq!(
+        keyset_ids(
+            &engine,
+            serde_json::json!({"limit": 2, "cursor_priority": 5, "cursor_id": "2"})
+        )
+        .await,
+        ["8", "5"]
+    );
+    assert_eq!(
+        keyset_ids(
+            &engine,
+            serde_json::json!({"limit": 2, "cursor_priority": 4, "cursor_id": "5"})
+        )
+        .await,
+        ["1"]
+    );
+}
+
 on_each_dialect! { ;
     list_and_by_pk_compile_and_execute,
     where_eq_uses_production_compiler,
     query_plan_corpus_matches_server_semantics,
+    omitted_cursor_variables_select_the_head_page,
+    keyset_cursor_composes_with_a_row_policy,
 }

@@ -9,6 +9,7 @@ use crate::read_model::ReadModelWritePlanBuilder;
 use crate::repository::{
     CommitBatch, RepositoryError, StreamIdentity, StreamWrite, TransactionalCommit,
 };
+use crate::schedule::{Schedule, ScheduleWrite};
 use crate::table::TableWritePlan;
 
 /// What a commit does with the ids of the outbox rows it just inserted.
@@ -74,10 +75,12 @@ impl CommitReceipt {
     }
 }
 
-/// Builder returned by [`AggregateRepository::outbox`] and
-/// [`AggregateRepository::read_models`] that commits an aggregate together with
-/// outbox rows, relational read-model writes, and (when the repository has
-/// snapshots configured) a snapshot — all in one async transactional batch.
+/// Builder returned by [`AggregateRepository::outbox`],
+/// [`AggregateRepository::read_models`] and
+/// [`AggregateRepository::schedule`] that commits an aggregate together with
+/// outbox rows, relational read-model writes, schedule writes and (when the
+/// repository has snapshots configured) a snapshot — all in one async
+/// transactional batch.
 ///
 /// Borrows the repository so it can be called through `ctx.repo()` inside async
 /// handlers. Chain `.outbox(..)` / `.read_models(..)` to stage more, then
@@ -88,6 +91,7 @@ pub struct AggregateCommit<'a, R, A> {
     explicit_domain_events: Vec<PreparedDomainEvent>,
     outbox_messages: Vec<OutboxMessage>,
     read_model_plans: Vec<TableWritePlan>,
+    schedules: Vec<ScheduleWrite>,
     error: Option<RepositoryError>,
 }
 
@@ -99,6 +103,7 @@ impl<'a, R, A> AggregateCommit<'a, R, A> {
             explicit_domain_events: Vec::new(),
             outbox_messages: Vec::new(),
             read_model_plans: Vec::new(),
+            schedules: Vec::new(),
             error: None,
         }
     }
@@ -143,6 +148,22 @@ impl<'a, R, A> AggregateCommit<'a, R, A> {
                 Err(err) => self.error = Some(err.into()),
             }
         }
+        self
+    }
+
+    /// Schedule (or re-schedule) work for the committed aggregate
+    /// ([`crate::schedule`]), in the same transaction. It fires only where
+    /// the repository's schedules are dispatched (a schedule worker
+    /// attached, or a host that fires its own).
+    pub fn schedule(mut self, schedule: Schedule) -> Self {
+        self.schedules.push(ScheduleWrite::Arm(schedule));
+        self
+    }
+
+    /// Cancel a schedule of the committed aggregate in the same transaction
+    /// (no-op when it is not armed).
+    pub fn cancel_schedule(mut self, name: impl Into<String>) -> Self {
+        self.schedules.push(ScheduleWrite::Cancel(name.into()));
         self
     }
 }
@@ -196,7 +217,7 @@ where
                 read_model_plans: self.read_model_plans,
                 snapshots,
                 inbox_receipts: Vec::new(),
-                schedules: Vec::new(),
+                schedules: self.schedules,
             })
             .await?;
         if let Some(version) = snapshot_version {
@@ -290,6 +311,18 @@ impl<R, A> AggregateRepository<R, A> {
     pub fn read_models(&self, read_models: ReadModelWritePlanBuilder) -> AggregateCommit<'_, R, A> {
         AggregateCommit::empty(self).read_models(read_models)
     }
+
+    /// Start a commit that schedules work for the aggregate
+    /// ([`AggregateCommit::schedule`]).
+    pub fn schedule(&self, schedule: Schedule) -> AggregateCommit<'_, R, A> {
+        AggregateCommit::empty(self).schedule(schedule)
+    }
+
+    /// Start a commit that cancels a schedule of the aggregate
+    /// ([`AggregateCommit::cancel_schedule`]).
+    pub fn cancel_schedule(&self, name: impl Into<String>) -> AggregateCommit<'_, R, A> {
+        AggregateCommit::empty(self).cancel_schedule(name)
+    }
 }
 
 fn domain_event_repository_error(error: DomainEventCaptureError) -> RepositoryError {
@@ -307,7 +340,6 @@ mod tests {
     use super::*;
     use crate::{sourced, AggregateBuilder, Entity, InMemoryRepository, OutboxStore};
     use std::sync::Mutex;
-    use std::time::Duration;
 
     #[derive(Default)]
     struct Dummy {
@@ -362,21 +394,18 @@ mod tests {
         }));
         let mut aggregate = Dummy::default();
         aggregate.touch().unwrap();
-        let now = crate::time::now();
-        let due = OutboxMessage::create("due", "T", vec![]).unwrap();
-        let timer = OutboxMessage::create("timer", "T", vec![])
-            .unwrap()
-            .deliver_after(now, Duration::from_secs(3600));
+        let first = OutboxMessage::create("first", "T", vec![]).unwrap();
+        let second = OutboxMessage::create("second", "T", vec![]).unwrap();
 
-        repo.outbox(due)
-            .outbox(timer)
+        repo.outbox(first)
+            .outbox(second)
             .commit(&mut aggregate)
             .await
             .unwrap();
 
         assert_eq!(
             *handed_over.lock().unwrap(),
-            vec!["due".to_string(), "timer".to_string()]
+            vec!["first".to_string(), "second".to_string()]
         );
         // Nothing is claimed inside the commit: the publisher claims.
         let pending = repo.repo().outbox_store().pending(10).await.unwrap();

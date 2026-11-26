@@ -390,9 +390,6 @@ macro_rules! repository_conformance_tests {
             outbox_backlog_stats_report_the_oldest_pending_message(b) =>
                 $crate::repository::storage::outbox_backlog_stats_report_the_oldest_pending_message(b.repository(), b.outbox());
             #[tokio::test]
-            outbox_honours_deliver_at(b) =>
-                $crate::repository::storage::outbox_honours_deliver_at(b.repository(), b.outbox());
-            #[tokio::test]
             consumer_inbox_records_dedupes_and_fences_with_real_effects(b) =>
                 $crate::repository::inbox::inbox_records_dedupes_and_fences_with_real_effects(b.repository(), b.outbox());
             #[tokio::test]
@@ -412,8 +409,8 @@ macro_rules! repository_conformance_tests {
         }
         $crate::conformance_cases! { @if $durable $crate::repository::Durable, $backend, open_durable;
             #[tokio::test]
-            scheduled_message_survives_restart_and_fires_when_due(b) =>
-                $crate::repository::storage::scheduled_message_survives_restart_and_fires_when_due(&b);
+            released_row_keeps_its_backoff_across_restart(b) =>
+                $crate::repository::storage::released_row_keeps_its_backoff_across_restart(&b);
         }
     };
 }

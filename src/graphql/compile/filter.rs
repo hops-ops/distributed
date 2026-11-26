@@ -331,7 +331,7 @@ fn compile_client_where(
                     }
                     if let Value::Object(ops) = val {
                         for (op, rhs) in ops {
-                            preds.push(compile_client_op(
+                            preds.extend(compile_client_op(
                                 inner,
                                 col_name,
                                 &col.column_type,
@@ -392,7 +392,29 @@ fn compile_client_where(
     Ok((!preds.is_empty()).then(|| format!("({})", preds.join(" AND "))))
 }
 
+/// One comparison of a client `where`, or `None` when its operand is `null`.
+///
+/// A `null` operand adds no predicate, as a `null` field or `_and` already
+/// does. GraphQL resolves an omitted nullable variable to `null`, and the
+/// client replica drops the field it fills, so an optional variable (a window
+/// cursor, a search box) means "no constraint" on both sides. Use `_is_null`
+/// to match SQL NULL.
 fn compile_client_op(
+    inner: &EngineInner,
+    column: &str,
+    column_type: &ColumnType,
+    op: &str,
+    rhs: &Value,
+    alias: &str,
+    binds: &mut Vec<BindValue>,
+) -> Result<Option<String>, CompileError> {
+    if matches!(rhs, Value::Null) {
+        return Ok(None);
+    }
+    compile_client_comparison(inner, column, column_type, op, rhs, alias, binds).map(Some)
+}
+
+fn compile_client_comparison(
     inner: &EngineInner,
     column: &str,
     column_type: &ColumnType,

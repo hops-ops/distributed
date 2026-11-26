@@ -148,16 +148,57 @@ Put stable values in GraphQL itself:
 ```graphql
 query ChatMessages(
   $limit: Int! = 25
-  $offset: Int! = 0
+  $room: String! = "lobby"
 ) @load @live {
-  chat_messages(limit: $limit, offset: $offset) { message_id body }
+  chat_messages(where: { room_id: { _eq: $room } }, limit: $limit) { message_id body }
 }
 ```
 
 The generated variable properties are optional, while the compiler-owned codec
 canonicalizes the defaults before cache identity, SSR, live continuation, or
-transport. An explicit `ChatMessages.use({ limit: 50, offset: 0 })` overrides
-them; `ChatMessages.use()` uses the exact defaults.
+transport. An explicit `ChatMessages.use({ limit: 50 })` overrides them;
+`ChatMessages.use()` uses the exact defaults.
+
+### Windows: a live head plus older pages
+
+A list operation marked `@window` pages by keyset instead of offset:
+
+```graphql
+query ChatMessages($limit: Int! = 25) @load @live @window {
+  chat_messages(
+    where: { room_id: { _eq: "lobby" } }
+    limit: $limit
+    order_by: [{ created_at: desc }, { message_id: desc }]
+  ) { message_id body created_at }
+}
+```
+
+```ts
+const lobby = ChatMessages.useWindow(); // or useWindow(variables, { pageSize })
+$lobby.rows; // newest first: the live head, then every loaded page, once each
+$lobby.hasMore; // rows exist after the last one
+await lobby.fetchMore(); // never rejects; see $lobby.fetchMoreError
+```
+
+The compiler requires `limit: $variable`, no `offset`, and a literal
+`order_by` of `asc`/`desc` columns that are non-null strings or numbers. The
+keyset is those columns followed by any primary-key column not listed
+(ascending, as the server breaks ties), so every row has a unique position.
+For each it adds a nullable `$cursor_<column>` variable and ANDs the rows after
+the cursor into `where`; row policies and the caller's filter still apply. An
+omitted cursor adds no predicate (a `null` comparison operand never does), so
+the document with no cursor is the head page SSR loads.
+
+The head keeps the caller's variables, so a window over SSR data mounts with
+no request, and it alone is `@live`. Retained pages are ordinary non-live
+operations; because each starts after a row's values, head arrivals never move
+or stale them. The first `fetchMore()` starts after the head's newest server
+row and asks for the rest of the head plus one page, so the head can take
+`pageSize - 1` arrivals before the rows it dropped are in no page; at that
+point the window drops its pages rather than show a gap, and `fetchMore()`
+starts again. A page shorter than its limit is the end. Rows compare like the
+server orders them (strings by UTF-8 bytes on both SQLite and Postgres), and
+`pending.has(row)` covers every page.
 
 Same-name route parameters are inferred. For external values, add one bounded
 sidecar beside the document rather than putting screen behavior in

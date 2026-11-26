@@ -12,7 +12,7 @@ use super::causal::{
     ModeledProjectionMetadata,
 };
 use super::causal::{CausalDispatchError, CausalDispatchResult, SealModeledProjection};
-#[cfg(feature = "graphql")]
+#[cfg(feature = "http")]
 use super::causal::{ExternalCausalAttempt, ExternalCausalReservation};
 use super::helpers::{
     is_json_content_type, message_to_json_input, message_to_session, names_by_kind,
@@ -31,10 +31,10 @@ use crate::bus::{
 use crate::command::{TypedCommandContract, TypedServiceCommandBinding};
 use crate::command_dispatch::VerifiedPrincipal;
 use crate::command_ledger::CommandLookup;
+#[cfg(feature = "http")]
+use crate::command_ledger::ExternalDispatchBinding;
 #[cfg(feature = "graphql")]
-use crate::command_ledger::{
-    CommandId, CommandLedgerKey, ExternalDispatchBinding, PrincipalPartitionId,
-};
+use crate::command_ledger::{CommandId, CommandLedgerKey, PrincipalPartitionId};
 use crate::microsvc::error::HandlerError;
 use crate::microsvc::lifecycle::LifecycleGate;
 use crate::microsvc::projector::{ProjectionRepairHandle, ProjectorRegistration};
@@ -709,7 +709,7 @@ impl Service {
 
     /// Every typed command that commits to `aggregate`, by name, with its
     /// declared shard (`None` when the command declares none).
-    #[cfg(feature = "graphql")]
+    #[cfg(feature = "http")]
     pub(crate) fn aggregate_command_shards(
         &self,
         aggregate: std::any::TypeId,
@@ -752,7 +752,7 @@ impl Service {
     /// Reserve the gateway ledger row for a command that will be committed by
     /// an aggregate cell. The route performs canonical input and grant checks
     /// before any remote request is made.
-    #[cfg(feature = "graphql")]
+    #[cfg(feature = "http")]
     pub(crate) async fn reserve_external_causal(
         &self,
         command: &str,
@@ -786,7 +786,7 @@ impl Service {
     /// Persist a sealed terminal receipt for a command committed by a cell.
     /// This path only updates the gateway ledger and never invokes a local
     /// handler or appends a local event batch.
-    #[cfg(feature = "graphql")]
+    #[cfg(feature = "http")]
     pub(crate) async fn complete_external_causal(
         &self,
         command: &str,
@@ -813,7 +813,7 @@ impl Service {
 
     /// Mark a remote attempt retryable after a transport/protocol failure.
     /// The durable fence remains the authority for later replay or reclaim.
-    #[cfg(feature = "graphql")]
+    #[cfg(feature = "http")]
     pub(crate) async fn abandon_external_causal(
         &self,
         command: &str,
@@ -1006,29 +1006,6 @@ impl Service {
     /// ambiguous IDs all collapse to `unknown`.
     #[cfg(feature = "graphql")]
     pub(crate) async fn causal_command_status(
-        &self,
-        command_id: &str,
-        session: &Session,
-        principal: VerifiedPrincipal,
-    ) -> Result<CausalCommandPublicStatus, CausalDispatchError> {
-        self.causal_command_status_internal(command_id, session, principal, None)
-            .await
-    }
-
-    #[cfg(feature = "graphql")]
-    pub(crate) async fn causal_command_status_with_protocol(
-        &self,
-        command_id: &str,
-        session: &Session,
-        principal: VerifiedPrincipal,
-        protocol: crate::graphql::protocol::ProtocolResponseAccumulator,
-    ) -> Result<CausalCommandPublicStatus, CausalDispatchError> {
-        self.causal_command_status_internal(command_id, session, principal, Some(protocol))
-            .await
-    }
-
-    #[cfg(feature = "graphql")]
-    async fn causal_command_status_internal(
         &self,
         command_id: &str,
         session: &Session,

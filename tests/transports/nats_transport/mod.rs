@@ -152,12 +152,12 @@ async fn archive_and_live_decode_reject_the_same_poisoned_identity_and_kind_head
         let bytes = event.canonical_bytes().unwrap();
         let mut headers = async_nats::HeaderMap::new();
         headers.insert(
-            "x-sourced-payload-codec",
+            "x-distributed-payload-codec",
             "distributed.domain-event-occurrence+json",
         );
         if case != "missing-kind" {
             headers.insert(
-                "X-Sourced-Kind",
+                "x-distributed-kind",
                 if case == "wrong-kind" {
                     "command"
                 } else {
@@ -165,6 +165,7 @@ async fn archive_and_live_decode_reject_the_same_poisoned_identity_and_kind_head
                 },
             );
         }
+        headers.insert("x-distributed-id", event.id());
         if event.external_source().is_some() {
             let mut hash = Sha256::new();
             hash.update(b"distributed.nats.external-occurrence.v1\0");
@@ -173,13 +174,12 @@ async fn archive_and_live_decode_reject_the_same_poisoned_identity_and_kind_head
                 "Nats-Msg-Id",
                 format!("external:sha256:{:x}", hash.finalize()),
             );
-            headers.insert("X-Distributed-Occurrence-Id", event.id());
             if case == "duplicate" {
-                headers.append("x-distributed-occurrence-id", "forged-extra");
+                headers.append("X-Distributed-Id", "forged-extra");
             }
         } else {
-            headers.insert("Nats-Msg-Id", event.id());
-            headers.insert("x-distributed-occurrence-id", "forged-logical");
+            // An aggregate event whose broker dedup id is not its message id.
+            headers.insert("Nats-Msg-Id", "forged-dedup");
         }
         js.publish_with_headers(
             format!("{namespace}.evt.{}", event.descriptor().name),
@@ -216,9 +216,9 @@ async fn malformed_external_headers_fail_closed_without_ack_or_false_progress() 
     let event = external_balance(1, 10);
     let mut headers = async_nats::HeaderMap::new();
     headers.insert("Nats-Msg-Id", "forged");
-    headers.insert("X-Sourced-Kind", "event");
-    headers.append("X-Distributed-Occurrence-Id", event.id());
-    headers.append("X-Distributed-Occurrence-Id", event.id());
+    headers.insert("x-distributed-kind", "event");
+    headers.append("X-Distributed-Id", event.id());
+    headers.append("x-distributed-id", event.id());
     js.publish_with_headers(subject, headers, event.canonical_bytes().unwrap().into())
         .await
         .unwrap()

@@ -13,8 +13,11 @@ import type {
 	ReplicaOperationArtifact,
 	ReplicaSnapshot,
 	ReplicaWatch,
+	ReplicaWindowOperationArtifact,
+	ReplicaWindowRow,
 	WatchReplicaOptions
 } from '../replica/index.js';
+import { replicaWindowPageSize } from '../replica/window.js';
 import type { GqlError, GraphqlVariables } from '../types.js';
 import { authFromPageData, type PageGraphqlData } from './auth.js';
 import {
@@ -31,6 +34,11 @@ import type {
 	DistributedSvelteKitLocationContext,
 	SveltekitBoundaryRetention
 } from '../boundary-lifecycle.js';
+import {
+	SveltekitWindowStoreImpl,
+	type SveltekitWindowStore,
+	type UseSveltekitWindowOptions
+} from './window.js';
 import {
 	distributedReloadLifecycle,
 	registerDistributedReloadClient,
@@ -113,6 +121,30 @@ type UseOperationArguments<TVariables extends GraphqlVariables> =
 				options?: UseSveltekitOperationOptions
 		  ];
 
+type UseWindowArguments<TVariables extends GraphqlVariables> =
+	Record<string, never> extends TVariables
+		?
+				| []
+				| [variables: TVariables]
+				| [variables: TVariables, options: UseSveltekitWindowOptions]
+		: [variables: TVariables, options?: UseSveltekitWindowOptions];
+
+/** A generated `@window` operation: everything a query has, plus `useWindow`. */
+export type SveltekitWindowOperation<
+	TData,
+	TVariables extends GraphqlVariables
+> = SveltekitBoundOperation<TData, TVariables> &
+	Readonly<{
+		/**
+		 * The live head page plus every page `fetchMore()` loaded, as one
+		 * ordered, de-duplicated `rows` list. Cursor and `limit` variables
+		 * are the window's; pass the operation's other variables.
+		 */
+		useWindow(
+			...args: UseWindowArguments<TVariables>
+		): SveltekitWindowStore<ReplicaWindowRow<TData>>;
+	}>;
+
 export type SveltekitBoundOperation<
 	TData,
 	TVariables extends GraphqlVariables
@@ -138,6 +170,9 @@ export type DistributedSvelteKitClient<TCommands> = Readonly<{
 	replica: DistributedReplica;
 	transport: ReplicaGraphqlTransport;
 	commands: TCommands;
+	operation<TData, TVariables extends GraphqlVariables>(
+		artifact: ReplicaWindowOperationArtifact<TData, TVariables>
+	): SveltekitWindowOperation<TData, TVariables>;
 	operation<TData, TVariables extends GraphqlVariables>(
 		artifact: ReplicaOperationArtifact<TData, TVariables>
 	): SveltekitBoundOperation<TData, TVariables>;
@@ -237,10 +272,10 @@ export function createDistributedSvelteKit<TCommands = Readonly<Record<never, ne
 		active: client.track,
 		idle: client.release
 	});
-	const operation = <TData, TVariables extends GraphqlVariables>(
+	const operation = (<TData, TVariables extends GraphqlVariables>(
 		artifact: ReplicaOperationArtifact<TData, TVariables>
 	): SveltekitBoundOperation<TData, TVariables> =>
-		bindOperation(client.replica, artifact, lifecycle);
+		bindOperation(client.replica, artifact, lifecycle)) as DistributedSvelteKitClient<TCommands>['operation'];
 	const boundary = <
 		TData,
 		TVariables extends GraphqlVariables,
@@ -300,6 +335,20 @@ export function createDistributedSvelteKit<TCommands = Readonly<Record<never, ne
  * Most SvelteKit applications use `createDistributedSvelteKit().operation()`;
  * this form exists for custom composition and framework adapter conformance.
  */
+export function bindSveltekitOperation<
+	TData,
+	TVariables extends GraphqlVariables
+>(
+	replica: DistributedReplica,
+	artifact: ReplicaWindowOperationArtifact<TData, TVariables>
+): SveltekitWindowOperation<TData, TVariables>;
+export function bindSveltekitOperation<
+	TData,
+	TVariables extends GraphqlVariables
+>(
+	replica: DistributedReplica,
+	artifact: ReplicaOperationArtifact<TData, TVariables>
+): SveltekitBoundOperation<TData, TVariables>;
 export function bindSveltekitOperation<
 	TData,
 	TVariables extends GraphqlVariables
@@ -395,9 +444,38 @@ function bindOperation<TData, TVariables extends GraphqlVariables>(
 		);
 		return store;
 	};
+	const window = artifact.window;
+	const useWindow =
+		window === undefined
+			? undefined
+			: (
+					variables: TVariables = {} as TVariables,
+					options: UseSveltekitWindowOptions = {}
+				): SveltekitWindowStore<unknown> => {
+					const pageSize = replicaWindowPageSize(window, options.pageSize);
+					const live = options.live ?? artifact.live !== undefined;
+					const open = (values: GraphqlVariables, pageLive: boolean) =>
+						use(...([values, { live: pageLive }] as UseOperationArguments<TVariables>));
+					// The head keeps the caller's variables (and so the cache key
+					// SSR seeded) unless a page size overrides the default limit.
+					const head =
+						options.pageSize === undefined
+							? variables
+							: { ...variables, [window.limitVariable]: pageSize };
+					return new SveltekitWindowStoreImpl(
+						window,
+						artifact.roots[0]!.responseKey,
+						open,
+						variables,
+						pageSize,
+						head,
+						live
+					);
+				};
 	return Object.freeze({
 		artifact,
 		use,
+		...(useWindow === undefined ? {} : { useWindow }),
 		read: (variables: TVariables) => replica.read(artifact, variables),
 		prefetch: (variables: TVariables) =>
 			prefetchReplicaOperation(replica, artifact, variables),

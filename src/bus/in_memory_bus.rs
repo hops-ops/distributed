@@ -22,7 +22,7 @@ use super::source::{MessageSource, ReceivedMessage};
 use super::{
     run_source, Bus, BusConsumer, MessageRouter, PublishDeadLetters, RunOptions, TransportError,
 };
-use super::{Message, OrderedDelivery};
+use super::{Message, OrderedDelivery, WireEnvelope};
 use crate::projection_protocol::{ProjectionEpoch, ProjectionSource};
 
 /// Each queued command with the number of times it has been delivered.
@@ -200,10 +200,12 @@ fn validate_topic_retry(existing: &Message, retry: &Message) -> Result<(), Trans
 
 impl Bus for InMemoryBus {
     async fn send_message(&self, message: Message) -> Result<(), TransportError> {
+        WireEnvelope::validate(&message)?;
         self.enqueue(message)
     }
 
     async fn publish_message(&self, message: Message) -> Result<(), TransportError> {
+        WireEnvelope::validate(&message)?;
         self.append(message)
     }
 }

@@ -151,7 +151,6 @@ impl VerifiedPrincipal {
         self.expires_at
     }
 
-    #[cfg(feature = "graphql")]
     pub(crate) fn subject_matches(&self, subject: &str) -> bool {
         self.subject == subject
     }

@@ -13,7 +13,7 @@
 //! possible if Queue accepts a message and the outbox settlement is interrupted;
 //! the stable message id is therefore required end to end.
 
-use crate::bus::{validate_stable_message_id, Message, MessagePublisher, TransportError};
+use crate::bus::{Message, MessagePublisher, TransportError, WireEnvelope};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -38,15 +38,14 @@ pub struct CelldQueueEnvelope {
 impl CelldQueueEnvelope {
     /// Validate and wrap a canonical message for celld Queue.
     pub fn new(message: Message) -> Result<Self, TransportError> {
-        message.validate_name().map_err(|error| {
-            TransportError::permanent(format!("invalid celld Queue message name: {error}"))
+        WireEnvelope::validate(&message).map_err(|error| {
+            TransportError::permanent(format!("invalid celld Queue message: {error}"))
         })?;
-        let id = message.id().ok_or_else(|| {
-            TransportError::permanent("celld Queue messages require a stable message id")
-        })?;
-        validate_stable_message_id(Some(id)).map_err(|error| {
-            TransportError::permanent(format!("invalid celld Queue message id: {error}"))
-        })?;
+        if message.id().is_none() {
+            return Err(TransportError::permanent(
+                "celld Queue messages require a stable message id",
+            ));
+        }
 
         let envelope = Self {
             version: CELLD_QUEUE_ENVELOPE_VERSION,

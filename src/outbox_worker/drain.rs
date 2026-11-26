@@ -174,7 +174,7 @@ where
                         match self.dispatcher.dispatch_ids(&ids).await {
                             Ok(_) => backoff = self.error_backoff,
                             Err(error) => {
-                                eprintln!("outbox drain: {error}");
+                                tracing::warn!(%error, "outbox drain failed; backing off");
                                 backoff = backoff.saturating_mul(2).min(self.max_error_backoff);
                                 sleep_for = backoff;
                             }
@@ -195,7 +195,7 @@ where
                     };
                 }
                 Err(error) => {
-                    eprintln!("outbox drain: {error}");
+                    tracing::warn!(%error, "outbox drain failed; backing off");
                     sleep_for = backoff;
                     backoff = backoff.saturating_mul(2).min(self.max_error_backoff);
                 }

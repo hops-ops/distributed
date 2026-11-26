@@ -8,13 +8,15 @@ use std::time::SystemTime;
 use serde::{Deserialize, Serialize};
 
 use super::message::{
-    SagaMessage, SagaPhase, SagaSignal, META_ATTEMPT, META_COMMAND_ID, META_MEMBER, META_PHASE,
-    META_REPLY_TO, META_SAGA_ID, META_SAGA_TYPE, META_STEP, SAGA_TIMEOUT,
+    SagaMessage, SagaPhase, SagaSignal, META_ATTEMPT, META_MEMBER, META_PHASE, META_REPLY_TO,
+    META_SAGA_ID, META_SAGA_TYPE, META_STEP,
 };
+use super::timeout::{SagaTimeout, SAGA_TIMEOUT_SCHEDULE};
 use super::{SagaDefinition, SagaError};
 use crate::aggregate::Aggregate;
 use crate::entity::{Entity, EventRecord};
 use crate::outbox::OutboxMessage;
+use crate::schedule::{Schedule, ScheduleWrite};
 
 /// Lifecycle of a saga.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -177,21 +179,25 @@ impl<T> SagaEvent<T> {
 /// How a message was handled.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SagaOutcome {
-    /// New events were recorded (and possibly commands/timers emitted).
+    /// New events were recorded (and possibly commands emitted, the timer
+    /// re-armed or cancelled).
     Applied,
     /// This message id was already processed: nothing to do, ack it.
     Duplicate,
-    /// Stale or irrelevant (late reply, superseded timer, terminal saga): ack it.
+    /// Stale or irrelevant (late reply, superseded timeout, terminal saga): ack it.
     Ignored,
 }
 
 /// Result of a saga transition: commit the aggregate together with
-/// `messages` (commands to participants and the saga's own timers) in one
-/// transaction.
+/// `messages` (commands to participants) and `timer` in one transaction.
 #[derive(Debug)]
 pub struct SagaTransition {
     pub outcome: SagaOutcome,
     pub messages: Vec<OutboxMessage>,
+    /// The saga's timeout schedule ([`SAGA_TIMEOUT_SCHEDULE`]): armed at the
+    /// deadline of a new dispatch, cancelled when the saga ends, `None` when
+    /// it stays as it was.
+    pub timer: Option<ScheduleWrite>,
 }
 
 impl SagaTransition {
@@ -199,6 +205,7 @@ impl SagaTransition {
         Self {
             outcome,
             messages: Vec::new(),
+            timer: None,
         }
     }
 }
@@ -207,13 +214,14 @@ impl SagaTransition {
 ///
 /// `Saga<D>` is an ordinary [`Aggregate`]: load and commit it with any
 /// repository (`repo.aggregate::<Saga<D>>()`). Its methods record events
-/// and *return* the outbox messages to commit alongside them; commit both in
-/// one batch (`repo.outbox(..).commit(&mut saga)`, or use
-/// [`SagaRunner`](super::SagaRunner) which does exactly that).
+/// and *return* the outbox messages and the timeout schedule write to commit
+/// alongside them, in one batch ([`SagaRunner`](super::SagaRunner) does
+/// exactly that).
 ///
-/// Idempotency: every reply/timeout message id that changed state is stored
-/// in the saga, so a redelivery is reported as [`SagaOutcome::Duplicate`]
-/// and emits nothing. Optimistic stream versions fence concurrent handlers.
+/// Idempotency: every reply id that changed state is stored in the saga, so
+/// a redelivery is reported as [`SagaOutcome::Duplicate`] and emits nothing;
+/// a timeout for a dispatch the saga no longer awaits is ignored. Optimistic
+/// stream versions fence concurrent handlers.
 pub struct Saga<D: SagaDefinition> {
     entity: Entity,
     data: D::Data,
@@ -359,13 +367,10 @@ impl<D: SagaDefinition> Saga<D> {
         let mut messages = Vec::new();
         self.record(SagaEvent::Started { data })?;
         self.advance_from(0, now, &mut messages)?;
-        Ok(SagaTransition {
-            outcome: SagaOutcome::Applied,
-            messages,
-        })
+        self.applied(None, messages)
     }
 
-    /// React to a reply or timeout. See [`SagaOutcome`] for the no-op cases.
+    /// React to a participant reply. See [`SagaOutcome`] for the no-op cases.
     pub fn handle(
         &mut self,
         message: &SagaMessage,
@@ -406,7 +411,7 @@ impl<D: SagaDefinition> Saga<D> {
         let mut messages = Vec::new();
         let id = message.message_id.clone();
         if cursor.phase == SagaPhase::Action && cursor.fan_out > 0 {
-            return self.handle_member(step, &cursor, message, now);
+            return self.handle_member(step, cursor, message, now);
         }
         if message.member != cursor.member {
             // A reply for another member's compensation, or a fan-out reply
@@ -431,15 +436,6 @@ impl<D: SagaDefinition> Saga<D> {
                 })?;
                 self.compensate_next(now, &mut messages)?;
             }
-            (SagaPhase::Action, SagaSignal::TimedOut) if current_attempt => {
-                self.record(SagaEvent::StepFailed {
-                    step,
-                    message_id: id,
-                    reason: format!("step `{}` timed out", message.step),
-                    timed_out: true,
-                })?;
-                self.compensate_next(now, &mut messages)?;
-            }
             (SagaPhase::Compensation, SagaSignal::Succeeded { .. }) => {
                 self.record(SagaEvent::CompensationSucceeded {
                     step,
@@ -451,24 +447,95 @@ impl<D: SagaDefinition> Saga<D> {
             (SagaPhase::Compensation, SagaSignal::Failed { reason }) if current_attempt => {
                 self.compensation_failed(step, id, reason.clone(), &cursor, now, &mut messages)?;
             }
-            (SagaPhase::Compensation, SagaSignal::TimedOut) if current_attempt => {
-                let reason = format!("compensation of `{}` timed out", message.step);
-                self.compensation_failed(step, id, reason, &cursor, now, &mut messages)?;
-            }
-            // Failure/timeout of a superseded attempt.
+            // Failure of a superseded attempt.
             _ => return Ok(SagaTransition::unchanged(SagaOutcome::Ignored)),
         }
-        Ok(SagaTransition {
-            outcome: SagaOutcome::Applied,
-            messages,
-        })
+        self.applied(Some(cursor), messages)
     }
 
-    /// A reply or timer for one member of the fan-out action in flight.
+    /// React to the saga's timeout schedule firing (see [`SagaTimeouts`]).
+    /// The awaited step (or compensation) failed with an unknown outcome; a
+    /// fan-out action times out every member that has not replied. A timeout
+    /// for a dispatch the saga no longer awaits is [`SagaOutcome::Ignored`].
+    ///
+    /// [`SagaTimeouts`]: super::SagaTimeouts
+    pub fn time_out(
+        &mut self,
+        timeout: &SagaTimeout,
+        now: SystemTime,
+    ) -> Result<SagaTransition, SagaError> {
+        if self.status == SagaStatus::NotStarted {
+            return Err(SagaError::NotStarted);
+        }
+        if timeout.saga_id != self.id() {
+            return Err(SagaError::Malformed(format!(
+                "timeout for saga {} delivered to {}/{}",
+                timeout.saga_id,
+                D::SAGA_TYPE,
+                self.id()
+            )));
+        }
+        let Some(step) = step_index::<D>(&timeout.step) else {
+            return Err(SagaError::Malformed(format!(
+                "unknown saga step `{}`",
+                timeout.step
+            )));
+        };
+        let phase = SagaPhase::parse(&timeout.phase)?;
+        let Some(cursor) = self.cursor.clone().filter(|cursor| {
+            !self.status.is_terminal()
+                && (cursor.step, cursor.phase, cursor.attempt) == (step, phase, timeout.attempt)
+        }) else {
+            return Ok(SagaTransition::unchanged(SagaOutcome::Ignored));
+        };
+        let command_id = self.command_id(step, phase, cursor.attempt);
+        let mut messages = Vec::new();
+        match phase {
+            SagaPhase::Action if cursor.fan_out > 0 => {
+                for member in 0..cursor.fan_out {
+                    if self
+                        .fan_out
+                        .as_ref()
+                        .is_some_and(|fan_out| fan_out.is_settled(member))
+                    {
+                        continue;
+                    }
+                    self.record(SagaEvent::MemberFailed {
+                        step,
+                        member,
+                        message_id: format!("{command_id}:{member}:timeout"),
+                        reason: format!("member {member} of step `{}` timed out", timeout.step),
+                        timed_out: true,
+                    })?;
+                }
+                self.settle_fan_out(step, now, &mut messages)?;
+            }
+            SagaPhase::Action => {
+                self.record(SagaEvent::StepFailed {
+                    step,
+                    message_id: format!("{command_id}:timeout"),
+                    reason: format!("step `{}` timed out", timeout.step),
+                    timed_out: true,
+                })?;
+                self.compensate_next(now, &mut messages)?;
+            }
+            SagaPhase::Compensation => {
+                let message_id = match cursor.member {
+                    Some(member) => format!("{command_id}:{member}:timeout"),
+                    None => format!("{command_id}:timeout"),
+                };
+                let reason = format!("compensation of `{}` timed out", timeout.step);
+                self.compensation_failed(step, message_id, reason, &cursor, now, &mut messages)?;
+            }
+        }
+        self.applied(Some(cursor), messages)
+    }
+
+    /// A reply for one member of the fan-out action in flight.
     fn handle_member(
         &mut self,
         step: u32,
-        cursor: &SagaCursor,
+        cursor: SagaCursor,
         message: &SagaMessage,
         now: SystemTime,
     ) -> Result<SagaTransition, SagaError> {
@@ -490,7 +557,8 @@ impl<D: SagaDefinition> Saga<D> {
                 .as_ref()
                 .is_none_or(|fan_out| fan_out.is_settled(member))
         {
-            // A late reply after this member's timeout, or a superseded timer.
+            // A late reply after this member timed out, or for a superseded
+            // attempt.
             return Ok(SagaTransition::unchanged(SagaOutcome::Ignored));
         }
         let message_id = message.message_id.clone();
@@ -508,32 +576,89 @@ impl<D: SagaDefinition> Saga<D> {
                 reason: reason.clone(),
                 timed_out: false,
             })?,
-            SagaSignal::TimedOut => self.record(SagaEvent::MemberFailed {
-                step,
-                member,
-                message_id,
-                reason: format!("member {member} of step `{}` timed out", message.step),
-                timed_out: true,
-            })?,
         }
         let mut messages = Vec::new();
-        let settled = self
+        self.settle_fan_out(step, now, &mut messages)?;
+        self.applied(Some(cursor), messages)
+    }
+
+    /// Once every member of the fan-out action replied or timed out: advance
+    /// when all succeeded, otherwise compensate.
+    fn settle_fan_out(
+        &mut self,
+        step: u32,
+        now: SystemTime,
+        messages: &mut Vec<OutboxMessage>,
+    ) -> Result<(), SagaError> {
+        let Some(fan_out) = self
             .fan_out
             .as_ref()
             .filter(|fan_out| fan_out.all_settled())
-            .cloned();
-        if let Some(fan_out) = settled {
-            self.record(SagaEvent::FanOutSettled { step })?;
-            if fan_out.succeeded.len() as u32 == fan_out.members {
-                self.advance_from(step as usize + 1, now, &mut messages)?;
-            } else {
-                self.compensate_next(now, &mut messages)?;
-            }
+            .cloned()
+        else {
+            return Ok(());
+        };
+        self.record(SagaEvent::FanOutSettled { step })?;
+        if fan_out.succeeded.len() as u32 == fan_out.members {
+            self.advance_from(step as usize + 1, now, messages)
+        } else {
+            self.compensate_next(now, messages)
         }
+    }
+
+    /// An applied transition, with the timer write its new state implies:
+    /// cancelled once the saga is terminal, re-armed when it awaits a new
+    /// dispatch (`before` is the dispatch it awaited when the message came).
+    fn applied(
+        &self,
+        before: Option<SagaCursor>,
+        messages: Vec<OutboxMessage>,
+    ) -> Result<SagaTransition, SagaError> {
+        let timer = if self.status.is_terminal() {
+            Some(ScheduleWrite::Cancel(SAGA_TIMEOUT_SCHEDULE.to_string()))
+        } else {
+            match &self.cursor {
+                Some(cursor) if Some(cursor) != before.as_ref() => {
+                    Some(ScheduleWrite::Arm(self.timeout_schedule(cursor)?))
+                }
+                _ => None,
+            }
+        };
         Ok(SagaTransition {
             outcome: SagaOutcome::Applied,
             messages,
+            timer,
         })
+    }
+
+    /// The timeout schedule of the dispatch `cursor` awaits.
+    fn timeout_schedule(&self, cursor: &SagaCursor) -> Result<Schedule, SagaError> {
+        let input = SagaTimeout {
+            saga_id: self.id().to_string(),
+            step: D::steps()[cursor.step as usize].name.to_string(),
+            phase: cursor.phase.as_str().to_string(),
+            attempt: cursor.attempt,
+        };
+        Schedule::at(
+            SAGA_TIMEOUT_SCHEDULE,
+            cursor.deadline,
+            D::TIMEOUT_COMMAND,
+            &input,
+        )
+        .map_err(|error| SagaError::Definition(format!("saga timeout schedule: {error}")))
+    }
+
+    /// Command id of a dispatch, before any fan-out member suffix:
+    /// `type:id:step:phase:attempt`.
+    fn command_id(&self, step: u32, phase: SagaPhase, attempt: u32) -> String {
+        format!(
+            "{}:{}:{}:{}:{}",
+            D::SAGA_TYPE,
+            self.id(),
+            D::steps()[step as usize].name,
+            phase.as_str(),
+            attempt
+        )
     }
 
     // ---------------------------------------------------------------------
@@ -640,9 +765,10 @@ impl<D: SagaDefinition> Saga<D> {
         )
     }
 
-    /// Record a dispatch and emit each command plus its durable timeout timer.
-    /// Fan-out members (and member compensations) carry their index in the
-    /// command id (`…:{attempt}:{member}`) and in `saga-member` metadata.
+    /// Record a dispatch and emit each command; its deadline arms the timeout
+    /// schedule ([`applied`](Self::applied)). Fan-out members (and member
+    /// compensations) carry their index in the command id
+    /// (`…:{attempt}:{member}`) and in `saga-member` metadata.
     fn dispatch(
         &mut self,
         step: u32,
@@ -660,14 +786,7 @@ impl<D: SagaDefinition> Saga<D> {
         let deadline = now
             .checked_add(timeout)
             .ok_or_else(|| SagaError::Definition("saga step timeout overflows".into()))?;
-        let base_id = format!(
-            "{}:{}:{}:{}:{}",
-            D::SAGA_TYPE,
-            self.id(),
-            definition.name,
-            phase.as_str(),
-            attempt
-        );
+        let base_id = self.command_id(step, phase, attempt);
         let saga_id = self.id().to_string();
         let metadata = [
             (META_SAGA_TYPE, D::SAGA_TYPE.to_string()),
@@ -688,37 +807,26 @@ impl<D: SagaDefinition> Saga<D> {
             SagaPhase::Action => None,
         };
 
-        let mut outgoing = Vec::with_capacity(commands.len() * 2);
+        let mut outgoing = Vec::with_capacity(commands.len());
         for (member, command) in commands {
             let command_id = match member {
                 Some(member) => format!("{base_id}:{member}"),
                 None => base_id.clone(),
             };
             let mut outbound = OutboxMessage::create_to(
-                command_id.clone(),
+                command_id,
                 command.command_type,
                 command.destination,
                 command.payload,
             )?;
-            let mut timer = OutboxMessage::create_to(
-                format!("{command_id}:timeout"),
-                SAGA_TIMEOUT,
-                D::REPLY_TO,
-                Vec::new(),
-            )?
-            .deliver_at(deadline);
-            for message in [&mut outbound, &mut timer] {
-                for (key, value) in &metadata {
-                    message.set_meta(*key, value.clone());
-                }
-                if let Some(member) = member {
-                    message.set_meta(META_MEMBER, member.to_string());
-                }
-                message.set_correlation_id(saga_id.clone());
+            for (key, value) in &metadata {
+                outbound.set_meta(*key, value.clone());
             }
-            timer.set_meta(META_COMMAND_ID, command_id);
+            if let Some(member) = member {
+                outbound.set_meta(META_MEMBER, member.to_string());
+            }
+            outbound.set_correlation_id(saga_id.clone());
             outgoing.push(outbound);
-            outgoing.push(timer);
         }
 
         self.record(SagaEvent::Dispatched {

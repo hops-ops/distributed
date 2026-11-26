@@ -45,7 +45,13 @@ test('the same browser comes back as the same player after reloads and restarts'
 		return { api, pit };
 	}
 
-	/** Walk with `[mx, my]` for `frames` command frames, then stand still. */
+	/**
+	 * Walk with `[mx, my]` for `frames` command frames, then stand still
+	 * until the room has applied every input. The page draws its player
+	 * predicted ahead of the room; a busy room (dropped ticks) can be
+	 * seconds of inputs behind, and a page closed then leaves the body where
+	 * the room had it, not where the page drew it.
+	 */
 	async function walk(pit, [mx, my], frames) {
 		for (let i = 0; i < frames; i += 1) {
 			pit.client.sendInput({ mx, my, buttons: 0 });
@@ -55,6 +61,7 @@ test('the same browser comes back as the same player after reloads and restarts'
 			pit.client.sendInput({ mx: 0, my: 0, buttons: 0 });
 			await sleep(1000 / 30);
 		}
+		await until(() => pit.client.predictor?.pending.length === 0, 10_000, 'the room applied every input');
 	}
 
 	/** The player as the page shows it. */

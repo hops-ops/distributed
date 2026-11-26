@@ -1418,6 +1418,7 @@ dependencies = [
  "sqlx",
  "tokio",
  "tokio-tungstenite 0.30.0",
+ "tracing",
  "trybuild",
  "uuid",
  "wasm-bindgen",

@@ -576,6 +576,25 @@ impl SqlBusDialect for PostgresBusDialect {
         Ok(())
     }
 
+    async fn renew_claim(
+        &self,
+        seq: i64,
+        claim_token: &str,
+        lease_secs: f64,
+    ) -> Result<bool, TransportError> {
+        let renewed = sqlx::query(
+            "UPDATE bus_queue SET locked_until = now() + ($3 * interval '1 second') \
+             WHERE seq = $1 AND claim_token = $2",
+        )
+        .bind(seq)
+        .bind(claim_token)
+        .bind(lease_secs)
+        .execute(&self.pool)
+        .await
+        .map_err(|err| db_err("renew claim", err))?;
+        Ok(renewed.rows_affected() == 1)
+    }
+
     async fn release_claim(
         &self,
         seq: i64,

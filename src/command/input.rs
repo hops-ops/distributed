@@ -186,7 +186,7 @@ pub(crate) fn canonicalize_command_input(
     })
 }
 
-#[cfg(feature = "graphql")]
+#[cfg(feature = "http")]
 /// Check a command payload produced elsewhere (an aggregate cell) against
 /// the command's declared output type, by the input rules: every required
 /// field present, no undeclared field, every value of its declared type.

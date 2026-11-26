@@ -77,11 +77,9 @@ pub use application::{
     FrameworkCompatibility, LogicalId, Module, ModuleManifest, ProjectionSpec, SurfaceSpec,
     APPLICATION_MANIFEST_SCHEMA_VERSION,
 };
-#[cfg(feature = "graphql")]
-pub use command_dispatch::{
-    CellRequestContext, CommandHost, HttpCommandHost, LocalCommandHost, SharedCommandHost,
-    TrustedRequestMetadata,
-};
+#[cfg(feature = "http")]
+pub use command_dispatch::{CellRequestContext, HttpCommandHost, TrustedRequestMetadata};
+pub use command_dispatch::{CommandHost, LocalCommandHost, ProtocolAuthority, SharedCommandHost};
 
 // Domain events: typed outward contracts distinct from replay events/snapshots.
 pub use domain_event::{
@@ -334,13 +332,9 @@ pub use saga::{
 pub use schedule::{Capabilities, Capability, Schedule, ScheduleWrite};
 
 // Outbox: commit concerns (aggregate + outbox in one commit).
-//
-// Low-level row plumbing (`outbox_message_insert_plan`, `outbox_message_row_values`)
-// stays reachable under `distributed::outbox::*` and is intentionally NOT re-exported
-// at the crate root — it is an adapter-authoring detail, not part of the quick-start API.
 pub use outbox::{
-    outbox_message_key, outbox_message_schema, AggregateCommit, CommitReceipt, OutboxMessage,
-    OutboxMessageStatus, OutboxPublisherConfig, OUTBOX_MESSAGES_TABLE,
+    outbox_message_schema, AggregateCommit, CommitReceipt, OutboxMessage, OutboxMessageStatus,
+    OutboxPublisherConfig, OUTBOX_MESSAGES_TABLE,
 };
 
 // Outbox Worker: drain and publish concerns.

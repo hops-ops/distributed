@@ -7,7 +7,7 @@ use super::super::graphql::{
     Cardinality, CompiledArgument, CompiledBranch, CompiledBranchSemantic, CompiledFilterField,
     CompiledFilterPlan, CompiledMember, CompiledObject, CompiledOperation, CompiledOrderField,
     CompiledOrderPlan, CompiledPaginationPlan, CompiledRelationshipPlan, CompiledStorage,
-    CompiledVariableCodec,
+    CompiledVariableCodec, CompiledWindow,
 };
 use super::super::manifest::{
     ClientManifest, ClientRelationshipKind, ClientRelationshipMaintenance, ClientRowPolicy,
@@ -27,6 +27,8 @@ struct Artifact<'a> {
     protocol: ArtifactProtocol<'a>,
     #[serde(skip_serializing_if = "Option::is_none")]
     live: Option<ArtifactLive<'a>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    window: Option<&'a CompiledWindow>,
 }
 
 #[derive(Serialize)]
@@ -267,6 +269,7 @@ pub(super) fn render_operation_artifact_json(
             id: &live.hash,
             document: &live.document,
         }),
+        window: operation.window.as_ref(),
     };
     let artifact_json = serde_json::to_string_pretty(&artifact).map_err(|error| {
         ClientCompileError::manifest(

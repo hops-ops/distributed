@@ -168,6 +168,18 @@
         "path": "migrations/postgres/0014_hot_path_indexes.sql",
         "sha256": "519c693c60dea20999b65a666b2010e61caab1ce57340e62776926362a8b4ae7"
       }
+    },
+    {
+      "version": 15,
+      "description": "outbox without published",
+      "sqlite": {
+        "path": "migrations/sqlite/0015_outbox_without_published.sql",
+        "sha256": "a0076a01ab031b935095918df59c3e55e5c5acd9c363b5895e8112db91e96366"
+      },
+      "postgres": {
+        "path": "migrations/postgres/0015_outbox_without_published.sql",
+        "sha256": "e546fa87ad87b99b5c55625d9d0ad0675de480d746ce71dc419d0e1e1022ba82"
+      }
     }
   ]
 }

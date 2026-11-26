@@ -106,7 +106,7 @@ test.describe('chat (alice)', () => {
 			timeout: 20_000
 		});
 
-		// Seed more than one page so offset history is meaningful (page size 25).
+		// Seed more than one page so history paging is meaningful (page size 25).
 		const stamp = Date.now();
 		const total = 30;
 		for (let i = 0; i < total; i += 1) {
