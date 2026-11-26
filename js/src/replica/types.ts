@@ -507,6 +507,8 @@ type ReplicaOperationArtifactBase<
 		readonly id: string;
 		readonly document: string;
 	};
+	/** `@window`: the keyset this operation pages by. */
+	readonly window?: ReplicaWindowArtifact;
 	/** Phantom slots preserve generated result/variables types. */
 	readonly __result?: TData;
 	readonly __variables?: TVariables;
@@ -567,6 +569,46 @@ export type ReplicaOperationArtifact<
 	TData = Record<string, unknown>,
 	TVariables extends GraphqlVariables = GraphqlVariables
 > = ReplicaProtocolOperationArtifact<TData, TVariables>;
+
+/**
+ * One keyset column of a `@window` operation, in window order. Each row
+ * carries it at `responseKey`; a page after a row sets `variable` to it.
+ */
+export type ReplicaWindowKey = {
+	readonly field: string;
+	readonly responseKey: string;
+	readonly variable: string;
+	readonly direction: 'asc' | 'desc';
+	readonly codec: string;
+};
+
+/**
+ * The compiler's `@window` contract: the operation's `where` holds the rows
+ * after the cursor `keys` name, in `order_by` then primary-key order. With
+ * the cursor variables omitted it is the head page.
+ */
+export type ReplicaWindowArtifact = {
+	readonly limitVariable: string;
+	readonly pageSize: number;
+	readonly maxLimit: number;
+	readonly keys: readonly ReplicaWindowKey[];
+};
+
+/** A generated `@window` operation. */
+export type ReplicaWindowOperationArtifact<
+	TData = Record<string, unknown>,
+	TVariables extends GraphqlVariables = GraphqlVariables
+> = ReplicaOperationArtifact<TData, TVariables> & {
+	readonly window: ReplicaWindowArtifact;
+};
+
+/** The row type of a single-root list operation's data. */
+export type ReplicaWindowRow<TData> = TData[keyof TData] extends
+	| readonly (infer TRow)[]
+	| null
+	| undefined
+	? TRow
+	: never;
 
 /** Framework-neutral compiler metadata consumed by placement adapters. */
 export type ReplicaIslandMetadata = {

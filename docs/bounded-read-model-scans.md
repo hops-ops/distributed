@@ -31,3 +31,9 @@ Consumers must validate command fences against the owning aggregate and provide
 event-driven reconciliation for late rows. In particular, an empty first scan
 does not prove a concurrently created row will never need processing. This API
 does not provide an authorization bypass or replace a public GraphQL read policy.
+
+This is a server-side store API. Browser clients page a GraphQL list with a
+`@window` operation instead: its keyset is the operation's `order_by` plus the
+primary key, and its cursor is ordinary filter variables, so the same row
+policy, collation and authorization apply to every page (see the client
+replica section of the README).

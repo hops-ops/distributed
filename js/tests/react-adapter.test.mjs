@@ -365,8 +365,10 @@ test('React and SvelteKit subpaths remain bundle-isolated and React is optional'
 		reactBundle.outputFiles[0].contents.byteLength < 45_000,
 		'React adapter browser bundle exceeded its framework-isolation budget'
 	);
+	// Unminified. ~722 KB with keyset windows (2026-11); the Node and compiler
+	// checks above catch the dependencies this budget used to stand in for.
 	assert.ok(
-		svelteBundle.outputFiles[0].contents.byteLength < 720_000,
+		svelteBundle.outputFiles[0].contents.byteLength < 750_000,
 		'SvelteKit adapter browser bundle pulled in an unexpected Node/compiler dependency'
 	);
 });

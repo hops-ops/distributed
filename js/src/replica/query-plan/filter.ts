@@ -204,6 +204,9 @@ export function evaluateCallerField(
 	}
 	const predicates: ReplicaFilterEvaluation[] = [];
 	for (const [rawOperator, rhs] of Object.entries(value)) {
+		// A null operand adds no predicate, as on the server: an omitted
+		// nullable variable (a window cursor) means "no constraint".
+		if (rhs === null) continue;
 		const operatorPath = [...path, rawOperator];
 		if (
 			!isFilterOperator(rawOperator) ||

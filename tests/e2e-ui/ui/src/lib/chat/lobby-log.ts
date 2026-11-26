@@ -1,5 +1,6 @@
 /**
- * Lobby chat log geometry + history merge (pure).
+ * Lobby chat log geometry (pure). Paging, ordering and de-duplication belong
+ * to the generated `ChatMessages.useWindow()`.
  *
  * The scroller uses `flex-direction: column-reverse`. Browser scrollTop models:
  *
@@ -10,9 +11,6 @@
  *
  * Helpers normalize both so near-bottom / near-top and scroll preserve work.
  */
-
-/** Keep in sync across SSR variables and the chat page. */
-export const CHAT_PAGE_SIZE = 25;
 
 /** Detach stick-to-bottom once the user leaves the newest edge. */
 export const NEAR_BOTTOM_PX = 48;
@@ -68,43 +66,6 @@ export function nearTop(m: ChatLogMetrics, thresholdPx: number = LOAD_TOP_PX): b
 /** Content does not fill the scroller — load older until it does or history ends. */
 export function needsHistoryFill(m: ChatLogMetrics): boolean {
 	return m.scrollHeight <= m.clientHeight + 1;
-}
-
-/** A complete newest window shorter than its limit proves there is no older page. */
-export function liveWindowProvesHistoryExhausted(
-	messageCount: number,
-	pageSize: number
-): boolean {
-	return messageCount < pageSize;
-}
-
-export type HistoryPageResult<T extends { message_id: string }> = Readonly<{
-	/** Ascending rows to prepend (already reversed from server desc). */
-	fresh: readonly T[];
-	/** Next offset to request. */
-	nextOffset: number;
-	/** False when the page was short of a full window. */
-	hasMore: boolean;
-}>;
-
-/**
- * Merge one server history page (desc order) into the local history cursor.
- * Server returns newest-first for the offset window; we reverse to ascending.
- */
-export function mergeHistoryPage<T extends { message_id: string }>(
-	pageDesc: readonly T[],
-	knownIds: ReadonlySet<string>,
-	currentOffset: number,
-	pageSize: number
-): HistoryPageResult<T> {
-	const ascending = [...pageDesc].reverse();
-	const fresh = ascending.filter((m) => !knownIds.has(m.message_id));
-	const hasMore = pageDesc.length >= pageSize;
-	return {
-		fresh,
-		nextOffset: currentOffset + pageSize,
-		hasMore: pageDesc.length === 0 ? false : hasMore
-	};
 }
 
 /** Pin newest end under column-reverse (both scrollTop models). */

@@ -1,7 +1,9 @@
 use super::graphql::{compile_document, CompiledOperation};
 use super::manifest::ClientManifest;
 use super::render::{render_operation_artifact_json, render_operation_module};
-use super::tests::{manifest, parse_manifest, refresh_schema_fingerprint};
+use super::tests::{
+    manifest, parse_manifest, refresh_schema_fingerprint, window_manifest, WINDOW_FEED,
+};
 use super::{ClientDocument, ClientSurfaceIdentity};
 use crate::golden::assert_golden;
 
@@ -105,4 +107,15 @@ fn scalar_only_operation_module_is_byte_exact_and_needs_no_replica_value_import(
         "{module}"
     );
     assert!(!module.contains("ReplicaValue"), "{module}");
+}
+
+#[test]
+fn window_runtime_bridge_artifact_is_byte_exact() {
+    // `js/tests/replica-window.test.mjs` pages a replica with this artifact.
+    let manifest = parse_manifest(window_manifest(), &ClientSurfaceIdentity::role("user"))
+        .expect("window manifest");
+    let document = ClientDocument::new("src/routes/feed/+page.graphql", WINDOW_FEED);
+    let operation = compile_document(&document, &manifest).expect("compile window operation");
+    let artifact = render_operation_artifact_json(&operation, &manifest).unwrap();
+    assert_golden("window-bridge-operation.json", &format!("{artifact}\n"));
 }
