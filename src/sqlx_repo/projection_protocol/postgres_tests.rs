@@ -159,6 +159,28 @@ mod postgres_tests {
         assert_eq!(repeated.changes[0].kind, ProjectionChangeKind::Checkpoint);
     }
 
+    /// The next notification naming this module's table, or `None` if none
+    /// arrives `within`. NOTIFY channels are database-wide, not per schema,
+    /// so a listener also hears tests writing other tables of the shared test
+    /// database concurrently; those are skipped. Tests writing this table hold
+    /// `POSTGRES_PROJECTION_TEST_LOCK`.
+    async fn recv_view_change(
+        listener: &mut sqlx::postgres::PgListener,
+        within: Duration,
+    ) -> Option<sqlx::postgres::PgNotification> {
+        let deadline = tokio::time::Instant::now() + within;
+        loop {
+            let notification = tokio::time::timeout_at(deadline, listener.recv())
+                .await
+                .ok()?
+                .unwrap();
+            let tables: Vec<String> = serde_json::from_str(notification.payload()).unwrap();
+            if tables.contains(&schema().table_name) {
+                return Some(notification);
+            }
+        }
+    }
+
     fn topology() -> ProjectorTopologyId {
         ProjectorTopologyId::new(1, "postgres_projection_runtime", [71; 32]).unwrap()
     }
@@ -603,10 +625,9 @@ mod postgres_tests {
             .unwrap()
             .unwrap();
         assert!(local_change.tables.contains(PROJECTION_CHANGE_NOTIFY_TABLE));
-        tokio::time::timeout(Duration::from_secs(2), pg_changes.recv())
+        recv_view_change(&mut pg_changes, Duration::from_secs(2))
             .await
-            .expect("PostgreSQL notifies only after the projection transaction commits")
-            .unwrap();
+            .expect("PostgreSQL notifies only after the projection transaction commits");
         assert_live_snapshot(
             &repository
                 .projection_query_snapshot(&snapshot_request(ProjectionGeneration::initial()))
@@ -926,9 +947,9 @@ mod postgres_tests {
             Err(tokio::sync::broadcast::error::TryRecvError::Empty)
         );
         assert!(
-            tokio::time::timeout(Duration::from_millis(150), rollback_pg_changes.recv())
+            recv_view_change(&mut rollback_pg_changes, Duration::from_millis(150))
                 .await
-                .is_err(),
+                .is_none(),
             "a rolled-back pg_notify must never be delivered"
         );
         assert_eq!(
@@ -983,10 +1004,9 @@ mod postgres_tests {
             .await
             .expect("local change is published after commit")
             .unwrap();
-        tokio::time::timeout(Duration::from_secs(2), rollback_pg_changes.recv())
+        recv_view_change(&mut rollback_pg_changes, Duration::from_secs(2))
             .await
-            .expect("PostgreSQL notification is delivered after commit")
-            .unwrap();
+            .expect("PostgreSQL notification is delivered after commit");
         let committed_11 = repository
             .projection_query_snapshot(&snapshot_request(generation))
             .await
