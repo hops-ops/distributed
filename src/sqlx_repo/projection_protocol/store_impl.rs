@@ -1360,4 +1360,33 @@ where
             }))
         }
     }
+
+    fn stopped_projection_failures<'a>(
+        &'a self,
+        topology: &'a ProjectorTopologyId,
+    ) -> impl Future<Output = Result<Vec<String>, ProjectionProtocolError>> + Send + 'a {
+        async move {
+            let topology_hash = topology.digest();
+            let mut builder = QueryBuilder::<DB>::new(
+                "SELECT stopped_failure_id FROM projection_partitions \
+                 WHERE stopped_failure_id IS NOT NULL AND topology_hash = ",
+            );
+            builder.push_bind(topology_hash.as_slice());
+            builder.push(" ORDER BY stopped_failure_id");
+            builder
+                .build()
+                .fetch_all(self.pool())
+                .await
+                .map_err(|error| {
+                    protocol_storage_error::<DB>("list stopped projection failures", error)
+                })?
+                .iter()
+                .map(|row| {
+                    row.try_get("stopped_failure_id").map_err(|error| {
+                        protocol_storage_error::<DB>("decode stopped projection failure", error)
+                    })
+                })
+                .collect()
+        }
+    }
 }

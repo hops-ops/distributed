@@ -164,4 +164,12 @@ pub(crate) trait ProjectionProtocolStore: Send + Sync {
     ) -> impl Future<Output = Result<Option<ProjectionFailureLocation>, ProjectionProtocolError>>
            + Send
            + 'a;
+
+    /// The failure IDs currently stopping partitions of `topology`, in
+    /// ascending order. A partition leaves the list when its failure is
+    /// repaired.
+    fn stopped_projection_failures<'a>(
+        &'a self,
+        topology: &'a ProjectorTopologyId,
+    ) -> impl Future<Output = Result<Vec<String>, ProjectionProtocolError>> + Send + 'a;
 }

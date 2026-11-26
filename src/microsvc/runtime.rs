@@ -14,7 +14,9 @@ use std::time::Duration;
 
 use super::service::DynBusPublisher;
 use super::Service;
-use crate::bus::{Bus, BusConsumer, MessageRouter, RunOptions, TransportError};
+use crate::bus::{
+    Bus, BusConsumer, IdleGroup, MessageRouter, RunOptions, RunUntil, TransportError,
+};
 
 /// Default lease for an immediate after-commit outbox publish. Short by design:
 /// it only needs to cover commit → publish, so a crash before the publish
@@ -72,8 +74,10 @@ impl Service {
     /// handlers share one consumer and every projector has its own
     /// ([`projector_consumers`](Self::projector_consumers)).
     ///
-    /// Returns when the consumers stop: a pull source that drains, or the
-    /// first error. A projector that stops on a terminal failure does not end
+    /// Returns when the consumers stop: on shutdown, on the first error, or,
+    /// with [`RunOptions::until_idle`], when every consumer is idle at the
+    /// same time, so what a handler published for another consumer during
+    /// the run is consumed in the same run. A projector that stops on a terminal failure does not end
     /// the run: the other consumers keep going, and the run returns that
     /// projector's error when they have stopped.
     ///
@@ -133,19 +137,32 @@ async fn run_consumers<'b, B>(
 where
     B: Bus + BusConsumer,
 {
+    // A drain ends when all the consumers are idle together: what one
+    // handles may publish to another that already found nothing to do.
+    let drain = matches!(options.until, RunUntil::Idle).then(IdleGroup::new);
+    let options = || {
+        let mut options = options.clone();
+        if let Some(drain) = &drain {
+            options.until = RunUntil::AllIdle(drain.member());
+        }
+        options
+    };
     let plan = MessageRouter::subscription_plan(service.as_ref());
-    let mut consumers: Vec<ConsumerFuture<'b>> = Vec::new();
+    // Each consumer, and whether it is a projector's.
+    let mut consumers: Vec<(bool, ConsumerFuture<'b>)> = Vec::new();
     if !plan.commands.is_empty() {
-        consumers.push(Box::pin(bus.listen(Arc::clone(&service), options.clone())));
+        consumers.push((false, Box::pin(bus.listen(Arc::clone(&service), options()))));
     }
     if !plan.events.is_empty() {
-        consumers.push(Box::pin(
-            bus.subscribe(Arc::clone(&service), options.clone()),
+        consumers.push((
+            false,
+            Box::pin(bus.subscribe(Arc::clone(&service), options())),
         ));
     }
     for projector in service.projector_consumers() {
-        consumers.push(Box::pin(
-            bus.subscribe(Arc::new(projector), options.clone()),
+        consumers.push((
+            true,
+            Box::pin(bus.subscribe(Arc::new(projector), options())),
         ));
     }
 
@@ -153,23 +170,24 @@ where
     poll_fn(move |cx| {
         let mut index = 0;
         while index < consumers.len() {
-            match consumers[index].as_mut().poll(cx) {
-                Poll::Ready(Ok(())) => {
+            let (projector, consumer) = &mut consumers[index];
+            match (consumer.as_mut().poll(cx), *projector) {
+                (Poll::Ready(Ok(())), _) => {
                     // Drop the finished consumer future; nothing left to poll.
                     let _finished = consumers.remove(index);
                 }
                 // A projector's terminal stop: its delivery is retained and
                 // only an operator's repair changes that, so the other
                 // consumers keep running.
-                Poll::Ready(Err(error))
+                (Poll::Ready(Err(error)), true)
                     if error.is_permanent() && error.should_retain_and_stop() =>
                 {
                     tracing::error!(%error, "a projector consumer stopped; the others keep running");
                     let _stopped = consumers.remove(index);
                     stopped.get_or_insert(error);
                 }
-                Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
-                Poll::Pending => index += 1,
+                (Poll::Ready(Err(error)), _) => return Poll::Ready(Err(error)),
+                (Poll::Pending, _) => index += 1,
             }
         }
         if consumers.is_empty() {
