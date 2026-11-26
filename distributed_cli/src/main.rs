@@ -1,7 +1,7 @@
 use clap::Parser;
 use distributed_cli::{DistributedArgs, DistributedCommands, LifecycleError, LifecycleOutput};
 
-/// The `distributed` CLI: build/dev lifecycle, scaffold, client compile,
+/// The `distributed` CLI: build/dev lifecycle, client compile,
 /// describe manifests, and render schema artifacts.
 #[derive(Parser, Debug)]
 #[command(name = "distributed", version, about, long_about = None)]

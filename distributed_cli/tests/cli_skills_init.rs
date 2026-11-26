@@ -7,7 +7,11 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
-const SKILL_NAMES: [&str; 3] = ["distributed-usage", "distributed-ci", "distributed-schema"];
+const SKILL_NAMES: [&str; 3] = [
+    "distributed-usage",
+    "distributed-deploy",
+    "distributed-schema",
+];
 const BEGIN: &str =
     "<!-- distributed:skills:begin (managed by distributed skills init; do not edit inside) -->";
 const END: &str = "<!-- distributed:skills:end -->";
@@ -77,7 +81,7 @@ fn init_bootstraps_a_fresh_project_and_reruns_are_noops() {
     }
     let agents_md = read(&dir, "AGENTS.md");
     assert!(agents_md.contains(BEGIN) && agents_md.contains(END));
-    assert!(stdout.contains("created .distributed/skills/distributed-ci/SKILL.md"));
+    assert!(stdout.contains("created .distributed/skills/distributed-deploy/SKILL.md"));
     assert!(stdout.contains("Initialized 5 skills at .distributed/skills (wired: claude, agents)"));
 
     // No strays at the harness skill roots (only skill folders).
@@ -108,7 +112,7 @@ fn local_edits_are_skipped_without_force_and_overwritten_with_it() {
     let dir = project_dir("skills-drift");
     init_ok(&dir, &["init", "--agents", "none"]);
 
-    let edited = dir.join(".distributed/skills/distributed-ci/SKILL.md");
+    let edited = dir.join(".distributed/skills/distributed-deploy/SKILL.md");
     fs::write(&edited, "my local notes\n").unwrap();
     let user_added = dir.join(".distributed/skills/my-own-skill/SKILL.md");
     fs::create_dir_all(user_added.parent().unwrap()).unwrap();
@@ -117,22 +121,22 @@ fn local_edits_are_skipped_without_force_and_overwritten_with_it() {
     // Drift is a warning, not an error; the edit and user files survive.
     let (_, stderr) = init_ok(&dir, &["init", "--agents", "none"]);
     assert!(
-        stderr.contains("skipped .distributed/skills/distributed-ci/SKILL.md")
+        stderr.contains("skipped .distributed/skills/distributed-deploy/SKILL.md")
             && stderr.contains("--force"),
         "stderr: {stderr}"
     );
     assert_eq!(
-        read(&dir, ".distributed/skills/distributed-ci/SKILL.md"),
+        read(&dir, ".distributed/skills/distributed-deploy/SKILL.md"),
         "my local notes\n"
     );
 
     // --force converges the drifted file; user-added files are never touched.
     let (stdout, _) = init_ok(&dir, &["init", "--agents", "none", "--force"]);
     assert!(
-        stdout.contains("updated .distributed/skills/distributed-ci/SKILL.md"),
+        stdout.contains("updated .distributed/skills/distributed-deploy/SKILL.md"),
         "{stdout}"
     );
-    assert!(read(&dir, ".distributed/skills/distributed-ci/SKILL.md").starts_with("---\n"));
+    assert!(read(&dir, ".distributed/skills/distributed-deploy/SKILL.md").starts_with("---\n"));
     assert_eq!(
         read(&dir, ".distributed/skills/my-own-skill/SKILL.md"),
         "mine\n"

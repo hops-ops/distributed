@@ -33,11 +33,7 @@ use crate::manifest_harness::{
 };
 use crate::skills::{embedded_skills, generate_skills, SkillsInitSpec, AGENTS_MD_FILE};
 use crate::wasm_pures::build_declared_wasm_pures;
-use crate::{
-    generate_service_scaffold, package_name, render_atlas_schema, AtlasDatabaseUrl,
-    AtlasSchemaSpec, BusTarget, FileMode, GeneratedFile, GithubRepo, GitopsPromoteTarget,
-    MetricsTarget, PostCreateAction, ServiceScaffoldSpec, ServiceTransport, StoreTarget,
-};
+use crate::{render_atlas_schema, AtlasDatabaseUrl, AtlasSchemaSpec, FileMode, GeneratedFile};
 
 const DISTRIBUTED_MANIFEST_SCHEMA_VERSION: u64 = 3;
 
@@ -55,9 +51,6 @@ pub enum DistributedCommands {
     Build(BuildArgs),
     /// Run one coherent local application supervisor
     Dev(DevArgs),
-    /// Scaffold a new Distributed microservice crate
-    #[command(alias = "create")]
-    Scaffold(ScaffoldArgs),
     /// Print a service's explicit ApplicationManifest as JSON
     Describe(DescribeArgs),
     /// Compile role/application-scoped GraphQL operations into client artifacts
@@ -187,86 +180,6 @@ pub enum AgentHarness {
     Pi,
     /// The shared `.agents/skills/` convention + AGENTS.md managed block.
     Agents,
-}
-
-#[derive(Args, Debug)]
-pub struct ScaffoldArgs {
-    /// Service/package name to scaffold
-    pub name: String,
-    /// Output directory. Defaults to ./<name>.
-    #[arg(long)]
-    pub path: Option<PathBuf>,
-    /// Service framework to scaffold
-    #[arg(long, value_enum, default_value = "distributed")]
-    pub framework: Framework,
-    /// Compatibility alias for scaffold kind, e.g. distributed-microsvc.
-    #[arg(long)]
-    pub kind: Option<String>,
-    /// Runtime transport to scaffold
-    #[arg(long, value_enum, default_value = "http")]
-    pub transport: Transport,
-    /// Compatibility shortcut for --transport http.
-    #[arg(long)]
-    pub http: bool,
-    /// Compatibility shortcut for --transport knative.
-    #[arg(long)]
-    pub knative: bool,
-    /// Model aggregate to scaffold. May be repeated.
-    #[arg(long)]
-    pub model: Vec<String>,
-    /// Generate placeholder read-model modules and register them in read_model_catalog().
-    #[arg(long)]
-    pub read_models: bool,
-    /// Generate src/query/ GraphQL skeleton, enable the graphql feature, and wire with_graphql.
-    #[arg(long)]
-    pub query_api: bool,
-    /// Enable Distributed tracing spans and GitOps OTLP environment values.
-    #[arg(long, visible_alias = "otel")]
-    pub tracing: bool,
-    /// Command handler to scaffold. May be repeated.
-    #[arg(long)]
-    pub command: Vec<String>,
-    /// Event handler to scaffold. May be repeated.
-    #[arg(long)]
-    pub event: Vec<String>,
-    /// Message bus backend to scaffold.
-    #[arg(long, value_enum)]
-    pub bus: Option<Bus>,
-    /// Metrics integration to scaffold.
-    #[arg(long, value_enum)]
-    pub metrics: Option<Metrics>,
-    /// Generate independent local and cloud workload charts under
-    /// .gitops/local and .gitops/deploy.
-    #[arg(long)]
-    pub gitops: bool,
-    /// Generate a GitOps promotion chart for Argo CD or Flux.
-    #[arg(long, value_enum)]
-    pub gitops_promote: Option<GitopsPromote>,
-    /// GitHub repository to create and configure with release workflows.
-    #[arg(long, value_name = "OWNER/REPO")]
-    pub github: Option<String>,
-    /// GitOps preview environment repository to promote pull-request previews into.
-    #[arg(long, value_name = "OWNER/REPO")]
-    pub github_preview: Option<String>,
-    /// GitOps permanent environment repository to promote version tags into.
-    #[arg(long, value_name = "OWNER/REPO")]
-    pub github_promote: Option<String>,
-    /// Read-model/schema storage target
-    #[arg(
-        long,
-        alias = "storage",
-        visible_alias = "storage",
-        visible_alias = "read-model",
-        value_enum,
-        default_value = "postgres"
-    )]
-    pub store: Store,
-    /// Path to the local Distributed crate.
-    #[arg(long)]
-    pub distributed_path: Option<PathBuf>,
-    /// Overwrite generated files in an existing directory.
-    #[arg(long)]
-    pub force: bool,
 }
 
 #[derive(Args, Debug)]
@@ -484,51 +397,6 @@ pub struct SchemaArgs {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
-pub enum Framework {
-    Distributed,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
-pub enum Transport {
-    Http,
-    Knative,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
-pub enum GitopsPromote {
-    Argo,
-    Flux,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
-pub enum Bus {
-    Rabbitmq,
-    Kafka,
-    Psql,
-    Nats,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
-pub enum Metrics {
-    Prometheus,
-}
-
-impl From<Metrics> for MetricsTarget {
-    fn from(value: Metrics) -> Self {
-        match value {
-            Metrics::Prometheus => MetricsTarget::Prometheus,
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
-pub enum Store {
-    Postgres,
-    Sqlite,
-    InMemory,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 pub enum ManifestFormat {
     Json,
 }
@@ -550,48 +418,6 @@ pub enum SchemaFormat {
     Graphql,
 }
 
-// Map the CLI's clap enums onto the generation spec enums. These exist so
-// `--help` / value parsing stay in the command surface while generation stays in
-// the `generate`/`atlas` modules.
-impl From<Transport> for ServiceTransport {
-    fn from(transport: Transport) -> Self {
-        match transport {
-            Transport::Http => ServiceTransport::Http,
-            Transport::Knative => ServiceTransport::Knative,
-        }
-    }
-}
-
-impl From<Store> for StoreTarget {
-    fn from(store: Store) -> Self {
-        match store {
-            Store::Postgres => StoreTarget::Postgres,
-            Store::Sqlite => StoreTarget::Sqlite,
-            Store::InMemory => StoreTarget::InMemory,
-        }
-    }
-}
-
-impl From<Bus> for BusTarget {
-    fn from(bus: Bus) -> Self {
-        match bus {
-            Bus::Rabbitmq => BusTarget::Rabbitmq,
-            Bus::Kafka => BusTarget::Kafka,
-            Bus::Psql => BusTarget::Psql,
-            Bus::Nats => BusTarget::Nats,
-        }
-    }
-}
-
-impl From<GitopsPromote> for GitopsPromoteTarget {
-    fn from(promote: GitopsPromote) -> Self {
-        match promote {
-            GitopsPromote::Argo => GitopsPromoteTarget::Argo,
-            GitopsPromote::Flux => GitopsPromoteTarget::Flux,
-        }
-    }
-}
-
 /// Dispatch a parsed command.
 ///
 /// `command_prefix` is how this command tree is reached from the running
@@ -602,7 +428,6 @@ pub fn run(args: &DistributedArgs, command_prefix: &[&str]) -> Result<(), Box<dy
     match &args.command {
         DistributedCommands::Build(build) => run_build(build, command_prefix),
         DistributedCommands::Dev(dev) => run_dev(dev, command_prefix),
-        DistributedCommands::Scaffold(scaffold) => run_scaffold(scaffold),
         DistributedCommands::Describe(describe) => run_describe(describe),
         DistributedCommands::Client(client) => run_client(client),
         DistributedCommands::ClientManifest(client) => run_client_manifest(client),
@@ -1302,87 +1127,6 @@ fn display_path(path: &Path) -> String {
         .to_string()
 }
 
-fn run_scaffold(args: &ScaffoldArgs) -> Result<(), Box<dyn Error>> {
-    validate_scaffold_kind(args.framework, args.kind.as_deref())?;
-    let transport = if args.http && args.knative {
-        return Err("--http and --knative cannot be used together".into());
-    } else if args.http {
-        Transport::Http
-    } else if args.knative {
-        Transport::Knative
-    } else {
-        args.transport
-    };
-
-    let github = parse_optional_github_repo(args.github.as_deref(), "--github")?;
-    let github_preview =
-        parse_optional_github_repo(args.github_preview.as_deref(), "--github-preview")?;
-    let github_promote =
-        parse_optional_github_repo(args.github_promote.as_deref(), "--github-promote")?;
-
-    // The default output directory uses the normalized package name, so derive it
-    // (and fail fast on an invalid name) before creating any directory.
-    let package_name = package_name(&args.name)?;
-    let output_dir = args
-        .path
-        .clone()
-        .unwrap_or_else(|| PathBuf::from(&package_name));
-    let output_dir = absolute_path(&output_dir)?;
-    ensure_output_dir(&output_dir, args.force)?;
-
-    let distributed_path = resolve_distributed_path(args.distributed_path.as_deref(), &output_dir)?;
-    let distributed_dependency_path = path_for_toml(&relative_path(&output_dir, &distributed_path));
-
-    // GraphQL execution needs a SQL store feature; promote in-memory → sqlite.
-    let store = {
-        let store = args.store.into();
-        if args.query_api && matches!(store, crate::StoreTarget::InMemory) {
-            eprintln!(
-                "warning: --query-api requires a SQL store; promoting --store in-memory to sqlite"
-            );
-            crate::StoreTarget::Sqlite
-        } else {
-            store
-        }
-    };
-
-    let spec = ServiceScaffoldSpec {
-        name: args.name.clone(),
-        transport: transport.into(),
-        store,
-        bus: args.bus.map(Into::into),
-        metrics: args.metrics.map(Into::into),
-        models: args.model.clone(),
-        read_models: args.read_models || args.query_api,
-        query_api: args.query_api,
-        tracing: args.tracing,
-        commands: args.command.clone(),
-        events: args.event.clone(),
-        distributed_dependency_path,
-        gitops: args.gitops,
-        gitops_promote: args.gitops_promote.map(Into::into),
-        github,
-        github_preview,
-        github_promote,
-    };
-
-    let project = generate_service_scaffold(spec)?;
-    for file in &project.files {
-        write_generated_file(&output_dir, file)?;
-    }
-    for warning in &project.warnings {
-        eprintln!("warning: {warning}");
-    }
-    for action in &project.post_create_actions {
-        match action {
-            PostCreateAction::EnsureGithubRepository { repo } => ensure_github_repo(repo)?,
-        }
-    }
-
-    println!("Scaffolded Distributed service at {}", output_dir.display());
-    Ok(())
-}
-
 fn run_describe(args: &DescribeArgs) -> Result<(), Box<dyn Error>> {
     match args.format {
         ManifestFormat::Json => {
@@ -1807,46 +1551,9 @@ fn atlas_spec_from_flags(
     })
 }
 
-fn validate_scaffold_kind(framework: Framework, kind: Option<&str>) -> Result<(), Box<dyn Error>> {
-    if framework != Framework::Distributed {
-        return Err("only --framework distributed is supported".into());
-    }
-
-    if let Some(kind) = kind {
-        match kind {
-            "distributed-microsvc" | "distributed" => {}
-            _ => {
-                return Err(format!(
-                    "unsupported service kind `{kind}`; expected distributed-microsvc"
-                )
-                .into());
-            }
-        }
-    }
-
-    Ok(())
-}
-
-fn ensure_output_dir(path: &Path, force: bool) -> Result<(), Box<dyn Error>> {
-    if path.exists() {
-        if !path.is_dir() {
-            return Err(format!("{} exists and is not a directory", path.display()).into());
-        }
-        if !force && fs::read_dir(path)?.next().is_some() {
-            return Err(format!(
-                "{} already exists and is not empty; pass --force to overwrite generated files",
-                path.display()
-            )
-            .into());
-        }
-    }
-    fs::create_dir_all(path)?;
-    Ok(())
-}
-
 /// Write one generated file under `output_dir`, creating parent directories and
-/// honoring the optional mode hint (executable bit, or a symlink whose
-/// `contents` is the relative target).
+/// honoring the optional mode hint (a symlink whose `contents` is the
+/// relative target).
 fn write_generated_file(output_dir: &Path, file: &GeneratedFile) -> Result<(), Box<dyn Error>> {
     let path = output_dir.join(&file.path);
     if let Some(parent) = path.parent() {
@@ -1856,9 +1563,6 @@ fn write_generated_file(output_dir: &Path, file: &GeneratedFile) -> Result<(), B
         return replace_with_symlink(&path, Path::new(&file.contents));
     }
     fs::write(&path, &file.contents)?;
-    if file.mode == Some(FileMode::Executable) {
-        set_executable(&path)?;
-    }
     Ok(())
 }
 
@@ -1886,67 +1590,6 @@ fn replace_with_symlink(path: &Path, _target: &Path) -> Result<(), Box<dyn Error
         path.display()
     )
     .into())
-}
-
-#[cfg(unix)]
-fn set_executable(path: &Path) -> Result<(), Box<dyn Error>> {
-    use std::os::unix::fs::PermissionsExt;
-    let mut perms = fs::metadata(path)?.permissions();
-    perms.set_mode(perms.mode() | 0o111);
-    fs::set_permissions(path, perms)?;
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn set_executable(_path: &Path) -> Result<(), Box<dyn Error>> {
-    Ok(())
-}
-
-fn parse_optional_github_repo(
-    raw: Option<&str>,
-    flag: &str,
-) -> Result<Option<GithubRepo>, Box<dyn Error>> {
-    raw.map(|value| {
-        GithubRepo::parse(value)
-            .map_err(|err| -> Box<dyn Error> { format!("{flag}: {err}").into() })
-    })
-    .transpose()
-}
-
-fn ensure_github_repo(repo: &GithubRepo) -> Result<(), Box<dyn Error>> {
-    let slug = repo.slug();
-    let view_output = Command::new("gh")
-        .args(["repo", "view", &slug, "--json", "nameWithOwner"])
-        .output();
-
-    match view_output {
-        Ok(output) if output.status.success() => {
-            println!("GitHub repository {slug} already exists");
-            return Ok(());
-        }
-        Ok(_) => {}
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            return Err(
-                "GitHub CLI (`gh`) is not installed or not in PATH. Install it before using --github."
-                    .into(),
-            );
-        }
-        Err(err) => return Err(Box::new(err)),
-    }
-
-    let output = Command::new("gh")
-        .args(github_repo_create_args(&slug))
-        .output()?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("gh repo create failed: {stderr}").into());
-    }
-    println!("Created GitHub repository {slug}");
-    Ok(())
-}
-
-fn github_repo_create_args(slug: &str) -> Vec<&str> {
-    vec!["repo", "create", slug, "--private"]
 }
 
 fn validate_manifest_json(envelope: &serde_json::Value) -> Result<(), Box<dyn Error>> {
@@ -2090,37 +1733,6 @@ fn absolute_path(path: &Path) -> Result<PathBuf, Box<dyn Error>> {
     }
 }
 
-fn relative_path(from_dir: &Path, to: &Path) -> PathBuf {
-    let from = path_components(from_dir);
-    let to = path_components(to);
-    let common = from
-        .iter()
-        .zip(to.iter())
-        .take_while(|(left, right)| left == right)
-        .count();
-    let mut relative = PathBuf::new();
-    for _ in common..from.len() {
-        relative.push("..");
-    }
-    for component in &to[common..] {
-        relative.push(component);
-    }
-    if relative.as_os_str().is_empty() {
-        PathBuf::from(".")
-    } else {
-        relative
-    }
-}
-
-fn path_components(path: &Path) -> Vec<OsString> {
-    path.components()
-        .filter_map(|component| match component {
-            Component::Normal(value) => Some(value.to_os_string()),
-            _ => None,
-        })
-        .collect()
-}
-
 pub(crate) fn path_for_toml(path: &Path) -> String {
     path.to_string_lossy().replace('\\', "/")
 }
@@ -2212,14 +1824,6 @@ mod tests {
     }
 
     #[test]
-    fn github_repo_create_args_are_private() {
-        assert_eq!(
-            github_repo_create_args("hops-ops/test-domain"),
-            vec!["repo", "create", "hops-ops/test-domain", "--private"]
-        );
-    }
-
-    #[test]
     fn client_manifest_validator_rejects_other_versions() {
         let error = validate_client_manifest_json(&serde_json::json!({"manifest_version": 3}))
             .expect_err("pre-release v3 manifests must be rejected");
@@ -2244,31 +1848,6 @@ mod tests {
             ProjectGenerationPhase::LifecycleBuild,
             "lifecycle node `application` executor failed"
         ));
-    }
-
-    #[test]
-    fn optional_github_repo_reports_the_flag_on_error() {
-        let err = parse_optional_github_repo(Some("missing-repo"), "--github")
-            .expect_err("invalid repo should error");
-        assert!(err.to_string().contains("--github"));
-        assert!(parse_optional_github_repo(None, "--github")
-            .unwrap()
-            .is_none());
-        let ok = parse_optional_github_repo(Some("hops-ops/test-domain"), "--github")
-            .unwrap()
-            .unwrap();
-        assert_eq!(ok.slug(), "hops-ops/test-domain");
-    }
-
-    #[test]
-    fn scaffold_help_lists_otel_alias() {
-        let mut command = ScaffoldArgs::augment_args(clap::Command::new("scaffold"));
-        let mut help = Vec::new();
-        command.write_help(&mut help).unwrap();
-        let help = String::from_utf8(help).unwrap();
-
-        assert!(help.contains("--tracing"));
-        assert!(help.contains("--otel"));
     }
 
     #[test]

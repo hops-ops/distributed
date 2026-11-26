@@ -31,14 +31,16 @@ teardown() {
   done
 }
 
-@test "project build and dev are zero-config and invalid typed exports fail before UI" {
+# A GraphQL service with no lifecycle configuration, linked to this checkout.
+copy_zero_config_app() {
   PROJECT="$ROOT/zero-config-app"
-  run "$DISTRIBUTED_BIN" scaffold zero-config-app \
-    --path "$PROJECT" \
-    --distributed-path "$DISTRIBUTED_ROOT" \
-    --query-api \
-    --store sqlite
-  [ "$status" -eq 0 ]
+  cp -R "$BATS_TEST_DIRNAME/../fixtures/zero-config-app" "$PROJECT"
+  sed "s|__DISTRIBUTED_ROOT__|$DISTRIBUTED_ROOT|" "$PROJECT/Cargo.toml" > "$PROJECT/Cargo.toml.next"
+  mv "$PROJECT/Cargo.toml.next" "$PROJECT/Cargo.toml"
+}
+
+@test "project build and dev are zero-config and invalid typed exports fail before UI" {
+  copy_zero_config_app
 
   mkdir -p "$PROJECT/ui" "$ROOT/bin"
   printf '{"name":"zero-config-ui","private":true,"scripts":{"build":"vite build"},"dependencies":{"@hops-ops/distributed":"file:%s/js"}}\n' \
@@ -129,13 +131,7 @@ SCRIPT
 }
 
 @test "linked checkout skew is structured and fails before build or dev startup" {
-  PROJECT="$ROOT/skewed-app"
-  run "$DISTRIBUTED_BIN" scaffold skewed-app \
-    --path "$PROJECT" \
-    --distributed-path "$DISTRIBUTED_ROOT" \
-    --query-api \
-    --store sqlite
-  [ "$status" -eq 0 ]
+  copy_zero_config_app
 
   OTHER_JS="$ROOT/other-distributed/js"
   mkdir -p "$PROJECT/ui" "$OTHER_JS"
@@ -151,14 +147,14 @@ SCRIPT
   [[ "$output" == *'"affected_components":["rust","cli","javascript"]'* ]]
   [[ "$output" == *'"expected"'* ]]
   [[ "$output" == *'"repair"'* ]]
-  [ ! -e "$PROJECT/target/debug/skewed-app" ]
+  [ ! -e "$PROJECT/target/debug/zero-config-app" ]
   [ ! -e "$PROJECT/ui/node_modules" ]
   [ ! -e "$PROJECT/.distributed/lifecycle/active.json" ]
 
   run "$DISTRIBUTED_BIN" dev "$PROJECT"
   [ "$status" -eq 1 ]
   [[ "$output" == *'incompatible Distributed framework members'* ]]
-  [ ! -e "$PROJECT/target/debug/skewed-app" ]
+  [ ! -e "$PROJECT/target/debug/zero-config-app" ]
   [ ! -e "$PROJECT/ui/node_modules" ]
   [ ! -e "$PROJECT/.distributed/lifecycle/active.json" ]
 }

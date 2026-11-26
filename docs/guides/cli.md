@@ -2,8 +2,8 @@
 
 ## Service CLI (`distributed`)
 
-The [`distributed_cli`](../../distributed_cli/) crate ships `distributed` — tooling to scaffold
-services, inspect a service's logical application artifact, and render physical
+The [`distributed_cli`](../../distributed_cli/) crate ships `distributed` — tooling to build and run an
+application, inspect a service's logical application artifact, and render physical
 read-model schema artifacts. It is
 also a library, so `hops` mounts the same commands under `hops service` (anything
 below as `distributed <cmd>` works as `hops service <cmd>`).
@@ -20,8 +20,7 @@ make the surrounding structure deterministic. Event storming produces commands,
 past-tense events, aggregates, policies, and read models. Those names map
 directly onto Distributed conventions, so an AI assistant can generate or revise
 a smaller target: model fields, event methods, handler bodies, and projection
-shapes. Boilerplate service setup, manifest discovery, schema output, and GitOps
-artifacts stay deterministic.
+shapes. Manifest discovery, client generation and schema output stay deterministic.
 
 For an existing typed `Service`, derive the logical application from its command
 inventory and the same full GraphQL `Surface` used by the runtime:
@@ -61,21 +60,10 @@ Once published, `cargo install distributed_cli` installs a matching
 CLI built from that checkout. From a checkout, run the CLI with
 `cargo run -p distributed_cli --bin distributed -- <cmd>`; application
 checkouts such as [`tests/e2e-ui`](../../tests/e2e-ui/) wrap this as `make run`.
-`scaffold` writes a path dependency on a local Distributed checkout
-(`--distributed-path`, `DISTRIBUTED_PATH`, or the nearest enclosing checkout).
+The CLI does not generate a project. `distributed skills init` installs agent
+skills that describe the service layout; see `distributed-usage`.
 
 ```bash
-distributed scaffold orders \
-  --model order \
-  --read-models \
-  --command order.submit \
-  --event order.submitted \
-  --store postgres \
-  --transport http \
-  --bus nats \
-  --gitops \
-  --metrics prometheus
-
 cd orders
 cargo test
 distributed describe                  # print the ApplicationManifest as JSON
@@ -154,21 +142,13 @@ for the next edit.
 
 Use the event-storming board as the input:
 
-- Aggregates become `--model <name>`.
-- Commands become `--command <aggregate.action>`.
-- Events and policy/projection subscriptions become `--event <fact.happened>`.
-- Query views become `--read-models`, then concrete `#[derive(ReadModel)]`
-  structs in the generated service.
+- Aggregates become `#[sourced]` models.
+- Commands become typed command handlers, one module each.
+- Events and policy/projection subscriptions become event handlers.
+- Query views become `#[derive(ReadModel)]` structs registered in
+  `read_model_catalog()`.
 
-The scaffold is intentionally a starting point. Replace placeholder aggregate
-fields, event methods, guards, handler bodies, and read model columns with the
-domain behavior discovered in the session. If a service needs custom code outside
-those conventions, write normal Rust and keep the generated manifest updated.
-
-The `--metrics prometheus` scaffold option enables Distributed's `/metrics`
-endpoint and, when paired with `--gitops`, emits Prometheus Operator
-`ServiceMonitor` and `PrometheusRule` templates for HTTP services. The generated
-values keep those CRDs disabled until an environment explicitly enables them.
+The `metrics` feature adds `GET /metrics` to an HTTP service.
 Bus-only and worker services can expose the same registry on a side port with
 `distributed::metrics::serve_http("0.0.0.0:9100", Some("orders-worker")).await?`,
 or compose `distributed::metrics::http_router_for_service("orders-worker")` into
