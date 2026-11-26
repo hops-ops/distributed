@@ -82,6 +82,7 @@ where
     S: MessageSource,
 {
     let service = router.consumer_group();
+    let consumer = consumer_name(router);
     let transport = source.transport_name();
 
     while let Some(received) = next_delivery(source, &options.until, service, transport).await? {
@@ -94,9 +95,26 @@ where
             let _dispatching = dispatching(&options.until);
             dispatch(router, received.message(), received.ordered_delivery()).await
         };
-        settle_result(service, transport, options, received, result).await?;
+        settle_result(
+            service,
+            consumer.as_deref(),
+            transport,
+            options,
+            received,
+            result,
+        )
+        .await?;
     }
     Ok(())
+}
+
+/// The durable consumer `router` runs as: its group, with its scope. A
+/// service runs several consumers in one group name, so a dead letter names
+/// the consumer, not the service.
+fn consumer_name<R: MessageRouter>(router: &R) -> Option<String> {
+    router
+        .consumer_group()
+        .map(|group| crate::bus::topology::scoped_group(group, router))
 }
 
 /// End a run: let the source write what it still holds. The run's own error
@@ -220,6 +238,7 @@ async fn settle_ignored<M: ReceivedMessage>(
 /// Returns `Err` when the run must end.
 async fn settle_result<M: ReceivedMessage>(
     service: Option<&str>,
+    consumer: Option<&str>,
     transport: &str,
     options: &RunOptions,
     received: M,
@@ -267,7 +286,7 @@ async fn settle_result<M: ReceivedMessage>(
             let dead = DeadLetter {
                 message: received.message().clone(),
                 reason: error.to_string(),
-                consumer: service.unwrap_or_default().to_owned(),
+                consumer: consumer.unwrap_or_default().to_owned(),
                 attempts,
             };
             if let Err(sink_error) = sink.dead_letter(dead).await {
@@ -479,8 +498,16 @@ where
         };
         if let Some(error) = received.decode_error() {
             let error = TransportError::new(error.kind(), error.message());
-            let outcome =
-                settle_result(service, self.transport, &self.options, received, Err(error)).await;
+            let consumer = consumer_name(self.router.as_ref());
+            let outcome = settle_result(
+                service,
+                consumer.as_deref(),
+                self.transport,
+                &self.options,
+                received,
+                Err(error),
+            )
+            .await;
             self.record_stop(outcome);
             return;
         }
@@ -559,8 +586,10 @@ where
         };
         let error = entry.stop.or(entry.retryable).or(extra).or(entry.permanent);
         let service = self.service();
+        let consumer = consumer_name(self.router.as_ref());
         let outcome = settle_result(
             service.as_deref(),
+            consumer.as_deref(),
             self.transport,
             &self.options,
             entry.received,

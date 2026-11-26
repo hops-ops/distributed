@@ -716,6 +716,47 @@ fn a_retry_that_reaches_max_attempts_is_dead_lettered_then_acked() {
     );
 }
 
+/// A router that is one of several consumers in its group.
+struct Scoped(Arc<Handlers>);
+
+impl crate::bus::MessageRouter for Scoped {
+    fn consumer_group(&self) -> Option<&str> {
+        crate::bus::MessageRouter::consumer_group(self.0.as_ref())
+    }
+    fn consumer_scope(&self) -> Option<&str> {
+        Some("ledger")
+    }
+    fn handles(&self, kind: MessageKind, name: &str) -> bool {
+        crate::bus::MessageRouter::handles(self.0.as_ref(), kind, name)
+    }
+    fn subscription_plan(&self) -> crate::bus::SubscriptionPlan {
+        crate::bus::MessageRouter::subscription_plan(self.0.as_ref())
+    }
+    async fn dispatch(&self, message: &Message) -> Result<(), TransportError> {
+        crate::bus::MessageRouter::dispatch(self.0.as_ref(), message).await
+    }
+}
+
+/// Two consumers of one service may dead-letter the same message. Each
+/// dead letter names its own consumer, so neither replaces the other.
+#[test]
+fn a_dead_letter_names_the_scoped_consumer() {
+    let recorder = Recorder::new();
+    let scoped = Arc::new(Scoped(Arc::new(
+        router(&recorder).as_ref().clone().named("billing"),
+    )));
+    block_on(run_source(
+        scoped,
+        source(&recorder, &["permanent"], 1),
+        RunOptions::until_idle().with_dead_letters(recorder.clone()),
+    ))
+    .unwrap();
+    assert!(recorder.events().iter().any(|event| matches!(
+        event,
+        Event::DeadLetter(_, consumer, _) if consumer == "billing-ledger"
+    )));
+}
+
 #[test]
 fn a_dead_letter_with_nowhere_to_go_is_handed_back_and_ends_the_run() {
     for sink in [None, Some(Arc::new(BrokenSink) as Arc<dyn DeadLetterSink>)] {
