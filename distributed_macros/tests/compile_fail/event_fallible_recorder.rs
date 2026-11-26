@@ -6,7 +6,7 @@ struct Todo {
     title: String,
 }
 
-#[sourced(entity)]
+#[sourced(entity, aggregate_type = "todo")]
 impl Todo {
     // The event is recorded before this body runs: an `Err` here would leave
     // a stored event whose state change never happened.

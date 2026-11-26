@@ -1,10 +1,29 @@
-use distributed::{hydrate, Aggregate, GetStream, RepositoryError, StreamIdentity};
+use distributed::{
+    hydrate, Aggregate, CommitBatch, GetStream, RepositoryError, StreamIdentity, StreamWrite,
+    TransactionalCommit,
+};
 
 use crate::bomberman::domain::bomb::Bomb;
 use crate::bomberman::domain::explosion::Explosion;
 use crate::bomberman::domain::game_map::GameMap;
 use crate::bomberman::domain::player::Player;
 use crate::bomberman::error::GameError;
+
+/// One aggregate's stream write, for [`commit_aggregates`].
+pub(crate) fn stream<A: Aggregate>(aggregate: &mut A) -> Result<StreamWrite<'_>, GameError> {
+    let identity = StreamIdentity::new(A::aggregate_type(), aggregate.entity().id())?;
+    Ok(StreamWrite::new(identity, aggregate.entity_mut()))
+}
+
+/// Commit aggregates of different types in one transaction. The typed commit
+/// builder commits one aggregate type; a raw batch runs the same validation.
+pub(crate) async fn commit_aggregates<R: TransactionalCommit>(
+    repo: &R,
+    streams: Vec<StreamWrite<'_>>,
+) -> Result<(), GameError> {
+    repo.commit_batch(CommitBatch::new(streams)).await?;
+    Ok(())
+}
 
 /// Load and hydrate a single aggregate by its raw id, keyed under the
 /// aggregate's own stream type. Works through `&R` (handlers borrow the repo).

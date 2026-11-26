@@ -35,7 +35,7 @@ pub struct Order {
 }
 
 #[allow(dead_code)]
-#[sourced(entity)]
+#[sourced(entity, aggregate_type = "order")]
 impl Order {
     pub fn new() -> Self {
         Self::default()

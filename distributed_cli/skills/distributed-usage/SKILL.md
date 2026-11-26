@@ -156,7 +156,7 @@ Rules that prevent real bugs:
   Use `when = <expr>` for intentional idempotent/no-op transitions so they
   record nothing; use explicit validation when the API promises a rejection.
 - Evolving an event's payload? Do not edit stored data — add an upcaster:
-  `#[sourced(entity, upcasters(("initialized", 1 => 2, V1 => V2, upcast_fn)))]`
+  `#[sourced(entity, aggregate_type = "todo", upcasters(("initialized", 1 => 2, V1 => V2, upcast_fn)))]`
   and mark new-format methods `#[event("initialized", version = 2)]`.
 
 ## Command handlers

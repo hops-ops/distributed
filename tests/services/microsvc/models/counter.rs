@@ -10,7 +10,7 @@ pub struct Counter {
     pub value: i64,
 }
 
-#[sourced(entity)]
+#[sourced(entity, aggregate_type = "counter")]
 impl Counter {
     #[event("initialized")]
     pub fn create(&mut self, id: String) {

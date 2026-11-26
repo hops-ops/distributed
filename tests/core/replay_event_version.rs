@@ -12,7 +12,7 @@ struct Versioned {
     calls: usize,
 }
 
-#[distributed::sourced(entity)]
+#[distributed::sourced(entity, aggregate_type = "versioned")]
 impl Versioned {
     #[event("renamed", version = 2)]
     fn rename(&mut self, value: String) {
@@ -121,7 +121,7 @@ struct IncompleteUpcast {
     entity: Entity,
 }
 
-#[distributed::sourced(entity, upcasters(
+#[distributed::sourced(entity, aggregate_type = "incomplete_upcast", upcasters(
     ("renamed", 1 => 2, (String,) => (String,), convert_semantics),
 ))]
 impl IncompleteUpcast {
@@ -145,7 +145,7 @@ fn convert_semantics((value,): (String,)) -> (String,) {
     (format!("v2:{value}"),)
 }
 
-#[distributed::sourced(entity, upcasters(
+#[distributed::sourced(entity, aggregate_type = "upcasted", upcasters(
     ("renamed", 1 => 2, (String,) => (String,), convert_semantics),
 ))]
 impl Upcasted {

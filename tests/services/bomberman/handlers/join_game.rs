@@ -1,6 +1,6 @@
-use distributed::{CommitBuilderExt, GetStream, TransactionalCommit};
+use distributed::{GetStream, TransactionalCommit};
 
-use super::shared::get_aggregate;
+use super::shared::{commit_aggregates, get_aggregate, stream};
 use crate::bomberman::domain::game_map::GameMap;
 use crate::bomberman::domain::player::Player;
 use crate::bomberman::error::GameError;
@@ -29,10 +29,7 @@ where
     player.join(format!("player:{}", player_id), name.into(), sx, sy)?;
     map.add_player(player.entity.id().to_string())?;
 
-    repo.aggregate(&mut map)
-        .aggregate(&mut player)
-        .commit()
-        .await?;
+    commit_aggregates(repo, vec![stream(&mut map)?, stream(&mut player)?]).await?;
 
     Ok(())
 }

@@ -67,30 +67,6 @@ impl InboxReceipt {
     }
 }
 
-/// Outcome of committing an [`InboxReceipt`].
-///
-/// A `Duplicate` is **not** an error: the message was already processed, so the
-/// consumer treats it as success (acks) without re-running effects.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum InboxOutcome {
-    /// The receipt was newly recorded (first time this message was processed).
-    Processed,
-    /// A receipt for `(consumer, message_id)` already existed; effects were skipped.
-    Duplicate,
-}
-
-impl InboxOutcome {
-    /// Whether this is the first processing (vs a deduplicated replay).
-    pub fn is_processed(self) -> bool {
-        matches!(self, InboxOutcome::Processed)
-    }
-
-    /// Whether the message was already processed (a deduplicated replay).
-    pub fn is_duplicate(self) -> bool {
-        matches!(self, InboxOutcome::Duplicate)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -101,14 +77,6 @@ mod tests {
         assert_eq!(r.key(), ("projections", "evt-1"));
         assert_eq!(r.consumer, "projections");
         assert_eq!(r.message_id, "evt-1");
-    }
-
-    #[test]
-    fn outcome_predicates() {
-        assert!(InboxOutcome::Processed.is_processed());
-        assert!(!InboxOutcome::Processed.is_duplicate());
-        assert!(InboxOutcome::Duplicate.is_duplicate());
-        assert!(!InboxOutcome::Duplicate.is_processed());
     }
 
     #[test]

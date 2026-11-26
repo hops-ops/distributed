@@ -78,6 +78,10 @@ macro_rules! conformance_cases {
     (@if true $($rest:tt)*) => {
         $crate::conformance_cases! { $($rest)* }
     };
+    (@unless true $($rest:tt)*) => {};
+    (@unless false $($rest:tt)*) => {
+        $crate::conformance_cases! { $($rest)* }
+    };
     ($trait:path, $backend:ty, $open:ident;
         $( $(#[$meta:meta])* $name:ident($b:ident) => $body:expr; )*
     ) => {

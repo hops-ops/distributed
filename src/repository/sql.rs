@@ -309,11 +309,13 @@ pub(crate) async fn load_stream<E: SqlExecutor>(
         None if events.is_empty() => return Ok(None),
         None => entity.load_from_history(events),
         Some(after) => {
-            // Keep the existing SQL snapshot-only restore contract. A future
-            // snapshot above a non-empty durable stream is clamped, not trusted.
+            // An empty tail is either a stream with nothing after `after`, or a
+            // missing stream (a lingering snapshot): read the version to tell
+            // them apart. A prefix past the stream is clamped, so a snapshot
+            // ahead of it is a cache miss, never trusted.
             let prefix = if events.is_empty() {
                 match stream_version(executor, identity).await? {
-                    0 => after,
+                    0 => return Ok(None),
                     version => after.min(version),
                 }
             } else {

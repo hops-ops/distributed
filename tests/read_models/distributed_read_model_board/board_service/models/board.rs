@@ -17,7 +17,7 @@ pub struct Board {
     pub cards: Vec<CardState>,
 }
 
-#[sourced(entity)]
+#[sourced(entity, aggregate_type = "board")]
 impl Board {
     #[event("opened")]
     pub fn open(&mut self, id: String, name: String) {

@@ -28,7 +28,7 @@ struct SafeRecorder {
     applied: bool,
 }
 
-#[distributed::sourced(entity)]
+#[distributed::sourced(entity, aggregate_type = "safe_recorder")]
 impl SafeRecorder {
     #[event("recorded")]
     fn record(&mut self, _payload: FailingSerialize) {

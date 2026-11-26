@@ -19,6 +19,10 @@ struct SameVersionUpcasterAggregate {
 impl Aggregate for SameVersionUpcasterAggregate {
     type ReplayError = String;
 
+    fn aggregate_type() -> &'static str {
+        "same_version_upcaster_aggregate"
+    }
+
     fn entity(&self) -> &Entity {
         &self.entity
     }

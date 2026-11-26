@@ -8,7 +8,7 @@ use crate::domain_event::{
     DomainEvent, DomainEventCaptureError, DomainEventDescriptor, DomainEventEnvelope,
     DomainEventOccurrence,
 };
-use crate::entity::{BitcodePayloadCodec, Entity, EventRecordError, PayloadCodec};
+use crate::entity::{BitcodePayloadCodec, Entity, EventRecordError};
 use crate::trace_context::{TraceContext, CAUSATION_ID, CORRELATION_ID, TRACEPARENT, TRACESTATE};
 use crate::SourcedResult;
 

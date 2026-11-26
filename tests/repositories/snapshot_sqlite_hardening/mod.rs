@@ -84,10 +84,11 @@ async fn snapshot_hydrated_load_does_not_read_pre_snapshot_rows() {
     let snap = repo.get_snapshot(&identity(id)).await.unwrap().unwrap();
     assert_eq!(snap.version, 5, "snapshot should cover the whole stream");
 
-    // Physically delete every pre-snapshot row. After this, a *full* replay is
-    // impossible (the early events are gone); only a snapshot+tail load can
-    // reconstruct correct state.
-    sqlx::query("DELETE FROM aggregate_events WHERE aggregate_type = ? AND aggregate_id = ? AND sequence <= ?")
+    // Physically delete every row before the last. After this, a *full* replay
+    // is impossible (the early events are gone); only a snapshot+tail load can
+    // reconstruct correct state. The last row stays: a stream with no rows is
+    // missing, whatever snapshot lingers for it.
+    sqlx::query("DELETE FROM aggregate_events WHERE aggregate_type = ? AND aggregate_id = ? AND sequence < ?")
         .bind(Counter::aggregate_type())
         .bind(id)
         .bind(5_i64)
@@ -96,8 +97,8 @@ async fn snapshot_hydrated_load_does_not_read_pre_snapshot_rows() {
         .unwrap();
     assert_eq!(
         count_event_rows(&repo, id).await,
-        0,
-        "all pre-snapshot rows removed; only the snapshot remains"
+        1,
+        "only the row the snapshot ends on remains"
     );
 
     // Load via snapshot + (empty) tail. The total comes entirely from the

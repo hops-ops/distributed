@@ -29,7 +29,6 @@ pub mod entity;
 pub mod repository;
 
 pub(crate) mod command_ledger;
-mod commit_builder;
 #[cfg(feature = "gateway")]
 pub mod gateway;
 pub mod graphql;
@@ -64,8 +63,8 @@ pub mod trace_context;
 // Re-export entity types at crate root for convenience
 pub use entity::{
     upcast_events, upcast_events_for_replay, upcast_payload, BitcodePayloadCodec, Entity,
-    EventRecord, EventRecordError, EventUpcaster, PayloadCodec, Recorded, UpcastError,
-    BITCODE_PAYLOAD_CODEC, BITCODE_PAYLOAD_CODEC_VERSION,
+    EventRecord, EventRecordError, EventUpcaster, Recorded, UpcastError, BITCODE_PAYLOAD_CODEC,
+    BITCODE_PAYLOAD_CODEC_VERSION,
 };
 
 // Placement-independent application composition. The module path remains the
@@ -294,9 +293,9 @@ pub type SourcedResult<T = ()> = std::result::Result<T, EventRecordError>;
 
 // Re-export repository traits at crate root for convenience
 pub use repository::{
-    CommitBatch, GetStream, InboxOutcome, InboxReceipt, InboxStore, PreparedEventAppend,
-    ReadModelWritePlanStore, RelationalReadModelQueryStore, Repository, RepositoryError,
-    SnapshotStore, SnapshotWrite, StreamIdentity, StreamWrite, TransactionalCommit,
+    CommitBatch, GetStream, InboxReceipt, InboxStore, PreparedEventAppend, ReadModelWritePlanStore,
+    RelationalReadModelQueryStore, Repository, RepositoryError, SnapshotStore, SnapshotWrite,
+    StreamIdentity, StreamWrite, TransactionalCommit,
 };
 
 // Re-export aggregate types at crate root for convenience
@@ -353,15 +352,7 @@ pub use outbox_worker::{
     OutboxPublishFailureAction, OutboxSource, OutboxStore, ReceivedOutboxMessage, OUTBOX_RETRY,
 };
 
-pub use queued_repo::{
-    // WithOpts + unlock traits for the queued repository variant.
-    GetAllWithOpts,
-    GetWithOpts,
-    // Queued repository
-    Queueable,
-    QueuedRepository,
-    ReadOpts,
-};
+pub use queued_repo::{Queueable, QueuedRepository, ReadOpts};
 
 // Read models: projections and read-optimized views.
 //
@@ -392,9 +383,6 @@ pub use table::{
 pub use trace_context::{
     is_valid_traceparent, TraceContext, CAUSATION_ID, CORRELATION_ID, TRACEPARENT, TRACESTATE,
 };
-
-// CommitBuilder: transactional batches of outbox messages and aggregates
-pub use commit_builder::{CommitBuilder, CommitBuilderExt, StagedCommitBuilder};
 
 // Snapshot: state snapshot payloads and rebuildable cache records for hydration
 pub use snapshot::{hydrate_from_snapshot, InMemorySnapshotStore, SnapshotRecord, Snapshottable};

@@ -2,12 +2,10 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use crate::aggregate::{Aggregate, AggregateRepository};
+use crate::aggregate::{stream_identity_for, Aggregate, AggregateRepository};
 use crate::domain_event::{DomainEvent, DomainEventCaptureError, DomainEventCommitGuardError};
 use crate::outbox::{OutboxMessage, PreparedDomainEvent};
-use crate::repository::{
-    CommitBatch, RepositoryError, StreamIdentity, StreamWrite, TransactionalCommit,
-};
+use crate::repository::{CommitBatch, RepositoryError, StreamWrite, TransactionalCommit};
 use crate::schedule::{Schedule, ScheduleWrite};
 
 /// What a commit does with the ids of the outbox rows it just inserted.
@@ -73,15 +71,14 @@ impl CommitReceipt {
     }
 }
 
-/// Builder returned by [`AggregateRepository::outbox`] (and `publish` /
-/// `publish_events`) and [`AggregateRepository::schedule`] that commits an
-/// aggregate together with outbox rows, schedule writes and (when the
-/// repository has snapshots configured) a snapshot — all in one async
-/// transactional batch.
+/// The commit builder: commits aggregates together with their published
+/// domain events, outbox rows, schedule writes and (when the repository has
+/// snapshots configured) a snapshot, all in one transactional batch.
+/// [`AggregateRepository::commit`] is its zero-option form.
 ///
 /// Borrows the repository so it can be called through `ctx.repo()` inside async
-/// handlers. Chain `.outbox(..)` / `.publish(..)` to stage more, then
-/// `.commit(&mut aggregate)`.
+/// handlers. Chain `.publish_events()` / `.outbox(..)` / `.schedule(..)` to
+/// stage more, then `.commit(&mut aggregate)` or `.commit_all(&mut [..])`.
 pub struct AggregateCommit<'a, R, A> {
     repo: &'a AggregateRepository<R, A>,
     publish_captured_events: bool,
@@ -92,7 +89,7 @@ pub struct AggregateCommit<'a, R, A> {
 }
 
 impl<'a, R, A> AggregateCommit<'a, R, A> {
-    fn empty(repo: &'a AggregateRepository<R, A>) -> Self {
+    pub(crate) fn new(repo: &'a AggregateRepository<R, A>) -> Self {
         Self {
             repo,
             publish_captured_events: false,
@@ -168,18 +165,39 @@ where
     /// pending for the drain loop. A publish failure leaves them retryable.
     /// Without a bus, rows stay pending for a separately operated worker.
     ///
+    /// Outbox messages without a source are stamped with this aggregate.
     /// Returns a [`CommitReceipt`] carrying the inserted outbox message ids.
-    pub async fn commit(mut self, aggregate: &mut A) -> Result<CommitReceipt, RepositoryError> {
+    pub async fn commit(self, aggregate: &mut A) -> Result<CommitReceipt, RepositoryError> {
+        self.commit_all(&mut [aggregate]).await
+    }
+
+    /// Commit several aggregates of this type in one transaction, as
+    /// [`commit`](Self::commit) does one. Outbox messages are stamped with a
+    /// source only when exactly one aggregate is committed, and an explicit
+    /// [`publish`](Self::publish) needs exactly one aggregate to bind to.
+    pub async fn commit_all(
+        mut self,
+        aggregates: &mut [&mut A],
+    ) -> Result<CommitReceipt, RepositoryError> {
         if let Some(err) = self.error.take() {
             return Err(err);
         }
-        self.prepare_domain_publications(aggregate)?;
-        for message in &mut self.outbox_messages {
-            if message.source_aggregate_type.is_none()
-                && message.source_aggregate_id.is_none()
-                && message.source_sequence.is_none()
-            {
-                message.set_source(aggregate);
+        if !self.explicit_domain_events.is_empty() && aggregates.len() != 1 {
+            return Err(RepositoryError::Model(
+                "an explicit `publish` binds to one aggregate; commit exactly one".into(),
+            ));
+        }
+        for aggregate in aggregates.iter() {
+            self.prepare_domain_publications(aggregate)?;
+        }
+        if let [aggregate] = &*aggregates {
+            for message in &mut self.outbox_messages {
+                if message.source_aggregate_type.is_none()
+                    && message.source_aggregate_id.is_none()
+                    && message.source_sequence.is_none()
+                {
+                    message.set_source(&**aggregate);
+                }
             }
         }
         let outbox_message_ids: Vec<String> = self
@@ -188,32 +206,37 @@ where
             .map(|message| message.id().to_string())
             .collect();
 
-        let publisher = self.repo.outbox_publisher();
-
-        let (snapshots, snapshot_version) = self.repo.snapshot_writes_for(aggregate)?;
-        let identity = StreamIdentity::new(A::aggregate_type(), aggregate.entity().id())?;
-        let stream = StreamWrite::new(identity, aggregate.entity_mut());
+        let mut snapshots = Vec::new();
+        let mut snapshot_versions = Vec::with_capacity(aggregates.len());
+        for aggregate in aggregates.iter() {
+            let (mut writes, version) = self.repo.snapshot_writes(aggregate)?;
+            snapshots.append(&mut writes);
+            snapshot_versions.push(version);
+        }
+        let mut streams = Vec::with_capacity(aggregates.len());
+        for aggregate in aggregates.iter_mut() {
+            let identity = stream_identity_for::<A>(aggregate.entity().id())?;
+            streams.push(StreamWrite::new(identity, aggregate.entity_mut()));
+        }
         self.repo
             .repo()
             .commit_batch(CommitBatch {
-                streams: vec![stream],
+                streams,
                 outbox_messages: self.outbox_messages,
                 snapshots,
                 inbox_receipts: Vec::new(),
                 schedules: self.schedules,
             })
             .await?;
-        if let Some(version) = snapshot_version {
-            aggregate.entity_mut().set_snapshot_version(version);
+        for (aggregate, version) in aggregates.iter_mut().zip(snapshot_versions) {
+            if let Some(version) = version {
+                aggregate.entity_mut().set_snapshot_version(version);
+            }
         }
-        aggregate
-            .entity_mut()
-            .mark_domain_events_committed()
-            .map_err(domain_event_guard_repository_error)?;
 
         // Best-effort after-commit publish. Command completion is this commit;
         // publish must not delay the caller.
-        if let Some(config) = publisher {
+        if let Some(config) = self.repo.outbox_publisher() {
             config
                 .publish_after_commit(outbox_message_ids.clone())
                 .await;
@@ -223,19 +246,12 @@ where
     }
 
     fn prepare_domain_publications(&mut self, aggregate: &A) -> Result<(), RepositoryError> {
-        let entity = aggregate.entity();
-        entity
-            .domain_event_commit_guard()
-            .map_err(domain_event_guard_repository_error)?;
-        let pending = entity
+        // Whether every captured event is published is checked by the
+        // commit's validation, on every path.
+        let pending = aggregate
+            .entity()
             .pending_domain_events_for_commit()
             .map_err(domain_event_guard_repository_error)?;
-        if !pending.is_empty() && !self.publish_captured_events {
-            return Err(RepositoryError::Model(
-                "aggregate has captured domain events; add `publish_events()` to the commit".into(),
-            ));
-        }
-
         if self.publish_captured_events {
             self.outbox_messages.extend(
                 pending
@@ -276,29 +292,29 @@ impl<R, A> AggregateRepository<R, A> {
     /// Start an aggregate commit that publishes its exact captured domain
     /// events.
     pub fn publish_events(&self) -> AggregateCommit<'_, R, A> {
-        AggregateCommit::empty(self).publish_events()
+        AggregateCommit::new(self).publish_events()
     }
 
     /// Start an aggregate commit with one explicitly authored outward event.
     pub fn publish<E: DomainEvent>(&self, event: E) -> AggregateCommit<'_, R, A> {
-        AggregateCommit::empty(self).publish(event)
+        AggregateCommit::new(self).publish(event)
     }
 
     /// Start a commit with an outbox message attached.
     pub fn outbox(&self, message: OutboxMessage) -> AggregateCommit<'_, R, A> {
-        AggregateCommit::empty(self).outbox(message)
+        AggregateCommit::new(self).outbox(message)
     }
 
     /// Start a commit that schedules work for the aggregate
     /// ([`AggregateCommit::schedule`]).
     pub fn schedule(&self, schedule: Schedule) -> AggregateCommit<'_, R, A> {
-        AggregateCommit::empty(self).schedule(schedule)
+        AggregateCommit::new(self).schedule(schedule)
     }
 
     /// Start a commit that cancels a schedule of the aggregate
     /// ([`AggregateCommit::cancel_schedule`]).
     pub fn cancel_schedule(&self, name: impl Into<String>) -> AggregateCommit<'_, R, A> {
-        AggregateCommit::empty(self).cancel_schedule(name)
+        AggregateCommit::new(self).cancel_schedule(name)
     }
 }
 
@@ -315,7 +331,8 @@ fn domain_event_guard_repository_error(error: DomainEventCommitGuardError) -> Re
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{sourced, AggregateBuilder, Entity, InMemoryRepository, OutboxStore};
+    use crate::repository::StreamIdentity;
+    use crate::{sourced, AggregateBuilder, Entity, InMemoryRepository, OutboxStore, Queueable};
     use std::sync::Mutex;
 
     #[derive(Default)]
@@ -323,7 +340,7 @@ mod tests {
         entity: Entity,
     }
 
-    #[sourced(entity)]
+    #[sourced(entity, aggregate_type = "dummy")]
     impl Dummy {
         #[event("Touched")]
         fn touch(&mut self) {
@@ -447,7 +464,7 @@ mod tests {
         value: i64,
     }
 
-    #[derive(Default)]
+    #[derive(Default, crate::Snapshot)]
     struct PublishedCounter {
         entity: Entity,
         value: i64,
@@ -489,26 +506,49 @@ mod tests {
 
     #[tokio::test]
     async fn a_commit_that_would_drop_captured_events_is_refused_on_every_path() {
-        let repo = InMemoryRepository::new().aggregate::<PublishedCounter>();
+        let repo = InMemoryRepository::new()
+            .queued()
+            .aggregate::<PublishedCounter>()
+            .with_snapshots(1);
         let mut counter = PublishedCounter::default();
         counter.open("counter-plain".into()).unwrap();
 
-        // Plain commit.
+        // The plain commit, the batch form, an outbox commit without
+        // `publish_events()`, and a hand-built batch all refuse.
         let plain = repo.commit(&mut counter).await.unwrap_err();
         assert!(plain.to_string().contains("publish_events"), "{plain}");
-        // The transactional batch builder.
-        let batch = crate::CommitBuilder::new(repo.repo())
-            .aggregate(&mut counter)
-            .commit()
+        let all = repo.commit_all(&mut [&mut counter]).await.unwrap_err();
+        assert!(all.to_string().contains("publish_events"), "{all}");
+        let other = OutboxMessage::create("unrelated", "T", vec![]).unwrap();
+        let outbox = repo.outbox(other).commit(&mut counter).await.unwrap_err();
+        assert!(outbox.to_string().contains("publish_events"), "{outbox}");
+        let identity =
+            StreamIdentity::new(PublishedCounter::aggregate_type(), "counter-plain").unwrap();
+        let raw = repo
+            .repo()
+            .commit_batch(CommitBatch::new(vec![StreamWrite::new(
+                identity,
+                &mut counter.entity,
+            )]))
             .await
             .unwrap_err();
-        assert!(batch.to_string().contains("publish_events"), "{batch}");
+        assert!(raw.to_string().contains("publish_events"), "{raw}");
         // Nothing was stored, and the occurrences are intact for a retry.
-        assert!(repo.get("counter-plain").await.unwrap().is_none());
+        assert!(repo.peek("counter-plain").await.unwrap().is_none());
+        assert_eq!(counter.entity.committed_version(), 0);
         assert_eq!(counter.entity.pending_domain_events().len(), 1);
 
         repo.publish_events().commit(&mut counter).await.unwrap();
-        assert!(repo.get("counter-plain").await.unwrap().is_some());
+        assert!(counter.entity.pending_domain_events().is_empty());
+        assert!(repo.peek("counter-plain").await.unwrap().is_some());
+        let published = repo
+            .repo()
+            .inner()
+            .outbox_store()
+            .pending(10)
+            .await
+            .unwrap();
+        assert_eq!(published.len(), 1);
     }
 
     #[tokio::test]
@@ -586,7 +626,7 @@ mod tests {
         assert!(matches!(
             error,
             RepositoryError::Model(ref message)
-                if message.contains("add `publish_events()`")
+                if message.contains("publish_events()")
         ));
         assert_eq!(counter.entity.committed_version(), 0);
         assert_eq!(counter.entity.pending_domain_events().len(), 1);

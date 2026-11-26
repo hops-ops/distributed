@@ -148,11 +148,9 @@ where
         .await
         .expect("stale load should succeed")
         .expect("stale seat should exist");
-    let mut winner = seat_repo
-        .get(&seat_id)
-        .await
-        .expect("winner load should succeed")
-        .expect("winner seat should exist");
+    // The winner is the committed original, not a second load: a second
+    // load of the stream would wait on a queued repository's lock.
+    let mut winner = original;
     stale
         .reserve(
             unique_id("stale-checkout"),

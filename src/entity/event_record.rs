@@ -10,31 +10,18 @@ use crate::trace_context::{TraceContext, CAUSATION_ID, CORRELATION_ID, TRACEPARE
 pub const BITCODE_PAYLOAD_CODEC: &str = "bitcode";
 pub const BITCODE_PAYLOAD_CODEC_VERSION: u16 = 1;
 
-/// Codec used to serialize and deserialize event payload bytes.
-pub trait PayloadCodec {
-    const NAME: &'static str;
-    const VERSION: u16;
-
-    type Error: std::error::Error + Send + Sync + 'static;
-
-    fn encode<T: Serialize + ?Sized>(value: &T) -> Result<Vec<u8>, Self::Error>;
-    fn decode<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, Self::Error>;
-}
-
-/// Default payload codec.
+/// The payload codec: bitcode, the only codec events and outbox messages use.
 pub struct BitcodePayloadCodec;
 
-impl PayloadCodec for BitcodePayloadCodec {
-    const NAME: &'static str = BITCODE_PAYLOAD_CODEC;
-    const VERSION: u16 = BITCODE_PAYLOAD_CODEC_VERSION;
+impl BitcodePayloadCodec {
+    pub const NAME: &'static str = BITCODE_PAYLOAD_CODEC;
+    pub const VERSION: u16 = BITCODE_PAYLOAD_CODEC_VERSION;
 
-    type Error = bitcode::Error;
-
-    fn encode<T: Serialize + ?Sized>(value: &T) -> Result<Vec<u8>, Self::Error> {
+    pub fn encode<T: Serialize + ?Sized>(value: &T) -> Result<Vec<u8>, bitcode::Error> {
         bitcode::serialize(value)
     }
 
-    fn decode<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, Self::Error> {
+    pub fn decode<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, bitcode::Error> {
         bitcode::deserialize(bytes)
     }
 }
@@ -150,16 +137,7 @@ mod payload_serde {
 
 impl EventRecord {
     pub fn new(event_name: impl Into<String>, payload: Vec<u8>, sequence: u64) -> Self {
-        EventRecord {
-            event_name: event_name.into(),
-            payload_codec: Cow::Borrowed(BITCODE_PAYLOAD_CODEC),
-            payload_codec_version: BITCODE_PAYLOAD_CODEC_VERSION,
-            payload,
-            event_version: 1,
-            sequence,
-            timestamp: crate::time::now(),
-            metadata: HashMap::new(),
-        }
+        Self::new_versioned(event_name, payload, sequence, 1)
     }
 
     /// Create an event record at a specific version.
@@ -188,15 +166,9 @@ impl EventRecord {
         sequence: u64,
         metadata: HashMap<String, String>,
     ) -> Self {
-        EventRecord {
-            event_name: event_name.into(),
-            payload_codec: Cow::Borrowed(BITCODE_PAYLOAD_CODEC),
-            payload_codec_version: BITCODE_PAYLOAD_CODEC_VERSION,
-            payload,
-            event_version: 1,
-            sequence,
-            timestamp: crate::time::now(),
+        Self {
             metadata,
+            ..Self::new(event_name, payload, sequence)
         }
     }
 

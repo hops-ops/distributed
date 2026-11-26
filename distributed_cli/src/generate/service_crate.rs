@@ -500,7 +500,7 @@ pub struct CommandAggregate {
     pub status: String,
 }
 
-#[sourced(entity)]
+#[sourced(entity, aggregate_type = "command_aggregate")]
 impl CommandAggregate {
     #[event("service.command_recorded")]
     pub fn record_command(&mut self, command: String, id: String, name: Option<String>) {
@@ -550,7 +550,7 @@ pub struct {model_struct} {{
     pub status: String,
 }}
 
-#[sourced(entity)]
+#[sourced(entity, aggregate_type = {aggregate_type})]
 impl {model_struct} {{
     #[event({command_recorded_event})]
     pub fn record_command(&mut self, command: String, id: String, name: Option<String>) {{
@@ -563,6 +563,7 @@ impl {model_struct} {{
 }}
 "#,
             model_struct = model.type_ident,
+            aggregate_type = rust_string(&model.name),
             command_recorded_event =
                 rust_string(&format!("{}.command_recorded", model.message_prefix)),
         )

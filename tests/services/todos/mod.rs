@@ -1,8 +1,8 @@
 use common::todo::{Todo, TodoState};
 use distributed::bus::{Message, MessagePublisher, TransportError};
 use distributed::{
-    AggregateBuilder, CommitBuilderExt, InMemoryOutboxStore, InMemoryRepository, Lock, LockManager,
-    OutboxDispatcher, OutboxMessage, OutboxMessageStatus, OutboxStore, Queueable, RepositoryError,
+    AggregateBuilder, InMemoryOutboxStore, InMemoryRepository, Lock, LockManager, OutboxDispatcher,
+    OutboxMessage, OutboxMessageStatus, OutboxStore, Queueable, RepositoryError,
 };
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
@@ -225,7 +225,12 @@ async fn outbox_records_persisted() {
     let snapshot = todo.state();
     let message = todo_outbox_message(&id, "init", "todo.initialized", &snapshot);
 
-    repo.outbox(message).commit(&mut todo).await.unwrap();
+    repo.clone()
+        .aggregate::<Todo>()
+        .outbox(message)
+        .commit(&mut todo)
+        .await
+        .unwrap();
 
     // Check pending outbox messages
     let pending = repo.outbox_store().pending(usize::MAX).await.unwrap();
@@ -245,7 +250,12 @@ async fn outbox_dispatch_publishes_and_completes_committed_row() {
     let (mut todo, id) = initialized_todo("user1", "Outbox dispatch");
     let message = todo_outbox_message(&id, "init", "todo.initialized", &todo.state());
     let message_id = message.id().to_string();
-    repo.outbox(message).commit(&mut todo).await.unwrap();
+    repo.clone()
+        .aggregate::<Todo>()
+        .outbox(message)
+        .commit(&mut todo)
+        .await
+        .unwrap();
 
     let dispatcher = dispatcher(&repo);
     let outcome = dispatcher.dispatch_batch(10).await.unwrap();
@@ -487,7 +497,9 @@ async fn outbox_dispatch_drains_one_row_at_a_time() {
         message3.id().to_string(),
     ];
 
-    repo.outbox(message1)
+    repo.clone()
+        .aggregate::<Todo>()
+        .outbox(message1)
         .outbox(message2)
         .outbox(message3)
         .commit(&mut todo)

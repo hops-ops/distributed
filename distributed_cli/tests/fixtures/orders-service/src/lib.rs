@@ -8,8 +8,8 @@ use distributed::command::{
     PreparedCommand,
 };
 use distributed::graphql::{
-    build_surface, read, surface_for_role, DistributedClientSurfaceExport,
-    SurfaceOptions, SurfaceProjector,
+    build_surface, read, surface_for_role, DistributedClientSurfaceExport, SurfaceOptions,
+    SurfaceProjector,
 };
 use distributed::microsvc::{CausalCommandContext, HandlerError, Routes, Service};
 use distributed::{
@@ -85,6 +85,10 @@ struct FixtureAggregate {
 
 impl Aggregate for FixtureAggregate {
     type ReplayError = std::convert::Infallible;
+
+    fn aggregate_type() -> &'static str {
+        "fixture_aggregate"
+    }
 
     fn entity(&self) -> &Entity {
         &self.entity

@@ -25,12 +25,10 @@ mod validation;
 pub use error::RepositoryError;
 pub(crate) use error::CONCURRENT_WRITE_RETRIES;
 pub use identity::StreamIdentity;
-pub use inbox::{InboxOutcome, InboxReceipt};
+pub use inbox::InboxReceipt;
 pub use traits::{
     CommitBatch, GetStream, InboxStore, PreparedEventAppend, ReadModelWritePlanStore,
     RelationalReadModelQueryStore, Repository, SnapshotStore, SnapshotWrite, StreamWrite,
     TransactionalCommit,
 };
-pub(crate) use validation::{
-    require_captured_events_are_published, validate_commit_batch, validate_snapshot_identity,
-};
+pub(crate) use validation::{validate_commit_batch, validate_snapshot_identity};

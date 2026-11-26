@@ -1,5 +1,6 @@
 use distributed::{sourced, Entity};
 
+#[derive(Default)]
 struct Todo {
     entity: Entity,
 }

@@ -14,7 +14,7 @@ use crate::domain_event::{
 use crate::trace_context::{TraceContext, CAUSATION_ID, CORRELATION_ID};
 use crate::SourcedResult;
 
-use super::{BitcodePayloadCodec, EventRecord, EventRecordError, PayloadCodec};
+use super::{BitcodePayloadCodec, EventRecord, EventRecordError};
 
 /// Position and time of an event recorded by the current unit of work
 /// ([`Entity::last_recorded`]).
@@ -123,23 +123,6 @@ impl Clone for Entity {
             // A copy does not own what the original holds.
             hold: None,
         }
-    }
-}
-
-struct ReplayGuard<'a> {
-    replaying: &'a mut bool,
-}
-
-impl<'a> ReplayGuard<'a> {
-    fn new(replaying: &'a mut bool) -> Self {
-        *replaying = true;
-        ReplayGuard { replaying }
-    }
-}
-
-impl Drop for ReplayGuard<'_> {
-    fn drop(&mut self) {
-        *self.replaying = false;
     }
 }
 
@@ -381,8 +364,13 @@ impl Entity {
     }
 
     /// Mark all current events as committed. Called by repository after successful commit.
+    /// Record that the new events are durable. A backend calls this after its
+    /// commit succeeds; the commit's validation required every captured domain
+    /// event to leave in that transaction, so the pending occurrences are
+    /// cleared with it.
     pub fn mark_committed(&mut self) {
         self.committed_version = self.version;
+        self.pending_domain_events.clear();
     }
 
     /// Set metadata that will be attached to every subsequent event.
@@ -459,18 +447,7 @@ impl Entity {
         name: impl Into<String>,
         payload: &T,
     ) -> SourcedResult {
-        if self.replaying {
-            return Ok(());
-        }
-
-        let bytes = BitcodePayloadCodec::encode(payload).map_err(EventRecordError::encode)?;
-        let sequence = self.next_sequence();
-        let mut record = EventRecord::new(name, bytes, sequence);
-        if !self.metadata.is_empty() {
-            record.metadata = self.metadata.clone();
-        }
-        self.push_new_event(record);
-        Ok(())
+        self.digest_v(name, 1, payload)
     }
 
     /// Record a versioned event.
@@ -545,19 +522,6 @@ impl Entity {
         self.prefix_version = prefix_version;
         self.version = prefix_version + self.events.len() as u64;
         self.committed_version = self.version;
-    }
-
-    pub fn rehydrate<F, E>(&mut self, mut apply: F) -> Result<(), E>
-    where
-        F: FnMut(&EventRecord) -> Result<(), E>,
-    {
-        let _guard = ReplayGuard::new(&mut self.replaying);
-
-        for event in &self.events {
-            apply(event)?;
-        }
-
-        Ok(())
     }
 
     pub fn is_replaying(&self) -> bool {
@@ -695,23 +659,6 @@ mod tests {
         assert!(err.message.contains("intentional serialization failure"));
         assert_eq!(entity.version(), 0);
         assert!(entity.events().is_empty());
-    }
-
-    #[test]
-    fn rehydrate() {
-        let mut entity = Entity::new();
-        entity.digest("test_event1", &"arg1").unwrap();
-        entity.digest("test_event2", &"arg2").unwrap();
-
-        let mut replayed = Vec::new();
-        let result = entity.rehydrate(|event| {
-            replayed.push(event.event_name.clone());
-            Ok::<(), ()>(())
-        });
-
-        assert!(result.is_ok());
-        assert_eq!(replayed, vec!["test_event1", "test_event2"]);
-        assert!(!entity.is_replaying());
     }
 
     #[test]

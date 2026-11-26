@@ -111,10 +111,20 @@ mod tests {
     fn parse_sourced_args_accepts_upcasters() {
         let attr = quote! {
             entity,
+            aggregate_type = "todo",
             upcasters(("initialized", 1 => 2, OldPayload => NewPayload, upcast_fn))
         };
         let args = sourced::parse_sourced_args.parse2(attr).unwrap();
         assert_eq!(args.upcasters.len(), 1);
+    }
+
+    #[test]
+    fn parse_sourced_args_requires_aggregate_type() {
+        let err = sourced::parse_sourced_args
+            .parse2(quote! { entity })
+            .err()
+            .expect("an aggregate without a durable stream name should be rejected");
+        assert!(err.to_string().contains("requires `aggregate_type"));
     }
 
     // ---- aggregate -------------------------------------------------------

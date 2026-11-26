@@ -4,7 +4,7 @@ struct Workflow {
     entity: Entity,
 }
 
-#[sourced(entity)]
+#[sourced(entity, aggregate_type = "workflow")]
 impl Workflow {
     #[event("user.completed")]
     pub fn user_completed(&mut self) {}

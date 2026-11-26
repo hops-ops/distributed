@@ -5,6 +5,7 @@
 
 use std::future::Future;
 use std::sync::Arc;
+use std::time::{Duration, SystemTime};
 
 use crate::command_ledger::{
     AttemptFence, CausalCommitBatch, CausalGetStream, CausalRepositoryIdentity,
@@ -14,6 +15,8 @@ use crate::command_ledger::{
 };
 use crate::entity::Entity;
 use crate::lock::{InMemoryLockManager, LockGuard, LockManager};
+use crate::microsvc::CausalHostProjections;
+use crate::projection::rebuild::{RebuildContext, SnapshotProjectionRebuildPlan};
 use crate::projection_protocol::{
     PartitionId, ProjectionCausationEvidenceBatch, ProjectionCausationEvidenceRequest,
     ProjectionChangeCursor, ProjectionChangeRead, ProjectionCheckpoint, ProjectionCommitBatch,
@@ -25,14 +28,16 @@ use crate::projection_protocol::{
     ProjectionProtocolStore, ProjectionQuerySnapshot, ProjectionQuerySnapshotRequest,
     ProjectionRecordMetadata, ProjectionRecordScope, ProjectorTopologyId, TrustedProjectionInput,
 };
-use crate::read_model::{ReadModelLoadGraph, ReadModelLoadRequest};
+use crate::read_model::{
+    ReadModelLoadGraph, ReadModelLoadRequest, ReadModelScanPage, ReadModelScanRequest,
+};
 use crate::repository::{
     CommitBatch, GetStream, InboxStore, ReadModelWritePlanStore, RelationalReadModelQueryStore,
     RepositoryError, SnapshotStore, StreamIdentity, StreamWrite, TransactionalCommit,
 };
+use crate::schedule::{BackendHost, Capabilities};
 use crate::snapshot::SnapshotRecord;
 use crate::table::{TableStoreError, TableWritePlan};
-
 /// Options for read operations.
 #[derive(Debug, Clone, Copy)]
 pub struct ReadOpts {
@@ -135,13 +140,12 @@ impl<R, L: LockManager> QueuedRepository<R, L> {
 
     /// Load several streams, each returned entity owning its stream's lock.
     /// Locks are taken in key order so two batches cannot deadlock.
-    async fn locked_many(
+    async fn locked_many<'a>(
         &self,
-        identities: &[StreamIdentity],
+        identities: impl Iterator<Item = &'a StreamIdentity> + Send,
         load: impl Future<Output = Result<Vec<Entity>, RepositoryError>> + Send,
     ) -> Result<Vec<Entity>, RepositoryError> {
         let mut keyed: Vec<(String, &StreamIdentity)> = identities
-            .iter()
             .map(|identity| (identity.storage_key(), identity))
             .collect();
         keyed.sort_unstable_by(|a, b| a.0.cmp(&b.0));
@@ -161,6 +165,23 @@ impl<R, L: LockManager> QueuedRepository<R, L> {
     }
 }
 
+/// Implements trait methods that hand the call to the wrapped repository
+/// unchanged. Every method a capability trait declares is listed, defaults
+/// included, so a backend's own implementation is never replaced by a
+/// trait default here.
+macro_rules! delegate {
+    ($(
+        $(#[$meta:meta])*
+        fn $name:ident $(<$lt:lifetime>)? (&$($self_lt:lifetime)? self $(, $arg:ident: $arg_ty:ty)* $(,)?) -> $ret:ty;
+    )*) => {$(
+        $(#[$meta])*
+        fn $name $(<$lt>)? (&$($self_lt)? self $(, $arg: $arg_ty)*) -> $ret {
+            self.inner.$name($($arg),*)
+        }
+    )*};
+}
+
+// Locking reads: each returned entity owns its stream's lock.
 impl<R, L> GetStream for QueuedRepository<R, L>
 where
     R: GetStream,
@@ -177,7 +198,7 @@ where
         &'a self,
         identities: &'a [StreamIdentity],
     ) -> impl Future<Output = Result<Vec<Entity>, RepositoryError>> + Send + 'a {
-        self.locked_many(identities, self.inner.get_streams(identities))
+        self.locked_many(identities.iter(), self.inner.get_streams(identities))
     }
 
     fn get_stream_tail<'a>(
@@ -190,81 +211,15 @@ where
             self.inner.get_stream_tail(identity, after_version),
         )
     }
-}
 
-impl<R, L> CausalGetStream for QueuedRepository<R, L>
-where
-    R: CausalGetStream,
-    L: LockManager,
-{
-    fn get_causal_stream_tail<'a>(
+    fn get_stream_tails<'a>(
         &'a self,
-        identity: &'a StreamIdentity,
-        after_version: u64,
-    ) -> impl Future<Output = Result<Option<Entity>, RepositoryError>> + Send + 'a {
-        self.inner.get_causal_stream_tail(identity, after_version)
-    }
-
-    fn get_causal_stream<'a>(
-        &'a self,
-        identity: &'a StreamIdentity,
-    ) -> impl Future<Output = Result<Option<Entity>, RepositoryError>> + Send + 'a {
-        // Deliberately bypass queue locking: a causal workspace may await user
-        // handler code between load and commit. Optimistic stream versions and
-        // the durable command attempt fence provide the authoritative safety.
-        self.inner.get_causal_stream(identity)
-    }
-}
-
-impl<R, L> CausalRepositoryIdentity for QueuedRepository<R, L>
-where
-    R: CausalRepositoryIdentity,
-    L: LockManager,
-{
-    fn causal_storage_identity(&self) -> CausalStorageIdentity {
-        self.inner.causal_storage_identity()
-    }
-}
-
-impl<R, L> CommandLedgerStore for QueuedRepository<R, L>
-where
-    R: CommandLedgerStore,
-    L: LockManager,
-{
-    fn reserve_command(
-        &self,
-        reservation: CommandReservation,
-    ) -> impl Future<Output = Result<ReservationOutcome, CommandLedgerError>> + Send + '_ {
-        self.inner.reserve_command(reservation)
-    }
-
-    fn lookup_command<'a>(
-        &'a self,
-        key: &'a CommandLedgerKey,
-        scope: CommandLookupScope<'a>,
-    ) -> impl Future<Output = Result<CommandLookup, CommandLedgerError>> + Send + 'a {
-        self.inner.lookup_command(key, scope)
-    }
-
-    fn mark_retryable_unknown(
-        &self,
-        attempt: AttemptFence,
-    ) -> impl Future<Output = Result<(), CommandLedgerError>> + Send + '_ {
-        self.inner.mark_retryable_unknown(attempt)
-    }
-
-    fn complete_external_command(
-        &self,
-        completion: ExternalCommandCompletion,
-    ) -> impl Future<Output = Result<(), CommandLedgerError>> + Send + '_ {
-        self.inner.complete_external_command(completion)
-    }
-
-    fn compact_expired_commands(
-        &self,
-        limit: usize,
-    ) -> impl Future<Output = Result<u64, CommandLedgerError>> + Send + '_ {
-        self.inner.compact_expired_commands(limit)
+        requests: &'a [(StreamIdentity, u64)],
+    ) -> impl Future<Output = Result<Vec<Entity>, RepositoryError>> + Send + 'a {
+        self.locked_many(
+            requests.iter().map(|(identity, _)| identity),
+            self.inner.get_stream_tails(requests),
+        )
     }
 }
 
@@ -314,373 +269,229 @@ where
     }
 }
 
-impl<R, L> CausalTransactionalCommit for QueuedRepository<R, L>
-where
-    R: CausalTransactionalCommit,
-    L: LockManager,
-{
-    fn commit_causal_batch<'a>(
-        &'a self,
-        batch: CausalCommitBatch<'a>,
-    ) -> impl Future<Output = Result<CommandCompletion<'a>, CommandLedgerError>> + Send + 'a {
-        // Causal loads deliberately bypass this wrapper's queue locks, so a
-        // causal commit never owns one to release. Delegating without touching
-        // the lock manager is essential: a matching lock may belong to an
-        // unrelated legacy load/commit flow that is still in progress.
-        self.inner.commit_causal_batch(batch)
+// Causal reads and commits deliberately bypass the queue locks: a causal
+// workspace may await handler code between load and commit, and optimistic
+// stream versions plus the durable command attempt fence are the
+// authoritative safety. A causal commit therefore never owns a lock to
+// release, and must not touch one: a matching lock may belong to an unrelated
+// locking load that is still in progress.
+impl<R: CausalGetStream, L: LockManager> CausalGetStream for QueuedRepository<R, L> {
+    delegate! {
+        fn get_causal_stream<'a>(&'a self, identity: &'a StreamIdentity)
+            -> impl Future<Output = Result<Option<Entity>, RepositoryError>> + Send + 'a;
+        fn get_causal_stream_tail<'a>(&'a self, identity: &'a StreamIdentity, after_version: u64)
+            -> impl Future<Output = Result<Option<Entity>, RepositoryError>> + Send + 'a;
     }
 }
 
-impl<R, L> crate::microsvc::CausalHostProjections for QueuedRepository<R, L>
-where
-    R: crate::microsvc::CausalHostProjections,
-    L: LockManager,
+impl<R: CausalTransactionalCommit, L: LockManager> CausalTransactionalCommit
+    for QueuedRepository<R, L>
 {
-    #[cfg(feature = "graphql")]
-    fn command_causation_evidence<'a>(
-        &'a self,
-        request: &'a crate::projection_protocol::ProjectionCausationEvidenceRequest,
-    ) -> impl std::future::Future<
-        Output = Result<
-            crate::projection_protocol::ProjectionCausationEvidenceBatch,
-            crate::projection_protocol::ProjectionProtocolError,
-        >,
-    > + Send
-           + 'a {
-        self.inner.command_causation_evidence(request)
-    }
-    fn __register_direct_projection_models<'a>(
-        &'a self,
-        topology: &'a crate::projection_protocol::ProjectorTopologyId,
-        ownership: &'a [crate::projection_protocol::ProjectionModelOwnership],
-    ) -> impl std::future::Future<
-        Output = Result<(), crate::projection_protocol::ProjectionProtocolError>,
-    > + Send
-           + 'a {
-        self.inner
-            .__register_direct_projection_models(topology, ownership)
+    delegate! {
+        fn commit_causal_batch<'a>(&'a self, batch: CausalCommitBatch<'a>)
+            -> impl Future<Output = Result<CommandCompletion<'a>, CommandLedgerError>> + Send + 'a;
     }
 }
 
-impl<R, L> ProjectionProtocolStore for QueuedRepository<R, L>
-where
-    R: ProjectionProtocolStore,
-    L: LockManager,
+impl<R: CausalRepositoryIdentity, L: LockManager> CausalRepositoryIdentity
+    for QueuedRepository<R, L>
 {
-    async fn projection_rebuild_records(
+    delegate! {
+        fn causal_storage_identity(&self) -> CausalStorageIdentity;
+    }
+}
+
+impl<R: CommandLedgerStore, L: LockManager> CommandLedgerStore for QueuedRepository<R, L> {
+    delegate! {
+        fn reserve_command(&self, reservation: CommandReservation)
+            -> impl Future<Output = Result<ReservationOutcome, CommandLedgerError>> + Send + '_;
+        fn lookup_command<'a>(&'a self, key: &'a CommandLedgerKey, scope: CommandLookupScope<'a>)
+            -> impl Future<Output = Result<CommandLookup, CommandLedgerError>> + Send + 'a;
+        fn mark_retryable_unknown(&self, attempt: AttemptFence)
+            -> impl Future<Output = Result<(), CommandLedgerError>> + Send + '_;
+        fn complete_external_command(&self, completion: ExternalCommandCompletion)
+            -> impl Future<Output = Result<(), CommandLedgerError>> + Send + '_;
+        fn compact_expired_commands(&self, limit: usize)
+            -> impl Future<Output = Result<u64, CommandLedgerError>> + Send + '_;
+    }
+}
+
+impl<R: CausalHostProjections, L: LockManager> CausalHostProjections for QueuedRepository<R, L> {
+    delegate! {
+        #[cfg(feature = "graphql")]
+        fn command_causation_evidence<'a>(&'a self, request: &'a ProjectionCausationEvidenceRequest)
+            -> impl Future<Output = Result<ProjectionCausationEvidenceBatch, ProjectionProtocolError>> + Send + 'a;
+        fn __register_direct_projection_models<'a>(
+            &'a self,
+            topology: &'a ProjectorTopologyId,
+            ownership: &'a [ProjectionModelOwnership],
+        ) -> impl Future<Output = Result<(), ProjectionProtocolError>> + Send + 'a;
+    }
+}
+
+impl<R: ProjectionProtocolStore, L: LockManager> ProjectionProtocolStore
+    for QueuedRepository<R, L>
+{
+    delegate! {
+        fn projection_rebuild_records<'a>(&'a self, context: &'a RebuildContext)
+            -> impl Future<Output = Result<Vec<ProjectionRecordMetadata>, ProjectionProtocolError>> + Send + 'a;
+        fn commit_projection_rebuild(&self, plan: SnapshotProjectionRebuildPlan)
+            -> impl Future<Output = Result<usize, ProjectionProtocolError>> + Send + '_;
+        fn register_projection_models<'a>(
+            &'a self,
+            topology: &'a ProjectorTopologyId,
+            ownership: &'a [ProjectionModelOwnership],
+        ) -> impl Future<Output = Result<(), ProjectionProtocolError>> + Send + 'a;
+        fn commit_projection(&self, batch: ProjectionCommitBatch)
+            -> impl Future<Output = Result<ProjectionCommitResult, ProjectionProtocolError>> + Send + '_;
+        fn record_projection_failure(&self, batch: ProjectionFailureBatch)
+            -> impl Future<Output = Result<ProjectionFailure, ProjectionProtocolError>> + Send + '_;
+        fn projection_checkpoint<'a>(
+            &'a self,
+            cursor_scope: &'a ProjectionInputCursor,
+            generation: ProjectionGeneration,
+        ) -> impl Future<Output = Result<Option<ProjectionCheckpoint>, ProjectionProtocolError>> + Send + 'a;
+        fn projection_record<'a>(&'a self, scope: &'a ProjectionRecordScope)
+            -> impl Future<Output = Result<Option<ProjectionRecordMetadata>, ProjectionProtocolError>> + Send + 'a;
+        fn projection_input_disposition<'a>(&'a self, input: &'a TrustedProjectionInput)
+            -> impl Future<Output = Result<ProjectionInputDisposition, ProjectionProtocolError>> + Send + 'a;
+        fn projection_query_snapshot<'a>(&'a self, request: &'a ProjectionQuerySnapshotRequest)
+            -> impl Future<Output = Result<ProjectionQuerySnapshot, ProjectionProtocolError>> + Send + 'a;
+        fn projection_execution_snapshot_batch<'a>(
+            &'a self,
+            request: &'a ProjectionExecutionSnapshotBatchRequest,
+        ) -> impl Future<Output = Result<ProjectionExecutionSnapshotBatch, ProjectionProtocolError>> + Send + 'a;
+        fn projection_causation_evidence<'a>(&'a self, request: &'a ProjectionCausationEvidenceRequest)
+            -> impl Future<Output = Result<ProjectionCausationEvidenceBatch, ProjectionProtocolError>> + Send + 'a;
+        fn projection_partition_runtime_state<'a>(
+            &'a self,
+            topology: &'a ProjectorTopologyId,
+            partition: &'a PartitionId,
+        ) -> impl Future<Output = Result<Option<ProjectionPartitionRuntimeState>, ProjectionProtocolError>> + Send + 'a;
+        fn projection_observation<'a>(
+            &'a self,
+            causation_id: &'a str,
+            scope: &'a ProjectionRecordScope,
+            kind: ProjectionObservationKind,
+        ) -> impl Future<Output = Result<Option<ProjectionObservation>, ProjectionProtocolError>> + Send + 'a;
+        fn projection_changes<'a>(
+            &'a self,
+            topology: &'a ProjectorTopologyId,
+            partition: &'a PartitionId,
+            after: Option<&'a ProjectionChangeCursor>,
+            limit: usize,
+        ) -> impl Future<Output = Result<ProjectionChangeRead, ProjectionProtocolError>> + Send + 'a;
+        fn repair_projection<'a>(
+            &'a self,
+            topology: &'a ProjectorTopologyId,
+            partition: &'a PartitionId,
+            failure_id: &'a str,
+        ) -> impl Future<Output = Result<ProjectionGeneration, ProjectionProtocolError>> + Send + 'a;
+        fn compact_projection_changes<'a>(&'a self, through: &'a ProjectionChangeCursor)
+            -> impl Future<Output = Result<u64, ProjectionProtocolError>> + Send + 'a;
+        fn projection_failure<'a>(
+            &'a self,
+            topology: &'a ProjectorTopologyId,
+            partition: &'a PartitionId,
+            failure_id: &'a str,
+        ) -> impl Future<Output = Result<Option<ProjectionFailure>, ProjectionProtocolError>> + Send + 'a;
+        fn projection_failure_location<'a>(&'a self, failure_id: &'a str)
+            -> impl Future<Output = Result<Option<ProjectionFailureLocation>, ProjectionProtocolError>> + Send + 'a;
+    }
+}
+
+// Read models, snapshots, the consumer inbox, schedules and the backend host
+// are not gated by aggregate locks, so a queued repository stays a complete
+// drop-in for the repository it wraps.
+
+impl<R: SnapshotStore, L: LockManager> SnapshotStore for QueuedRepository<R, L> {
+    delegate! {
+        fn get_snapshot<'a>(&'a self, identity: &'a StreamIdentity)
+            -> impl Future<Output = Result<Option<SnapshotRecord>, RepositoryError>> + Send + 'a;
+        fn get_snapshots<'a>(&'a self, identities: &'a [StreamIdentity])
+            -> impl Future<Output = Result<Vec<SnapshotRecord>, RepositoryError>> + Send + 'a;
+        fn save_snapshot<'a>(&'a self, identity: &'a StreamIdentity, record: SnapshotRecord)
+            -> impl Future<Output = Result<(), RepositoryError>> + Send + 'a;
+        fn delete_snapshot<'a>(&'a self, identity: &'a StreamIdentity)
+            -> impl Future<Output = Result<bool, RepositoryError>> + Send + 'a;
+    }
+}
+
+impl<R: ReadModelWritePlanStore, L: LockManager> ReadModelWritePlanStore
+    for QueuedRepository<R, L>
+{
+    delegate! {
+        fn commit_write_plan(&self, plan: TableWritePlan)
+            -> impl Future<Output = Result<(), TableStoreError>> + Send + '_;
+    }
+}
+
+impl<R: RelationalReadModelQueryStore, L: LockManager> RelationalReadModelQueryStore
+    for QueuedRepository<R, L>
+{
+    delegate! {
+        fn scan_read_model(&self, request: ReadModelScanRequest)
+            -> impl Future<Output = Result<ReadModelScanPage, TableStoreError>> + Send + '_;
+        fn load_graph(&self, request: ReadModelLoadRequest)
+            -> impl Future<Output = Result<ReadModelLoadGraph, TableStoreError>> + Send + '_;
+    }
+}
+
+impl<R: InboxStore, L: LockManager> InboxStore for QueuedRepository<R, L> {
+    delegate! {
+        fn inbox_contains<'a>(&'a self, consumer: &'a str, message_id: &'a str)
+            -> impl Future<Output = Result<bool, RepositoryError>> + Send + 'a;
+        fn purge_inbox_older_than(&self, age: Duration)
+            -> impl Future<Output = Result<u64, RepositoryError>> + Send;
+    }
+}
+
+impl<R: BackendHost, L: LockManager> BackendHost for QueuedRepository<R, L> {
+    delegate! {
+        fn capabilities(&self) -> Capabilities;
+        fn host_now(&self) -> impl Future<Output = Result<SystemTime, RepositoryError>> + Send + '_;
+    }
+}
+
+#[cfg(feature = "runtime-tokio")]
+#[async_trait::async_trait]
+impl<R, L> crate::schedule::ScheduleStore for QueuedRepository<R, L>
+where
+    R: crate::schedule::ScheduleStore,
+    L: LockManager + 'static,
+{
+    fn with_schedule_dispatch(self) -> Self {
+        Self {
+            inner: self.inner.with_schedule_dispatch(),
+            lock_manager: self.lock_manager,
+        }
+    }
+
+    async fn schedule_now(&self) -> Result<SystemTime, RepositoryError> {
+        self.inner.schedule_now().await
+    }
+
+    async fn claim_due_schedules(
         &self,
-        context: &crate::projection::rebuild::RebuildContext,
-    ) -> Result<Vec<crate::projection_protocol::ProjectionRecordMetadata>, ProjectionProtocolError>
-    {
-        self.inner.projection_rebuild_records(context).await
-    }
-
-    async fn commit_projection_rebuild(
-        &self,
-        plan: crate::projection::rebuild::SnapshotProjectionRebuildPlan,
-    ) -> Result<usize, ProjectionProtocolError> {
-        self.inner.commit_projection_rebuild(plan).await
-    }
-
-    fn register_projection_models<'a>(
-        &'a self,
-        topology: &'a ProjectorTopologyId,
-        ownership: &'a [ProjectionModelOwnership],
-    ) -> impl Future<Output = Result<(), ProjectionProtocolError>> + Send + 'a {
-        self.inner.register_projection_models(topology, ownership)
-    }
-
-    fn commit_projection(
-        &self,
-        batch: ProjectionCommitBatch,
-    ) -> impl Future<Output = Result<ProjectionCommitResult, ProjectionProtocolError>> + Send + '_
-    {
-        self.inner.commit_projection(batch)
-    }
-
-    fn record_projection_failure(
-        &self,
-        batch: ProjectionFailureBatch,
-    ) -> impl Future<Output = Result<ProjectionFailure, ProjectionProtocolError>> + Send + '_ {
-        self.inner.record_projection_failure(batch)
-    }
-
-    fn projection_checkpoint<'a>(
-        &'a self,
-        cursor_scope: &'a ProjectionInputCursor,
-        generation: ProjectionGeneration,
-    ) -> impl Future<Output = Result<Option<ProjectionCheckpoint>, ProjectionProtocolError>> + Send + 'a
-    {
-        self.inner.projection_checkpoint(cursor_scope, generation)
-    }
-
-    fn projection_record<'a>(
-        &'a self,
-        scope: &'a ProjectionRecordScope,
-    ) -> impl Future<Output = Result<Option<ProjectionRecordMetadata>, ProjectionProtocolError>>
-           + Send
-           + 'a {
-        self.inner.projection_record(scope)
-    }
-
-    fn projection_input_disposition<'a>(
-        &'a self,
-        input: &'a TrustedProjectionInput,
-    ) -> impl Future<Output = Result<ProjectionInputDisposition, ProjectionProtocolError>> + Send + 'a
-    {
-        self.inner.projection_input_disposition(input)
-    }
-
-    fn projection_query_snapshot<'a>(
-        &'a self,
-        request: &'a ProjectionQuerySnapshotRequest,
-    ) -> impl Future<Output = Result<ProjectionQuerySnapshot, ProjectionProtocolError>> + Send + 'a
-    {
-        self.inner.projection_query_snapshot(request)
-    }
-
-    fn projection_execution_snapshot_batch<'a>(
-        &'a self,
-        request: &'a ProjectionExecutionSnapshotBatchRequest,
-    ) -> impl Future<Output = Result<ProjectionExecutionSnapshotBatch, ProjectionProtocolError>>
-           + Send
-           + 'a {
-        self.inner.projection_execution_snapshot_batch(request)
-    }
-
-    fn projection_causation_evidence<'a>(
-        &'a self,
-        request: &'a ProjectionCausationEvidenceRequest,
-    ) -> impl Future<Output = Result<ProjectionCausationEvidenceBatch, ProjectionProtocolError>>
-           + Send
-           + 'a {
-        self.inner.projection_causation_evidence(request)
-    }
-
-    fn projection_partition_runtime_state<'a>(
-        &'a self,
-        topology: &'a ProjectorTopologyId,
-        partition: &'a PartitionId,
-    ) -> impl Future<Output = Result<Option<ProjectionPartitionRuntimeState>, ProjectionProtocolError>>
-           + Send
-           + 'a {
-        self.inner
-            .projection_partition_runtime_state(topology, partition)
-    }
-
-    fn projection_observation<'a>(
-        &'a self,
-        causation_id: &'a str,
-        scope: &'a ProjectionRecordScope,
-        kind: ProjectionObservationKind,
-    ) -> impl Future<Output = Result<Option<ProjectionObservation>, ProjectionProtocolError>> + Send + 'a
-    {
-        self.inner.projection_observation(causation_id, scope, kind)
-    }
-
-    fn projection_changes<'a>(
-        &'a self,
-        topology: &'a ProjectorTopologyId,
-        partition: &'a PartitionId,
-        after: Option<&'a ProjectionChangeCursor>,
+        now_ms: i64,
+        claim_until_ms: i64,
         limit: usize,
-    ) -> impl Future<Output = Result<ProjectionChangeRead, ProjectionProtocolError>> + Send + 'a
-    {
+    ) -> Result<Vec<(StreamIdentity, crate::schedule::ArmedSchedule)>, RepositoryError> {
         self.inner
-            .projection_changes(topology, partition, after, limit)
+            .claim_due_schedules(now_ms, claim_until_ms, limit)
+            .await
     }
 
-    fn repair_projection<'a>(
-        &'a self,
-        topology: &'a ProjectorTopologyId,
-        partition: &'a PartitionId,
-        failure_id: &'a str,
-    ) -> impl Future<Output = Result<ProjectionGeneration, ProjectionProtocolError>> + Send + 'a
-    {
+    async fn settle_schedule(
+        &self,
+        owner: &StreamIdentity,
+        name: &str,
+        generation: u64,
+        settlement: &crate::schedule::ScheduleSettlement,
+    ) -> Result<(), RepositoryError> {
         self.inner
-            .repair_projection(topology, partition, failure_id)
-    }
-
-    fn compact_projection_changes<'a>(
-        &'a self,
-        through: &'a ProjectionChangeCursor,
-    ) -> impl Future<Output = Result<u64, ProjectionProtocolError>> + Send + 'a {
-        self.inner.compact_projection_changes(through)
-    }
-
-    fn projection_failure<'a>(
-        &'a self,
-        topology: &'a ProjectorTopologyId,
-        partition: &'a PartitionId,
-        failure_id: &'a str,
-    ) -> impl Future<Output = Result<Option<ProjectionFailure>, ProjectionProtocolError>> + Send + 'a
-    {
-        self.inner
-            .projection_failure(topology, partition, failure_id)
-    }
-
-    fn projection_failure_location<'a>(
-        &'a self,
-        failure_id: &'a str,
-    ) -> impl Future<Output = Result<Option<ProjectionFailureLocation>, ProjectionProtocolError>>
-           + Send
-           + 'a {
-        self.inner.projection_failure_location(failure_id)
-    }
-}
-
-// Non-locking forwards: read models, snapshots, and the consumer inbox are not
-// gated by aggregate locks (matching the sync `SnapshotStore` delegation), so a
-// queued repository stays a complete drop-in for its inner async repository.
-
-impl<R, L> SnapshotStore for QueuedRepository<R, L>
-where
-    R: SnapshotStore,
-    L: LockManager,
-{
-    fn get_snapshot<'a>(
-        &'a self,
-        identity: &'a StreamIdentity,
-    ) -> impl Future<Output = Result<Option<SnapshotRecord>, RepositoryError>> + Send + 'a {
-        self.inner.get_snapshot(identity)
-    }
-
-    fn get_snapshots<'a>(
-        &'a self,
-        identities: &'a [StreamIdentity],
-    ) -> impl Future<Output = Result<Vec<SnapshotRecord>, RepositoryError>> + Send + 'a {
-        self.inner.get_snapshots(identities)
-    }
-
-    fn save_snapshot<'a>(
-        &'a self,
-        identity: &'a StreamIdentity,
-        record: SnapshotRecord,
-    ) -> impl Future<Output = Result<(), RepositoryError>> + Send + 'a {
-        self.inner.save_snapshot(identity, record)
-    }
-
-    fn delete_snapshot<'a>(
-        &'a self,
-        identity: &'a StreamIdentity,
-    ) -> impl Future<Output = Result<bool, RepositoryError>> + Send + 'a {
-        self.inner.delete_snapshot(identity)
-    }
-}
-
-impl<R, L> ReadModelWritePlanStore for QueuedRepository<R, L>
-where
-    R: ReadModelWritePlanStore,
-    L: LockManager,
-{
-    fn commit_write_plan(
-        &self,
-        plan: TableWritePlan,
-    ) -> impl Future<Output = Result<(), TableStoreError>> + Send + '_ {
-        self.inner.commit_write_plan(plan)
-    }
-}
-
-impl<R, L> RelationalReadModelQueryStore for QueuedRepository<R, L>
-where
-    R: RelationalReadModelQueryStore,
-    L: LockManager,
-{
-    fn scan_read_model(
-        &self,
-        request: crate::read_model::ReadModelScanRequest,
-    ) -> impl Future<Output = Result<crate::read_model::ReadModelScanPage, TableStoreError>> + Send + '_
-    {
-        self.inner.scan_read_model(request)
-    }
-
-    fn load_graph(
-        &self,
-        request: ReadModelLoadRequest,
-    ) -> impl Future<Output = Result<ReadModelLoadGraph, TableStoreError>> + Send + '_ {
-        self.inner.load_graph(request)
-    }
-}
-
-impl<R, L> InboxStore for QueuedRepository<R, L>
-where
-    R: InboxStore,
-    L: LockManager,
-{
-    fn inbox_contains<'a>(
-        &'a self,
-        consumer: &'a str,
-        message_id: &'a str,
-    ) -> impl Future<Output = Result<bool, RepositoryError>> + Send + 'a {
-        self.inner.inbox_contains(consumer, message_id)
-    }
-
-    fn purge_inbox_older_than(
-        &self,
-        age: std::time::Duration,
-    ) -> impl Future<Output = Result<u64, RepositoryError>> + Send {
-        // Inbox maintenance is a direct store operation; the queue/lock layer adds
-        // nothing, so delegate straight through to the inner store.
-        self.inner.purge_inbox_older_than(age)
-    }
-}
-
-/// Opt-out reads for a queued repository — the counterpart to
-/// [`GetWithOpts`]. `ReadOpts::no_lock()` reads without acquiring the lock.
-pub trait GetWithOpts {
-    fn get_stream_with<'a>(
-        &'a self,
-        identity: &'a StreamIdentity,
-        opts: ReadOpts,
-    ) -> impl Future<Output = Result<Option<Entity>, RepositoryError>> + Send + 'a;
-}
-
-/// Opt-out multi-reads — the counterpart to [`GetAllWithOpts`].
-pub trait GetAllWithOpts {
-    fn get_streams_with<'a>(
-        &'a self,
-        identities: &'a [StreamIdentity],
-        opts: ReadOpts,
-    ) -> impl Future<Output = Result<Vec<Entity>, RepositoryError>> + Send + 'a;
-}
-
-impl<R, L> GetWithOpts for QueuedRepository<R, L>
-where
-    R: GetStream,
-    L: LockManager,
-{
-    fn get_stream_with<'a>(
-        &'a self,
-        identity: &'a StreamIdentity,
-        opts: ReadOpts,
-    ) -> impl Future<Output = Result<Option<Entity>, RepositoryError>> + Send + 'a {
-        async move {
-            if opts.lock {
-                self.get_stream(identity).await
-            } else {
-                self.inner.get_stream(identity).await
-            }
-        }
-    }
-}
-
-impl<R, L> GetAllWithOpts for QueuedRepository<R, L>
-where
-    R: GetStream,
-    L: LockManager,
-{
-    fn get_streams_with<'a>(
-        &'a self,
-        identities: &'a [StreamIdentity],
-        opts: ReadOpts,
-    ) -> impl Future<Output = Result<Vec<Entity>, RepositoryError>> + Send + 'a {
-        async move {
-            if opts.lock {
-                self.get_streams(identities).await
-            } else {
-                self.inner.get_streams(identities).await
-            }
-        }
+            .settle_schedule(owner, name, generation, settlement)
+            .await
     }
 }
 
@@ -768,22 +579,5 @@ mod tests {
             "a causal commit must not release a lock another writer holds"
         );
         held.release().await.unwrap();
-    }
-}
-
-impl<R, L> crate::schedule::BackendHost for QueuedRepository<R, L>
-where
-    R: crate::schedule::BackendHost,
-    L: LockManager,
-{
-    fn capabilities(&self) -> crate::schedule::Capabilities {
-        self.inner.capabilities()
-    }
-
-    fn host_now(
-        &self,
-    ) -> impl Future<Output = Result<std::time::SystemTime, crate::RepositoryError>> + Send + '_
-    {
-        self.inner.host_now()
     }
 }

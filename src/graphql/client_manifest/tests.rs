@@ -227,6 +227,10 @@ struct ManifestAggregate {
 impl crate::Aggregate for ManifestAggregate {
     type ReplayError = std::convert::Infallible;
 
+    fn aggregate_type() -> &'static str {
+        "manifest_aggregate"
+    }
+
     fn entity(&self) -> &crate::Entity {
         &self.entity
     }

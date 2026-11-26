@@ -22,7 +22,7 @@ pub struct GameMap {
     pub explosions: Vec<String>,
 }
 
-#[sourced(entity)]
+#[sourced(entity, aggregate_type = "game_map")]
 impl GameMap {
     #[event("initialized")]
     pub fn create(

@@ -130,7 +130,7 @@ impl CellSqlRepository {
                 "aggregate cells accept command effects, not consumer-inbox writes".into(),
             ));
         }
-        let prepared = validate_commit_batch(&batch)?;
+        let prepared = validate_commit_batch(&batch, None)?;
         super::alarm::validate_schedule_writes(&batch.schedules)?;
         self.connection.transaction(|executor| {
             finish_sql(async {
