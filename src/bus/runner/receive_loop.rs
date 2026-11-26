@@ -29,7 +29,8 @@ use crate::bus::{Message, MessageKind, OrderedDelivery, TransportError, Transpor
 ///
 /// The run returns `Ok(())` when its shutdown signal is triggered (after
 /// settling the delivery in hand) or, with [`RunUntil::Idle`], when the source
-/// has nothing to deliver. A receive or settle error ends the run with that
+/// has nothing to deliver ([`RunUntil::AllIdle`]: when its whole group has
+/// nothing to deliver). A receive or settle error ends the run with that
 /// error; effects already committed make the redelivery safe.
 ///
 /// When the router declares several [delivery lanes](MessageRouter::delivery_lanes)
@@ -46,10 +47,16 @@ where
     R: MessageRouter,
     S: MessageSource,
 {
-    if router.delivery_lanes() > 1 && source.settles_independently() {
-        return LaneRun::new(router, source, options).run().await;
+    let until = options.until.clone();
+    let outcome = if router.delivery_lanes() > 1 && source.settles_independently() {
+        LaneRun::new(router, source, options).run().await
+    } else {
+        run_sequential(router, source, options).await
+    };
+    if let RunUntil::AllIdle(member) = &until {
+        member.leave();
     }
-    run_sequential(router, source, options).await
+    outcome
 }
 
 async fn run_sequential<R, S>(
@@ -84,6 +91,7 @@ where
             settle_ignored(service, transport, received).await?;
             continue;
         } else {
+            let _dispatching = dispatching(&options.until);
             dispatch(router, received.message(), received.ordered_delivery()).await
         };
         settle_result(service, transport, options, received, result).await?;
@@ -129,6 +137,15 @@ async fn yield_now() {
     .await
 }
 
+/// Mark a dispatch for the run's [`IdleGroup`](crate::bus::IdleGroup), if it
+/// has one.
+fn dispatching(until: &RunUntil) -> Option<crate::bus::idle::Dispatching> {
+    match until {
+        RunUntil::AllIdle(member) => Some(member.dispatching()),
+        RunUntil::Idle | RunUntil::Shutdown(_) => None,
+    }
+}
+
 /// The next delivery, or `None` when the run should end.
 ///
 /// Yields first, so a run returns to its executor at least once per delivery
@@ -151,6 +168,16 @@ async fn next_delivery<S: MessageSource>(
     };
     let shutdown = match until {
         RunUntil::Idle => return source.recv().await.map_err(recv_error),
+        RunUntil::AllIdle(member) => loop {
+            let activity = member.activity();
+            if let Some(received) = source.recv().await.map_err(recv_error)? {
+                return Ok(Some(received));
+            }
+            if member.found_empty(activity) {
+                return Ok(None);
+            }
+            select(pin!(source.ready()), pin!(member.changed(activity))).await;
+        },
         RunUntil::Shutdown(shutdown) => shutdown,
     };
     loop {
@@ -426,8 +453,10 @@ where
             let router = Arc::clone(&self.router);
             let message = Arc::clone(&entry.message);
             let ordered = entry.ordered.clone();
+            let dispatching = dispatching(&self.options.until);
             self.lane_busy[lane] = true;
             self.running.push(Box::pin(async move {
+                let _dispatching = dispatching;
                 let result = dispatch_lane(router.as_ref(), &message, ordered.as_ref(), lane).await;
                 (sequence, lane, result)
             }));

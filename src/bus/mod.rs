@@ -81,6 +81,7 @@ mod dead_letter;
 mod error;
 mod failure_policy;
 mod handlers;
+mod idle;
 mod in_memory_bus;
 #[cfg(feature = "kafka")]
 mod kafka;
@@ -155,6 +156,7 @@ pub(crate) use error::retryable;
 pub use error::{TransportError, TransportErrorKind};
 pub use failure_policy::{FailureAction, FailurePolicy};
 pub use handlers::{Handlers, MessageHandler};
+pub use idle::{IdleGroup, IdleMember};
 pub use in_memory_bus::{InMemoryBus, InMemoryReceived};
 #[cfg(any(feature = "nats", feature = "rabbitmq"))]
 pub(crate) use message::strip_address_prefix;

@@ -1091,6 +1091,63 @@ async fn a_retrying_handler_does_not_starve_the_projector_it_waits_for() {
     );
 }
 
+/// A handler publishes the fact a projector consumes, after that projector's
+/// consumer has already found nothing to do. One drain still projects it.
+#[tokio::test]
+async fn one_drain_projects_what_a_handler_published_during_it() {
+    const TRIGGER: &str = "task15.trigger";
+    let repository = InMemoryRepository::new();
+    let bus = InMemoryBus::new();
+    let projected = Arc::new(Mutex::new(Vec::new()));
+    let record = Arc::clone(&projected);
+    let publisher = bus.clone();
+    let service = Service::new()
+        .named("task15-drain")
+        .routes(
+            Routes::new()
+                .with_read_model_store(repository.clone())
+                .causal_projector::<TodoChanged>(primary_projector())
+                .model::<PrimaryView>()
+                .handle(move |context: CausalProjectorContext, fact: TodoChanged| {
+                    let record = Arc::clone(&record);
+                    async move {
+                        context
+                            .project(&PrimaryView {
+                                id: fact.id.clone(),
+                                title: fact.title,
+                            })
+                            .await?;
+                        record.lock().unwrap().push(fact.id);
+                        Ok(())
+                    }
+                }),
+        )
+        .routes(Routes::new().with_dependencies(()).event(TRIGGER).handle(
+            move |_: &crate::microsvc::Context<()>| {
+                let publisher = publisher.clone();
+                async move {
+                    // Long enough for the projector's consumer to go idle.
+                    for _ in 0..8 {
+                        tokio::task::yield_now().await;
+                    }
+                    publisher
+                        .publish_message(fact_message("late", "published by a handler"))
+                        .await
+                        .map_err(|error| HandlerError::Other(Box::new(error)))?;
+                    Ok(serde_json::json!({}))
+                }
+            },
+        ))
+        .with_bus(bus.clone());
+
+    bus.publish_message(Message::new(TRIGGER, MessageKind::Event, b"{}".to_vec()).with_id("t-1"))
+        .await
+        .unwrap();
+    service.run(RunOptions::until_idle()).await.unwrap();
+
+    assert_eq!(*projected.lock().unwrap(), ["late"]);
+}
+
 fn malformed_service(repository: InMemoryRepository, invoked: Arc<AtomicUsize>) -> Service {
     let projector = SurfaceProjector::new("task15_malformed")
         .facts(["task15.malformed"])
