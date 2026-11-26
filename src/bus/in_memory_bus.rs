@@ -262,8 +262,10 @@ impl BusConsumer for InMemoryBus {
         router: Arc<R>,
         options: RunOptions,
     ) -> Result<(), TransportError> {
-        let source =
-            self.topic_source(router.subscription_plan().events, router.consumer_group())?;
+        let group = router
+            .consumer_group()
+            .map(|group| super::topology::scoped_group(group, router.as_ref()));
+        let source = self.topic_source(router.subscription_plan().events, group.as_deref())?;
         run_source(router, source, self.with_dead_letters(options)).await
     }
 }

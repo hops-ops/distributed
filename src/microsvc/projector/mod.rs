@@ -25,7 +25,7 @@ pub(super) use errors::projection_error_is_retryable;
 #[cfg(feature = "graphql")]
 pub(super) use runtime::RegisteredModeledProjector;
 pub(super) use runtime::{
-    ErasedProjectorHandler, ProjectorRegistration, ProjectorRepairFuture,
+    ErasedProjectorHandler, ProjectorDispatchFuture, ProjectorRegistration, ProjectorRepairFuture,
     ProjectorRepairLookupFuture,
 };
 

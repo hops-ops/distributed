@@ -998,6 +998,208 @@ async fn service_fans_same_fact_out_across_projector_only_route_bundles() {
     assert_eq!(secondary_calls.load(Ordering::SeqCst), 1);
 }
 
+/// Two projectors of one fact in a named service. With `primary_rejects` the
+/// primary projector's handler refuses every input it is given, the way a
+/// release with a deterministic projection bug does.
+fn two_projector_service(
+    repository: &InMemoryRepository,
+    primary_rejects: bool,
+    applied: &Arc<Mutex<Vec<(&'static str, String)>>>,
+) -> Service {
+    let primary_applied = Arc::clone(applied);
+    let secondary_applied = Arc::clone(applied);
+    Service::new().named("task15-isolation").routes(
+        Routes::new()
+            .with_read_model_store(repository.clone())
+            .causal_projector::<TodoChanged>(primary_projector())
+            .model::<PrimaryView>()
+            .handle(move |context: CausalProjectorContext, fact: TodoChanged| {
+                let applied = Arc::clone(&primary_applied);
+                async move {
+                    applied.lock().unwrap().push(("primary", fact.id.clone()));
+                    if primary_rejects {
+                        return Err(HandlerError::rejected("the primary view cannot hold this"));
+                    }
+                    context
+                        .project(&PrimaryView {
+                            id: fact.id,
+                            title: fact.title,
+                        })
+                        .await?;
+                    Ok(())
+                }
+            })
+            .causal_projector::<TodoChanged>(secondary_projector())
+            .model::<SecondaryView>()
+            .handle(move |context: CausalProjectorContext, fact: TodoChanged| {
+                let applied = Arc::clone(&secondary_applied);
+                async move {
+                    applied.lock().unwrap().push(("secondary", fact.id.clone()));
+                    context
+                        .project(&SecondaryView {
+                            id: fact.id,
+                            title: fact.title,
+                        })
+                        .await?;
+                    Ok(())
+                }
+            }),
+    )
+}
+
+/// The 2026-11-25 halt: a rollout leaves one projection unable to accept its
+/// inputs. That projector must stop alone with a recorded failure, and resume
+/// from its failed input once the release is corrected and the failure
+/// repaired.
+#[tokio::test]
+async fn a_projector_that_rejects_its_input_stops_alone_and_resumes_after_repair() {
+    rejecting_projector_stops_alone_and_resumes_after_repair(InMemoryBus::new()).await;
+}
+
+/// The same on a durable bus whose group is set explicitly, as an
+/// application does: the projectors still consume as separate groups.
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn a_rejecting_projector_stops_alone_on_a_sql_bus_with_an_explicit_group() {
+    use sqlx::Row as _;
+
+    let directory =
+        std::env::temp_dir().join(format!("projector-isolation-{}", uuid::Uuid::now_v7()));
+    std::fs::create_dir(&directory).unwrap();
+    struct Cleanup(std::path::PathBuf);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    let _cleanup = Cleanup(directory.clone());
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .connect_with(
+            sqlx::sqlite::SqliteConnectOptions::new()
+                .filename(directory.join("bus.sqlite"))
+                .create_if_missing(true),
+        )
+        .await
+        .unwrap();
+    let bus = crate::bus::SqliteBus::new(pool.clone()).group("isolation");
+    bus.ensure_tables().await.unwrap();
+
+    rejecting_projector_stops_alone_and_resumes_after_repair(bus).await;
+
+    let mut consumers: Vec<String> = sqlx::query("SELECT consumer FROM bus_offset")
+        .fetch_all(&pool)
+        .await
+        .unwrap()
+        .iter()
+        .map(|row| row.get("consumer"))
+        .collect();
+    consumers.sort();
+    assert_eq!(
+        consumers,
+        ["isolation-task15_a_primary", "isolation-task15_b_secondary"],
+        "one cursor per projector; the service has no event handler of its own"
+    );
+}
+
+async fn rejecting_projector_stops_alone_and_resumes_after_repair<B>(bus: B)
+where
+    B: Bus + crate::bus::BusConsumer + Clone + 'static,
+{
+    let repository = InMemoryRepository::new();
+    let applied = Arc::new(Mutex::new(Vec::new()));
+    let take = |applied: &Arc<Mutex<Vec<(&'static str, String)>>>| {
+        std::mem::take(&mut *applied.lock().unwrap())
+    };
+    let ids = |projector: &str, applied: &[(&'static str, String)]| -> Vec<String> {
+        applied
+            .iter()
+            .filter(|(name, _)| *name == projector)
+            .map(|(_, id)| id.clone())
+            .collect()
+    };
+
+    bus.publish_message(fact_message("a", "before the rollout"))
+        .await
+        .unwrap();
+    two_projector_service(&repository, false, &applied)
+        .with_bus(bus.clone())
+        .run(RunOptions::until_idle())
+        .await
+        .unwrap();
+    let before = take(&applied);
+    assert_eq!(ids("primary", &before), ["a"]);
+    assert_eq!(ids("secondary", &before), ["a"]);
+
+    // The rollout: the primary projector now rejects its inputs.
+    for id in ["b", "c"] {
+        bus.publish_message(fact_message(id, "after the rollout"))
+            .await
+            .unwrap();
+    }
+    let stopped = two_projector_service(&repository, true, &applied)
+        .with_bus(bus.clone())
+        .run(RunOptions::until_idle())
+        .await
+        .expect_err("the rejecting projector reports its terminal stop");
+    assert!(stopped.is_permanent() && stopped.should_retain_and_stop());
+    let handle = repair_handle(&stopped);
+    assert!(
+        matches!(
+            stopped
+                .source()
+                .and_then(|source| source.downcast_ref::<HandlerError>()),
+            Some(HandlerError::ProjectionTerminalRecorded { projection, .. })
+                if projection == "task15_a_primary"
+        ),
+        "the failure is recorded and names its projection: {stopped}"
+    );
+    assert!(
+        stopped.to_string().contains("task15_a_primary"),
+        "{stopped}"
+    );
+    let during = take(&applied);
+    assert_eq!(
+        ids("secondary", &during),
+        ["b", "c"],
+        "the other projector keeps delivering, in order"
+    );
+    assert_eq!(
+        ids("primary", &during),
+        ["b"],
+        "no later input passes the failed one"
+    );
+
+    // A restart changes nothing: the stop is durable and still local.
+    bus.publish_message(fact_message("d", "while stopped"))
+        .await
+        .unwrap();
+    let still_stopped = two_projector_service(&repository, true, &applied)
+        .with_bus(bus.clone())
+        .run(RunOptions::until_idle())
+        .await
+        .expect_err("the stop survives a restart");
+    assert_eq!(repair_handle(&still_stopped), handle);
+    let while_stopped = take(&applied);
+    assert_eq!(ids("secondary", &while_stopped), ["d"]);
+    assert!(ids("primary", &while_stopped).is_empty());
+
+    // The release is corrected and the operator repairs the failure.
+    let repaired = two_projector_service(&repository, false, &applied);
+    assert_eq!(repaired.repair_projection(&handle).await.unwrap().get(), 2);
+    repaired
+        .with_bus(bus.clone())
+        .run(RunOptions::until_idle())
+        .await
+        .unwrap();
+    let after = take(&applied);
+    assert_eq!(
+        ids("primary", &after),
+        ["b", "c", "d"],
+        "the repaired projector resumes from its failed input"
+    );
+    assert!(ids("secondary", &after).is_empty());
+}
+
 fn malformed_service(repository: InMemoryRepository, invoked: Arc<AtomicUsize>) -> Service {
     let projector = SurfaceProjector::new("task15_malformed")
         .facts(["task15.malformed"])

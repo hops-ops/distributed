@@ -72,6 +72,9 @@ where
     })
 }
 
+/// Lock a partition and return its stored state, creating it with a newly
+/// minted change epoch when it does not exist yet. An existing partition
+/// keeps the epoch it was created with.
 pub(super) async fn lock_partition_in_tx<DB>(
     tx: &mut Transaction<'_, DB>,
     topology: &ProjectorTopologyId,

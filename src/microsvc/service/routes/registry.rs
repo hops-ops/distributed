@@ -48,7 +48,8 @@ use crate::microsvc::dependencies::{
 use crate::microsvc::error::HandlerError;
 use crate::microsvc::projector::{
     CausalProjectorRouteBuilder, ErasedProjectorHandler, ProjectionRepairHandle,
-    ProjectorRegistration, ProjectorRepairFuture, ProjectorRepairLookupFuture,
+    ProjectorDispatchFuture, ProjectorRegistration, ProjectorRepairFuture,
+    ProjectorRepairLookupFuture,
 };
 #[cfg(feature = "graphql")]
 use crate::microsvc::projector::{ModeledProjectorHandlerFn, ModeledProjectorRouteBuilder};
@@ -71,7 +72,19 @@ enum RegisteredHandler<D> {
         handle: Arc<HandlerFn<D>>,
     },
     Causal(Box<dyn ErasedCausalHandler<D>>),
-    Projector(Vec<Arc<dyn ErasedProjectorHandler<D>>>),
+}
+
+/// A projector and the event names it consumes. A projector is not a message
+/// handler of the bundle: it consumes through a consumer of its own.
+struct RoutedProjector<D> {
+    events: Vec<String>,
+    handler: Arc<dyn ErasedProjectorHandler<D>>,
+}
+
+impl<D> RoutedProjector<D> {
+    fn name(&self) -> &str {
+        self.handler.compiled().topology().name()
+    }
 }
 
 /// A typed bundle of command/event handlers and the dependency value they use.
@@ -83,7 +96,7 @@ pub struct Routes<D> {
     handlers: HashMap<MessageKind, HashMap<String, RegisteredHandler<D>>>,
     handler_specs: Vec<HandlerSpec>,
     command_mounts: Vec<CommandMount>,
-    projectors: Vec<Arc<dyn ErasedProjectorHandler<D>>>,
+    projectors: Vec<RoutedProjector<D>>,
     modeled_local_services: BTreeSet<String>,
     outbox_configurator: Option<OutboxConfigurator<D>>,
 }
@@ -496,7 +509,6 @@ impl<D: Send + Sync + 'static> Routes<D> {
         spec: HandlerSpec,
         handler: Box<dyn ErasedProjectorHandler<D>>,
     ) -> Self {
-        let by_name = self.handlers.entry(MessageKind::Event).or_default();
         let names = spec.names();
         for (position, name) in names.iter().enumerate() {
             assert!(
@@ -506,34 +518,10 @@ impl<D: Send + Sync + 'static> Routes<D> {
                 name
             );
         }
-        let handler: Arc<dyn ErasedProjectorHandler<D>> = Arc::from(handler);
-        for name in names {
-            match by_name.get_mut(name) {
-                Some(RegisteredHandler::Projector(projectors)) => {
-                    projectors.push(Arc::clone(&handler));
-                    projectors.sort_by(|left, right| {
-                        let left = left.registration().topology;
-                        let right = right.registration().topology;
-                        left.name()
-                            .cmp(right.name())
-                            .then_with(|| left.digest().cmp(&right.digest()))
-                    });
-                }
-                Some(RegisteredHandler::Event { .. } | RegisteredHandler::Causal(_)) => {
-                    panic!(
-                        "causal projector route {:?} `{name}` collides with a non-projector handler",
-                        MessageKind::Event
-                    );
-                }
-                None => {
-                    by_name.insert(
-                        name.to_string(),
-                        RegisteredHandler::Projector(vec![Arc::clone(&handler)]),
-                    );
-                }
-            }
-        }
-        self.projectors.push(handler);
+        self.projectors.push(RoutedProjector {
+            events: names.into_iter().map(str::to_owned).collect(),
+            handler: Arc::from(handler),
+        });
         self.handler_specs.push(spec);
         self
     }
@@ -544,7 +532,7 @@ impl<D: Send + Sync + 'static> Routes<D> {
             .flat_map(HashMap::values)
             .filter_map(|handler| match handler {
                 RegisteredHandler::Causal(handler) => Some(handler.as_ref()),
-                RegisteredHandler::Event { .. } | RegisteredHandler::Projector(_) => None,
+                RegisteredHandler::Event { .. } => None,
             })
     }
 
@@ -566,7 +554,6 @@ impl<D: Send + Sync + 'static> Routes<D> {
         message: &Message,
         input: Value,
         session: Session,
-        ordered: Option<&OrderedDelivery>,
     ) -> Result<Value, HandlerError> {
         // Clone the handler/guard Arcs so the handler map is not borrowed across
         // the (awaited) handler future.
@@ -588,33 +575,6 @@ impl<D: Send + Sync + 'static> Routes<D> {
                         )
                         .into(),
                     ));
-                }
-                RegisteredHandler::Projector(projectors) => {
-                    for projector in projectors {
-                        if let Err(error) = projector
-                            .dispatch(&self.dependencies, message, ordered)
-                            .await
-                        {
-                            if error.is_projection_retryable()
-                                || matches!(
-                                    error,
-                                    HandlerError::ProjectionTerminalRecorded { .. }
-                                        | HandlerError::ProjectionDeliveryHalted { .. }
-                                )
-                            {
-                                return Err(error);
-                            }
-                            // Causal-projector delivery is stricter than the
-                            // service's ordinary permanent-failure policy. If a
-                            // permanent error was not converted to a durable
-                            // terminal record, dead-lettering or acknowledging
-                            // it would let later input cross an unproven gap.
-                            return Err(HandlerError::ProjectionDeliveryHalted {
-                                source: Box::new(error),
-                            });
-                        }
-                    }
-                    return Ok(Value::Null);
                 }
             }
         };
@@ -716,7 +676,14 @@ where
     fn projector_registrations(&self) -> Vec<ProjectorRegistration> {
         self.projectors
             .iter()
-            .map(|projector| projector.registration())
+            .map(|projector| {
+                let compiled = projector.handler.compiled();
+                ProjectorRegistration {
+                    topology: compiled.topology().clone(),
+                    ownership: compiled.ownership().to_vec(),
+                    events: projector.events.clone(),
+                }
+            })
             .collect()
     }
 
@@ -730,7 +697,7 @@ where
     fn bootstrap_projectors(&self) -> ProjectorBootstrapFuture<'_> {
         Box::pin(async move {
             for projector in &self.projectors {
-                projector.bootstrap(&self.dependencies).await?;
+                projector.handler.bootstrap(&self.dependencies).await?;
             }
             Ok(())
         })
@@ -744,6 +711,7 @@ where
             let mut owner = None;
             for (index, projector) in self.projectors.iter().enumerate() {
                 if projector
+                    .handler
                     .locates_failure(&self.dependencies, handle)
                     .await?
                     && owner.replace(index).is_some()
@@ -760,6 +728,7 @@ where
                 return Ok(None);
             };
             self.projectors[owner]
+                .handler
                 .repair(&self.dependencies, handle)
                 .await
         })
@@ -773,6 +742,7 @@ where
             let mut found = false;
             for projector in &self.projectors {
                 if projector
+                    .handler
                     .locates_failure(&self.dependencies, handle)
                     .await?
                 {
@@ -791,13 +761,41 @@ where
         })
     }
 
-    fn is_causal_projector(&self, message: &Message) -> bool {
-        matches!(
-            self.handlers
-                .get(&message.kind)
-                .and_then(|handlers| handlers.get(message.name())),
-            Some(RegisteredHandler::Projector(_))
-        )
+    fn dispatch_projector<'a>(
+        &'a self,
+        projector: &'a str,
+        message: &'a Message,
+        ordered: Option<&'a OrderedDelivery>,
+    ) -> ProjectorDispatchFuture<'a> {
+        Box::pin(async move {
+            let routed = self
+                .projectors
+                .iter()
+                .find(|routed| routed.name() == projector)
+                .ok_or_else(|| HandlerError::UnknownCommand(message.name.clone()))?;
+            match routed
+                .handler
+                .dispatch(&self.dependencies, message, ordered)
+                .await
+            {
+                Ok(()) => Ok(()),
+                Err(error)
+                    if error.is_projection_retryable()
+                        || matches!(error, HandlerError::ProjectionTerminalRecorded { .. }) =>
+                {
+                    Err(error)
+                }
+                // Projector delivery is stricter than the ordinary
+                // permanent-failure policy. A permanent error that was not
+                // converted to a durable terminal record must not be
+                // dead-lettered or acknowledged: later input would cross an
+                // unproven gap. This projector's consumer retains it and stops.
+                Err(error) => Err(HandlerError::ProjectionDeliveryHalted {
+                    projection: projector.to_owned(),
+                    source: Box::new(error),
+                }),
+            }
+        })
     }
 
     #[cfg(feature = "graphql")]
@@ -852,9 +850,8 @@ where
         message: &'a Message,
         input: Value,
         session: Session,
-        ordered: Option<&'a OrderedDelivery>,
     ) -> HandlerFuture<'a> {
-        Box::pin(self.invoke(message, input, session, ordered))
+        Box::pin(self.invoke(message, input, session))
     }
 
     fn dispatch_causal<'a>(
@@ -1018,9 +1015,7 @@ where
                 {
                     Some(handler.storage_identity(&self.dependencies))
                 }
-                RegisteredHandler::Causal(_)
-                | RegisteredHandler::Event { .. }
-                | RegisteredHandler::Projector(_) => None,
+                RegisteredHandler::Causal(_) | RegisteredHandler::Event { .. } => None,
             })
             .collect()
     }

@@ -219,6 +219,24 @@ The projector consumes published domain events and commits the row changes,
 row revisions, broker checkpoint and causal observations in one adapter
 transaction, so bus redelivery is idempotent.
 
+Each projector consumes through a durable consumer of its own. `Service::run`
+subscribes one per projector, in the consumer group `<group>-<projector>`, so
+each keeps its own cursor, retry and dead-letter path and sees its events in
+broker order. Event handlers registered with `.event(..)` share the service's
+own consumer and never wait behind a projector.
+
+A projector that cannot accept an input records a durable failure for that
+partition and its consumer stops, retaining the failed delivery. The other
+projectors keep consuming, and `run` returns the stopped projector's error
+when they finish. The error names the projection and carries a
+`ProjectionRepairHandle`. Fix the cause, call
+`Service::repair_projection(&handle)`, and restart consumption: the projector
+resumes from its failed input, so no later event passes it.
+
+A projector needs ordered delivery evidence from the bus. The in-memory, SQL
+and NATS JetStream buses provide it. On Kafka, RabbitMQ, Redis Streams and
+the Knative ingress a projector's consumer stops at its first event.
+
 ### Changing a projection
 
 A changed projection applies to the events delivered after it is deployed.

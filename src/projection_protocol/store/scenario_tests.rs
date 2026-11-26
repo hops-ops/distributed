@@ -810,6 +810,8 @@ pub(crate) async fn message_identity_is_topology_wide_across_projection_partitio
     ));
 }
 
+/// Recording the same failure twice yields the one failure, which stops its
+/// partition.
 pub(crate) async fn failure_recording_is_idempotent_for_exact_batch(
     scenario: impl ProjectionProtocolScenario,
 ) {
@@ -840,6 +842,15 @@ pub(crate) async fn failure_recording_is_idempotent_for_exact_batch(
             .await
             .unwrap(),
         Some(failure)
+    );
+    assert_eq!(
+        repository
+            .projection_partition_runtime_state(&scenario.topology(), &scenario.partition())
+            .await
+            .unwrap()
+            .and_then(|state| state.stopped_failure_id),
+        Some(failure_id),
+        "the recorded failure stops its partition"
     );
 }
 

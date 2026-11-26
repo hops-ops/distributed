@@ -2819,7 +2819,7 @@ async fn graphql_succeeded_status_evaluates_retained_projection_evidence() {
     )
     .unwrap();
     service
-        .dispatch_ordered_message(&Message::from(pending[0].clone()), Some(&ordered))
+        .dispatch_projector(0, &Message::from(pending[0].clone()), Some(&ordered))
         .await
         .expect("the real modeled projector should commit its evidence");
 

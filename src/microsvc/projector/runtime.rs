@@ -39,7 +39,7 @@ pub(in crate::microsvc) trait ErasedProjectorHandler<D>: Send + Sync {
         ordered: Option<&'a OrderedDelivery>,
     ) -> ProjectorDispatchFuture<'a>;
 
-    fn registration(&self) -> ProjectorRegistration;
+    fn compiled(&self) -> &CompiledProjectionTopology;
 
     fn bootstrap<'a>(&'a self, dependencies: &'a D) -> ProjectorDispatchFuture<'a>;
 
@@ -60,6 +60,8 @@ pub(in crate::microsvc) trait ErasedProjectorHandler<D>: Send + Sync {
 pub(in crate::microsvc) struct ProjectorRegistration {
     pub(in crate::microsvc) topology: ProjectorTopologyId,
     pub(in crate::microsvc) ownership: Vec<ProjectionModelOwnership>,
+    /// The event names the projector consumes.
+    pub(in crate::microsvc) events: Vec<String>,
 }
 
 pub(super) struct RegisteredProjector<I> {
@@ -79,11 +81,8 @@ impl<D> ErasedProjectorHandler<D> for RegisteredModeledProjector
 where
     D: CausalProjectionRouteDependencies + Send + Sync + 'static,
 {
-    fn registration(&self) -> ProjectorRegistration {
-        ProjectorRegistration {
-            topology: self.compiled.topology().clone(),
-            ownership: self.compiled.ownership().to_vec(),
-        }
+    fn compiled(&self) -> &CompiledProjectionTopology {
+        &self.compiled
     }
 
     fn bootstrap<'a>(&'a self, dependencies: &'a D) -> ProjectorDispatchFuture<'a> {
@@ -357,7 +356,7 @@ where
             match store.commit_projection(batch).await {
                 Ok(_) => Ok(()),
                 Err(ProjectionProtocolError::PartitionStopped { failure_id }) => {
-                    Err(terminal_recorded(failure_id))
+                    Err(terminal_recorded(self.compiled.topology(), failure_id))
                 }
                 Err(error) if projection_error_is_retryable(&error) => Err(error.into()),
                 Err(error) => {
@@ -379,11 +378,8 @@ where
     D: CausalProjectionRouteDependencies + Send + Sync + 'static,
     I: serde::de::DeserializeOwned + Send + 'static,
 {
-    fn registration(&self) -> ProjectorRegistration {
-        ProjectorRegistration {
-            topology: self.compiled.topology().clone(),
-            ownership: self.compiled.ownership().to_vec(),
-        }
+    fn compiled(&self) -> &CompiledProjectionTopology {
+        &self.compiled
     }
 
     fn bootstrap<'a>(&'a self, dependencies: &'a D) -> ProjectorDispatchFuture<'a> {
@@ -627,7 +623,7 @@ where
             match store.commit_projection(batch).await {
                 Ok(_) => Ok(()),
                 Err(ProjectionProtocolError::PartitionStopped { failure_id }) => {
-                    Err(terminal_recorded(failure_id))
+                    Err(terminal_recorded(self.compiled.topology(), failure_id))
                 }
                 Err(error) if projection_error_is_retryable(&error) => Err(error.into()),
                 Err(error) => {
