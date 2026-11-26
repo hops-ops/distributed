@@ -2,7 +2,8 @@
 //! projected relational tables through primary-key loads plus explicit
 //! relationship includes.
 
-use distributed::{InMemoryReadModelStore, ReadModelWorkspaceExt, TableStoreError};
+use distributed::read_model::{InMemoryReadModelStore, ReadModelWorkspaceExt};
+use distributed::table::TableStoreError;
 
 use crate::distributed_read_model::read_models::{checkout_key, seat_key, CheckoutView, SeatView};
 

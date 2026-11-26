@@ -6,7 +6,7 @@ const MAX_PROJECTION_ITEMS: usize = 128;
 // Retained event versions grow the catalog without expanding a command's
 // selected capabilities or an occurrence's executable operation budget.
 const MAX_PROJECTION_PROGRAM_ARMS: usize = 256;
-// Frozen with `distributed::MAX_PROJECTION_EXPRESSION_DEPTH`. The CLI crate is
+// Frozen with `distributed::projection::MAX_PROJECTION_EXPRESSION_DEPTH`. The CLI crate is
 // intentionally dependency-free from the runtime crate, so keep a boundary
 // test below to prevent this executable-contract limit from drifting.
 const MAX_EXPRESSION_DEPTH: usize = 64;

@@ -437,15 +437,21 @@ mod tests {
 
     // Keep this generic: a concrete SQL/memory instantiation would also satisfy
     // ProjectionProtocolStore and conceal an accidental query-store bound.
-    fn assert_queued_causal_backend<R: CausalRepositoryBackend, L: crate::LockManager + 'static>() {
+    fn assert_queued_causal_backend<
+        R: CausalRepositoryBackend,
+        L: crate::lock::LockManager + 'static,
+    >() {
         assert_causal_backend::<crate::QueuedRepository<R, L>>();
     }
 
     #[test]
     fn causal_capability_resolves_without_a_projection_store() {
-        assert_queued_causal_backend::<crate::cell_host::CellStreamStore, crate::InMemoryLockManager>(
+        assert_queued_causal_backend::<
+            crate::microsvc::cell_host::CellStreamStore,
+            crate::lock::InMemoryLockManager,
+        >();
+        assert_queued_causal_backend::<crate::InMemoryRepository, crate::lock::InMemoryLockManager>(
         );
-        assert_queued_causal_backend::<crate::InMemoryRepository, crate::InMemoryLockManager>();
     }
 
     #[test]

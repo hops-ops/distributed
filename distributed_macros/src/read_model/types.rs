@@ -11,42 +11,42 @@ pub(super) fn option_string_tokens(value: Option<&str>) -> proc_macro2::TokenStr
 pub(super) fn column_type_tokens(ty: &Type, jsonb: bool, text: bool) -> proc_macro2::TokenStream {
     let framework = crate::shared::framework();
     if jsonb {
-        return quote! { #framework::ColumnType::Json };
+        return quote! { #framework::table::ColumnType::Json };
     }
     if text {
-        return quote! { #framework::ColumnType::Text };
+        return quote! { #framework::table::ColumnType::Text };
     }
 
     let ty = option_inner_type(ty).unwrap_or(ty);
     if let Some(last) = last_type_segment(ty) {
         let ident = last.ident.to_string();
         return match ident.as_str() {
-            "String" | "str" => quote! { #framework::ColumnType::Text },
-            "bool" => quote! { #framework::ColumnType::Boolean },
+            "String" | "str" => quote! { #framework::table::ColumnType::Text },
+            "bool" => quote! { #framework::table::ColumnType::Boolean },
             "i8" | "i16" | "i32" | "i64" | "isize" => {
-                quote! { #framework::ColumnType::Integer }
+                quote! { #framework::table::ColumnType::Integer }
             }
             "u8" | "u16" | "u32" | "u64" | "usize" => {
-                quote! { #framework::ColumnType::UnsignedInteger }
+                quote! { #framework::table::ColumnType::UnsignedInteger }
             }
-            "f32" | "f64" => quote! { #framework::ColumnType::Float },
+            "f32" | "f64" => quote! { #framework::table::ColumnType::Float },
             "Vec" => {
                 if vec_inner_is_u8(last) {
-                    quote! { #framework::ColumnType::Bytes }
+                    quote! { #framework::table::ColumnType::Bytes }
                 } else {
-                    quote! { #framework::ColumnType::Json }
+                    quote! { #framework::table::ColumnType::Json }
                 }
             }
-            "HashMap" | "BTreeMap" | "Value" => quote! { #framework::ColumnType::Json },
+            "HashMap" | "BTreeMap" | "Value" => quote! { #framework::table::ColumnType::Json },
             _ => {
                 let type_name = ty.to_token_stream().to_string();
-                quote! { #framework::ColumnType::Unsupported(#type_name.to_string()) }
+                quote! { #framework::table::ColumnType::Unsupported(#type_name.to_string()) }
             }
         };
     }
 
     let type_name = ty.to_token_stream().to_string();
-    quote! { #framework::ColumnType::Unsupported(#type_name.to_string()) }
+    quote! { #framework::table::ColumnType::Unsupported(#type_name.to_string()) }
 }
 
 /// The column's JSON shape (`Some(<T as JsonType>::json_shape())`) when the
@@ -64,7 +64,7 @@ pub(super) fn json_type_tokens(ty: &Type, jsonb: bool, text: bool) -> proc_macro
                 }
             }));
     if json {
-        quote! { Some(<#inner as #framework::JsonType>::json_shape()) }
+        quote! { Some(<#inner as #framework::table::JsonType>::json_shape()) }
     } else {
         quote! { None }
     }
@@ -116,13 +116,13 @@ pub(super) fn bytes_row_value_tokens(
     if option_inner.is_some() {
         Some(quote! {
             match &#value {
-                Some(value) => #framework::RowValue::Bytes(value.clone()),
-                None => #framework::RowValue::Null,
+                Some(value) => #framework::table::RowValue::Bytes(value.clone()),
+                None => #framework::table::RowValue::Null,
             }
         })
     } else {
         Some(quote! {
-            #framework::RowValue::Bytes(#value.clone())
+            #framework::table::RowValue::Bytes(#value.clone())
         })
     }
 }

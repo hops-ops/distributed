@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::time::{Duration, UNIX_EPOCH};
 
 use distributed::bus::{Message, MessageKind};
-use distributed::DomainEventOccurrence;
+use distributed::domain_event::DomainEventOccurrence;
 use distributed_leaderboard::{
     conformance, Board, LeaderboardChange, LeaderboardError, LeaderboardErrorKind,
     LeaderboardProjector, LeaderboardStore, RedisLeaderboard, ScorePolicy, ScoreSubmission,
@@ -26,7 +26,7 @@ fn unique(prefix: &str) -> String {
     format!("{prefix}-{}", uuid::Uuid::now_v7().simple())
 }
 
-#[derive(serde::Serialize, serde::Deserialize, distributed::DomainEvent)]
+#[derive(serde::Serialize, serde::Deserialize, distributed::domain_event::DomainEvent)]
 #[domain_event(name = "dungeon.gold_looted", version = 1)]
 struct GoldLooted {
     player: String,
@@ -35,7 +35,7 @@ struct GoldLooted {
 
 fn looted(position: u64, player: &str, gold: u32) -> DomainEventOccurrence {
     DomainEventOccurrence::capture_external(
-        distributed::ExternalEventSource {
+        distributed::domain_event::ExternalEventSource {
             producer: "zone.sim".into(),
             stream: "zone-7".into(),
             position,
@@ -172,7 +172,7 @@ async fn redis_boards_serve_graphql_queries_and_live_updates() {
         .await
         .unwrap();
     let engine = GraphqlEngine::from_schema_catalog(
-        &distributed::ReadModelCatalog::new("gold-service"),
+        &distributed::table::ReadModelCatalog::new("gold-service"),
         repo.pool().clone(),
     )
     .unwrap()

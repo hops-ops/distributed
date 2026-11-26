@@ -1,5 +1,6 @@
+use distributed::read_model::ReadModel;
 use distributed::read_model::ReadModelWritePlanBuilder;
-use distributed::{GetStream, ReadModel, ReadModelWritePlanStore, RepositoryError};
+use distributed::{GetStream, ReadModelWritePlanStore, RepositoryError};
 use serde::{Deserialize, Serialize};
 
 use crate::bomberman::domain::game_map::GameMap;
@@ -9,7 +10,7 @@ use crate::bomberman::handlers::{
     get_aggregate, load_active_explosions, load_game_players, load_live_bombs,
 };
 
-#[derive(Clone, Debug, Serialize, Deserialize, distributed::JsonType)]
+#[derive(Clone, Debug, Serialize, Deserialize, distributed::table::JsonType)]
 pub struct PlayerState {
     pub id: String,
     pub name: String,
@@ -18,7 +19,7 @@ pub struct PlayerState {
     pub alive: bool,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, distributed::JsonType)]
+#[derive(Clone, Debug, Serialize, Deserialize, distributed::table::JsonType)]
 pub struct BombState {
     pub id: String,
     pub owner: String,
@@ -27,7 +28,7 @@ pub struct BombState {
     pub ticks: u8,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, distributed::JsonType)]
+#[derive(Clone, Debug, Serialize, Deserialize, distributed::table::JsonType)]
 pub struct ExplosionState {
     pub id: String,
     pub owner: String,

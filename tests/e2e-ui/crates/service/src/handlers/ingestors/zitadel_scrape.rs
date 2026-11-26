@@ -10,14 +10,14 @@ use std::pin::Pin;
 
 use axum::http::HeaderMap;
 use distributed::command::{typed_command, PreparedCommand, Succeeded, TypedCommand};
+use distributed::domain_event::ExternalEventSource;
 use distributed::microsvc::{
     CausalCommandContext, CausalDispatchError, HandlerError, HttpCommandDispatch,
     PreparedCommandHandler, Service,
 };
-use distributed::{
-    ExternalEventSource, ReadModelWorkspaceExt, ReadModelWritePlanStore,
-    RelationalReadModelQueryStore, RowKey, RowValue,
-};
+use distributed::read_model::ReadModelWorkspaceExt;
+use distributed::table::{RowKey, RowValue};
+use distributed::{ReadModelWritePlanStore, RelationalReadModelQueryStore};
 use e2e_readmodels::AuthUsers;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -28,13 +28,13 @@ use super::zitadel::{ingestor_principal, ingestor_session, verify_authenticity, 
 
 pub const COMMAND: &str = "zitadel.scrape.v1";
 
-#[derive(Debug, Deserialize, distributed::CommandInput)]
+#[derive(Debug, Deserialize, distributed::command::CommandInput)]
 pub struct ZitadelScrapeInput {
     /// What asked for this scrape: `http`, `start` or `interval`.
     pub trigger: String,
 }
 
-#[derive(Debug, Serialize, distributed::CommandOutput)]
+#[derive(Debug, Serialize, distributed::command::CommandOutput)]
 pub struct ZitadelScrapePayload {
     /// Users the Management API listed.
     pub listed: u32,
@@ -176,8 +176,10 @@ mod tests {
     use super::super::zitadel::{user_profile, HUMAN_UPDATED};
     use super::*;
     use distributed::microsvc::Routes;
+    use distributed::outbox_worker::OutboxStore;
     use distributed::read_model::ReadModelWritePlanBuilder;
-    use distributed::{InMemoryRepository, OutboxStore, RelationalReadModel};
+    use distributed::read_model::RelationalReadModel;
+    use distributed::InMemoryRepository;
     use e2e_projections::{ZitadelUserProfile, AUTH_USERS};
 
     fn listed_user(subject: &str, display_name: &str) -> MappedDelivery {

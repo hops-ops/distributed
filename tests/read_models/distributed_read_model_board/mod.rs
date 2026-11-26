@@ -19,11 +19,11 @@ use std::time::Duration;
 
 use board_service::{AddCard, Board, MoveCard, OpenBoard, RemoveCard};
 use distributed::bus::{Bus, BusConsumer, InMemoryBus, RunOptions};
-use distributed::microsvc::{Message, MessageKind, Service, Session};
-use distributed::{
-    AggregateBuilder, ClaimOutboxMessages, InMemoryOutboxStore, InMemoryReadModelStore,
-    InMemoryRepository, OutboxClaimRef, OutboxStore, Queueable,
-};
+use distributed::bus::{Message, MessageKind};
+use distributed::microsvc::{Service, Session};
+use distributed::outbox_worker::{ClaimOutboxMessages, OutboxClaimRef, OutboxStore};
+use distributed::read_model::InMemoryReadModelStore;
+use distributed::{AggregateBuilder, InMemoryOutboxStore, InMemoryRepository, Queueable};
 use projections_service::{load_board, service as build_projection};
 use query_service::BoardQueryService;
 use read_models::register_schemas;

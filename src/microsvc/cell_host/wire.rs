@@ -4,7 +4,7 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::OutboxMessage;
+use crate::outbox::OutboxMessage;
 
 pub const MAX_CELL_PROJECTION_EVENTS: usize = 256;
 pub const MAX_CELL_PROJECTION_EVENT_PAYLOAD_BYTES: usize = 1024 * 1024;
@@ -269,7 +269,7 @@ mod tests {
         )
         .expect("selected");
         selected.set_causation_id("causation-1");
-        selected.status = crate::OutboxMessageStatus::InFlight;
+        selected.status = crate::outbox::OutboxMessageStatus::InFlight;
         selected.attempts = 7;
         selected.worker_id = Some("queue-worker".into());
 

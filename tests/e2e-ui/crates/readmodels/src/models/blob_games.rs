@@ -1,6 +1,6 @@
 use blob_domain::{Direction, Tile};
 use distributed::graphql::{claim, col, read, AuthorizedReadModel, ModelPermissions};
-use distributed::ReadModel;
+use distributed::read_model::ReadModel;
 use serde::{Deserialize, Serialize};
 
 use super::AuthUsers;

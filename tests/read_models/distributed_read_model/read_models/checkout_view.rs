@@ -1,4 +1,4 @@
-use distributed::ReadModel;
+use distributed::read_model::ReadModel;
 use serde::{Deserialize, Serialize};
 
 use super::{CheckoutStepView, SeatView};

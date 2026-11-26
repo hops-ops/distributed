@@ -21,7 +21,7 @@ use distributed::bus::{
     RunOptions, SubscriptionPlan, TransportError, DEAD_LETTER_EVENT,
 };
 use distributed::projection_protocol::ProjectionEpoch;
-use distributed::{CAUSATION_ID, TRACEPARENT};
+use distributed::trace_context::{CAUSATION_ID, TRACEPARENT};
 use tokio::sync::Notify;
 
 /// A SQL bus backend. [`BusHarness::start`] opens an isolated database with

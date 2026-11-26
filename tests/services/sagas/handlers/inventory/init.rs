@@ -2,7 +2,7 @@ use super::*;
 
 pub const COMMAND: &str = "inventory.initialize";
 
-#[derive(Debug, Serialize, distributed::CommandOutput)]
+#[derive(Debug, Serialize, distributed::command::CommandOutput)]
 pub struct Output {
     pub sku: String,
     pub stock: u32,

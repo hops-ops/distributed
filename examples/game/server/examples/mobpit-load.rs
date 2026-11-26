@@ -61,7 +61,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use clap::Parser;
-use distributed::cell_host::CELL_INTERNAL_SECRET_HEADER;
+use distributed::microsvc::cell_host::CELL_INTERNAL_SECRET_HEADER;
 use distributed_game::authoring::GameInput;
 use distributed_game::bots::{run_bots, Behaviour, BotConfig, Circle, RandomWalk, Summary};
 use distributed_game::net::TicketKey;

@@ -3,8 +3,8 @@ use std::collections::BTreeMap;
 use serde::Serialize;
 use serde_json::Value;
 
+use crate::domain_event::DomainEventOccurrence;
 use crate::projection_protocol::{MAX_PROJECTION_PARTITION_BYTES, MAX_PROJECTION_RECORD_KEY_BYTES};
-use crate::DomainEventOccurrence;
 
 use super::canonical::{bounded_key_bytes, bounded_partition_bytes, canonical_json_bytes};
 use super::{

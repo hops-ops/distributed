@@ -7,7 +7,8 @@ use super::*;
 pub struct SqlxRepository<DB: sqlx::Database> {
     pub(super) pool: Pool<DB>,
     pub(super) read_model_schemas: Arc<RwLock<TableSchemaRegistry>>,
-    pub(super) read_model_change_tx: tokio::sync::broadcast::Sender<crate::ReadModelChange>,
+    pub(super) read_model_change_tx:
+        tokio::sync::broadcast::Sender<crate::read_model::ReadModelChange>,
     /// When false, skips Postgres `pg_notify` (local broadcast still fires).
     /// Opt-out via [`SqlxRepository::without_read_model_change_notify`]. Writers
     /// that opt out silently break cross-process GraphQL subscriptions.
@@ -83,7 +84,9 @@ where
     ///
     /// Lagging receivers observe [`tokio::sync::broadcast::error::RecvError::Lagged`]
     /// and should treat that as all-dirty for subscription invalidation.
-    pub fn read_model_changes(&self) -> tokio::sync::broadcast::Receiver<crate::ReadModelChange> {
+    pub fn read_model_changes(
+        &self,
+    ) -> tokio::sync::broadcast::Receiver<crate::read_model::ReadModelChange> {
         self.read_model_change_tx.subscribe()
     }
 
@@ -109,7 +112,7 @@ where
         self
     }
 
-    pub fn publish_read_model_change(&self, change: crate::ReadModelChange) {
+    pub fn publish_read_model_change(&self, change: crate::read_model::ReadModelChange) {
         if change.is_empty() {
             return;
         }

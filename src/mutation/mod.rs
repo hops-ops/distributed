@@ -15,7 +15,6 @@ mod program;
 #[cfg(test)]
 mod tests;
 
-pub use crate::projection::MutationKind;
 pub use bind::{body_field_binding, envelope_binding, MutationInputBinding, ProjectionHandler};
 pub use descriptor::{
     bind_event_apply_mutation, bind_event_to_mutation, compile_projection,

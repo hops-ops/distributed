@@ -21,11 +21,10 @@ use std::time::Duration;
 use serde_json::json;
 
 use distributed::bus::{Bus, BusConsumer, InMemoryBus, RunOptions};
-use distributed::microsvc::{Message, MessageKind, Routes, Service, Session};
-use distributed::{
-    AggregateBuilder, ClaimOutboxMessages, InMemoryOutboxStore, InMemoryRepository, OutboxClaimRef,
-    OutboxStore, Queueable,
-};
+use distributed::bus::{Message, MessageKind};
+use distributed::microsvc::{Routes, Service, Session};
+use distributed::outbox_worker::{ClaimOutboxMessages, OutboxClaimRef, OutboxStore};
+use distributed::{AggregateBuilder, InMemoryOutboxStore, InMemoryRepository, Queueable};
 
 use super::commands::dispatch;
 use super::handlers;

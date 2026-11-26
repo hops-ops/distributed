@@ -11,10 +11,9 @@ pub mod seat;
 pub mod snapshots;
 pub mod storage;
 
-use distributed::{
-    InMemoryOutboxStore, InMemoryRepository, OutboxMessage, OutboxStore, Queueable,
-    QueuedRepository,
-};
+use distributed::outbox::OutboxMessage;
+use distributed::outbox_worker::OutboxStore;
+use distributed::{InMemoryOutboxStore, InMemoryRepository, Queueable, QueuedRepository};
 
 /// A repository under test. `open` returns `None` to skip when the backing
 /// service is absent and not required (see [`crate::env::require_service`]);

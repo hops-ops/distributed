@@ -9,9 +9,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use distributed::{
-    sourced, AggregateBuilder, Entity, InMemoryRepository, Lock, LockError, LockManager, Queueable,
-};
+use distributed::lock::{Lock, LockError, LockManager};
+use distributed::{sourced, AggregateBuilder, Entity, InMemoryRepository, Queueable};
 
 /// How a backend configures a manager; `None` keeps the manager default.
 #[derive(Clone, Copy, Debug, Default)]
@@ -325,7 +324,7 @@ pub use self::sqlite::Sqlite;
 
 #[cfg(feature = "sqlite")]
 mod sqlite {
-    use distributed::SqliteLockManager;
+    use distributed::lock::SqliteLockManager;
 
     use super::{configured, LockBackend, LockOptions};
     use crate::sqlite::TempDb;
@@ -360,7 +359,7 @@ pub use self::postgres::Postgres;
 
 #[cfg(feature = "postgres")]
 mod postgres {
-    use distributed::PostgresLockManager;
+    use distributed::lock::PostgresLockManager;
 
     use super::{configured, LockBackend, LockOptions};
     use crate::postgres::PostgresTestSchema;

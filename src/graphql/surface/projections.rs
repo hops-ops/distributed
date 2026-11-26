@@ -1,14 +1,15 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::projection::catalog::{ActiveProjectionBindings, ProjectionCatalog, ProjectionEpoch};
+use crate::projection::catalog::{ActiveProjectionBindings, ProjectionCatalog};
 use crate::projection::placement::{
     ProjectionBinding, ProjectionBindingId, ProjectionBindingState, ProjectionExecutionClass,
     ProjectionExecutorRoute, ProjectionPlacement,
 };
-use crate::{
+use crate::projection::{
     MutationKind, ProjectionField, ProjectionInvalidation, ProjectionKeyField, ProjectionOperation,
     ProjectionPartition, ProjectionProgram, ProjectionProgramId, ProjectionRelationshipEffect,
 };
+use crate::projection_protocol::ProjectionEpoch;
 
 use super::types::{SurfaceProjectionOwner, SurfaceProjectionOwnerKind};
 use super::{SurfaceModel, SurfaceRelationshipKeys};
@@ -33,7 +34,7 @@ pub(crate) struct SurfaceProjectionOperation {
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 pub(crate) struct SurfaceProjectionArm {
     pub arm_id: String,
-    pub selector: crate::ProjectionEventSelector,
+    pub selector: crate::projection::ProjectionEventSelector,
     pub operations: Vec<SurfaceProjectionOperation>,
 }
 
@@ -1035,12 +1036,12 @@ fn validate_direct_program(
 mod tests {
     use super::*;
     use crate::graphql::{build_surface, read, surface_for_role, ReadPermission, SurfaceOptions};
+    use crate::projection::{
+        ProjectionAssignment, ProjectionExpression, ProjectionRelationship, ProjectionValue,
+    };
     use crate::table::{
         ColumnType, PrimaryKey, RelationshipDef, RelationshipKind, TableColumn, TableKind,
         TableSchema,
-    };
-    use crate::{
-        ProjectionAssignment, ProjectionExpression, ProjectionRelationship, ProjectionValue,
     };
 
     fn schema(
@@ -1110,7 +1111,7 @@ mod tests {
             "patch-and-link",
             0,
             MutationKind::Patch,
-            crate::ProjectionTarget::try_new("TodoView", "todos").unwrap(),
+            crate::projection::ProjectionTarget::try_new("TodoView", "todos").unwrap(),
             vec![key(0, "todo_id")],
             vec![ProjectionField::try_new(
                 0,
@@ -1181,7 +1182,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             narrow.relationship_effects[0].kind(),
-            crate::ProjectionRelationshipEffectKind::Invalidate
+            crate::projection::ProjectionRelationshipEffectKind::Invalidate
         );
         assert!(narrow.invalidations.contains(
             &ProjectionInvalidation::relationship("TodoView", "owner", "UserView",).unwrap()
@@ -1212,7 +1213,7 @@ mod tests {
             "patch-user",
             1,
             MutationKind::Patch,
-            crate::ProjectionTarget::try_new("UserView", "users").unwrap(),
+            crate::projection::ProjectionTarget::try_new("UserView", "users").unwrap(),
             vec![key(0, "user_id")],
             vec![ProjectionField::try_new(
                 0,

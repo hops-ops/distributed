@@ -112,7 +112,7 @@ where
 
     /// Stage one exact projected read-model row for same-transaction commit.
     ///
-    /// Prefer materializing `row` with [`crate::Mutation::from_state`] so the
+    /// Prefer materializing `row` with [`crate::mutation::Mutation::from_state`] so the
     /// handler write matches the portable mutation IR used for replay/async.
     pub fn readmodel<M>(
         &self,
@@ -149,7 +149,7 @@ pub struct NoDirectProjection;
 ///
 /// Built by [`CausalRepository::readmodel`] / [`CausalCommandContext::readmodel`].
 /// The row should come from the same mutation program used for event→mutation
-/// replay (typically [`crate::Mutation::from_state`]).
+/// replay (typically [`crate::mutation::Mutation::from_state`]).
 pub struct StagedProjectedRow<M>(M);
 
 /// Fluent, handler-facing causal unit of work.
@@ -168,7 +168,7 @@ pub struct CausalCommitBuilder<
     context: &'context CausalCommandContext<'route, A>,
     publish_captured_events: bool,
     explicit_events: Vec<PreparedDomainEvent>,
-    external_events: Vec<crate::DomainEventOccurrence>,
+    external_events: Vec<crate::domain_event::DomainEventOccurrence>,
     outbox_messages: Vec<OutboxMessage>,
     error: Option<HandlerError>,
     projection: Projection,
@@ -219,7 +219,7 @@ impl<'context, 'route, A, Publication, Projection>
     /// Publish one typed fact from an external source: a provider webhook, a
     /// reconciliation, anything that is not an aggregate transition.
     ///
-    /// The fact becomes a [`DomainEventOccurrence`](crate::DomainEventOccurrence)
+    /// The fact becomes a [`DomainEventOccurrence`](crate::domain_event::DomainEventOccurrence)
     /// whose identity is `source` alone, so the same source position published
     /// twice is one outbox message id (the second commit fails with
     /// [`RepositoryError::DuplicateOutboxMessage`](crate::RepositoryError::DuplicateOutboxMessage)).
@@ -227,7 +227,7 @@ impl<'context, 'route, A, Publication, Projection>
     /// so a `projection!` over `E` projects it like an aggregate's event.
     pub fn publish_external<E: DomainEvent>(
         mut self,
-        source: crate::ExternalEventSource,
+        source: crate::domain_event::ExternalEventSource,
         event: E,
     ) -> CausalCommitBuilder<'context, 'route, A, WithPublication, Projection> {
         if self.error.is_none() {
@@ -346,8 +346,8 @@ where
 
     /// Stage one exact projected read-model row for same-transaction commit.
     ///
-    /// Unlocks [`PreparedCausalCommit::projected`] without a placement-selected
-    /// service registry entry. Prefer rows from [`crate::Mutation::from_state`].
+    /// Unlocks `PreparedCausalCommit::projected` without a placement-selected
+    /// service registry entry. Prefer rows from [`crate::mutation::Mutation::from_state`].
     pub fn readmodel<M>(
         self,
         row: M,
@@ -505,7 +505,7 @@ impl<'a, A> CausalCommandContext<'a, A> {
         self.message.causation_id()
     }
 
-    pub fn trace_context(&self) -> crate::TraceContext {
+    pub fn trace_context(&self) -> crate::trace_context::TraceContext {
         self.message.trace_context()
     }
 
@@ -541,7 +541,7 @@ impl<'a, A> CausalCommandContext<'a, A> {
     /// source. See [`CausalCommitBuilder::publish_external`].
     pub fn publish_external<E: DomainEvent>(
         &self,
-        source: crate::ExternalEventSource,
+        source: crate::domain_event::ExternalEventSource,
         event: E,
     ) -> CausalCommitBuilder<'_, 'a, A, WithPublication, NoDirectProjection> {
         CausalCommitBuilder::empty(self).publish_external(source, event)
@@ -551,9 +551,12 @@ impl<'a, A> CausalCommandContext<'a, A> {
     /// trace context. Causation is the ledger's, applied when it commits.
     fn capture_external<E: DomainEvent>(
         &self,
-        source: crate::ExternalEventSource,
+        source: crate::domain_event::ExternalEventSource,
         event: &E,
-    ) -> Result<crate::DomainEventOccurrence, crate::DomainEventCaptureError> {
+    ) -> Result<
+        crate::domain_event::DomainEventOccurrence,
+        crate::domain_event::DomainEventCaptureError,
+    > {
         let mut metadata = std::collections::HashMap::new();
         self.trace_context().inject_map(&mut metadata);
         if let Some(correlation_id) = self.correlation_id() {
@@ -562,7 +565,7 @@ impl<'a, A> CausalCommandContext<'a, A> {
                 correlation_id.to_string(),
             );
         }
-        crate::DomainEventOccurrence::capture_external(
+        crate::domain_event::DomainEventOccurrence::capture_external(
             source,
             crate::time::now(),
             metadata.into_iter().collect(),
@@ -655,7 +658,7 @@ where
 
     /// Stage one exact projected read-model row for same-transaction commit.
     ///
-    /// Prefer rows from [`crate::Mutation::from_state`] so the write matches the
+    /// Prefer rows from [`crate::mutation::Mutation::from_state`] so the write matches the
     /// portable mutation used for event bindings and client cache application.
     pub fn readmodel<M>(
         &self,

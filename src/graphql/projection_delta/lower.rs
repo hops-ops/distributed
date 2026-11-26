@@ -3,12 +3,12 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::projection::placement::{
     ProjectionBindingState, ProjectionExecutionClass, ProjectionPlacement,
 };
-use crate::projection_protocol::MAX_PROJECTION_PARTITION_BYTES;
-use crate::{
+use crate::projection::{
     MutationKind, ProjectionInvalidation, ProjectionRelationshipEffectKind, ResolvedProjectionKey,
     ResolvedProjectionMutation, ResolvedProjectionPartition, ResolvedProjectionPartitionRef,
     ResolvedProjectionPlan, ResolvedProjectionRelationshipEffect, ResolvedProjectionValue,
 };
+use crate::projection_protocol::MAX_PROJECTION_PARTITION_BYTES;
 
 use super::authorization::{
     ProjectionAuthorization, ProjectionPartitionScopeEncoder, ProjectionVisibilityEvaluator,

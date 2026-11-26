@@ -39,7 +39,7 @@ where
             }
             commit_read_model_tx(tx).await?;
             if !tables.is_empty() {
-                self.publish_read_model_change(crate::ReadModelChange { tables });
+                self.publish_read_model_change(crate::read_model::ReadModelChange { tables });
             }
             Ok(())
         }

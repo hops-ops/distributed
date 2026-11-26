@@ -625,7 +625,7 @@ where
             tx.commit().await.map_err(|error| {
                 protocol_storage_error::<DB>("commit projection transaction", error)
             })?;
-            self.publish_read_model_change(crate::ReadModelChange {
+            self.publish_read_model_change(crate::read_model::ReadModelChange {
                 tables: changed_tables,
             });
             Ok(ProjectionCommitResult {
@@ -758,7 +758,7 @@ where
             tx.commit().await.map_err(|error| {
                 protocol_storage_error::<DB>("commit projection failure", error)
             })?;
-            self.publish_read_model_change(crate::ReadModelChange {
+            self.publish_read_model_change(crate::read_model::ReadModelChange {
                 tables: changed_tables,
             });
             Ok(failure)

@@ -26,8 +26,8 @@
 
 use std::time::{Duration, SystemTime};
 
-use distributed::cell_host::AggregateCell;
 use distributed::command::{typed_command, PreparedCommand, Succeeded};
+use distributed::microsvc::cell_host::AggregateCell;
 use distributed::microsvc::schedule::schedule_guard;
 use distributed::microsvc::{
     CausalCommandContext, CausalRouteDependencies, HandlerError, PortableCommand, Routes,
@@ -75,7 +75,9 @@ pub struct ContentRollout {
 }
 
 /// What zones and read models see of the rollout.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, distributed::DomainState)]
+#[derive(
+    Clone, Debug, PartialEq, Eq, Serialize, Deserialize, distributed::domain_event::DomainState,
+)]
 #[domain_state(version = 1)]
 pub struct ContentState {
     /// The world (the cell's stream id).
@@ -156,7 +158,7 @@ impl ContentRollout {
 }
 
 /// [`START`] input.
-#[derive(Debug, Clone, Serialize, Deserialize, distributed::CommandInput)]
+#[derive(Debug, Clone, Serialize, Deserialize, distributed::command::CommandInput)]
 pub struct StartInput {
     /// The world (the cell's shard).
     pub world: String,
@@ -171,14 +173,14 @@ pub struct StartInput {
 }
 
 /// [`APPLY`] / [`SETTLE`] input.
-#[derive(Debug, Clone, Serialize, Deserialize, distributed::CommandInput)]
+#[derive(Debug, Clone, Serialize, Deserialize, distributed::command::CommandInput)]
 pub struct PhaseInput {
     /// The world.
     pub world: String,
 }
 
 /// A rollout command's answer.
-#[derive(Debug, Clone, Serialize, Deserialize, distributed::CommandOutput)]
+#[derive(Debug, Clone, Serialize, Deserialize, distributed::command::CommandOutput)]
 pub struct RolloutReceipt {
     /// The phase after the command.
     pub phase: String,

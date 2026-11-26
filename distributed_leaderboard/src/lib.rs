@@ -18,7 +18,7 @@
 //!   ordering and tie-break semantics as Redis, for tests and demos.
 //! - `RedisLeaderboard` (feature `redis`) — Redis sorted sets, with every
 //!   idempotent write executed by one Lua script.
-//! - [`LeaderboardProjector`] — maps [`DomainEventOccurrence`](distributed::DomainEventOccurrence)s
+//! - [`LeaderboardProjector`] — maps [`DomainEventOccurrence`](distributed::domain_event::DomainEventOccurrence)s
 //!   (directly, or decoded from an outbox [`Message`](distributed::bus::Message))
 //!   to score changes through a [`LeaderboardProjection`], applies them
 //!   idempotently and rebuilds boards from an event history.

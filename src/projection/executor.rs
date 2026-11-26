@@ -638,21 +638,32 @@ mod tests {
         ExpectedVersion, PatchMode, RowPatch, RowValues, RowWriteMode, TableRowMutation,
     };
 
-    #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize, crate::ReadModel)]
+    #[derive(
+        Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize, crate::read_model::ReadModel,
+    )]
     #[readmodel(table = "executor_todos", primary_key = ["id"])]
     struct TodoView {
         id: String,
         title: String,
     }
 
-    #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize, crate::ReadModel)]
+    #[derive(
+        Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize, crate::read_model::ReadModel,
+    )]
     #[readmodel(table = "executor_audits", primary_key = ["id"])]
     struct AuditView {
         id: String,
         action: String,
     }
 
-    #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize, crate::DomainState)]
+    #[derive(
+        Clone,
+        Debug,
+        PartialEq,
+        serde::Serialize,
+        serde::Deserialize,
+        crate::domain_event::DomainState,
+    )]
     #[domain_state(version = 1)]
     struct ExecutorState {
         id: String,
@@ -661,11 +672,13 @@ mod tests {
     }
 
     fn executor_multi_table_program(
-    ) -> Result<crate::ProjectionProgram, crate::ProjectionProgramError> {
+    ) -> Result<crate::projection::ProjectionProgram, crate::projection::ProjectionProgramError>
+    {
         use crate::mutation::{
-            body_field_binding, compile_projection, MutationColumn, MutationKind,
-            MutationOperation, MutationProgram, ProjectionHandler,
+            body_field_binding, compile_projection, MutationColumn, MutationOperation,
+            MutationProgram, ProjectionHandler,
         };
+        use crate::projection::MutationKind;
         use crate::projection::{
             ProjectionEventSelector, ProjectionPartition, ProjectionTarget, ProjectionValueType,
         };
@@ -692,10 +705,12 @@ mod tests {
                 )?,
             ],
         )?;
-        let selector =
-            ProjectionEventSelector::try_from_descriptor(&crate::DomainEventDescriptor::state::<
-                ExecutorState,
-            >("executor.changed", 1))?;
+        let selector = ProjectionEventSelector::try_from_descriptor(
+            &crate::domain_event::DomainEventDescriptor::state::<ExecutorState>(
+                "executor.changed",
+                1,
+            ),
+        )?;
         compile_projection(
             "executor-generated-multi-table",
             1,
@@ -714,7 +729,7 @@ mod tests {
     }
 
     fn executor_multi_table_lower(
-        plan: &crate::ResolvedProjectionPlan,
+        plan: &crate::projection::ResolvedProjectionPlan,
     ) -> Result<
         crate::projection::lower::LoweredProjectionPlan,
         crate::projection::lower::ProjectionLoweringError,
@@ -727,7 +742,7 @@ mod tests {
                 "AuditView" => records.push(lower_model_mutation::<AuditView>(mutation)?),
                 other => {
                     return Err(crate::projection::lower::ProjectionLoweringError::Table(
-                        crate::TableStoreError::Metadata(format!("unknown model `{other}`")),
+                        crate::table::TableStoreError::Metadata(format!("unknown model `{other}`")),
                     ));
                 }
             }
@@ -935,10 +950,13 @@ mod tests {
         }
     }
 
-    fn generated_occurrence() -> crate::DomainEventOccurrence {
-        crate::DomainEventOccurrence::capture(
-            crate::DomainEventDescriptor::state::<ExecutorState>("executor.changed", 1),
-            crate::DomainEventEnvelope {
+    fn generated_occurrence() -> crate::domain_event::DomainEventOccurrence {
+        crate::domain_event::DomainEventOccurrence::capture(
+            crate::domain_event::DomainEventDescriptor::state::<ExecutorState>(
+                "executor.changed",
+                1,
+            ),
+            crate::domain_event::DomainEventEnvelope {
                 aggregate_type: "executor".into(),
                 aggregate_id: "todo-1".into(),
                 aggregate_sequence: 1,

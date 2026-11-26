@@ -10,9 +10,10 @@ pub use checkout_step_view::CheckoutStepView;
 pub use checkout_view::CheckoutView;
 pub use seat_view::SeatView;
 
+use distributed::read_model::InMemoryReadModelStore;
 #[cfg(any(feature = "postgres", feature = "sqlite"))]
 use distributed::table::TableSchemaRegistry;
-use distributed::{InMemoryReadModelStore, RowKey, RowValue, TableStoreError};
+use distributed::table::{RowKey, RowValue, TableStoreError};
 
 pub fn register_schemas(store: &InMemoryReadModelStore) -> Result<(), TableStoreError> {
     store.register_schema::<SeatView>()?;

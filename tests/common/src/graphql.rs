@@ -9,9 +9,9 @@ use distributed::graphql::{read, GraphqlEngine, GraphqlPool, GraphqlPoolSource, 
 use distributed::microsvc::Session;
 use distributed::projection_protocol::ProjectionChangeRetention;
 use distributed::read_model::ReadModelWritePlanBuilder;
-use distributed::{
-    ReadModelChange, RelationalReadModel, SqliteRepository, TableSchema, TableSchemaRegistry,
-};
+use distributed::read_model::{ReadModelChange, RelationalReadModel};
+use distributed::table::{TableSchema, TableSchemaRegistry};
+use distributed::SqliteRepository;
 
 pub use crate::read_models::{child, order, parent, ChildView, OrderView, ParentView};
 pub use crate::session::session;

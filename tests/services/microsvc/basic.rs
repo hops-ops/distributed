@@ -15,12 +15,12 @@ use crate::microsvc::models::counter::{
     Counter, CreateCounter, DecrementCounter, IncrementCounter,
 };
 
-#[derive(Debug, Serialize, distributed::CommandOutput)]
+#[derive(Debug, Serialize, distributed::command::CommandOutput)]
 struct Created {
     id: String,
 }
 
-#[derive(Debug, Serialize, distributed::CommandOutput)]
+#[derive(Debug, Serialize, distributed::command::CommandOutput)]
 struct CounterValue {
     value: i64,
 }
@@ -168,9 +168,9 @@ async fn domain_event_fans_out_to_multiple_subscribers() {
                 }),
         );
 
-    let message = distributed::microsvc::Message::new(
+    let message = distributed::bus::Message::new(
         "metachangeset.opened",
-        distributed::microsvc::MessageKind::Event,
+        distributed::bus::MessageKind::Event,
         b"{}".to_vec(),
     );
     service.dispatch_message(&message).await.unwrap();

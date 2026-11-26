@@ -1,7 +1,7 @@
 //! Where a demo's celld is: the base URL and the internal secret shared
 //! with the cells worker (`examples/game/cells`).
 
-use distributed::cell_host::InternalHttpSecret;
+use distributed::microsvc::cell_host::InternalHttpSecret;
 
 /// Env var of the celld base URL.
 pub const CELLD_URL_ENV: &str = "CELLD_URL";
@@ -39,7 +39,7 @@ impl CelldOptions {
         };
         Self::new(
             var(CELLD_URL_ENV)?,
-            var(distributed::cell_host::CELL_INTERNAL_SECRET_ENV)?,
+            var(distributed::microsvc::cell_host::CELL_INTERNAL_SECRET_ENV)?,
         )
     }
 }

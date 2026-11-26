@@ -876,8 +876,8 @@ impl Service {
     ) -> Result<CausalDispatchResult, CausalDispatchError> {
         let seal = move |causation_id: crate::command_ledger::CausationId,
                          retention: Duration,
-                         occurrences: &[crate::DomainEventOccurrence],
-                         selectors: &[crate::ProjectionEventSelector]|
+                         occurrences: &[crate::domain_event::DomainEventOccurrence],
+                         selectors: &[crate::projection::ProjectionEventSelector]|
               -> Result<ModeledProjectionMetadata, String> {
             let metadata = protocol
                 .projection_metadata_for_actual(causation_id, retention, occurrences, selectors)

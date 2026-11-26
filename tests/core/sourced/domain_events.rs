@@ -1,10 +1,10 @@
 use std::cell::Cell;
 
-use distributed::{
-    domain_event::{DomainEventBodyContract, DomainEventContract},
-    AggregateBuilder, DomainDeletion, DomainEvent, DomainEventBodyKind, DomainState, Entity,
-    InMemoryRepository,
+use distributed::domain_event::{
+    DomainDeletion, DomainEvent, DomainEventBodyContract, DomainEventBodyKind, DomainEventContract,
+    DomainState,
 };
+use distributed::{AggregateBuilder, Entity, InMemoryRepository};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, distributed_macros::DomainState)]

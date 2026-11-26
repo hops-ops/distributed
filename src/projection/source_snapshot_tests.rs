@@ -2,16 +2,20 @@
 use std::sync::Arc;
 
 use crate::domain_event::DomainEventContract;
+use crate::domain_event::{DomainEventDescriptor, DomainEventEnvelope, DomainEventOccurrence};
 use crate::projection::executor::prepare_portable_projection;
 use crate::projection::lower::{EventualOnly, ProjectionDescriptor};
 use crate::projection_protocol::*;
-use crate::{
-    DomainEventDescriptor, DomainEventEnvelope, DomainEventOccurrence, RelationalReadModel, RowKey,
-    RowValue,
-};
+use crate::read_model::RelationalReadModel;
+use crate::table::{RowKey, RowValue};
 
 #[derive(
-    Clone, Debug, serde::Serialize, serde::Deserialize, crate::DomainState, crate::ReadModel,
+    Clone,
+    Debug,
+    serde::Serialize,
+    serde::Deserialize,
+    crate::domain_event::DomainState,
+    crate::read_model::ReadModel,
 )]
 #[domain_state(version = 1)]
 #[readmodel(table = "source_snapshot_rows", primary_key = ["id"])]
@@ -26,7 +30,7 @@ struct ExternalRow {
     id: String,
     title: String,
 }
-impl crate::DomainEvent for ExternalRow {
+impl crate::domain_event::DomainEvent for ExternalRow {
     const DESCRIPTOR: DomainEventDescriptor = DomainEventDescriptor {
         name: std::borrow::Cow::Borrowed("external.ledger.changed"),
         version: 1,
@@ -43,7 +47,7 @@ impl DomainEventContract for ExternalRow {
     const EVENT_NAME: &'static str = "external.ledger.changed";
     const EVENT_VERSION: u64 = 1;
     fn descriptor() -> DomainEventDescriptor {
-        <Self as crate::DomainEvent>::DESCRIPTOR.clone()
+        <Self as crate::domain_event::DomainEvent>::DESCRIPTOR.clone()
     }
 }
 crate::projection! {
@@ -88,11 +92,11 @@ impl DomainEventContract for Removed {
     }
 }
 #[allow(non_snake_case)]
-fn SaveSnapshot() -> crate::Mutation<()> {
+fn SaveSnapshot() -> crate::mutation::Mutation<()> {
     crate::mutation_file!("tests/fixtures/source_snapshot_save.graphql")
 }
 #[allow(non_snake_case)]
-fn DeleteSnapshot() -> crate::Mutation<()> {
+fn DeleteSnapshot() -> crate::mutation::Mutation<()> {
     crate::mutation_file!("tests/fixtures/source_snapshot_delete.graphql")
 }
 crate::projection! {
@@ -563,7 +567,7 @@ fn source_snapshots_reject_direct_materialization() {
 }
 
 fn rebuild_projector() -> crate::graphql::SurfaceProjector {
-    crate::LocalProjectionMounts::builder("snapshot-test", "events")
+    crate::projection::LocalProjectionMounts::builder("snapshot-test", "events")
         .eventual(SNAPSHOTS)
         .build()
         .unwrap()
@@ -887,7 +891,7 @@ async fn snapshot_rebuild_original_private_log_coverage() {
 #[tokio::test]
 async fn snapshot_rebuild_external_sparse_members_and_mixed_origins() {
     let store = crate::InMemoryRepository::new();
-    let projector = crate::LocalProjectionMounts::builder("external-test", "events")
+    let projector = crate::projection::LocalProjectionMounts::builder("external-test", "events")
         .eventual(EXTERNAL_SNAPSHOTS)
         .build()
         .unwrap()

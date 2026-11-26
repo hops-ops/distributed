@@ -36,8 +36,8 @@
 //! Callers must hold the `zone-host` role (an internal identity on the
 //! authenticated internal path).
 
-use distributed::cell_host::AggregateCell;
 use distributed::command::{typed_command, PreparedCommand, Succeeded};
+use distributed::microsvc::cell_host::AggregateCell;
 use distributed::microsvc::{
     CausalCommandContext, CausalRouteDependencies, HandlerError, PortableCommand, Routes,
 };
@@ -59,7 +59,9 @@ pub const STALE_PREFIX: &str = "stale:";
 pub const ZONE_STATE_INLINE_MAX: usize = 64 * 1024;
 
 /// A snapshot stored in object storage.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, distributed::CommandInput)]
+#[derive(
+    Clone, Debug, PartialEq, Eq, Serialize, Deserialize, distributed::command::CommandInput,
+)]
 pub struct BlobRef {
     /// Object key.
     pub key: String,
@@ -98,7 +100,9 @@ pub struct ZoneState {
 
 /// The public state of a zone's hibernation slot carried by its outward
 /// events: one `zone_snapshots` read-model row (no snapshot bytes).
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, distributed::DomainState)]
+#[derive(
+    Clone, Debug, PartialEq, Eq, Serialize, Deserialize, distributed::domain_event::DomainState,
+)]
 #[domain_state(version = 1)]
 pub struct ZoneSnapshotStatus {
     /// Zone (the cell's stream id).
@@ -186,7 +190,7 @@ impl ZoneState {
 
 /// `zone_state.save` input: exactly one of `inline_b64` (standard base64,
 /// at most [`ZONE_STATE_INLINE_MAX`] bytes decoded) and `blob`.
-#[derive(Debug, Serialize, Deserialize, distributed::CommandInput)]
+#[derive(Debug, Serialize, Deserialize, distributed::command::CommandInput)]
 pub struct SaveInput {
     pub zone_id: String,
     pub token: u64,
@@ -196,14 +200,16 @@ pub struct SaveInput {
 }
 
 /// `zone_state.delete` input.
-#[derive(Debug, Serialize, Deserialize, distributed::CommandInput)]
+#[derive(Debug, Serialize, Deserialize, distributed::command::CommandInput)]
 pub struct DeleteInput {
     pub zone_id: String,
     pub token: u64,
 }
 
 /// Outcome of a save or delete.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, distributed::CommandOutput)]
+#[derive(
+    Debug, Clone, PartialEq, Eq, Serialize, Deserialize, distributed::command::CommandOutput,
+)]
 pub struct StatePayload {
     pub zone_id: String,
     pub token: u64,
@@ -371,10 +377,11 @@ pub mod celld_worker {
     use super::*;
     use ::worker::{Bucket, Method, Request, Response, Result};
     use base64::Engine as _;
-    use distributed::cell_host::{
-        CausalDispatchError, CellCommandIdentity, CellWaitPathRequest,
-        CELL_PRINCIPAL_PARTITION_HEADER, CELL_SERVICE_ID_HEADER,
+    use distributed::microsvc::cell_host::{
+        CellCommandIdentity, CellWaitPathRequest, CELL_PRINCIPAL_PARTITION_HEADER,
+        CELL_SERVICE_ID_HEADER,
     };
+    use distributed::microsvc::CausalDispatchError;
     use distributed::microsvc::Session;
     use serde_json::{json, Value};
 
@@ -458,7 +465,10 @@ pub mod celld_worker {
                     _ => return error_response(CausalDispatchError::Unauthorized),
                 };
                 let mut session = Session::new();
-                for key in [distributed::USER_ID_KEY, distributed::microsvc::ROLE_KEY] {
+                for key in [
+                    distributed::microsvc::USER_ID_KEY,
+                    distributed::microsvc::ROLE_KEY,
+                ] {
                     if let Some(value) = header(key) {
                         session.set(key, value);
                     }

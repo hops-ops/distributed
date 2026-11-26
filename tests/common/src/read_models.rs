@@ -1,7 +1,7 @@
 //! The shared read-model set: orders across tenants, and a parent/child pair
 //! for relationship scenarios.
 
-use distributed::ReadModel;
+use distributed::read_model::ReadModel;
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, ReadModel)]

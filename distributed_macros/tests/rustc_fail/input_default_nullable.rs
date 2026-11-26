@@ -1,4 +1,5 @@
-use distributed::{command_input_defaults, CommandInput};
+use distributed::command::CommandInput;
+use distributed::command_input_defaults;
 use serde::Deserialize;
 
 #[derive(Deserialize, CommandInput)]

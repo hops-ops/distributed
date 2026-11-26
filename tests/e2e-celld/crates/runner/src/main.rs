@@ -9,7 +9,7 @@
 
 use std::env;
 
-use distributed::cell_host::{InternalHttpSecret, CELL_INTERNAL_SECRET_ENV};
+use distributed::microsvc::cell_host::{InternalHttpSecret, CELL_INTERNAL_SECRET_ENV};
 use e2e_celld_runner::{identity_from_env, run, HostOptions};
 
 #[tokio::main]

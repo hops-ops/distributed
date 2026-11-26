@@ -17,6 +17,7 @@ use std::pin::Pin;
 
 use sqlx::{Encode, Executor, IntoArguments, Pool, QueryBuilder, Row, Transaction, Type};
 
+use crate::projection::ProjectionProgramId;
 use crate::projection_protocol::{
     change_kind_for_mutation, change_page, change_read_window, checked_next, classify_input,
     corrupt_storage, ensure_active_input, ensure_change_epoch, failure_matches_batch, next_record,
@@ -47,7 +48,6 @@ use crate::sqlx_repo::repo::{repository_storage_error, SqlxRepoBackend, SqlxRepo
 use crate::table::{
     validate_row_values, RowValues, TableMutation, TableStoreError, TableWritePlan,
 };
-use crate::ProjectionProgramId;
 
 mod helpers;
 mod identity;

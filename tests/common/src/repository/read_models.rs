@@ -1,8 +1,7 @@
 use distributed::read_model::ReadModelWritePlanBuilder;
-use distributed::{
-    ReadModel, ReadModelWritePlanStore, RelationalReadModel, RelationalReadModelQueryStore, RowKey,
-    RowValue, TableSchemaRegistry, Versioned,
-};
+use distributed::read_model::{ReadModel, RelationalReadModel, Versioned};
+use distributed::table::{RowKey, RowValue, TableSchemaRegistry};
+use distributed::{ReadModelWritePlanStore, RelationalReadModelQueryStore};
 use serde::{Deserialize, Serialize};
 
 use super::scenario::unique_id;

@@ -34,7 +34,7 @@ const COLD_RUNTIME_READY_TIMEOUT_MS: u64 = 300_000;
 pub struct DiscoveredLifecycleProject {
     /// Stable project name derived from the Cargo workspace directory.
     pub name: String,
-    /// Package exporting the typed `distributed::ApplicationManifest`.
+    /// Package exporting the typed `distributed::application::ApplicationManifest`.
     pub application_package: String,
     /// Fully-qualified zero-argument Rust export used for typed introspection.
     pub application_entrypoint: String,

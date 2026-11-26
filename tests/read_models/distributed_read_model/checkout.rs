@@ -3,7 +3,7 @@
 //! Commands are present-tense requests. Events are past-tense facts.
 
 use distributed::microsvc::HandlerError;
-use distributed::OutboxMessage;
+use distributed::outbox::OutboxMessage;
 use serde::{Deserialize, Serialize};
 
 pub mod checkout_command {
@@ -31,14 +31,14 @@ pub const CHECKOUT_SEAT_RESERVED: &str = "seat_reserved";
 pub const RESERVING_SEAT_MESSAGE: &str = "reserving seat...";
 pub const SEAT_RESERVED_MESSAGE: &str = "your seat is reserved, enter your payment info";
 
-#[derive(Clone, Debug, Serialize, Deserialize, distributed::CommandInput)]
+#[derive(Clone, Debug, Serialize, Deserialize, distributed::command::CommandInput)]
 pub struct StartCheckout {
     pub checkout_id: String,
     pub seat_id: String,
     pub seat_category: String,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, distributed::CommandInput)]
+#[derive(Clone, Debug, Serialize, Deserialize, distributed::command::CommandInput)]
 pub struct AddSeat {
     pub seat_id: String,
     pub category: String,

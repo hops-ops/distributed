@@ -8,11 +8,11 @@ pub use crate::command_sink::{CelldFactSink, FactRoute, DEFAULT_CELLD_FACT_TIMEO
 
 use std::time::Duration;
 
-use distributed::cell_host::{
+use distributed::microsvc::cell_host::{
     InternalHttpSecret, CELL_INTERNAL_SECRET_HEADER, CELL_PRINCIPAL_PARTITION_HEADER,
     CELL_SERVICE_ID_HEADER,
 };
-use distributed::USER_ID_KEY;
+use distributed::microsvc::USER_ID_KEY;
 use serde_json::{json, Value};
 
 use crate::facts::BoxFuture;
@@ -409,7 +409,7 @@ impl crate::world::ZoneStateStore for CellZoneStateStore {
 mod tests {
     use crate::facts::Fact;
     use crate::stamp::FactStamp;
-    use distributed::USER_ID_KEY;
+    use distributed::microsvc::USER_ID_KEY;
     use serde_json::json;
 
     #[test]

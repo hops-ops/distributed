@@ -10,7 +10,8 @@
 use std::sync::Arc;
 
 use distributed::bus::{Bus, BusConsumer, FailurePolicy, InMemoryBus, RunOptions};
-use distributed::microsvc::{Message, MessageKind, Routes, Service, TRANSPORT_ROLE};
+use distributed::bus::{Message, MessageKind};
+use distributed::microsvc::{Routes, Service, TRANSPORT_ROLE};
 use distributed::{AggregateBuilder, InMemoryRepository, Queueable};
 use serde_json::json;
 

@@ -16,7 +16,8 @@ for physical read-model SQL/SDL (override with `--entrypoint <path>`).
 The service must export a function that registers its read models / tables:
 
 ```rust
-use distributed::{ReadModelCatalog, ReadModel};
+use distributed::read_model::ReadModel;
+use distributed::table::ReadModelCatalog;
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, ReadModel)]
 #[table("orders")]

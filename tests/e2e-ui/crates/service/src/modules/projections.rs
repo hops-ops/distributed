@@ -2,9 +2,9 @@
 //!
 //! Each projection is mounted from its `projection!` descriptor, which names
 //! it, pins its epoch and its model. Topology, catalog activation, and Surface
-//! packaging come from [`distributed::LocalProjectionMounts`].
+//! packaging come from [`distributed::projection::LocalProjectionMounts`].
 
-use distributed::LocalProjectionMounts;
+use distributed::projection::LocalProjectionMounts;
 use e2e_projections::{AUTH_USERS, BLOB_GAMES, CHAT_MESSAGES, TODOS};
 
 /// Every projection of the application, mounted for one local process.

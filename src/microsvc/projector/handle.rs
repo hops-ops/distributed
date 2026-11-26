@@ -12,7 +12,7 @@ const DETERMINISTIC_FAILURE_ID_BYTES: usize = 64;
 /// unique deterministic failure ID. It never serializes a canonical projection
 /// partition, which may contain tenant identifiers. During repair, the owning
 /// store resolves and validates the exact durable topology/partition scope and
-/// the [`Service`](super::Service) verifies that topology is registered.
+/// the [`Service`](crate::microsvc::Service) verifies that topology is registered.
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub struct ProjectionRepairHandle {
     version: u8,

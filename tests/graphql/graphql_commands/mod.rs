@@ -33,7 +33,7 @@ fn graphql_type_def_mapping_golden() {
     assert!(input.fields[1].list);
 }
 
-#[derive(distributed::CommandInput)]
+#[derive(distributed::command::CommandInput)]
 #[allow(dead_code)]
 struct DerivedInput {
     id: String,
@@ -41,14 +41,14 @@ struct DerivedInput {
     tags: Option<Vec<String>>,
 }
 
-#[derive(distributed::CommandOutput)]
+#[derive(distributed::command::CommandOutput)]
 #[allow(dead_code)]
 struct DerivedOutput {
     ok: bool,
     id: String,
 }
 
-#[derive(distributed::CommandInput)]
+#[derive(distributed::command::CommandInput)]
 #[allow(dead_code)]
 struct UnsignedInput {
     tiny: u8,
@@ -87,7 +87,7 @@ fn unsigned_command_derive_preserves_range_and_portable_contract() {
     assert!(encoded["fields"][4].get("unsigned_integer").is_none());
 }
 
-#[derive(distributed::CommandInput, serde::Deserialize)]
+#[derive(distributed::command::CommandInput, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[allow(dead_code)]
 struct ScalarMatrixInput {
@@ -100,7 +100,7 @@ struct ScalarMatrixInput {
     optional_nullable_items: Option<Vec<Option<String>>>,
 }
 
-#[derive(distributed::CommandOutput, serde::Serialize)]
+#[derive(distributed::command::CommandOutput, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 #[allow(dead_code)]
 struct ScalarMatrixOutput {
@@ -113,7 +113,7 @@ struct ScalarMatrixOutput {
     optional_nullable_items: Option<Vec<Option<String>>>,
 }
 
-#[derive(distributed::CommandInput)]
+#[derive(distributed::command::CommandInput)]
 #[serde(rename_all(deserialize = "camelCase", serialize = "SCREAMING_SNAKE_CASE"))]
 #[allow(dead_code)]
 struct DirectionalInputNames {
@@ -122,7 +122,7 @@ struct DirectionalInputNames {
     custom_id: String,
 }
 
-#[derive(distributed::CommandOutput)]
+#[derive(distributed::command::CommandOutput)]
 #[serde(rename_all(deserialize = "camelCase", serialize = "SCREAMING_SNAKE_CASE"))]
 #[allow(dead_code)]
 struct DirectionalOutputNames {

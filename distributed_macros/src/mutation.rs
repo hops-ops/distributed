@@ -394,8 +394,8 @@ fn expand_declaration(decl: MutationDeclaration) -> Result<TokenStream> {
     // returns an error; nothing here can panic.
     Ok(quote! {
         {
-            const __STEPS: &[#framework::MutationStep] = &[#(#steps),*];
-            #framework::Mutation::<()>::declare(#name_lit, #version, __STEPS)
+            const __STEPS: &[#framework::mutation::MutationStep] = &[#(#steps),*];
+            #framework::mutation::Mutation::<()>::declare(#name_lit, #version, __STEPS)
         }
     })
 }
@@ -411,7 +411,7 @@ fn expand_inputs(framework: &TokenStream, bindings: &[GraphqlFieldBinding]) -> T
         let column = LitStr::new(&column.to_string(), column.span());
         let path = path_literals(path);
         quote! {
-            #framework::MutationInput { column: #column, path: &[#(#path),*] }
+            #framework::mutation::MutationInput { column: #column, path: &[#(#path),*] }
         }
     });
     quote! { &[#(#inputs),*] }
@@ -419,28 +419,28 @@ fn expand_inputs(framework: &TokenStream, bindings: &[GraphqlFieldBinding]) -> T
 
 fn expand_step(framework: &TokenStream, operation: &MutationOpSyntax) -> TokenStream {
     let schema = |model: &Path| {
-        quote! { <#model as #framework::RelationalReadModel>::schema }
+        quote! { <#model as #framework::read_model::RelationalReadModel>::schema }
     };
     match operation {
         MutationOpSyntax::Upsert { model, input_root } => {
             let model = schema(model);
             let object = path_literals(input_root);
             quote! {
-                #framework::MutationStep::Upsert { model: #model, object: &[#(#object),*] }
+                #framework::mutation::MutationStep::Upsert { model: #model, object: &[#(#object),*] }
             }
         }
         MutationOpSyntax::InsertOne { model, object_root } => {
             let model = schema(model);
             let object = path_literals(object_root);
             quote! {
-                #framework::MutationStep::Insert { model: #model, object: &[#(#object),*] }
+                #framework::mutation::MutationStep::Insert { model: #model, object: &[#(#object),*] }
             }
         }
         MutationOpSyntax::DeleteByPk { model, keys } => {
             let model = schema(model);
             let key = expand_inputs(framework, keys);
             quote! {
-                #framework::MutationStep::Delete { model: #model, key: #key }
+                #framework::mutation::MutationStep::Delete { model: #model, key: #key }
             }
         }
         MutationOpSyntax::UpdateByPk { model, keys, sets } => {
@@ -448,7 +448,7 @@ fn expand_step(framework: &TokenStream, operation: &MutationOpSyntax) -> TokenSt
             let key = expand_inputs(framework, keys);
             let set = expand_inputs(framework, sets);
             quote! {
-                #framework::MutationStep::Patch { model: #model, key: #key, set: #set }
+                #framework::mutation::MutationStep::Patch { model: #model, key: #key, set: #set }
             }
         }
     }

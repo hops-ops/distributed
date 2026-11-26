@@ -355,14 +355,18 @@ impl FieldAttrs {
         let through = option_string_tokens(relationship.through.as_deref());
         let target_foreign_key = option_string_tokens(relationship.target_foreign_key.as_deref());
         let kind = match relationship.kind {
-            RelationshipKindAttr::HasMany => quote! { #framework::RelationshipKind::HasMany },
-            RelationshipKindAttr::BelongsTo => quote! { #framework::RelationshipKind::BelongsTo },
+            RelationshipKindAttr::HasMany => {
+                quote! { #framework::table::RelationshipKind::HasMany }
+            }
+            RelationshipKindAttr::BelongsTo => {
+                quote! { #framework::table::RelationshipKind::BelongsTo }
+            }
             RelationshipKindAttr::ManyToMany => {
-                quote! { #framework::RelationshipKind::ManyToMany }
+                quote! { #framework::table::RelationshipKind::ManyToMany }
             }
         };
         Ok(Some(quote! {
-            #framework::RelationshipDef {
+            #framework::table::RelationshipDef {
                 references: #references,
                 field_name: #field_name.to_string(),
                 kind: #kind,
@@ -410,8 +414,8 @@ impl FieldAttrs {
                     #field_name => {
                         self.#ident = rows
                             .into_iter()
-                            .map(<#inner as #framework::RelationalReadModel>::from_row)
-                            .collect::<Result<Vec<_>, #framework::TableStoreError>>()?;
+                            .map(<#inner as #framework::read_model::RelationalReadModel>::from_row)
+                            .collect::<Result<Vec<_>, #framework::table::TableStoreError>>()?;
                         Ok(())
                     }
                 };
@@ -419,11 +423,11 @@ impl FieldAttrs {
                     #field_name => self
                         .#ident
                         .iter()
-                        .map(#framework::RelationalReadModel::to_row)
-                        .collect::<Result<Vec<_>, #framework::TableStoreError>>()
+                        .map(#framework::read_model::RelationalReadModel::to_row)
+                        .collect::<Result<Vec<_>, #framework::table::TableStoreError>>()
                 };
                 let include_schema = quote! {
-                    #field_name => Ok(<#inner as #framework::RelationalReadModel>::schema())
+                    #field_name => Ok(<#inner as #framework::read_model::RelationalReadModel>::schema())
                 };
                 Ok((hydrate, include_rows, include_schema))
             }
@@ -445,9 +449,9 @@ impl FieldAttrs {
                     field_name,
                 )?;
                 let hydrated_value = if boxed.is_some() {
-                    quote! { ::std::boxed::Box::new(<#inner as #framework::RelationalReadModel>::from_row(row)?) }
+                    quote! { ::std::boxed::Box::new(<#inner as #framework::read_model::RelationalReadModel>::from_row(row)?) }
                 } else {
-                    quote! { <#inner as #framework::RelationalReadModel>::from_row(row)? }
+                    quote! { <#inner as #framework::read_model::RelationalReadModel>::from_row(row)? }
                 };
                 let included_value = if boxed.is_some() {
                     quote! { value.as_ref() }
@@ -462,7 +466,7 @@ impl FieldAttrs {
                             None => None,
                         };
                         if rows.next().is_some() {
-                            return Err(#framework::TableStoreError::Metadata(format!(
+                            return Err(#framework::table::TableStoreError::Metadata(format!(
                                 "belongs_to relationship `{}` returned more than one row",
                                 #field_name
                             )));
@@ -474,13 +478,13 @@ impl FieldAttrs {
                     #field_name => {
                         let mut rows = Vec::new();
                         if let Some(value) = &self.#ident {
-                            rows.push(#framework::RelationalReadModel::to_row(#included_value)?);
+                            rows.push(#framework::read_model::RelationalReadModel::to_row(#included_value)?);
                         }
                         Ok(rows)
                     }
                 };
                 let include_schema = quote! {
-                    #field_name => Ok(<#inner as #framework::RelationalReadModel>::schema())
+                    #field_name => Ok(<#inner as #framework::read_model::RelationalReadModel>::schema())
                 };
                 Ok((hydrate, include_rows, include_schema))
             }
@@ -619,7 +623,7 @@ pub(super) fn foreign_key_tokens(foreign_key: &ForeignKeyParts) -> proc_macro2::
     let table = &foreign_key.table;
     let column = &foreign_key.column;
     quote! {
-        #framework::ForeignKey {
+        #framework::table::ForeignKey {
             table: #table.to_string(),
             column: #column.to_string(),
         }

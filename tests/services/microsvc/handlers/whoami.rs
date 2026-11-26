@@ -11,10 +11,10 @@ use crate::microsvc::models::counter::Counter;
 
 pub const COMMAND: &str = "session.identify";
 
-#[derive(Debug, Deserialize, distributed::CommandInput)]
+#[derive(Debug, Deserialize, distributed::command::CommandInput)]
 pub struct Input {}
 
-#[derive(Debug, Serialize, distributed::CommandOutput)]
+#[derive(Debug, Serialize, distributed::command::CommandOutput)]
 pub struct Output {
     pub user_id: String,
 }

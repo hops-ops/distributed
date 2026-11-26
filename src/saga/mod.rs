@@ -17,7 +17,7 @@
 //!   auditable.
 //! - Every transition returns what to commit **with** the saga's events: the
 //!   participant commands (outbox messages) and the saga's timeout
-//!   [`Schedule`](crate::Schedule) ([`SagaTransition::timer`]). A crash can
+//!   [`Schedule`](crate::schedule::Schedule) ([`SagaTransition::timer`]). A crash can
 //!   never lose a dispatched command or its timeout.
 //! - Participants reply with [`SagaReply`] (`succeeded` / `failed`), routed to
 //!   [`SagaDefinition::REPLY_TO`]. Replies arrive as [`SagaMessage`]s and are

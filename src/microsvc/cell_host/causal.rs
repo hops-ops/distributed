@@ -9,10 +9,11 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use super::{CausalDispatchError, CausalDispatchResult, CellProjectionEventWireItem};
+use super::CellProjectionEventWireItem;
 use crate::command_ledger::{
     CommandId, CommandLedgerError, CommandLedgerKey, PrincipalPartitionId,
 };
+use crate::microsvc::{CausalDispatchError, CausalDispatchResult};
 
 /// Bounded retry material, owned by the command ledger and expired with its
 /// replay retention. It is not an outbox record or an event history archive.

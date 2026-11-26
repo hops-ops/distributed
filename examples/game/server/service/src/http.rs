@@ -17,7 +17,8 @@ use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::Router;
-use distributed::graphql::{graphql_router_composed, GraphqlEngine};
+use distributed::graphql::http::graphql_router_composed;
+use distributed::graphql::GraphqlEngine;
 
 const ALLOWED_HEADERS: &str = "authorization, content-type, accept, x-distributed-participant";
 

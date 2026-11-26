@@ -190,7 +190,7 @@ where
         tx.commit()
             .await
             .map_err(|e| protocol_storage_error::<DB>("commit snapshot rebuild", e))?;
-        self.publish_read_model_change(crate::ReadModelChange { tables });
+        self.publish_read_model_change(crate::read_model::ReadModelChange { tables });
         Ok(plan.rows.len())
     }
 }

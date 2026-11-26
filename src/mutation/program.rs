@@ -233,7 +233,7 @@ impl MutationProgram {
         })
     }
 
-    /// Build the mutation a [`mutation!`](crate::mutation) declaration states.
+    /// Build the mutation a [`mutation!`](macro@crate::mutation) declaration states.
     ///
     /// # Errors
     ///
@@ -289,7 +289,7 @@ pub struct MutationInput {
     pub path: &'static [&'static str],
 }
 
-/// One statement of a [`mutation!`](crate::mutation) declaration. The macros
+/// One statement of a [`mutation!`](macro@crate::mutation) declaration. The macros
 /// emit these as data; [`MutationProgram::build`] turns them into operations.
 #[derive(Clone, Copy, Debug)]
 pub enum MutationStep {
@@ -432,7 +432,7 @@ pub(super) fn complete_row(
     MutationOperation::try_new(operation_id, kind, target(schema)?, key, fields)
 }
 
-/// A declared mutation: what [`mutation!`](crate::mutation) and
+/// A declared mutation: what [`mutation!`](macro@crate::mutation) and
 /// [`mutation_file!`](crate::mutation_file) expand to. `I` marks the input
 /// type the author declared.
 #[derive(Debug)]

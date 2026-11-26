@@ -11,13 +11,13 @@ use crate::table::{
 };
 use std::any::TypeId;
 
-#[derive(Serialize, crate::DomainEvent)]
+#[derive(Serialize, crate::domain_event::DomainEvent)]
 #[domain_event(name = "todo.projected", version = 1)]
 struct ManifestTodoProjected {
     todo_id: String,
 }
 
-#[derive(Serialize, crate::DomainEvent)]
+#[derive(Serialize, crate::domain_event::DomainEvent)]
 #[domain_event(name = "todo.archived", version = 1)]
 struct ManifestTodoArchived {
     todo_id: String,
@@ -338,7 +338,7 @@ fn modeled_surface(
         full_surface(),
         state,
         execution_class,
-        crate::ProjectionPartition::Unit,
+        crate::projection::ProjectionPartition::Unit,
     )
 }
 
@@ -350,14 +350,14 @@ fn modeled_causal_surface(
         causal_full_surface(),
         state,
         execution_class,
-        crate::ProjectionPartition::Unit,
+        crate::projection::ProjectionPartition::Unit,
     )
 }
 
 fn modeled_surface_with_partition(
     state: crate::projection::placement::ProjectionBindingState,
     execution_class: crate::projection::placement::ProjectionExecutionClass,
-    partition: crate::ProjectionPartition,
+    partition: crate::projection::ProjectionPartition,
 ) -> Surface {
     modeled_surface_with_base(full_surface(), state, execution_class, partition)
 }
@@ -366,7 +366,7 @@ fn modeled_surface_with_base(
     mut surface: Surface,
     state: crate::projection::placement::ProjectionBindingState,
     execution_class: crate::projection::placement::ProjectionExecutionClass,
-    partition: crate::ProjectionPartition,
+    partition: crate::projection::ProjectionPartition,
 ) -> Surface {
     use crate::projection::catalog::ProjectionBindingActivation;
     use crate::projection::placement::{
@@ -374,16 +374,16 @@ fn modeled_surface_with_base(
         ProjectionPhysicalTopology, ProjectionSourceBinding, PROJECTION_PARTITION_CODEC_VERSION,
     };
     use crate::projection::{
-        ProjectionArm, ProjectionField, ProjectionOperation, ProjectionTarget,
-    };
-    use crate::projection_protocol::{ProjectionEpoch, ProjectorTopologyId};
-    use crate::{
         MutationKind, ProjectionAssignment, ProjectionExpression, ProjectionKeyField,
         ProjectionProgram, ProjectionValueType,
     };
+    use crate::projection::{
+        ProjectionArm, ProjectionField, ProjectionOperation, ProjectionTarget,
+    };
+    use crate::projection_protocol::{ProjectionEpoch, ProjectorTopologyId};
 
-    let selector = crate::ProjectionEventSelector::try_from_descriptor(
-        &<ManifestTodoProjected as crate::DomainEvent>::DESCRIPTOR,
+    let selector = crate::projection::ProjectionEventSelector::try_from_descriptor(
+        &<ManifestTodoProjected as crate::domain_event::DomainEvent>::DESCRIPTOR,
     )
     .unwrap();
     let key = ProjectionKeyField::try_new(
@@ -932,9 +932,9 @@ fn role_and_application_partition_manifests_hide_raw_paths_and_denied_values() {
     let mut full = modeled_surface_with_partition(
         ProjectionBindingState::Active,
         ProjectionExecutionClass::Causal,
-        crate::ProjectionPartition::Expression(
-            crate::ProjectionExpression::body_path(
-                crate::ProjectionValueType::String,
+        crate::projection::ProjectionPartition::Expression(
+            crate::projection::ProjectionExpression::body_path(
+                crate::projection::ProjectionValueType::String,
                 ["private_partition_path"],
             )
             .unwrap(),
@@ -951,7 +951,7 @@ fn role_and_application_partition_manifests_hide_raw_paths_and_denied_values() {
                 .field(
                     ["private_partition_path"],
                     crate::command::CommandProjectionPreviewSource::constant(
-                        crate::ProjectionValue::string("denied-partition-value"),
+                        crate::projection::ProjectionValue::string("denied-partition-value"),
                     ),
                 ),
         );
@@ -1282,11 +1282,11 @@ fn client_projection_arms_are_canonical_across_declaration_order() {
         SurfaceProjectionArm, SurfaceProjectionOperation, SurfaceSelectedProjectionProgram,
     };
     use crate::projection::{
-        PROJECTION_OPERATION_SEMANTICS_VERSION, PROJECTION_PROGRAM_IR_VERSION,
-    };
-    use crate::{
         MutationKind, ProjectionAssignment, ProjectionExpression, ProjectionField,
         ProjectionKeyField, ProjectionPartition, ProjectionValueType,
+    };
+    use crate::projection::{
+        PROJECTION_OPERATION_SEMANTICS_VERSION, PROJECTION_PROGRAM_IR_VERSION,
     };
 
     let surface = build_surface(&[todos(), users()], &SurfaceOptions::sqlite()).unwrap();
@@ -1314,18 +1314,21 @@ fn client_projection_arms_are_canonical_across_declaration_order() {
         invalidations: Vec::new(),
         force_revalidate: false,
     };
-    let arm = |name: &str, descriptor: &crate::DomainEventDescriptor| SurfaceProjectionArm {
-        arm_id: name.into(),
-        selector: crate::ProjectionEventSelector::try_from_descriptor(descriptor).unwrap(),
-        operations: vec![operation()],
+    let arm = |name: &str, descriptor: &crate::domain_event::DomainEventDescriptor| {
+        SurfaceProjectionArm {
+            arm_id: name.into(),
+            selector: crate::projection::ProjectionEventSelector::try_from_descriptor(descriptor)
+                .unwrap(),
+            operations: vec![operation()],
+        }
     };
     let archived = arm(
         "archived",
-        &<ManifestTodoArchived as crate::DomainEvent>::DESCRIPTOR,
+        &<ManifestTodoArchived as crate::domain_event::DomainEvent>::DESCRIPTOR,
     );
     let projected = arm(
         "projected",
-        &<ManifestTodoProjected as crate::DomainEvent>::DESCRIPTOR,
+        &<ManifestTodoProjected as crate::domain_event::DomainEvent>::DESCRIPTOR,
     );
     let selected = |arms| SurfaceSelectedProjectionProgram {
         name: "canonical-client-arms".into(),
@@ -1335,7 +1338,7 @@ fn client_projection_arms_are_canonical_across_declaration_order() {
         partition: ProjectionPartition::Unit,
         arms,
     };
-    let program_id = crate::ProjectionProgramId::parse(
+    let program_id = crate::projection::ProjectionProgramId::parse(
         "pp1:sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
     )
     .unwrap();
@@ -2444,7 +2447,9 @@ fn catalog_or_mismatched_surface_cannot_be_labeled_as_authorized() {
 
 #[test]
 fn json_columns_give_one_client_contract_for_every_dialect() {
-    #[derive(Clone, Default, serde::Serialize, serde::Deserialize, crate::ReadModel)]
+    #[derive(
+        Clone, Default, serde::Serialize, serde::Deserialize, crate::read_model::ReadModel,
+    )]
     #[readmodel(primary_key = ["board_id"])]
     struct Boards {
         board_id: String,
@@ -2452,7 +2457,7 @@ fn json_columns_give_one_client_contract_for_every_dialect() {
         #[readmodel(jsonb)]
         metadata: serde_json::Value,
     }
-    use crate::RelationalReadModel;
+    use crate::read_model::RelationalReadModel;
 
     let manifest = |options: SurfaceOptions| {
         let full = build_surface(&[Boards::schema().clone()], &options).expect("surface");

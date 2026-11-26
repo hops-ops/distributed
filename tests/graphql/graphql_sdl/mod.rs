@@ -1,7 +1,9 @@
 //! Golden-file tests for the dep-free GraphQL SDL renderer.
 
-use distributed::{
-    graphql::{graphql_sdl_for_tables, graphql_sdl_for_tables_with_options, SdlOptions},
+use distributed::graphql::{
+    graphql_sdl_for_tables, graphql_sdl_for_tables_with_options, SdlOptions,
+};
+use distributed::table::{
     ColumnType, ForeignKey, PrimaryKey, RelationshipDef, RelationshipKind, TableColumn, TableKind,
     TableSchema,
 };
@@ -214,7 +216,7 @@ fn collision_errors() {
 
 #[test]
 fn manifest_graphql_sdl_method() {
-    let manifest = distributed::ReadModelCatalog::new("demo")
+    let manifest = distributed::table::ReadModelCatalog::new("demo")
         .table_schema(players())
         .table_schema(weapons())
         .table_schema(operational_outbox());

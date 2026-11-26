@@ -5,12 +5,12 @@
 //! with compile-time reject remaining as defense-in-depth.
 
 use async_graphql::Request;
-use distributed::graphql::IdentityConfig;
-use distributed::graphql::{
-    comparison_op_fields, include_postgres_json_comparison_ops, read, GraphqlEngine,
-    ModelPermissions, POSTGRES_JSON_COMPARISON_OPS,
+use distributed::graphql::naming::{
+    comparison_op_fields, include_postgres_json_comparison_ops, POSTGRES_JSON_COMPARISON_OPS,
 };
-use distributed::ReadModel;
+use distributed::graphql::IdentityConfig;
+use distributed::graphql::{read, GraphqlEngine, ModelPermissions};
+use distributed::read_model::ReadModel;
 use serde::{Deserialize, Serialize};
 
 use common::graphql::{assert_no_sql_leak, error_messages, session, Db};

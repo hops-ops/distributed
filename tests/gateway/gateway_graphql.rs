@@ -93,7 +93,7 @@ impl CustomQuery {
         input
     }
 }
-fn custom_router(filter: distributed::graphql::GraphqlOperationFilter) -> Router {
+fn custom_router(filter: distributed::graphql::http::GraphqlOperationFilter) -> Router {
     let schema = Schema::build(CustomQuery, EmptyMutation, EmptySubscription).finish();
     Router::new().route(
         "/graphql",
@@ -183,7 +183,9 @@ async fn embedded_remote_parity() {
     assert!(tokio_tungstenite::connect_async(ws_request).await.is_err());
 }
 
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, distributed::ReadModel)]
+#[derive(
+    Clone, Debug, serde::Serialize, serde::Deserialize, distributed::read_model::ReadModel,
+)]
 #[readmodel(table = "gateway_items", primary_key = ["id"])]
 struct Item {
     id: String,

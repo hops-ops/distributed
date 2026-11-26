@@ -6,7 +6,7 @@
 //! cells ([`CelldCommandHost::route_aggregate`]), the bus is NATS, and the
 //! cells' Queue relay is an internal route.
 //!
-//! [`CelldCommandHost::route_aggregate`]: distributed::cell_host::CelldCommandHost::route_aggregate
+//! [`CelldCommandHost::route_aggregate`]: distributed::microsvc::cell_host::CelldCommandHost::route_aggregate
 
 mod host;
 mod http;

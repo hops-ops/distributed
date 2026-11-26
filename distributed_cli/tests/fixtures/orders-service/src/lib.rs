@@ -3,6 +3,7 @@
 
 use std::any::TypeId;
 
+use distributed::application::{Application, ApplicationManifest, SurfaceSpec};
 use distributed::command::{
     typed_command, Atomic, CommandInputType, CommandOutputType, CommandTypeDef, CommandTypeField,
     PreparedCommand,
@@ -12,10 +13,9 @@ use distributed::graphql::{
     SurfaceProjector,
 };
 use distributed::microsvc::{CausalCommandContext, HandlerError, Routes, Service};
-use distributed::{
-    Aggregate, AggregateRepository, Application, ApplicationManifest, Entity, EventRecord,
-    InMemoryRepository, ReadModel, ReadModelCatalog, SurfaceSpec,
-};
+use distributed::read_model::ReadModel;
+use distributed::table::ReadModelCatalog;
+use distributed::{Aggregate, AggregateRepository, Entity, EventRecord, InMemoryRepository};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, ReadModel)]

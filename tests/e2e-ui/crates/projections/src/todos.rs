@@ -1,8 +1,8 @@
 //! Todo: mutations + projections.
 
+use distributed::mutation::Mutation;
 use distributed::mutation_file;
 use distributed::projection::lower::{EventualOnly, ProjectionDescriptor};
-use distributed::Mutation;
 use e2e_readmodels::Todos;
 use todo_domain::{
     TodoArchivedDomainEvent, TodoCompletedDomainEvent, TodoCreatedDomainEvent,
@@ -58,9 +58,12 @@ distributed::projection! {
 
 #[cfg(test)]
 mod tests {
+    use distributed::domain_event::DomainEventBodyKind;
     use distributed::domain_event::DomainEventContract;
     use distributed::projection::placement::ProjectionExecutionClass;
-    use distributed::{DomainEventBodyKind, MutationKind, RelationalReadModel, RowValue};
+    use distributed::projection::MutationKind;
+    use distributed::read_model::RelationalReadModel;
+    use distributed::table::RowValue;
 
     use super::*;
     use todo_domain::{Todo, TodoPurgedDomainEvent};

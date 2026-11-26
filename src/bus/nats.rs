@@ -49,7 +49,9 @@ fn external_dedup_id(payload: &[u8]) -> String {
 /// an external fact (whose transport identity must match the fact), else the
 /// message id.
 fn dedup_id(message: &Message) -> Result<Option<String>, TransportError> {
-    let Ok(event) = crate::DomainEventOccurrence::from_canonical_bytes(&message.payload) else {
+    let Ok(event) =
+        crate::domain_event::DomainEventOccurrence::from_canonical_bytes(&message.payload)
+    else {
         return Ok(message.id.clone());
     };
     if event.external_source().is_none() {
@@ -67,12 +69,12 @@ fn dedup_id(message: &Message) -> Result<Option<String>, TransportError> {
 }
 
 fn is_external_occurrence(payload: &[u8]) -> bool {
-    crate::DomainEventOccurrence::from_canonical_bytes(payload)
+    crate::domain_event::DomainEventOccurrence::from_canonical_bytes(payload)
         .is_ok_and(|event| event.external_source().is_some())
 }
 
 pub(super) fn archived_identity_matches(
-    event: &crate::DomainEventOccurrence,
+    event: &crate::domain_event::DomainEventOccurrence,
     payload: &[u8],
     headers: &async_nats::HeaderMap,
 ) -> bool {
@@ -418,15 +420,15 @@ impl ReceivedMessage for NatsReceived {
 mod tests {
     use super::*;
 
-    #[derive(serde::Serialize, serde::Deserialize, crate::DomainEvent)]
+    #[derive(serde::Serialize, serde::Deserialize, crate::domain_event::DomainEvent)]
     #[domain_event(name = "external.balance_recorded", version = 1)]
     struct Balance {
         value: u64,
     }
 
     fn external_message(position: u64, value: u64) -> Message {
-        let event = crate::DomainEventOccurrence::capture_external(
-            crate::ExternalEventSource {
+        let event = crate::domain_event::DomainEventOccurrence::capture_external(
+            crate::domain_event::ExternalEventSource {
                 producer: "ledger.adapter".into(),
                 stream: "account-one".into(),
                 position,
@@ -531,7 +533,9 @@ mod tests {
     #[test]
     fn retained_archive_rejects_same_ambiguity_as_live_delivery() {
         let message = external_message(1, 10);
-        let event = crate::DomainEventOccurrence::from_canonical_bytes(&message.payload).unwrap();
+        let event =
+            crate::domain_event::DomainEventOccurrence::from_canonical_bytes(&message.payload)
+                .unwrap();
         let headers = published_headers(&message);
         assert!(archived_identity_matches(
             &event,

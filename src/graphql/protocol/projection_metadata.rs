@@ -5,8 +5,8 @@ use serde::de::{Error as _, IgnoredAny, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
 
 use super::OpaqueProtocolToken;
+use crate::domain_event::MAX_DOMAIN_EVENT_BODY_BYTES;
 use crate::graphql::projection_delta::{ProjectionDelta, ProjectionDeltaError};
-use crate::MAX_DOMAIN_EVENT_BODY_BYTES;
 
 /// Version of the command response/status projection metadata envelope.
 pub(crate) const COMMAND_PROJECTION_METADATA_WIRE_VERSION: u16 = 1;

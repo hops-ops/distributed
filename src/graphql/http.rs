@@ -418,7 +418,7 @@ pub async fn microsvc_graphql_get(State(service): State<Arc<Service>>) -> Respon
 /// `wsConnectionParams` (`x-user-id` / `x-roles`). Empty clients remain
 /// anonymous; the GraphiQL page sends its demo identity explicitly.
 ///
-/// Every connection is bounded by the engine's [`WebsocketLimits`].
+/// Every connection is bounded by the engine's [`WebsocketLimits`](super::WebsocketLimits).
 pub async fn microsvc_graphql_ws(
     State(service): State<Arc<Service>>,
     headers: HeaderMap,

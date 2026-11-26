@@ -9,7 +9,7 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use distributed::cell_host::InternalHttpSecret;
+use distributed::microsvc::cell_host::InternalHttpSecret;
 use distributed_game::celld::CellZoneOwnership;
 use distributed_game::net::{GameServer, ServerConfig, TicketKey, ZoneFactory};
 use distributed_game::world::{
@@ -140,12 +140,10 @@ async fn zone_leases_live_in_celld_cells() {
     let mut config = ServerConfig::new(TicketKey::new("celld-lease-test-ticket-secret"));
     config.ownership_ttl = Duration::from_secs(3);
     config.ownership_renew_every = Duration::from_millis(500);
-    let server = GameServer::<Arena>::new(
-        config,
-        ZoneFactory::sync(|_| Some(ArenaConfig::default())),
-    )
-        .with_host_id("A")
-        .with_ownership(Arc::new(ownership(&base, "host-a")));
+    let server =
+        GameServer::<Arena>::new(config, ZoneFactory::sync(|_| Some(ArenaConfig::default())))
+            .with_host_id("A")
+            .with_ownership(Arc::new(ownership(&base, "host-a")));
     assert!(server.activate("zl-game").await, "zone activated");
     let held = lease(&base, "zl-game").await;
     let holder = held["state"]["holder"]

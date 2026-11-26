@@ -2,7 +2,7 @@ use super::*;
 
 pub const COMMAND: &str = "inventory.reserve";
 
-#[derive(Debug, Serialize, distributed::CommandOutput)]
+#[derive(Debug, Serialize, distributed::command::CommandOutput)]
 pub struct Output {
     pub reserved: u32,
 }

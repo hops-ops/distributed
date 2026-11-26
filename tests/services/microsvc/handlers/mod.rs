@@ -1,8 +1,7 @@
+use distributed::lock::InMemoryLockManager;
 use distributed::microsvc::{Session, ROLE_KEY, USER_ID_KEY};
-use distributed::{
-    AggregateRepository, InMemoryLockManager, InMemoryRepository, OutboxMessage, QueuedRepository,
-    SourcedResult,
-};
+use distributed::outbox::OutboxMessage;
+use distributed::{AggregateRepository, InMemoryRepository, QueuedRepository, SourcedResult};
 use serde::Serialize;
 
 use crate::microsvc::models::counter::Counter;

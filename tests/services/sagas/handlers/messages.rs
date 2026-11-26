@@ -5,7 +5,7 @@
 //! event handler decodes with `ctx.input`.
 
 use distributed::microsvc::HandlerError;
-use distributed::OutboxMessage;
+use distributed::outbox::OutboxMessage;
 use serde::{Deserialize, Serialize};
 
 use crate::sagas::order::OrderItem;
@@ -28,7 +28,7 @@ pub fn json_outbox_to<T: Serialize>(
 
 // === Saga → Order Service ===
 
-#[derive(Debug, Serialize, Deserialize, distributed::CommandInput)]
+#[derive(Debug, Serialize, Deserialize, distributed::command::CommandInput)]
 pub struct CreateOrderMsg {
     pub saga_id: String,
     pub order_id: String,
@@ -37,7 +37,7 @@ pub struct CreateOrderMsg {
     pub total_cents: u32,
 }
 
-#[derive(Debug, Serialize, Deserialize, distributed::CommandInput)]
+#[derive(Debug, Serialize, Deserialize, distributed::command::CommandInput)]
 pub struct CompleteOrderMsg {
     pub saga_id: String,
     pub order_id: String,
@@ -59,7 +59,7 @@ pub struct OrderCompletedMsg {
 
 // === Saga → Inventory Service ===
 
-#[derive(Debug, Serialize, Deserialize, distributed::CommandInput)]
+#[derive(Debug, Serialize, Deserialize, distributed::command::CommandInput)]
 pub struct ReserveInventoryMsg {
     pub saga_id: String,
     pub order_id: String,
@@ -77,7 +77,7 @@ pub struct InventoryReservedMsg {
 
 // === Saga → Payment Service ===
 
-#[derive(Debug, Serialize, Deserialize, distributed::CommandInput)]
+#[derive(Debug, Serialize, Deserialize, distributed::command::CommandInput)]
 pub struct ProcessPaymentMsg {
     pub saga_id: String,
     pub order_id: String,
@@ -94,7 +94,7 @@ pub struct PaymentSucceededMsg {
 
 // === Command Inputs ===
 
-#[derive(Debug, Serialize, Deserialize, distributed::CommandInput)]
+#[derive(Debug, Serialize, Deserialize, distributed::command::CommandInput)]
 pub struct StartSagaInput {
     pub saga_id: String,
     pub order_id: String,
@@ -103,7 +103,7 @@ pub struct StartSagaInput {
     pub total_cents: u32,
 }
 
-#[derive(Debug, Serialize, Deserialize, distributed::CommandInput)]
+#[derive(Debug, Serialize, Deserialize, distributed::command::CommandInput)]
 pub struct InitInventoryInput {
     pub sku: String,
     pub stock: u32,

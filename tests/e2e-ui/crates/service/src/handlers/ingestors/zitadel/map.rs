@@ -16,7 +16,7 @@ pub const MACHINE_CREATED: &str = "zitadel.user.machine.created.v1";
 ///
 /// It holds nothing that differs between two deliveries of one event, so a
 /// redelivery is the same command.
-#[derive(Debug, Clone, Serialize, Deserialize, distributed::CommandInput)]
+#[derive(Debug, Clone, Serialize, Deserialize, distributed::command::CommandInput)]
 pub struct ZitadelIngressInput {
     pub delivery_id: Option<String>,
     pub event_type: Option<String>,
@@ -30,7 +30,7 @@ pub struct ZitadelIngressInput {
     pub roles: Option<Vec<String>>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, distributed::CommandInput)]
+#[derive(Debug, Clone, Serialize, Deserialize, distributed::command::CommandInput)]
 pub struct ZitadelIngressEmail {
     pub address: String,
     /// Absent means not primary.

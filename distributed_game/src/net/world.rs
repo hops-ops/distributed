@@ -60,7 +60,7 @@ use crate::protocol::Notice;
 use crate::world::{BarrierMode, ChildEvent, HostAddr};
 use crate::zone::Zone;
 use crate::zone_message::ZoneEnvelope;
-use distributed::cell_host::CELL_INTERNAL_SECRET_HEADER;
+use distributed::microsvc::cell_host::CELL_INTERNAL_SECRET_HEADER;
 
 type Reply = (StatusCode, String);
 

@@ -7,9 +7,8 @@ use async_graphql::Request;
 use distributed::command::{typed_command, PreparedCommand, Succeeded};
 use distributed::graphql::{graphiql_enabled_from_env_vars, read, GraphqlEngine, ModelPermissions};
 use distributed::microsvc::{router, CausalCommandContext, HandlerError, Routes, Service, Session};
-use distributed::{
-    Aggregate, AggregateRepository, Entity, EventRecord, InMemoryRepository, ReadModel,
-};
+use distributed::read_model::ReadModel;
+use distributed::{Aggregate, AggregateRepository, Entity, EventRecord, InMemoryRepository};
 use serde::{Deserialize, Serialize};
 use tower::util::ServiceExt;
 
@@ -40,13 +39,13 @@ impl Aggregate for T4Aggregate {
     }
 }
 
-#[derive(Deserialize, distributed::CommandInput)]
+#[derive(Deserialize, distributed::command::CommandInput)]
 struct T4CommandInput {
     id: String,
     name: String,
 }
 
-#[derive(Serialize, distributed::CommandOutput)]
+#[derive(Serialize, distributed::command::CommandOutput)]
 struct T4CommandOutput {
     id: String,
     name: String,

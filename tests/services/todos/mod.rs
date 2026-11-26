@@ -1,8 +1,10 @@
 use common::todo::{Todo, TodoState};
 use distributed::bus::{Message, MessagePublisher, TransportError};
+use distributed::lock::{Lock, LockManager};
+use distributed::outbox::{OutboxMessage, OutboxMessageStatus};
+use distributed::outbox_worker::{OutboxDispatcher, OutboxStore};
 use distributed::{
-    AggregateBuilder, InMemoryOutboxStore, InMemoryRepository, Lock, LockManager, OutboxDispatcher,
-    OutboxMessage, OutboxMessageStatus, OutboxStore, Queueable, RepositoryError,
+    AggregateBuilder, InMemoryOutboxStore, InMemoryRepository, Queueable, RepositoryError,
 };
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};

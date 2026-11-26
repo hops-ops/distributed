@@ -10,6 +10,8 @@
 pub(crate) mod input;
 mod types;
 
+pub use distributed_macros::{CommandInput, CommandOutput};
+
 pub(crate) use types::scalar_type_name;
 pub use types::{
     __input_has_field, CommandInputType, CommandOutputType, CommandTypeDef, CommandTypeField,

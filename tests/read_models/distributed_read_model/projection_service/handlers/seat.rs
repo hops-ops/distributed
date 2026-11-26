@@ -1,5 +1,5 @@
 use distributed::microsvc::{Context, HandlerError};
-use distributed::ReadModelWorkspaceExt;
+use distributed::read_model::ReadModelWorkspaceExt;
 use serde_json::{json, Value};
 
 use crate::distributed_read_model::checkout::{

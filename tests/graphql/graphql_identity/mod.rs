@@ -8,13 +8,13 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::http::{HeaderMap, HeaderValue};
 use base64::Engine;
+use distributed::graphql::http::{graphql_router, graphql_router_composed};
 use distributed::graphql::{
-    extract_bearer, graphql_router, graphql_router_composed, map_claims_to_session, read,
-    AuthError, ClaimMapConfig, GraphqlEngine, IdentityConfig, IdentityResolver, ModelPermissions,
-    OidcConfig, OidcValidator, WebsocketLimits,
+    extract_bearer, map_claims_to_session, read, AuthError, ClaimMapConfig, GraphqlEngine,
+    IdentityConfig, IdentityResolver, ModelPermissions, OidcConfig, OidcValidator, WebsocketLimits,
 };
 use distributed::microsvc::Session;
-use distributed::ReadModel;
+use distributed::read_model::ReadModel;
 use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
 use rsa::pkcs1::EncodeRsaPrivateKey;
 use rsa::traits::PublicKeyParts;
@@ -931,7 +931,7 @@ fn gateway_secret_wrong_is_401() {
 #[tokio::test]
 async fn gateway_oidc_context_keeps_backend_authority() {
     use distributed::gateway::{Admission, AuthProvider, BackendCredential, Credentials};
-    use distributed::graphql::identity::OidcGatewayProvider;
+    use distributed::graphql::OidcGatewayProvider;
     let keys = mint_keys();
     let claims = json!({ "iss": "http://localhost:8080", "aud": "graphql-api", "sub": "user-a-001", "exp": now() + 3600, "iat": now(), "groups": ["customer", "unmapped"] });
     let token = sign_claims(&keys, claims.clone());

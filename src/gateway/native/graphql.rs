@@ -11,7 +11,8 @@ use crate::gateway::{
     },
     BindingKind, DeliveryCapabilities, Forwarding, GraphqlCapabilities, GraphqlExecutor,
 };
-use crate::graphql::{graphql_router_composed, GraphqlEngine, GraphqlOperationFilter};
+use crate::graphql::http::{graphql_router_composed, GraphqlOperationFilter};
+use crate::graphql::GraphqlEngine;
 use axum::{
     extract::{
         ws::{Message, WebSocket, WebSocketUpgrade},

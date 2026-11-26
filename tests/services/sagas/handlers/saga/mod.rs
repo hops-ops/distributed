@@ -1,8 +1,9 @@
 //! Saga service handlers — coordinates the order fulfillment flow.
 
 use distributed::command::{typed_command, PreparedCommand, Succeeded, TypedCommand};
+use distributed::lock::InMemoryLockManager;
 use distributed::microsvc::{CausalCommandContext, Context, HandlerError};
-use distributed::{AggregateRepository, InMemoryLockManager, InMemoryRepository, QueuedRepository};
+use distributed::{AggregateRepository, InMemoryRepository, QueuedRepository};
 use serde::Serialize;
 use serde_json::{json, Value};
 

@@ -1,17 +1,17 @@
 use serde::{Deserialize, Serialize};
 
+use crate::domain_event::{DomainEventBodyKind, DOMAIN_EVENT_OCCURRENCE_VERSION};
 use crate::projection::{
-    ProjectionEnvelopeField, ProjectionEventSelector, ProjectionExpression, ProjectionPartition,
-    ProjectionProgramError, ProjectionTarget, ProjectionValueType,
+    MutationKind, ProjectionEnvelopeField, ProjectionEventSelector, ProjectionExpression,
+    ProjectionPartition, ProjectionProgramError, ProjectionTarget, ProjectionValueType,
     MAX_PROJECTION_OPERATIONS_PER_OCCURRENCE,
 };
-use crate::{DomainEventBodyKind, DOMAIN_EVENT_OCCURRENCE_VERSION};
 
 use super::*;
 
 const STATE_FP: &str = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, crate::ReadModel)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, crate::read_model::ReadModel)]
 #[readmodel(table = "mutation_todos", primary_key = ["todo_id"])]
 struct Todos {
     todo_id: String,
@@ -37,7 +37,7 @@ fn selector() -> ProjectionEventSelector {
 }
 
 fn schema() -> &'static crate::table::TableSchema {
-    <Todos as crate::RelationalReadModel>::schema()
+    <Todos as crate::read_model::RelationalReadModel>::schema()
 }
 
 const SAVE: Mutation<()> = Mutation::declare(
@@ -64,7 +64,7 @@ const DELETE: Mutation<()> = Mutation::declare(
 fn bound(
     mutation: Mutation<()>,
     inputs: Vec<MutationInputBinding>,
-) -> Result<crate::ProjectionProgram, ProjectionProgramError> {
+) -> Result<crate::projection::ProjectionProgram, ProjectionProgramError> {
     compile_projection(
         "todos",
         1,
@@ -115,11 +115,11 @@ fn a_declared_upsert_writes_every_column_typed_by_the_schema() {
     };
     assert_eq!(
         assigned("done"),
-        crate::ProjectionAssignment::Set(body(ProjectionValueType::Boolean, &["done"]))
+        crate::projection::ProjectionAssignment::Set(body(ProjectionValueType::Boolean, &["done"]))
     );
     assert_eq!(
         assigned("rank"),
-        crate::ProjectionAssignment::Set(body(ProjectionValueType::I64, &["rank"]))
+        crate::projection::ProjectionAssignment::Set(body(ProjectionValueType::I64, &["rank"]))
     );
     assert_eq!(
         operation.key()[0].expression(),
@@ -153,7 +153,7 @@ fn an_input_takes_its_own_binding_before_a_bound_parent_object() {
             .iter()
             .find(|field| field.name() == name)
             .unwrap();
-        let crate::ProjectionAssignment::Set(expression) = field.assignment() else {
+        let crate::projection::ProjectionAssignment::Set(expression) = field.assignment() else {
             panic!("a declared column is always set");
         };
         expression.clone()

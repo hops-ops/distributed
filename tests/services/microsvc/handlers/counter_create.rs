@@ -14,12 +14,12 @@ use crate::microsvc::models::counter::Counter;
 
 pub const COMMAND: &str = "counter.initialize";
 
-#[derive(Debug, Deserialize, distributed::CommandInput)]
+#[derive(Debug, Deserialize, distributed::command::CommandInput)]
 pub struct Input {
     pub id: String,
 }
 
-#[derive(Debug, Serialize, distributed::CommandOutput)]
+#[derive(Debug, Serialize, distributed::command::CommandOutput)]
 pub struct Output {
     pub id: String,
 }

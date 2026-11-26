@@ -4,7 +4,8 @@
 use async_graphql::Request;
 use distributed::graphql::IdentityConfig;
 use distributed::graphql::{claim, col, read, GraphqlEngine, GraphqlPoolSource, ModelPermissions};
-use distributed::{ReadModelCatalog, RelationalReadModel, RelationshipDef, RelationshipKind};
+use distributed::read_model::RelationalReadModel;
+use distributed::table::{ReadModelCatalog, RelationshipDef, RelationshipKind};
 
 use common::graphql::{
     child, engine_all_columns, error_messages, exec_json, parent, seed_orders, session, ChildView,

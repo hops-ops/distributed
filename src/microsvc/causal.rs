@@ -88,7 +88,7 @@ trait StagedStream: Send + Sync {
         &self,
         event: &PreparedDomainEvent,
         ordinal: u32,
-    ) -> Result<crate::DomainEventOccurrence, DomainEventCaptureError>;
+    ) -> Result<crate::domain_event::DomainEventOccurrence, DomainEventCaptureError>;
     fn stamp_source(&self, message: &mut OutboxMessage);
 }
 
@@ -105,7 +105,7 @@ impl<A: Aggregate + Send + Sync> StagedStream for A {
         &self,
         event: &PreparedDomainEvent,
         ordinal: u32,
-    ) -> Result<crate::DomainEventOccurrence, DomainEventCaptureError> {
+    ) -> Result<crate::domain_event::DomainEventOccurrence, DomainEventCaptureError> {
         event.bind(self, ordinal)
     }
 
@@ -333,7 +333,7 @@ pub(crate) struct AggregatePublication {
 struct WorkspaceState {
     aggregates: Vec<StagedAggregate>,
     identities: HashSet<StreamIdentity>,
-    external_events: Vec<crate::DomainEventOccurrence>,
+    external_events: Vec<crate::domain_event::DomainEventOccurrence>,
     outbox_messages: Vec<OutboxMessage>,
     read_model_plans: Vec<TableWritePlan>,
     snapshots: Vec<SnapshotWrite>,
@@ -470,7 +470,7 @@ impl<A> CausalWorkspace<'_, A> {
     /// [`CausalWorkspaceParts::prepare_domain_publications`].
     pub(crate) fn stage_external_event(
         &self,
-        occurrence: crate::DomainEventOccurrence,
+        occurrence: crate::domain_event::DomainEventOccurrence,
     ) -> Result<(), CausalWorkspaceError> {
         self.state
             .lock()
@@ -621,13 +621,13 @@ impl<A> CausalWorkspace<'_, A> {
 pub(crate) struct CausalWorkspaceParts {
     aggregates: Vec<StagedAggregate>,
     /// External facts staged by the handler, causation not yet applied.
-    external_events: Vec<crate::DomainEventOccurrence>,
+    external_events: Vec<crate::domain_event::DomainEventOccurrence>,
     outbox_messages: Vec<OutboxMessage>,
     read_model_plans: Vec<TableWritePlan>,
     snapshots: Vec<SnapshotWrite>,
     schedules: Vec<ScheduleWrite>,
     /// Exact ledger-causation-stamped outward occurrences in publication order.
-    domain_event_occurrences: Vec<crate::DomainEventOccurrence>,
+    domain_event_occurrences: Vec<crate::domain_event::DomainEventOccurrence>,
     /// Captured occurrences consumed only by a direct modeled projection.
     /// Every member must be the one selected occurrence or validation fails;
     /// no unrelated outward event may disappear merely because the command is
@@ -714,7 +714,7 @@ impl CausalWorkspaceParts {
     /// causation and publication ordinals have been sealed.
     pub(crate) fn prepared_domain_occurrences(
         &self,
-    ) -> Result<&[crate::DomainEventOccurrence], CausalWorkspaceError> {
+    ) -> Result<&[crate::domain_event::DomainEventOccurrence], CausalWorkspaceError> {
         if !self.publications_prepared {
             return Err(CausalWorkspaceError::DomainPublicationsNotPrepared);
         }
@@ -924,7 +924,13 @@ mod tests {
     }
 
     #[derive(
-        Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, crate::DomainState,
+        Clone,
+        Debug,
+        PartialEq,
+        Eq,
+        serde::Serialize,
+        serde::Deserialize,
+        crate::domain_event::DomainState,
     )]
     #[domain_state(version = 1)]
     struct CausalPublishedState {
@@ -965,7 +971,9 @@ mod tests {
         }
     }
 
-    #[derive(Clone, Debug, PartialEq, Serialize, serde::Deserialize, crate::ReadModel)]
+    #[derive(
+        Clone, Debug, PartialEq, Serialize, serde::Deserialize, crate::read_model::ReadModel,
+    )]
     #[readmodel(table = "modeled_direct_views", primary_key = ["id"])]
     struct ModeledDirectView {
         id: String,
@@ -975,7 +983,9 @@ mod tests {
     static MODELED_DIRECT_BUILDS: std::sync::atomic::AtomicUsize =
         std::sync::atomic::AtomicUsize::new(0);
 
-    fn modeled_direct_program() -> Result<crate::ProjectionProgram, crate::ProjectionProgramError> {
+    fn modeled_direct_program(
+    ) -> Result<crate::projection::ProjectionProgram, crate::projection::ProjectionProgramError>
+    {
         use crate::mutation::{
             compile_projection, state_upsert_program_for_model, ProjectionHandler,
             ProjectionInputSource,
@@ -983,14 +993,16 @@ mod tests {
         use crate::projection::ProjectionEventSelector;
 
         MODELED_DIRECT_BUILDS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        let selector =
-            ProjectionEventSelector::try_from_descriptor(&crate::DomainEventDescriptor::state::<
-                CausalPublishedState,
-            >("causal.created", 1))?;
+        let selector = ProjectionEventSelector::try_from_descriptor(
+            &crate::domain_event::DomainEventDescriptor::state::<CausalPublishedState>(
+                "causal.created",
+                1,
+            ),
+        )?;
         compile_projection(
             "modeled-direct-workspace",
             1,
-            crate::ProjectionPartition::Unit,
+            crate::projection::ProjectionPartition::Unit,
             [ProjectionHandler::try_new(
                 "created",
                 selector,
@@ -1017,13 +1029,13 @@ mod tests {
         };
     }
 
-    #[derive(Clone, Debug, Serialize, crate::DomainEvent)]
+    #[derive(Clone, Debug, Serialize, crate::domain_event::DomainEvent)]
     #[domain_event(name = "causal.background", version = 1)]
     struct BackgroundEvent {
         id: String,
     }
 
-    #[derive(crate::DomainEvent)]
+    #[derive(crate::domain_event::DomainEvent)]
     #[domain_event(name = "causal.poisoned", version = 1)]
     struct PoisonedOutwardEvent {
         marker: bool,
@@ -1265,7 +1277,7 @@ mod tests {
                 assert_eq!(
                     occurrence
                         .metadata()
-                        .get(crate::CAUSATION_ID)
+                        .get(crate::trace_context::CAUSATION_ID)
                         .map(String::as_str),
                     Some("ledger-attempt-1")
                 );
@@ -1512,7 +1524,7 @@ mod tests {
         let [(resolved, record)] = lowered.records().collect::<Vec<_>>()[..] else {
             panic!("modeled direct lowering must contain one record");
         };
-        assert_eq!(resolved.kind(), crate::MutationKind::Upsert);
+        assert_eq!(resolved.kind(), crate::projection::MutationKind::Upsert);
         assert_eq!(record.schema().model_name, "ModeledDirectView");
         assert_eq!(record.schema().table_name, "modeled_direct_views");
         assert_eq!(

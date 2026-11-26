@@ -1,7 +1,8 @@
 //! Read-only query service for the board read model. Primary-key loads plus
 //! `has_many` / `belongs_to` relationship includes.
 
-use distributed::{InMemoryReadModelStore, ReadModelWorkspaceExt, TableStoreError};
+use distributed::read_model::{InMemoryReadModelStore, ReadModelWorkspaceExt};
+use distributed::table::TableStoreError;
 
 use crate::distributed_read_model_board::read_models::{board_key, card_key, BoardView, CardView};
 

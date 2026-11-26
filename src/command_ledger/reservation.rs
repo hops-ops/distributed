@@ -559,10 +559,10 @@ pub(super) fn validate_projection_metadata_bytes(
     let Some(bytes) = projection_metadata else {
         return Ok(());
     };
-    if bytes.is_empty() || bytes.len() > crate::MAX_DOMAIN_EVENT_BODY_BYTES {
+    if bytes.is_empty() || bytes.len() > crate::domain_event::MAX_DOMAIN_EVENT_BODY_BYTES {
         return Err(CommandLedgerError::Invalid(format!(
             "command projection metadata must contain 1..={} bytes",
-            crate::MAX_DOMAIN_EVENT_BODY_BYTES
+            crate::domain_event::MAX_DOMAIN_EVENT_BODY_BYTES
         )));
     }
     if !matches!(

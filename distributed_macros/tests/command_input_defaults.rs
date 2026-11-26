@@ -1,7 +1,8 @@
 //! Compile-pass checks for command_input_defaults!.
 
+use distributed::command::CommandInput;
 use distributed::command::{typed_command, Succeeded};
-use distributed::{command_input_defaults, CommandInput};
+use distributed::command_input_defaults;
 use serde::Deserialize;
 
 #[derive(Clone, Deserialize, CommandInput)]
@@ -12,7 +13,7 @@ struct PlanInput {
     created_at: String,
 }
 
-#[derive(Clone, serde::Serialize, distributed::CommandOutput)]
+#[derive(Clone, serde::Serialize, distributed::command::CommandOutput)]
 struct PlanOutput {
     id: String,
 }

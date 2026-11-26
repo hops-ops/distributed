@@ -578,8 +578,8 @@ pub(crate) fn typescript_scalar(field: &CompiledScalar) -> Result<String, Client
 
 /// The TypeScript type of a JSON value of this shape (read-only, like every
 /// generated data type).
-pub(crate) fn typescript_json(shape: &distributed::JsonShape) -> String {
-    use distributed::JsonShape;
+pub(crate) fn typescript_json(shape: &distributed::table::JsonShape) -> String {
+    use distributed::table::JsonShape;
     let quote = |value: &str| serde_json::to_string(value).expect("a string serializes");
     let element = |shape: &JsonShape| {
         let item = typescript_json(shape);
@@ -670,7 +670,7 @@ mod local_tests {
 
     #[test]
     fn json_shapes_render_exact_readonly_types() {
-        use distributed::{JsonField, JsonShape};
+        use distributed::table::{JsonField, JsonShape};
         let tile = JsonShape::Enum {
             values: vec!["hole".into(), "player".into()],
         };

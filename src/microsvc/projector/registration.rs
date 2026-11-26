@@ -6,11 +6,11 @@ use std::sync::Arc;
 use crate::graphql::SurfaceProjector;
 #[cfg(feature = "graphql")]
 use crate::projection::lower::ProjectionDescriptor;
+#[cfg(feature = "graphql")]
+use crate::projection::ProjectionProgramId;
 use crate::projection_protocol::{CompiledProjectionTopology, ProjectionEpoch};
 use crate::read_model::RelationalReadModel;
 use crate::table::TableSchema;
-#[cfg(feature = "graphql")]
-use crate::ProjectionProgramId;
 
 use super::super::dependencies::CausalProjectionRouteDependencies;
 use super::super::service::{HandlerSpec, Routes};

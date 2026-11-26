@@ -213,7 +213,8 @@ application-manifest entrypoint — by default `<crate>::application_manifest`.
 `<crate>::read_model_catalog`. Keep those owners separate:
 
 ```rust
-use distributed::{ReadModelCatalog, ReadModel};
+use distributed::read_model::ReadModel;
+use distributed::table::ReadModelCatalog;
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, ReadModel)]

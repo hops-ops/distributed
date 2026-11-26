@@ -271,7 +271,7 @@ async fn wake_notified(wake: &Option<Arc<Notify>>) {
     }
 }
 
-/// Handle for a spawned [`OutboxDrainRunner`]. Abort-only on [`stop`]; drop
+/// Handle for a spawned [`OutboxDrainRunner`]. Abort-only on [`stop`](Self::stop); drop
 /// leaves the task running so fire-and-forget hosts stay drained.
 pub struct OutboxDrainHandle {
     join: JoinHandle<Result<(), TransportError>>,
@@ -308,10 +308,8 @@ mod tests {
         let ids = coalesce_hints(&mut rx, vec!["a".into(), "a".into(), "b".into()], 4);
         assert_eq!(ids, vec!["a", "b", "c", "d"]);
     }
-    use crate::{
-        CommitBatch, InMemoryOutboxStore, InMemoryRepository, OutboxMessage, OutboxMessageStatus,
-        TransactionalCommit,
-    };
+    use crate::outbox::{OutboxMessage, OutboxMessageStatus};
+    use crate::{CommitBatch, InMemoryOutboxStore, InMemoryRepository, TransactionalCommit};
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;

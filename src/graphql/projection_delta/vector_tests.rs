@@ -10,14 +10,15 @@ use super::types::{
     ProjectionMutationSource, MAX_PROJECTION_DELTA_OPERATIONS,
 };
 use super::*;
+use crate::domain_event::MAX_DOMAIN_EVENT_BODY_BYTES;
 use crate::graphql::client_manifest::{
     ClientCapabilities, ClientExecutionLimits, ClientProtocolOperations, ClientSurfaceIdentity,
     DistributedClientManifest, DISTRIBUTED_CLIENT_MANIFEST_VERSION,
     DISTRIBUTED_CLIENT_PROTOCOL_VERSION,
 };
-use crate::{
+use crate::projection::{
     ResolvedProjectionMutation, ResolvedProjectionPartition, ResolvedProjectionRelationshipEffect,
-    MAX_DOMAIN_EVENT_BODY_BYTES, MAX_PROJECTION_EXPRESSION_DEPTH,
+    MAX_PROJECTION_EXPRESSION_DEPTH,
 };
 
 const CACHE_SCOPE_TOKEN: &str = "v1.cache-scope.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";

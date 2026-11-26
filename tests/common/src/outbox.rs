@@ -1,6 +1,7 @@
 //! Outbox lookups over the public `OutboxStore` surface.
 
-use distributed::{OutboxMessage, OutboxMessageStatus, OutboxStore};
+use distributed::outbox::{OutboxMessage, OutboxMessageStatus};
+use distributed::outbox_worker::OutboxStore;
 
 /// Find an outbox message by id by scanning every status bucket — the only
 /// by-id lookup the public store surface offers.

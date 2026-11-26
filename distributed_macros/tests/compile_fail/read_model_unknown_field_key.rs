@@ -1,4 +1,4 @@
-use distributed::ReadModel;
+use distributed::read_model::ReadModel;
 
 #[derive(ReadModel)]
 struct CounterView {

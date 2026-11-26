@@ -141,7 +141,7 @@ pub fn derive_command_output(input: TokenStream) -> TokenStream {
     }
 }
 
-/// Derive the serialized JSON shape (`distributed::JsonType`) of a
+/// Derive the serialized JSON shape (`distributed::table::JsonType`) of a
 /// named-field struct or a unit-only enum, following its Serde names.
 #[proc_macro_derive(JsonType, attributes(serde))]
 pub fn derive_json_type(input: TokenStream) -> TokenStream {

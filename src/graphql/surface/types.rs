@@ -287,7 +287,7 @@ impl SurfaceProjectionOwner {
     pub(crate) fn active_modeled_program_id_for(
         &self,
         model: &str,
-    ) -> Option<crate::ProjectionProgramId> {
+    ) -> Option<crate::projection::ProjectionProgramId> {
         self.modeled
             .iter()
             .find(|modeled| {

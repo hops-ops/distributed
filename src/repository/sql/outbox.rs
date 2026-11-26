@@ -517,8 +517,9 @@ mod tests {
     #[cfg(feature = "sqlite")]
     #[tokio::test]
     async fn delivery_settlement_rolls_back_with_its_transaction() {
+        use crate::outbox_worker::OutboxStore;
         use crate::sqlx_repo::repo::ConnectionExecutor;
-        use crate::{CommitBatch, OutboxStore, SqliteRepository, TransactionalCommit};
+        use crate::{CommitBatch, SqliteRepository, TransactionalCommit};
         use std::time::Duration;
         let repo = SqliteRepository::connect_and_migrate("sqlite::memory:")
             .await

@@ -1,9 +1,9 @@
 use std::sync::Arc;
 
+use distributed::trace_context::TraceContext;
 use distributed::{
     Aggregate, AggregateBuilder, CommitBatch, Entity, GetStream, QueuedRepository, RepositoryError,
-    SnapshotRecord, SnapshotStore, SnapshotWrite, StreamIdentity, StreamWrite, TraceContext,
-    TransactionalCommit,
+    SnapshotRecord, SnapshotStore, SnapshotWrite, StreamIdentity, StreamWrite, TransactionalCommit,
 };
 use tokio::sync::Barrier;
 

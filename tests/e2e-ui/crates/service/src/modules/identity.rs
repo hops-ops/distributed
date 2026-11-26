@@ -5,7 +5,7 @@
 //! commit with their ledger receipts; the `AUTH_USERS` projection writes them.
 
 use distributed::microsvc::{Routes, ServiceStores, StoreDependencies};
-use distributed::LocalProjectionMounts;
+use distributed::projection::LocalProjectionMounts;
 use e2e_projections::AUTH_USERS;
 
 use crate::handlers::ingestors::{zitadel, zitadel_scrape};
@@ -29,7 +29,8 @@ pub fn routes<St: ServiceStores>(
 mod tests {
     use distributed::bus::{InMemoryBus, RunOptions};
     use distributed::microsvc::{SqlStores, SqliteStores};
-    use distributed::{ReadModelWorkspaceExt, RowKey, RowValue};
+    use distributed::read_model::ReadModelWorkspaceExt;
+    use distributed::table::{RowKey, RowValue};
     use e2e_readmodels::AuthUsers;
     use serde_json::json;
 

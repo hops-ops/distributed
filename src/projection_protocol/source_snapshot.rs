@@ -1,7 +1,7 @@
 //! Authoritative source versions, separate from broker and row revisions.
 
 use super::ProjectionProtocolError;
-use crate::DomainEventOccurrence;
+use crate::domain_event::DomainEventOccurrence;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 

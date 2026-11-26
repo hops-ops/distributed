@@ -9,13 +9,13 @@ use crate::microsvc::models::counter::Counter;
 
 pub const COMMAND: &str = "counter.increment";
 
-#[derive(Debug, Deserialize, distributed::CommandInput)]
+#[derive(Debug, Deserialize, distributed::command::CommandInput)]
 pub struct Input {
     pub id: String,
     pub amount: i64,
 }
 
-#[derive(Debug, Serialize, distributed::CommandOutput)]
+#[derive(Debug, Serialize, distributed::command::CommandOutput)]
 pub struct Output {
     pub id: String,
     pub value: i64,

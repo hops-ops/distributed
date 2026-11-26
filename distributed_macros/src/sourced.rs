@@ -364,7 +364,7 @@ fn expand_domain_capture(
                 quote! {
                     self.#entity_field.capture_domain_state(
                         #aggregate_type,
-                        #framework::DomainEventDescriptor::state::<#state>(#event_name, #version),
+                        #framework::domain_event::DomainEventDescriptor::state::<#state>(#event_name, #version),
                         &__distributed_domain_state,
                     )
                 },
@@ -386,8 +386,8 @@ fn expand_domain_capture(
                         const EVENT_NAME: &'static str = #event_name;
                         const EVENT_VERSION: u64 = #version;
 
-                        fn descriptor() -> #framework::DomainEventDescriptor {
-                            #framework::DomainEventDescriptor::state::<#state>(
+                        fn descriptor() -> #framework::domain_event::DomainEventDescriptor {
+                            #framework::domain_event::DomainEventDescriptor::state::<#state>(
                                 #event_name,
                                 #version,
                             )
@@ -438,13 +438,13 @@ fn expand_domain_capture(
                     #(#field_definitions),*
                 }
 
-                impl #framework::DomainEvent for #body_type {
-                    const DESCRIPTOR: #framework::DomainEventDescriptor =
-                        #framework::DomainEventDescriptor {
+                impl #framework::domain_event::DomainEvent for #body_type {
+                    const DESCRIPTOR: #framework::domain_event::DomainEventDescriptor =
+                        #framework::domain_event::DomainEventDescriptor {
                             name: std::borrow::Cow::Borrowed(#event_name),
                             version: #version,
-                            body: #framework::DomainEventBodyDescriptor::distributed_json(
-                                #framework::DomainEventBodyKind::Event,
+                            body: #framework::domain_event::DomainEventBodyDescriptor::distributed_json(
+                                #framework::domain_event::DomainEventBodyKind::Event,
                                 #body_type_name,
                                 #version,
                                 #schema,
@@ -457,8 +457,8 @@ fn expand_domain_capture(
                     const EVENT_NAME: &'static str = #event_name;
                     const EVENT_VERSION: u64 = #version;
 
-                    fn descriptor() -> #framework::DomainEventDescriptor {
-                        <Self as #framework::DomainEvent>::DESCRIPTOR.clone()
+                    fn descriptor() -> #framework::domain_event::DomainEventDescriptor {
+                        <Self as #framework::domain_event::DomainEvent>::DESCRIPTOR.clone()
                     }
                 }
 
@@ -468,8 +468,8 @@ fn expand_domain_capture(
                     fn command_projection_descriptor(
                         _: &'static str,
                         _: u64,
-                    ) -> #framework::DomainEventDescriptor {
-                        <Self as #framework::DomainEvent>::DESCRIPTOR.clone()
+                    ) -> #framework::domain_event::DomainEventDescriptor {
+                        <Self as #framework::domain_event::DomainEvent>::DESCRIPTOR.clone()
                     }
                 }
 
@@ -534,12 +534,12 @@ fn expand_domain_capture(
                     const EVENT_NAME: &'static str = #event_name;
                     const EVENT_VERSION: u64 = #version;
 
-                    fn descriptor() -> #framework::DomainEventDescriptor {
-                        #framework::DomainEventDescriptor {
+                    fn descriptor() -> #framework::domain_event::DomainEventDescriptor {
+                        #framework::domain_event::DomainEventDescriptor {
                             name: std::borrow::Cow::Borrowed(#event_name),
                             version: #version,
-                            body: #framework::DomainEventBodyDescriptor::distributed_json(
-                                #framework::DomainEventBodyKind::Deletion,
+                            body: #framework::domain_event::DomainEventBodyDescriptor::distributed_json(
+                                #framework::domain_event::DomainEventBodyKind::Deletion,
                                 #deletion_type_name,
                                 1,
                                 #schema,
@@ -550,7 +550,7 @@ fn expand_domain_capture(
                 }
 
                 impl #framework::domain_event::DomainEventBodyContract<
-                    #framework::DomainDeletion<#identity>
+                    #framework::domain_event::DomainDeletion<#identity>
                 > for #event_type
                 {
                 }
@@ -560,11 +560,11 @@ fn expand_domain_capture(
                 quote! {
                     self.#entity_field.capture_domain_deletion(
                         #aggregate_type,
-                        #framework::DomainEventDescriptor {
+                        #framework::domain_event::DomainEventDescriptor {
                             name: std::borrow::Cow::Borrowed(#event_name),
                             version: #version,
-                            body: #framework::DomainEventBodyDescriptor::distributed_json(
-                                #framework::DomainEventBodyKind::Deletion,
+                            body: #framework::domain_event::DomainEventBodyDescriptor::distributed_json(
+                                #framework::domain_event::DomainEventBodyKind::Deletion,
                                 #deletion_type_name,
                                 1,
                                 #schema,
@@ -580,7 +580,7 @@ fn expand_domain_capture(
                 capture: quote! {
                     if !self.#entity_field.is_replaying() {
                         let __distributed_domain_deletion =
-                            #framework::DomainDeletion::new(
+                            #framework::domain_event::DomainDeletion::new(
                                 #identity {
                                     aggregate_id: self.#entity_field.id().to_owned(),
                                 },
@@ -624,7 +624,7 @@ fn expand_domain_capture(
                     {
                         fn __distributed_assert_domain_event_contract<T>()
                         where
-                            T: #framework::DomainEvent
+                            T: #framework::domain_event::DomainEvent
                                 + #framework::domain_event::DomainEventBodyContract<T>,
                         {
                         }
@@ -637,7 +637,7 @@ fn expand_domain_capture(
                                 __distributed_domain_event_source,
                             );
                         if <#output as #framework::domain_event::DomainEventContract>::descriptor()
-                            != <#output as #framework::DomainEvent>::DESCRIPTOR
+                            != <#output as #framework::domain_event::DomainEvent>::DESCRIPTOR
                         {
                             return Err(#framework::EventRecordError {
                                 message: "domain-event capture failed: adapter output contract differs from its DomainEvent descriptor".to_owned(),
@@ -895,7 +895,7 @@ pub(crate) fn expand_sourced(attr: TokenStream2, item: TokenStream2) -> syn::Res
             /// Stable aggregate identity carried by deletion domain events.
             ///
             /// Version one uses the causing aggregate sequence as the
-            /// [`distributed::DomainDeletion`] incarnation.
+            /// [`distributed::domain_event::DomainDeletion`] incarnation.
             #[derive(
                 Clone,
                 Debug,

@@ -495,7 +495,7 @@ pub struct ProjectionObservation {
     /// Semantic program identity recorded by the projector that authored this
     /// observation. `None` is legacy/unversioned evidence and cannot satisfy a
     /// modeled causal obligation.
-    pub program_id: Option<crate::ProjectionProgramId>,
+    pub program_id: Option<crate::projection::ProjectionProgramId>,
 }
 
 /// Durable terminal failure for one exact input and repair generation.
@@ -565,7 +565,7 @@ pub struct ProjectionChange {
     pub failure_id: Option<String>,
     /// Semantic program identity recorded at commit time. It is deliberately
     /// independent from the currently active projector binding.
-    pub program_id: Option<crate::ProjectionProgramId>,
+    pub program_id: Option<crate::projection::ProjectionProgramId>,
 }
 
 /// Result and exact evidence produced by an asynchronous projection commit.

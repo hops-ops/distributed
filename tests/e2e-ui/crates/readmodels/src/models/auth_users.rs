@@ -1,7 +1,7 @@
 //! Auth users imported from Zitadel Action ingress.
 
 use distributed::graphql::{read, AuthorizedReadModel, ModelPermissions};
-use distributed::ReadModel;
+use distributed::read_model::ReadModel;
 use serde::{Deserialize, Serialize};
 
 /// Imported IdP user. PK: `user_id` (= Zitadel subject / OIDC `sub` / session `x-user-id`).

@@ -24,7 +24,7 @@ pub const COMMAND_PROJECTION_EXTENSION_VERSION: u32 = 2;
 
 #[derive(Clone)]
 struct SlotOrigin {
-    event: crate::ProjectionEventSelector,
+    event: crate::projection::ProjectionEventSelector,
     slot: String,
     target: SlotTarget,
     value_type: ProjectionValueType,
@@ -570,7 +570,7 @@ fn auto_aggregate_id_path(
 }
 
 fn lower_program(
-    program_id: crate::ProjectionProgramId,
+    program_id: crate::projection::ProjectionProgramId,
     program: &SurfaceSelectedProjectionProgram,
     surface: &Surface,
     slots: &mut Vec<SlotOrigin>,
@@ -605,7 +605,7 @@ fn lower_program(
 
 #[cfg(test)]
 pub(super) fn lower_program_for_test(
-    program_id: crate::ProjectionProgramId,
+    program_id: crate::projection::ProjectionProgramId,
     program: &SurfaceSelectedProjectionProgram,
     surface: &Surface,
 ) -> Result<ClientProjectionProgram, ClientManifestError> {
@@ -613,7 +613,7 @@ pub(super) fn lower_program_for_test(
 }
 
 fn lower_arm(
-    program_id: crate::ProjectionProgramId,
+    program_id: crate::projection::ProjectionProgramId,
     arm: &SurfaceProjectionArm,
     partition: &ProjectionPartition,
     surface: &Surface,
@@ -640,7 +640,7 @@ fn lower_arm(
 }
 
 fn lower_operation(
-    program_id: crate::ProjectionProgramId,
+    program_id: crate::projection::ProjectionProgramId,
     arm: &SurfaceProjectionArm,
     arm_ref: &str,
     operation: &SurfaceProjectionOperation,
@@ -824,7 +824,7 @@ fn lower_operation(
 }
 
 fn lower_expression(
-    program_id: crate::ProjectionProgramId,
+    program_id: crate::projection::ProjectionProgramId,
     arm: &SurfaceProjectionArm,
     arm_ref: &str,
     position: &str,
@@ -835,7 +835,7 @@ fn lower_expression(
 }
 
 fn lower_expression_at(
-    program_id: crate::ProjectionProgramId,
+    program_id: crate::projection::ProjectionProgramId,
     arm: &SurfaceProjectionArm,
     arm_ref: &str,
     position: &str,
@@ -939,7 +939,7 @@ fn lower_expression_at(
 }
 
 fn slot_id(
-    program_id: crate::ProjectionProgramId,
+    program_id: crate::projection::ProjectionProgramId,
     arm: &SurfaceProjectionArm,
     arm_ref: &str,
     position: &str,
@@ -960,7 +960,10 @@ fn slot_id(
     )
 }
 
-fn arm_ref(program_id: crate::ProjectionProgramId, arm: &SurfaceProjectionArm) -> String {
+fn arm_ref(
+    program_id: crate::projection::ProjectionProgramId,
+    arm: &SurfaceProjectionArm,
+) -> String {
     opaque_ref(
         b"distributed.client-projection-arm.v1",
         &(
@@ -973,7 +976,7 @@ fn arm_ref(program_id: crate::ProjectionProgramId, arm: &SurfaceProjectionArm) -
     .expect("canonical projection arm identity serialization cannot fail")
 }
 
-fn event_ref(selector: &crate::ProjectionEventSelector) -> ClientProjectionEventRef {
+fn event_ref(selector: &crate::projection::ProjectionEventSelector) -> ClientProjectionEventRef {
     ClientProjectionEventRef {
         id: opaque_ref(b"distributed.client-projection-event.v1", selector, "pe1")
             .expect("canonical event selector serialization cannot fail"),
@@ -1240,6 +1243,7 @@ fn mutation_kind(kind: MutationKind) -> ClientProjectionMutationKind {
 mod tests {
     use super::*;
     use crate::command::{CommandProjectionPreview, CommandProjectionPreviewSource};
+    use crate::domain_event::{DomainEvent, DomainEventBodyKind};
     use crate::graphql::{
         build_surface, SurfaceOptions, SurfaceProjector, SurfaceTypeDef, SurfaceTypeField,
     };
@@ -1247,19 +1251,18 @@ mod tests {
     use crate::projection::placement::{
         ProjectionBindingId, ProjectionBindingState, ProjectionExecutionClass, ProjectionPlacement,
     };
-    use crate::table::{ColumnType, PrimaryKey, TableColumn, TableKind, TableSchema};
-    use crate::{
-        DomainEvent, DomainEventBodyKind, ProjectionEnvelopeField, ProjectionExpression,
-        ProjectionKeyField, ProjectionValue,
+    use crate::projection::{
+        ProjectionEnvelopeField, ProjectionExpression, ProjectionKeyField, ProjectionValue,
     };
+    use crate::table::{ColumnType, PrimaryKey, TableColumn, TableKind, TableSchema};
 
-    #[derive(Serialize, crate::DomainEvent)]
+    #[derive(Serialize, crate::domain_event::DomainEvent)]
     #[domain_event(name = "todo.preview-a", version = 1)]
     struct PreviewA {
         value: String,
     }
 
-    #[derive(Serialize, crate::DomainEvent)]
+    #[derive(Serialize, crate::domain_event::DomainEvent)]
     #[domain_event(name = "todo.preview-b", version = 1)]
     struct PreviewB {
         value: String,
@@ -1289,9 +1292,9 @@ mod tests {
         .unwrap()
     }
 
-    fn selector() -> crate::ProjectionEventSelector {
-        crate::ProjectionEventSelector::try_new(
-            crate::DOMAIN_EVENT_OCCURRENCE_VERSION,
+    fn selector() -> crate::projection::ProjectionEventSelector {
+        crate::projection::ProjectionEventSelector::try_new(
+            crate::domain_event::DOMAIN_EVENT_OCCURRENCE_VERSION,
             "todo.purged",
             1,
             DomainEventBodyKind::Deletion,
@@ -1299,8 +1302,8 @@ mod tests {
             1,
             "private-delete-schema",
             "sha256:1111111111111111111111111111111111111111111111111111111111111111",
-            crate::DOMAIN_EVENT_BODY_CODEC,
-            crate::DOMAIN_EVENT_BODY_CODEC_VERSION,
+            crate::domain_event::DOMAIN_EVENT_BODY_CODEC,
+            crate::domain_event::DOMAIN_EVENT_BODY_CODEC_VERSION,
         )
         .unwrap()
     }
@@ -1334,20 +1337,20 @@ mod tests {
         }
     }
 
-    fn typed_selector<E: DomainEvent>() -> crate::ProjectionEventSelector {
-        crate::ProjectionEventSelector::try_from_descriptor(&E::DESCRIPTOR).unwrap()
+    fn typed_selector<E: DomainEvent>() -> crate::projection::ProjectionEventSelector {
+        crate::projection::ProjectionEventSelector::try_from_descriptor(&E::DESCRIPTOR).unwrap()
     }
 
     fn selected_program(
         name: &str,
-        selectors: impl IntoIterator<Item = crate::ProjectionEventSelector>,
+        selectors: impl IntoIterator<Item = crate::projection::ProjectionEventSelector>,
     ) -> SurfaceSelectedProjectionProgram {
         selected_program_with_partition(name, selectors, ProjectionPartition::Unit)
     }
 
     fn selected_program_with_partition(
         name: &str,
-        selectors: impl IntoIterator<Item = crate::ProjectionEventSelector>,
+        selectors: impl IntoIterator<Item = crate::projection::ProjectionEventSelector>,
         partition: ProjectionPartition,
     ) -> SurfaceSelectedProjectionProgram {
         let operations = |ordinal| {
@@ -1389,7 +1392,7 @@ mod tests {
 
     fn selected_constant_program(
         name: &str,
-        selector: crate::ProjectionEventSelector,
+        selector: crate::projection::ProjectionEventSelector,
     ) -> SurfaceSelectedProjectionProgram {
         SurfaceSelectedProjectionProgram {
             name: name.into(),
@@ -1423,7 +1426,7 @@ mod tests {
 
     fn selected_value_patch_program(
         name: &str,
-        selector: crate::ProjectionEventSelector,
+        selector: crate::projection::ProjectionEventSelector,
     ) -> SurfaceSelectedProjectionProgram {
         SurfaceSelectedProjectionProgram {
             name: name.into(),
@@ -1481,7 +1484,7 @@ mod tests {
         selected: Option<SurfaceSelectedProjectionProgram>,
     ) -> crate::graphql::SurfaceModeledProjection {
         crate::graphql::SurfaceModeledProjection::selected_for_client_manifest_test(
-            crate::ProjectionProgramId::parse(&format!(
+            crate::projection::ProjectionProgramId::parse(&format!(
                 "pp1:sha256:{}",
                 format!("{seed:02x}").repeat(32)
             ))
@@ -1918,8 +1921,11 @@ mod tests {
                 ProjectionValue::string("tenant-a"),
             )),
         );
-        let program_id =
-            crate::ProjectionProgramId::parse(&format!("pp1:sha256:{}", "22".repeat(32))).unwrap();
+        let program_id = crate::projection::ProjectionProgramId::parse(&format!(
+            "pp1:sha256:{}",
+            "22".repeat(32)
+        ))
+        .unwrap();
         let mut unit_slots = Vec::new();
         let unit = lower_program(program_id, &unit, &todo_surface(), &mut unit_slots).unwrap();
         let mut expression_slots = Vec::new();
@@ -2159,8 +2165,11 @@ mod tests {
             partition: ProjectionPartition::Unit,
             arms: vec![arm],
         };
-        let program_id =
-            crate::ProjectionProgramId::parse(&format!("pp1:sha256:{}", "11".repeat(32))).unwrap();
+        let program_id = crate::projection::ProjectionProgramId::parse(&format!(
+            "pp1:sha256:{}",
+            "11".repeat(32)
+        ))
+        .unwrap();
         let mut slots = Vec::new();
         let lowered = lower_program(program_id, &selected, &todo_surface(), &mut slots).unwrap();
         let key = &lowered.arms[0].operations[0].key;

@@ -1,8 +1,7 @@
 use std::future::Future;
 
-use distributed::{
-    InMemoryReadModelStore, ReadModel, ReadModelWorkspaceExt, RowKey, RowValue, TableStoreError,
-};
+use distributed::read_model::{InMemoryReadModelStore, ReadModel, ReadModelWorkspaceExt};
+use distributed::table::{RowKey, RowValue, TableStoreError};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, ReadModel)]
@@ -21,7 +20,7 @@ struct Profile {
 
 #[test]
 fn cyclic_singular_relationships_hydrate_and_serialize_without_box_metadata() {
-    use distributed::{RelationalReadModel, RelationalReadModelIncludes};
+    use distributed::read_model::{RelationalReadModel, RelationalReadModelIncludes};
     let mut account = Account {
         id: "a".into(),
         profile: None,

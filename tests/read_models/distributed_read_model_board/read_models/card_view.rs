@@ -1,10 +1,12 @@
-use distributed::ReadModel;
+use distributed::read_model::ReadModel;
 use serde::{Deserialize, Serialize};
 
 use super::BoardView;
 
 /// Structured JSONB payload stored in one column of the `cards` table.
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, distributed::JsonType)]
+#[derive(
+    Clone, Debug, Default, PartialEq, Serialize, Deserialize, distributed::table::JsonType,
+)]
 pub struct CardPayload {
     pub labels: Vec<String>,
     pub assignee: Option<String>,

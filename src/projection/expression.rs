@@ -3,7 +3,7 @@ use std::collections::BTreeSet;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::DomainEventOccurrence;
+use crate::domain_event::DomainEventOccurrence;
 
 use super::ProjectionProgramError;
 
@@ -736,9 +736,9 @@ impl ProjectionExpression {
                     ),
                     ProjectionEnvelopeField::BodyKind => ProjectionValue::string(
                         match occurrence.descriptor().body.kind {
-                            crate::DomainEventBodyKind::State => "state",
-                            crate::DomainEventBodyKind::Event => "event",
-                            crate::DomainEventBodyKind::Deletion => "deletion",
+                            crate::domain_event::DomainEventBodyKind::State => "state",
+                            crate::domain_event::DomainEventBodyKind::Event => "event",
+                            crate::domain_event::DomainEventBodyKind::Deletion => "deletion",
                         }
                         .to_owned(),
                     ),

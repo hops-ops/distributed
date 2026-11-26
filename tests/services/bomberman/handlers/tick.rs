@@ -1,5 +1,6 @@
+use distributed::outbox::OutboxMessage;
 use distributed::{
-    Aggregate, CommitBatch, GetStream, OutboxMessage, RepositoryError, StreamIdentity, StreamWrite,
+    Aggregate, CommitBatch, GetStream, RepositoryError, StreamIdentity, StreamWrite,
     TransactionalCommit,
 };
 

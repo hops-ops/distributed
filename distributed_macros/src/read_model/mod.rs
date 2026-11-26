@@ -41,7 +41,7 @@ pub(crate) fn expand_read_model(input: DeriveInput) -> syn::Result<proc_macro2::
 
     let read_model_impl = if let Some(id_field) = &id_field {
         Some(quote! {
-            impl #framework::ReadModel for #name {
+            impl #framework::read_model::ReadModel for #name {
                 const COLLECTION: &'static str = #collection;
 
                 fn id(&self) -> &str {

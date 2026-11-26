@@ -159,7 +159,7 @@ impl ObjectOptions {
             .collect();
         Ok(Self {
             ticket_secret,
-            internal_secret: get(distributed::cell_host::CELL_INTERNAL_SECRET_ENV)
+            internal_secret: get(distributed::microsvc::cell_host::CELL_INTERNAL_SECRET_ENV)
                 .filter(|secret| !secret.is_empty()),
             tick_hz,
             patch_hz: patch_hz.clamp(1, tick_hz),

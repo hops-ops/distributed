@@ -1,11 +1,12 @@
 //! Explicit, bounded maintenance for full-state snapshot projections.
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
+use crate::domain_event::DomainEventOccurrence;
 use crate::projection::lower::ProjectionServerExecutorDescriptor;
+use crate::projection::MutationKind;
 use crate::projection_protocol::*;
 use crate::table::{TableMutation, TableWritePlan};
 use crate::{repository::StreamIdentity, EventRecord};
-use crate::{DomainEventOccurrence, MutationKind};
 use sha2::{Digest, Sha256};
 
 pub(crate) const MAX_REBUILD_RECORDS: usize = 10_000;

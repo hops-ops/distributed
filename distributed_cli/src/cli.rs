@@ -839,7 +839,7 @@ fn contextualize_project_generation_error(
     let error = error.to_string();
     if is_application_introspection_failure(phase, &error) {
         return format!(
-            "typed application `{}` could not be introspected through `{}`; the selected application crate must publicly export a zero-argument function returning `distributed::ApplicationManifest` (or select another export with `[package.metadata.distributed.application] entrypoint = \"...\"`):\n{error}",
+            "typed application `{}` could not be introspected through `{}`; the selected application crate must publicly export a zero-argument function returning `distributed::application::ApplicationManifest` (or select another export with `[package.metadata.distributed.application] entrypoint = \"...\"`):\n{error}",
             project.application_package, project.application_entrypoint
         )
         .into();

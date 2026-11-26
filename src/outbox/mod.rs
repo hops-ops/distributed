@@ -25,7 +25,7 @@
 //! ## Example
 //!
 //! ```ignore
-//! use distributed::OutboxMessage;
+//! use distributed::outbox::OutboxMessage;
 //!
 //! // Create aggregate and domain event outbox message
 //! let mut order = Order::new();

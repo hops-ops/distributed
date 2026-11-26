@@ -16,6 +16,7 @@ mod registry;
 mod sql;
 
 pub use catalog::ReadModelCatalog;
+pub use distributed_macros::JsonType;
 pub use error::TableStoreError;
 pub use json_type::{JsonField, JsonShape, JsonType};
 pub use metadata::{

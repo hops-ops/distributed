@@ -1,9 +1,10 @@
 mod aggregates;
 
 use aggregates::*;
+use distributed::domain_event::{DomainState, DOMAIN_EVENT_BODY_CODEC};
+use distributed::outbox_worker::OutboxStore;
 use distributed::{
-    Aggregate, AggregateBuilder, DomainState, InMemoryRepository, OutboxStore, SnapshotStore,
-    Snapshottable, StreamIdentity, DOMAIN_EVENT_BODY_CODEC,
+    Aggregate, AggregateBuilder, InMemoryRepository, SnapshotStore, Snapshottable, StreamIdentity,
 };
 use serde::Serialize;
 

@@ -352,5 +352,5 @@ pub(crate) struct CompiledScalar {
     pub(crate) nullable: bool,
     pub(crate) expose: bool,
     /// The exact shape of a `json` field's values, when the model states it.
-    pub(crate) json_type: Option<distributed::JsonShape>,
+    pub(crate) json_type: Option<distributed::table::JsonShape>,
 }

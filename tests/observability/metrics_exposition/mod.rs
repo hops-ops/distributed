@@ -17,22 +17,25 @@ use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use distributed::bus::Message;
 use distributed::bus::{MessagePublisher, TransportError};
 use distributed::command::{typed_command, PreparedCommand, Succeeded};
-use distributed::microsvc::{self, CausalCommandContext, HandlerError, Message, Routes, Service};
+use distributed::microsvc;
+use distributed::microsvc::{CausalCommandContext, HandlerError, Routes, Service};
+use distributed::outbox::OutboxMessage;
 use distributed::outbox_worker::OutboxDispatcher;
-use distributed::{CommitBatch, InMemoryRepository, OutboxMessage, TransactionalCommit};
+use distributed::{CommitBatch, InMemoryRepository, TransactionalCommit};
 use serde_json::json;
 
 use common::env as env_support;
 
-#[derive(Debug, serde::Deserialize, distributed::CommandInput)]
+#[derive(Debug, serde::Deserialize, distributed::command::CommandInput)]
 struct CreateOrder {
     #[allow(dead_code)] // the request shape; the handler ignores it
     id: String,
 }
 
-#[derive(Debug, serde::Serialize, distributed::CommandOutput)]
+#[derive(Debug, serde::Serialize, distributed::command::CommandOutput)]
 struct OrderCreated {
     ok: bool,
 }

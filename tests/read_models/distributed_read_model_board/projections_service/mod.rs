@@ -6,7 +6,8 @@ mod handlers;
 use std::sync::Arc;
 
 use distributed::microsvc::{HandlerError, Routes, Service};
-use distributed::{InMemoryReadModelStore, ReadModelWorkspaceExt, TableStoreError};
+use distributed::read_model::{InMemoryReadModelStore, ReadModelWorkspaceExt};
+use distributed::table::TableStoreError;
 
 use crate::distributed_read_model_board::read_models::{board_key, BoardView};
 

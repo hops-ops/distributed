@@ -12,7 +12,8 @@ use distributed::bus::{
     run_source, Handlers, MessagePublisher, NatsBus, NatsJetStreamSource, NatsPublisher,
     RetryBackoff, RunOptions, TransportError,
 };
-use distributed::microsvc::{Context, Message, MessageKind, Routes, Service};
+use distributed::bus::{Message, MessageKind};
+use distributed::microsvc::{Context, Routes, Service};
 use serde_json::json;
 
 use common::env as env_support;
@@ -23,15 +24,15 @@ fn nats_url() -> Option<String> {
     env_support::require_service("NATS_URL", "nats transport test")
 }
 
-#[derive(serde::Serialize, distributed::DomainEvent)]
+#[derive(serde::Serialize, distributed::domain_event::DomainEvent)]
 #[domain_event(name = "ledger.external_balance", version = 1)]
 struct ExternalBalance {
     value: u64,
 }
 
-fn external_balance(position: u64, value: u64) -> distributed::DomainEventOccurrence {
-    distributed::DomainEventOccurrence::capture_external(
-        distributed::ExternalEventSource {
+fn external_balance(position: u64, value: u64) -> distributed::domain_event::DomainEventOccurrence {
+    distributed::domain_event::DomainEventOccurrence::capture_external(
+        distributed::domain_event::ExternalEventSource {
             producer: "ledger-webhook".into(),
             stream: "account-one".into(),
             position,
@@ -67,7 +68,7 @@ async fn external_identity_content_conflicts_and_retained_archive_survive_broker
     assert_eq!(first.id(), altered.id());
     for event in [&first, &first, &altered, &next] {
         bus.publish_message(
-            distributed::OutboxMessage::from_domain_event_occurrence(event)
+            distributed::outbox::OutboxMessage::from_domain_event_occurrence(event)
                 .unwrap()
                 .into(),
         )
@@ -208,9 +209,11 @@ async fn malformed_external_headers_fail_closed_without_ack_or_false_progress() 
         .with_subject_prefix(&prefix);
     publisher
         .publish(
-            distributed::OutboxMessage::from_domain_event_occurrence(&external_balance(2, 20))
-                .unwrap()
-                .into(),
+            distributed::outbox::OutboxMessage::from_domain_event_occurrence(&external_balance(
+                2, 20,
+            ))
+            .unwrap()
+            .into(),
         )
         .await
         .unwrap();
@@ -237,7 +240,7 @@ async fn malformed_external_headers_fail_closed_without_ack_or_false_progress() 
 #[tokio::test]
 async fn derived_facts_round_trip_after_interrupted_publish_prefix() {
     let Some(url) = nats_url() else { return };
-    #[derive(serde::Serialize, distributed::DomainEvent)]
+    #[derive(serde::Serialize, distributed::domain_event::DomainEvent)]
     #[domain_event(name = "document.indexed", version = 1)]
     struct Indexed {
         document_id: String,
@@ -311,10 +314,11 @@ async fn derived_facts_round_trip_after_interrupted_publish_prefix() {
                 .with_dependencies(())
                 .event(Box::leak(subject.into_boxed_str()))
                 .handle(move |ctx: &Context<()>| {
-                    let decoded = distributed::DomainEventOccurrence::from_canonical_bytes(
-                        ctx.message().payload(),
-                    )
-                    .unwrap();
+                    let decoded =
+                        distributed::domain_event::DomainEventOccurrence::from_canonical_bytes(
+                            ctx.message().payload(),
+                        )
+                        .unwrap();
                     assert_eq!(ctx.message().id(), Some(decoded.id()));
                     assert_eq!(ctx.message().causation_id(), decoded.causation_id());
                     captured.lock().unwrap().push(decoded);

@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use distributed::graphql::surface::{
+use distributed::graphql::{
     ExternalReadError, ExternalReadExecutor, ExternalReadResult, ExternalReadSource,
 };
 use distributed::microsvc::Session;

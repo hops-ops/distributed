@@ -4,7 +4,14 @@ use serde::{Deserialize, Serialize};
 
 /// Represents a line item in an order
 #[derive(
-    Clone, Debug, Serialize, Deserialize, PartialEq, Encode, Decode, distributed::CommandInput,
+    Clone,
+    Debug,
+    Serialize,
+    Deserialize,
+    PartialEq,
+    Encode,
+    Decode,
+    distributed::command::CommandInput,
 )]
 pub struct OrderItem {
     pub sku: String,

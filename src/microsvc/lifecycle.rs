@@ -392,9 +392,9 @@ mod tests {
             CausalCommandContext, CausalDispatchError, HandlerError, Routes, Service, Session,
         };
 
-        #[derive(serde::Deserialize, crate::CommandInput)]
+        #[derive(serde::Deserialize, crate::command::CommandInput)]
         struct Ping {}
-        #[derive(serde::Serialize, crate::CommandOutput)]
+        #[derive(serde::Serialize, crate::command::CommandOutput)]
         struct Pong {
             pong: bool,
         }

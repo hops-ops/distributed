@@ -10,7 +10,7 @@ twice.
 |------|-----------|--------|
 | Change state in two cells with rollback | Saga / process manager | `distributed::saga` |
 | Run something at a time in the future, across restarts | `Schedule` (`ctx.schedule`) | `distributed::schedule` |
-| A cell schedules its own future or recurring work | Re-armable cell alarm | `distributed::cell_host` |
+| A cell schedules its own future or recurring work | Re-armable cell alarm | `distributed::microsvc::cell_host` |
 | One owner per key, with stale writers rejected | Lease with fencing token | `distributed::lease` |
 | Deterministic time in tests | `Clock`, `ManualClock` | `distributed::clock` |
 

@@ -27,9 +27,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use distributed::graphql::surface::{
-    ExternalField, ExternalReadSource, ExternalRoot, ExternalType,
-};
+use distributed::graphql::{ExternalField, ExternalReadSource, ExternalRoot, ExternalType};
 use distributed::microsvc::USER_ID_KEY;
 
 use crate::manifest::{ClientLeaderboard, ClientLeaderboardArgument, ClientLeaderboardRoot};

@@ -8,12 +8,12 @@
 //! stays on the GraphQL host.
 
 use chat_domain::{post, ChatMessage, ChatMessageState};
-use distributed::cell_host::{
-    AggregateCell, CausalDispatchError, CausalDispatchResult, CellCommandIdentity,
-    CellWaitPathRequest, CelldOutbox, InternalHttpSecret, CELL_CAUSATION_ID_HEADER,
-    CELL_INTERNAL_SECRET_ENV, CELL_INTERNAL_SECRET_HEADER, CELL_PRINCIPAL_PARTITION_HEADER,
-    CELL_SERVICE_ID_HEADER,
+use distributed::microsvc::cell_host::{
+    AggregateCell, CellCommandIdentity, CellWaitPathRequest, CelldOutbox, InternalHttpSecret,
+    CELL_CAUSATION_ID_HEADER, CELL_INTERNAL_SECRET_ENV, CELL_INTERNAL_SECRET_HEADER,
+    CELL_PRINCIPAL_PARTITION_HEADER, CELL_SERVICE_ID_HEADER,
 };
+use distributed::microsvc::{CausalDispatchError, CausalDispatchResult};
 use distributed::microsvc::{Session, ROLE_KEY, USER_ID_KEY};
 use distributed::Aggregate;
 use serde::de::DeserializeOwned;

@@ -2,7 +2,7 @@ use super::*;
 
 pub const COMMAND: &str = "saga.start";
 
-#[derive(Debug, Serialize, distributed::CommandOutput)]
+#[derive(Debug, Serialize, distributed::command::CommandOutput)]
 pub struct Output {
     pub saga_id: String,
 }

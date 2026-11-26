@@ -165,7 +165,7 @@ pub(super) struct PendingChange {
     pub(super) scope: Option<ProjectionRecordScope>,
     pub(super) revision: Option<RecordRevision>,
     pub(super) failure_id: Option<String>,
-    pub(super) program_id: Option<crate::ProjectionProgramId>,
+    pub(super) program_id: Option<crate::projection::ProjectionProgramId>,
 }
 
 impl PartitionState {

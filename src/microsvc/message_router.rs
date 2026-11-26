@@ -6,7 +6,8 @@
 //! bus-core runner only ever sees an already-classified `TransportError`.
 
 use crate::bus::{LaneSet, MessageRouter, OrderedDelivery, TransportError};
-use crate::microsvc::{Message, MessageKind, Service, SubscriptionPlan};
+use crate::bus::{Message, MessageKind, SubscriptionPlan};
+use crate::microsvc::Service;
 
 impl MessageRouter for Service {
     fn consumer_group(&self) -> Option<&str> {

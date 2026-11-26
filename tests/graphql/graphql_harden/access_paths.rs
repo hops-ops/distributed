@@ -8,9 +8,8 @@
 use async_graphql::Request;
 use distributed::graphql::IdentityConfig;
 use distributed::graphql::{claim, col, read, GraphqlEngine, ReadPermission};
-use distributed::{
-    ReadModel, ReadModelCatalog, RelationalReadModel, RelationshipDef, RelationshipKind,
-};
+use distributed::read_model::{ReadModel, RelationalReadModel};
+use distributed::table::{ReadModelCatalog, RelationshipDef, RelationshipKind};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 

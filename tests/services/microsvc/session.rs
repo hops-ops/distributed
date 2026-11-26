@@ -11,10 +11,10 @@ use std::collections::HashMap;
 
 use crate::microsvc::commands::dispatch;
 
-#[derive(Debug, Deserialize, distributed::CommandInput)]
+#[derive(Debug, Deserialize, distributed::command::CommandInput)]
 struct Identify {}
 
-#[derive(Debug, Serialize, distributed::CommandOutput)]
+#[derive(Debug, Serialize, distributed::command::CommandOutput)]
 struct Identity {
     user_id: String,
 }

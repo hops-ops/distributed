@@ -58,13 +58,13 @@ impl Board {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize, distributed::CommandInput)]
+#[derive(Clone, Debug, Deserialize, Serialize, distributed::command::CommandInput)]
 pub struct OpenBoard {
     pub id: String,
     pub name: String,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize, distributed::CommandInput)]
+#[derive(Clone, Debug, Deserialize, Serialize, distributed::command::CommandInput)]
 pub struct AddCard {
     pub id: String,
     pub card_id: String,
@@ -74,14 +74,14 @@ pub struct AddCard {
     pub assignee: Option<String>,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize, distributed::CommandInput)]
+#[derive(Clone, Debug, Deserialize, Serialize, distributed::command::CommandInput)]
 pub struct MoveCard {
     pub id: String,
     pub card_id: String,
     pub column: String,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize, distributed::CommandInput)]
+#[derive(Clone, Debug, Deserialize, Serialize, distributed::command::CommandInput)]
 pub struct RemoveCard {
     pub id: String,
     pub card_id: String,

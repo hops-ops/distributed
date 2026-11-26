@@ -5,11 +5,12 @@
 //! `@live` (the SvelteKit page's active events).
 
 use distributed::graphql::SurfaceProjector;
+use distributed::mutation::Mutation;
+use distributed::mutation_file;
 use distributed::projection::lower::{EventualOnly, ProjectionDescriptor};
-use distributed::{
-    mutation_file, LocalProjectionMounts, Mutation, ReadModel, ReadModelCatalog,
-    RelationalReadModel,
-};
+use distributed::projection::LocalProjectionMounts;
+use distributed::read_model::{ReadModel, RelationalReadModel};
+use distributed::table::ReadModelCatalog;
 use serde::{Deserialize, Serialize};
 
 #[allow(unused_imports)]

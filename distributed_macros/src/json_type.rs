@@ -46,14 +46,14 @@ pub fn expand(input: DeriveInput) -> syn::Result<TokenStream> {
                     };
                     let ty = &field.ty;
                     Ok(quote! {
-                        #framework::JsonField {
+                        #framework::table::JsonField {
                             name: ::std::string::String::from(#wire),
-                            shape: <#ty as #framework::JsonType>::json_shape(),
+                            shape: <#ty as #framework::table::JsonType>::json_shape(),
                         }
                     })
                 })
                 .collect::<syn::Result<Vec<_>>>()?;
-            quote! { #framework::JsonShape::Object { fields: ::std::vec![#(#fields),*] } }
+            quote! { #framework::table::JsonShape::Object { fields: ::std::vec![#(#fields),*] } }
         }
         Data::Enum(data) => {
             if data.variants.is_empty() {
@@ -84,7 +84,7 @@ pub fn expand(input: DeriveInput) -> syn::Result<TokenStream> {
                 })
                 .collect::<syn::Result<Vec<_>>>()?;
             quote! {
-                #framework::JsonShape::Enum {
+                #framework::table::JsonShape::Enum {
                     values: ::std::vec![#(::std::string::String::from(#values)),*],
                 }
             }
@@ -97,8 +97,8 @@ pub fn expand(input: DeriveInput) -> syn::Result<TokenStream> {
         }
     };
     Ok(quote! {
-        impl #framework::JsonType for #name {
-            fn json_shape() -> #framework::JsonShape {
+        impl #framework::table::JsonType for #name {
+            fn json_shape() -> #framework::table::JsonShape {
                 #shape
             }
         }

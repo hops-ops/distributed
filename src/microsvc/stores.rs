@@ -7,11 +7,12 @@
 //! [`Routes::for_aggregate`](crate::microsvc::Routes::for_aggregate).
 //! [`Stores`] is the value a host builds from its backend.
 
+use crate::lock::LockManager;
 use crate::microsvc::dependencies::{
     CausalProjectionStore, CausalRepositoryBackend, HasOutboxStore, RepoReadModelDependencies,
 };
 use crate::{
-    AggregateRepository, GetStream, LockManager, QueuedRepository, ReadModelWritePlanStore,
+    AggregateRepository, GetStream, QueuedRepository, ReadModelWritePlanStore,
     RelationalReadModelQueryStore,
 };
 
@@ -108,7 +109,7 @@ pub use sql::SqliteStores;
 mod sql {
     use super::{ServiceStores, Stores};
     use crate::bus::{Bus, BusConsumer};
-    use crate::ReadModelCatalog;
+    use crate::table::ReadModelCatalog;
     use std::error::Error;
     use std::future::Future;
 
@@ -137,7 +138,9 @@ mod sql {
         fn bus(&self, group: &str) -> Self::Bus;
 
         /// Committed read-model changes, for GraphQL live queries.
-        fn read_model_changes(&self) -> tokio::sync::broadcast::Receiver<crate::ReadModelChange>;
+        fn read_model_changes(
+            &self,
+        ) -> tokio::sync::broadcast::Receiver<crate::read_model::ReadModelChange>;
 
         /// The database GraphQL queries read through, carrying the
         /// repository identity that proves `Projected` commands update the
@@ -177,7 +180,7 @@ mod sql {
 
                 fn read_model_changes(
                     &self,
-                ) -> tokio::sync::broadcast::Receiver<crate::ReadModelChange> {
+                ) -> tokio::sync::broadcast::Receiver<crate::read_model::ReadModelChange> {
                     self.read_models.read_model_changes()
                 }
 
@@ -194,7 +197,7 @@ mod sql {
         /// Every store of a service in one SQLite database.
         SqliteStores,
         crate::SqliteRepository,
-        crate::SqliteLockManager,
+        crate::lock::SqliteLockManager,
         crate::bus::SqliteBus
     );
 
@@ -203,7 +206,7 @@ mod sql {
         /// Every store of a service in one Postgres database.
         PostgresStores,
         crate::PostgresRepository,
-        crate::PostgresLockManager,
+        crate::lock::PostgresLockManager,
         crate::bus::PostgresBus
     );
 }

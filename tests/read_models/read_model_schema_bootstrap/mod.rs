@@ -1,8 +1,8 @@
 use std::collections::HashMap;
 
-use distributed::{
-    ColumnType, ReadModel, RelationalReadModel, TableSchemaRegistry, TableStoreError,
-    DEFAULT_TABLE_VERSION_COLUMN,
+use distributed::read_model::{ReadModel, RelationalReadModel};
+use distributed::table::{
+    ColumnType, TableSchemaRegistry, TableStoreError, DEFAULT_TABLE_VERSION_COLUMN,
 };
 use serde::{Deserialize, Serialize};
 

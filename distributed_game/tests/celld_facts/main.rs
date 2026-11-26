@@ -13,7 +13,7 @@
 
 use std::time::{Duration, Instant};
 
-use distributed::cell_host::InternalHttpSecret;
+use distributed::microsvc::cell_host::InternalHttpSecret;
 use distributed_game::celld::{CelldFactSink, FactRoute};
 use distributed_game::lifecycle::{JoinVia, LeftReason, PlayerJoined, PlayerLeft};
 use distributed_game::{

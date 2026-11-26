@@ -5,11 +5,6 @@ use std::sync::Arc;
 
 use axum::http::StatusCode;
 use distributed::bus::{Bus, BusConsumer, InMemoryBus, TransportError};
-use distributed::cell_host::{
-    AggregateCell, CellCommandIdentity, CelldCommandHost, InternalHttpSecret,
-    CELL_CAUSATION_ID_HEADER, CELL_INTERNAL_SECRET_HEADER, CELL_PRINCIPAL_PARTITION_HEADER,
-    CELL_SERVICE_ID_HEADER,
-};
 use distributed::command::{
     typed_command, CommandInputType, CommandOutputType, CommandTypeDef, CommandTypeField,
     PreparedCommand, Succeeded,
@@ -17,6 +12,11 @@ use distributed::command::{
 use distributed::command_dispatch::{
     CellRequestContext, CommandHost, HttpCommandHost, SharedCommandHost, TrustedRequestMetadata,
     VerifiedPrincipal,
+};
+use distributed::microsvc::cell_host::{
+    AggregateCell, CellCommandIdentity, CelldCommandHost, InternalHttpSecret,
+    CELL_CAUSATION_ID_HEADER, CELL_INTERNAL_SECRET_HEADER, CELL_PRINCIPAL_PARTITION_HEADER,
+    CELL_SERVICE_ID_HEADER,
 };
 use distributed::microsvc::{
     router, CausalCommandContext, HandlerError, PortableCommand, Routes, Service, Session,
@@ -1537,9 +1537,9 @@ async fn bus_send_has_no_reply_value() {
 
 #[tokio::test]
 async fn same_host_listen_ping_and_http_wait_path() {
-    #[derive(Debug, serde::Deserialize, distributed::CommandInput)]
+    #[derive(Debug, serde::Deserialize, distributed::command::CommandInput)]
     struct PingInput {}
-    #[derive(Debug, serde::Serialize, distributed::CommandOutput)]
+    #[derive(Debug, serde::Serialize, distributed::command::CommandOutput)]
     struct Pong {
         pong: bool,
     }
@@ -1621,14 +1621,15 @@ async fn same_host_listen_ping_and_http_wait_path() {
 #[cfg(feature = "grpc")]
 #[tokio::test]
 async fn grpc_wait_path_returns_command_id_and_receipt() {
-    use distributed::microsvc::grpc::{CommandServiceClient, GrpcRequest};
+    use distributed::microsvc::grpc::command_service_client::CommandServiceClient;
+    use distributed::microsvc::grpc::GrpcRequest;
     use tokio::net::TcpListener;
     use tokio_stream::wrappers::TcpListenerStream;
 
     let service = wait_service();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    let grpc_svc = distributed::microsvc::grpc_server(service);
+    let grpc_svc = distributed::microsvc::grpc::grpc_server(service);
     tokio::spawn(async move {
         tonic::transport::Server::builder()
             .add_service(grpc_svc)

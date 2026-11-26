@@ -1,7 +1,7 @@
+use distributed::read_model::ReadModel;
 use distributed::read_model::{ReadModelScanRequest, ReadModelWritePlanBuilder};
-use distributed::{
-    ReadModel, ReadModelWritePlanStore, RelationalReadModelQueryStore, RowValue, RowValues,
-};
+use distributed::table::{RowValue, RowValues};
+use distributed::{ReadModelWritePlanStore, RelationalReadModelQueryStore};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, ReadModel)]
@@ -158,7 +158,7 @@ async fn bounded_keyset_sqlite_preserves_scope_cursor_and_row_versions() {
     let store = distributed::SqliteRepository::connect_and_migrate("sqlite::memory:")
         .await
         .unwrap();
-    let mut registry = distributed::TableSchemaRegistry::new();
+    let mut registry = distributed::table::TableSchemaRegistry::new();
     registry.register::<ScanCandidate>().unwrap();
     store
         .bootstrap_table_schema_for_dev(&registry)

@@ -3,18 +3,24 @@ use distributed::projection::lower::{
     related_operation, state_selector, LoweredProjectionPlan, ProjectionAuthoringField,
     ProjectionLoweringError,
 };
+use distributed::projection::{
+    MutationKind, ProjectionArm, ProjectionEventSet, ProjectionExpression, ProjectionPartition,
+    ProjectionPlanTemplate, ProjectionProgram, ProjectionProgramError, ProjectionValue,
+};
+use distributed::read_model::ReadModelWorkspaceExt;
 use distributed::read_model::ReadModelWritePlanBuilder;
 #[cfg(feature = "sqlite")]
 use distributed::table::TableSchemaRegistry;
-use distributed::{
-    Entity, ExpectedVersion, InMemoryRepository, MutationKind, ProjectionArm, ProjectionEventSet,
-    ProjectionExpression, ProjectionPartition, ProjectionPlanTemplate, ProjectionProgram,
-    ProjectionProgramError, ProjectionValue, ReadModelWorkspaceExt, ReadModelWritePlanStore,
-    RowKey, RowValue, RowWriteMode, TableMutation, TableRowMutation, TableWritePlan,
+use distributed::table::{
+    ExpectedVersion, RowKey, RowValue, RowWriteMode, TableMutation, TableRowMutation,
+    TableWritePlan,
 };
+use distributed::{Entity, InMemoryRepository, ReadModelWritePlanStore};
 use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, distributed::DomainState)]
+#[derive(
+    Clone, Debug, PartialEq, Serialize, Deserialize, distributed::domain_event::DomainState,
+)]
 #[domain_state(version = 1)]
 struct PlayerState {
     player_id: String,
@@ -64,7 +70,9 @@ impl PlayerAggregate {
     }
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, distributed::ReadModel)]
+#[derive(
+    Clone, Debug, Default, PartialEq, Serialize, Deserialize, distributed::read_model::ReadModel,
+)]
 #[readmodel(table = "projection_players", primary_key = ["player_id"])]
 struct Players {
     player_id: String,
@@ -73,7 +81,9 @@ struct Players {
     weapons: Vec<PlayerWeapons>,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, distributed::ReadModel)]
+#[derive(
+    Clone, Debug, Default, PartialEq, Serialize, Deserialize, distributed::read_model::ReadModel,
+)]
 #[readmodel(table = "projection_player_weapons", primary_key = ["weapon_id"])]
 struct PlayerWeapons {
     #[readmodel(
@@ -85,7 +95,9 @@ struct PlayerWeapons {
     acquired_at: String,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, distributed::ReadModel)]
+#[derive(
+    Clone, Debug, Default, PartialEq, Serialize, Deserialize, distributed::read_model::ReadModel,
+)]
 #[readmodel(
     table = "projection_player_weapon_links",
     primary_key = ["player_id", "weapon_id"]
@@ -97,7 +109,9 @@ struct PlayerWeaponLinks {
     weapon_id: String,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, distributed::ReadModel)]
+#[derive(
+    Clone, Debug, Default, PartialEq, Serialize, Deserialize, distributed::read_model::ReadModel,
+)]
 #[readmodel(
     table = "projection_player_summaries",
     primary_key = ["player_id"]
@@ -107,7 +121,9 @@ struct PlayerSummary {
     weapon_count: u64,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, distributed::ReadModel)]
+#[derive(
+    Clone, Debug, Default, PartialEq, Serialize, Deserialize, distributed::read_model::ReadModel,
+)]
 #[readmodel(table = "projection_collision_parents", primary_key = ["id"])]
 struct CollisionParent {
     id: String,
@@ -116,7 +132,9 @@ struct CollisionParent {
     children: Vec<CollisionChild>,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, distributed::ReadModel)]
+#[derive(
+    Clone, Debug, Default, PartialEq, Serialize, Deserialize, distributed::read_model::ReadModel,
+)]
 #[readmodel(table = "projection_collision_children", primary_key = ["child_id"])]
 struct CollisionChild {
     child_id: String,
@@ -128,7 +146,7 @@ struct PlayerEvents;
 
 impl ProjectionEventSet for PlayerEvents {
     fn projection_event_selectors(
-    ) -> Result<Vec<distributed::ProjectionEventSelector>, ProjectionProgramError> {
+    ) -> Result<Vec<distributed::projection::ProjectionEventSelector>, ProjectionProgramError> {
         Ok(vec![state_selector::<PlayerState>("player.loaded", 1)?])
     }
 }
@@ -186,7 +204,7 @@ fn player_program() -> Result<ProjectionProgram, ProjectionProgramError> {
 }
 
 fn lower_player_program(
-    plan: &distributed::ResolvedProjectionPlan,
+    plan: &distributed::projection::ResolvedProjectionPlan,
 ) -> Result<LoweredProjectionPlan, ProjectionLoweringError> {
     let mut records = Vec::new();
     for mutation in plan.mutations() {
@@ -249,7 +267,7 @@ fn weapon_key() -> RowKey {
     ])
 }
 
-fn occurrence() -> distributed::DomainEventOccurrence {
+fn occurrence() -> distributed::domain_event::DomainEventOccurrence {
     let mut aggregate = PlayerAggregate::default();
     aggregate
         .load(
@@ -267,7 +285,7 @@ fn occurrence() -> distributed::DomainEventOccurrence {
         .clone()
 }
 
-fn collision_occurrence() -> distributed::DomainEventOccurrence {
+fn collision_occurrence() -> distributed::domain_event::DomainEventOccurrence {
     let mut aggregate = PlayerAggregate::default();
     aggregate
         .load(
@@ -308,7 +326,10 @@ fn expected_models() -> (Players, PlayerWeapons, PlayerSummary, PlayerWeaponLink
     )
 }
 
-fn portable_and_fluent_plans() -> (distributed::TableWritePlan, distributed::TableWritePlan) {
+fn portable_and_fluent_plans() -> (
+    distributed::table::TableWritePlan,
+    distributed::table::TableWritePlan,
+) {
     let resolved = ProjectionPlanTemplate::<PlayerEvents>::try_new(
         player_program().expect("manual portable program"),
     )

@@ -1,8 +1,8 @@
 //! Fact batches committed into a real `distributed` AggregateCell with a
 //! server-built trusted Session.
 
-use distributed::cell_host::AggregateCell;
 use distributed::command::{typed_command, PreparedCommand, Succeeded};
+use distributed::microsvc::cell_host::AggregateCell;
 use distributed::microsvc::{
     CausalCommandContext, CausalRouteDependencies, HandlerError, PortableCommand, Routes,
 };
@@ -31,12 +31,12 @@ impl Hero {
     }
 }
 
-#[derive(Debug, Deserialize, distributed::CommandInput)]
+#[derive(Debug, Deserialize, distributed::command::CommandInput)]
 struct CreditInput {
     amount: u32,
 }
 
-#[derive(Debug, Serialize, distributed::CommandOutput)]
+#[derive(Debug, Serialize, distributed::command::CommandOutput)]
 struct CreditPayload {
     hero: String,
     xp: u32,

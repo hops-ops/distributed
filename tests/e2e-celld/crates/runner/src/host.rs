@@ -10,12 +10,12 @@ use std::sync::Arc;
 
 use chat_domain::ChatMessage;
 use distributed::bus::{celld_queue_relay_handler, NatsBus};
-use distributed::cell_host::{CelldCommandHost, InternalHttpSecret};
 use distributed::graphql::IdentityConfig;
+use distributed::microsvc::cell_host::{CelldCommandHost, InternalHttpSecret};
 use distributed::microsvc::{
     spawn_service_consumer_loop, LifecycleGate, PostgresStores, SqlStores,
 };
-use distributed::BusPublisher;
+use distributed::outbox_worker::BusPublisher;
 use e2e_service::{
     build_graphql_engine, build_service, read_models, spawn_scrape_from_env, E2E_UI_APPLICATION,
 };
@@ -107,9 +107,10 @@ mod tests {
     use std::sync::Arc;
 
     use chat_domain::ChatMessage;
-    use distributed::cell_host::{CelldCommandHost, InternalHttpSecret};
+    use distributed::lock::InMemoryLockManager;
+    use distributed::microsvc::cell_host::{CelldCommandHost, InternalHttpSecret};
     use distributed::microsvc::Stores;
-    use distributed::{InMemoryLockManager, InMemoryRepository};
+    use distributed::InMemoryRepository;
     use e2e_service::build_service;
     use todo_domain::Todo;
 

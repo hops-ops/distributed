@@ -4,9 +4,9 @@ use blob_domain::{
     BlobInitializedDomainEvent, BlobLevelStartedDomainEvent, BlobMovedDomainEvent,
     BlobStartedDomainEvent,
 };
+use distributed::mutation::Mutation;
 use distributed::mutation_file;
 use distributed::projection::lower::{DirectCandidate, ProjectionDescriptor};
-use distributed::Mutation;
 use e2e_readmodels::BlobGames;
 
 /// Mutation: upsert one BlobGames row from `input.game`.
@@ -43,7 +43,8 @@ distributed::projection! {
 
 #[cfg(test)]
 mod tests {
-    use distributed::{MutationKind, RowValue};
+    use distributed::projection::MutationKind;
+    use distributed::table::RowValue;
 
     use super::*;
     use blob_domain::{BlobGame, BlobGameState, Direction};

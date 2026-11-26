@@ -3,7 +3,9 @@
 
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, distributed::JsonType)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, distributed::table::JsonType,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum Tile {
     Hole,

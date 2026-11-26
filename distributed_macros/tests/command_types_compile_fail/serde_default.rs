@@ -1,4 +1,4 @@
-use distributed::CommandInput;
+use distributed::command::CommandInput;
 
 #[derive(CommandInput)]
 struct DefaultedInput {

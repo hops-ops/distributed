@@ -12,12 +12,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
+use distributed::clock::ManualClock;
 use distributed::command::{typed_command, PreparedCommand, Succeeded};
 use distributed::command_dispatch::VerifiedPrincipal;
 use distributed::microsvc::schedule::{schedule_guard, ScheduleWorkerConfig};
 use distributed::microsvc::{CausalCommandContext, HandlerError, PortableCommand, Routes, Service};
 use distributed::schedule::{ArmedSchedule, Capability, Schedule};
-use distributed::{sourced, AggregateRepository, Entity, GetStream, ManualClock, StreamIdentity};
+use distributed::{sourced, AggregateRepository, Entity, GetStream, StreamIdentity};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
@@ -69,7 +70,7 @@ impl Ticker {
     }
 }
 
-#[derive(Debug, Deserialize, distributed::CommandInput)]
+#[derive(Debug, Deserialize, distributed::command::CommandInput)]
 struct StartInput {
     id: String,
     limit: u32,
@@ -77,12 +78,12 @@ struct StartInput {
     tick_command: String,
 }
 
-#[derive(Debug, Serialize, Deserialize, distributed::CommandInput)]
+#[derive(Debug, Serialize, Deserialize, distributed::command::CommandInput)]
 struct TickInput {
     id: String,
 }
 
-#[derive(Debug, Serialize, distributed::CommandOutput)]
+#[derive(Debug, Serialize, distributed::command::CommandOutput)]
 struct TickerPayload {
     id: String,
     ticks: u32,
@@ -580,7 +581,7 @@ macro_rules! schedule_conformance_tests {
                 start(&crashed, "crash", 1, 0, TICK).await;
                 // Both workers measure claims by one manual clock, a second
                 // ahead of the database clock that stamped the due time.
-                let clock = distributed::ManualClock::new(SystemTime::now() + Duration::from_secs(1));
+                let clock = distributed::clock::ManualClock::new(SystemTime::now() + Duration::from_secs(1));
                 let crashing = crashing.with_clock(Arc::new(clock.clone()));
 
                 // The worker claims the arm and dispatches it (the tick
@@ -620,7 +621,7 @@ macro_rules! schedule_conformance_tests {
             fires_by_the_store_clock_once_per_arm(b) => async move {
                 use $crate::schedule::*;
                 use std::time::{Duration, SystemTime};
-                let clock = distributed::ManualClock::new(
+                let clock = distributed::clock::ManualClock::new(
                     SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000),
                 );
                 let (repo, worker) = ScheduleWorker::attach(b.repository_on(clock.clone()), fast());

@@ -17,12 +17,12 @@ use super::{
     ProjectionRecordScope, ProjectionScopeCodec, RecordRevision, RecordTransition,
     TrustedProjectionInput,
 };
+use crate::projection::ProjectionProgramId;
 use crate::read_model::RelationalReadModel;
 use crate::table::{
     DeleteTableRowMutation, ExpectedVersion, PatchMode, PatchTableRowMutation, RowKey, RowPatch,
     RowWriteMode, TableMutation, TableRowMutation, TableSchema,
 };
-use crate::ProjectionProgramId;
 
 /// Typed, commit-less workspace passed to a causal projector handler.
 ///

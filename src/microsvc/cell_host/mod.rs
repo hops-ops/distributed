@@ -2,7 +2,7 @@
 //!
 //! Domain crates keep `CausalCommandContext` / `ctx.repo()`. This module is
 //! the host adapter: one named cell per shard, private stream store, same
-//! [`PortableCommand`] mounts as SOA `Routes`. It is **not** a sqlx dialect
+//! [`PortableCommand`](crate::microsvc::PortableCommand) mounts as SOA `Routes`. It is **not** a sqlx dialect
 //! and must not be gated behind `feature = "celld"` (`PCH-DEC-005`).
 //!
 //! Live celld fleet / CI is not required (`PCH-AC-006.1`). A workers-rs
@@ -36,8 +36,6 @@ mod sql_store;
 mod store;
 mod wire;
 
-// Schedule types under their old cell-host paths, for the host's own code.
-pub use crate::microsvc::service::{CausalDispatchError, CausalDispatchResult};
 #[allow(unused_imports)]
 pub(crate) use crate::schedule::{
     ArmedSchedule, FailedSchedule, FiredSchedule, Schedule, ScheduleError, ScheduleFireReport,

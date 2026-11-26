@@ -331,8 +331,9 @@ fn domain_event_guard_repository_error(error: DomainEventCommitGuardError) -> Re
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::outbox_worker::OutboxStore;
     use crate::repository::StreamIdentity;
-    use crate::{sourced, AggregateBuilder, Entity, InMemoryRepository, OutboxStore, Queueable};
+    use crate::{sourced, AggregateBuilder, Entity, InMemoryRepository, Queueable};
     use std::sync::Mutex;
 
     #[derive(Default)]
@@ -456,7 +457,13 @@ mod tests {
     }
 
     #[derive(
-        Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, crate::DomainState,
+        Clone,
+        Debug,
+        PartialEq,
+        Eq,
+        serde::Serialize,
+        serde::Deserialize,
+        crate::domain_event::DomainState,
     )]
     #[domain_state(version = 1)]
     struct PublishedCounterState {
@@ -497,7 +504,13 @@ mod tests {
     }
 
     #[derive(
-        Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, crate::DomainEvent,
+        Clone,
+        Debug,
+        PartialEq,
+        Eq,
+        serde::Serialize,
+        serde::Deserialize,
+        crate::domain_event::DomainEvent,
     )]
     #[domain_event(name = "counter.notified", version = 1)]
     struct CounterNotified {
@@ -641,7 +654,7 @@ mod tests {
 
     #[tokio::test]
     async fn explicit_publish_serializes_its_dto_instead_of_replay_bytes() {
-        use crate::DomainEventBodyKind;
+        use crate::domain_event::DomainEventBodyKind;
 
         let repo = InMemoryRepository::new().aggregate::<Dummy>();
         let mut aggregate = Dummy::default();

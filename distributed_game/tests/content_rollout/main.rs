@@ -5,11 +5,11 @@
 
 use std::time::{Duration, SystemTime};
 
-use distributed::cell_host::{
-    AggregateCell, CausalDispatchError, CellCommandIdentity, CellStreamStore,
-};
+use distributed::clock::ManualClock;
+use distributed::microsvc::cell_host::{AggregateCell, CellCommandIdentity, CellStreamStore};
+use distributed::microsvc::CausalDispatchError;
 use distributed::microsvc::{Session, ROLE_KEY, USER_ID_KEY};
-use distributed::{ManualClock, StreamIdentity};
+use distributed::StreamIdentity;
 use distributed_game::cell::command_id_for;
 use distributed_game::world::content_rollout::{
     mount_content_rollout, zone_step, ContentRollout, ZoneStep, CONTENT_ADMIN_ROLE, PHASE_APPLIED,

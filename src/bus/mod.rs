@@ -19,12 +19,12 @@
 //!
 //! - [`MessagePublisher`] — the single publish boundary, with each adapter's
 //!   durable publish threshold documented;
-//! - [`OutboxDispatcher`](crate::OutboxDispatcher) / [`OutboxDispatchOutcome`](crate::OutboxDispatchOutcome) — map durable outbox rows to
+//! - [`OutboxDispatcher`](crate::outbox_worker::OutboxDispatcher) / [`OutboxDispatchOutcome`](crate::outbox_worker::OutboxDispatchOutcome) — map durable outbox rows to
 //!   `Message` and dispatch them, sharing one claim → publish → complete path
 //!   between background polling and after-commit immediate dispatch.
 //!
 //! Concrete adapters build on these traits: the Postgres outbox-backed source
-//! ([`OutboxSource`](crate::OutboxSource)) is always available; the NATS JetStream and RabbitMQ
+//! ([`OutboxSource`](crate::outbox_worker::OutboxSource)) is always available; the NATS JetStream and RabbitMQ
 //! adapters are behind the `nats` and `rabbitmq` features. The Knative/HTTP
 //! ingress shape and the Kafka adapter are still separate slices. Everything
 //! builds on the vocabulary defined here:

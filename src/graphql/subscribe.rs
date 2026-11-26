@@ -1,8 +1,8 @@
 //! Live queries: one shared producer per distinct read, fanned out.
 //!
-//! Every live root — a catalog plan or an external read — is a [`LiveRead`].
+//! Every live root — a catalog plan or an external read — is a `LiveRead`.
 //! Subscribers whose reads have the same key share one entry of a
-//! [`LiveRegistry`] and its one producer loop:
+//! `LiveRegistry` and its one producer loop:
 //!
 //! 1. The first subscriber creates the entry; the producer's first execution
 //!    is that subscriber's first frame. A later subscriber opens with its own

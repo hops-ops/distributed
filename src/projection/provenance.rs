@@ -1,6 +1,6 @@
 use serde::Serialize;
 
-use crate::{
+use crate::domain_event::{
     DomainEventBodyKind, DomainEventDescriptor, DomainEventOccurrence,
     DOMAIN_EVENT_OCCURRENCE_VERSION,
 };

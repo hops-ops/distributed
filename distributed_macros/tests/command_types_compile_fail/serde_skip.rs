@@ -1,4 +1,4 @@
-use distributed::CommandOutput;
+use distributed::command::CommandOutput;
 
 #[derive(CommandOutput)]
 struct SkippedOutput {

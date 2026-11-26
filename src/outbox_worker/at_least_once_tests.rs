@@ -14,10 +14,11 @@ use crate::bus::{
     run_source, Handlers, Message, MessagePublisher, MessageSource, ReceivedMessage, RunOptions,
     TransportError,
 };
+use crate::outbox::{OutboxMessage, OutboxMessageStatus};
 use crate::outbox_worker::{ClaimOutboxMessages, OutboxClaimRef, OutboxDispatcher, OutboxStore};
 use crate::{
-    CommitBatch, InMemoryOutboxStore, InMemoryRepository, InboxReceipt, OutboxMessage,
-    OutboxMessageStatus, RepositoryError, TransactionalCommit,
+    CommitBatch, InMemoryOutboxStore, InMemoryRepository, InboxReceipt, RepositoryError,
+    TransactionalCommit,
 };
 
 /// An outbox whose next `complete` fails as a retryable storage error: the

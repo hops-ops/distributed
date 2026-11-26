@@ -1,4 +1,4 @@
-use distributed::ReadModel;
+use distributed::read_model::ReadModel;
 
 // No field named `id` and no `#[readmodel(id)]` marker: the derive cannot
 // know which field uniquely identifies the read model.

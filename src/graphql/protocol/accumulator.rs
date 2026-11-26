@@ -157,8 +157,8 @@ impl ProtocolResponseAccumulator {
         &self,
         causation_id: crate::command_ledger::CausationId,
         replay_retention: std::time::Duration,
-        occurrences: &[crate::DomainEventOccurrence],
-        sealed_events: &[crate::ProjectionEventSelector],
+        occurrences: &[crate::domain_event::DomainEventOccurrence],
+        sealed_events: &[crate::projection::ProjectionEventSelector],
     ) -> Result<super::CommandProjectionMetadataV1, ProtocolAccumulatorError> {
         let request = self
             .inner

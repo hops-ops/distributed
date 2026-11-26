@@ -14,7 +14,7 @@
 
 use std::time::Duration;
 
-use distributed::cell_host::{InternalHttpSecret, CELL_INTERNAL_SECRET_HEADER};
+use distributed::microsvc::cell_host::{InternalHttpSecret, CELL_INTERNAL_SECRET_HEADER};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -201,14 +201,14 @@ impl CrawlerCells {
             .post(&url)
             .header(CELL_INTERNAL_SECRET_HEADER, self.secret.header_value())
             .header(
-                distributed::cell_host::CELL_SERVICE_ID_HEADER,
+                distributed::microsvc::cell_host::CELL_SERVICE_ID_HEADER,
                 "mobpit-admin",
             )
             .header(
-                distributed::cell_host::CELL_PRINCIPAL_PARTITION_HEADER,
+                distributed::microsvc::cell_host::CELL_PRINCIPAL_PARTITION_HEADER,
                 principal,
             )
-            .header(distributed::USER_ID_KEY, principal)
+            .header(distributed::microsvc::USER_ID_KEY, principal)
             .json(&serde_json::json!({ "commandId": command_id, "input": input }))
             .send()
             .await

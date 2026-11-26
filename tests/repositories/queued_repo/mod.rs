@@ -7,9 +7,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use distributed::lock::InMemoryLockManager;
 use distributed::{
     sourced, Aggregate, AggregateBuilder, AggregateRepository, Entity, GetStream,
-    InMemoryLockManager, InMemoryRepository, Queueable, StreamIdentity,
+    InMemoryRepository, Queueable, StreamIdentity,
 };
 use tokio::sync::Barrier;
 
@@ -330,7 +331,8 @@ use common::sqlite as sqlite_support;
 mod stale_lease {
     use super::*;
     use crate::queued_repo::sqlite_support::TempDb;
-    use distributed::{QueuedRepository, RepositoryError, SqliteLockManager};
+    use distributed::lock::SqliteLockManager;
+    use distributed::{QueuedRepository, RepositoryError};
 
     /// Writer A loads (holds the lease), the lease TTL expires, writer B steals
     /// the lease and commits, then A commits its stale load. The queue lock can

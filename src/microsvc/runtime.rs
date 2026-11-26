@@ -40,7 +40,7 @@ impl Service {
     /// publish is recovered in-process. Beside it, a second worker tombstones
     /// expired rows of the typed commands' ledgers in bounded batches until
     /// the service is dropped. Spawn a separate
-    /// [`crate::OutboxDrainRunner`] next to `run` only when you want an extra
+    /// [`crate::outbox_worker::OutboxDrainRunner`] next to `run` only when you want an extra
     /// competing drainer.
     pub fn with_bus<B>(mut self, bus: B) -> Self
     where
@@ -99,12 +99,12 @@ impl Service {
         store: S,
         publisher: P,
         max_attempts: u32,
-    ) -> crate::OutboxDrainRunner<S, P>
+    ) -> crate::outbox_worker::OutboxDrainRunner<S, P>
     where
-        S: crate::OutboxStore,
+        S: crate::outbox_worker::OutboxStore,
         P: crate::bus::MessagePublisher,
     {
-        crate::OutboxDrainRunner::for_store(store, publisher, max_attempts)
+        crate::outbox_worker::OutboxDrainRunner::for_store(store, publisher, max_attempts)
     }
 }
 
@@ -194,9 +194,10 @@ mod tests {
             "{deliveries:?}"
         );
     }
+    use crate::outbox::{OutboxMessage, OutboxMessageStatus};
     use crate::{
-        sourced, AggregateBuilder, Entity, InMemoryRepository, OutboxMessage, OutboxMessageStatus,
-        Queueable, Snapshot, TransactionalCommit,
+        sourced, AggregateBuilder, Entity, InMemoryRepository, Queueable, Snapshot,
+        TransactionalCommit,
     };
 
     #[derive(Default)]
@@ -214,10 +215,10 @@ mod tests {
         }
     }
 
-    #[derive(Deserialize, crate::CommandInput)]
+    #[derive(Deserialize, crate::command::CommandInput)]
     struct Touch {}
 
-    #[derive(Serialize, crate::CommandOutput)]
+    #[derive(Serialize, crate::command::CommandOutput)]
     struct Touched {
         ok: bool,
     }
@@ -389,7 +390,7 @@ mod tests {
         let bus = InMemoryBus::new();
         let handle = Service::outbox_drain(
             store.clone(),
-            crate::BusPublisher::new(std::sync::Arc::new(bus.clone())),
+            crate::outbox_worker::BusPublisher::new(std::sync::Arc::new(bus.clone())),
             5,
         )
         .with_poll_interval(std::time::Duration::from_millis(5))

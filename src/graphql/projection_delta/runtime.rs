@@ -21,6 +21,7 @@ use super::{
     ProjectionDeltaScope, ProjectionDeltaSurfaceIdentity,
 };
 use crate::command_ledger::{CausationId, PrincipalPartitionId};
+use crate::domain_event::DomainEventOccurrence;
 use crate::graphql::client_manifest::DistributedClientSurfaceExport;
 use crate::graphql::protocol::{
     CommandProjectionLifecycleProofV1, CommandProjectionMetadataV1, CommandProjectionObligationV1,
@@ -29,17 +30,16 @@ use crate::graphql::protocol::{
 };
 use crate::graphql::surface::{Surface, SurfaceModeledProjection};
 use crate::projection::placement::{ProjectionBinding, ProjectionExecutorRoute};
+use crate::projection::{
+    ProjectionEventSelector, ProjectionProgram, ProjectionRelationshipEffectKind,
+    ResolvedProjectionKey, ResolvedProjectionMutation, ResolvedProjectionPartition,
+    ResolvedProjectionPartitionRef, ResolvedProjectionPlan, ResolvedProjectionRelationshipEffect,
+};
 use crate::projection_protocol::{
     ProjectionCausationEvidenceBatch, ProjectionObservation, ProjectionObservationKind,
     ProjectionScopeCodec, ProjectorTopologyId, RecordKey, RecordKeyField,
 };
 use crate::table::ColumnType;
-use crate::{
-    DomainEventOccurrence, ProjectionEventSelector, ProjectionProgram,
-    ProjectionRelationshipEffectKind, ResolvedProjectionKey, ResolvedProjectionMutation,
-    ResolvedProjectionPartition, ResolvedProjectionPartitionRef, ResolvedProjectionPlan,
-    ResolvedProjectionRelationshipEffect,
-};
 
 /// Maximum lifetime of a request-scoped modeled projection authority.
 ///
@@ -1490,7 +1490,7 @@ fn delta_value_json(
 }
 
 fn projection_value_json(
-    value: crate::ProjectionValueRef<'_>,
+    value: crate::projection::ProjectionValueRef<'_>,
 ) -> Result<serde_json::Value, ProjectionRuntimeAuthorityError> {
     let delta = super::DeltaValue::try_from_projection_ref(value)
         .map_err(ProjectionRuntimeAuthorityError::Delta)?;
@@ -1934,12 +1934,11 @@ fn evaluate_complete_after_policy(
             .iter()
             .find(|field| field.name() == column.field_name)
             .and_then(|field| match field.value() {
-                crate::ResolvedProjectionValue::Value(value) => {
+                crate::projection::ResolvedProjectionValue::Value(value) => {
                     projection_value_json(value.as_ref()).ok()
                 }
-                crate::ResolvedProjectionValue::Absent | crate::ResolvedProjectionValue::Unset => {
-                    None
-                }
+                crate::projection::ResolvedProjectionValue::Absent
+                | crate::projection::ResolvedProjectionValue::Unset => None,
             })
             .or_else(|| {
                 mutation

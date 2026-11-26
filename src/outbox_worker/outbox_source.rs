@@ -167,11 +167,10 @@ mod tests {
     use super::*;
     use crate::bus::{run_source, RunOptions};
     use crate::microsvc::Service;
+    use crate::outbox::{OutboxMessage, OutboxMessageStatus};
     use crate::outbox_worker::testing::block_on;
-    use crate::{
-        CommitBatch, InMemoryRepository, OutboxMessage, OutboxMessageStatus, OutboxStore,
-        TransactionalCommit,
-    };
+    use crate::outbox_worker::OutboxStore;
+    use crate::{CommitBatch, InMemoryRepository, TransactionalCommit};
     use serde_json::json;
 
     fn store_row(repo: &InMemoryRepository, id: &str, name: &str) {

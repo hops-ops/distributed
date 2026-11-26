@@ -6,7 +6,7 @@
 //!   (cd tests/celld/fact-worker && worker-build --release)
 //!   cargo test -p distributed_game --features celld,runtime --test celld_zone_state
 
-use distributed::cell_host::InternalHttpSecret;
+use distributed::microsvc::cell_host::InternalHttpSecret;
 use distributed_game::celld::CellZoneStateStore;
 use distributed_game::world::zone_state::ZONE_STATE_INLINE_MAX;
 use distributed_game::world::{state_store_conformance, StoredZoneState, ZoneStateStore};

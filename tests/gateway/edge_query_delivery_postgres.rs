@@ -5,7 +5,9 @@ use distributed::microsvc::Session;
 use serde_json::{json, Value};
 use std::time::Duration;
 
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, distributed::ReadModel)]
+#[derive(
+    Clone, Debug, serde::Serialize, serde::Deserialize, distributed::read_model::ReadModel,
+)]
 #[readmodel(table = "gateway_replica_views", primary_key = ["id"])]
 struct ReplicaView {
     id: String,

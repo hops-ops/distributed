@@ -5,13 +5,13 @@
 use serde_json::{json, Value};
 use worker::*;
 
-#[derive(serde::Deserialize, distributed::CommandInput)]
+#[derive(serde::Deserialize, distributed::command::CommandInput)]
 pub struct BatchInput {
     pub todo_id: String,
     pub title: String,
 }
 
-#[derive(serde::Serialize, distributed::CommandOutput)]
+#[derive(serde::Serialize, distributed::command::CommandOutput)]
 pub struct BatchPayload {
     pub title: String,
 }

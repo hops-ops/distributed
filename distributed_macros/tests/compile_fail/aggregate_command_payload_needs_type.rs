@@ -1,7 +1,7 @@
 use distributed::{sourced, Entity};
 use serde::Deserialize;
 
-#[derive(Debug, Deserialize, distributed::CommandInput)]
+#[derive(Debug, Deserialize, distributed::command::CommandInput)]
 pub struct EquipInput {
     pub hero_id: String,
 }

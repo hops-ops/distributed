@@ -1,16 +1,22 @@
-use distributed::{command::CommandEventSet, AggregateBuilder, DomainEvent};
+use distributed::command::CommandEventSet;
+use distributed::domain_event::DomainEvent;
+use distributed::AggregateBuilder;
 
 mod facts {
     use serde::{Deserialize, Serialize};
 
-    #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, distributed::DomainEvent)]
+    #[derive(
+        Clone, Debug, PartialEq, Serialize, Deserialize, distributed::domain_event::DomainEvent,
+    )]
     #[domain_event(name = "repository.branch_created", version = 2)]
     pub struct BranchCreated {
         pub repository_id: String,
         pub name: String,
     }
 
-    #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, distributed::DomainEvent)]
+    #[derive(
+        Clone, Debug, PartialEq, Serialize, Deserialize, distributed::domain_event::DomainEvent,
+    )]
     #[domain_event(name = "repository.tag_created", version = 1)]
     pub struct TagCreated {
         pub repository_id: String,

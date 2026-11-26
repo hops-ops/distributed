@@ -5,7 +5,7 @@
 use async_graphql::{Request, Variables};
 use distributed::graphql::IdentityConfig;
 use distributed::graphql::{col, read, GraphqlEngine, ModelPermissions};
-use distributed::ReadModel;
+use distributed::read_model::ReadModel;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 

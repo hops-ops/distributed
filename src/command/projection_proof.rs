@@ -4,11 +4,11 @@ use sha2::{Digest, Sha256};
 
 use super::outcomes::CommandConsistency;
 use crate::projection::lower::LoweredProjectionPlan;
+use crate::projection::{MutationKind, ResolvedProjectionValue};
 use crate::read_model::RelationalReadModel;
 use crate::table::{
     RowKey, RowValue, RowValues, RowWriteMode, TableMutation, TableStoreError, TableWritePlan,
 };
-use crate::{MutationKind, ResolvedProjectionValue};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum CommandCommitProofError {

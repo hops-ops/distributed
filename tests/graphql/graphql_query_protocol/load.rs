@@ -64,24 +64,25 @@ async fn separate_origin_and_client_savings() {
     use std::collections::BTreeMap;
     let gate = Arc::new(tokio::sync::Semaphore::new(10000));
     let gate_layer = gate.clone();
-    let gql = distributed::graphql::graphql_router_composed(engine.clone(), None, None).layer(
-        middleware::from_fn(move |request: HttpRequest, next: Next| {
-            let gate = gate_layer.clone();
-            async move {
-                if request.method() != axum::http::Method::POST {
-                    return next.run(request).await;
+    let gql = distributed::graphql::http::graphql_router_composed(engine.clone(), None, None)
+        .layer(middleware::from_fn(
+            move |request: HttpRequest, next: Next| {
+                let gate = gate_layer.clone();
+                async move {
+                    if request.method() != axum::http::Method::POST {
+                        return next.run(request).await;
+                    }
+                    let (parts, body) = request.into_parts();
+                    let bytes = axum::body::to_bytes(body, 1024 * 1024).await.unwrap();
+                    let value: Value = serde_json::from_slice(&bytes).unwrap();
+                    if value["extensions"]["gatewayDelivery"]["action"] != "validate" {
+                        gate.acquire().await.unwrap().forget();
+                    }
+                    next.run(HttpRequest::from_parts(parts, Body::from(bytes)))
+                        .await
                 }
-                let (parts, body) = request.into_parts();
-                let bytes = axum::body::to_bytes(body, 1024 * 1024).await.unwrap();
-                let value: Value = serde_json::from_slice(&bytes).unwrap();
-                if value["extensions"]["gatewayDelivery"]["action"] != "validate" {
-                    gate.acquire().await.unwrap().forget();
-                }
-                next.run(HttpRequest::from_parts(parts, Body::from(bytes)))
-                    .await
-            }
-        }),
-    );
+            },
+        ));
     let observed = engine.clone();
     let counters = versions.clone();
     let release = gate.clone();

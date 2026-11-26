@@ -29,17 +29,22 @@ use std::time::{Duration, SystemTime};
 use serde::{Deserialize, Serialize};
 
 use distributed::bus::Message;
+use distributed::clock::ManualClock;
 use distributed::command::{typed_command, PreparedCommand, Succeeded};
 use distributed::microsvc::schedule::{ScheduleWorker, ScheduleWorkerConfig};
 use distributed::microsvc::{
     CausalCommandContext, HandlerError, PortableCommand, Routes, Service, TRANSPORT_ROLE,
 };
+use distributed::outbox::OutboxMessage;
+use distributed::outbox_worker::{ClaimOutboxMessages, OutboxClaimRef, OutboxStore};
+use distributed::saga::{
+    Saga, SagaAction, SagaCommand, SagaDefinition, SagaError, SagaMessage, SagaOutcome, SagaReply,
+    SagaRunner, SagaStatus, SagaStep,
+};
 use distributed::saga::{SagaCursor, SagaTimeout, SagaTimeouts, SAGA_TIMEOUT_SCHEDULE};
 use distributed::{
-    sourced, Aggregate, AggregateBuilder, AggregateRepository, ClaimOutboxMessages, Entity,
-    InMemoryOutboxStore, InMemoryRepository, ManualClock, OutboxClaimRef, OutboxMessage,
-    OutboxStore, Saga, SagaAction, SagaCommand, SagaDefinition, SagaError, SagaMessage,
-    SagaOutcome, SagaReply, SagaRunner, SagaStatus, SagaStep, StreamIdentity,
+    sourced, Aggregate, AggregateBuilder, AggregateRepository, Entity, InMemoryOutboxStore,
+    InMemoryRepository, StreamIdentity,
 };
 
 // ===========================================================================
@@ -85,7 +90,7 @@ impl Wallet {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize, distributed::CommandInput)]
+#[derive(Debug, Serialize, Deserialize, distributed::command::CommandInput)]
 struct MoveCmd {
     transfer: String,
     wallet: String,
@@ -185,7 +190,7 @@ const WALLET_COMMANDS: [&str; 4] = [
     "wallet.reverse_credit",
 ];
 
-#[derive(Debug, Serialize, distributed::CommandOutput)]
+#[derive(Debug, Serialize, distributed::command::CommandOutput)]
 struct MoveOutcome {
     applied: bool,
 }
