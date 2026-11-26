@@ -2,14 +2,20 @@
 //! test: its own temp project, port and process tree (killed on drop; only
 //! processes this harness started). Skips (returns `None`) when the worker
 //! is not built or celld cannot start, unless `CELLD_FACTS_REQUIRED=1`.
+//! The port comes from [`ports`] (picked outside the ephemeral ranges; a
+//! start whose listener bind finds it taken is retried on a fresh one).
 
 #![allow(dead_code)]
 
 use std::io::Write as _;
-use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
+
+#[path = "ports.rs"]
+pub mod ports;
+
+use ports::LaunchError;
 
 pub const SECRET: &str = "test-only-internal-secret-change-me-2026";
 
@@ -55,18 +61,17 @@ impl Celld {
         ));
         copy_dir(&build, &project.join("build"));
         std::fs::copy(dir.join("wrangler.jsonc"), project.join("wrangler.jsonc")).unwrap();
-        let port = TcpListener::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port();
         let mut celld = Self {
             project,
-            port,
+            port: 0,
             child: None,
             generation: 0,
         };
-        if let Err(reason) = celld.start() {
+        let started = ports::on_free_port(|port| {
+            celld.port = port;
+            celld.launch()
+        });
+        if let Err(reason) = started {
             assert!(
                 std::env::var_os(required).is_none(),
                 "celld dev is required but did not start: {reason}"
@@ -81,15 +86,23 @@ impl Celld {
         format!("http://127.0.0.1:{}", self.port)
     }
 
-    /// Start `celld dev`; `Err` when it is unavailable or exits early (no
-    /// celld on PATH, or no esbuild for its bundler).
+    /// Start `celld dev` again on the same port (after [`crash`](Self::crash));
+    /// `Err` when it is unavailable or exits early (no celld on PATH, or no
+    /// esbuild for its bundler).
     pub fn start(&mut self) -> Result<(), String> {
+        self.launch().map_err(|error| error.to_string())
+    }
+
+    /// Start `celld dev` on `self.port`; [`LaunchError::PortTaken`] when its
+    /// listener could not bind it.
+    fn launch(&mut self) -> Result<(), LaunchError> {
         self.generation += 1;
+        let failed = LaunchError::Failed;
         let binary = std::env::var("CELLD_BIN").unwrap_or_else(|_| "celld".into());
         let help = Command::new(&binary)
             .args(["dev", "--help"])
             .output()
-            .map_err(|error| format!("cannot run `{binary}`: {error}"))?;
+            .map_err(|error| failed(format!("cannot run `{binary}`: {error}")))?;
         let mut args = vec![
             "dev".to_string(),
             self.project.display().to_string(),
@@ -114,7 +127,7 @@ impl Celld {
             .stdout(log.try_clone().unwrap())
             .stderr(log)
             .spawn()
-            .map_err(|error| format!("cannot start `{binary} dev`: {error}"))?;
+            .map_err(|error| failed(format!("cannot start `{binary} dev`: {error}")))?;
         self.child = Some(child);
         let deadline = Instant::now() + Duration::from_secs(90);
         while Instant::now() < deadline {
@@ -130,17 +143,22 @@ impl Celld {
             if let Some(status) = exited {
                 self.child = None;
                 let log = std::fs::read_to_string(&log_path).unwrap_or_default();
-                return Err(format!(
+                let why = format!(
                     "celld dev exited ({status}): {}",
                     log.lines().rev().take(3).collect::<Vec<_>>().join(" | ")
-                ));
+                );
+                return Err(if ports::listener_taken(&log, self.port) {
+                    LaunchError::PortTaken(why)
+                } else {
+                    failed(why)
+                });
             }
             std::thread::sleep(Duration::from_millis(200));
         }
-        Err(format!(
+        Err(failed(format!(
             "celld dev did not become ready; logs in {}",
             self.project.display()
-        ))
+        )))
     }
 
     /// Kill the launcher this test started and every descendant.

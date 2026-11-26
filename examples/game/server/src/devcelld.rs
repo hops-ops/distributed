@@ -9,9 +9,11 @@
 //! - `CELLD_ESBUILD` (celld's bundler) is inherited from the environment.
 //! - State lives in `{project}/.celld/dev` and survives [`DevCelld::restart`]
 //!   (crash-recovery tests).
+//! - The port comes from the celld launchers' shared [`ports`] (celld has no
+//!   `--port 0`): picked outside the ephemeral ranges, and a launch whose
+//!   listener bind finds the port taken is retried on a fresh one.
 
 use std::io::Write as _;
-use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -26,13 +28,10 @@ pub fn cells_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../cells")
 }
 
-/// A free local port (bound then released).
-pub fn free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .and_then(|listener| listener.local_addr())
-        .map(|addr| addr.port())
-        .expect("free port")
-}
+#[path = "../../../../distributed_game/tests/support/ports.rs"]
+pub mod ports;
+
+use ports::LaunchError;
 
 /// A random `test-only-…` internal secret (the Queue relay accepts plain
 /// HTTP to localhost only with a `test-only-` secret).
@@ -85,6 +84,21 @@ impl DevCelld {
         relay_url: Option<String>,
         vars: &[(&str, &str)],
     ) -> Result<Self, String> {
+        Self::in_project_on(
+            project,
+            relay_url,
+            vars,
+            std::iter::repeat_with(ports::free_port),
+        )
+    }
+
+    /// [`in_project_with`](Self::in_project_with) trying `ports` in order.
+    fn in_project_on(
+        project: &Path,
+        relay_url: Option<String>,
+        vars: &[(&str, &str)],
+        ports: impl IntoIterator<Item = u16>,
+    ) -> Result<Self, String> {
         let build = cells_dir().join("build");
         if !build.join("worker/shim.mjs").exists() {
             return Err(format!(
@@ -102,7 +116,7 @@ impl DevCelld {
         .map_err(|e| format!("wrangler.jsonc: {e}"))?;
         let mut celld = Self {
             project: project.to_path_buf(),
-            port: free_port(),
+            port: 0,
             secret: test_secret(),
             ticket_secret: test_secret(),
             vars: vars
@@ -114,7 +128,10 @@ impl DevCelld {
             generation: 0,
             keep: true,
         };
-        celld.launch()?;
+        ports::on_ports(ports, |port| {
+            celld.port = port;
+            celld.launch()
+        })?;
         Ok(celld)
     }
 
@@ -153,13 +170,16 @@ impl DevCelld {
         &self.project
     }
 
-    fn launch(&mut self) -> Result<(), String> {
+    /// Start celld on `self.port`; [`LaunchError::PortTaken`] when its
+    /// listener could not bind it.
+    fn launch(&mut self) -> Result<(), LaunchError> {
         self.generation += 1;
+        let failed = LaunchError::Failed;
         let binary = std::env::var(CELLD_BIN_ENV).map_err(|_| {
-            format!(
+            failed(format!(
                 "{CELLD_BIN_ENV} is not set: the demos' cells run on celld (the version in \
                  .celld-version); point {CELLD_BIN_ENV} at the celld binary"
-            )
+            ))
         })?;
         let mut vars = format!(
             "DISTRIBUTED_INTERNAL_SECRET={}\nGAME_TICKET_SECRET={}\n",
@@ -172,9 +192,10 @@ impl DevCelld {
             vars.push_str(&format!("CELLD_QUEUE_RELAY_URL={relay}\n"));
         }
         std::fs::write(self.project.join(".dev.vars"), vars)
-            .map_err(|e| format!(".dev.vars: {e}"))?;
+            .map_err(|e| failed(format!(".dev.vars: {e}")))?;
         let log_path = self.project.join(format!("celld-{}.log", self.generation));
-        let log = std::fs::File::create(&log_path).map_err(|e| e.to_string())?;
+        let log = std::fs::File::create(&log_path).map_err(|e| failed(e.to_string()))?;
+        let stdout = log.try_clone().map_err(|e| failed(e.to_string()))?;
         let mut command = Command::new(&binary);
         command
             .arg("dev")
@@ -190,11 +211,11 @@ impl DevCelld {
                 std::env::var("CELLD_REBALANCE_INTERVAL_MS").unwrap_or_else(|_| "0".into()),
             )
             .stdin(Stdio::null())
-            .stdout(log.try_clone().map_err(|e| e.to_string())?)
+            .stdout(stdout)
             .stderr(log);
         let child = command
             .spawn()
-            .map_err(|error| format!("cannot start `{binary} dev`: {error}"))?;
+            .map_err(|error| failed(format!("cannot start `{binary} dev`: {error}")))?;
         self.child = Some(child);
         let deadline = Instant::now() + Duration::from_secs(90);
         while Instant::now() < deadline {
@@ -208,17 +229,22 @@ impl DevCelld {
             if let Some(status) = exited {
                 self.child = None;
                 let log = std::fs::read_to_string(&log_path).unwrap_or_default();
-                return Err(format!(
+                let why = format!(
                     "celld dev exited ({status}): {}",
                     log.lines().rev().take(5).collect::<Vec<_>>().join(" | ")
-                ));
+                );
+                return Err(if ports::listener_taken(&log, self.port) {
+                    LaunchError::PortTaken(why)
+                } else {
+                    failed(why)
+                });
             }
             std::thread::sleep(Duration::from_millis(100));
         }
-        Err(format!(
+        Err(failed(format!(
             "celld dev did not become ready; logs in {}",
             self.project.display()
-        ))
+        )))
     }
 
     /// Kill the launcher and every descendant (a crash: no graceful
@@ -248,10 +274,12 @@ impl DevCelld {
         }
     }
 
-    /// Crash and start again on the same project, port and secret.
+    /// Crash and start again on the same project, port and secret (the
+    /// services hold the URL, so the port cannot change: [`ports::PORTS`]
+    /// keeps the kernel from handing it out while celld is down).
     pub fn restart(&mut self) -> Result<(), String> {
         self.crash();
-        self.launch()
+        self.launch().map_err(|error| error.to_string())
     }
 }
 
@@ -320,4 +348,84 @@ fn http_status(port: u16, path: &str) -> Option<u16> {
     let mut response = String::new();
     stream.read_to_string(&mut response).ok()?;
     response.split_whitespace().nth(1)?.parse().ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ports::{self, LaunchError};
+    use super::DevCelld;
+
+    /// celld's own output when its listener port is held (celld 0.6.3).
+    const TAKEN: &str = "Error: the local node exited before it announced its operator listener\n\
+        Error: bind --listen 127.0.0.1:40073\n\nCaused by:\n    Address already in use (os error 98)";
+
+    #[test]
+    fn only_a_conflict_on_our_own_port_counts_as_taken() {
+        assert!(ports::listener_taken(TAKEN, 40073));
+        assert!(!ports::listener_taken(TAKEN, 4007));
+        assert!(!ports::listener_taken(
+            "Error: bind --listen 127.0.0.1:40073: permission denied",
+            40073
+        ));
+        assert!(!ports::listener_taken("Error: no esbuild", 40073));
+    }
+
+    #[test]
+    fn a_taken_port_is_retried_and_any_other_failure_is_not() {
+        let mut tried = Vec::new();
+        let port = ports::on_ports([1, 2, 3], |port| {
+            tried.push(port);
+            if port < 3 {
+                Err(LaunchError::PortTaken("taken".into()))
+            } else {
+                Ok(port)
+            }
+        });
+        assert_eq!((port, tried), (Ok(3), vec![1, 2, 3]));
+
+        let mut calls = 0;
+        let failed = ports::on_ports([1, 2, 3], |_| -> Result<(), _> {
+            calls += 1;
+            Err(LaunchError::Failed("no esbuild".into()))
+        });
+        assert_eq!((failed, calls), (Err("no esbuild".into()), 1));
+
+        let mut calls = 0;
+        let exhausted = ports::on_free_port(|_| -> Result<(), _> {
+            calls += 1;
+            Err(LaunchError::PortTaken("taken".into()))
+        });
+        assert!(exhausted.unwrap_err().starts_with("every port was taken"));
+        assert_eq!(calls, ports::ATTEMPTS);
+    }
+
+    #[test]
+    fn free_ports_stay_out_of_the_ephemeral_ranges() {
+        for _ in 0..100 {
+            assert!(ports::PORTS.contains(&ports::free_port()));
+        }
+    }
+
+    /// The race itself, made certain: another process already listens on
+    /// the port celld is given. celld exits with the bind conflict and the
+    /// launch goes on to a fresh port.
+    #[test]
+    fn celld_starts_when_its_first_port_is_taken() {
+        let thief = std::net::TcpListener::bind("127.0.0.1:0").expect("hold a port");
+        let held = thief.local_addr().unwrap().port();
+        let project = std::env::temp_dir().join(format!(
+            "game-demo-celld-taken-{}",
+            crate::common::random_hex(8)
+        ));
+        let ports = std::iter::once(held).chain(std::iter::repeat_with(ports::free_port));
+        let celld = DevCelld::in_project_on(&project, None, &[], ports)
+            .unwrap_or_else(|error| panic!("celld dev: {error}"));
+        assert_ne!(celld.port, held);
+        assert!(celld.url().ends_with(&celld.port.to_string()));
+        let first = std::fs::read_to_string(project.join("celld-1.log")).unwrap();
+        assert!(ports::listener_taken(&first, held), "first launch: {first}");
+        assert_eq!(celld.generation, 2);
+        drop(celld);
+        let _ = std::fs::remove_dir_all(&project);
+    }
 }
