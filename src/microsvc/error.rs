@@ -39,14 +39,21 @@ pub enum HandlerError {
     /// An explicitly repaired partition is waiting for its exact failed input;
     /// unrelated delivery must remain retryable and cannot invoke the handler.
     ProjectionRepairPending { failure_id: String },
-    /// The terminal failure is already durable. The transport must retain this
-    /// exact delivery and stop so an operator can repair then restart.
-    ProjectionTerminalRecorded { repair: ProjectionRepairHandle },
-    /// A permanent causal-projector failure could not be represented by a
-    /// durable terminal record. The transport must retain this exact delivery
-    /// and stop rather than applying an ordinary dead-letter/drop policy across
-    /// an unproven causal gap.
-    ProjectionDeliveryHalted { source: Box<HandlerError> },
+    /// The terminal failure of `projection` is already durable. The
+    /// projector's consumer must retain this exact delivery and stop so an
+    /// operator can repair then restart. Other projectors keep consuming.
+    ProjectionTerminalRecorded {
+        projection: String,
+        repair: ProjectionRepairHandle,
+    },
+    /// A permanent failure of `projection` could not be represented by a
+    /// durable terminal record. The projector's consumer must retain this
+    /// exact delivery and stop rather than applying an ordinary
+    /// dead-letter/drop policy across an unproven causal gap.
+    ProjectionDeliveryHalted {
+        projection: String,
+        source: Box<HandlerError>,
+    },
     /// Other error.
     Other(Box<dyn Error + Send + Sync>),
 }
@@ -72,13 +79,14 @@ impl fmt::Display for HandlerError {
                 f,
                 "projection repair is waiting for exact failed input `{failure_id}`"
             ),
-            HandlerError::ProjectionTerminalRecorded { repair } => write!(
+            HandlerError::ProjectionTerminalRecorded { projection, repair } => write!(
                 f,
-                "projection terminal failure `{}` was recorded; retain delivery and stop; repair handle: {repair}",
+                "projection `{projection}` terminal failure `{}` was recorded; retain delivery and stop; repair handle: {repair}",
                 repair.failure_id()
             ),
-            HandlerError::ProjectionDeliveryHalted { .. } => f.write_str(
-                "causal projector delivery halted before a durable terminal record was available; retain delivery and stop",
+            HandlerError::ProjectionDeliveryHalted { projection, .. } => write!(
+                f,
+                "projection `{projection}` delivery halted before a durable terminal record was available; retain delivery and stop",
             ),
             HandlerError::Other(e) => write!(f, "handler error: {}", e),
         }
@@ -90,7 +98,7 @@ impl Error for HandlerError {
         match self {
             HandlerError::Repository(e) => Some(e),
             HandlerError::Projection(e) => Some(e),
-            HandlerError::ProjectionDeliveryHalted { source } => Some(source.as_ref()),
+            HandlerError::ProjectionDeliveryHalted { source, .. } => Some(source.as_ref()),
             HandlerError::Other(e) => Some(e.as_ref()),
             _ => None,
         }
@@ -144,7 +152,7 @@ impl HandlerError {
     /// terminal projector failure.
     pub fn projection_repair_handle(&self) -> Option<&ProjectionRepairHandle> {
         match self {
-            Self::ProjectionTerminalRecorded { repair } => Some(repair),
+            Self::ProjectionTerminalRecorded { repair, .. } => Some(repair),
             _ => None,
         }
     }

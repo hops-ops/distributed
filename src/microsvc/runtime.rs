@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use super::service::DynBusPublisher;
 use super::Service;
-use crate::bus::{Bus, BusConsumer, RunOptions, TransportError};
+use crate::bus::{Bus, BusConsumer, MessageRouter, RunOptions, TransportError};
 
 /// Default lease for an immediate after-commit outbox publish. Short by design:
 /// it only needs to cover commit → publish, so a crash before the publish
@@ -68,8 +68,14 @@ impl Service {
 
     /// Run against the bus attached with [`with_bus`](Self::with_bus): consume
     /// the registered command names (competing `listen`) and event names
-    /// (fan-out `subscribe`) concurrently on the caller's runtime. Returns when
-    /// the consumers stop (a pull source that drains, or the first error).
+    /// (fan-out `subscribe`) concurrently on the caller's runtime. The event
+    /// handlers share one consumer and every projector has its own
+    /// ([`projector_consumers`](Self::projector_consumers)).
+    ///
+    /// Returns when the consumers stop: a pull source that drains, or the
+    /// first error. A projector that stops on a terminal failure does not end
+    /// the run: the other consumers keep going, and the run returns that
+    /// projector's error when they have stopped.
     ///
     /// Producing is handled on the commit path — `repo.outbox(msg).commit(agg)`
     /// publishes immediately once a bus is attached.
@@ -112,9 +118,13 @@ impl Service {
 /// bus for `'b`.
 type ConsumerFuture<'b> = Pin<Box<dyn Future<Output = Result<(), TransportError>> + Send + 'b>>;
 
-/// Drive a service's command/event consumers concurrently on the caller's
-/// runtime — no spawn, no timer. Returns on the first error; finishes when all
-/// consumers stop.
+/// Drive a service's consumers concurrently on the caller's runtime — no
+/// spawn, no timer: one for its commands, one for its event handlers, and one
+/// per projector. Finishes when all consumers stop.
+///
+/// A consumer error ends the run at once, except a projector's terminal stop:
+/// that projector's consumer ends alone, and its error is returned once the
+/// others have finished.
 async fn run_consumers<'b, B>(
     bus: &'b B,
     service: Arc<Service>,
@@ -123,15 +133,23 @@ async fn run_consumers<'b, B>(
 where
     B: Bus + BusConsumer,
 {
-    let plan = service.subscription_plan();
+    let plan = MessageRouter::subscription_plan(service.as_ref());
     let mut consumers: Vec<ConsumerFuture<'b>> = Vec::new();
     if !plan.commands.is_empty() {
         consumers.push(Box::pin(bus.listen(Arc::clone(&service), options.clone())));
     }
     if !plan.events.is_empty() {
-        consumers.push(Box::pin(bus.subscribe(Arc::clone(&service), options)));
+        consumers.push(Box::pin(
+            bus.subscribe(Arc::clone(&service), options.clone()),
+        ));
+    }
+    for projector in service.projector_consumers() {
+        consumers.push(Box::pin(
+            bus.subscribe(Arc::new(projector), options.clone()),
+        ));
     }
 
+    let mut stopped: Option<TransportError> = None;
     poll_fn(move |cx| {
         let mut index = 0;
         while index < consumers.len() {
@@ -140,12 +158,22 @@ where
                     // Drop the finished consumer future; nothing left to poll.
                     let _finished = consumers.remove(index);
                 }
+                // A projector's terminal stop: its delivery is retained and
+                // only an operator's repair changes that, so the other
+                // consumers keep running.
+                Poll::Ready(Err(error))
+                    if error.is_permanent() && error.should_retain_and_stop() =>
+                {
+                    tracing::error!(%error, "a projector consumer stopped; the others keep running");
+                    let _stopped = consumers.remove(index);
+                    stopped.get_or_insert(error);
+                }
                 Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
                 Poll::Pending => index += 1,
             }
         }
         if consumers.is_empty() {
-            Poll::Ready(Ok(()))
+            Poll::Ready(stopped.take().map_or(Ok(()), Err))
         } else {
             Poll::Pending
         }

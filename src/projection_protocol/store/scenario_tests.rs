@@ -1229,8 +1229,9 @@ pub(crate) async fn source_capability_mismatch_outranks_message_id_reuse(
     ));
 }
 
-/// A partition's change epoch is part of its scope. A writer naming another
-/// epoch is told which scope field disagrees.
+/// A partition's change epoch is part of its scope. A commit naming another
+/// epoch is told which scope field disagrees. The failure that follows is
+/// still recorded, in the partition's stored epoch, and stops the partition.
 pub(crate) async fn change_epoch_is_fixed_per_partition(scenario: impl ProjectionProtocolScenario) {
     let repository = scenario.repository().await;
     repository
@@ -1258,32 +1259,44 @@ pub(crate) async fn change_epoch_is_fixed_per_partition(scenario: impl Projectio
     let mut batch = scenario.batch(next.clone(), Vec::new(), Vec::new());
     batch.change_epoch = other_epoch.clone();
 
-    let is_epoch_mismatch = |error: ProjectionProtocolError| {
-        matches!(
-            error,
-            ProjectionProtocolError::ScopeMismatch {
-                field: "projection change epoch"
-            }
+    assert!(matches!(
+        repository.commit_projection(batch).await.unwrap_err(),
+        ProjectionProtocolError::ScopeMismatch {
+            field: "projection change epoch"
+        }
+    ));
+    let failure_id = scenario.failure_id("epoch-failure");
+    let failure_batch = || {
+        ProjectionFailureBatch::new(
+            next.clone(),
+            other_epoch.clone(),
+            &failure_id,
+            "commit_projection",
+            b"projection change epoch".to_vec(),
         )
+        .unwrap()
     };
-    assert!(is_epoch_mismatch(
-        repository.commit_projection(batch).await.unwrap_err()
-    ));
-    assert!(is_epoch_mismatch(
+    let failure = repository
+        .record_projection_failure(failure_batch())
+        .await
+        .unwrap();
+    assert_eq!(failure.change, scenario.change_cursor(2));
+    assert_eq!(
         repository
-            .record_projection_failure(
-                ProjectionFailureBatch::new(
-                    next,
-                    other_epoch,
-                    &scenario.failure_id("epoch-failure"),
-                    "decode_error",
-                    b"bad payload".to_vec(),
-                )
-                .unwrap(),
-            )
+            .record_projection_failure(failure_batch())
             .await
-            .unwrap_err()
-    ));
+            .unwrap(),
+        failure,
+        "recording the same failure again is idempotent"
+    );
+    assert_eq!(
+        repository
+            .projection_partition_runtime_state(&scenario.topology(), &scenario.partition())
+            .await
+            .unwrap()
+            .and_then(|state| state.stopped_failure_id),
+        Some(failure_id)
+    );
 }
 
 fn assert_query_snapshot_is_coherent(snapshot: &ProjectionQuerySnapshot) {

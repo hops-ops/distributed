@@ -656,8 +656,12 @@ where
                 .map_err(|error| protocol_storage_error::<DB>("begin projection failure", error))?;
             verify_registered_topology_in_tx(&mut tx, self.verified_registrations(), &topology)
                 .await?;
+            // A failure is recorded in the partition's stored epoch: the
+            // projector that cannot write under its declared epoch must still
+            // be able to stop its partition durably.
             let mut state =
-                lock_partition_in_tx(&mut tx, &topology, &partition, &batch.change_epoch).await?;
+                lock_stored_partition_in_tx(&mut tx, &topology, &partition, &batch.change_epoch)
+                    .await?;
             validate_input_identity_in_tx(&mut tx, &batch.input).await?;
             ensure_active_input(&batch.input, state.active_generation, None)?;
             if let Some(stopped) = &state.stopped_failure_id {

@@ -34,6 +34,16 @@ pub trait MessageRouter: Send + Sync {
         None
     }
 
+    /// Names this router's consumer within its group, for a service that
+    /// consumes through several durable consumers (one per projector).
+    ///
+    /// A transport appends it to the group it resolved, whether that came
+    /// from [`consumer_group`](Self::consumer_group) or from the bus's own
+    /// configuration, so two scopes never share a cursor.
+    fn consumer_scope(&self) -> Option<&str> {
+        None
+    }
+
     /// Whether this router has a handler for `(kind, name)`. The runner acks and
     /// ignores a delivered message it does not handle rather than dead-lettering it.
     fn handles(&self, kind: MessageKind, name: &str) -> bool;

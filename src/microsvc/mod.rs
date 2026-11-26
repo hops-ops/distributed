@@ -99,6 +99,7 @@ pub use descriptor::{
 };
 pub use error::HandlerError;
 pub use lifecycle::LifecycleGate;
+pub use message_router::ProjectorConsumer;
 pub use projector::{
     CausalProjectorContext, CausalProjectorRouteBuilder, LoadedProjection, ProjectionRepairHandle,
     ProjectionRepairHandleParseError,

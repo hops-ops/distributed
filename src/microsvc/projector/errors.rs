@@ -5,7 +5,7 @@ use crate::projection_protocol::{
     CompiledProjectionTopology, PartitionId, ProjectionEpoch, ProjectionFailureBatch,
     ProjectionGeneration, ProjectionInputCursor, ProjectionInputFingerprint,
     ProjectionPartitionRuntimeState, ProjectionProtocolError, ProjectionProtocolStore,
-    TrustedProjectionInput,
+    ProjectorTopologyId, TrustedProjectionInput,
 };
 
 use super::super::HandlerError;
@@ -76,19 +76,20 @@ pub(super) fn preflight_runtime_state(
     let Some(state) = state else {
         return Ok(ProjectionGeneration::initial());
     };
+    let topology = cursor.topology();
     if let Some(failure_id) = &state.stopped_failure_id {
-        return Err(terminal_recorded(failure_id.clone()));
+        return Err(terminal_recorded(topology, failure_id.clone()));
     }
     if let Some(pending) = &state.pending_retry {
         if &pending.input != cursor {
-            return Err(terminal_recorded(pending.failure_id.clone()));
+            return Err(terminal_recorded(topology, pending.failure_id.clone()));
         }
         if pending.input_fingerprint != fingerprint
             || pending.message_id != message_id
             || pending.causation_id != causation_id
             || pending.gap_free != gap_free
         {
-            return Err(terminal_recorded(pending.failure_id.clone()));
+            return Err(terminal_recorded(topology, pending.failure_id.clone()));
         }
     }
     Ok(state.active_generation)
@@ -108,9 +109,10 @@ where
         return Err(error);
     }
     let detail = error.to_string();
+    let topology = input.cursor.topology().clone();
     let failure_id =
         record_terminal_failure(store, input, change_epoch, code, detail.as_bytes()).await?;
-    Err(terminal_recorded(failure_id))
+    Err(terminal_recorded(&topology, failure_id))
 }
 
 pub(super) async fn record_terminal_protocol_failure<S>(
@@ -124,15 +126,16 @@ where
     S: ProjectionProtocolStore,
 {
     if let ProjectionProtocolError::PartitionStopped { failure_id } = error {
-        return Err(terminal_recorded(failure_id));
+        return Err(terminal_recorded(input.cursor.topology(), failure_id));
     }
     if projection_error_is_retryable(&error) {
         return Err(error.into());
     }
     let detail = error.to_string();
+    let topology = input.cursor.topology().clone();
     let failure_id =
         record_terminal_failure(store, input, change_epoch, code, detail.as_bytes()).await?;
-    Err(terminal_recorded(failure_id))
+    Err(terminal_recorded(&topology, failure_id))
 }
 
 async fn record_terminal_failure<S>(
@@ -148,6 +151,7 @@ where
     const MAX_FAILURE_DETAIL_BYTES: usize = 1024 * 1024;
 
     let failure_id = deterministic_failure_id(&input);
+    let topology = input.cursor.topology().clone();
     let detail = if detail.len() > MAX_FAILURE_DETAIL_BYTES {
         &detail[..MAX_FAILURE_DETAIL_BYTES]
     } else {
@@ -166,14 +170,18 @@ where
         // and failure write. Retaining the current exact source position and
         // stopping is the same required outcome as observing it in preflight.
         Err(ProjectionProtocolError::PartitionStopped { failure_id }) => {
-            Err(terminal_recorded(failure_id))
+            Err(terminal_recorded(&topology, failure_id))
         }
         Err(error) => Err(error.into()),
     }
 }
 
-pub(super) fn terminal_recorded(failure_id: String) -> HandlerError {
+pub(super) fn terminal_recorded(
+    topology: &ProjectorTopologyId,
+    failure_id: String,
+) -> HandlerError {
     HandlerError::ProjectionTerminalRecorded {
+        projection: topology.name().to_owned(),
         repair: ProjectionRepairHandle::for_failure(failure_id),
     }
 }

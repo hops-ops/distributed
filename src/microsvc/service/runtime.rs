@@ -37,6 +37,7 @@ use crate::command_ledger::ExternalDispatchBinding;
 use crate::command_ledger::{CommandId, CommandLedgerKey, PrincipalPartitionId};
 use crate::microsvc::error::HandlerError;
 use crate::microsvc::lifecycle::LifecycleGate;
+use crate::microsvc::message_router::ProjectorConsumer;
 use crate::microsvc::projector::{ProjectionRepairHandle, ProjectorRegistration};
 use crate::microsvc::session::{Session, TRANSPORT_ROLE, TRANSPORT_USER_ID};
 
@@ -51,6 +52,23 @@ pub(crate) type ServiceRunner = Box<
         + Sync,
 >;
 
+/// A registered projector: where it lives and what it consumes.
+pub(crate) struct ProjectorRoute {
+    /// The projector's topology name, unique within a service.
+    pub(crate) name: String,
+    /// Index of the route bundle that owns the projector.
+    route: usize,
+    /// The event names the projector consumes.
+    pub(crate) events: Vec<String>,
+}
+
+impl ProjectorRoute {
+    pub(crate) fn consumes(&self, message: &Message) -> bool {
+        message.kind == MessageKind::Event
+            && self.events.iter().any(|event| event == message.name())
+    }
+}
+
 /// Name of the delivery lane that plain [`Service::routes`] registers into.
 pub const DEFAULT_DELIVERY_LANE: &str = "default";
 
@@ -63,6 +81,9 @@ pub struct Service {
     route_lanes: Vec<usize>,
     /// Lane names by index; index 0 is the unnamed default lane.
     lane_names: Vec<&'static str>,
+    /// Every registered projector. Each consumes through a consumer of its
+    /// own ([`Service::projector_consumers`]), never through `index`.
+    projectors: Vec<ProjectorRoute>,
     handler_specs: Vec<HandlerSpec>,
     causal_command_policy: CausalCommandPolicy,
     runner: Option<ServiceRunner>,
@@ -92,6 +113,7 @@ impl Service {
             index: HashMap::new(),
             route_lanes: Vec::new(),
             lane_names: vec![DEFAULT_DELIVERY_LANE],
+            projectors: Vec::new(),
             handler_specs: Vec::new(),
             causal_command_policy: CausalCommandPolicy::default(),
             runner: None,
@@ -574,6 +596,13 @@ impl Service {
             .flat_map(|routes| routes.projector_registrations())
             .collect::<Vec<_>>();
         validate_projector_registrations(existing_projectors.iter().chain(new_projectors.iter()));
+        let route_index = self.routes.len();
+        self.projectors
+            .extend(new_projectors.into_iter().map(|projector| ProjectorRoute {
+                name: projector.topology.name().to_owned(),
+                route: route_index,
+                events: projector.events,
+            }));
         let typed_commands = routes
             .typed_contracts()
             .into_iter()
@@ -617,7 +646,6 @@ impl Service {
             );
         }
 
-        let route_index = self.routes.len();
         for (kind, name) in keys {
             self.index
                 .entry(kind)
@@ -1092,16 +1120,11 @@ impl Service {
     /// An event runs its event handlers. A command runs its typed command
     /// through the ledger as the transport identity: the command must
     /// declare [`TRANSPORT_ROLE`] and the message must carry an id.
+    ///
+    /// Projectors are not run here: each consumes through its own consumer
+    /// ([`projector_consumers`](Self::projector_consumers)).
     pub async fn dispatch_message(&self, message: &Message) -> Result<Value, HandlerError> {
-        self.dispatch_ordered_message(message, None).await
-    }
-
-    pub(crate) async fn dispatch_ordered_message(
-        &self,
-        message: &Message,
-        ordered: Option<&OrderedDelivery>,
-    ) -> Result<Value, HandlerError> {
-        self.dispatch_lane_message(message, ordered, None).await
+        self.dispatch_lane_message(message, None).await
     }
 
     /// Dispatch only the routes of one delivery lane (`None` runs every lane
@@ -1109,7 +1132,6 @@ impl Service {
     pub(crate) async fn dispatch_lane_message(
         &self,
         message: &Message,
-        ordered: Option<&OrderedDelivery>,
         lane: Option<usize>,
     ) -> Result<Value, HandlerError> {
         // A typed command is measured and traced by the typed dispatch it
@@ -1119,7 +1141,7 @@ impl Service {
         }
         #[cfg(feature = "metrics")]
         let started = Instant::now();
-        let result = self.dispatch_message_inner(message, ordered, lane).await;
+        let result = self.dispatch_message_inner(message, lane).await;
         #[cfg(feature = "metrics")]
         {
             let error = result.as_ref().err();
@@ -1139,11 +1161,21 @@ impl Service {
     async fn dispatch_message_inner(
         &self,
         message: &Message,
-        ordered: Option<&OrderedDelivery>,
         lane: Option<usize>,
     ) -> Result<Value, HandlerError> {
         self.ensure_mutations_open()?;
         if !self.handles_message(message.kind, &message.name) {
+            if self
+                .projectors
+                .iter()
+                .any(|projector| projector.consumes(message))
+            {
+                return Err(HandlerError::UnqualifiedProjectionDelivery(format!(
+                    "event `{}` is consumed only by projectors, and each projector consumes \
+                     through its own consumer",
+                    message.name
+                )));
+            }
             return Err(HandlerError::UnknownCommand(message.name.clone()));
         }
 
@@ -1151,32 +1183,83 @@ impl Service {
         if route_indices.is_empty() {
             return Err(HandlerError::UnknownCommand(message.name.clone()));
         }
-        let projector_only = route_indices
-            .iter()
-            .all(|index| self.routes[*index].is_causal_projector(message));
-        let input = if projector_only {
-            // The causal projector owns raw parsing so unit/constant partition
-            // declarations can durably record typed decode failures at the
-            // authenticated source cursor.
-            Value::Null
-        } else {
-            match message_to_json_input(message) {
-                Ok(input) => input,
-                // Binary payloads (bitcode, octet-stream) legitimately fail JSON
-                // parsing: handlers for those read `ctx.message().payload` directly,
-                // so a `Null` input is the intended fallback. A payload that
-                // *claims* to be JSON but does not parse is a decode error — surface
-                // it instead of silently nulling the input.
-                Err(_) if !is_json_content_type(&message.content_type) => Value::Null,
-                Err(err) => return Err(err),
-            }
+        let input = match message_to_json_input(message) {
+            Ok(input) => input,
+            // Binary payloads (bitcode, octet-stream) legitimately fail JSON
+            // parsing: handlers for those read `ctx.message().payload` directly,
+            // so a `Null` input is the intended fallback. A payload that
+            // *claims* to be JSON but does not parse is a decode error — surface
+            // it instead of silently nulling the input.
+            Err(_) if !is_json_content_type(&message.content_type) => Value::Null,
+            Err(err) => return Err(err),
         };
         let session = message_to_session(message);
         self.in_dispatch_span(
             message,
-            self.run_event_routes(message, input, session, ordered, route_indices),
+            self.run_event_routes(message, input, session, route_indices),
         )
         .await
+    }
+
+    /// Deliver one event to one projector, as that projector's consumer does.
+    ///
+    /// The projector owns raw parsing, so it can durably record a decode
+    /// failure at the authenticated source cursor.
+    pub(crate) async fn dispatch_projector(
+        &self,
+        projector: usize,
+        message: &Message,
+        ordered: Option<&OrderedDelivery>,
+    ) -> Result<(), HandlerError> {
+        #[cfg(feature = "metrics")]
+        let started = Instant::now();
+        let route = &self.projectors[projector];
+        let result = match self.ensure_mutations_open() {
+            Ok(()) => {
+                let work =
+                    self.routes[route.route].dispatch_projector(&route.name, message, ordered);
+                #[cfg(feature = "otel")]
+                let work = {
+                    use tracing::Instrument as _;
+                    work.instrument(microsvc_handler_span(message))
+                };
+                self.in_dispatch_span(message, work).await
+            }
+            Err(error) => Err(error),
+        };
+        #[cfg(feature = "metrics")]
+        {
+            let error = result.as_ref().err();
+            crate::metrics::record_microsvc_dispatch(
+                self.name(),
+                message.kind,
+                crate::telemetry::handler_message_label(message.name(), error),
+                error
+                    .map(crate::telemetry::handler_error_status)
+                    .unwrap_or(crate::telemetry::dispatch_status::SUCCESS),
+                started.elapsed(),
+            );
+        }
+        result
+    }
+
+    /// One router per registered projector.
+    ///
+    /// Each is a durable consumer of its own: its own group (the service's,
+    /// scoped by the projector), cursor, retry and dead-letter path. A
+    /// projector that stops on a terminal failure therefore stops alone, and
+    /// resumes from its failed input after
+    /// [`repair_projection`](Self::repair_projection). [`run`](Self::run)
+    /// subscribes every one of them; subscribe them yourself only when you
+    /// drive a bus directly.
+    pub fn projector_consumers(self: &Arc<Self>) -> Vec<ProjectorConsumer> {
+        (0..self.projectors.len())
+            .map(|projector| ProjectorConsumer::new(Arc::clone(self), projector))
+            .collect()
+    }
+
+    pub(crate) fn projector_route(&self, projector: usize) -> &ProjectorRoute {
+        &self.projectors[projector]
     }
 
     /// Run a typed command a transport delivered (a bus consumer, the
@@ -1277,7 +1360,6 @@ impl Service {
         message: &Message,
         input: Value,
         session: Session,
-        ordered: Option<&OrderedDelivery>,
         route_indices: Vec<usize>,
     ) -> Result<Value, HandlerError> {
         #[cfg(feature = "otel")]
@@ -1286,7 +1368,7 @@ impl Service {
             let mut result = Value::Null;
             for route_index in route_indices {
                 result = self.routes[route_index]
-                    .dispatch(message, input.clone(), session.clone(), ordered)
+                    .dispatch(message, input.clone(), session.clone())
                     .await?;
             }
             Ok(result)
@@ -1320,7 +1402,8 @@ impl Service {
         &self.handler_specs
     }
 
-    /// Return the command/event names a transport should subscribe to.
+    /// Return every command/event name this service consumes, through its
+    /// own consumer or through a projector's.
     pub fn subscription_plan(&self) -> SubscriptionPlan {
         let mut plan = SubscriptionPlan::default();
 
@@ -1340,6 +1423,7 @@ impl Service {
     }
 
     /// Return whether this service has a handler for the message name.
+    /// Projectors are not handlers: each consumes through its own consumer.
     pub fn handles(&self, name: &str) -> bool {
         self.index
             .values()

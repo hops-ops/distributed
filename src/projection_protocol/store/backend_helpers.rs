@@ -45,7 +45,6 @@ pub(crate) fn failure_matches_batch(
         && failure.failure_code == batch.failure_code
         && failure.failure_bytes == batch.failure_bytes
         && failure.failure_digest == batch.failure_digest
-        && failure.change.epoch() == &batch.change_epoch
 }
 
 #[cfg(test)]

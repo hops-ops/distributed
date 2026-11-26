@@ -121,7 +121,16 @@ pub fn resolve_consumer_group<R: MessageRouter>(
         )));
     };
 
-    validate_consumer_group(group, transport)
+    validate_consumer_group(&scoped_group(group, router), transport)
+}
+
+/// `group`, with the router's [`consumer_scope`](MessageRouter::consumer_scope)
+/// appended when it has one.
+pub(super) fn scoped_group<R: MessageRouter>(group: &str, router: &R) -> String {
+    match router.consumer_scope() {
+        Some(scope) => format!("{group}-{scope}"),
+        None => group.to_owned(),
+    }
 }
 
 fn validate_topology_name(
