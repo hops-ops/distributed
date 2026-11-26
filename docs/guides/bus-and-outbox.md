@@ -265,7 +265,11 @@ bus.listen(
   keep consuming while the source is quiet. The run returns `Ok(())` only when
   the signal is triggered, after settling the delivery in hand.
   `RunOptions::until_idle()` returns as soon as nothing is available; it is for
-  tests and one-shot drains.
+  tests and one-shot drains. On Kafka "nothing is available" means the
+  consumer has joined its group and read every assigned partition to its
+  end, not that the topic was quiet for a while; `with_fetch_timeout` (8 s by
+  default) only bounds one wait on the broker, for the group to be joined or
+  for the next record.
 - **Retries.** A retryable failure (for example a transient `NotFound`) is
   redelivered after a backoff that doubles with each delivery (50 ms up to 5 s
   by default; `with_backoff`). `with_max_attempts(n)` dead-letters a message

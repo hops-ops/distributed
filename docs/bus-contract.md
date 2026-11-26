@@ -18,7 +18,7 @@ difference (`BusCapabilities`) and the suite checks the declared behaviour.
 | **One stream keeps its order** | Messages of one aggregate (the `x-distributed-source-aggregate-id` metadata the outbox sets) of one name arrive in the order they were produced. |
 | **Retryable failures are redelivered** | The message is handed back and delivered again after a backoff that grows with each delivery (`RunOptions::with_backoff`, `with_max_attempts`). |
 | **Permanent failures are dead-lettered** | The runner stores `{message, reason, consumer, attempts}` as a `distributed.dead_letter` event on the same bus, then acknowledges the delivery. Later messages are not held up. A payload the handler cannot decode is a permanent failure like any other. |
-| **A consumer runs until shutdown** | A quiet transport does not end a run. `Shutdown::trigger` ends it with `Ok(())` after the delivery in hand is settled. `RunOptions::until_idle()` is the drain for tests. |
+| **A consumer runs until shutdown** | A quiet transport does not end a run. `Shutdown::trigger` ends it with `Ok(())` after the delivery in hand is settled. `RunOptions::until_idle()` is the drain for tests: it ends when the transport has nothing to deliver (a Kafka consumer: its group joined and every assigned partition read to its end). |
 
 Retry, the attempt limit, dead-lettering and shutdown are done by the runner
 above the transport, which is why they are the same everywhere. A transport
@@ -65,7 +65,11 @@ The shapes behind the table:
 - **Kafka** sends every message of a kind to one topic (`{ns}.cmd`,
   `{ns}.evt`), keyed by the stream id (else the message id), and carries the
   name in the `x-distributed-name` header. A consumer acknowledges names it
-  does not handle.
+  does not handle. A consumer is idle once it has joined its group and read
+  every partition assigned to it to its end (a topic that does not exist yet
+  assigns none); the fetch timeout (8 s) only bounds one wait on the broker,
+  for the group to be joined or for the next record, so a broker that stops
+  answering cannot hang a drain.
 - **RabbitMQ** declares one queue per command name on send, so a command
   sent before any listener is kept; a listener of two names reads two
   queues. A group's events share one queue.

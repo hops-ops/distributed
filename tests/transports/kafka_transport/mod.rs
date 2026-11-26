@@ -6,7 +6,7 @@
 //!
 //! Each test creates its topics first (`common::kafka::create_bus_topics`).
 
-use std::time::Duration;
+mod source;
 
 use common::env as env_support;
 use common::ids::unique;
@@ -54,7 +54,6 @@ impl BusHarness for Kafka {
             .namespace(&self.namespace)
             .await
             .expect("connect bus")
-            .with_fetch_timeout(Duration::from_secs(10))
     }
 }
 

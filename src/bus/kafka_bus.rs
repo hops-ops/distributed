@@ -26,14 +26,12 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
-use super::kafka::{KafkaPublisher, KafkaSource};
+use super::kafka::{KafkaPublisher, KafkaSource, DEFAULT_FETCH_TIMEOUT};
 use super::{
     run_source, Bus, BusConsumer, BusTopologyConfig, MessageRouter, PublishDeadLetters, RunOptions,
     TransportError,
 };
 use super::{Message, MessageKind};
-
-const DEFAULT_FETCH_TIMEOUT: Duration = Duration::from_secs(8);
 
 /// Kafka [`Bus`] + [`BusConsumer`]. Cheap to clone.
 #[derive(Clone)]
@@ -65,8 +63,12 @@ impl KafkaBusConnect {
         self
     }
 
-    /// Override how long a `listen`/`subscribe` poll waits before idling. Kafka
-    /// group bootstrap/rebalance takes time, so this is generous by default.
+    /// Bound one wait of a `listen`/`subscribe` consumer on the broker (8 s
+    /// by default): for its group to be joined, then for the next record. A
+    /// consumer is idle once it has read its partitions to their end, not
+    /// after this much quiet; a wait that runs out also ends an
+    /// [`until_idle`](super::RunOptions::until_idle) drain, so a broker that
+    /// does not answer does not hang it.
     pub fn with_fetch_timeout(mut self, timeout: Duration) -> Self {
         self.fetch_timeout = timeout;
         self
@@ -135,8 +137,12 @@ impl KafkaBus {
         self
     }
 
-    /// Override how long a `listen`/`subscribe` poll waits before idling. Kafka
-    /// group bootstrap/rebalance takes time, so this is generous by default.
+    /// Bound one wait of a `listen`/`subscribe` consumer on the broker (8 s
+    /// by default): for its group to be joined, then for the next record. A
+    /// consumer is idle once it has read its partitions to their end, not
+    /// after this much quiet; a wait that runs out also ends an
+    /// [`until_idle`](super::RunOptions::until_idle) drain, so a broker that
+    /// does not answer does not hang it.
     pub fn with_fetch_timeout(mut self, timeout: Duration) -> Self {
         self.fetch_timeout = timeout;
         self
@@ -177,7 +183,7 @@ impl KafkaBus {
             self.topology.namespace_for("kafka")?,
             kind_suffix(kind)
         );
-        let source = KafkaSource::connect(&self.brokers, &group_id, &[&topic])
+        let source = KafkaSource::connect(&self.brokers, &group_id, &topic)
             .await?
             .with_fetch_timeout(self.fetch_timeout);
         let options = options.or_dead_letters(|| Arc::new(PublishDeadLetters(self.clone())));

@@ -1121,7 +1121,6 @@ async fn kafka_matrix_bus(ns: &str) -> distributed::bus::KafkaBus {
         .namespace(ns)
         .await
         .expect("kafka connect")
-        .with_fetch_timeout(Duration::from_secs(10))
 }
 
 #[cfg(feature = "kafka")]
