@@ -5,8 +5,7 @@
 //! pattern to the whole repository surface: the SQL statements and row codecs
 //! are identical across the two backends because `QueryBuilder<DB>` renders the
 //! right placeholder dialect. What genuinely differs — schema SQL, bind-param
-//! chunking, the timestamp codec (Postgres integer-microsecond `timestamptz` vs
-//! SQLite `"secs.nanos"` text), the unique-violation predicate, conflict
+//! chunking, the database clock and JSON casts, the unique-violation predicate, conflict
 //! recovery (SQLite can re-read in the failed transaction; a failed Postgres
 //! statement aborts it), and the outbox `claim` strategy — lives behind the
 //! [`SqlxRepoBackend`] trait, implemented once per backend.
@@ -19,7 +18,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
 use std::sync::{Arc, RwLock};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime};
 
 use sqlx::migrate::{Migrate, Migration, MigrationType, Migrator};
 use sqlx::pool::PoolOptions;
@@ -82,7 +81,8 @@ pub use backend::SqlxRepoBackend;
 pub(crate) use backend::POSTGRES_MIGRATIONS;
 #[cfg(feature = "sqlite")]
 pub(crate) use backend::SQLITE_MIGRATIONS;
-pub(crate) use errors::{repository_storage_error, system_time_epoch_secs};
+pub(crate) use errors::repository_storage_error;
+#[cfg(feature = "postgres")]
 #[cfg(feature = "postgres")]
 pub(crate) use outbox::outbox_message_from_row;
 pub use types::{SqlxOutboxStore, SqlxRepository};

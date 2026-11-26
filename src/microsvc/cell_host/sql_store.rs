@@ -65,7 +65,7 @@ fn cell_migrations(
 ) -> impl Iterator<Item = &'static crate::repository::migrations::EmbeddedMigration> {
     crate::repository::migrations::SQLITE_MIGRATIONS
         .iter()
-        .filter(|migration| matches!(migration.version, 1 | 2 | 4 | 8 | 11 | 15))
+        .filter(|migration| matches!(migration.version, 1 | 2 | 4 | 8 | 11 | 15 | 16))
 }
 
 #[derive(Clone)]
@@ -376,30 +376,12 @@ impl OutboxStore for CellSqlOutboxStore {
         // Match the native no-practical-bound convention within JS's exact
         // integer range; never round a bound crossing the runtime binding.
         let limit = (limit as u64).min(9_007_199_254_740_991) as i64;
-        let rows = self.connection.read(|executor| {
-            finish_sql(
-                executor.query(
-                    Statement::new("SELECT ")
-                        .sql(crate::repository::sqlite_codec::OUTBOX_SELECT)
-                        .sql(" FROM outbox_messages WHERE status = ")
-                        .bind(status.as_str().into())
-                        .sql(" ORDER BY CAST(created_at AS REAL), message_id LIMIT ")
-                        .bind(limit.into()),
-                ),
-            )
-        })?;
-        rows.into_iter().map(outbox::from_row).collect()
+        self.connection
+            .read(|executor| finish_sql(outbox::by_status(executor, status, limit)))
     }
     async fn backlog_stats(&self) -> Result<OutboxBacklogStats, RepositoryError> {
-        let rows = self.connection.read(|executor| finish_sql(executor.query(Statement::new("SELECT COUNT(*) AS pending, MIN(CAST(created_at AS REAL)) AS oldest FROM outbox_messages WHERE status = 'pending'"))))?;
-        let row = rows
-            .first()
-            .ok_or_else(|| RepositoryError::Model("outbox count returned no row".into()))?;
-        Ok(OutboxBacklogStats {
-            pending: usize::try_from(row.integer("pending")?)
-                .map_err(|_| RepositoryError::Model("outbox count is not representable".into()))?,
-            oldest_created_at: row.optional_timestamp("oldest")?,
-        })
+        self.connection
+            .read(|executor| finish_sql(outbox::backlog(executor)))
     }
     async fn claim(
         &self,
@@ -455,9 +437,10 @@ impl CellSqlOutboxStore {
 mod alarms {
     use super::*;
     use crate::microsvc::cell_host::alarm::{ScheduleError, ScheduleWrite, MAX_ARMED_SCHEDULES};
+    use crate::repository::sql::{micros_as_millis, millis_as_micros};
 
     const SELECT: &str =
-        "SELECT name, command, input, due_at_ms, generation, attempts FROM cell_alarms WHERE armed = 1";
+        "SELECT name, command, input, due_at, generation, attempts FROM cell_alarms WHERE armed = 1";
 
     pub(super) async fn apply(
         executor: &mut impl SqlExecutor,
@@ -469,15 +452,15 @@ mod alarms {
                     let input = alarm.input_json()?;
                     executor
                         .execute(
-                            Statement::new("INSERT INTO cell_alarms (name, command, input, due_at_ms, generation, attempts, armed) VALUES (")
+                            Statement::new("INSERT INTO cell_alarms (name, command, input, due_at, generation, attempts, armed) VALUES (")
                                 .bind(alarm.name().into())
                                 .sql(", ")
                                 .bind(alarm.command().into())
                                 .sql(", ")
                                 .bind(input.as_str().into())
                                 .sql(", ")
-                                .bind(alarm.due_at_ms()?.into())
-                                .sql(", 1, 0, 1) ON CONFLICT (name) DO UPDATE SET command = excluded.command, input = excluded.input, due_at_ms = excluded.due_at_ms, generation = cell_alarms.generation + 1, attempts = 0, armed = 1"),
+                                .bind(millis_as_micros(alarm.due_at_ms()?)?.into())
+                                .sql(", 1, 0, 1) ON CONFLICT (name) DO UPDATE SET command = excluded.command, input = excluded.input, due_at = excluded.due_at, generation = cell_alarms.generation + 1, attempts = 0, armed = 1"),
                         )
                         .await?;
                 }
@@ -517,12 +500,14 @@ mod alarms {
         let limit = (limit as u64).min(9_007_199_254_740_991) as i64;
         let mut statement = Statement::new(SELECT);
         if let Some(due_by_ms) = due_by_ms {
-            statement = statement.sql(" AND due_at_ms <= ").bind(due_by_ms.into());
+            statement = statement
+                .sql(" AND due_at <= ")
+                .bind(millis_as_micros(due_by_ms)?.into());
         }
         let rows = executor
             .query(
                 statement
-                    .sql(" ORDER BY due_at_ms, name LIMIT ")
+                    .sql(" ORDER BY due_at, name LIMIT ")
                     .bind(limit.into()),
             )
             .await?;
@@ -535,7 +520,7 @@ mod alarms {
                     input: serde_json::from_str(&input).map_err(|error| {
                         RepositoryError::Model(format!("cell alarm input is invalid JSON: {error}"))
                     })?,
-                    due_at_ms: row.integer("due_at_ms")?,
+                    due_at_ms: micros_as_millis(row.integer("due_at")?),
                     generation: u64::try_from(row.integer("generation")?).map_err(|_| {
                         RepositoryError::Model("cell alarm generation is negative".into())
                     })?,
@@ -550,14 +535,15 @@ mod alarms {
     ) -> Result<Option<i64>, RepositoryError> {
         let rows = executor
             .query(Statement::new(
-                "SELECT MIN(due_at_ms) AS due FROM cell_alarms WHERE armed = 1",
+                "SELECT MIN(due_at) AS due FROM cell_alarms WHERE armed = 1",
             ))
             .await?;
         Ok(rows
             .first()
             .map(|row| row.optional_integer("due"))
             .transpose()?
-            .flatten())
+            .flatten()
+            .map(micros_as_millis))
     }
 
     pub(super) async fn settle(
@@ -573,8 +559,8 @@ mod alarms {
                 Statement::new("UPDATE cell_alarms SET armed = 0, attempts = 0 WHERE name = ")
             }
             ScheduleSettlement::Retry { due_at_ms } => {
-                Statement::new("UPDATE cell_alarms SET attempts = attempts + 1, due_at_ms = ")
-                    .bind((*due_at_ms).into())
+                Statement::new("UPDATE cell_alarms SET attempts = attempts + 1, due_at = ")
+                    .bind(millis_as_micros(*due_at_ms)?.into())
                     .sql(" WHERE name = ")
             }
         };

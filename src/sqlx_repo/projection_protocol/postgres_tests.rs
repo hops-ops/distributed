@@ -20,6 +20,8 @@ mod postgres_tests {
         TableSchemaRegistry, TableStoreError, TableWritePlan,
     };
 
+    use crate::sqlx_repo::postgres_test_schema::postgres_test_schema;
+
     static POSTGRES_PROJECTION_TEST_LOCK: tokio::sync::Mutex<()> =
         tokio::sync::Mutex::const_new(());
 
@@ -54,10 +56,13 @@ mod postgres_tests {
 
     #[tokio::test]
     async fn postgres_redelivery_identity_is_atomic_across_partition_and_cursor_races() {
-        let Some(url) = crate::test_env::require_service(
+        let Some((_schema, url)) = postgres_test_schema(
             "DISTRIBUTED_TEST_POSTGRES_URL",
             "Postgres projection protocol test",
-        ) else {
+            "redelivery_identity",
+        )
+        .await
+        else {
             return;
         };
         let _test_guard = POSTGRES_PROJECTION_TEST_LOCK.lock().await;
@@ -476,10 +481,13 @@ mod postgres_tests {
 
     #[tokio::test]
     async fn postgres_projection_protocol_runtime_conforms() {
-        let Some(database_url) = crate::test_env::require_service(
+        let Some((_schema, database_url)) = postgres_test_schema(
             "DISTRIBUTED_TEST_POSTGRES_URL",
             "Postgres projection protocol test",
-        ) else {
+            "runtime_conforms",
+        )
+        .await
+        else {
             return;
         };
         let _test_guard = POSTGRES_PROJECTION_TEST_LOCK.lock().await;

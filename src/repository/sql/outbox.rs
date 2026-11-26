@@ -1,11 +1,21 @@
 //! Delivery rows shared by native SQL and cell-local SQL. Transactions belong
 //! to the caller, so these inserts join the command's event and receipt writes.
 
+#[cfg(any(
+    feature = "sqlite",
+    all(feature = "cloudflare-workers", target_arch = "wasm32")
+))]
+use super::timestamp_micros;
 use super::{json_error, signed, unsigned, SqlBind, SqlExecutor, SqlPart, SqlRow, Statement};
 use crate::outbox::{OutboxMessage, OutboxMessageStatus};
 use crate::outbox_worker::store::ensure_active_claim;
-use crate::outbox_worker::{ClaimOutboxMessages, OutboxClaimRef};
-use crate::repository::{sqlite_codec, RepositoryError};
+#[cfg(any(
+    feature = "sqlite",
+    all(feature = "cloudflare-workers", target_arch = "wasm32")
+))]
+use crate::outbox_worker::ClaimOutboxMessages;
+use crate::outbox_worker::{OutboxBacklogStats, OutboxClaimRef};
+use crate::repository::RepositoryError;
 use std::borrow::Cow;
 use std::time::{Duration, SystemTime};
 
@@ -53,11 +63,11 @@ pub(crate) fn inserts(
                     serde_json::to_string(&message.metadata).map_err(json_error)?,
                 )),
                 Some(SqlBind::from(message.status.as_str())),
-                Some(SqlBind::Timestamp(message.created_at)),
+                Some(SqlBind::timestamp(message.created_at)?),
                 // A new row is claimable at once; only a release delays it.
-                Some(SqlBind::Timestamp(message.created_at)),
+                Some(SqlBind::timestamp(message.created_at)?),
                 message.worker_id.as_deref().map(SqlBind::from),
-                message.leased_until.map(SqlBind::Timestamp),
+                message.leased_until.map(SqlBind::timestamp).transpose()?,
                 Some(SqlBind::Integer(i64::from(message.attempts))),
                 message.last_error.as_deref().map(SqlBind::from),
                 message.source_aggregate_type.as_deref().map(SqlBind::from),
@@ -126,14 +136,27 @@ pub(crate) fn from_row(row: impl SqlRow) -> Result<OutboxMessage, RepositoryErro
     })
 }
 
-fn sqlite_claimable(statement: &mut Statement<'_>, now: SystemTime) {
-    statement.push("((status = 'pending' AND CAST(next_available_at AS REAL) <= CAST(");
-    statement.push_bind(SqlBind::Timestamp(now));
-    statement.push(" AS REAL)) OR (status = 'in_flight' AND (claimed_until IS NULL OR CAST(claimed_until AS REAL) <= CAST(");
-    statement.push_bind(SqlBind::Timestamp(now));
-    statement.push(" AS REAL))))");
+/// Rows a claim may take at `now`: pending and due, or in flight with an
+/// expired lease. The leading term is the claim index's own WHERE clause,
+/// which SQLite needs to see verbatim before it uses that index.
+#[cfg(any(
+    feature = "sqlite",
+    all(feature = "cloudflare-workers", target_arch = "wasm32")
+))]
+fn claimable(statement: &mut Statement<'_>, now: i64) {
+    statement.push(
+        "status IN ('pending', 'in_flight') AND ((status = 'pending' AND next_available_at <= ",
+    );
+    statement.push_bind(now);
+    statement.push(") OR (status = 'in_flight' AND (claimed_until IS NULL OR claimed_until <= ");
+    statement.push_bind(now);
+    statement.push(")))");
 }
 
+#[cfg(any(
+    feature = "sqlite",
+    all(feature = "cloudflare-workers", target_arch = "wasm32")
+))]
 fn destination(statement: &mut Statement<'_>, request: &ClaimOutboxMessages) {
     if let Some(destination) = request.destination.as_deref() {
         statement.push(" AND destination = ");
@@ -143,8 +166,12 @@ fn destination(statement: &mut Statement<'_>, request: &ClaimOutboxMessages) {
 
 /// SQLite has no row-lock/SKIP LOCKED claim. Both SQLx SQLite and cells use
 /// this candidate scan plus conditional update in a caller-owned transaction.
-pub(crate) async fn claim_sqlite(
-    executor: &mut impl SqlExecutor,
+#[cfg(any(
+    feature = "sqlite",
+    all(feature = "cloudflare-workers", target_arch = "wasm32")
+))]
+pub(crate) async fn claim_sqlite<E: SqlExecutor>(
+    executor: &mut E,
     request: ClaimOutboxMessages,
     now: SystemTime,
 ) -> Result<Vec<OutboxMessage>, RepositoryError> {
@@ -154,13 +181,15 @@ pub(crate) async fn claim_sqlite(
     let deadline = now
         .checked_add(request.lease)
         .ok_or_else(|| RepositoryError::Model("failed to compute outbox lease deadline".into()))?;
+    let deadline = timestamp_micros(deadline)?;
+    let now = timestamp_micros(now)?;
     let ids = if let Some(ids) = request.message_ids.clone() {
         ids
     } else {
         let mut query = Statement::new("SELECT message_id FROM outbox_messages WHERE ");
-        sqlite_claimable(&mut query, now);
+        claimable(&mut query, now);
         destination(&mut query, &request);
-        query.push(" ORDER BY CAST(created_at AS REAL) ASC, message_id ASC LIMIT ");
+        query.push(" ORDER BY created_at ASC, message_id ASC LIMIT ");
         query.push_bind(signed(request.batch_size as u64, "outbox claim limit")?);
         executor
             .query(query)
@@ -178,13 +207,13 @@ pub(crate) async fn claim_sqlite(
             Statement::new("UPDATE outbox_messages SET status = 'in_flight', claimed_by = ")
                 .bind(request.worker_id.as_str().into())
                 .sql(", claimed_until = ")
-                .bind(SqlBind::Timestamp(deadline))
-                .sql(
-                    ", attempts = attempts + 1, updated_at = CURRENT_TIMESTAMP WHERE message_id = ",
-                )
+                .bind(deadline.into())
+                .sql(", attempts = attempts + 1, updated_at = ")
+                .sql(E::NOW)
+                .sql(" WHERE message_id = ")
                 .bind(id.as_str().into())
                 .sql(" AND ");
-        sqlite_claimable(&mut update, now);
+        claimable(&mut update, now);
         destination(&mut update, &request);
         if executor.execute(update).await? == 0 {
             continue;
@@ -192,7 +221,7 @@ pub(crate) async fn claim_sqlite(
         let rows = executor
             .query(
                 Statement::new("SELECT ")
-                    .sql(sqlite_codec::OUTBOX_SELECT)
+                    .sql(E::OUTBOX_SELECT)
                     .sql(" FROM outbox_messages WHERE message_id = ")
                     .bind(id.as_str().into()),
             )
@@ -204,6 +233,47 @@ pub(crate) async fn claim_sqlite(
         claimed.push(from_row(row)?);
     }
     Ok(claimed)
+}
+
+/// Rows of one status, oldest first.
+pub(crate) async fn by_status<E: SqlExecutor>(
+    executor: &mut E,
+    status: OutboxMessageStatus,
+    limit: i64,
+) -> Result<Vec<OutboxMessage>, RepositoryError> {
+    executor
+        .query(
+            Statement::new("SELECT ")
+                .sql(E::OUTBOX_SELECT)
+                .sql(" FROM outbox_messages WHERE status = ")
+                .bind(status.as_str().into())
+                .sql(" ORDER BY created_at ASC, message_id ASC LIMIT ")
+                .bind(limit.into()),
+        )
+        .await?
+        .into_iter()
+        .map(from_row)
+        .collect()
+}
+
+/// How many rows are pending, and since when.
+pub(crate) async fn backlog<E: SqlExecutor>(
+    executor: &mut E,
+) -> Result<OutboxBacklogStats, RepositoryError> {
+    let rows = executor
+        .query(Statement::new(
+            "SELECT COUNT(*) AS pending, MIN(created_at) AS oldest FROM outbox_messages \
+             WHERE status = 'pending'",
+        ))
+        .await?;
+    let row = rows
+        .first()
+        .ok_or_else(|| RepositoryError::Model("outbox count returned no row".into()))?;
+    Ok(OutboxBacklogStats {
+        pending: usize::try_from(row.integer("pending")?)
+            .map_err(|_| RepositoryError::Model("outbox count is not representable".into()))?,
+        oldest_created_at: row.optional_timestamp("oldest")?,
+    })
 }
 
 pub(crate) enum Transition<'a> {
@@ -234,10 +304,10 @@ pub(crate) async fn transition<E: SqlExecutor>(
             } else {
                 ", failed_at = "
             });
-            statement.push_bind(SqlBind::Timestamp(match transition {
+            statement.push_bind(SqlBind::timestamp(match transition {
                 Transition::Release(_, retry_after) => now + retry_after,
                 _ => now,
-            }));
+            })?);
             statement.push(", updated_at = ");
             statement.push(E::NOW);
             statement
@@ -249,12 +319,8 @@ pub(crate) async fn transition<E: SqlExecutor>(
     statement.push_bind(claim.worker_id.as_str());
     statement.push(" AND attempts = ");
     statement.push_bind(i64::from(claim.attempt));
-    statement.push(" AND claimed_until IS NOT NULL AND ");
-    statement.part(SqlPart::TimestampCompare {
-        column: "claimed_until",
-        operator: ">",
-        value: now,
-    });
+    statement.push(" AND claimed_until > ");
+    statement.push_bind(SqlBind::timestamp(now)?);
     if executor.execute(statement).await? > 0 {
         return Ok(());
     }
@@ -291,7 +357,7 @@ pub(crate) async fn requeue_failed<E: SqlExecutor>(
         "UPDATE outbox_messages SET status = 'pending', attempts = 0, failed_at = NULL, \
          next_available_at = ",
     );
-    statement.push_bind(SqlBind::Timestamp(now));
+    statement.push_bind(SqlBind::timestamp(now)?);
     statement.push(", updated_at = ");
     statement.push(E::NOW);
     statement.push(" WHERE status = 'failed' AND message_id = ");

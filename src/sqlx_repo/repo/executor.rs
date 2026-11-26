@@ -39,18 +39,9 @@ where
             .try_get(column)
             .map_err(|error| repository_storage_error::<DB>(column, error))
     }
-    fn timestamp(&self, column: &'static str) -> Result<SystemTime, RepositoryError> {
-        DB::decode_timestamp(&self.0, column)
-    }
-    fn optional_timestamp(
-        &self,
-        column: &'static str,
-    ) -> Result<Option<SystemTime>, RepositoryError> {
-        DB::decode_optional_timestamp(&self.0, column)
-    }
 }
 
-fn build<DB>(statement: &Statement<'_>) -> Result<QueryBuilder<DB>, RepositoryError>
+fn build<DB>(statement: &Statement<'_>) -> QueryBuilder<DB>
 where
     DB: SqlxRepoBackend,
     for<'q> i64: Encode<'q, DB> + Type<DB>,
@@ -60,22 +51,6 @@ where
     let mut builder = QueryBuilder::<DB>::new("");
     for part in &statement.0 {
         match part {
-            SqlPart::TimestampCompare {
-                column,
-                operator,
-                value,
-            } => {
-                DB::push_timestamp_cmp(&mut builder, column, operator, *value)?;
-            }
-            SqlPart::LedgerNow => DB::push_command_ledger_now(&mut builder),
-            SqlPart::LedgerNowEpoch => DB::push_command_ledger_now_epoch(&mut builder),
-            SqlPart::LedgerDeadline(value) => {
-                DB::push_command_ledger_deadline(&mut builder, *value)
-            }
-            SqlPart::LedgerDeadlineIsLive(value) => DB::push_command_ledger_deadline_is_live(
-                &mut builder,
-                &DB::timestamp_value(*value)?,
-            ),
             SqlPart::LedgerJson(value) => DB::push_command_ledger_json(&mut builder, value),
             SqlPart::Sql(sql) => {
                 builder.push(sql);
@@ -92,12 +67,9 @@ where
             SqlPart::Bind(SqlBind::Metadata(value)) => {
                 DB::push_metadata(&mut builder.separated(""), value);
             }
-            SqlPart::Bind(SqlBind::Timestamp(value)) => {
-                DB::push_timestamp(&mut builder.separated(""), &DB::timestamp_value(*value)?);
-            }
         }
     }
-    Ok(builder)
+    builder
 }
 
 impl<DB> SqlExecutor for ConnectionExecutor<'_, DB>
@@ -124,7 +96,7 @@ where
         DB::COMMAND_LEDGER_COMPACTION_LOCK_SUFFIX;
 
     async fn query(&mut self, statement: Statement<'_>) -> Result<Vec<Self::Row>, RepositoryError> {
-        build::<DB>(&statement)?
+        build::<DB>(&statement)
             .build()
             .fetch_all(&mut *self.0)
             .await
@@ -133,7 +105,7 @@ where
     }
 
     async fn execute(&mut self, statement: Statement<'_>) -> Result<u64, RepositoryError> {
-        build::<DB>(&statement)?
+        build::<DB>(&statement)
             .build()
             .execute(&mut *self.0)
             .await

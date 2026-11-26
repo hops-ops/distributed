@@ -6,7 +6,7 @@ use crate::table::{ColumnType, TableSchema};
 
 use super::super::engine::EngineInner;
 use super::binds::{operand_to_bind, value_to_bind, BindValue};
-use super::dialect::{comparison_operand, placeholder, text_pattern, SqlDialect};
+use super::dialect::{placeholder, text_pattern, SqlDialect};
 use super::scan::{relationship_link, ModelScan, ScanLink};
 use super::CompileError;
 
@@ -153,15 +153,6 @@ fn compile_filter_expr(
                 }
             };
             let cast_ph = cast_placeholder(inner.dialect, &col.column_type, &ph);
-            let col_ref = match op {
-                CmpOp::Eq | CmpOp::Neq => {
-                    comparison_operand(inner.dialect, &col.column_type, &col_ref, false)
-                }
-                CmpOp::Gt | CmpOp::Gte | CmpOp::Lt | CmpOp::Lte => {
-                    comparison_operand(inner.dialect, &col.column_type, &col_ref, true)
-                }
-                _ => col_ref,
-            };
             Ok(format!("{col_ref} {sql_op} {cast_ph}"))
         }
         FilterExpr::In {
@@ -189,7 +180,6 @@ fn compile_filter_expr(
                 .find(|c| c.column_name == *column)
                 .ok_or_else(|| format!("unknown column `{column}`"))?;
             let col_ref = format!("{alias}.\"{column}\"");
-            let col_ref = comparison_operand(inner.dialect, &col.column_type, &col_ref, false);
             let mut phs = Vec::new();
             for v in values {
                 let bind = operand_to_bind(v, session, &col.column_type)?;
@@ -484,7 +474,6 @@ fn compile_client_comparison(
                 ));
             }
             let sql_op = if op == "_in" { "IN" } else { "NOT IN" };
-            let col_ref = comparison_operand(inner.dialect, column_type, &col_ref, false);
             Ok(format!("{col_ref} {sql_op} ({})", phs.join(", ")))
         }
         other => {
@@ -515,13 +504,6 @@ fn compile_client_comparison(
             };
             let ph = comparand(inner.dialect, value_to_bind(rhs, column_type)?, binds);
             let cast_ph = cast_placeholder(inner.dialect, column_type, &ph);
-            let col_ref = match other {
-                "_eq" | "_neq" => comparison_operand(inner.dialect, column_type, &col_ref, false),
-                "_gt" | "_gte" | "_lt" | "_lte" => {
-                    comparison_operand(inner.dialect, column_type, &col_ref, true)
-                }
-                _ => col_ref,
-            };
             Ok(format!("{col_ref} {sql_op} {cast_ph}"))
         }
     }

@@ -230,7 +230,7 @@ mod sqlite {
                 "INSERT INTO aggregate_events (aggregate_type, aggregate_id, sequence, event_name, \
                  event_version, payload, payload_codec, payload_codec_version, metadata, \
                  recorded_at) \
-                 VALUES (?, ?, 1, 'BadEvent', 1, x'00', 'json', 1, '{}', '0.000000000')",
+                 VALUES (?, ?, 1, 'BadEvent', 1, x'00', 'json', 1, '{}', 0)",
             )
             .bind(aggregate_type)
             .bind(id)
@@ -245,7 +245,7 @@ mod sqlite {
                  payload_codec_version, metadata, status, created_at, next_available_at, \
                  attempts, correlation_id, causation_id) \
                  VALUES (?, 'OutboxColumns', x'00', 'bytes', 1, '{}', 'pending', \
-                 '0.000000000', '0.000000000', 0, 'corr-column', 'cause-column')",
+                 0, 0, 0, 'corr-column', 'cause-column')",
             )
             .bind(message_id)
             .execute(self.repository.pool())
@@ -321,7 +321,7 @@ mod postgres {
                 "INSERT INTO aggregate_events (aggregate_type, aggregate_id, sequence, event_name, \
                  event_version, payload, payload_codec, payload_codec_version, metadata, \
                  recorded_at) \
-                 VALUES ($1, $2, 1, 'BadEvent', 1, $3, 'json', 1, '{}'::jsonb, now())",
+                 VALUES ($1, $2, 1, 'BadEvent', 1, $3, 'json', 1, '{}'::jsonb, 0)",
             )
             .bind(aggregate_type)
             .bind(id)
@@ -337,7 +337,7 @@ mod postgres {
                  payload_codec_version, metadata, status, created_at, next_available_at, \
                  attempts, correlation_id, causation_id) \
                  VALUES ($1, 'OutboxColumns', decode('00', 'hex'), 'bytes', 1, '{}'::jsonb, \
-                 'pending', now(), now(), 0, 'corr-column', 'cause-column')",
+                 'pending', 0, 0, 0, 'corr-column', 'cause-column')",
             )
             .bind(message_id)
             .execute(self.repository.pool())

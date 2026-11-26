@@ -15,10 +15,9 @@ pub(crate) mod migrations;
 pub(crate) mod sql;
 #[cfg(any(
     feature = "sqlite",
-    feature = "postgres",
     all(feature = "cloudflare-workers", target_arch = "wasm32")
 ))]
-pub(crate) mod sqlite_codec;
+pub(crate) mod sqlite_select;
 mod traits;
 mod validation;
 

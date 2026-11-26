@@ -52,7 +52,7 @@ async fn migration_is_idempotent_and_uses_postgres_column_types() {
         vec![
             ("metadata".into(), "jsonb".into()),
             ("payload".into(), "bytea".into()),
-            ("recorded_at".into(), "timestamptz".into()),
+            ("recorded_at".into(), "int8".into()),
         ]
     );
 

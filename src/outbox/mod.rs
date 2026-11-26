@@ -39,12 +39,10 @@
 
 mod commit;
 mod message;
-mod table;
 
 // Outbox message record
 pub(crate) use message::PreparedDomainEvent;
 pub use message::{OutboxMessage, OutboxMessageStatus};
-pub use table::{outbox_message_schema, OUTBOX_MESSAGES_TABLE};
 
 // Commit helpers
 #[allow(unused_imports)] // used by graphql causal commit

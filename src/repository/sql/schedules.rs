@@ -3,7 +3,7 @@
 //! name, written in the command's transaction. Cells keep their own
 //! single-owner `cell_alarms` table.
 
-use super::{SqlExecutor, SqlRow, Statement};
+use super::{micros_as_millis, millis_as_micros, SqlExecutor, SqlRow, Statement};
 use crate::repository::RepositoryError;
 use crate::schedule::{
     ArmedSchedule, ScheduleError, ScheduleSettlement, ScheduleWrite, MAX_ARMED_SCHEDULES,
@@ -22,7 +22,7 @@ pub(crate) async fn apply(
                 let input = schedule.input_json()?;
                 executor
                     .execute(
-                        Statement::new("INSERT INTO aggregate_schedules (aggregate_type, aggregate_id, name, command, input, due_at_ms, generation, attempts, armed) VALUES (")
+                        Statement::new("INSERT INTO aggregate_schedules (aggregate_type, aggregate_id, name, command, input, due_at, generation, attempts, armed) VALUES (")
                             .bind(owner.aggregate_type().into())
                             .sql(", ")
                             .bind(owner.aggregate_id().into())
@@ -33,8 +33,8 @@ pub(crate) async fn apply(
                             .sql(", ")
                             .bind(input.as_str().into())
                             .sql(", ")
-                            .bind(schedule.due_at_ms()?.into())
-                            .sql(", 1, 0, 1) ON CONFLICT (aggregate_type, aggregate_id, name) DO UPDATE SET command = excluded.command, input = excluded.input, due_at_ms = excluded.due_at_ms, generation = aggregate_schedules.generation + 1, attempts = 0, armed = 1, claimed_until_ms = NULL"),
+                            .bind(millis_as_micros(schedule.due_at_ms()?)?.into())
+                            .sql(", 1, 0, 1) ON CONFLICT (aggregate_type, aggregate_id, name) DO UPDATE SET command = excluded.command, input = excluded.input, due_at = excluded.due_at, generation = aggregate_schedules.generation + 1, attempts = 0, armed = 1, claimed_until = NULL"),
                     )
                     .await?;
             }
@@ -42,7 +42,7 @@ pub(crate) async fn apply(
                 executor
                     .execute(
                         Statement::new(
-                            "UPDATE aggregate_schedules SET armed = 0, attempts = 0, claimed_until_ms = NULL WHERE aggregate_type = ",
+                            "UPDATE aggregate_schedules SET armed = 0, attempts = 0, claimed_until = NULL WHERE aggregate_type = ",
                         )
                         .bind(owner.aggregate_type().into())
                         .sql(" AND aggregate_id = ")
@@ -83,12 +83,12 @@ pub(crate) async fn armed(
     let rows = executor
         .query(
             Statement::new(
-                "SELECT name, command, input, due_at_ms, generation, attempts FROM aggregate_schedules WHERE armed = 1 AND aggregate_type = ",
+                "SELECT name, command, input, due_at, generation, attempts FROM aggregate_schedules WHERE armed = 1 AND aggregate_type = ",
             )
             .bind(owner.aggregate_type().into())
             .sql(" AND aggregate_id = ")
             .bind(owner.aggregate_id().into())
-            .sql(" ORDER BY due_at_ms, name"),
+            .sql(" ORDER BY due_at, name"),
         )
         .await?;
     rows.iter().map(armed_from_row).collect()
@@ -102,7 +102,7 @@ fn armed_from_row(row: &impl SqlRow) -> Result<ArmedSchedule, RepositoryError> {
         input: serde_json::from_str(&input).map_err(|error| {
             RepositoryError::Model(format!("schedule input is invalid JSON: {error}"))
         })?,
-        due_at_ms: row.integer("due_at_ms")?,
+        due_at_ms: micros_as_millis(row.integer("due_at")?),
         generation: u64::try_from(row.integer("generation")?)
             .map_err(|_| RepositoryError::Model("schedule generation is negative".into()))?,
         attempts: u32::try_from(row.integer("attempts")?).unwrap_or(u32::MAX),
@@ -121,18 +121,19 @@ pub(crate) async fn claim_due<E: SqlExecutor>(
     limit: usize,
 ) -> Result<Vec<(StreamIdentity, ArmedSchedule)>, RepositoryError> {
     let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+    let now = millis_as_micros(now_ms)?;
     let rows = executor
         .query(
-            Statement::new("UPDATE aggregate_schedules SET claimed_until_ms = ")
-                .bind(claim_until_ms.into())
-                .sql(" WHERE (aggregate_type, aggregate_id, name) IN (SELECT aggregate_type, aggregate_id, name FROM aggregate_schedules WHERE armed = 1 AND due_at_ms <= ")
-                .bind(now_ms.into())
-                .sql(" AND (claimed_until_ms IS NULL OR claimed_until_ms <= ")
-                .bind(now_ms.into())
-                .sql(") ORDER BY due_at_ms, aggregate_type, aggregate_id, name LIMIT ")
+            Statement::new("UPDATE aggregate_schedules SET claimed_until = ")
+                .bind(millis_as_micros(claim_until_ms)?.into())
+                .sql(" WHERE (aggregate_type, aggregate_id, name) IN (SELECT aggregate_type, aggregate_id, name FROM aggregate_schedules WHERE armed = 1 AND due_at <= ")
+                .bind(now.into())
+                .sql(" AND (claimed_until IS NULL OR claimed_until <= ")
+                .bind(now.into())
+                .sql(") ORDER BY due_at, aggregate_type, aggregate_id, name LIMIT ")
                 .bind(limit.into())
                 .sql(E::SCHEDULE_CLAIM_LOCK_SUFFIX)
-                .sql(") RETURNING aggregate_type, aggregate_id, name, command, input, due_at_ms, generation, attempts"),
+                .sql(") RETURNING aggregate_type, aggregate_id, name, command, input, due_at, generation, attempts"),
         )
         .await?;
     let mut claimed = rows
@@ -168,12 +169,12 @@ pub(crate) async fn settle(
         .map_err(|_| RepositoryError::Model("schedule generation exceeds SQL storage".into()))?;
     let statement = match settlement {
         ScheduleSettlement::Done => Statement::new(
-            "UPDATE aggregate_schedules SET armed = 0, attempts = 0, claimed_until_ms = NULL WHERE aggregate_type = ",
+            "UPDATE aggregate_schedules SET armed = 0, attempts = 0, claimed_until = NULL WHERE aggregate_type = ",
         ),
         ScheduleSettlement::Retry { due_at_ms } => Statement::new(
-            "UPDATE aggregate_schedules SET attempts = attempts + 1, claimed_until_ms = NULL, due_at_ms = ",
+            "UPDATE aggregate_schedules SET attempts = attempts + 1, claimed_until = NULL, due_at = ",
         )
-        .bind((*due_at_ms).into())
+        .bind(millis_as_micros(*due_at_ms)?.into())
         .sql(" WHERE aggregate_type = "),
     };
     executor

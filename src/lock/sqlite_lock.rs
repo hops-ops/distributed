@@ -11,12 +11,13 @@
 use sqlx::sqlite::SqliteQueryResult;
 use sqlx::Sqlite;
 
+use crate::repository::sql::sqlite_now;
 use crate::sqlx_repo::is_sqlite_busy;
 
 use super::sqlx_common::{LockDialect, SqlxLock, SqlxLockManager};
 
-/// SQLite [`LockDialect`]: `?n` placeholders, `unixepoch('now','subsec')` as
-/// the authoritative clock.
+/// SQLite [`LockDialect`]: `?n` placeholders, `unixepoch('now','subsec')` in
+/// microseconds as the authoritative clock.
 #[derive(Debug, Clone, Copy)]
 pub struct SqliteDialect;
 
@@ -32,8 +33,8 @@ impl LockDialect for SqliteDialect {
 CREATE TABLE IF NOT EXISTS aggregate_locks (\
   lock_key TEXT NOT NULL PRIMARY KEY,\
   owner_token TEXT NOT NULL,\
-  acquired_at REAL NOT NULL,\
-  expires_at REAL NOT NULL,\
+  acquired_at INTEGER NOT NULL,\
+  expires_at INTEGER NOT NULL,\
   CHECK (lock_key <> ''),\
   CHECK (owner_token <> '')\
 );\
@@ -41,23 +42,25 @@ CREATE INDEX IF NOT EXISTS aggregate_locks_expires_at_idx ON aggregate_locks (ex
 
     /// Same conditional upsert as Postgres (insert / steal-expired /
     /// re-acquire-own-token), one atomic statement.
-    const ACQUIRE_SQL: &'static str = r#"
-        INSERT INTO aggregate_locks (lock_key, owner_token, acquired_at, expires_at)
-        VALUES (?1, ?2, unixepoch('now','subsec'), unixepoch('now','subsec') + ?3)
-        ON CONFLICT (lock_key) DO UPDATE
-          SET owner_token = excluded.owner_token,
-              acquired_at = excluded.acquired_at,
-              expires_at = excluded.expires_at
-          WHERE aggregate_locks.expires_at <= unixepoch('now','subsec')
-             OR aggregate_locks.owner_token = excluded.owner_token
-        RETURNING owner_token
-        "#;
+    const ACQUIRE_SQL: &'static str = concat!(
+        "INSERT INTO aggregate_locks (lock_key, owner_token, acquired_at, expires_at) VALUES (?1, ?2, ",
+        sqlite_now!(),
+        ", ",
+        sqlite_now!(),
+        " + ?3) ON CONFLICT (lock_key) DO UPDATE SET owner_token = excluded.owner_token, \
+         acquired_at = excluded.acquired_at, expires_at = excluded.expires_at \
+         WHERE aggregate_locks.expires_at <= ",
+        sqlite_now!(),
+        " OR aggregate_locks.owner_token = excluded.owner_token RETURNING owner_token"
+    );
 
     const RELEASE_SQL: &'static str =
         "DELETE FROM aggregate_locks WHERE lock_key = ?1 AND owner_token = ?2";
 
-    const SWEEP_SQL: &'static str =
-        "DELETE FROM aggregate_locks WHERE expires_at <= unixepoch('now','subsec')";
+    const SWEEP_SQL: &'static str = concat!(
+        "DELETE FROM aggregate_locks WHERE expires_at <= ",
+        sqlite_now!()
+    );
 
     /// SQLite serializes writers, so a colliding writer may get `SQLITE_BUSY` —
     /// treat that as contention (retry), not failure, since the pool sets no

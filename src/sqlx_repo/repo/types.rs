@@ -231,7 +231,13 @@ where
     for<'c> &'c Pool<DB>: Executor<'c, Database = DB>,
     DB::Arguments: IntoArguments<DB>,
 {
-    for statement in table_schema_statements(registry, DB::TABLE_DIALECT)? {
+    let statements = table_schema_statements(registry, DB::TABLE_DIALECT)?
+        .into_iter()
+        .chain(crate::table::text_collation_upgrades(
+            registry,
+            DB::TABLE_DIALECT,
+        )?);
+    for statement in statements {
         sqlx::query(audited_table_schema_sql(statement))
             .execute(pool)
             .await

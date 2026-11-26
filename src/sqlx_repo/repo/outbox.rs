@@ -24,23 +24,17 @@ where
         limit: usize,
     ) -> impl Future<Output = Result<Vec<OutboxMessage>, RepositoryError>> + Send + '_ {
         async move {
-            let mut builder = QueryBuilder::<DB>::new("SELECT ");
-            builder.push(DB::OUTBOX_SELECT);
-            builder.push(" FROM outbox_messages WHERE status = ");
-            builder.push_bind(status.as_str());
-            builder.push(" ORDER BY ");
-            builder.push(DB::ORDER_BY_CREATED_AT);
-            builder.push(" ASC, message_id ASC LIMIT ");
+            let mut connection = self.pool.acquire().await.map_err(|error| {
+                repository_storage_error::<DB>("acquire outbox connection", error)
+            })?;
             // usize::MAX means "no practical bound"; clamp to what the column
             // type can carry.
-            builder.push_bind(i64::try_from(limit).unwrap_or(i64::MAX));
-            let rows = builder.build().fetch_all(&self.pool).await.map_err(|err| {
-                repository_storage_error::<DB>("load outbox messages by status", err)
-            })?;
-
-            rows.into_iter()
-                .map(outbox_message_from_row::<DB>)
-                .collect()
+            crate::repository::sql::outbox::by_status(
+                &mut executor::ConnectionExecutor::<DB>(&mut connection),
+                status,
+                i64::try_from(limit).unwrap_or(i64::MAX),
+            )
+            .await
         }
     }
 
@@ -48,34 +42,13 @@ where
         &self,
     ) -> impl Future<Output = Result<OutboxBacklogStats, RepositoryError>> + Send + '_ {
         async move {
-            let mut builder = QueryBuilder::<DB>::new("SELECT COUNT(*) AS pending_count, ");
-            builder.push(DB::OUTBOX_OLDEST_CREATED_AT_SELECT);
-            builder.push(" FROM outbox_messages WHERE status = ");
-            builder.push_bind(OutboxMessageStatus::Pending.as_str());
-            let row =
-                builder.build().fetch_one(&self.pool).await.map_err(|err| {
-                    repository_storage_error::<DB>("load outbox backlog stats", err)
-                })?;
-
-            let pending_count: i64 = row.try_get("pending_count").map_err(|err| {
-                repository_storage_error::<DB>("decode outbox backlog count row", err)
+            let mut connection = self.pool.acquire().await.map_err(|error| {
+                repository_storage_error::<DB>("acquire outbox connection", error)
             })?;
-            let pending =
-                repository_u64_from_i64(DB::BACKEND, pending_count, "outbox backlog count")
-                    .and_then(|value| {
-                        usize::try_from(value).map_err(|_| {
-                            RepositoryError::Model(format!(
-                                "{} outbox backlog count value {value} is invalid",
-                                DB::BACKEND
-                            ))
-                        })
-                    })?;
-            let oldest_created_at = DB::decode_optional_timestamp(&row, "oldest_created_at")?;
-
-            Ok(OutboxBacklogStats {
-                pending,
-                oldest_created_at,
-            })
+            crate::repository::sql::outbox::backlog(&mut executor::ConnectionExecutor::<DB>(
+                &mut connection,
+            ))
+            .await
         }
     }
 
@@ -218,6 +191,7 @@ where
     Ok(())
 }
 
+#[cfg(feature = "postgres")]
 pub(crate) fn outbox_message_from_row<DB>(row: DB::Row) -> Result<OutboxMessage, RepositoryError>
 where
     DB: SqlxRepoBackend,

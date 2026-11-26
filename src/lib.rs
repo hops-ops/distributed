@@ -332,8 +332,7 @@ pub use schedule::{Capabilities, Capability, Schedule, ScheduleWrite};
 
 // Outbox: commit concerns (aggregate + outbox in one commit).
 pub use outbox::{
-    outbox_message_schema, AggregateCommit, CommitReceipt, OutboxMessage, OutboxMessageStatus,
-    OutboxPublisherConfig, OUTBOX_MESSAGES_TABLE,
+    AggregateCommit, CommitReceipt, OutboxMessage, OutboxMessageStatus, OutboxPublisherConfig,
 };
 
 // Outbox Worker: drain and publish concerns.

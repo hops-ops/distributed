@@ -10,12 +10,11 @@ use async_graphql::Value;
 use crate::graphql::surface::{model_has_client_normalized_identity, SurfaceModel};
 use crate::microsvc::Session;
 use crate::table::{
-    resolve_direct_join_keys, resolve_m2m_join_keys, ColumnType, RelationshipDef, RelationshipKind,
-    TableSchema,
+    resolve_direct_join_keys, resolve_m2m_join_keys, RelationshipDef, RelationshipKind, TableSchema,
 };
 
 use super::super::engine::EngineInner;
-use super::dialect::{join_predicate_direct, join_predicate_m2m_pairs, SqlDialect};
+use super::dialect::{join_predicate_direct, join_predicate_m2m_pairs};
 use super::CompileError;
 
 /// Ties a scan to what encloses it: an optional `JOIN` (many-to-many through
@@ -134,7 +133,6 @@ impl<'a> ModelScan<'a> {
             alias,
             |column| self.allows_column(column),
             self.inner.strict_where,
-            self.inner.dialect,
         )
     }
 }
@@ -215,7 +213,6 @@ pub(super) fn compile_order_by(
     alias: &str,
     allows_column: impl Fn(&str) -> bool,
     strict: bool,
-    dialect: SqlDialect,
 ) -> Result<String, CompileError> {
     let mut parts = Vec::new();
     if let Some(Value::List(items)) = order_arg {
@@ -258,28 +255,14 @@ pub(super) fn compile_order_by(
                         "asc_nulls_last" | "desc_nulls_last" => " NULLS LAST",
                         _ => "",
                     };
-                    let collation = schema
-                        .columns
-                        .iter()
-                        .find(|column| column.column_name == *col)
-                        .filter(|column| column.column_type == ColumnType::Text)
-                        .map(|_| format!(" COLLATE {}", dialect.ops().binary_collation))
-                        .unwrap_or_default();
-                    parts.push(format!("{alias}.\"{col}\"{collation} {sql_dir}{nulls}"));
+                    parts.push(format!("{alias}.\"{col}\" {sql_dir}{nulls}"));
                 }
             }
         }
     }
     // Always append PK asc tiebreaker.
     for pk in &schema.primary_key.columns {
-        let collation = schema
-            .columns
-            .iter()
-            .find(|column| column.column_name == *pk)
-            .filter(|column| column.column_type == ColumnType::Text)
-            .map(|_| format!(" COLLATE {}", dialect.ops().binary_collation))
-            .unwrap_or_default();
-        parts.push(format!("{alias}.\"{pk}\"{collation} ASC"));
+        parts.push(format!("{alias}.\"{pk}\" ASC"));
     }
     if parts.is_empty() {
         Ok(String::new())
@@ -333,8 +316,7 @@ mod strict_order_by_tests {
         let schema = item_schema();
         let perm = |_: &str| true;
         let arg = order_list(vec![("nope", "asc")]);
-        let err = compile_order_by(&schema, Some(&arg), "t0", perm, true, SqlDialect::Sqlite)
-            .unwrap_err();
+        let err = compile_order_by(&schema, Some(&arg), "t0", perm, true).unwrap_err();
         assert!(err.to_string().contains("unknown order_by"), "{err}");
     }
 
@@ -343,8 +325,7 @@ mod strict_order_by_tests {
         let schema = item_schema();
         let perm = |column: &str| matches!(column, "id" | "name");
         let arg = order_list(vec![("secret", "asc")]);
-        let err = compile_order_by(&schema, Some(&arg), "t0", perm, true, SqlDialect::Sqlite)
-            .unwrap_err();
+        let err = compile_order_by(&schema, Some(&arg), "t0", perm, true).unwrap_err();
         assert!(err.to_string().contains("ungranted order_by"), "{err}");
     }
 
@@ -353,15 +334,11 @@ mod strict_order_by_tests {
         let schema = item_schema();
         let perm = |column: &str| matches!(column, "id" | "name");
         let arg = order_list(vec![("secret", "asc"), ("nope", "desc"), ("name", "desc")]);
-        let sql =
-            compile_order_by(&schema, Some(&arg), "t0", perm, false, SqlDialect::Sqlite).unwrap();
-        assert!(sql.contains(r#"t0."name" COLLATE BINARY DESC"#), "{sql}");
+        let sql = compile_order_by(&schema, Some(&arg), "t0", perm, false).unwrap();
+        assert!(sql.contains(r#"t0."name" DESC"#), "{sql}");
         assert!(!sql.contains("secret"), "{sql}");
         assert!(!sql.contains("nope"), "{sql}");
-        assert!(
-            sql.contains(r#"t0."id" COLLATE BINARY ASC"#),
-            "pk tiebreak: {sql}"
-        );
+        assert!(sql.contains(r#"t0."id" ASC"#), "pk tiebreak: {sql}");
     }
 
     #[test]
@@ -369,10 +346,9 @@ mod strict_order_by_tests {
         let schema = item_schema();
         let perm = |_: &str| true;
         let arg = order_list(vec![("name", "desc")]);
-        let sql =
-            compile_order_by(&schema, Some(&arg), "t0", perm, true, SqlDialect::Sqlite).unwrap();
-        assert!(sql.contains(r#"t0."name" COLLATE BINARY DESC"#), "{sql}");
-        assert!(sql.contains(r#"t0."id" COLLATE BINARY ASC"#), "{sql}");
+        let sql = compile_order_by(&schema, Some(&arg), "t0", perm, true).unwrap();
+        assert!(sql.contains(r#"t0."name" DESC"#), "{sql}");
+        assert!(sql.contains(r#"t0."id" ASC"#), "{sql}");
     }
 
     #[test]
@@ -390,8 +366,7 @@ mod strict_order_by_tests {
         );
         let arg = GqlValue::List(vec![GqlValue::Object(entry)]);
 
-        let error = compile_order_by(&schema, Some(&arg), "t0", perm, false, SqlDialect::Sqlite)
-            .unwrap_err();
+        let error = compile_order_by(&schema, Some(&arg), "t0", perm, false).unwrap_err();
         assert!(
             matches!(&error, CompileError::InvalidFilter(detail)
                 if detail.contains("ambiguous order_by") && detail.contains("one field per list entry")),
@@ -405,16 +380,11 @@ mod strict_order_by_tests {
         let perm = |_: &str| true;
         let arg = order_list(vec![("name", "desc"), ("secret", "asc")]);
 
-        let sql =
-            compile_order_by(&schema, Some(&arg), "t0", perm, true, SqlDialect::Postgres).unwrap();
-        assert!(sql.contains(r#"t0."name" COLLATE "C" DESC"#), "{sql}");
-        assert!(sql.contains(r#"t0."secret" COLLATE "C" ASC"#), "{sql}");
-        let name_position = sql
-            .find(r#"t0."name" COLLATE "C" DESC"#)
-            .expect("name ordering");
-        let secret_position = sql
-            .find(r#"t0."secret" COLLATE "C" ASC"#)
-            .expect("secret ordering");
+        let sql = compile_order_by(&schema, Some(&arg), "t0", perm, true).unwrap();
+        assert!(sql.contains(r#"t0."name" DESC"#), "{sql}");
+        assert!(sql.contains(r#"t0."secret" ASC"#), "{sql}");
+        let name_position = sql.find(r#"t0."name" DESC"#).expect("name ordering");
+        let secret_position = sql.find(r#"t0."secret" ASC"#).expect("secret ordering");
         assert!(name_position < secret_position, "{sql}");
     }
 }

@@ -180,6 +180,30 @@
         "path": "migrations/postgres/0015_outbox_without_published.sql",
         "sha256": "e546fa87ad87b99b5c55625d9d0ad0675de480d746ce71dc419d0e1e1022ba82"
       }
+    },
+    {
+      "version": 16,
+      "description": "integer timestamps",
+      "sqlite": {
+        "path": "migrations/sqlite/0016_integer_timestamps.sql",
+        "sha256": "7e8f6790c415055788c7ced8a978690ad91f28db691690653a570eb0e202851d"
+      },
+      "postgres": {
+        "path": "migrations/postgres/0016_integer_timestamps.sql",
+        "sha256": "1551fe1787c16a9ef29a1aee807ee35480c91f862461421bc1b41a2e5456d694"
+      }
+    },
+    {
+      "version": 17,
+      "description": "integer lease and schedule timestamps",
+      "sqlite": {
+        "path": "migrations/sqlite/0017_integer_lease_and_schedule_timestamps.sql",
+        "sha256": "1c022c7364bbbd9611bc5b5e658d97c405741dc3fe2fbacbf4a79b861a1cefbc"
+      },
+      "postgres": {
+        "path": "migrations/postgres/0017_integer_lease_and_schedule_timestamps.sql",
+        "sha256": "7b448eca529161e62ab9dd0ba750755e6b299c685b1cfaadd7b050f3193c1e93"
+      }
     }
   ]
 }
