@@ -10,14 +10,16 @@ that keeps failing monopolize the consumer.
 
 ## Retry backoff for retryable failures
 
-A retryable failure NAKs the delivery so the broker redelivers it later. On
-NATS JetStream the NAK carries a delay derived from the delivery count:
-`base * 2^(delivered - 1)`, capped (defaults 50 ms and 5 s;
-`NatsBus::with_nack_backoff` / `NatsJetStreamSource::with_nack_backoff`).
-The first retry is still prompt. A message that fails every time stops
-being redelivered ahead of newer messages in a hot loop. Retries remain
-unlimited and the message is still retained; only the redelivery time moves.
-Setting the base to zero restores an immediate NAK.
+A retryable failure hands the delivery back to the transport with a delay
+derived from the delivery count: `base * 2^(attempt - 1)`, capped (defaults
+50 ms and 5 s; `RunOptions::with_backoff(RetryBackoff::new(base, max))`). The
+runner computes the delay above the transport, so every bus uses the same
+policy; on NATS JetStream it is the NAK delay. The first retry is still prompt,
+and a message that fails every time is not redelivered ahead of newer messages
+in a hot loop. Retries are unlimited unless `RunOptions::with_max_attempts`
+sets a limit, after which the message is dead-lettered.
+`RetryBackoff::immediate()` (the `RunOptions::until_idle()` default) redelivers
+at once and is meant for tests.
 
 This is not a substitute for classifying failures correctly. A command
 rejection that is durably recorded under a deterministic command identity
@@ -31,7 +33,7 @@ stay retryable.
 A router may partition its routes into named **lanes**. `Service::lane(name,
 routes)` registers a route bundle in a lane. Plain `Service::routes` uses the
 default lane. Lanes are opt-in. A service that registers no named lane runs
-exactly as before.
+every route sequentially as described above.
 
 When a router has more than one lane and the source settles each delivery
 independently (`MessageSource::settles_independently`, true for NATS
@@ -56,7 +58,7 @@ JetStream), the runner:
    are NAKed, not skipped. Other in-flight deliveries finish and settle, then
    the run returns the error.
 
-The default lane keeps its existing behavior, including route-order
+The default lane behaves like a single-lane consumer, including route-order
 dependencies between its routes within one delivery.
 
 Sources whose acknowledgement is positional (Kafka offset commits) or
@@ -79,9 +81,8 @@ correctness (or whose downstream readers' correctness) needs another lane's
 effects from an *earlier* message — for example, a process policy that
 completes a workflow the UI then reads through a projection maintained in
 another lane — must share that lane, or its readers must tolerate the
-projection arriving later. Forge hit this: provisioning completed before the
-read-access projection existed, producing transient 404s, until the
-derivation moved into the process lane.
+projection arriving later. Otherwise a workflow can complete before the
+projection that grants read access exists, and readers see transient 404s.
 
 Lanes do not weaken existing guarantees:
 
@@ -90,9 +91,9 @@ Lanes do not weaken existing guarantees:
   already true for a single-lane consumer.
 - **At-least-once:** a delivery is acknowledged only after all of its lanes
   succeeded. A crash or failure before that redelivers it to every lane, so
-  every route must stay idempotent, as today.
-- **Failure policy and DLQ:** unchanged, applied once per delivery after all
-  lanes finish.
+  every route must stay idempotent.
+- **Failure policy and DLQ:** applied once per delivery after all lanes
+  finish.
 - **Ack deadline:** a delivery waiting in a busy lane still counts against the
   broker's ack wait. Keep the window small enough that a lane's backlog clears
   well within it. An expired delivery is redelivered, which is safe under the

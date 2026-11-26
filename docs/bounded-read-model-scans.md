@@ -12,7 +12,7 @@ let rows = page.typed::<PullRequestView>()?;
 let cursor = page.next;
 ```
 
-The initial capability supports a single non-null text primary key, at most 16
+Scans support a single non-null text primary key, at most 16
 typed equality filters and 1–100 returned rows. Filters support text, nullable
 NULL, booleans and signed/unsigned integers within the SQL signed range. Text
 filters and cursor keys are bounded to 4096 bytes; NUL is rejected. Composite
@@ -35,5 +35,6 @@ does not provide an authorization bypass or replace a public GraphQL read policy
 This is a server-side store API. Browser clients page a GraphQL list with a
 `@window` operation instead: its keyset is the operation's `order_by` plus the
 primary key, and its cursor is ordinary filter variables, so the same row
-policy, collation and authorization apply to every page (see the client
-replica section of the README).
+policy, collation and authorization apply to every page (see
+[Windows](../js/README.md#windows-a-live-head-plus-older-pages) in the JS
+client README).

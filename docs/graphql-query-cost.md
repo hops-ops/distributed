@@ -69,7 +69,7 @@ Client manifests export the limits a generated client must respect as
 { "max_depth": 8, "max_fields": 500, "max_rows": 200000, "max_bool_width": 256, "max_in_list": 1000 }
 ```
 
-The client compiler (`distributed client compile`) computes rows with the same
+The client compiler (`distributed client`) computes rows with the same
 functions (`distributed::graphql::row_cost`) and refuses an operation whose
 literal or default page sizes already exceed `max_rows`. A variable `limit` is
 unknown at build time and counts as the field's default page size; the engine

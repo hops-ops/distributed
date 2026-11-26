@@ -14,9 +14,8 @@ twice.
 | One owner per key, with stale writers rejected | Lease with fencing token | `distributed::lease` |
 | Deterministic time in tests | `Clock`, `ManualClock` | `distributed::clock` |
 
-All three are dependency-free in core. The SQL lease stores follow the
-existing `sqlite` / `postgres` features. No new cargo feature was added and
-default features are unchanged.
+All three are dependency-free in core and need no feature of their own: the
+SQL lease and schedule stores come with the `sqlite` / `postgres` features.
 
 ## Schedules: an aggregate schedules its own work
 
@@ -27,7 +26,7 @@ events (`distributed::schedule`). Outbox rows are never delayed except by a
 publish retry's backoff; work that must happen later is a schedule whose
 handler emits the message then.
 
-```rust
+```rust,ignore
 // on the route: what the command needs from its host
 routes.typed_command(start).requires(Capability::Scheduling).requires(Capability::Clock)
 
@@ -83,7 +82,7 @@ removes any caller value); `ctx.schedule` refuses unless the route declared
 any Tokio runtime feature). SQL and in-memory repositories store schedules
 for every aggregate in one table, so a worker process fires them:
 
-```rust
+```rust,ignore
 let (repo, schedules) = ScheduleWorker::attach(
     PostgresRepository::connect_and_migrate(url).await?,
     ScheduleWorkerConfig::default(),
@@ -94,7 +93,7 @@ let worker = schedules.spawn(service); // worker.stop().await on shutdown
 
 - Each pass claims up to 32 due, unclaimed rows in one statement
   (`UPDATE … WHERE … IN (SELECT … FOR UPDATE SKIP LOCKED) RETURNING`;
-  SQLite serializes writers instead), marking them `claimed_until_ms`
+  SQLite serializes writers instead), marking them `claimed_until`
   (default 30 s ahead). Concurrent workers in several processes get
   disjoint rows.
 - Each claimed arm is dispatched through the `Service` with
@@ -131,7 +130,7 @@ runs deterministically.
 
 ## Leases with fencing tokens
 
-```rust
+```rust,ignore
 let lease = leases.acquire("boss:hydra", "zone-7", Duration::from_secs(15)).await?;
 // every 5s
 let lease = leases.renew(&lease, Duration::from_secs(15)).await?; // Err(Lost) => stop acting
@@ -193,7 +192,7 @@ attempt }` into the saga through the `SagaTimeouts<D>` route, which calls
 `Saga::time_out`. Mount that route on a service over the saga repository and
 attach a schedule worker (or run on a host that fires its own schedules):
 
-```rust
+```rust,ignore
 let (repo, worker) = ScheduleWorker::attach(repo, ScheduleWorkerConfig::default());
 let service = Arc::new(Service::new().named("transfer-saga").routes(
     Routes::new()
@@ -212,7 +211,7 @@ declares the transport role (`.roles([TRANSPORT_ROLE])`); a typed command
 that does not is refused when a bus delivers it. The handler builds the
 reply from its session and stages it in the same commit as its state change:
 
-```rust
+```rust,ignore
 let reply = SagaReply::from_session(ctx.session()).map_err(rejected)?;
 // ... load the aggregate, apply or refuse the step ...
 let reply = reply.succeeded(output).map_err(rejected)?;
@@ -271,7 +270,7 @@ ticket reservation per party when a match starts. `action` returns
 (`SagaCommand` converts with `.into()`); `compensation` and
 `on_step_succeeded` receive the member index (`0` for single steps).
 
-```rust
+```rust,ignore
 fn action(step: &str, saga_id: &str, d: &MatchStart) -> Result<SagaAction, SagaError> {
     match step {
         "reserve" => Ok(SagaAction::fan_out(

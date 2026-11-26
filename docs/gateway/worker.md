@@ -61,15 +61,18 @@ parsed JSON, credentials, active requests, sockets and the application's own
 allocations need additional memory headroom. Groups, consumers, frame sizes,
 queue length, response sizes and operation lifetimes have independent limits.
 
-Modern GraphQL subscriptions use standard ping/pong payload echo as delivery
-credits: the supplied JS transport echoes the payload. Full data and confirmation
-proof stay unchanged. A client that does not acknowledge is reset instead of
-silently accumulating data. Raw UI and legacy GraphQL sockets cannot assume that
-protocol; they have bounded callback queues and cumulative delivery limits,
-after which reconnect is required. `websocket_buffer_bytes` bounds a complete
-frame and aggregate queued wire bytes per socket; arbitrary UI delivery is
-limited to eight times this value per connection. Customize limits for the UI's
-protocol. Outgoing origin sockets remain active and do not hibernate. One shared
+With a delivery binding, `graphql-transport-ws` subscriptions use standard
+ping/pong payload echo as delivery credits: after each `next` the gateway sends
+a `ping` and waits for the matching `pong` (the supplied JS transport echoes
+the payload). Full data and confirmation proof stay unchanged. A client that
+does not acknowledge is reset (`LIVE_RESET_REQUIRED`) instead of silently
+accumulating data. Sockets that cannot use credits have cumulative delivery
+limits instead, after which the gateway closes them and the client must
+reconnect: legacy `graphql-ws` sockets and any GraphQL socket forwarded
+without a delivery binding may receive `websocket_buffer_bytes` in total, and
+raw UI sockets eight times that value. `websocket_buffer_bytes` (default
+256 KiB) also bounds a complete frame and the aggregate queued wire bytes per
+socket. Customize limits for the UI's protocol. Outgoing origin sockets remain active and do not hibernate. One shared
 steady-state producer does not mean one lifetime handshake: every consumer is
 independently authenticated at the origin before grouping.
 

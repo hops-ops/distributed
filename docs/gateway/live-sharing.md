@@ -25,9 +25,12 @@ frames. Unknown cursors keep independent streams. Equal data alone never proves
 cursor equality. Duplicate suppression hashes the whole data and protocol envelope,
 so new confirmation evidence is delivered even when values are unchanged.
 
-Cursorless `live.mode = "snapshot"` responses cannot prove shared replay handoff;
-they retain independent authorized subscriptions and reconnect with fresh queries.
-See [live query delivery](../live-query-delivery.md) for the wire contract.
+Cursorless `live.mode = "snapshot"` frames carry no cursor vector, so they never
+prove a handoff. Consumers whose initial request matches a group with complete
+retained history still join it; a consumer that starts an independent replay
+of a snapshot-mode operation keeps its own upstream subscription and recovers
+with a fresh query. See [live query delivery](../live-query-delivery.md) for the
+wire contract.
 
 Defaults bound a coordinator to 256 groups, 1,024 consumers per group, 16 pending
 frames per consumer, 1 MiB per full frame, eight retained history frames and a
@@ -58,8 +61,8 @@ attempts, resets, upstream frames, exact duplicate frames and safe handoffs. Sou
 attempts include credential reconnects; they are not a count of active producers.
 `GraphqlEngine::live_subscriber_count()` reports live subscriptions reaching the
 origin and `live_producer_count()` its producers
-(one per distinct origin live read; see `docs/live-query-delivery.md`). No credentials or subject identifiers appear in these counters.
+(one per distinct origin live read; see [live query delivery](../live-query-delivery.md#shared-execution-at-the-origin)). No credentials or subject identifiers appear in these counters.
 
-Disable `live_sharing` and remove the live delivery resource to restore independent
-subscriptions. Existing client resume/reset and response-sealing behavior remains
-in force. No migration or new credential is required by live coordination itself.
+Disable `live_sharing` and remove the live delivery resource to keep independent
+subscriptions. Client resume/reset and response sealing are the same either way;
+live coordination needs no migration or credential of its own.
