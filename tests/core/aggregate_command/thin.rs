@@ -96,12 +96,145 @@ command! {
     payload: |hero, _principal| hero_payload(hero),
 }
 
+// `Succeeded`, on a transition that captures the `hero.napped` domain event.
+command! {
+    name: "hero.siesta",
+    transition: domain_commands::Nap,
+    aggregate: Hero,
+    input: NapInput,
+    outcome: Succeeded<HeroPayload>,
+    shard: |_input| "dee".to_string(),
+    load: or_create,
+    roles: ["player"],
+    field: "heroes_siesta",
+    invoke: |hero, input, principal| hero
+        .nap(principal.to_string(), NapInput { minutes: input.minutes })
+        .map(|_| ()),
+    payload: |hero, _principal| hero_payload(hero),
+}
+
 fn thin_cell(id: &str) -> AggregateCell<Hero> {
     AggregateCell::<Hero>::new(id)
         .unwrap()
         .mount(enlist())
         .mount(outfit_command())
         .mount(doze())
+        .mount(siesta())
+}
+
+/// The cell's outbox rows as `(source sequence, event type)`, in stream
+/// order (the outbox itself is unordered).
+fn outbox_events(cell: &AggregateCell<Hero>) -> Vec<(Option<u64>, String)> {
+    let mut rows: Vec<_> = cell
+        .durable_outbox()
+        .unwrap()
+        .into_iter()
+        .map(|message| (message.source_sequence, message.event_type))
+        .collect();
+    rows.sort();
+    rows
+}
+
+/// An aggregate whose events are history-only: nothing to publish.
+#[derive(Clone, Default, Serialize, Deserialize)]
+pub struct Tally {
+    entity: distributed::Entity,
+    count: u32,
+}
+
+#[sourced(entity, aggregate_type = "tally")]
+impl Tally {
+    #[event("tally.bumped")]
+    fn bumped(&mut self, id: String) {
+        self.entity.set_id(id);
+        self.count += 1;
+    }
+}
+
+/// The witness of a transition with no outward domain events.
+pub enum Bumped {}
+
+impl distributed::command::CommandEventSet for Bumped {
+    fn command_event_set() -> distributed::command::CommandProjectionEventSet {
+        Default::default()
+    }
+}
+
+#[derive(Debug, Deserialize, distributed::CommandInput)]
+pub struct BumpInput {
+    pub tally_id: String,
+}
+
+#[derive(Debug, Serialize, distributed::CommandOutput)]
+pub struct TallyPayload {
+    pub count: u32,
+}
+
+command! {
+    name: "tally.bump",
+    transition: Bumped,
+    aggregate: Tally,
+    input: BumpInput,
+    outcome: Succeeded<TallyPayload>,
+    shard: |input| input.tally_id.clone(),
+    load: or_create,
+    roles: ["player"],
+    field: "tallies_bump",
+    invoke: |tally, input, _principal| tally.bumped(input.tally_id.clone()),
+    payload: |tally, _principal| TallyPayload { count: tally.count },
+}
+
+#[tokio::test]
+async fn succeeded_commits_an_aggregate_without_domain_events() {
+    let cell = AggregateCell::<Tally>::new("t").unwrap().mount(bump());
+    for count in 1..=2 {
+        let identity = CellCommandIdentity::new(
+            "tallies",
+            "ana",
+            format!("0190a000-0000-7000-8001-{count:012}"),
+        )
+        .unwrap();
+        let result = cell
+            .dispatch_idempotent(
+                "tally.bump",
+                &identity,
+                json!({ "tally_id": "t" }),
+                session(Some("ana")),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.payload(), &json!({ "count": count }));
+    }
+    assert_eq!(cell.history().await.unwrap().len(), 2);
+    assert!(cell.durable_outbox().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn succeeded_publishes_the_captured_domain_events() {
+    let cell = thin_cell("dee");
+    for naps in 1..=2 {
+        let payload = dispatch(
+            &cell,
+            "hero.siesta",
+            json!({ "minutes": 5 }),
+            session(Some("dee")),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            payload,
+            json!({ "hero_id": "dee", "name": "dee", "items": 0 })
+        );
+        assert_eq!(cell.load().await.unwrap().unwrap().naps, naps);
+    }
+    assert_eq!(
+        outbox_events(&cell),
+        [
+            (Some(1), "hero.created".to_string()),
+            (Some(2), "hero.napped".to_string()),
+            (Some(3), "hero.napped".to_string()),
+        ]
+    );
 }
 
 #[tokio::test]
