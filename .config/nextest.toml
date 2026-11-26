@@ -23,11 +23,11 @@ fail-fast = false
 path = "junit.xml"
 
 [test-groups]
-# Compile-fail tests build scratch crates with a nested `cargo`. The three
-# trybuild binaries of `distributed_macros` share one trybuild project
-# directory, and both `rustc_fail` binaries build in the shared
-# `target/tests/rustc-fail/target` (`tests/support/rustc_fail.rs`). Run at
-# once, they overwrite each other's project files.
+# Compile-fail tests build scratch crates with a nested `cargo`. Both
+# `rustc_fail` binaries build in the shared `target/tests/rustc-fail/target`
+# (`tests/support/rustc_fail.rs`), and every trybuild binary builds in the
+# shared `target/tests/trybuild` workspace. Run at once, they overwrite each
+# other's project files or wait on one Cargo lock.
 compile-fail = { max-threads = 1 }
 # The lifecycle-project tests of `distributed_cli` build one fixture project
 # into one Cargo target directory (`CARGO_TARGET_TMPDIR/lifecycle-project`);
@@ -49,8 +49,6 @@ postgres-projection-views = { max-threads = 1 }
 [[profile.default.overrides]]
 filter = '''
 binary_id(distributed_macros::compile_fail)
-| binary_id(distributed_macros::command_types_compile_fail)
-| binary_id(distributed_macros::command_input_defaults_compile_fail)
 | binary_id(distributed_macros::rustc_fail)
 | binary_id(distributed_game_macros::compile_fail)
 | binary_id(distributed_game_macros::rustc_fail)
