@@ -1,3 +1,10 @@
+//! The canonical merge of projection-delta operations and recoveries.
+//!
+//! Generic over the field value `V` and partition `P`: the server merges
+//! concrete [`DeltaValue`](super::DeltaValue)s, the client compiler merges the
+//! symbolic expressions of a command preview, and both get the same merge,
+//! recovery and ordering semantics.
+
 use std::collections::{BTreeMap, BTreeSet};
 
 use super::{
@@ -5,9 +12,20 @@ use super::{
     ProjectionDeltaRecovery, ProjectionDeltaRecoveryCondition, ProjectionDeltaRecoveryTarget,
 };
 
-pub(crate) fn canonicalize_operations(
-    operations: Vec<ProjectionDeltaOperation>,
-) -> Result<Vec<ProjectionDeltaOperation>, ProjectionDeltaError> {
+/// Merge every operation on one scope into its final mutation, ordered by
+/// scope.
+///
+/// Within one scope the later occurrence wins, except that a patch extends an
+/// upsert (inside its replacement mask) and cannot revive a delete.
+///
+/// # Errors
+///
+/// [`ProjectionDeltaError::InvalidOperation`] when one occurrence contributes
+/// two different mutations to a scope, or the mutations on a scope cannot
+/// compose.
+pub fn canonicalize_operations<V: Clone + Ord, P: Clone + Ord>(
+    operations: Vec<ProjectionDeltaOperation<V, P>>,
+) -> Result<Vec<ProjectionDeltaOperation<V, P>>, ProjectionDeltaError> {
     let mut by_scope = BTreeMap::new();
     for operation in operations {
         let scope = operation.canonical_scope();
@@ -22,15 +40,20 @@ pub(crate) fn canonicalize_operations(
     Ok(operations)
 }
 
-pub(crate) fn canonicalize_recoveries(
-    recoveries: Vec<ProjectionDeltaRecovery>,
-    operations: &[ProjectionDeltaOperation],
-) -> Vec<ProjectionDeltaRecovery> {
+/// Merge recoveries by target, ordered by target.
+///
+/// `Always` wins over `IfRecordMissing`, and an `IfRecordMissing` recovery is
+/// kept only while a conditional patch of the same record remains in the
+/// canonical `operations`.
+pub fn canonicalize_recoveries<V: Clone + Ord, P: Clone + Ord>(
+    recoveries: Vec<ProjectionDeltaRecovery<V, P>>,
+    operations: &[ProjectionDeltaOperation<V, P>],
+) -> Vec<ProjectionDeltaRecovery<V, P>> {
     let mut by_target = BTreeMap::new();
     for recovery in recoveries {
         by_target
             .entry(recovery.target.clone())
-            .and_modify(|existing: &mut ProjectionDeltaRecovery| {
+            .and_modify(|existing: &mut ProjectionDeltaRecovery<V, P>| {
                 existing.occurrence_ordinal =
                     existing.occurrence_ordinal.max(recovery.occurrence_ordinal);
                 if recovery.condition == ProjectionDeltaRecoveryCondition::Always {
@@ -66,9 +89,9 @@ pub(crate) fn canonicalize_recoveries(
     recoveries
 }
 
-fn merge_operation(
-    existing: &mut ProjectionDeltaOperation,
-    incoming: ProjectionDeltaOperation,
+fn merge_operation<V: Clone + Ord, P: Clone + Ord>(
+    existing: &mut ProjectionDeltaOperation<V, P>,
+    incoming: ProjectionDeltaOperation<V, P>,
 ) -> Result<(), ProjectionDeltaError> {
     if existing.occurrence_ordinal == incoming.occurrence_ordinal {
         if existing.mutation != incoming.mutation {
@@ -91,10 +114,10 @@ fn merge_operation(
     Ok(())
 }
 
-fn merge_mutation(
-    existing: ProjectionDeltaMutation,
-    incoming: ProjectionDeltaMutation,
-) -> Result<ProjectionDeltaMutation, ProjectionDeltaError> {
+fn merge_mutation<V: Clone + Ord, P: Clone + Ord>(
+    existing: ProjectionDeltaMutation<V, P>,
+    incoming: ProjectionDeltaMutation<V, P>,
+) -> Result<ProjectionDeltaMutation<V, P>, ProjectionDeltaError> {
     if !same_merge_scope(&existing, &incoming) {
         return Err(incompatible_final_mutations());
     }
@@ -223,9 +246,9 @@ fn merge_mutation(
     }
 }
 
-fn same_merge_scope(
-    existing: &ProjectionDeltaMutation,
-    incoming: &ProjectionDeltaMutation,
+fn same_merge_scope<V: PartialEq, P: PartialEq>(
+    existing: &ProjectionDeltaMutation<V, P>,
+    incoming: &ProjectionDeltaMutation<V, P>,
 ) -> bool {
     match (existing, incoming) {
         (

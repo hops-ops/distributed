@@ -53,7 +53,7 @@ use validation::validate_surface_structure;
 
 #[cfg(test)]
 use build::client_manifest_from_surface;
-pub use codec::client_protocol_fingerprint;
+pub use codec::{canonical_json_value, client_protocol_fingerprint, hash_bytes};
 pub use commands::{command_operation, command_status_operation};
 pub use error::ClientManifestError;
 pub use export::{prune_client_manifest, DistributedClientSurfaceExport};
@@ -69,20 +69,19 @@ pub use types::{
     ClientCommandShape, ClientField, ClientFilterField, ClientFilterInput,
     ClientFilterInputRelationship, ClientFilterSemantics, ClientKeyField, ClientModel,
     ClientOrderSemantics, ClientPaginationSemantics, ClientProjectionArm,
-    ClientProjectionAssignment, ClientProjectionBinding, ClientProjectionEnvelopeField,
-    ClientProjectionEventRef, ClientProjectionExpression, ClientProjectionFallback,
-    ClientProjectionField, ClientProjectionInvalidation, ClientProjectionKeyField,
-    ClientProjectionMutationKind, ClientProjectionObjectField, ClientProjectionOperation,
-    ClientProjectionPartition, ClientProjectionPreviewSource, ClientProjectionProgram,
-    ClientProjectionRelationshipEffect, ClientProjectionTopologyIdentity, ClientProjectionValue,
-    ClientProjectionValueField, ClientProjector, ClientProtocolOperation, ClientProtocolOperations,
-    ClientRelationship, ClientRelationshipAggregate, ClientRelationshipKind,
-    ClientRelationshipMaintenance, ClientRoot, ClientRootKind, ClientRootOperation,
-    ClientRowPolicy, ClientTrustedPresetDescriptor, ClientTypeDef, ClientTypeField,
-    CommandConsistencyExtension, CommandDirectProjectionExtension, CommandInputDefaultsExtension,
-    CommandProjectionArmRef, CommandProjectionExtension, CommandProjectionPreviewOccurrence,
-    CommandProjectionPreviewValue, DistributedClientManifest, ModelNormalization,
-    RelationshipKeyMapping, ScalarCodec,
+    ClientProjectionAssignment, ClientProjectionBinding, ClientProjectionEventRef,
+    ClientProjectionExpression, ClientProjectionFallback, ClientProjectionField,
+    ClientProjectionInvalidation, ClientProjectionKeyField, ClientProjectionMutationKind,
+    ClientProjectionObjectField, ClientProjectionOperation, ClientProjectionPartition,
+    ClientProjectionPreviewSource, ClientProjectionProgram, ClientProjectionRelationshipEffect,
+    ClientProjectionTopologyIdentity, ClientProjector, ClientProtocolOperation,
+    ClientProtocolOperations, ClientRelationship, ClientRelationshipAggregate,
+    ClientRelationshipKind, ClientRelationshipMaintenance, ClientRoot, ClientRootKind,
+    ClientRootOperation, ClientRowPolicy, ClientTrustedPresetDescriptor, ClientTypeDef,
+    ClientTypeField, CommandConsistencyExtension, CommandDirectProjectionExtension,
+    CommandInputDefaultsExtension, CommandProjectionArmRef, CommandProjectionExtension,
+    CommandProjectionPreviewOccurrence, CommandProjectionPreviewValue, DistributedClientManifest,
+    ModelNormalization, RelationshipKeyMapping, ScalarCodec,
 };
 pub use validation::trusted_preset_descriptors;
 

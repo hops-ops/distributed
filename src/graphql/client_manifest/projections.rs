@@ -859,10 +859,8 @@ fn lower_expression_at(
                 value_type: value_type.clone(),
             }
         }
-        ProjectionExpressionRef::Envelope { field } if intrinsic_envelope(field) => {
-            ClientProjectionExpression::Envelope {
-                field: client_envelope(field),
-            }
+        ProjectionExpressionRef::Envelope { field } if field.is_client_intrinsic() => {
+            ClientProjectionExpression::Envelope { field }
         }
         ProjectionExpressionRef::Envelope { field } => {
             let value_type = envelope_value_type(field);
@@ -877,7 +875,7 @@ fn lower_expression_at(
             ClientProjectionExpression::Slot { slot, value_type }
         }
         ProjectionExpressionRef::Constant { value } => ClientProjectionExpression::Constant {
-            value: client_value(value),
+            value: value.clone(),
         },
         ProjectionExpressionRef::Enum { enum_type, variant } => ClientProjectionExpression::Enum {
             enum_type: enum_type.to_owned(),
@@ -1106,7 +1104,7 @@ fn client_preview_source(
         CommandProjectionPreviewSource::Constant { value } => {
             if constant_compatible(value, expected) {
                 ClientProjectionPreviewSource::Constant {
-                    value: client_value(value),
+                    value: value.clone(),
                 }
             } else {
                 ClientProjectionPreviewSource::Unknown
@@ -1207,15 +1205,6 @@ fn constant_compatible(value: &ProjectionValue, expected: &ProjectionValueType) 
     }
 }
 
-fn intrinsic_envelope(field: ProjectionEnvelopeField) -> bool {
-    matches!(
-        field,
-        ProjectionEnvelopeField::OccurrenceVersion
-            | ProjectionEnvelopeField::EventName
-            | ProjectionEnvelopeField::EventVersion
-    )
-}
-
 fn envelope_value_type(field: ProjectionEnvelopeField) -> ProjectionValueType {
     match field {
         ProjectionEnvelopeField::AggregateSequence
@@ -1231,57 +1220,6 @@ fn envelope_value_type(field: ProjectionEnvelopeField) -> ProjectionValueType {
         | ProjectionEnvelopeField::BodySchema
         | ProjectionEnvelopeField::BodyCodec => ProjectionValueType::String,
         _ => unreachable!("intrinsic envelope fields are not lowered to slots"),
-    }
-}
-
-fn client_value(value: &ProjectionValue) -> ClientProjectionValue {
-    match value.as_ref() {
-        ProjectionValueRef::Null => ClientProjectionValue::Null,
-        ProjectionValueRef::Boolean(value) => ClientProjectionValue::Boolean(value),
-        ProjectionValueRef::I64(value) => ClientProjectionValue::I64(value.to_owned()),
-        ProjectionValueRef::U64(value) => ClientProjectionValue::U64(value.to_owned()),
-        ProjectionValueRef::F64(value) => ClientProjectionValue::F64(value.to_owned()),
-        ProjectionValueRef::String(value) => ClientProjectionValue::String(value.to_owned()),
-        ProjectionValueRef::Enum { enum_type, variant } => ClientProjectionValue::Enum {
-            enum_type: enum_type.to_owned(),
-            variant: variant.to_owned(),
-        },
-        ProjectionValueRef::List(values) => {
-            ClientProjectionValue::List(values.iter().map(client_value).collect())
-        }
-        ProjectionValueRef::Object(fields) => ClientProjectionValue::Object(
-            fields
-                .iter()
-                .map(|field| ClientProjectionValueField {
-                    name: field.name().to_owned(),
-                    value: client_value(field.value()),
-                })
-                .collect(),
-        ),
-    }
-}
-
-fn client_envelope(field: ProjectionEnvelopeField) -> ClientProjectionEnvelopeField {
-    match field {
-        ProjectionEnvelopeField::OccurrenceVersion => {
-            ClientProjectionEnvelopeField::OccurrenceVersion
-        }
-        ProjectionEnvelopeField::OccurrenceId
-        | ProjectionEnvelopeField::AggregateType
-        | ProjectionEnvelopeField::AggregateId
-        | ProjectionEnvelopeField::AggregateSequence
-        | ProjectionEnvelopeField::PublicationOrdinal
-        | ProjectionEnvelopeField::BodyFingerprint
-        | ProjectionEnvelopeField::BodyKind
-        | ProjectionEnvelopeField::BodyTypeName
-        | ProjectionEnvelopeField::BodyVersion
-        | ProjectionEnvelopeField::BodySchema
-        | ProjectionEnvelopeField::BodyCodec
-        | ProjectionEnvelopeField::BodyCodecVersion => {
-            unreachable!("non-intrinsic envelope fields are lowered to slots")
-        }
-        ProjectionEnvelopeField::EventName => ClientProjectionEnvelopeField::EventName,
-        ProjectionEnvelopeField::EventVersion => ClientProjectionEnvelopeField::EventVersion,
     }
 }
 
@@ -1817,9 +1755,8 @@ mod tests {
                 .iter()
                 .any(|value| matches!(
                     &value.source,
-                    ClientProjectionPreviewSource::Constant {
-                        value: ClientProjectionValue::String(value),
-                    } if value == "transition-value"
+                    ClientProjectionPreviewSource::Constant { value }
+                        if value == &ProjectionValue::string("transition-value")
                 )));
         }
     }
@@ -2244,7 +2181,7 @@ mod tests {
         assert!(matches!(
             key[2].expression,
             ClientProjectionExpression::Envelope {
-                field: ClientProjectionEnvelopeField::EventName
+                field: ProjectionEnvelopeField::EventName
             }
         ));
         assert_eq!(slots.len(), 2);

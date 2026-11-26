@@ -25,11 +25,12 @@ pub(crate) use distributed::projection::placement::{
     ProjectionBindingState, ProjectionExecutionClass, ProjectionPlacement,
 };
 pub(crate) use distributed::projection::{
-    ProjectionRelationshipEffectKind, ProjectionScalarTransform, ProjectionValueType,
+    ProjectionEnvelopeField, ProjectionRelationshipEffectKind, ProjectionScalarTransform,
+    ProjectionValue, ProjectionValueRef, ProjectionValueType,
     PROJECTION_OPERATION_SEMANTICS_VERSION, PROJECTION_PROGRAM_IR_VERSION,
 };
 pub(crate) use distributed_leaderboard::{
     ClientLeaderboard, ClientLeaderboardRoot, LEADERBOARDS_SECTION,
 };
 
-pub(crate) use util::{canonical_json_value, hash_bytes, validate_exact_operation_hash};
+pub(crate) use util::validate_exact_operation_hash;

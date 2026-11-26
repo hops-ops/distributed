@@ -3,7 +3,8 @@ use crate::projection::placement::{
     ProjectionBindingState, ProjectionExecutionClass, ProjectionPlacement,
 };
 use crate::projection::{
-    ProjectionRelationshipEffectKind, ProjectionScalarTransform, ProjectionValueType,
+    ProjectionEnvelopeField, ProjectionRelationshipEffectKind, ProjectionScalarTransform,
+    ProjectionValue, ProjectionValueType,
 };
 
 fn deserialize_exact_u32<'de, D>(
@@ -779,11 +780,13 @@ pub enum ClientProjectionExpression {
         slot: String,
         value_type: ProjectionValueType,
     },
+    /// Only [client-intrinsic](ProjectionEnvelopeField::is_client_intrinsic)
+    /// fields; the others are slots.
     Envelope {
-        field: ClientProjectionEnvelopeField,
+        field: ProjectionEnvelopeField,
     },
     Constant {
-        value: ClientProjectionValue,
+        value: ProjectionValue,
     },
     Enum {
         enum_type: String,
@@ -806,40 +809,6 @@ pub enum ClientProjectionExpression {
 pub struct ClientProjectionObjectField {
     pub name: String,
     pub value: ClientProjectionExpression,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ClientProjectionEnvelopeField {
-    OccurrenceVersion,
-    EventName,
-    EventVersion,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(
-    tag = "type",
-    content = "value",
-    rename_all = "snake_case",
-    deny_unknown_fields
-)]
-pub enum ClientProjectionValue {
-    Null,
-    Boolean(bool),
-    I64(String),
-    U64(String),
-    F64(String),
-    String(String),
-    Enum { enum_type: String, variant: String },
-    List(Vec<ClientProjectionValue>),
-    Object(Vec<ClientProjectionValueField>),
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ClientProjectionValueField {
-    pub name: String,
-    pub value: ClientProjectionValue,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1030,7 +999,7 @@ pub enum ClientProjectionPreviewSource {
     Input { path: Vec<String> },
     GeneratedDefault { path: Vec<String> },
     TrustedPreset { name: String, codec: String },
-    Constant { value: ClientProjectionValue },
+    Constant { value: ProjectionValue },
     Null,
     Absent,
     Unknown,

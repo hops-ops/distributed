@@ -754,7 +754,17 @@ fn validate_expression(
             slot,
             value_type: _,
         } => validate_nonempty(slot, "projection expression slot"),
-        ClientProjectionExpression::Envelope { field: _ } => Ok(()),
+        ClientProjectionExpression::Envelope { field } => {
+            if field.is_client_intrinsic() {
+                Ok(())
+            } else {
+                Err(projection_error(
+                    "client.manifest.projection_envelope",
+                    "projection envelope expressions carry only client-intrinsic fields; \
+                     other envelope fields are typed slots",
+                ))
+            }
+        }
         ClientProjectionExpression::Constant { value } => validate_value(value, depth),
         ClientProjectionExpression::Enum { enum_type, variant } => {
             validate_nonempty(enum_type, "projection enum type")?;
@@ -797,19 +807,18 @@ fn validate_expression(
     }
 }
 
-fn validate_value(value: &ClientProjectionValue, depth: usize) -> Result<(), ClientCompileError> {
+/// Deserializing a [`ProjectionValue`] already proved its numbers canonical,
+/// its object members sorted and unique, and its own depth; the depth here is
+/// that of the expression holding it plus the value's.
+fn validate_value(value: &ProjectionValue, depth: usize) -> Result<(), ClientCompileError> {
     if depth > MAX_EXPRESSION_DEPTH {
         return Err(projection_error(
             "client.manifest.projection_value_depth",
             "projection value exceeds maximum depth 64",
         ));
     }
-    match value {
-        ClientProjectionValue::Null | ClientProjectionValue::Boolean(_) => Ok(()),
-        ClientProjectionValue::I64(value) => validate_canonical_i64(value),
-        ClientProjectionValue::U64(value) => validate_canonical_u64(value),
-        ClientProjectionValue::F64(value) => validate_canonical_f64(value),
-        ClientProjectionValue::String(value) => {
+    match value.as_ref() {
+        ProjectionValueRef::String(value) => {
             if value.chars().any(char::is_control) {
                 return Err(projection_error(
                     "client.manifest.projection_value",
@@ -818,28 +827,27 @@ fn validate_value(value: &ClientProjectionValue, depth: usize) -> Result<(), Cli
             }
             Ok(())
         }
-        ClientProjectionValue::Enum { enum_type, variant } => {
+        ProjectionValueRef::Enum { enum_type, variant } => {
             validate_nonempty(enum_type, "projection enum type")?;
             validate_nonempty(variant, "projection enum variant")
         }
-        ClientProjectionValue::List(values) => {
+        ProjectionValueRef::List(values) => {
             for value in values {
                 validate_value(value, depth + 1)?;
             }
             Ok(())
         }
-        ClientProjectionValue::Object(fields) => {
-            if fields.windows(2).any(|pair| pair[0].name >= pair[1].name) {
-                return Err(projection_error(
-                    "client.manifest.projection_value_object",
-                    "projection object value fields must be sorted and unique",
-                ));
-            }
+        ProjectionValueRef::Object(fields) => {
             for field in fields {
-                validate_value(&field.value, depth + 1)?;
+                validate_value(field.value(), depth + 1)?;
             }
             Ok(())
         }
+        ProjectionValueRef::Null
+        | ProjectionValueRef::Boolean(_)
+        | ProjectionValueRef::I64(_)
+        | ProjectionValueRef::U64(_)
+        | ProjectionValueRef::F64(_) => Ok(()),
     }
 }
 
@@ -1012,14 +1020,14 @@ fn unsigned_codec(codec: &str) -> bool {
     matches!(codec, "uint8" | "uint16" | "uint32" | "uint64_safe_integer")
 }
 
-fn constant_compatible(value: &ClientProjectionValue, expected: &ProjectionValueType) -> bool {
-    match (value, expected) {
-        (ClientProjectionValue::Boolean(_), ProjectionValueType::Boolean)
-        | (ClientProjectionValue::I64(_), ProjectionValueType::I64)
-        | (ClientProjectionValue::U64(_), ProjectionValueType::U64)
-        | (ClientProjectionValue::F64(_), ProjectionValueType::F64)
-        | (ClientProjectionValue::String(_), ProjectionValueType::String) => true,
-        (ClientProjectionValue::Enum { enum_type, .. }, ProjectionValueType::Enum(expected)) => {
+fn constant_compatible(value: &ProjectionValue, expected: &ProjectionValueType) -> bool {
+    match (value.as_ref(), expected) {
+        (ProjectionValueRef::Boolean(_), ProjectionValueType::Boolean)
+        | (ProjectionValueRef::I64(_), ProjectionValueType::I64)
+        | (ProjectionValueRef::U64(_), ProjectionValueType::U64)
+        | (ProjectionValueRef::F64(_), ProjectionValueType::F64)
+        | (ProjectionValueRef::String(_), ProjectionValueType::String) => true,
+        (ProjectionValueRef::Enum { enum_type, .. }, ProjectionValueType::Enum(expected)) => {
             enum_type == expected
         }
         (_, ProjectionValueType::Json) => true,
@@ -1128,53 +1136,6 @@ fn validate_prefixed_hash(
     validate_hash(hash, label)
 }
 
-fn validate_canonical_i64(value: &str) -> Result<(), ClientCompileError> {
-    value
-        .parse::<i64>()
-        .ok()
-        .filter(|parsed| parsed.to_string() == value)
-        .map(|_| ())
-        .ok_or_else(|| {
-            projection_error(
-                "client.manifest.projection_number",
-                "projection i64 must be canonical and in range",
-            )
-        })
-}
-
-fn validate_canonical_u64(value: &str) -> Result<(), ClientCompileError> {
-    value
-        .parse::<u64>()
-        .ok()
-        .filter(|parsed| parsed.to_string() == value)
-        .map(|_| ())
-        .ok_or_else(|| {
-            projection_error(
-                "client.manifest.projection_number",
-                "projection u64 must be canonical and in range",
-            )
-        })
-}
-
-fn validate_canonical_f64(value: &str) -> Result<(), ClientCompileError> {
-    let Some(parsed) = value.parse::<f64>().ok().filter(|value| value.is_finite()) else {
-        return Err(projection_error(
-            "client.manifest.projection_number",
-            "projection f64 must be finite and canonical",
-        ));
-    };
-    let canonical = serde_json::Number::from_f64(if parsed == 0.0 { 0.0 } else { parsed })
-        .expect("finite float")
-        .to_string();
-    if canonical != value {
-        return Err(projection_error(
-            "client.manifest.projection_number",
-            "projection f64 must be finite and canonical",
-        ));
-    }
-    Ok(())
-}
-
 fn projection_error(code: &'static str, message: impl Into<String>) -> ClientCompileError {
     ClientCompileError::manifest(code, message)
 }
@@ -1196,7 +1157,7 @@ mod tests {
 
     fn nested_expression(depth: usize) -> ClientProjectionExpression {
         let mut expression = ClientProjectionExpression::Constant {
-            value: ClientProjectionValue::Null,
+            value: ProjectionValue::null(),
         };
         for _ in 1..depth {
             expression = ClientProjectionExpression::List {
@@ -1204,6 +1165,16 @@ mod tests {
             };
         }
         expression
+    }
+
+    #[test]
+    fn envelope_expressions_admit_only_client_intrinsic_fields() {
+        let envelope = |field| ClientProjectionExpression::Envelope { field };
+        validate_expression(&envelope(ProjectionEnvelopeField::EventName), 1)
+            .expect("event name is known to the command");
+        let error = validate_expression(&envelope(ProjectionEnvelopeField::OccurrenceId), 1)
+            .expect_err("occurrence id is written by the server");
+        assert_eq!(error.code, "client.manifest.projection_envelope");
     }
 
     #[test]
