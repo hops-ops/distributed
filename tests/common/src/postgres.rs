@@ -69,7 +69,7 @@ impl PostgresTestSchema {
     pub async fn repository_unmigrated(&self) -> PostgresRepository {
         PostgresRepository::new(
             PgPoolOptions::new()
-                .max_connections(5)
+                .max_connections(crate::POOL_CONNECTIONS)
                 .after_connect({
                     let schema_name = self.schema_name.clone();
                     move |connection, _metadata| {

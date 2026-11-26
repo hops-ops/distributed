@@ -14,6 +14,13 @@ use distributed::{InMemoryLeaseStore, ManualClock};
 
 const TTL: Duration = Duration::from_secs(30);
 
+/// Racers per race: as many as one store's pool can put in the database at
+/// once, so the database decides the race. A racer beyond that only queues in
+/// the pool, and on a host slow enough that the racers ahead of it hold every
+/// connection past the pool's acquire timeout (30s), it fails with
+/// `pool timed out` instead of `Held`.
+const RACERS: usize = crate::POOL_CONNECTIONS as usize;
+
 /// A lease store under test, on storage another "process" can reach.
 pub trait LeaseBackend: Sized {
     type Store: LeaseStore + Clone + Send + Sync + 'static;
@@ -123,7 +130,7 @@ pub async fn stale_fence_rejected<B: LeaseBackend>(backend: &B) {
 pub async fn concurrent_acquire_has_one_winner<B: LeaseBackend>(backend: &B) {
     let store = backend.store();
     let mut tasks = Vec::new();
-    for n in 0..16 {
+    for n in 0..RACERS {
         let store = store.clone();
         tasks.push(tokio::spawn(async move {
             store
@@ -212,7 +219,7 @@ pub async fn concurrent_takeover_after_expiry_has_one_winner<B: LeaseBackend>(ba
     let first = store.acquire("k", "a", ttl).await.unwrap();
     backend.elapse(ttl).await;
     let mut tasks = Vec::new();
-    for n in 0..8 {
+    for n in 0..RACERS {
         let store = store.clone();
         tasks.push(tokio::spawn(async move {
             store.acquire("k", &format!("h{n}"), TTL).await

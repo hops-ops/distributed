@@ -42,7 +42,7 @@ impl TempDb {
             .create_if_missing(true)
             .busy_timeout(busy_timeout);
         SqlitePoolOptions::new()
-            .max_connections(5)
+            .max_connections(crate::POOL_CONNECTIONS)
             .connect_with(options)
             .await
             .expect("sqlite test pool")
