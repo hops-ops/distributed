@@ -1430,3 +1430,220 @@ fn assert_exact_codec_boundary(kind: &str, limit: usize) -> Result<(), Box<dyn E
     ));
     Ok(())
 }
+
+/// The programs of `tests/fixtures/resolved-projection-plan-v1.json`:
+/// expression keys and an envelope partition (`golden`); mutation input keys
+/// bound through arm bindings and a body partition (`input_keys`); a constant
+/// key and the unit partition (`constant_key`).
+fn resolved_plan_vector_programs(
+) -> Result<Vec<(&'static str, ProjectionProgram)>, ProjectionProgramError> {
+    use crate::mutation::{
+        body_field_binding, compile_projection, envelope_binding, MutationColumn,
+        MutationOperation, MutationProgram, ProjectionHandler,
+    };
+
+    let input_column = |name: &str, input: &str| {
+        MutationColumn::try_new(name, ProjectionValueType::String, [input])
+    };
+    let input_keys = compile_projection(
+        "todo-titles",
+        1,
+        ProjectionPartition::Expression(body_path(&["owner_id"])?),
+        [ProjectionHandler::try_new(
+            "renamed",
+            ProjectionEventSelector::try_from_descriptor(&renamed_descriptor())?,
+            vec![
+                body_field_binding(["id"], ["todo_id"], ProjectionValueType::String)?,
+                body_field_binding(["title"], ["title"], ProjectionValueType::String)?,
+                envelope_binding(["stream"], ProjectionEnvelopeField::AggregateId)?,
+            ],
+            MutationProgram::try_new(
+                "rename-todo",
+                1,
+                vec![MutationOperation::try_new(
+                    "upsert-title",
+                    MutationKind::Upsert,
+                    ProjectionTarget::try_new("TodoTitles", "todo_titles")?,
+                    vec![input_column("todo_id", "id")?],
+                    vec![
+                        input_column("todo_id", "id")?,
+                        input_column("title", "title")?,
+                        input_column("stream", "stream")?,
+                    ],
+                )?],
+            )?,
+        )?],
+    )?;
+    Ok(vec![
+        ("golden", golden_program()?),
+        ("input_keys", input_keys),
+        (
+            "constant_key",
+            simple_program(ProjectionEventSelector::try_from_descriptor(
+                &purged_descriptor(),
+            )?)?,
+        ),
+    ])
+}
+
+fn renamed_descriptor() -> DomainEventDescriptor {
+    descriptor(
+        "todo.renamed",
+        DomainEventBodyKind::Event,
+        "TodoRenamed",
+        PATCH_FP,
+    )
+}
+
+fn purged_descriptor() -> DomainEventDescriptor {
+    descriptor(
+        "todo.purged",
+        DomainEventBodyKind::Deletion,
+        "TodoDeleted",
+        DELETE_FP,
+    )
+}
+
+/// The whole fixture document: the programs, and for each case the program
+/// it runs, the occurrence and the plan that occurrence resolves to.
+///
+/// Cases cover a full upsert with model and relationship invalidations and
+/// JSON string escapes, a patch with an unset field, a composite delete key
+/// with an unlink, a related insert with a link and integer bounds, input
+/// keys with a body partition, and a constant key in the unit partition.
+fn resolved_plan_vector() -> Result<Value, Box<dyn Error>> {
+    let state = descriptor(
+        "todo.state-published",
+        DomainEventBodyKind::State,
+        "TodoState",
+        STATE_FP,
+    );
+    let reassigned = descriptor(
+        "todo.reassigned",
+        DomainEventBodyKind::State,
+        "TodoState",
+        RELATED_FP,
+    );
+    let cases = [
+        (
+            "expression-keys-upsert-invalidations",
+            "golden",
+            occurrence(
+                state,
+                &json!({
+                    "todo_id": "todo-001",
+                    "owner_id": "owner-α",
+                    "owner_count": 9,
+                    "title": "Résumé 🚀 \"quoted\" \\ tab\t",
+                    "status": "completed",
+                    "priority": -1
+                }),
+            )?,
+        ),
+        (
+            "expression-keys-patch-unset",
+            "golden",
+            occurrence(
+                renamed_descriptor(),
+                &json!({"todo_id": "todo-001", "title": "Renamed"}),
+            )?,
+        ),
+        (
+            "composite-key-delete-unlink",
+            "golden",
+            occurrence(
+                purged_descriptor(),
+                &json!({"key": "todo-001", "incarnation": 3, "owner_id": "owner-001"}),
+            )?,
+        ),
+        (
+            "related-insert-link",
+            "golden",
+            occurrence(
+                reassigned,
+                &json!({"todo_id": "todo-001", "owner_id": "owner-002"}),
+            )?,
+        ),
+        (
+            "input-keys-body-partition",
+            "input_keys",
+            occurrence(
+                renamed_descriptor(),
+                &json!({"todo_id": "todo-002", "owner_id": "owner-003", "title": "Bound"}),
+            )?,
+        ),
+        (
+            "constant-key-unit-partition",
+            "constant_key",
+            occurrence(purged_descriptor(), &json!({"key": "ignored"}))?,
+        ),
+    ];
+
+    let programs = resolved_plan_vector_programs()?;
+    let mut case_values = Vec::new();
+    for (name, program_name, occurrence) in &cases {
+        let (_, program) = programs
+            .iter()
+            .find(|(candidate, _)| candidate == program_name)
+            .ok_or("unknown vector program")?;
+        case_values.push(json!({
+            "name": name,
+            "program": program_name,
+            "occurrence": occurrence,
+            "plan": ResolvedProjectionPlan::resolve(program, occurrence)?,
+        }));
+    }
+    let program_values = programs
+        .iter()
+        .map(|(name, program)| Ok(((*name).to_owned(), serde_json::to_value(program)?)))
+        .collect::<Result<serde_json::Map<_, _>, Box<dyn Error>>>()?;
+    Ok(json!({
+        "fixture": "resolved-projection-plan",
+        "version": 1,
+        "programs": program_values,
+        "cases": case_values,
+    }))
+}
+
+#[test]
+fn resolved_plans_match_the_shared_fixture() -> Result<(), Box<dyn Error>> {
+    // The TypeScript suite (`js/tests/resolved-projection-plan.test.mjs`)
+    // canonicalizes the same file to the same bytes, so no digest is pinned.
+    let fixture = include_bytes!("../../tests/fixtures/resolved-projection-plan-v1.json");
+    let fixture = fixture
+        .strip_suffix(b"\n")
+        .ok_or("the resolved-plan fixture must end with one newline")?;
+    let expected = canonical::canonical_json_bytes(&resolved_plan_vector()?)?;
+    assert_eq!(
+        std::str::from_utf8(fixture)?,
+        std::str::from_utf8(&expected)?
+    );
+
+    // Each case maps its occurrence, read back from the file, to its plan bytes.
+    let document: Value = serde_json::from_slice(fixture)?;
+    let programs = resolved_plan_vector_programs()?;
+    let cases = document["cases"].as_array().ok_or("fixture cases")?;
+    assert_eq!(cases.len(), 6);
+    for case in cases {
+        let program_name = case["program"].as_str().ok_or("case program")?;
+        let (_, program) = programs
+            .iter()
+            .find(|(candidate, _)| *candidate == program_name)
+            .ok_or("unknown vector program")?;
+        assert_eq!(
+            &serde_json::to_value(program)?,
+            &document["programs"][program_name]
+        );
+        let occurrence = DomainEventOccurrence::from_canonical_bytes(
+            &canonical::canonical_json_bytes(&case["occurrence"])?,
+        )?;
+        let plan = ResolvedProjectionPlan::resolve(program, &occurrence)?;
+        assert_eq!(
+            plan.canonical_bytes()?,
+            canonical::canonical_json_bytes(&case["plan"])?,
+            "case {}",
+            case["name"]
+        );
+    }
+    Ok(())
+}

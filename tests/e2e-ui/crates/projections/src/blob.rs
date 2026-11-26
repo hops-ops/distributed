@@ -43,7 +43,7 @@ distributed::projection! {
 
 #[cfg(test)]
 mod tests {
-    use distributed::{MutationKind, RowValue, TableMutation};
+    use distributed::{MutationKind, RowValue};
 
     use super::*;
     use blob_domain::{BlobGame, BlobGameState, Direction};
@@ -88,13 +88,13 @@ mod tests {
             .unwrap()
             .plan(occurrence)
             .unwrap();
-        assert_eq!(lowered.resolved.mutations().len(), 1);
-        let [TableMutation::UpsertRow(row)] = lowered.write_plan.mutations.as_slice() else {
-            panic!("Blob direct projection must lower to one full-row upsert");
+        let [(resolved, record)] = lowered.records().collect::<Vec<_>>()[..] else {
+            panic!("Blob direct projection must lower to one record");
         };
-        assert_eq!(row.schema.model_name, "BlobGames");
+        assert_eq!(resolved.kind(), MutationKind::Upsert);
+        assert_eq!(record.schema().model_name, "BlobGames");
         assert_eq!(
-            row.values.get("game_id"),
+            record.values().get("game_id"),
             Some(&RowValue::String(game.entity.id().to_string()))
         );
     }
@@ -111,10 +111,11 @@ mod tests {
                 .unwrap()
                 .plan(occurrence)
                 .unwrap();
-            assert!(matches!(
-                lowered.write_plan.mutations.as_slice(),
-                [TableMutation::UpsertRow(_)]
-            ));
+            let kinds = lowered
+                .records()
+                .map(|(resolved, _)| resolved.kind())
+                .collect::<Vec<_>>();
+            assert_eq!(kinds, [MutationKind::Upsert]);
         }
         assert!(!game.entity.pending_domain_events().is_empty());
     }

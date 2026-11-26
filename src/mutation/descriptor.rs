@@ -110,11 +110,12 @@ pub fn lower_single_model<M>(
 where
     M: ProjectionReadModelMetadata,
 {
-    let mut builder = crate::read_model::ReadModelWritePlanBuilder::new();
-    for mutation in plan.mutations() {
-        lower_model_mutation::<M>(&mut builder, mutation)?;
-    }
-    finish_lowering(builder, plan)
+    let records = plan
+        .mutations()
+        .iter()
+        .map(lower_model_mutation::<M>)
+        .collect::<Result<Vec<_>, _>>()?;
+    finish_lowering(plan, records)
 }
 
 /// Inventory for a single output model.

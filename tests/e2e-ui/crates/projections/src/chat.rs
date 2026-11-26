@@ -40,7 +40,7 @@ distributed::projection! {
 #[cfg(test)]
 mod tests {
     use distributed::domain_event::DomainEventContract;
-    use distributed::{MutationKind, RelationalReadModel, RowValue, TableMutation};
+    use distributed::{MutationKind, RelationalReadModel, RowValue};
 
     use super::*;
     use chat_domain::{ChatMessage, ChatMessagePostedDomainEvent};
@@ -59,11 +59,12 @@ mod tests {
             .unwrap()
             .plan(occurrence)
             .unwrap();
-        let TableMutation::UpsertRow(row) = &lowered.write_plan.mutations[0] else {
-            panic!("expected upsert");
+        let [(resolved, record)] = lowered.records().collect::<Vec<_>>()[..] else {
+            panic!("expected one record");
         };
+        assert_eq!(resolved.kind(), MutationKind::Upsert);
         assert_eq!(
-            row.values.get("body"),
+            record.values().get("body"),
             Some(&RowValue::String("hello".into()))
         );
         assert_eq!(

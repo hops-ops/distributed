@@ -6,8 +6,7 @@ use super::outcomes::CommandConsistency;
 use crate::projection::lower::LoweredProjectionPlan;
 use crate::read_model::RelationalReadModel;
 use crate::table::{
-    ExpectedVersion, RowKey, RowValue, RowValues, RowWriteMode, TableMutation, TableStoreError,
-    TableWritePlan,
+    RowKey, RowValue, RowValues, RowWriteMode, TableMutation, TableStoreError, TableWritePlan,
 };
 use crate::{MutationKind, ResolvedProjectionValue};
 
@@ -230,12 +229,7 @@ impl ProjectionCommitProof {
 /// reach an adapter.
 pub(crate) fn validate_resolved_direct_plan(
     lowered: &LoweredProjectionPlan,
-) -> Result<(), CommandCommitProofError> {
-    lowered
-        .write_plan
-        .validate()
-        .map_err(|error| direct_plan_error(error.to_string()))?;
-
+) -> Result<TableMutation, CommandCommitProofError> {
     let [resolved] = lowered.resolved.mutations() else {
         return Err(direct_plan_error(
             "modeled direct projection must resolve exactly one record mutation",
@@ -278,24 +272,25 @@ pub(crate) fn validate_resolved_direct_plan(
         ));
     }
 
-    let [TableMutation::UpsertRow(row)] = lowered.write_plan.mutations.as_slice() else {
+    let [(_, record)] = lowered.records.as_slice() else {
         return Err(direct_plan_error(
-            "modeled direct projection must lower to exactly one full-row upsert",
+            "modeled direct projection must lower to exactly one record",
         ));
     };
-    if row.mode != RowWriteMode::Upsert || row.expected_version != ExpectedVersion::Any {
-        return Err(direct_plan_error(
-            "modeled direct projection requires an unfenced full-row upsert",
-        ));
-    }
-    if row.schema.model_name != resolved.target().model()
-        || row.schema.table_name != resolved.target().storage()
+    if record.schema().model_name != resolved.target().model()
+        || record.schema().table_name != resolved.target().storage()
     {
         return Err(direct_plan_error(
             "modeled direct projection logical and physical targets differ",
         ));
     }
-    Ok(())
+    // The direct path commits one unfenced full-row upsert; the protocol
+    // record revision, not a row version, fences it.
+    let mutation = record.clone().upsert();
+    mutation
+        .validate()
+        .map_err(|error| direct_plan_error(error.to_string()))?;
+    Ok(mutation)
 }
 
 fn direct_plan_error(error: impl Into<String>) -> CommandCommitProofError {

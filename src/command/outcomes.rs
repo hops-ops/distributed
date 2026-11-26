@@ -255,10 +255,10 @@ impl<K: CommandOutcome> PreparedCommand<K> {
                                 .into(),
                         ));
                     }
-                    validate_resolved_direct_plan(modeled)?;
+                    let mutation = validate_resolved_direct_plan(modeled)?;
                     proof.validate(
                         contract.output_type_id,
-                        std::iter::once(&modeled.write_plan),
+                        std::iter::once(&TableWritePlan::new(vec![mutation])),
                     )
                 } else {
                     proof.validate(contract.output_type_id, read_model_plans.iter())
@@ -290,14 +290,13 @@ impl<K: CommandOutcome> PreparedCommand<K> {
                 "modeled projected result has no resolved projection plan".into(),
             )
         })?;
-        validate_resolved_direct_plan(modeled)?;
-        let [crate::table::TableMutation::UpsertRow(row)] = modeled.write_plan.mutations.as_slice()
+        let crate::table::TableMutation::UpsertRow(row) = validate_resolved_direct_plan(modeled)?
         else {
             return Err(CommandCommitProofError::DirectProjection(
                 "modeled projected result must contain one complete row".into(),
             ));
         };
-        let payload = K::__projected_payload_from_row(row.values.clone())
+        let payload = K::__projected_payload_from_row(row.values)
             .map_err(|error| CommandCommitProofError::DirectProjection(error.to_string()))?
             .ok_or_else(|| {
                 CommandCommitProofError::DirectProjection(
@@ -361,19 +360,14 @@ impl<K: CommandOutcome> PreparedCommand<K> {
                                 .into(),
                         ));
                     }
-                    validate_resolved_direct_plan(&modeled)?;
-                    proof.validate(
-                        TypeId::of::<K::Payload>(),
-                        std::iter::once(&modeled.write_plan),
-                    )?;
-                    let LoweredProjectionPlan {
-                        mut write_plan,
-                        resolved,
-                    } = modeled;
-                    let mutation = write_plan
+                    let plan = TableWritePlan::new(vec![validate_resolved_direct_plan(&modeled)?]);
+                    proof.validate(TypeId::of::<K::Payload>(), std::iter::once(&plan))?;
+                    let resolved = modeled.resolved;
+                    let mutation = plan
                         .mutations
-                        .pop()
-                        .expect("validated modeled direct plan has one physical mutation");
+                        .into_iter()
+                        .next()
+                        .expect("the validated modeled direct plan has one physical mutation");
                     target.seal_resolved(&resolved, mutation, causation_id)
                 } else {
                     let mutation =

@@ -1,6 +1,5 @@
 //! Write plans: the deterministic mutation batches table stores apply.
 
-use super::mutation::{validate_delete_mutation, validate_patch_mutation, validate_row_mutation};
 use super::{TableMutation, TableStoreError};
 
 /// Deterministic unit-of-work output for relational table-store adapters.
@@ -19,14 +18,6 @@ impl TableWritePlan {
     }
 
     pub fn validate(&self) -> Result<(), TableStoreError> {
-        for mutation in &self.mutations {
-            match mutation {
-                TableMutation::UpsertRow(mutation) => validate_row_mutation(mutation)?,
-                TableMutation::PatchRow(mutation) => validate_patch_mutation(mutation)?,
-                TableMutation::DeleteRow(mutation) => validate_delete_mutation(mutation)?,
-            }
-        }
-
-        Ok(())
+        self.mutations.iter().try_for_each(TableMutation::validate)
     }
 }

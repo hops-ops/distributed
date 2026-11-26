@@ -256,11 +256,10 @@ impl ProjectionWorkspace {
     #[cfg(any(feature = "graphql", test))]
     pub(crate) fn execution_snapshot_request(
         &self,
-        mutations: &[TableMutation],
+        records: &[(&'static TableSchema, &RowKey)],
     ) -> Result<ProjectionExecutionSnapshotBatchRequest, ProjectionProtocolError> {
-        let mut requests = Vec::with_capacity(mutations.len());
-        for mutation in mutations {
-            let (schema, key) = mutation_schema_key(mutation);
+        let mut requests = Vec::with_capacity(records.len());
+        for &(schema, key) in records {
             self.ensure_registered_schema(schema)?;
             requests.push(ProjectionQuerySnapshotRequest::new(
                 &self.codec,

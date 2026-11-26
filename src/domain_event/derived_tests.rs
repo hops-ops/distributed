@@ -272,9 +272,8 @@ fn derived_facts_are_not_aggregate_snapshots() {
             .unwrap()
             .plan(&derived)
             .unwrap()
-            .write_plan
-            .mutations
-            .len(),
+            .records()
+            .count(),
         1
     );
     assert!(SNAPSHOT_ROWS
