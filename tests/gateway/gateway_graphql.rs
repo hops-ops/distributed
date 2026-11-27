@@ -596,3 +596,428 @@ async fn graphql_origin_receives_no_client_identity_channel() {
         }
     }
 }
+
+/// A remote GraphQL origin serving live operations over
+/// `graphql-transport-ws`; `admit` decides its `connection_init`.
+async fn live_origin(admit: bool) -> Server {
+    let schema = Schema::build(CustomQuery, EmptyMutation, EmptySubscription).finish();
+    serve(Router::new().route(
+        "/graphql/ws",
+        get(
+            move |protocol: GraphQLProtocol, upgrade: WebSocketUpgrade| {
+                let schema = schema.clone();
+                async move {
+                    upgrade
+                        .protocols(async_graphql::http::ALL_WEBSOCKET_PROTOCOLS)
+                        .on_upgrade(move |socket| {
+                            GraphQLWebSocket::new(socket, schema, protocol)
+                                .on_connection_init(move |_| async move {
+                                    if admit {
+                                        Ok(async_graphql::Data::default())
+                                    } else {
+                                        Err(async_graphql::Error::new("not admitted"))
+                                    }
+                                })
+                                .serve()
+                        })
+                        .into_response()
+                }
+            },
+        ),
+    ))
+    .await
+}
+
+/// A gateway in front of `origin` that shares live operations, so the
+/// gateway itself terminates the client's WebSocket.
+async fn live_gateway(origin: &Server) -> Server {
+    let caps = GraphqlCapabilities {
+        queries: true,
+        live: true,
+        commands: false,
+    };
+    let gateway = GatewayConfig {
+        bindings: vec![Binding::new(
+            "graphql",
+            BindingKind::Graphql {
+                executor: GraphqlExecutor::Remote {
+                    origin: origin.origin.clone(),
+                },
+                capabilities: caps,
+                delivery: DeliveryCapabilities {
+                    live_sharing: true,
+                    ..Default::default()
+                },
+                schema_extensions: vec![],
+            },
+        )],
+        routes: vec![Route::new("api", RoutePath::prefix("/graphql"), "graphql")],
+    }
+    .build()
+    .unwrap();
+    let delivery = Arc::new(
+        NativeDelivery::live(distributed::gateway::delivery::LiveLimits::default()).unwrap(),
+    );
+    serve(
+        NativeGateway::new(
+            gateway,
+            NativeOptions::new("https://public.example.invalid"),
+            [(
+                "graphql".into(),
+                NativeBinding::GraphqlWithDelivery(
+                    GraphqlBinding::Remote(RemoteGraphql::default()),
+                    delivery,
+                ),
+            )],
+            NativeAuth::anonymous(),
+        )
+        .unwrap()
+        .router(),
+    )
+    .await
+}
+
+/// The next frame that is not a text frame, or the close frame's code and
+/// reason; `None` when the stream ends without one.
+async fn next_control(socket: &mut Socket) -> Option<Message> {
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            match socket.next().await? {
+                Ok(Message::Text(_)) => continue,
+                Ok(other) => return Some(other),
+                Err(_) => return None,
+            }
+        }
+    })
+    .await
+    .unwrap()
+}
+
+fn close_code(message: Option<Message>) -> Option<(u16, String)> {
+    match message {
+        Some(Message::Close(Some(frame))) => Some((frame.code.into(), frame.reason.to_string())),
+        _ => None,
+    }
+}
+
+/// A gateway that shares live operations terminates the client's
+/// `graphql-transport-ws` connection itself: it answers keep-alives, ignores
+/// frames that change nothing, and closes the connection on a protocol
+/// violation with a code telling the client to reset.
+#[tokio::test]
+async fn the_gateway_answers_keepalives_and_closes_on_a_protocol_violation() {
+    let origin = live_origin(true).await;
+    let gateway = live_gateway(&origin).await;
+
+    let mut socket = connect(&gateway.origin).await;
+    socket
+        .send(Message::Text(
+            json!({"type":"ping","payload":{"n":1}}).to_string().into(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        ws_json(&mut socket).await,
+        json!({"type":"pong","payload":{"n":1}})
+    );
+    // A pong and a complete for an operation never opened are no-ops: the
+    // next frame the client receives answers its next ping.
+    for frame in [
+        json!({"type":"pong"}),
+        json!({"type":"complete","id":"never-opened"}),
+    ] {
+        socket
+            .send(Message::Text(frame.to_string().into()))
+            .await
+            .unwrap();
+    }
+    socket
+        .send(Message::Text(
+            json!({"type":"ping","payload":{"n":2}}).to_string().into(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        ws_json(&mut socket).await,
+        json!({"type":"pong","payload":{"n":2}})
+    );
+    socket
+        .send(Message::Ping(b"alive".to_vec().into()))
+        .await
+        .unwrap();
+    assert!(matches!(
+        next_control(&mut socket).await,
+        Some(Message::Pong(bytes)) if &bytes[..] == b"alive"
+    ));
+
+    let violations: [(&str, Message); 4] = [
+        (
+            "a second connection_init",
+            Message::Text(
+                json!({"type":"connection_init","payload":{}})
+                    .to_string()
+                    .into(),
+            ),
+        ),
+        ("text that is not JSON", Message::Text("{".into())),
+        (
+            "a frame type the protocol does not have",
+            Message::Text(json!({"type":"start","id":"1"}).to_string().into()),
+        ),
+        ("a binary frame", Message::Binary(b"{}".to_vec().into())),
+    ];
+    for (name, frame) in violations {
+        let mut socket = connect(&gateway.origin).await;
+        socket.send(frame).await.unwrap();
+        assert_eq!(
+            close_code(next_control(&mut socket).await),
+            Some((1013, "LIVE_RESET_REQUIRED".into())),
+            "{name}"
+        );
+    }
+}
+
+/// An origin that refuses the client's `connection_init` decides the
+/// connection: the sharing gateway passes the origin's close frame on to
+/// the client.
+#[tokio::test]
+async fn an_origin_that_refuses_connection_init_closes_the_client() {
+    let origin = live_origin(false).await;
+    let gateway = live_gateway(&origin).await;
+    let mut request = format!("{}/graphql/ws", gateway.origin.replace("http:", "ws:"))
+        .into_client_request()
+        .unwrap();
+    request.headers_mut().insert(
+        "sec-websocket-protocol",
+        "graphql-transport-ws".parse().unwrap(),
+    );
+    let (mut socket, _) = tokio_tungstenite::connect_async(request).await.unwrap();
+    socket
+        .send(Message::Text(
+            json!({"type":"connection_init","payload":{}})
+                .to_string()
+                .into(),
+        ))
+        .await
+        .unwrap();
+    let close = close_code(next_control(&mut socket).await);
+    // The origin's own close frame, as async-graphql sends it.
+    assert_eq!(close, Some((1002, "not admitted".into())));
+}
+
+/// One GraphQL binding declared with `declared` and bound at runtime to
+/// `bound`, served on `https://public.example.invalid` with `options`.
+fn native_graphql(
+    declared: BindingKind,
+    bound: Vec<NativeBinding>,
+    options: NativeOptions,
+) -> Result<NativeGateway, GatewayError> {
+    let gateway = GatewayConfig {
+        bindings: vec![Binding::new("graphql", declared)],
+        routes: vec![Route::new("api", RoutePath::prefix("/graphql"), "graphql")],
+    }
+    .build()
+    .unwrap();
+    NativeGateway::new(
+        gateway,
+        options,
+        bound
+            .into_iter()
+            .map(|binding| ("graphql".to_string(), binding)),
+        NativeAuth::anonymous(),
+    )
+}
+
+/// Every runtime GraphQL binding is checked against its declaration before
+/// the gateway serves: a contradiction is a configuration error, never a
+/// request-time surprise.
+#[tokio::test]
+async fn a_native_gateway_refuses_a_graphql_binding_that_contradicts_its_declaration() {
+    let caps = GraphqlCapabilities {
+        queries: true,
+        live: true,
+        commands: false,
+    };
+    let declared =
+        |executor: GraphqlExecutor, delivery: DeliveryCapabilities| BindingKind::Graphql {
+            executor,
+            capabilities: caps,
+            delivery,
+            schema_extensions: vec![],
+        };
+    let remote_at = |origin: &str| GraphqlExecutor::Remote {
+        origin: origin.into(),
+    };
+    let elsewhere = || remote_at("https://origin.example.invalid");
+    let remote = |binding: RemoteGraphql| NativeBinding::Graphql(GraphqlBinding::Remote(binding));
+    let options = || NativeOptions::new("https://public.example.invalid");
+    let live = || {
+        Arc::new(
+            NativeDelivery::live(distributed::gateway::delivery::LiveLimits::default()).unwrap(),
+        )
+    };
+    let sharing = DeliveryCapabilities {
+        live_sharing: true,
+        ..Default::default()
+    };
+    let embedded = EmbeddedGraphql::custom(
+        custom_router,
+        GraphqlCapabilities {
+            queries: true,
+            ..Default::default()
+        },
+        [],
+    )
+    .unwrap();
+
+    let cases: Vec<(&str, BindingKind, Vec<NativeBinding>, NativeOptions, &str)> = vec![
+        (
+            "a zero request body limit",
+            declared(elsewhere(), DeliveryCapabilities::default()),
+            vec![remote(RemoteGraphql::default())],
+            {
+                let mut options = options();
+                options.limits.request_body_bytes = 0;
+                options
+            },
+            "invalid native proxy limits",
+        ),
+        (
+            "a header to strip that is not a header name",
+            declared(elsewhere(), DeliveryCapabilities::default()),
+            vec![remote(RemoteGraphql::default())],
+            {
+                let mut options = options();
+                options.strip_headers = vec!["not a header".into()];
+                options
+            },
+            "invalid identity header strip list",
+        ),
+        (
+            "a remote binding for an embedded declaration",
+            declared(GraphqlExecutor::Embedded, DeliveryCapabilities::default()),
+            vec![remote(RemoteGraphql::default())],
+            options(),
+            "GraphQL executor location mismatch",
+        ),
+        (
+            "an embedded schema registered with other capabilities",
+            declared(GraphqlExecutor::Embedded, DeliveryCapabilities::default()),
+            vec![NativeBinding::Graphql(GraphqlBinding::Embedded(embedded))],
+            options(),
+            "embedded schema registration does not match declaration",
+        ),
+        (
+            "a remote path with a parent segment",
+            declared(elsewhere(), DeliveryCapabilities::default()),
+            vec![remote(RemoteGraphql {
+                http_path: "/graphql/../admin".into(),
+                ..Default::default()
+            })],
+            options(),
+            "ambiguous gateway path segments",
+        ),
+        (
+            "an origin that is the gateway itself",
+            declared(
+                remote_at("https://public.example.invalid"),
+                DeliveryCapabilities::default(),
+            ),
+            vec![remote(RemoteGraphql::default())],
+            options(),
+            "GraphQL upstream points to gateway",
+        ),
+        (
+            "a remote path with a needless percent-encoding",
+            declared(elsewhere(), DeliveryCapabilities::default()),
+            vec![remote(RemoteGraphql {
+                http_path: "/graph%71l".into(),
+                ..Default::default()
+            })],
+            options(),
+            "invalid remote GraphQL path",
+        ),
+        (
+            "live capability without a remote live endpoint",
+            declared(elsewhere(), DeliveryCapabilities::default()),
+            vec![remote(RemoteGraphql {
+                live_path: None,
+                ..Default::default()
+            })],
+            options(),
+            "live gateway needs a remote live endpoint",
+        ),
+        (
+            "live sharing declared without a delivery resource",
+            declared(elsewhere(), sharing),
+            vec![remote(RemoteGraphql::default())],
+            options(),
+            "delivery adapter is not bound",
+        ),
+        (
+            "a delivery resource the declaration does not ask for",
+            declared(elsewhere(), DeliveryCapabilities::default()),
+            vec![NativeBinding::GraphqlWithDelivery(
+                GraphqlBinding::Remote(RemoteGraphql::default()),
+                live(),
+            )],
+            options(),
+            "delivery resource does not match declaration",
+        ),
+        (
+            "the same binding bound twice",
+            declared(elsewhere(), DeliveryCapabilities::default()),
+            vec![
+                remote(RemoteGraphql::default()),
+                remote(RemoteGraphql::default()),
+            ],
+            options(),
+            "duplicate native binding",
+        ),
+    ];
+    for (name, declaration, bound, options, expected) in cases {
+        match native_graphql(declaration, bound, options) {
+            Err(error) => assert_eq!(error.to_string(), expected, "{name}"),
+            Ok(_) => panic!("{name}: expected `{expected}`"),
+        }
+    }
+}
+
+/// The gateway reads a GraphQL HTTP request itself before any executor
+/// sees it: a request it cannot read is answered at the edge.
+#[tokio::test]
+async fn a_graphql_request_the_gateway_cannot_read_is_answered_at_the_edge() {
+    let caps = GraphqlCapabilities {
+        queries: true,
+        ..Default::default()
+    };
+    let embedded = EmbeddedGraphql::custom(custom_router, caps, []).unwrap();
+    let mut options = NativeOptions::new("https://public.example.invalid");
+    options.limits.request_body_bytes = 64;
+    let server = serve(mounted_with_options(
+        GraphqlBinding::Embedded(embedded),
+        GraphqlExecutor::Embedded,
+        caps,
+        vec![],
+        options,
+    ))
+    .await;
+    let client = reqwest::Client::new();
+    let url = format!("{}/graphql", server.origin);
+
+    let get = client.get(&url).send().await.unwrap();
+    assert_eq!(get.status(), StatusCode::METHOD_NOT_ALLOWED);
+    assert_eq!(get.headers()["allow"], "POST");
+
+    let oversized = client
+        .post(&url)
+        .body(format!(r#"{{"query":"{{ {} }}"}}"#, "x".repeat(128)))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(oversized.status(), StatusCode::PAYLOAD_TOO_LARGE);
+
+    let unreadable = client.post(&url).body("{not json").send().await.unwrap();
+    let body: Value = unreadable.json().await.unwrap();
+    assert_eq!(body["errors"][0]["extensions"]["code"], "BAD_REQUEST");
+}
