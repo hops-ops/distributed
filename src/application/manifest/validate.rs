@@ -1179,3 +1179,376 @@ mod size_limit_tests {
         )));
     }
 }
+
+#[cfg(test)]
+mod validator_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn invalid(reason: &str) -> ApplicationResult<()> {
+        Err(ApplicationError::InvalidSpec(reason.into()))
+    }
+
+    #[test]
+    fn relationship_keys_accept_each_kind_and_reject_each_malformation() {
+        let cases = [
+            ("embedded", json!({"kind": "embedded"}), Ok(())),
+            (
+                "direct",
+                json!({"kind": "direct", "local": ["owner_id"], "remote": ["id"]}),
+                Ok(()),
+            ),
+            (
+                "through",
+                json!({
+                    "kind": "through", "local": ["id"], "remote": ["id"], "table": "tags_todos",
+                    "source_foreign_key": ["todo_id"], "target_foreign_key": ["tag_id"]
+                }),
+                Ok(()),
+            ),
+            (
+                "through opaque",
+                json!({"kind": "through_opaque", "local": ["id"], "remote": ["id"], "dependency": "members"}),
+                Ok(()),
+            ),
+            ("not an object", json!([]), invalid("relationship keys must be a tagged object")),
+            ("no kind", json!({"local": []}), invalid("relationship keys must declare their kind")),
+            (
+                "embedded with columns",
+                json!({"kind": "embedded", "local": ["id"]}),
+                invalid("embedded relationship keys contain redundant material"),
+            ),
+            (
+                "unknown kind",
+                json!({"kind": "lookup"}),
+                invalid("relationship keys have unknown kind `lookup`"),
+            ),
+            (
+                "no local columns",
+                json!({"kind": "direct", "remote": ["id"]}),
+                invalid("relationship keys need local columns"),
+            ),
+            (
+                "no remote columns",
+                json!({"kind": "direct", "local": ["id"]}),
+                invalid("relationship keys need remote columns"),
+            ),
+            (
+                "unpaired columns",
+                json!({"kind": "direct", "local": ["a", "b"], "remote": ["id"]}),
+                invalid("relationship key columns must be non-empty and paired"),
+            ),
+            (
+                "empty columns",
+                json!({"kind": "direct", "local": [], "remote": []}),
+                invalid("relationship key columns must be non-empty and paired"),
+            ),
+            (
+                "non-string column",
+                json!({"kind": "direct", "local": [1], "remote": ["id"]}),
+                invalid("relationship key columns must be strings"),
+            ),
+            (
+                "extra material on direct",
+                json!({"kind": "direct", "local": ["a"], "remote": ["b"], "table": "t"}),
+                invalid("relationship keys contain missing or redundant material"),
+            ),
+            (
+                "through without a table",
+                json!({
+                    "kind": "through", "local": ["id"], "remote": ["id"], "other": "x",
+                    "source_foreign_key": ["todo_id"], "target_foreign_key": ["tag_id"]
+                }),
+                invalid("through relationship keys need `table`"),
+            ),
+            (
+                "through with a non-string table",
+                json!({
+                    "kind": "through", "local": ["id"], "remote": ["id"], "table": 7,
+                    "source_foreign_key": ["todo_id"], "target_foreign_key": ["tag_id"]
+                }),
+                invalid("relationship key `table` must be a string"),
+            ),
+            (
+                "through key list of the wrong length",
+                json!({
+                    "kind": "through", "local": ["id"], "remote": ["id"], "table": "t",
+                    "source_foreign_key": ["a", "b"], "target_foreign_key": ["tag_id"]
+                }),
+                invalid(
+                    "relationship key `source_foreign_key` must list one through column per identity column",
+                ),
+            ),
+            (
+                "through key list that is not a list",
+                json!({
+                    "kind": "through", "local": ["id"], "remote": ["id"], "table": "t",
+                    "source_foreign_key": ["a"], "target_foreign_key": "tag_id"
+                }),
+                invalid("relationship key `target_foreign_key` must be a string list"),
+            ),
+            (
+                "through key list with a number",
+                json!({
+                    "kind": "through", "local": ["id"], "remote": ["id"], "table": "t",
+                    "source_foreign_key": [1], "target_foreign_key": ["tag_id"]
+                }),
+                invalid("relationship key `source_foreign_key` columns must be strings"),
+            ),
+            (
+                "opaque without a dependency",
+                json!({"kind": "through_opaque", "local": ["id"], "remote": ["id"], "other": "x"}),
+                invalid("opaque relationship keys need a dependency identity"),
+            ),
+            (
+                "opaque with a non-string dependency",
+                json!({"kind": "through_opaque", "local": ["id"], "remote": ["id"], "dependency": 1}),
+                invalid("relationship key `dependency` must be a string"),
+            ),
+        ];
+        for (name, keys, expected) in cases {
+            assert_eq!(validate_relationship_keys(&keys), expected, "{name}");
+        }
+        assert!(
+            matches!(
+                validate_relationship_keys(
+                    &json!({"kind": "direct", "local": [" a"], "remote": ["b"]})
+                ),
+                Err(ApplicationError::InvalidIdentity {
+                    kind: "relationship key column",
+                    ..
+                })
+            ),
+            "column names are portable text"
+        );
+    }
+
+    #[test]
+    fn row_policies_are_closed_tagged_objects() {
+        let cases = [
+            ("unrestricted", json!({"kind": "unrestricted"}), Ok(())),
+            ("server only", json!({"kind": "server_only"}), Ok(())),
+            (
+                "predicate",
+                json!({"kind": "predicate", "expression": {"eq": ["owner", "user"]}}),
+                Ok(()),
+            ),
+            (
+                "not an object",
+                json!("unrestricted"),
+                invalid("row policy must be a tagged object"),
+            ),
+            (
+                "no kind",
+                json!({"expression": {}}),
+                invalid("row policy must declare its kind"),
+            ),
+            (
+                "unrestricted with extra material",
+                json!({"kind": "unrestricted", "expression": {}}),
+                invalid("row policy contains unknown or redundant material"),
+            ),
+            (
+                "predicate without its expression",
+                json!({"kind": "predicate", "filter": {}}),
+                invalid("predicate row policy must retain its expression"),
+            ),
+            (
+                "unknown kind",
+                json!({"kind": "everyone"}),
+                invalid("row policy contains unknown or redundant material"),
+            ),
+            (
+                "predicate expression with a NUL string",
+                json!({"kind": "predicate", "expression": "a\u{0}"}),
+                invalid("row policy expression contains oversized or NUL string material"),
+            ),
+        ];
+        for (name, policy, expected) in cases {
+            assert_eq!(validate_row_policy(&policy), expected, "{name}");
+        }
+    }
+
+    #[test]
+    fn surface_arguments_have_a_known_kind() {
+        let argument = |kind: &str| crate::application::surface::SurfaceArgumentSpec {
+            name: "where".into(),
+            kind: kind.into(),
+            type_name: "TodoFilter".into(),
+            nullable: true,
+            list: false,
+        };
+        for kind in ["filter", "order", "limit", "offset", "primary_key"] {
+            assert_eq!(validate_surface_argument(&argument(kind)), Ok(()), "{kind}");
+        }
+        assert_eq!(
+            validate_surface_argument(&argument("cursor")),
+            invalid("surface argument `where` has unknown kind `cursor`")
+        );
+        assert!(matches!(
+            validate_surface_argument(&argument("")),
+            Err(ApplicationError::InvalidIdentity {
+                kind: "surface argument kind",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn roles_are_logical_ids_in_strictly_ascending_order() {
+        let roles = |values: &[&str]| {
+            values
+                .iter()
+                .map(|value| value.to_string())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(validate_roles("role", &roles(&["admin", "writer"])), Ok(()));
+        assert_eq!(
+            validate_roles("role", &roles(&["writer", "admin"])),
+            Err(ApplicationError::NonCanonical("role ordering"))
+        );
+        assert_eq!(
+            validate_roles("role", &roles(&["admin", "admin"])),
+            Err(ApplicationError::NonCanonical("role ordering"))
+        );
+        assert!(matches!(
+            validate_roles("role", &roles(&["has space"])),
+            Err(ApplicationError::InvalidIdentity { kind: "role", .. })
+        ));
+    }
+
+    #[test]
+    fn portable_artifact_and_digest_text_bounds() {
+        let long = "x".repeat(MAX_MANIFEST_STRING_BYTES + 1);
+        for (name, value) in [
+            ("blank", " "),
+            ("padded", " a"),
+            ("nul", "a\0b"),
+            ("too long", long.as_str()),
+        ] {
+            assert!(
+                matches!(
+                    validate_portable_text("k", value),
+                    Err(ApplicationError::InvalidIdentity { kind: "k", .. })
+                ),
+                "portable: {name}"
+            );
+            assert_eq!(
+                validate_artifact_text("k", value),
+                invalid("k must be a bounded artifact provenance value"),
+                "artifact: {name}"
+            );
+        }
+        assert_eq!(validate_artifact_text("k", "build 1"), Ok(()));
+
+        let digest = format!("sha256:{}", "0123456789abcdef".repeat(4));
+        assert_eq!(validate_sha256_text("k", &digest), Ok(()));
+        let form = invalid("k must use the sha256:<64 lowercase hex> form");
+        for (name, value) in [
+            ("other algorithm", format!("sha512:{}", "a".repeat(64))),
+            ("upper-case hex", format!("sha256:{}", "A".repeat(64))),
+            ("short", format!("sha256:{}", "a".repeat(63))),
+            ("non-hex", format!("sha256:{}", "g".repeat(64))),
+        ] {
+            assert_eq!(validate_sha256_text("k", &value), form, "{name}");
+        }
+    }
+
+    #[test]
+    fn json_contracts_reject_nul_object_keys() {
+        assert_eq!(
+            validate_json_contract("contract", &json!({"a\u{0}": 1})),
+            invalid("contract contains oversized or NUL object-key material")
+        );
+        assert_eq!(
+            validate_json_contract("contract", &json!({"a": [null, true, 1.5, {"b": "c"}]})),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn command_type_specs_are_bounded_unique_and_portable() {
+        use crate::application::command::{CommandTypeField, CommandTypeSpec};
+        let field = |name: &str, nested: Option<CommandTypeSpec>| CommandTypeField {
+            name: name.into(),
+            type_name: "String".into(),
+            nullable: false,
+            list: false,
+            item_nullable: false,
+            unsigned_integer: None,
+            nested: nested.map(Box::new),
+        };
+        let spec = |fields| CommandTypeSpec {
+            name: "Input".into(),
+            fields,
+        };
+        assert_eq!(
+            validate_command_type_spec(&spec(vec![field("a", Some(spec(vec![field("b", None)])))])),
+            Ok(())
+        );
+        assert_eq!(
+            validate_command_type_spec(&spec(vec![field("a", None), field("a", None)])),
+            Err(ApplicationError::Duplicate {
+                kind: "surface command type fields",
+                identity: "a".into()
+            })
+        );
+        assert!(matches!(
+            validate_command_type_spec(&spec(vec![field(
+                "a",
+                Some(spec(vec![field(" b", None)]))
+            )])),
+            Err(ApplicationError::InvalidIdentity {
+                kind: "surface command field",
+                ..
+            })
+        ));
+        let mut deep = spec(vec![field("leaf", None)]);
+        for _ in 0..=MAX_MANIFEST_JSON_DEPTH {
+            deep = spec(vec![field("next", Some(deep))]);
+        }
+        assert_eq!(
+            validate_command_type_spec(&deep),
+            invalid(&format!(
+                "surface command type exceeds nesting depth {MAX_MANIFEST_JSON_DEPTH}"
+            ))
+        );
+    }
+
+    #[test]
+    fn identity_sets_report_the_missing_duplicate_or_unsorted_entry() {
+        let ids = |values: &[&str]| {
+            values
+                .iter()
+                .map(|value| value.to_string())
+                .collect::<Vec<_>>()
+        };
+        let known = HashSet::from(["todos"]);
+        assert_eq!(require_reference("module", "todos", &known), Ok(()));
+        assert_eq!(
+            require_reference("module", "chat", &known),
+            Err(ApplicationError::Missing {
+                kind: "module",
+                identity: "chat".into()
+            })
+        );
+        assert_eq!(validate_sorted_unique("models", &ids(&["a", "b"])), Ok(()));
+        assert_eq!(
+            validate_sorted_unique("models", &ids(&["b", "a"])),
+            Err(ApplicationError::NonCanonical("models"))
+        );
+        assert_eq!(
+            validate_sorted_unique("models", &ids(&["a", "b", "a"])),
+            Err(ApplicationError::Duplicate {
+                kind: "models",
+                identity: "a".into()
+            })
+        );
+        assert_eq!(
+            validate_collection_len("models", MAX_MANIFEST_COLLECTION_ITEMS + 1),
+            invalid(&format!(
+                "models count exceeds {MAX_MANIFEST_COLLECTION_ITEMS}"
+            ))
+        );
+    }
+}
