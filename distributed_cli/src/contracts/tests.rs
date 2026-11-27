@@ -328,3 +328,350 @@ fn client_inventory_matches_schema_vectors() {
         );
     }
 }
+
+type CatalogEdit = fn(&mut ContractCatalog);
+
+/// Each structural rule of a catalog, one row per rule, with the code it is
+/// refused with.
+#[test]
+fn catalog_rejects_each_structural_rule_with_its_code() {
+    let rows: [(&str, CatalogEdit, ContractDiagnosticCode); 20] = [
+        (
+            "unsupported schema version",
+            |catalog| catalog.schema_version = CONTRACT_CATALOG_SCHEMA_VERSION + 1,
+            ContractDiagnosticCode::CatalogInvalid,
+        ),
+        (
+            "no entries",
+            |catalog| catalog.entries.clear(),
+            ContractDiagnosticCode::CatalogInvalid,
+        ),
+        (
+            "more entries than the limit",
+            |catalog| {
+                *catalog = self::catalog((0..257).map(|index| {
+                    let id = format!("entry-{index}");
+                    entry(
+                        &id,
+                        ContractArtifactKind::ApplicationManifest,
+                        "src/lib.rs",
+                        &format!("generated/{id}.json"),
+                    )
+                }));
+            },
+            ContractDiagnosticCode::CatalogInputLimit,
+        ),
+        (
+            "entry key that is not the entry's ID",
+            |catalog| client(&mut catalog.entries).id = "other".into(),
+            ContractDiagnosticCode::CatalogInvalid,
+        ),
+        (
+            "scope ID with surrounding whitespace",
+            |catalog| client(&mut catalog.entries).scope.id = " scope/client".into(),
+            ContractDiagnosticCode::CatalogInvalid,
+        ),
+        (
+            "owner ID carrying a credential",
+            |catalog| client(&mut catalog.entries).owner = "owner/token=abc".into(),
+            ContractDiagnosticCode::EnvironmentValue,
+        ),
+        (
+            "owner ID with parent traversal",
+            |catalog| client(&mut catalog.entries).owner = "owner/../client".into(),
+            ContractDiagnosticCode::CatalogInputLimit,
+        ),
+        (
+            "owner ID with unsupported characters",
+            |catalog| client(&mut catalog.entries).owner = "owner client".into(),
+            ContractDiagnosticCode::CatalogInvalid,
+        ),
+        (
+            "identity of another kind than the entry",
+            |catalog| {
+                client(&mut catalog.entries).identity.kind = ContractArtifactKind::DeploymentPlan
+            },
+            ContractDiagnosticCode::ChainKindMismatch,
+        ),
+        (
+            "identity with surrounding whitespace",
+            |catalog| client(&mut catalog.entries).identity.value = "ref:client ".into(),
+            ContractDiagnosticCode::CatalogInvalid,
+        ),
+        (
+            "entry without sources",
+            |catalog| client(&mut catalog.entries).provenance.sources.clear(),
+            ContractDiagnosticCode::CatalogInvalid,
+        ),
+        (
+            "generator that is a home-relative path",
+            |catalog| client(&mut catalog.entries).provenance.generator = "~/bin/gen".into(),
+            ContractDiagnosticCode::EnvironmentValue,
+        ),
+        (
+            "glob limit of zero",
+            |catalog| application(&mut catalog.entries).provenance.glob_limit = Some(0),
+            ContractDiagnosticCode::CatalogInputLimit,
+        ),
+        (
+            "glob limit above the maximum",
+            |catalog| {
+                application(&mut catalog.entries).provenance.glob_limit =
+                    Some(MAX_CATALOG_GLOB_MATCHES + 1)
+            },
+            ContractDiagnosticCode::CatalogInputLimit,
+        ),
+        (
+            "entry without outputs",
+            |catalog| client(&mut catalog.entries).outputs.clear(),
+            ContractDiagnosticCode::CatalogInvalid,
+        ),
+        (
+            "more outputs than the limit",
+            |catalog| {
+                client(&mut catalog.entries).outputs = (0..257)
+                    .map(|index| (format!("output-{index}"), format!("ui/out-{index}")))
+                    .collect();
+            },
+            ContractDiagnosticCode::CatalogInputLimit,
+        ),
+        (
+            "output path declared by two output IDs",
+            |catalog| {
+                let path =
+                    application(&mut catalog.entries).outputs["application-artifact"].clone();
+                client(&mut catalog.entries).outputs = BTreeMap::from([("other".into(), path)]);
+            },
+            ContractDiagnosticCode::CatalogDuplicateOutput,
+        ),
+        (
+            "source path with a drive letter",
+            |catalog| {
+                client(&mut catalog.entries).provenance.sources =
+                    ["C:/generated/application.json".to_string()].into();
+            },
+            ContractDiagnosticCode::CatalogPath,
+        ),
+        (
+            "lifecycle policy with unsupported characters",
+            |catalog| client(&mut catalog.entries).lifecycle = ["build now".to_string()].into(),
+            ContractDiagnosticCode::CatalogInvalid,
+        ),
+        (
+            "predecessor entry ID with surrounding whitespace",
+            |catalog| {
+                client(&mut catalog.entries)
+                    .predecessor
+                    .as_mut()
+                    .expect("client predecessor")
+                    .entry_id = "application ".into();
+            },
+            ContractDiagnosticCode::CatalogInvalid,
+        ),
+    ];
+    for (name, edit, code) in rows {
+        let mut catalog = valid_catalog();
+        edit(&mut catalog);
+        assert_eq!(rejection(&catalog), code, "{name}");
+    }
+}
+
+/// A valid one-client inventory as JSON, for rows that edit the raw document.
+fn inventory_json() -> Value {
+    serde_json::json!({
+        "schema_version": 1,
+        "clients": [{
+            "module": "$distributed/client",
+            "surface": "e2e-ui",
+            "documents": ["src/routes/example/+page.graphql"],
+            "output": "src/lib/generated/example",
+            "manifest_entrypoint": "crate::surface::client"
+        }]
+    })
+}
+
+type InventoryEdit = fn(&mut Value);
+
+/// Each rule of the client inventory, one row per rule, with its code.
+#[test]
+fn client_inventory_rejects_each_rule_with_its_code() {
+    let rows: [(&str, InventoryEdit, ContractDiagnosticCode); 18] = [
+        (
+            "unsupported schema version",
+            |value| value["schema_version"] = 2.into(),
+            ContractDiagnosticCode::CatalogInvalid,
+        ),
+        (
+            "no clients",
+            |value| value["clients"] = serde_json::json!([]),
+            ContractDiagnosticCode::CatalogInputLimit,
+        ),
+        (
+            "module outside $distributed",
+            |value| value["clients"][0]["module"] = "virtual/client".into(),
+            ContractDiagnosticCode::CatalogInvalid,
+        ),
+        (
+            "module carrying a credential",
+            |value| value["clients"][0]["module"] = "$distributed/token=abc".into(),
+            ContractDiagnosticCode::EnvironmentValue,
+        ),
+        (
+            "surface with unsupported characters",
+            |value| value["clients"][0]["surface"] = "e2e ui".into(),
+            ContractDiagnosticCode::CatalogInvalid,
+        ),
+        (
+            "output with a glob",
+            |value| value["clients"][0]["output"] = "src/lib/*".into(),
+            ContractDiagnosticCode::CatalogUnboundedGlob,
+        ),
+        (
+            "client without documents",
+            |value| value["clients"][0]["documents"] = serde_json::json!([]),
+            ContractDiagnosticCode::CatalogInputLimit,
+        ),
+        (
+            "document that is not GraphQL",
+            |value| value["clients"][0]["documents"][0] = "src/routes/page.ts".into(),
+            ContractDiagnosticCode::CatalogInvalid,
+        ),
+        (
+            "recursive document glob",
+            |value| value["clients"][0]["documents"][0] = "src/**/page.graphql".into(),
+            ContractDiagnosticCode::CatalogUnboundedGlob,
+        ),
+        (
+            "document glob at the root",
+            |value| value["clients"][0]["documents"][0] = "*.graphql".into(),
+            ContractDiagnosticCode::CatalogUnboundedGlob,
+        ),
+        (
+            "entrypoint that is not a Rust path",
+            |value| value["clients"][0]["manifest_entrypoint"] = "crate::".into(),
+            ContractDiagnosticCode::CatalogInvalid,
+        ),
+        (
+            "entrypoint carrying a credential",
+            |value| value["clients"][0]["manifest_entrypoint"] = "bearer abc".into(),
+            ContractDiagnosticCode::EnvironmentValue,
+        ),
+        (
+            "module declared twice",
+            |value| {
+                let mut second = value["clients"][0].clone();
+                second["surface"] = "other".into();
+                second["output"] = "src/lib/generated/other".into();
+                value["clients"]
+                    .as_array_mut()
+                    .expect("clients")
+                    .push(second);
+            },
+            ContractDiagnosticCode::CatalogDuplicateScope,
+        ),
+        (
+            "surface declared twice",
+            |value| {
+                let mut second = value["clients"][0].clone();
+                second["module"] = "$distributed/other".into();
+                second["output"] = "src/lib/generated/other".into();
+                value["clients"]
+                    .as_array_mut()
+                    .expect("clients")
+                    .push(second);
+            },
+            ContractDiagnosticCode::CatalogDuplicateScope,
+        ),
+        (
+            "output declared twice",
+            |value| {
+                let mut second = value["clients"][0].clone();
+                second["module"] = "$distributed/other".into();
+                second["surface"] = "other".into();
+                value["clients"]
+                    .as_array_mut()
+                    .expect("clients")
+                    .push(second);
+            },
+            ContractDiagnosticCode::CatalogDuplicateOutput,
+        ),
+        (
+            "forbidden metadata field",
+            |value| value["clients"][0]["env"] = "production".into(),
+            ContractDiagnosticCode::EnvironmentValue,
+        ),
+        (
+            "string longer than the limit",
+            |value| value["clients"][0]["surface"] = "s".repeat(4097).into(),
+            ContractDiagnosticCode::CatalogInputLimit,
+        ),
+        (
+            "array longer than the limit",
+            |value| value["clients"][0]["documents"] = serde_json::json!(vec![0; 8193]),
+            ContractDiagnosticCode::CatalogInputLimit,
+        ),
+    ];
+    let valid = serde_json::to_string(&inventory_json()).expect("inventory JSON");
+    ClientInventory::from_json_str(&valid).expect("the unmodified inventory is valid");
+    for (name, edit, code) in rows {
+        let mut value = inventory_json();
+        edit(&mut value);
+        let input = serde_json::to_string(&value).expect("inventory JSON");
+        let error = ClientInventory::from_json_str(&input)
+            .err()
+            .unwrap_or_else(|| panic!("{name}: inventory was accepted"));
+        assert_eq!(error.code(), code, "{name}: {}", error.message());
+    }
+
+    let error = ClientInventory::from_json_str("{").expect_err("malformed JSON");
+    assert_eq!(error.code(), ContractDiagnosticCode::CatalogInvalid);
+}
+
+/// What the file loader refuses before parsing: a missing path, a directory
+/// and bytes that are not UTF-8.
+#[test]
+fn client_inventory_loader_refuses_missing_special_and_non_utf8_files() {
+    let root = TemporaryDirectory::new();
+    let missing =
+        ClientInventory::from_path(root.path().join("absent.json")).expect_err("missing inventory");
+    assert_eq!(missing.code(), ContractDiagnosticCode::CatalogPath);
+
+    let directory = ClientInventory::from_path(root.path()).expect_err("directory inventory");
+    assert_eq!(directory.code(), ContractDiagnosticCode::CatalogSpecialFile);
+
+    let binary = root.path().join("binary.json");
+    fs::write(&binary, [0xff, 0xfe, 0x00]).expect("binary fixture");
+    let error = ClientInventory::from_path(&binary).expect_err("non-UTF-8 inventory");
+    assert_eq!(error.code(), ContractDiagnosticCode::CatalogInvalid);
+}
+
+/// The code strings are a stable vocabulary: tools match on them.
+#[test]
+fn diagnostic_codes_render_their_stable_strings() {
+    use ContractDiagnosticCode::*;
+    for (code, text) in [
+        (CatalogInvalid, "CTL-CATALOG-INVALID"),
+        (CatalogInputLimit, "CTL-CATALOG-LIMIT"),
+        (CatalogPath, "CTL-CATALOG-PATH"),
+        (CatalogSymlinkEscape, "CTL-CATALOG-SYMLINK"),
+        (CatalogSpecialFile, "CTL-CATALOG-FILE"),
+        (CatalogDuplicateScope, "CTL-CATALOG-DUPLICATE-SCOPE"),
+        (CatalogDuplicateOwner, "CTL-CATALOG-DUPLICATE-OWNER"),
+        (CatalogDuplicateOutput, "CTL-CATALOG-DUPLICATE-OUTPUT"),
+        (CatalogUnboundedGlob, "CTL-CATALOG-GLOB"),
+        (EnvironmentValue, "CTL-ENV-VALUE"),
+        (ChainMissingPredecessor, "CTL-CHAIN-MISSING"),
+        (ChainKindMismatch, "CTL-CHAIN-KIND"),
+        (ChainIdentityMismatch, "CTL-CHAIN-IDENTITY"),
+        (ChainCycle, "CTL-CHAIN-CYCLE"),
+    ] {
+        assert_eq!(code.to_string(), text);
+    }
+    let error = ClientInventory::from_json_str("{").expect_err("malformed JSON");
+    assert!(
+        error
+            .to_string()
+            .starts_with("CTL-CATALOG-INVALID: parse client inventory JSON"),
+        "{error}"
+    );
+}
