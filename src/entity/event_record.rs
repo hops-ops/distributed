@@ -258,6 +258,36 @@ mod tests {
         assert_eq!(deserialized.timestamp, event_record.timestamp);
     }
 
+    /// Version 1 is the default and is left out of the JSON form; reading the
+    /// JSON back restores it.
+    #[test]
+    fn event_version_one_is_the_default_and_left_out_of_json() {
+        let record = EventRecord::new("tested", vec![1, 2, 3], 1);
+        assert_eq!(record.event_version, 1);
+
+        let json = serde_json::to_string(&record).unwrap();
+        assert!(!json.contains("event_version"), "{json}");
+
+        let deserialized: EventRecord = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.event_version, 1);
+        assert_eq!(deserialized, record);
+    }
+
+    #[test]
+    fn an_event_version_other_than_one_is_written_and_read_back() {
+        let record = EventRecord::new_versioned("tested", vec![1, 2, 3], 1, 3);
+        assert_eq!(record.event_version, 3);
+        assert_eq!(record.event_name, "tested");
+
+        let json = serde_json::to_string(&record).unwrap();
+        assert!(json.contains("\"event_version\":3"), "{json}");
+
+        let deserialized: EventRecord = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.event_version, 3);
+        assert_eq!(deserialized.event_name, "tested");
+        assert_eq!(deserialized.sequence, 1);
+    }
+
     #[test]
     fn decode_payload() {
         let payload = bitcode::serialize(&("hello", 42i32, true)).unwrap();
