@@ -206,22 +206,6 @@ async fn zero_receiver_send_is_noop() {
     repo.publish_read_model_change(ReadModelChange::new(["items"]));
 }
 
-#[test]
-fn response_hash_stable() {
-    use async_graphql::Value;
-    let a = Value::from(1);
-    let b = Value::from(1);
-    let c = Value::from(2);
-    assert_eq!(
-        distributed::graphql::subscribe::response_hash(&a),
-        distributed::graphql::subscribe::response_hash(&b)
-    );
-    assert_ne!(
-        distributed::graphql::subscribe::response_hash(&a),
-        distributed::graphql::subscribe::response_hash(&c)
-    );
-}
-
 /// Live stream re-exec must AND claim row filters (same as query path).
 /// Two tenants subscribe with the same document; each only ever sees own rows
 /// on the initial push and after a cross-tenant write.

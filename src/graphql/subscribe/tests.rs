@@ -331,3 +331,13 @@ async fn a_closed_hub_ends_every_subscriber() {
     assert!(stream.next().await.is_none());
     assert_eq!(registry.len(), 0);
 }
+
+/// The push gate's hash: equal payloads hash equal, a changed one does not.
+#[test]
+fn response_hash_stable() {
+    let a = Value::from(1);
+    let b = Value::from(1);
+    let c = Value::from(2);
+    assert_eq!(response_hash(&a), response_hash(&b));
+    assert_ne!(response_hash(&a), response_hash(&c));
+}
