@@ -1698,3 +1698,145 @@ where
         target.model_name.clone(),
     )?)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn json(value: serde_json::Value) -> ProjectionValue {
+        ProjectionValue::try_from_json(value).unwrap()
+    }
+
+    #[test]
+    fn portable_values_lower_to_the_row_value_of_their_column() {
+        let object = json(serde_json::json!({"b": [1, -2], "a": {"on": true}, "f": 1.5}));
+        let cases = [
+            (
+                "null in any column",
+                ProjectionValue::null(),
+                ColumnType::Integer,
+                RowValue::Null,
+            ),
+            (
+                "boolean",
+                ProjectionValue::boolean(true),
+                ColumnType::Boolean,
+                RowValue::Bool(true),
+            ),
+            (
+                "signed",
+                ProjectionValue::signed(-7),
+                ColumnType::Integer,
+                RowValue::I64(-7),
+            ),
+            (
+                "unsigned within i64",
+                ProjectionValue::unsigned(7),
+                ColumnType::UnsignedInteger,
+                RowValue::I64(7),
+            ),
+            (
+                "unsigned above i64",
+                ProjectionValue::unsigned(u64::MAX),
+                ColumnType::UnsignedInteger,
+                RowValue::U64(u64::MAX),
+            ),
+            (
+                "float",
+                ProjectionValue::try_float(1.5).unwrap(),
+                ColumnType::Float,
+                RowValue::F64(1.5),
+            ),
+            (
+                "text",
+                ProjectionValue::string("hi"),
+                ColumnType::Text,
+                RowValue::String("hi".into()),
+            ),
+            (
+                "timestamp text",
+                ProjectionValue::string("2026-01-01T00:00:00Z"),
+                ColumnType::Timestamp,
+                RowValue::String("2026-01-01T00:00:00Z".into()),
+            ),
+            (
+                "enum variant as text",
+                ProjectionValue::enum_variant("Status", "Open"),
+                ColumnType::Text,
+                RowValue::String("Open".into()),
+            ),
+            (
+                "byte list",
+                json(serde_json::json!([0, 255])),
+                ColumnType::Bytes,
+                RowValue::Bytes(vec![0, 255]),
+            ),
+            (
+                "json object",
+                object,
+                ColumnType::Json,
+                RowValue::Json(serde_json::json!({"a": {"on": true}, "b": [1, -2], "f": 1.5})),
+            ),
+            (
+                "enum variant as json",
+                ProjectionValue::enum_variant("Status", "Open"),
+                ColumnType::Json,
+                RowValue::Json(serde_json::json!("Open")),
+            ),
+        ];
+        for (name, value, column, expected) in cases {
+            assert_eq!(
+                projection_value_to_row(&value, &column).unwrap(),
+                expected,
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_value_of_another_kind_is_rejected_by_its_column() {
+        let cases = [
+            (
+                "string into boolean",
+                ProjectionValue::string("true"),
+                ColumnType::Boolean,
+            ),
+            (
+                "unsigned into signed",
+                ProjectionValue::unsigned(7),
+                ColumnType::Integer,
+            ),
+            (
+                "signed into unsigned",
+                ProjectionValue::signed(-7),
+                ColumnType::UnsignedInteger,
+            ),
+            (
+                "byte above 255",
+                json(serde_json::json!([256])),
+                ColumnType::Bytes,
+            ),
+            (
+                "non-numeric byte",
+                json(serde_json::json!(["a"])),
+                ColumnType::Bytes,
+            ),
+            (
+                "unsupported column",
+                ProjectionValue::string("x"),
+                ColumnType::Unsupported("fn()".into()),
+            ),
+        ];
+        for (name, value, column) in cases {
+            let error = projection_value_to_row(&value, &column).unwrap_err();
+            assert!(
+                matches!(
+                    &error,
+                    ProjectionLoweringError::Table(TableStoreError::Metadata(reason))
+                        if reason.starts_with("portable projection value is incompatible with column type")
+                ),
+                "{name}: {error:?}"
+            );
+        }
+    }
+}
