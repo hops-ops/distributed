@@ -162,6 +162,31 @@ fn filter_and_order_arguments_outside_the_manifest_are_refused() {
             source: "query Q($w: [String!]) { todos(where: {_or: $w}) { id } }",
             code: "client.variable.type_mismatch",
         },
+        Row {
+            name: "filter that is a list beside a variable",
+            source: "query Q($id: ID!) { todos(where: [{id: {_eq: $id}}]) { id } }",
+            code: "client.filter.object_required",
+        },
+        Row {
+            name: "field compared to a variable instead of an operator object",
+            source: "query Q($p: Int!) { todos(where: {priority: $p}) { id } }",
+            code: "client.filter.comparison_object",
+        },
+        Row {
+            name: "IN item that is a list holding a variable",
+            source: "query Q($p: Int!) { todos(where: {priority: {_in: [[$p]]}}) { id } }",
+            code: "client.filter.operand",
+        },
+        Row {
+            name: "JSON operand that is an object holding a variable",
+            source: "query Q($j: JSON) { todos(where: {payload: {_eq: {nested: $j}}}) { id } }",
+            code: "client.filter.operand",
+        },
+        Row {
+            name: "_has_key operand that is a list holding a variable",
+            source: "query Q($k: String) { todos(where: {payload: {_has_key: [$k]}}) { id } }",
+            code: "client.filter.operand",
+        },
         // Order written as one literal.
         Row {
             name: "literal order entry that is not an object",
@@ -184,6 +209,11 @@ fn filter_and_order_arguments_outside_the_manifest_are_refused() {
             code: "client.order.direction",
         },
         // Order holding a variable somewhere.
+        Row {
+            name: "order entry that is a list holding a variable",
+            source: "query Q($o: todo_order_by!) { todos(order_by: [[$o]]) { id } }",
+            code: "client.order.object_required",
+        },
         Row {
             name: "order entry variable of the wrong input type",
             source: "query Q($o: String!) { todos(order_by: [$o]) { id } }",
@@ -228,6 +258,7 @@ fn filter_and_order_arguments_inside_the_manifest_compile() {
         "query Q($t: String) { todos(where: {title: {_eq: $t, _is_null: null}, payload: {_eq: null, _has_key: \"a\"}}) { id } }",
         "query Q($w: todo_bool_exp!) { todos(where: {_or: [$w, {priority: {_eq: 1}}], _not: {owner: {id: {_eq: \"x\"}}}}) { id } }",
         "query Q($o: todo_order_by!, $d: order_by!) { todos(order_by: [$o, {priority: $d}, {id: desc}]) { id } }",
+        "query Q { todos(where: null, order_by: null) { id } }",
     ] {
         compile(source).unwrap_or_else(|error| panic!("{source}: {error:?}"));
     }
