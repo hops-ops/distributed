@@ -11,13 +11,14 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::contracts::ContractCatalog;
+use crate::process::ProcessGroup;
 
 use super::graph::source_uses_output;
 use super::{
     digest_bytes, validate_content_identity, validate_portable_path, validate_stable_value,
     ArtifactNodeReceipt, DistributedSourceIdentity, GenerationManifest, LifecycleConfig,
     LifecycleDevConfig, LifecycleError, LifecycleGraph, ReleaseManifest,
-    LIFECYCLE_CONFIG_SCHEMA_VERSION,
+    GENERATED_DIRECTORY_MARKER, LIFECYCLE_CLI_EXECUTABLE_ENV, LIFECYCLE_CONFIG_SCHEMA_VERSION,
 };
 
 pub const LIFECYCLE_BUILD_CONFIG_SCHEMA_VERSION: u32 = 1;
@@ -85,37 +86,6 @@ pub struct LifecycleBuildConfig {
 }
 
 impl LifecycleBuildConfig {
-    pub fn from_path(path: impl AsRef<Path>) -> Result<Self, LifecycleError> {
-        let metadata = fs::symlink_metadata(path.as_ref()).map_err(|error| {
-            LifecycleError::new(format!(
-                "failed to inspect lifecycle config `{}`: {error}",
-                path.as_ref().display()
-            ))
-        })?;
-        if metadata.file_type().is_symlink() || !metadata.is_file() {
-            return Err(LifecycleError::new(
-                "lifecycle config must be a regular non-symlink file",
-            ));
-        }
-        if metadata.len() > 1024 * 1024 {
-            return Err(LifecycleError::new("lifecycle config exceeds 1 MiB"));
-        }
-        let bytes = fs::read(path.as_ref()).map_err(|error| {
-            LifecycleError::new(format!(
-                "failed to read lifecycle config `{}`: {error}",
-                path.as_ref().display()
-            ))
-        })?;
-        let config: Self = serde_json::from_slice(&bytes).map_err(|error| {
-            LifecycleError::new(format!(
-                "failed to parse lifecycle config `{}`: {error}",
-                path.as_ref().display()
-            ))
-        })?;
-        config.validate()?;
-        Ok(config)
-    }
-
     pub fn lifecycle(&self) -> LifecycleConfig {
         LifecycleConfig {
             schema_version: LIFECYCLE_CONFIG_SCHEMA_VERSION,
@@ -148,24 +118,7 @@ impl LifecycleBuildConfig {
     }
 }
 
-#[derive(Clone, Debug)]
-pub struct LifecycleBuildOptions {
-    pub root: PathBuf,
-    pub catalog: PathBuf,
-    pub config: PathBuf,
-    pub out: PathBuf,
-    pub check: bool,
-    pub lock_timeout: Duration,
-    /// Optional downstream-closed node subset; other receipts are verified and reused.
-    pub nodes: Option<BTreeSet<String>>,
-    /// Optional content snapshot that must still match immediately before activation.
-    pub activation_inputs: Option<BTreeMap<String, String>>,
-    /// Optional cooperative cancellation shared with a supervising watcher.
-    pub cancel: Option<Arc<AtomicBool>>,
-}
-
-/// A lifecycle graph resolved from project metadata rather than user-authored
-/// lifecycle files.
+/// The lifecycle graph of one project: what `build` and `dev` run.
 #[derive(Clone, Debug)]
 pub struct LifecycleProjectPlan {
     /// Canonical lifecycle root shared by every owned application component.
@@ -176,6 +129,9 @@ pub struct LifecycleProjectPlan {
     pub config: LifecycleBuildConfig,
     /// Project-relative or absolute content-addressed lifecycle state directory.
     pub out: PathBuf,
+    /// Canonical `distributed` executable that initiated the lifecycle work.
+    /// Executors and UI commands receive it so they call back into the same CLI.
+    pub cli_executable: PathBuf,
 }
 
 /// Per-invocation behavior for an already resolved lifecycle project.
@@ -183,8 +139,6 @@ pub struct LifecycleProjectPlan {
 pub struct LifecycleBuildRequest {
     /// Build in an isolated stage and report drift without activation.
     pub check: bool,
-    /// Existing output set against which check-mode outputs are compared.
-    pub check_baseline: LifecycleCheckBaseline,
     /// Maximum time to wait for a concurrent lifecycle build.
     pub lock_timeout: Duration,
     /// Optional downstream-closed node subset for incremental rebuilds.
@@ -205,29 +159,6 @@ pub enum LifecycleActivation {
     /// Install the immutable generation but leave the current pointer untouched.
     /// The dev supervisor uses this while it proves replacement processes ready.
     Deferred,
-}
-
-/// Output set used as the baseline for a read-only lifecycle check.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum LifecycleCheckBaseline {
-    /// Compare staged outputs with catalog-owned files in the source workspace.
-    Workspace,
-    /// Compare staged outputs with the currently active immutable generation.
-    ActiveGeneration,
-}
-
-impl From<&LifecycleBuildOptions> for LifecycleBuildRequest {
-    fn from(options: &LifecycleBuildOptions) -> Self {
-        Self {
-            check: options.check,
-            check_baseline: LifecycleCheckBaseline::Workspace,
-            lock_timeout: options.lock_timeout,
-            nodes: options.nodes.clone(),
-            activation_inputs: options.activation_inputs.clone(),
-            cancel: options.cancel.clone(),
-            activation: LifecycleActivation::Immediate,
-        }
-    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -253,34 +184,6 @@ pub struct LifecycleBuildReport {
     pub executed: Vec<String>,
     pub drift: Vec<BuildDrift>,
     pub active_generation: Option<String>,
-}
-
-pub fn run_lifecycle_build(
-    options: &LifecycleBuildOptions,
-) -> Result<LifecycleBuildReport, LifecycleError> {
-    let root = options.root.canonicalize().map_err(|error| {
-        LifecycleError::new(format!(
-            "failed to resolve lifecycle root `{}`: {error}",
-            options.root.display()
-        ))
-    })?;
-    if !root.is_dir() {
-        return Err(LifecycleError::new("lifecycle root must be a directory"));
-    }
-    let catalog_path = resolve_under_root(&root, &options.catalog, "contract catalog")?;
-    let config_path = resolve_under_root(&root, &options.config, "lifecycle config")?;
-    let config = LifecycleBuildConfig::from_path(config_path)?;
-    let catalog = ContractCatalog::from_path_at_root(&catalog_path, &root)
-        .map_err(|error| LifecycleError::new(error.to_string()))?;
-    run_lifecycle_project_build(
-        &LifecycleProjectPlan {
-            root,
-            catalog,
-            config,
-            out: options.out.clone(),
-        },
-        &LifecycleBuildRequest::from(options),
-    )
 }
 
 /// Build a lifecycle project whose catalog and execution plan were derived by
@@ -394,6 +297,7 @@ pub fn run_lifecycle_project_build(
             &node.outputs,
             executor,
             request.check,
+            &project.cli_executable,
             request.cancel.as_deref(),
         )?;
         let output_identities = collect_node_outputs(stage.path(), node_id, &graph)?;
@@ -422,12 +326,7 @@ pub fn run_lifecycle_project_build(
     let compatibility_id = digest_bytes(&compatibility_bytes);
 
     let drift = if request.check {
-        match request.check_baseline {
-            LifecycleCheckBaseline::Workspace => compare_workspace_outputs(&root, &generation)?,
-            LifecycleCheckBaseline::ActiveGeneration => {
-                compare_active_outputs(&out, &generation)?
-            }
-        }
+        compare_active_outputs(&out, &generation)?
     } else {
         if request
             .cancel
@@ -462,6 +361,7 @@ pub fn run_lifecycle_project_build(
         install_generation(stage, &out, &generation.generation_id)?;
         if request.activation == LifecycleActivation::Immediate {
             write_active_generation(&out, &generation.generation_id, &release.release_id)?;
+            prune_generations(&out, &generation.generation_id);
             Some(generation.generation_id.clone())
         } else {
             read_active_generation(&out)?
@@ -487,7 +387,9 @@ fn compare_active_outputs(
     generation: &GenerationManifest,
 ) -> Result<Vec<BuildDrift>, LifecycleError> {
     let active = read_active_generation(out)?;
-    let active_root = active.as_ref().map(|identity| out.join("generations").join(identity));
+    let active_root = active
+        .as_ref()
+        .map(|identity| out.join("generations").join(identity));
     let mut drift = Vec::new();
     for receipt in generation.receipts.values() {
         for (output, built_identity) in &receipt.output_identities {
@@ -641,6 +543,7 @@ fn execute_node(
     declared_outputs: &BTreeSet<String>,
     executor: &LifecycleExecutor,
     check: bool,
+    cli_executable: &Path,
     cancel: Option<&AtomicBool>,
 ) -> Result<(), LifecycleError> {
     let root_value = root.to_string_lossy();
@@ -675,47 +578,40 @@ fn execute_node(
         .env("DISTRIBUTED_LIFECYCLE_ROOT", root)
         .env("DISTRIBUTED_LIFECYCLE_STAGE", stage)
         .env("DISTRIBUTED_LIFECYCLE_NODE", node_id)
-        .env(
-            "DISTRIBUTED_LIFECYCLE_CHECK",
-            if check { "1" } else { "0" },
-        )
+        .env("DISTRIBUTED_LIFECYCLE_CHECK", if check { "1" } else { "0" })
+        .env(LIFECYCLE_CLI_EXECUTABLE_ENV, cli_executable)
+        .stdin(Stdio::null())
         .stdout(stdout)
         .stderr(Stdio::piped());
-    let mut child = command.spawn().map_err(|error| {
+    // The executor leads its own process group: `describe` blocks in `cargo
+    // run`, so cancelling the leader alone would leave the compiler running.
+    let mut executor_group = ProcessGroup::spawn(&mut command).map_err(|error| {
         LifecycleError::new(format!(
             "lifecycle node `{node_id}` failed to start executor `{}`: {error}",
             executor.program
         ))
     })?;
-    let stderr = child
+    let stderr = executor_group
+        .leader()
         .stderr
         .take()
         .ok_or_else(|| LifecycleError::new("lifecycle executor stderr pipe is unavailable"))?;
-    let stderr_reader = match std::thread::Builder::new()
+    let stderr_reader = std::thread::Builder::new()
         .name(format!("lifecycle-stderr-{node_id}"))
         .spawn(move || forward_executor_stderr(stderr))
-    {
-        Ok(reader) => reader,
-        Err(error) => {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(io_error("start lifecycle executor stderr reader")(error));
-        }
-    };
+        .map_err(io_error("start lifecycle executor stderr reader"))?;
     let status = loop {
         if cancel.is_some_and(|cancel| cancel.load(Ordering::SeqCst)) {
-            child
+            executor_group
                 .kill()
                 .map_err(io_error("cancel lifecycle executor"))?;
-            child
-                .wait()
-                .map_err(io_error("wait for canceled lifecycle executor"))?;
             let _ = finish_executor_stderr(stderr_reader);
             return Err(LifecycleError::canceled(format!(
                 "lifecycle build was canceled while node `{node_id}` was running"
             )));
         }
-        if let Some(status) = child
+        if let Some(status) = executor_group
+            .leader()
             .try_wait()
             .map_err(io_error("inspect lifecycle executor"))?
         {
@@ -723,6 +619,10 @@ fn execute_node(
         }
         std::thread::sleep(Duration::from_millis(10));
     };
+    // Nothing the executor left running may hold its stderr pipe open.
+    executor_group
+        .kill()
+        .map_err(io_error("stop lifecycle executor descendants"))?;
     let stderr_tail = finish_executor_stderr(stderr_reader)?;
     if !status.success() {
         let detail = String::from_utf8_lossy(&stderr_tail);
@@ -931,6 +831,9 @@ fn collect_regular_files(
             path.display()
         )));
     }
+    if path.join(GENERATED_DIRECTORY_MARKER).is_file() {
+        return Ok(());
+    }
     let mut entries = fs::read_dir(path)
         .map_err(io_error("read lifecycle directory"))?
         .collect::<Result<Vec<_>, _>>()
@@ -976,31 +879,6 @@ fn collect_regular_files(
         }
     }
     Ok(())
-}
-
-fn compare_workspace_outputs(
-    root: &Path,
-    generation: &GenerationManifest,
-) -> Result<Vec<BuildDrift>, LifecycleError> {
-    let mut drift = Vec::new();
-    for (node_id, receipt) in &generation.receipts {
-        for (output, built_identity) in &receipt.output_identities {
-            let workspace_identity = match fs::symlink_metadata(root.join(output)) {
-                Ok(_) => Some(hash_path(&root.join(output), root)?),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-                Err(error) => return Err(io_error("inspect workspace output")(error)),
-            };
-            if workspace_identity.as_ref() != Some(built_identity) {
-                drift.push(BuildDrift {
-                    node_id: node_id.clone(),
-                    output: output.clone(),
-                    built_identity: built_identity.clone(),
-                    workspace_identity,
-                });
-            }
-        }
-    }
-    Ok(drift)
 }
 
 fn reject_unowned_stage_files(stage: &Path, graph: &LifecycleGraph) -> Result<(), LifecycleError> {
@@ -1140,7 +1018,45 @@ pub fn activate_lifecycle_project_generation(
         report.active_generation.as_deref(),
         &report.generation_id,
     )?;
-    write_active_generation(&out, &report.generation_id, &report.release_id)
+    write_active_generation(&out, &report.generation_id, &report.release_id)?;
+    prune_generations(&out, &report.generation_id);
+    Ok(())
+}
+
+/// Remove the installed generations nothing can read any more.
+///
+/// Kept: the generation that was just activated, and every generation a
+/// running `dev` session names in its state file: the one it serves, the one
+/// it is switching to, and the one each of its processes was started with (a
+/// UI server that is not restarted keeps resolving the generation it started
+/// on). Every other generation is unreachable: nothing serves it, and
+/// activation refuses a generation built before the pointer last moved.
+///
+/// The caller holds the build lock and has moved the pointer. A generation
+/// that cannot be removed is reported and left for the next activation.
+fn prune_generations(out: &Path, active: &str) {
+    let Some(mut keep) = super::dev::generations_in_use(out) else {
+        return;
+    };
+    keep.insert(active.to_string());
+    let Ok(entries) = fs::read_dir(out.join("generations")) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(generation) = name.to_str() else {
+            continue;
+        };
+        if keep.contains(generation)
+            || validate_content_identity(generation, "generation").is_err()
+            || !entry.file_type().is_ok_and(|kind| kind.is_dir())
+        {
+            continue;
+        }
+        if let Err(error) = fs::remove_dir_all(entry.path()) {
+            eprintln!("lifecycle: could not remove unused generation `{generation}`: {error}");
+        }
+    }
 }
 
 fn ensure_activation_predecessor(
@@ -1251,27 +1167,6 @@ impl Drop for BuildLock {
     }
 }
 
-fn resolve_under_root(root: &Path, path: &Path, label: &str) -> Result<PathBuf, LifecycleError> {
-    let candidate = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        root.join(path)
-    };
-    reject_symlink_components(root, &candidate, label)?;
-    let resolved = candidate.canonicalize().map_err(|error| {
-        LifecycleError::new(format!(
-            "failed to resolve {label} `{}`: {error}",
-            candidate.display()
-        ))
-    })?;
-    if !resolved.starts_with(root) {
-        return Err(LifecycleError::new(format!(
-            "{label} escapes lifecycle root"
-        )));
-    }
-    Ok(resolved)
-}
-
 pub(super) fn resolve_output(root: &Path, path: &Path) -> Result<PathBuf, LifecycleError> {
     if path
         .components()
@@ -1375,6 +1270,126 @@ fn io_error(label: &'static str) -> impl FnOnce(std::io::Error) -> LifecycleErro
 mod tests {
     use super::*;
     use crate::lifecycle::graph::LifecycleErrorReason;
+
+    #[cfg(unix)]
+    #[test]
+    fn lifecycle_executor_receives_exact_cli_path_including_spaces() {
+        let fixture = tempfile::tempdir().expect("create executor fixture");
+        let stage = fixture.path().join("stage");
+        fs::create_dir_all(&stage).expect("create executor stage");
+        let script = fixture.path().join("print-cli.sh");
+        fs::write(
+            &script,
+            "#!/bin/sh\nprintf '%s' \"$DISTRIBUTED_LIFECYCLE_CLI_EXECUTABLE\"\n",
+        )
+        .expect("write executor script");
+        let cli = fixture.path().join("cli with spaces").join("distributed");
+        let mut outputs = BTreeSet::new();
+        outputs.insert("cli-path.txt".to_string());
+
+        execute_node(
+            fixture.path(),
+            &stage,
+            "clients",
+            &outputs,
+            &LifecycleExecutor {
+                identity: "sha256:executor".to_string(),
+                // Run the script through `sh` instead of exec-ing it: a
+                // freshly written executable can fail with ETXTBSY while a
+                // concurrently forked test child still holds its write fd.
+                program: "/bin/sh".to_string(),
+                args: vec![script.to_string_lossy().into_owned()],
+                stdout: Some("cli-path.txt".to_string()),
+            },
+            false,
+            &cli,
+            None,
+        )
+        .expect("executor should receive the initiating CLI identity");
+        assert_eq!(
+            fs::read_to_string(stage.join("cli-path.txt")).unwrap(),
+            cli.to_string_lossy()
+        );
+    }
+
+    #[test]
+    fn a_generated_directory_is_not_a_lifecycle_input() {
+        let fixture = tempfile::tempdir().expect("create source fixture");
+        let lib = fixture.path().join("lib");
+        fs::create_dir_all(lib.join("pkg")).unwrap();
+        fs::write(lib.join("app.ts"), "export {};\n").unwrap();
+        fs::write(lib.join("pkg/module.wasm"), "first").unwrap();
+        let identity = || hash_path(&lib, fixture.path()).unwrap();
+
+        let unmarked = identity();
+        fs::write(lib.join("pkg/module.wasm"), "second").unwrap();
+        assert_ne!(identity(), unmarked, "an ordinary directory is an input");
+
+        fs::write(lib.join("pkg").join(GENERATED_DIRECTORY_MARKER), "").unwrap();
+        let marked = identity();
+        fs::write(lib.join("pkg/module.wasm"), "third").unwrap();
+        fs::remove_file(lib.join("pkg/module.wasm")).unwrap();
+        assert_eq!(identity(), marked, "a generated directory is not");
+
+        fs::write(lib.join("app.ts"), "export const changed = true;\n").unwrap();
+        assert_ne!(identity(), marked, "its siblings still are");
+    }
+
+    #[test]
+    fn activation_removes_the_generations_nothing_reads() {
+        let generation = |digit: &str| format!("sha256:{}", digit.repeat(64));
+        let installed = |out: &Path| {
+            fs::read_dir(out.join("generations"))
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+                .collect::<BTreeSet<_>>()
+        };
+        let fixture = |state: Option<&str>| {
+            let fixture = tempfile::tempdir().expect("create generation store");
+            for name in ["1", "2", "3", "4"].map(generation) {
+                fs::create_dir_all(fixture.path().join("generations").join(name)).unwrap();
+            }
+            fs::create_dir_all(fixture.path().join("generations/not-a-generation")).unwrap();
+            if let Some(state) = state {
+                fs::write(fixture.path().join("dev.json"), state).unwrap();
+            }
+            fixture
+        };
+
+        // No session: only the active generation is read.
+        let store = fixture(None);
+        prune_generations(store.path(), &generation("4"));
+        assert_eq!(
+            installed(store.path()),
+            BTreeSet::from([generation("4"), "not-a-generation".to_string()])
+        );
+
+        // A session switching from 2 to 4 whose `ui` process started on 1.
+        let state = serde_json::json!({
+            "schemaVersion": 1,
+            "phase": "preparing",
+            "active": { "generationId": generation("2") },
+            "pending": { "generationId": generation("4") },
+            "members": { "ui": { "instanceId": "member-x", "generationId": generation("1") } },
+        })
+        .to_string();
+        let store = fixture(Some(&state));
+        prune_generations(store.path(), &generation("4"));
+        assert_eq!(
+            installed(store.path()),
+            BTreeSet::from([
+                generation("1"),
+                generation("2"),
+                generation("4"),
+                "not-a-generation".to_string()
+            ])
+        );
+
+        // A session whose state cannot be read: nothing is known to be unused.
+        let store = fixture(Some("{"));
+        prune_generations(store.path(), &generation("4"));
+        assert_eq!(installed(store.path()).len(), 5);
+    }
 
     #[test]
     fn activation_rejects_an_advanced_generation() {

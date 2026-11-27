@@ -3,18 +3,110 @@ use std::time::{Duration, SystemTime};
 
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::projection_protocol::{
-    ResolvedProjectionObligation, SameTransactionProjectionBatch, SameTransactionProjectionEvidence,
+    SameTransactionProjectionBatch, SameTransactionProjectionEvidence,
 };
 use crate::repository::CommitBatch;
 
 use super::{
-    ids::COMMAND_REPLAY_VERSION, state::validate_projection_obligation_semantics, AttemptToken,
-    CanonicalInputHash, CausationId, CommandContractFingerprint, CommandId, CommandLedgerError,
-    CommandLedgerKey, CommandLedgerState, TerminalCommandState, SHA256_BYTES,
+    ids::COMMAND_REPLAY_VERSION, state::validate_replay_state_without_projection_metadata,
+    AttemptToken, CanonicalInputHash, CausationId, CommandContractFingerprint, CommandId,
+    CommandLedgerError, CommandLedgerKey, CommandLedgerState, TerminalCommandState, SHA256_BYTES,
 };
+
+const EXTERNAL_BINDING_VERSION: u16 = 1;
+
+/// Immutable logical route ownership for a command dispatched outside the
+/// repository that owns its ledger row. Transport addresses and retry leases
+/// are intentionally not part of this identity.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ExternalDispatchBinding {
+    version: u16,
+    route_kind: String,
+    shard: String,
+}
+
+impl ExternalDispatchBinding {
+    pub(crate) fn new(
+        route_kind: impl Into<String>,
+        shard: impl Into<String>,
+    ) -> Result<Self, CommandLedgerError> {
+        let route_kind = route_kind.into();
+        let shard = shard.into();
+        validate_binding_part("external route kind", &route_kind)?;
+        validate_binding_part("external shard", &shard)?;
+        Ok(Self {
+            version: EXTERNAL_BINDING_VERSION,
+            route_kind,
+            shard,
+        })
+    }
+
+    pub(crate) fn route_kind(&self) -> &str {
+        &self.route_kind
+    }
+
+    pub(crate) fn shard(&self) -> &str {
+        &self.shard
+    }
+
+    /// Stable storage spelling. Parsing requires this exact canonical form so
+    /// equivalent-looking bindings cannot bypass the immutable row value.
+    pub(crate) fn to_storage(&self) -> Result<String, CommandLedgerError> {
+        serde_json::to_string(self).map_err(|error| {
+            CommandLedgerError::Invalid(format!(
+                "external dispatch binding could not be serialized: {error}"
+            ))
+        })
+    }
+
+    pub(crate) fn from_storage(value: &str) -> Result<Self, CommandLedgerError> {
+        let binding: Self = serde_json::from_str(value).map_err(|error| {
+            CommandLedgerError::Corrupt(format!(
+                "stored external dispatch binding is invalid: {error}"
+            ))
+        })?;
+        if binding.version != EXTERNAL_BINDING_VERSION {
+            return Err(CommandLedgerError::Corrupt(format!(
+                "stored external dispatch binding version `{}` is unsupported",
+                binding.version
+            )));
+        }
+        validate_binding_part("external route kind", &binding.route_kind)
+            .map_err(|error| CommandLedgerError::Corrupt(error.to_string()))?;
+        validate_binding_part("external shard", &binding.shard)
+            .map_err(|error| CommandLedgerError::Corrupt(error.to_string()))?;
+        let canonical = binding.to_storage().map_err(|error| {
+            CommandLedgerError::Corrupt(format!(
+                "stored external dispatch binding cannot be canonicalized: {error}"
+            ))
+        })?;
+        if canonical != value {
+            return Err(CommandLedgerError::Corrupt(
+                "stored external dispatch binding is not canonical JSON".into(),
+            ));
+        }
+        Ok(binding)
+    }
+}
+
+fn validate_binding_part(label: &str, value: &str) -> Result<(), CommandLedgerError> {
+    if value.trim().is_empty() {
+        return Err(CommandLedgerError::Invalid(format!(
+            "{label} must not be empty"
+        )));
+    }
+    if value.len() > 256 || value.chars().any(char::is_control) {
+        return Err(CommandLedgerError::Invalid(format!(
+            "{label} must be at most 256 bytes and contain no control characters"
+        )));
+    }
+    Ok(())
+}
 
 /// One validated reservation request. Fresh candidate IDs lose a race safely:
 /// only the inserted row keeps them; every retry reads the winner's causation.
@@ -27,6 +119,7 @@ pub(crate) struct CommandReservation {
     pub(super) retention: Duration,
     pub(super) candidate_causation: CausationId,
     pub(super) candidate_attempt: AttemptToken,
+    pub(super) external_binding: Option<ExternalDispatchBinding>,
 }
 
 impl CommandReservation {
@@ -60,7 +153,24 @@ impl CommandReservation {
             retention,
             candidate_causation: CausationId::new(),
             candidate_attempt: AttemptToken::new(),
+            external_binding: None,
         })
+    }
+
+    /// Mark this reservation as owned by an external logical route. The
+    /// binding is persisted with the reservation and cannot be changed by a
+    /// reclaim or completion.
+    pub(crate) fn with_external_binding(mut self, binding: ExternalDispatchBinding) -> Self {
+        self.external_binding = Some(binding);
+        self
+    }
+
+    /// Reuse the causation allocated by a trusted external gateway. The
+    /// command ID and canonical input still fence the cell row; this field
+    /// makes the remote receipt prove the same logical command attempt.
+    pub(crate) fn with_causation_id(mut self, causation_id: CausationId) -> Self {
+        self.candidate_causation = causation_id;
+        self
     }
 
     pub(crate) fn key(&self) -> &CommandLedgerKey {
@@ -95,6 +205,10 @@ impl CommandReservation {
         &self.candidate_attempt
     }
 
+    pub(crate) fn external_binding(&self) -> Option<&ExternalDispatchBinding> {
+        self.external_binding.as_ref()
+    }
+
     pub(crate) fn acquired_candidate_attempt(&self) -> CommandAttempt {
         CommandAttempt {
             key: self.key.clone(),
@@ -103,6 +217,7 @@ impl CommandReservation {
             causation_id: self.candidate_causation.clone(),
             attempt_token: self.candidate_attempt.clone(),
             attempt_number: 1,
+            external_binding: self.external_binding.clone(),
         }
     }
 }
@@ -117,8 +232,10 @@ fn validate_positive_duration(label: &str, duration: Duration) -> Result<(), Com
 }
 
 /// Exclusive capability returned to the process that owns the current lease.
-/// It is intentionally not `Clone`: one owned value must be consumed by either
-/// terminal completion or the retryable-unknown transition.
+/// It is intentionally not `Clone`. A local completion borrows it for one
+/// commit transaction: a transaction that rolled back left the ledger row
+/// in progress under this same attempt, so its owner may complete it again.
+/// The stored fence, not this value, decides whether a completion lands.
 pub(crate) struct CommandAttempt {
     pub(super) key: CommandLedgerKey,
     pub(super) contract_fingerprint: CommandContractFingerprint,
@@ -126,6 +243,7 @@ pub(crate) struct CommandAttempt {
     pub(super) causation_id: CausationId,
     pub(super) attempt_token: AttemptToken,
     pub(super) attempt_number: u64,
+    pub(super) external_binding: Option<ExternalDispatchBinding>,
 }
 
 impl CommandAttempt {
@@ -135,6 +253,10 @@ impl CommandAttempt {
 
     pub(crate) fn causation_id(&self) -> &CausationId {
         &self.causation_id
+    }
+
+    pub(crate) fn external_binding(&self) -> Option<&ExternalDispatchBinding> {
+        self.external_binding.as_ref()
     }
 
     #[cfg(test)]
@@ -164,29 +286,92 @@ impl CommandAttempt {
     }
 
     pub(crate) fn complete(
-        self,
+        &self,
         state: TerminalCommandState,
         outcome: Value,
         retention: Duration,
-    ) -> Result<CommandCompletion, CommandLedgerError> {
-        self.complete_with_replay_metadata(state, outcome, Vec::new(), None, retention, None)
+    ) -> Result<CommandCompletion<'_>, CommandLedgerError> {
+        self.complete_with_replay_metadata(state, outcome, None, retention, None)
     }
 
-    pub(crate) fn complete_with_obligations(
+    /// Complete an externally dispatched command without appending local
+    /// events or outbox messages. The reservation binding is checked before a
+    /// replay payload is constructed; the ledger repeats the check at its
+    /// fenced write boundary.
+    pub(crate) fn complete_external(
         self,
+        binding: ExternalDispatchBinding,
         state: TerminalCommandState,
         outcome: Value,
-        projection_obligations: Vec<ResolvedProjectionObligation>,
         retention: Duration,
-    ) -> Result<CommandCompletion, CommandLedgerError> {
-        self.complete_with_replay_metadata(
+    ) -> Result<ExternalCommandCompletion, CommandLedgerError> {
+        self.complete_external_with_replay_metadata(binding, state, outcome, None, retention, None)
+    }
+
+    /// Complete a remote command while retaining the exact sealed projection
+    /// metadata and absolute deadline returned by the remote command host.
+    /// Metadata is validated by the same versioned protocol checks used by a
+    /// local causal completion; it is never inferred from the active projector
+    /// registry.
+    pub(crate) fn complete_external_with_projection_metadata_until(
+        self,
+        binding: ExternalDispatchBinding,
+        state: TerminalCommandState,
+        outcome: Value,
+        projection_metadata: Vec<u8>,
+        retention: Duration,
+        retention_expires_at: SystemTime,
+    ) -> Result<ExternalCommandCompletion, CommandLedgerError> {
+        self.complete_external_with_replay_metadata(
+            binding,
             state,
             outcome,
-            projection_obligations,
-            None,
+            Some(projection_metadata),
             retention,
-            None,
+            Some(retention_expires_at),
         )
+    }
+
+    fn complete_external_with_replay_metadata(
+        self,
+        binding: ExternalDispatchBinding,
+        state: TerminalCommandState,
+        outcome: Value,
+        projection_metadata: Option<Vec<u8>>,
+        retention: Duration,
+        retention_expires_at: Option<SystemTime>,
+    ) -> Result<ExternalCommandCompletion, CommandLedgerError> {
+        if state == TerminalCommandState::Atomic {
+            return Err(CommandLedgerError::Invalid(
+                "external command completion cannot be atomic".into(),
+            ));
+        }
+        if self.external_binding.as_ref() != Some(&binding) {
+            return Err(CommandLedgerError::Invalid(
+                "external command completion binding does not match its reservation".into(),
+            ));
+        }
+        let CommandCompletion {
+            state,
+            replay,
+            retention,
+            retention_expires_at,
+            ..
+        } = self.complete_with_replay_metadata(
+            state,
+            outcome,
+            projection_metadata,
+            retention,
+            retention_expires_at,
+        )?;
+        Ok(ExternalCommandCompletion {
+            attempt: self,
+            binding,
+            state,
+            replay,
+            retention,
+            retention_expires_at,
+        })
     }
 
     /// Complete a command with exact already-canonical role-safe projection
@@ -198,16 +383,15 @@ impl CommandAttempt {
     /// state invariants.
     #[cfg(test)]
     pub(crate) fn complete_with_projection_metadata(
-        self,
+        &self,
         state: TerminalCommandState,
         outcome: Value,
         projection_metadata: Vec<u8>,
         retention: Duration,
-    ) -> Result<CommandCompletion, CommandLedgerError> {
+    ) -> Result<CommandCompletion<'_>, CommandLedgerError> {
         self.complete_with_replay_metadata(
             state,
             outcome,
-            Vec::new(),
             Some(projection_metadata),
             retention,
             None,
@@ -221,17 +405,16 @@ impl CommandAttempt {
     /// bytes, preventing a retained ledger tail whose metadata has already
     /// expired.
     pub(crate) fn complete_with_projection_metadata_until(
-        self,
+        &self,
         state: TerminalCommandState,
         outcome: Value,
         projection_metadata: Vec<u8>,
         retention: Duration,
         retention_expires_at: SystemTime,
-    ) -> Result<CommandCompletion, CommandLedgerError> {
+    ) -> Result<CommandCompletion<'_>, CommandLedgerError> {
         self.complete_with_replay_metadata(
             state,
             outcome,
-            Vec::new(),
             Some(projection_metadata),
             retention,
             Some(retention_expires_at),
@@ -239,39 +422,25 @@ impl CommandAttempt {
     }
 
     fn complete_with_replay_metadata(
-        self,
+        &self,
         state: TerminalCommandState,
         outcome: Value,
-        projection_obligations: Vec<ResolvedProjectionObligation>,
         projection_metadata: Option<Vec<u8>>,
         retention: Duration,
         retention_expires_at: Option<SystemTime>,
-    ) -> Result<CommandCompletion, CommandLedgerError> {
+    ) -> Result<CommandCompletion<'_>, CommandLedgerError> {
         validate_positive_duration("command replay retention", retention)?;
         if projection_metadata.is_none() {
-            validate_projection_obligation_semantics(state.into(), &projection_obligations)
+            validate_replay_state_without_projection_metadata(state.into())
                 .map_err(CommandLedgerError::Invalid)?;
         }
         validate_projection_metadata_bytes(state.into(), projection_metadata.as_deref())?;
-        if projection_metadata.is_some() && !projection_obligations.is_empty() {
-            return Err(CommandLedgerError::Invalid(
-                "command replay cannot mix legacy and modeled projection obligations".into(),
-            ));
-        }
         let mut replay = serde_json::Map::from_iter([
             (
                 "version".into(),
                 Value::from(u64::from(COMMAND_REPLAY_VERSION)),
             ),
             ("outcome".into(), outcome),
-            (
-                "projection_obligations".into(),
-                serde_json::to_value(projection_obligations).map_err(|error| {
-                    CommandLedgerError::Invalid(format!(
-                        "command replay obligations failed to serialize before commit: {error}"
-                    ))
-                })?,
-            ),
         ]);
         if let Some(projection_metadata) = projection_metadata {
             replay.insert(
@@ -335,17 +504,17 @@ impl AttemptFence {
 
 /// Authorization scope for a command-ledger lookup.
 ///
-/// Public status reads are bound to the selected command route. Ambiguous
-/// commit recovery instead presents the private attempt fence retained by the
+/// Public status reads are bound to a command route. Ambiguous commit
+/// recovery instead presents the private attempt fence retained by the
 /// dispatcher, so it can recover a terminal outcome without trusting a route
 /// name supplied by the caller.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy)]
 pub(crate) enum CommandLookupScope<'a> {
     CommandName(&'a str),
-    CommandContract {
-        command_name: &'a str,
-        contract_fingerprint: &'a [u8; SHA256_BYTES],
-    },
+    /// The row names its own route (command name, contract fingerprint) and
+    /// the caller decides whether that route may see it. A row the caller
+    /// declines is `Unknown`, exactly like an absent one.
+    Route(&'a (dyn Fn(&str, &[u8; SHA256_BYTES]) -> bool + Send + Sync)),
     Attempt(&'a AttemptFence),
 }
 
@@ -373,7 +542,6 @@ pub(crate) struct CommandReplay {
     pub(crate) state: CommandLedgerState,
     pub(crate) causation_id: CausationId,
     pub(crate) outcome: Value,
-    pub(crate) projection_obligations: Vec<ResolvedProjectionObligation>,
     /// Exact canonical role-safe delta and opaque obligation bytes.
     pub(crate) projection_metadata: Option<Vec<u8>>,
     /// Exact original direct-projection revision/change evidence.
@@ -391,10 +559,10 @@ pub(super) fn validate_projection_metadata_bytes(
     let Some(bytes) = projection_metadata else {
         return Ok(());
     };
-    if bytes.is_empty() || bytes.len() > crate::MAX_DOMAIN_EVENT_BODY_BYTES {
+    if bytes.is_empty() || bytes.len() > crate::domain_event::MAX_DOMAIN_EVENT_BODY_BYTES {
         return Err(CommandLedgerError::Invalid(format!(
             "command projection metadata must contain 1..={} bytes",
-            crate::MAX_DOMAIN_EVENT_BODY_BYTES
+            crate::domain_event::MAX_DOMAIN_EVENT_BODY_BYTES
         )));
     }
     if !matches!(
@@ -442,8 +610,9 @@ pub(crate) enum CommandLookup {
 }
 
 /// Exactly one fenced ledger completion attached to a domain commit.
-pub(crate) struct CommandCompletion {
-    pub(super) attempt: CommandAttempt,
+#[derive(Debug)]
+pub(crate) struct CommandCompletion<'a> {
+    pub(super) attempt: &'a CommandAttempt,
     pub(super) state: TerminalCommandState,
     pub(super) replay: String,
     direct_projection: Option<Value>,
@@ -451,9 +620,66 @@ pub(crate) struct CommandCompletion {
     retention_expires_at: Option<SystemTime>,
 }
 
-impl CommandCompletion {
+/// Terminal receipt for a command whose domain effects were committed by a
+/// different aggregate cell. It intentionally has no local domain batch
+/// companion; storing the receipt never republishes the remote cell's events.
+pub(crate) struct ExternalCommandCompletion {
+    pub(super) attempt: CommandAttempt,
+    pub(super) binding: ExternalDispatchBinding,
+    pub(super) state: TerminalCommandState,
+    pub(super) replay: String,
+    pub(super) retention: Duration,
+    retention_expires_at: Option<SystemTime>,
+}
+
+impl ExternalCommandCompletion {
     pub(crate) fn attempt(&self) -> &CommandAttempt {
         &self.attempt
+    }
+
+    pub(crate) fn binding(&self) -> &ExternalDispatchBinding {
+        &self.binding
+    }
+
+    pub(crate) fn state(&self) -> TerminalCommandState {
+        self.state
+    }
+
+    pub(crate) fn replay_json(&self) -> &str {
+        &self.replay
+    }
+
+    pub(crate) fn retention(&self) -> Duration {
+        self.retention
+    }
+
+    pub(crate) fn retention_expires_at(&self) -> Option<SystemTime> {
+        self.retention_expires_at
+    }
+
+    pub(crate) fn attempt_fence(&self) -> AttemptFence {
+        self.attempt.fence()
+    }
+}
+
+impl CommandCompletion<'_> {
+    pub(crate) fn attempt(&self) -> &CommandAttempt {
+        self.attempt
+    }
+
+    /// The replay every later lookup of this completion returns once its
+    /// transaction committed: decoded from the exact bytes the row stores.
+    pub(crate) fn into_replay(
+        self,
+        command_name: &str,
+    ) -> Result<CommandReplay, CommandLedgerError> {
+        super::record::decode_replay(
+            &self.attempt.key.command_id,
+            command_name,
+            self.state.into(),
+            &self.attempt.causation_id,
+            &self.replay,
+        )
     }
 
     pub(crate) fn state(&self) -> TerminalCommandState {
@@ -545,18 +771,18 @@ impl CommandCompletion {
 /// Existing public domain batch plus exactly one private ledger completion.
 pub(crate) struct CausalCommitBatch<'a> {
     pub(crate) domain: CommitBatch<'a>,
-    pub(crate) completion: CommandCompletion,
+    pub(crate) completion: CommandCompletion<'a>,
     pub(crate) direct_projection: Option<SameTransactionProjectionBatch>,
 }
 
 impl<'a> CausalCommitBatch<'a> {
-    pub(crate) fn new(domain: CommitBatch<'a>, completion: CommandCompletion) -> Self {
+    pub(crate) fn new(domain: CommitBatch<'a>, completion: CommandCompletion<'a>) -> Self {
         Self::build(domain, completion, None)
     }
 
     pub(crate) fn with_direct_projection(
         domain: CommitBatch<'a>,
-        completion: CommandCompletion,
+        completion: CommandCompletion<'a>,
         direct_projection: SameTransactionProjectionBatch,
     ) -> Self {
         Self::build(domain, completion, Some(direct_projection))
@@ -564,7 +790,7 @@ impl<'a> CausalCommitBatch<'a> {
 
     fn build(
         mut domain: CommitBatch<'a>,
-        completion: CommandCompletion,
+        completion: CommandCompletion<'a>,
         direct_projection: Option<SameTransactionProjectionBatch>,
     ) -> Self {
         // The attempt's stable causation is authoritative at the final boundary:

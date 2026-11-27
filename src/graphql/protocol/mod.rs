@@ -6,14 +6,16 @@
 //! never client-decodable identities and never bearer credentials.
 
 mod accumulator;
+#[cfg(test)]
+mod envelope_fixture;
 mod projection_metadata;
 #[cfg(test)]
 mod tests;
 mod token;
 mod types;
 
-pub use accumulator::ProtocolResponseAccumulator;
 pub(crate) use accumulator::issue_projection_obligation_token;
+pub use accumulator::ProtocolResponseAccumulator;
 pub(crate) use projection_metadata::{
     CommandProjectionLifecycleProofV1, CommandProjectionMetadataError, CommandProjectionMetadataV1,
     CommandProjectionObligationV1, MAX_COMMAND_PROJECTION_OBLIGATIONS,
@@ -25,7 +27,8 @@ pub(crate) use token::{
 pub(crate) use types::{
     DistributedCommandConsistency, DistributedCommandMetadata, DistributedCommandState,
     DistributedEnvelopeV1, DistributedIndexRevision, DistributedLiveCursor,
-    DistributedLiveMetadata, DistributedProjectionDisposition, DistributedProjectionExpectation,
+    DistributedLiveMetadata, DistributedLiveMode, DistributedObservedRecord,
+    DistributedProjectionDisposition, DistributedProjectionExpectation,
     DistributedProjectionObservation, DistributedQuerySnapshot, DistributedRecordRevision,
     DistributedTrustedPreset, RequestedLiveResume,
 };

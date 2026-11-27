@@ -1,0 +1,5 @@
+error: a predicted step takes `(state: &State, input: &Input, context: &Context, dt: f32)`
+  --> tests/compile_fail/predict_bad_signature.rs:15:9
+   |
+15 | fn step(state: State, _input: &Push) -> State {
+   |         ^^^^^

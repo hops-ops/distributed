@@ -1,5 +1,0 @@
-error: #[serde(with)] is not supported by GraphqlOutput because it changes the declared GraphQL field shape; define a separate wire type
- --> tests/graphql_compile_fail/serde_with.rs:5:13
-  |
-5 |     #[serde(with = "wire_value")]
-  |             ^^^^^^^^^^^^^^^^^^^

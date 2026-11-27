@@ -1,3 +1,4 @@
+import { compareCodeUnits } from '../../lib/compare-code-units.js';
 import {
 	type CacheIndexMetadata,
 	type CacheValue,
@@ -6,11 +7,14 @@ import {
 } from '../../internal/cache-engine.js';
 import type {
 	DistributedCommandMetadata,
-	DistributedOpaqueString
+	DistributedObservedRecord,
+	DistributedOpaqueString,
+	DistributedProjectionObservation
 } from '../../protocol.js';
 
-import { cloneJsonValue, replicaRecordKey } from '../identity.js';
-import type { ReplicaIndexSemanticChange } from '../index-maintenance.js';
+import { cloneJsonValue } from '../identity/clone.js';
+import { replicaRecordKey } from '../identity/keys.js';
+import type { ReplicaIndexSemanticChange } from '../index-maintenance/types.js';
 import type {
 	ReplicaIdentity,
 	ReplicaIndexTarget,
@@ -37,22 +41,68 @@ export function optimisticReceiptState(
 		}
 		expectations.set(key, true);
 	}
-	const observed = new Set<string>();
-	for (const observation of command.observations) {
-		if (observation.causationId !== command.causationId) {
-			protocolInvalid('extensions.distributed.command.observations');
-		}
-		const key = expectationKey(observation);
-		if (!expectations.has(key)) {
-			protocolInvalid('extensions.distributed.command.observations');
-		}
-		observed.add(key);
-	}
-	return {
+	const receipt: OptimisticReceiptState = {
 		causationId: command.causationId,
 		expectations,
-		observed
+		observed: new Set(),
+		revisions: new Map()
 	};
+	for (const observation of command.observations) {
+		if (
+			observation.causationId !== command.causationId ||
+			!expectations.has(expectationKey(observation))
+		) {
+			protocolInvalid('extensions.distributed.command.observations');
+		}
+		observeReceipt(receipt, observation);
+	}
+	return receipt;
+}
+
+/**
+ * Record one observation of this receipt's causation: the expectation it
+ * satisfies, and the row revision it names, if any. Observations of other
+ * causations or expectations are ignored.
+ */
+export function observeReceipt(
+	receipt: OptimisticReceiptState,
+	observation: DistributedProjectionObservation
+): void {
+	if (observation.causationId !== receipt.causationId) return;
+	const key = expectationKey(observation);
+	if (!receipt.expectations.has(key)) return;
+	receipt.observed.add(key);
+	if (observation.record !== undefined) {
+		receipt.revisions.set(key, observation.record);
+	}
+}
+
+/** Fold a later receipt's progress into the one already held. */
+export function mergeReceiptProgress(
+	into: OptimisticReceiptState,
+	from: OptimisticReceiptState
+): void {
+	for (const key of from.observed) into.observed.add(key);
+	for (const [key, revision] of from.revisions) {
+		into.revisions.set(key, revision);
+	}
+}
+
+/**
+ * Whether the base proves every expectation: each names the row revision its
+ * projection wrote, and `holds` finds the base at or past it. An expectation
+ * without a revision (a dependency) can prove the receipt only otherwise.
+ */
+export function receiptHeldByBase(
+	receipt: OptimisticReceiptState,
+	holds: (revision: DistributedObservedRecord) => boolean
+): boolean {
+	if (receipt.expectations.size === 0) return false;
+	for (const key of receipt.expectations.keys()) {
+		const revision = receipt.revisions.get(key);
+		if (revision === undefined || !holds(revision)) return false;
+	}
+	return true;
 }
 
 export function cloneOptimisticReceipt(
@@ -61,7 +111,8 @@ export function cloneOptimisticReceipt(
 	return {
 		causationId: receipt.causationId,
 		expectations: new Map(receipt.expectations),
-		observed: new Set(receipt.observed)
+		observed: new Set(receipt.observed),
+		revisions: new Map(receipt.revisions)
 	};
 }
 
@@ -104,7 +155,8 @@ export function diagnosticReceiptExpectations(
 				});
 			})
 			.sort((left, right) =>
-				`${left.projection}\0${left.model}`.localeCompare(
+				compareCodeUnits(
+					`${left.projection}\0${left.model}`,
 					`${right.projection}\0${right.model}`
 				)
 			)
@@ -266,7 +318,7 @@ export function replayReplicaOptimisticUpdate(
 	}
 }
 
-export function cloneOptimisticFields(
+function cloneOptimisticFields(
 	fields: ReplicaRecordPatch['fields']
 ): Readonly<Record<string, CacheValue>> {
 	if (fields === undefined) return Object.freeze({});
@@ -300,7 +352,7 @@ function cloneOptimisticUnset(
 	return Object.freeze(result);
 }
 
-export function cloneOptimisticLinks(
+function cloneOptimisticLinks(
 	links: ReplicaRecordPatch['links']
 ): Readonly<Record<string, RecordLink>> {
 	if (links === undefined) return Object.freeze({});
@@ -329,7 +381,7 @@ export function cloneOptimisticLinks(
 	);
 }
 
-export function assertPlainReplicaRecord(
+function assertPlainReplicaRecord(
 	value: object,
 	description: string
 ): void {
@@ -346,13 +398,13 @@ export function assertReplicaOptimisticLayerId(id: string): void {
 	assertReplicaName(id, 'optimistic layer id');
 }
 
-export function assertReplicaName(value: string, description: string): void {
+function assertReplicaName(value: string, description: string): void {
 	if (typeof value !== 'string' || value.length === 0) {
 		throw new TypeError(`${description} must be a non-empty string`);
 	}
 }
 
-export function assertReplicaOptimisticUpdateSynchronous(result: unknown): void {
+function assertReplicaOptimisticUpdateSynchronous(result: unknown): void {
 	if (
 		result !== null &&
 		(typeof result === 'object' || typeof result === 'function') &&

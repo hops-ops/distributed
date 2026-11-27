@@ -4,7 +4,7 @@ use std::fmt;
 
 use serde::{de::DeserializeOwned, Serialize};
 
-use super::{BitcodePayloadCodec, EventRecord, EventRecordError, PayloadCodec};
+use super::{BitcodePayloadCodec, EventRecord, EventRecordError};
 
 /// A stateless, pure transformation that converts an event payload from one version to another.
 ///

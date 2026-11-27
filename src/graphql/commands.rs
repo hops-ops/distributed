@@ -9,28 +9,29 @@ use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 
 #[cfg(feature = "graphql")]
-use super::command_contract::CommandConsistency;
-use super::command_contract::TypedCommandContract;
-#[cfg(feature = "graphql")]
 use super::surface::{
     compile_projection_owner_topology, validate_direct_modeled_owner_compatibility,
     SurfaceProjectionOwner,
 };
 use super::surface::{SurfaceCommand, SurfaceCommandShape, SurfaceTypeDef, SurfaceTypeField};
-use super::types::GraphqlTypeDef;
+#[cfg(feature = "graphql")]
+use crate::command::CommandConsistency;
+use crate::command::CommandTypeDef;
+use crate::command::TypedCommandContract;
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct TypedCommandInventory {
     contracts: Vec<TypedCommandContract>,
 }
 
-fn surface_type(definition: &GraphqlTypeDef) -> SurfaceTypeDef {
+fn surface_type(definition: &CommandTypeDef) -> SurfaceTypeDef {
     SurfaceTypeDef {
         name: definition.name.clone(),
         fields: definition
             .fields
             .iter()
             .map(|field| SurfaceTypeField {
+                unsigned_integer: field.unsigned_integer,
                 name: field.name.clone(),
                 type_name: field.type_name.clone(),
                 nullable: field.nullable,
@@ -81,12 +82,9 @@ impl TypedCommandInventory {
                     output: SurfaceCommandShape::Typed(surface_type(&contract.output)),
                     consistency: contract.consistency,
                     input_defaults: contract.input_defaults.clone(),
-                    effects: Some(contract.effects.clone()),
-                    confirmations: contract.confirmations.clone(),
                     projected_model: contract.projected_model.clone(),
                     direct_projection: contract.direct_projection.clone(),
                     projections: contract.projections.clone(),
-                    confirmation_unavailable: false,
                 }
             })
             .collect()
@@ -97,7 +95,7 @@ impl TypedCommandInventory {
         self.contracts.clone()
     }
 
-    /// Bind every confirmation and ordinary `Atomic<M>` target to the exact
+    /// Bind every ordinary `Atomic<M>` target to the exact
     /// compiled projector registry. Runtime lowering never reconstructs
     /// authority from projector/model strings.
     #[cfg(feature = "graphql")]
@@ -133,50 +131,6 @@ impl TypedCommandInventory {
 
         for contract in &mut self.contracts {
             let name = &contract.name;
-            for confirmation in &mut contract.confirmations {
-                let projector = projectors
-                    .iter()
-                    .find(|projector| projector.name == confirmation.projector)
-                    .ok_or_else(|| {
-                        format!(
-                            "typed command `{name}` expects unknown projector `{}`",
-                            confirmation.projector
-                        )
-                    })?;
-                let binding_facts = projector.binding_facts();
-                let binding_models = projector.binding_models();
-                if !confirmation.topology_matches(
-                    &projector.name,
-                    &binding_facts,
-                    &binding_models,
-                    &projector.partition,
-                ) {
-                    return Err(format!(
-                        "typed command `{name}` captured projector `{}` topology identity does not match the registered projector facts/models",
-                        confirmation.projector
-                    ));
-                }
-                if !confirmation.partition_matches(&projector.partition) {
-                    return Err(format!(
-                        "typed command `{name}` confirmation for projector `{}` does not provide the partition mapping required by its declaration",
-                        confirmation.projector
-                    ));
-                }
-                if !binding_models
-                    .iter()
-                    .any(|model| model == &confirmation.model)
-                {
-                    return Err(format!(
-                        "typed command `{name}` expects projector `{}` to confirm model `{}`, but that model is not in the projector topology",
-                        confirmation.projector, confirmation.model
-                    ));
-                }
-                let (topology, _) = compiled_projectors
-                    .get(&projector.name)
-                    .expect("every registered projector was compiled above");
-                confirmation.bind_protocol_topology(topology.clone());
-            }
-
             if contract.consistency != CommandConsistency::Atomic {
                 continue;
             }
@@ -214,13 +168,6 @@ impl TypedCommandInventory {
                     ));
                 }
             };
-            let binding_change_epoch = projector.binding_change_epoch();
-            if binding_change_epoch.is_none() {
-                return Err(format!(
-                    "typed projected command `{name}` owner `{}` has no registered change-log epoch",
-                    projector.name
-                ));
-            }
             let registered_schema = model_schemas
                 .get(&projected.model)
                 .expect("projector ownership above requires a registered model schema");
@@ -249,7 +196,6 @@ impl TypedCommandInventory {
                 &binding_facts,
                 &binding_models,
                 &projector.partition,
-                binding_change_epoch.as_deref(),
                 ownership.clone(),
                 Some(protocol_topology.clone()),
                 projector.active_modeled_program_id_for(&projected.model),

@@ -1,12 +1,16 @@
+import { createLazyReplicaCommandRuntime } from '@hops-ops/distributed/replica/lazy';
 import {
 	createReplicaCommandRuntime,
+	type ReplicaCommandStatusArtifact,
 	type DistributedReplica,
 	type ReplicaCommandArtifact,
 	type ReplicaCommandTransport
 } from '@hops-ops/distributed/replica';
 
 type CreateInput = {
-	readonly id: string;
+	/** Defaulted: optional to callers, always present on the sent input. */
+	readonly id?: string;
+	readonly note?: string | null;
 };
 
 type CreateOutput = {
@@ -54,3 +58,29 @@ runtime.commands.create();
 runtime.commands.ping({ id: 'todo-1' });
 // @ts-expect-error Result types cannot bleed between generated commands.
 runtime.commands.create({ id: 'todo-1' }).then((receipt) => receipt.result.pong);
+
+
+declare const status: ReplicaCommandStatusArtifact;
+const lazy = createLazyReplicaCommandRuntime(replica, transport, {
+ commands: { 'todo.create': { operationHash: 'hash', hasInput: true }, 'todo.ping': { operationHash: 'hash', hasInput: false } }, status
+}, async () => ({ entries: { 'todo.create': createArtifact, 'todo.ping': pingArtifact } }));
+lazy.commands.todo.create({ id: 'todo-1' }).then(receipt => { const ok: boolean = receipt.result.ok; return ok; });
+lazy.commands.todo.ping({ commandId: 'id' }).then(receipt => { const pong: true = receipt.result.pong; return pong; });
+lazy.preload();
+// @ts-expect-error Lazy commands preserve required input.
+lazy.commands.todo.create();
+// @ts-expect-error No-input commands still accept only options.
+lazy.commands.todo.ping({ id: 'todo-1' });
+// @ts-expect-error Lazy output inference stays specific to each command.
+lazy.commands.todo.create({ id: 'todo-1' }).then(receipt => receipt.result.pong);
+
+const call = runtime.commands.create({});
+const sentId: string = call.input.id;
+const sentNote: string | null | undefined = call.input.note;
+const callId: string = call.commandId;
+void [sentId, sentNote, callId];
+const pingCall = runtime.commands.ping();
+const noInput: undefined = pingCall.input;
+void noInput;
+// @ts-expect-error The sent input is read-only.
+call.input.id = 'other';

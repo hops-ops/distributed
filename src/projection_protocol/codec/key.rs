@@ -1,6 +1,8 @@
 use std::collections::BTreeSet;
 
+#[cfg(any(feature = "graphql", test))]
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+#[cfg(any(feature = "graphql", test))]
 use base64::Engine as _;
 
 use super::ProjectionScopeCodecError;
@@ -122,6 +124,7 @@ pub(super) enum TypedKeyValue {
     Timestamp(String),
 }
 
+#[cfg(any(feature = "graphql", test))]
 pub(super) fn typed_value_from_json(
     schema: &TableSchema,
     column: &TableColumn,
@@ -204,6 +207,7 @@ pub(super) fn typed_value_from_json(
     }
 }
 
+#[cfg(any(feature = "graphql", test))]
 pub(super) fn row_value_from_graphql_json(
     schema: &TableSchema,
     column: &TableColumn,
@@ -454,6 +458,7 @@ impl CanonicalEncoder {
     }
 }
 
+#[cfg(any(feature = "graphql", test))]
 fn json_shape(value: &serde_json::Value) -> &'static str {
     match value {
         serde_json::Value::Null => "null",

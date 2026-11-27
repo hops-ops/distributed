@@ -1,51 +1,38 @@
 import assert from 'node:assert/strict';
-import { createHash } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import test from 'node:test';
 
+import { canonicalCommandProjectionMetadata, canonicalProjectionDelta } from '../dist/replica/projection-delta/canonical.js';
 import {
-	canonicalCommandProjectionMetadata,
-	canonicalProjectionDelta,
 	parseCommandProjectionMetadata,
 	parseProjectionDelta,
 	validateCommandProjectionArtifact,
 	validateProjectionMetadataAuthority
-} from '../dist/replica/projection-delta/index.js';
-
-const VECTOR_HASH =
-	'7bdc06e1d3accc4c62132f967df1310d31f2f3b856fa7e97a7c5d0907a4ae17b';
+} from '../dist/replica/projection-delta/validate.js';
 
 const clone = (value) => structuredClone(value);
 
+// The shared fixtures are the cross-language wire contract: Rust
+// (`src/graphql/projection_delta/vector_tests.rs`,
+// `src/graphql/protocol/projection_metadata.rs`) asserts its canonical bytes
+// equal these files, and this suite asserts the TypeScript canonicalizer
+// reproduces them exactly. Equal bytes imply an equal digest.
+async function fixtureText(name) {
+	const text = await readFile(new URL(`../../tests/fixtures/${name}`, import.meta.url), 'utf8');
+	return text.endsWith('\n') ? text.slice(0, -1) : text;
+}
+
 async function vector() {
-	return JSON.parse(
-		await readFile(
-			new URL('../../tests/fixtures/projection-delta-v1.json', import.meta.url),
-			'utf8'
-		)
-	);
+	return JSON.parse(await fixtureText('projection-delta-v1.json'));
 }
 
 async function metadataVector() {
-	return JSON.parse(
-		await readFile(
-			new URL(
-				'../../tests/fixtures/command-projection-metadata-v1.json',
-				import.meta.url
-			),
-			'utf8'
-		)
-	);
+	return JSON.parse(await fixtureText('command-projection-metadata-v1.json'));
 }
 
 test('Rust projection vector is byte-identical across every op and tagged value', async () => {
 	const parsed = parseProjectionDelta(await vector());
-	const canonical = canonicalProjectionDelta(parsed);
-	assert.equal(Buffer.byteLength(canonical), 6327);
-	assert.equal(
-		createHash('sha256').update(canonical).digest('hex'),
-		VECTOR_HASH
-	);
+	assert.equal(canonicalProjectionDelta(parsed), await fixtureText('projection-delta-v1.json'));
 	assert.equal(parsed.operations.length, 8);
 	assert.deepEqual(
 		parsed.operations.map(({ mutation }) => mutation.op),
@@ -74,7 +61,6 @@ test('metadata validates identity, expiry, obligations, and canonical replay byt
 			{
 				programId: projection.program_id,
 				bindingId: projection.binding_id,
-				epoch: projection.epoch,
 				programIrVersion: 1,
 				operationSemanticsVersion: 1
 			}
@@ -99,6 +85,7 @@ test('metadata validates identity, expiry, obligations, and canonical replay byt
 		1_700_000_000_001
 	);
 	assert.equal(canonical, canonicalCommandProjectionMetadata(parsed));
+	assert.equal(canonical, await fixtureText('command-projection-metadata-v1.json'));
 	assert.throws(() =>
 		validateProjectionMetadataAuthority(
 			parsed,
@@ -330,7 +317,6 @@ function projectionArtifact() {
 			{
 				programId: `pp1:sha256:${'1'.repeat(64)}`,
 				bindingId: `pb1:sha256:${'2'.repeat(64)}`,
-				epoch: 'todos-v1',
 				programIrVersion: 1,
 				operationSemanticsVersion: 1
 			}
@@ -389,19 +375,9 @@ function projectionArtifact() {
 	};
 }
 
-test('projection artifact enforces Rust-aligned epoch/model and 4 KiB preview bounds', () => {
+test('projection artifact enforces Rust-aligned model and 4 KiB preview bounds', () => {
 	assert.doesNotThrow(() =>
 		validateCommandProjectionArtifact(projectionArtifact())
-	);
-
-	const epoch = projectionArtifact();
-	epoch.projections[0].epoch = 'e'.repeat(129);
-	assert.throws(() => validateCommandProjectionArtifact(epoch), /epoch/);
-
-	const controlEpoch = projectionArtifact();
-	controlEpoch.projections[0].epoch = `todos\u0000v1`;
-	assert.throws(() =>
-		validateCommandProjectionArtifact(controlEpoch)
 	);
 
 	const model = projectionArtifact();

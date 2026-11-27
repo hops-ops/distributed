@@ -1,8 +1,9 @@
 import {
 	type BaseCacheWriter,
-	type CacheEngineSnapshot,
+	type CacheIndex,
 	type CacheIndexCoverage,
 	type CacheIndexMetadata,
+	type CacheReader,
 	type CacheValue,
 	type OptimisticLayerView
 } from '../../internal/cache-engine.js';
@@ -13,20 +14,19 @@ import {
 	type DistributedRecordRevision,
 	type DistributedTrustedPreset
 } from '../../protocol.js';
-import type { ReplicaTrustedPresetDescriptor } from '../commands.js';
-import type { ReplicaCommandSurfaceContract } from '../command-runtime.js';
+import type { ReplicaTrustedPresetDescriptor } from '../commands/types.js';
+import type { ReplicaCommandSurfaceContract } from '../command-runtime/types.js';
+import { canonicalVariables, cloneJsonValue } from '../identity/clone.js';
 import {
-	canonicalVariables,
-	cloneJsonValue,
 	replicaIndexKey,
 	replicaRecordKey,
 	resolveArguments
-} from '../identity.js';
-import {
-	type ReplicaIndexMaintenanceSnapshot,
-	type ReplicaIndexSemanticChange,
-	type ReplicaIndexSemanticLayer
-} from '../index-maintenance.js';
+} from '../identity/keys.js';
+import type {
+	ReplicaIndexMaintenanceSnapshot,
+	ReplicaIndexSemanticChange,
+	ReplicaIndexSemanticLayer
+} from '../index-maintenance/types.js';
 import type { MaterializedReplicaResult } from '../materialize.js';
 import { validateReplicaOperationBinding as validatedArtifactBinding } from '../operation-binding.js';
 import {
@@ -47,6 +47,7 @@ import type {
 	ReplicaRevision,
 	ReplicaSnapshot,
 	ReplicaStatus,
+	ReplicaValue,
 	ReplicaWriteSource
 } from '../types.js';
 import {
@@ -105,6 +106,41 @@ export function prepareRecordEvidence(
 	};
 }
 
+/**
+ * Membership a result would write for one index: normalized record keys in
+ * response order. `null` means it cannot be established from the response
+ * alone (blocked by errors, missing, embedded, or without record evidence).
+ */
+type ReplicaIndexMembership = {
+	readonly records: readonly string[];
+	readonly nullValue: boolean;
+};
+
+export type ReplicaIndexMemberships = Map<string, ReplicaIndexMembership | null>;
+
+function recordMembership(
+	memberships: ReplicaIndexMemberships | undefined,
+	key: string,
+	membership: ReplicaIndexMembership | null
+): void {
+	if (memberships === undefined) return;
+	const previous = memberships.get(key);
+	if (previous === undefined) {
+		memberships.set(key, membership);
+		return;
+	}
+	// One response reaching an index twice must agree with itself.
+	if (
+		previous === null ||
+		membership === null ||
+		previous.nullValue !== membership.nullValue ||
+		previous.records.length !== membership.records.length ||
+		previous.records.some((record, ordinal) => record !== membership.records[ordinal])
+	) {
+		memberships.set(key, null);
+	}
+}
+
 export function replicaResultIndexKeys<
 	TData,
 	TVariables extends GraphqlVariables
@@ -112,7 +148,8 @@ export function replicaResultIndexKeys<
 	artifact: ReplicaOperationArtifact<TData, TVariables>,
 	variables: TVariables,
 	envelope: ReplicaResultEnvelope<TData>,
-	snapshot: DistributedQuerySnapshot
+	snapshot: DistributedQuerySnapshot,
+	memberships?: ReplicaIndexMemberships
 ): ReadonlySet<string> {
 	const keys = new Set<string>();
 	if (
@@ -156,6 +193,7 @@ export function replicaResultIndexKeys<
 				root.responseKey
 			)
 		) {
+			recordMembership(memberships, rootKey, null);
 			continue;
 		}
 		const value = envelope.data[root.responseKey];
@@ -163,6 +201,7 @@ export function replicaResultIndexKeys<
 			value === null &&
 			resultPathHasErrors(errorPaths, rootPath)
 		) {
+			recordMembership(memberships, rootKey, null);
 			continue;
 		}
 		collectResultBranchIndexKeys(
@@ -174,13 +213,14 @@ export function replicaResultIndexKeys<
 			variables,
 			errorPaths,
 			evidencePaths,
-			keys
+			keys,
+			memberships
 		);
 	}
 	return keys;
 }
 
-export function collectResultBranchIndexKeys(
+function collectResultBranchIndexKeys(
 	artifactId: string,
 	selection: RuntimeRootSelection | RuntimeObjectBranch,
 	value: unknown,
@@ -189,11 +229,23 @@ export function collectResultBranchIndexKeys(
 	variables: GraphqlVariables,
 	errorPaths: readonly (readonly (string | number)[])[],
 	evidencePaths: ReadonlySet<string>,
-	keys: Set<string>
+	keys: Set<string>,
+	memberships?: ReplicaIndexMemberships
 ): void {
-	if (value === null || value === undefined) return;
+	if (value === null) {
+		recordMembership(
+			memberships,
+			enclosingIndexKey,
+			selection.nullable ? { records: [], nullValue: true } : null
+		);
+		return;
+	}
+	if (value === undefined) {
+		recordMembership(memberships, enclosingIndexKey, null);
+		return;
+	}
 	if (selection.cardinality === 'one') {
-		collectResultObjectIndexKeys(
+		const recordKey = collectResultObjectIndexKeys(
 			artifactId,
 			selection.selection,
 			value,
@@ -203,14 +255,28 @@ export function collectResultBranchIndexKeys(
 			variables,
 			errorPaths,
 			evidencePaths,
-			keys
+			keys,
+			memberships
+		);
+		recordMembership(
+			memberships,
+			enclosingIndexKey,
+			recordKey === undefined ? null : { records: [recordKey], nullValue: false }
 		);
 		return;
 	}
-	if (!Array.isArray(value)) return;
+	if (!Array.isArray(value)) {
+		recordMembership(memberships, enclosingIndexKey, null);
+		return;
+	}
+	const records: string[] = [];
+	let certain = true;
 	for (const [ordinal, entry] of value.entries()) {
-		if (entry === null || entry === undefined) continue;
-		collectResultObjectIndexKeys(
+		if (entry === null || entry === undefined) {
+			certain = false;
+			continue;
+		}
+		const recordKey = collectResultObjectIndexKeys(
 			artifactId,
 			selection.selection,
 			entry,
@@ -220,12 +286,20 @@ export function collectResultBranchIndexKeys(
 			variables,
 			errorPaths,
 			evidencePaths,
-			keys
+			keys,
+			memberships
 		);
+		if (recordKey === undefined) certain = false;
+		else records.push(recordKey);
 	}
+	recordMembership(
+		memberships,
+		enclosingIndexKey,
+		certain ? { records, nullValue: false } : null
+	);
 }
 
-export function collectResultObjectIndexKeys(
+function collectResultObjectIndexKeys(
 	artifactId: string,
 	selection: RuntimeObjectSelection,
 	value: unknown,
@@ -235,10 +309,11 @@ export function collectResultObjectIndexKeys(
 	variables: GraphqlVariables,
 	errorPaths: readonly (readonly (string | number)[])[],
 	evidencePaths: ReadonlySet<string>,
-	keys: Set<string>
-): void {
+	keys: Set<string>,
+	memberships?: ReplicaIndexMemberships
+): string | undefined {
 	if (resultPathBlocked(errorPaths, path) || !isReplicaResultObject(value)) {
-		return;
+		return undefined;
 	}
 	const fields = new Map<string, CacheValue>();
 	for (const member of selection.members) {
@@ -260,6 +335,7 @@ export function collectResultObjectIndexKeys(
 		}
 	}
 	let parentKey: string;
+	let normalized = false;
 	if (
 		selection.storage.kind === 'normalized' &&
 		evidencePaths.has(responsePathKey(path.map(String)))
@@ -268,7 +344,8 @@ export function collectResultObjectIndexKeys(
 			const value = fields.get(field);
 			return value === undefined || value === null ? [] : [value];
 		});
-		if (identity.length !== selection.storage.identityFields.length) return;
+		if (identity.length !== selection.storage.identityFields.length) return undefined;
+		normalized = true;
 		parentKey = replicaRecordKey(
 			{
 				id: selection.storage.model,
@@ -300,6 +377,7 @@ export function collectResultObjectIndexKeys(
 			resultPathBlocked(errorPaths, branchPath) ||
 			!Object.prototype.hasOwnProperty.call(value, member.responseKey)
 		) {
+			recordMembership(memberships, branchKey, null);
 			continue;
 		}
 		const branchValue = value[member.responseKey];
@@ -307,6 +385,7 @@ export function collectResultObjectIndexKeys(
 			branchValue === null &&
 			resultPathHasErrors(errorPaths, branchPath)
 		) {
+			recordMembership(memberships, branchKey, null);
 			continue;
 		}
 		collectResultBranchIndexKeys(
@@ -318,19 +397,22 @@ export function collectResultObjectIndexKeys(
 			variables,
 			errorPaths,
 			evidencePaths,
-			keys
+			keys,
+			memberships
 		);
 	}
+	// Embedded rows are operation-local; they never share an index membership.
+	return normalized ? parentKey : undefined;
 }
 
-export function resultPathBlocked(
+function resultPathBlocked(
 	errorPaths: readonly (readonly (string | number)[])[],
 	path: readonly (string | number)[]
 ): boolean {
 	return errorPaths.some((errorPath) => resultPathPrefix(errorPath, path));
 }
 
-export function resultPathHasErrors(
+function resultPathHasErrors(
 	errorPaths: readonly (readonly (string | number)[])[],
 	path: readonly (string | number)[]
 ): boolean {
@@ -341,7 +423,7 @@ export function resultPathHasErrors(
 	);
 }
 
-export function resultPathPrefix(
+function resultPathPrefix(
 	prefix: readonly (string | number)[],
 	value: readonly (string | number)[]
 ): boolean {
@@ -351,50 +433,43 @@ export function resultPathPrefix(
 	);
 }
 
-export function isReplicaResultObject(
+function isReplicaResultObject(
 	value: unknown
 ): value is Readonly<Record<string, unknown>> {
 	return value !== null && typeof value === 'object' && !Array.isArray(value);
 }
 
+/** Confirmed cache state in the shape index maintenance reads. */
 export function indexMaintenanceSnapshot(
-	confirmed: CacheEngineSnapshot
+	confirmed: CacheReader
 ): ReplicaIndexMaintenanceSnapshot {
+	const index = (key: string) => {
+		const found = confirmed.index(key);
+		return found?.metadata === undefined
+			? undefined
+			: (found as CacheIndex & {
+					readonly metadata: NonNullable<CacheIndex['metadata']>;
+				});
+	};
 	return Object.freeze({
-		records: Object.freeze(
-			confirmed.records.flatMap((record) => {
-				if (record.tombstoneRevision !== undefined) return [];
-				const model = modelFromRecordKey(record.key);
-				if (model === undefined) return [];
-				return [
-					Object.freeze({
-						key: record.key,
-						model,
-						fields: Object.freeze(
-							Object.fromEntries(
-								Object.entries(record.fields).map(([name, field]) => [
-									name,
-									field.value
-								])
-							)
-						)
-					})
-				];
-			})
-		),
-		indexes: Object.freeze(
-			confirmed.indexes.flatMap((index) => {
-				if (index.deleted || index.metadata === undefined) return [];
-				return [
-					Object.freeze({
-						key: index.key,
-						records: index.records,
-						complete: index.complete,
-						metadata: index.metadata
-					})
-				];
-			})
-		)
+		record(key: string) {
+			const model = modelFromRecordKey(key);
+			if (model === undefined) return undefined;
+			const record = confirmed.record(key);
+			if (record === undefined) return undefined;
+			return Object.freeze({
+				key,
+				model,
+				fields: record.fields as Readonly<Record<string, ReplicaValue>>
+			});
+		},
+		index,
+		*indexes() {
+			for (const key of confirmed.indexKeys()) {
+				const found = index(key);
+				if (found !== undefined) yield found;
+			}
+		}
 	});
 }
 
@@ -616,7 +691,7 @@ export function operationKey<TData, TVariables extends GraphqlVariables>(
 	return `protocol:${artifactIdentity}:${canonicalVariables(variables)}`;
 }
 
-export function validatedSurfaceIdentity(
+function validatedSurfaceIdentity(
 	value: NonNullable<ReplicaOperationArtifact['protocol']>['surface']
 ): string {
 	if (
@@ -681,7 +756,8 @@ export function snapshotFrom<TData>(
 		stale: materialized.stale,
 		complete: materialized.complete,
 		errors: state.errors,
-		live: state.live
+		live: state.live,
+		pending: materialized.pending
 	});
 	// `materializeReplicaOperation` only reports complete after every generated
 	// selection is present; that runtime invariant is what promotes sparse data
@@ -700,11 +776,12 @@ export function snapshotEqual<TData>(
 		left.stale === right.stale &&
 		left.complete === right.complete &&
 		left.errors === right.errors &&
-		left.live === right.live
+		left.live === right.live &&
+		left.pending === right.pending
 	);
 }
 
-export function freezeErrors(errors: readonly GqlError[]): readonly GqlError[] {
+function freezeErrors(errors: readonly GqlError[]): readonly GqlError[] {
 	if (errors.length === 0) return EMPTY_ERRORS;
 	return Object.freeze(
 		errors.map((error) =>
@@ -734,6 +811,30 @@ export function stableErrors(
 ): readonly GqlError[] {
 	if (next.length === 0) return EMPTY_ERRORS;
 	return deepEqual(current, next) ? current : freezeErrors(next);
+}
+
+/**
+ * GraphQL payload of a live failure frame (`docs/live-query-delivery.md`): no
+ * result data and a nonempty list of errors that each carry a string message.
+ * Callers also require absent snapshot, live and command metadata. Partial
+ * data with errors is never a failure payload.
+ */
+export function isGraphqlFailurePayload(envelope: {
+	readonly data?: unknown;
+	readonly errors?: unknown;
+}): envelope is { readonly data?: null; readonly errors: readonly GqlError[] } {
+	return (
+		(envelope.data === undefined || envelope.data === null) &&
+		Array.isArray(envelope.errors) &&
+		envelope.errors.length > 0 &&
+		envelope.errors.every(
+			(error: unknown) =>
+				error !== null &&
+				typeof error === 'object' &&
+				!Array.isArray(error) &&
+				typeof (error as { message?: unknown }).message === 'string'
+		)
+	);
 }
 
 export function graphqlError(error: unknown): GqlError {

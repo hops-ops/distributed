@@ -8,10 +8,9 @@ use std::time::Duration;
 
 use distributed::bus::{InMemoryBus, RunOptions};
 use distributed::microsvc::serve;
-use distributed::{SqliteLockManager, SqliteRepository};
+use distributed::microsvc::{SqlStores, SqliteStores};
 use e2e_service::{
-    build_graphql_engine, build_service, distributed_client_surface, distributed_manifest,
-    DISTRIBUTED_CLIENT_SURFACE,
+    build_graphql_engine, build_service, distributed_client_surface, read_models, CLIENT_SURFACE,
 };
 use e2e_suite::{
     assert_http_commands_disabled, cases, graphql, graphql_for_application, graphql_raw,
@@ -37,42 +36,40 @@ async fn ensure_target() -> String {
     let base = format!("http://{bind}");
 
     // Always in-memory SQLite for offline suite (ignore compose DATABASE_URL=postgres).
-    let repo = SqliteRepository::connect_and_migrate("sqlite::memory:")
+    let stores = SqliteStores::connect("sqlite::memory:")
         .await
-        .expect("repo");
-    let registry = distributed_manifest().table_registry().expect("registry");
-    repo.bootstrap_table_schema_for_dev(&registry)
+        .expect("stores");
+    stores
+        .bootstrap_read_models(read_models().catalog())
         .await
         .expect("bootstrap");
-    let locks = SqliteLockManager::new(repo.pool().clone());
     let bus = InMemoryBus::new();
 
-    let change_rx = repo.read_model_changes();
+    let change_rx = stores.read_model_changes();
     // Offline suite uses a synthetic signed static-JWKS bearer. Durable command
     // tests exercise the same VerifiedPrincipal fence as production.
-    let service = build_service(repo.clone(), locks.clone(), repo.clone()).with_bus(bus.clone());
-    let gql = build_graphql_engine(&repo, &service, offline_oidc_identity(), Some(change_rx))
-        .expect("gql");
+    let service = build_service(&stores).with_bus(bus.clone());
+    let gql = build_graphql_engine(
+        stores.graphql_pool(),
+        &service,
+        offline_oidc_identity(),
+        Some(change_rx),
+    )
+    .expect("gql");
     let service = Arc::new(service.try_with_graphql(gql).expect("bind gql"));
 
     // Projector consumer (eventual consistency path — no command-side dual-write).
-    let consumer_repo = repo.clone();
-    let consumer_locks = locks.clone();
+    let consumer_stores = stores.clone();
     let bus_c = bus.clone();
     tokio::spawn(async move {
         loop {
-            let service = build_service(
-                consumer_repo.clone(),
-                consumer_locks.clone(),
-                consumer_repo.clone(),
-            )
-            .with_bus(bus_c.clone());
-            if let Err(error) = service.run(RunOptions::idempotent()).await {
+            let service = build_service(&consumer_stores).with_bus(bus_c.clone());
+            if let Err(error) = service.run(RunOptions::until_idle()).await {
                 eprintln!("offline projector loop: {error}");
                 if let Ok(Some((code, detail))) = sqlx::query_as::<_, (String, Vec<u8>)>(
                     "SELECT failure_code, failure_bytes FROM projection_failures LIMIT 1",
                 )
-                .fetch_optional(consumer_repo.pool())
+                .fetch_optional(consumer_stores.events.pool())
                 .await
                 {
                     eprintln!(
@@ -161,9 +158,9 @@ async fn t1a_application_surface_returns_actual_todo_upsert_and_causal_obligatio
         &mutation,
         "alice",
         "user",
-        DISTRIBUTED_CLIENT_SURFACE,
-        &["admin", "user"],
-        &["user"],
+        CLIENT_SURFACE.name,
+        CLIENT_SURFACE.eligible_roles,
+        CLIENT_SURFACE.schema_roles,
         &manifest.schema_fingerprint,
     )
     .await
@@ -397,16 +394,21 @@ async fn t2c_admin_force_archive() {
 /// Role SDL: force-archive only on admin schema (engine source of truth).
 #[tokio::test]
 async fn t2d_sdl_role_split_force_archive() {
-    let repo = distributed::SqliteRepository::connect_and_migrate("sqlite::memory:")
+    let stores = SqliteStores::connect("sqlite::memory:")
         .await
-        .expect("repo");
-    let registry = distributed_manifest().table_registry().expect("registry");
-    repo.bootstrap_table_schema_for_dev(&registry)
+        .expect("stores");
+    stores
+        .bootstrap_read_models(read_models().catalog())
         .await
         .expect("bootstrap");
-    let locks = distributed::SqliteLockManager::new(repo.pool().clone());
-    let service = build_service(repo.clone(), locks, repo.clone());
-    let engine = build_graphql_engine(&repo, &service, offline_oidc_identity(), None).expect("gql");
+    let service = build_service(&stores);
+    let engine = build_graphql_engine(
+        stores.graphql_pool(),
+        &service,
+        offline_oidc_identity(),
+        None,
+    )
+    .expect("gql");
     let user_sdl = engine.sdl_for_role("user").expect("user sdl");
     let admin_sdl = engine.sdl_for_role("admin").expect("admin sdl");
     assert!(
@@ -515,7 +517,7 @@ async fn t5_unauthenticated_rejected() {
           }}
         }}"#
     );
-    // DevHeaders with no identity → command guard rejects (causal_has_user).
+    // DevHeaders with no identity → command guard rejects.
     let (status, body) = graphql_raw(&base, &doc).await.expect(cases::UNAUTH);
     // GuardRejected is client-facing (often GraphQL errors / 400); Unauthorized
     // remains 401 when identity is checked elsewhere.
@@ -658,11 +660,16 @@ async fn t9_chat_room_partition_projects_posted_message() {
     let base = ensure_target().await;
     let message_id = id("chat");
     let room_id = id("room");
-    let created_at = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_millis()
-        .to_string();
+    let now_ms = || {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis()
+    };
+    // `created_at` is a `now()` default: whatever the caller sends (here a
+    // value from 1970) only previews; the server stamps its own clock.
+    let created_at = "1";
+    let before = now_ms();
     let command_id = new_command_id();
     let mutation = format!(
         r#"mutation {{
@@ -702,6 +709,18 @@ async fn t9_chat_room_partition_projects_posted_message() {
     assert_eq!(projected["room_id"], room_id);
     assert_eq!(projected["author_id"], "alice");
     assert_eq!(projected["body"], "partitioned hello");
+    let stored: u128 = projected["created_at"]
+        .as_str()
+        .and_then(|value| value.parse().ok())
+        .expect("created_at is canonical unix milliseconds");
+    assert!(
+        (before.saturating_sub(5_000)..=now_ms() + 5_000).contains(&stored),
+        "server must stamp created_at, got {stored}"
+    );
+    assert_eq!(
+        response["data"]["chat_messages_post"]["created_at"], projected["created_at"],
+        "the command payload carries the stamped value"
+    );
 }
 
 #[tokio::test]

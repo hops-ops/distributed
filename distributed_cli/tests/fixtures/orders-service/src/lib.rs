@@ -3,16 +3,19 @@
 
 use std::any::TypeId;
 
+use distributed::application::{Application, ApplicationManifest, SurfaceSpec};
+use distributed::command::{
+    typed_command, Atomic, CommandInputType, CommandOutputType, CommandTypeDef, CommandTypeField,
+    PreparedCommand,
+};
 use distributed::graphql::{
-    build_surface, surface_for_role, typed_command, DistributedClientSurfaceExport,
-    Atomic, GraphqlInputType, GraphqlOutputType, GraphqlTypeDef, GraphqlTypeField, PreparedCommand,
-    RoleGrant, SurfaceOptions, SurfaceProjector,
+    build_surface, read, surface_for_role, DistributedClientSurfaceExport, SurfaceOptions,
+    SurfaceProjector,
 };
 use distributed::microsvc::{CausalCommandContext, HandlerError, Routes, Service};
-use distributed::{
-    Aggregate, AggregateRepository, Application, ApplicationManifest, Entity, EventRecord,
-    InMemoryRepository, ReadModel, ReadModelCatalog, SurfaceSpec,
-};
+use distributed::read_model::ReadModel;
+use distributed::table::ReadModelCatalog;
+use distributed::{Aggregate, AggregateRepository, Entity, EventRecord, InMemoryRepository};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, ReadModel)]
@@ -23,12 +26,13 @@ pub struct OrderView {
     pub status: String,
 }
 
-impl GraphqlOutputType for OrderView {
-    fn graphql_type() -> GraphqlTypeDef {
-        GraphqlTypeDef::new(
+impl CommandOutputType for OrderView {
+    fn command_type() -> CommandTypeDef {
+        CommandTypeDef::new(
             "OrderView",
             vec![
-                GraphqlTypeField {
+                CommandTypeField {
+                    unsigned_integer: None,
                     name: "order_id".into(),
                     type_name: "String".into(),
                     nullable: false,
@@ -36,7 +40,8 @@ impl GraphqlOutputType for OrderView {
                     item_nullable: false,
                     nested: None,
                 },
-                GraphqlTypeField {
+                CommandTypeField {
+                    unsigned_integer: None,
                     name: "status".into(),
                     type_name: "String".into(),
                     nullable: false,
@@ -55,11 +60,12 @@ struct ProjectOrderInput {
     order_id: String,
 }
 
-impl GraphqlInputType for ProjectOrderInput {
-    fn graphql_type() -> GraphqlTypeDef {
-        GraphqlTypeDef::new(
+impl CommandInputType for ProjectOrderInput {
+    fn command_type() -> CommandTypeDef {
+        CommandTypeDef::new(
             "ProjectOrderInput",
-            vec![GraphqlTypeField {
+            vec![CommandTypeField {
+                unsigned_integer: None,
                 name: "order_id".into(),
                 type_name: "String".into(),
                 nullable: false,
@@ -79,6 +85,10 @@ struct FixtureAggregate {
 
 impl Aggregate for FixtureAggregate {
     type ReplayError = std::convert::Infallible;
+
+    fn aggregate_type() -> &'static str {
+        "fixture_aggregate"
+    }
 
     fn entity(&self) -> &Entity {
         &self.entity
@@ -148,12 +158,11 @@ pub fn distributed_client_surface() -> DistributedClientSurfaceExport {
         .expect("fixture typed service should bind")
         .with_projectors([SurfaceProjector::new("project_orders")
             .facts(["order.projected"])
-            .models(["OrderView"])
-            .change_epoch("orders-v1")])
+            .models(["OrderView"])])
         .expect("fixture projector should bind");
     let grants = std::collections::BTreeMap::from([(
         "OrderView".to_string(),
-        RoleGrant::all_columns().with_aggregations(),
+        read().all_columns().aggregations(),
     )]);
     let user =
         surface_for_role(&full, "user", &grants).expect("fixture role policy should be valid");

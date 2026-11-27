@@ -1,9 +1,14 @@
 use super::*;
 
+/// Bind each declared model to its table in this partition.
+///
+/// The partition's existing bindings are one statement; the caller holds the
+/// partition lock, so nothing else adds one meanwhile.
 pub(super) async fn ensure_partition_ownership_in_tx<DB>(
     tx: &mut Transaction<'_, DB>,
+    verified: &VerifiedRegistrations,
     topology: &ProjectorTopologyId,
-    partition: &ProjectionPartition,
+    partition: &PartitionId,
     ownership: &[ProjectionModelOwnership],
 ) -> Result<(), ProjectionProtocolError>
 where
@@ -18,65 +23,32 @@ where
 {
     let topology_hash = topology.digest();
     let partition_hash = partition.digest();
-    for declaration in ownership {
-        let mut registered = QueryBuilder::<DB>::new(
-            "SELECT topology_bytes, table_name FROM projection_registered_models \
-             WHERE topology_hash = ",
-        );
-        registered.push_bind(topology_hash.as_slice());
-        registered.push(" AND model_name = ");
-        registered.push_bind(declaration.model.as_str());
-        let Some(row) = registered
-            .build()
-            .fetch_optional(&mut **tx)
-            .await
-            .map_err(|error| {
-                protocol_storage_error::<DB>("verify causal projection registration", error)
-            })?
-        else {
-            return Err(ProjectionProtocolError::InvalidBatch(format!(
-                "projection model `{}` was not registered before projector traffic",
-                declaration.model
-            )));
-        };
-        let registered_topology: Vec<u8> = row.try_get("topology_bytes").map_err(|error| {
-            protocol_storage_error::<DB>("decode causal projection registration", error)
+    let mut bound_query = QueryBuilder::<DB>::new(
+        "SELECT model_name, table_name FROM projection_model_ownership WHERE topology_hash = ",
+    );
+    bound_query.push_bind(topology_hash.as_slice());
+    bound_query.push(" AND partition_hash = ");
+    bound_query.push_bind(partition_hash.as_slice());
+    let mut bound = Vec::new();
+    for row in bound_query
+        .build()
+        .fetch_all(&mut **tx)
+        .await
+        .map_err(|error| protocol_storage_error::<DB>("load projection model ownership", error))?
+    {
+        let model: String = row.try_get("model_name").map_err(|error| {
+            protocol_storage_error::<DB>("decode projection model ownership", error)
         })?;
-        verify_bytes(
-            &registered_topology,
-            &topology.canonical_bytes(),
-            "registered projector topology",
-        )?;
-        let registered_table: String = row.try_get("table_name").map_err(|error| {
-            protocol_storage_error::<DB>("decode causal projection registration", error)
+        let table: String = row.try_get("table_name").map_err(|error| {
+            protocol_storage_error::<DB>("decode projection table ownership", error)
         })?;
-        if registered_table != declaration.table {
-            return Err(ProjectionProtocolError::InvalidBatch(format!(
-                "projection model `{}` was registered for table `{registered_table}`, not `{}`",
-                declaration.model, declaration.table
-            )));
-        }
+        bound.push((model, table));
+    }
 
-        let mut by_model = QueryBuilder::<DB>::new(
-            "SELECT table_name FROM projection_model_ownership WHERE topology_hash = ",
-        );
-        by_model.push_bind(topology_hash.as_slice());
-        by_model.push(" AND partition_hash = ");
-        by_model.push_bind(partition_hash.as_slice());
-        by_model.push(" AND model_name = ");
-        by_model.push_bind(declaration.model.as_str());
-        if let Some(row) = by_model
-            .build()
-            .fetch_optional(&mut **tx)
-            .await
-            .map_err(|error| {
-                protocol_storage_error::<DB>("load projection model ownership", error)
-            })?
-        {
-            let table: String = row.try_get("table_name").map_err(|error| {
-                protocol_storage_error::<DB>("decode projection model ownership", error)
-            })?;
-            if table != declaration.table {
+    for declaration in ownership {
+        verify_registered_model_in_tx(tx, verified, topology, declaration).await?;
+        if let Some((_, table)) = bound.iter().find(|(model, _)| model == &declaration.model) {
+            if table != &declaration.table {
                 return Err(ProjectionProtocolError::InvalidBatch(format!(
                     "projection model `{}` is already bound to table `{table}`",
                     declaration.model
@@ -84,26 +56,7 @@ where
             }
             continue;
         }
-
-        let mut by_table = QueryBuilder::<DB>::new(
-            "SELECT model_name FROM projection_model_ownership WHERE topology_hash = ",
-        );
-        by_table.push_bind(topology_hash.as_slice());
-        by_table.push(" AND partition_hash = ");
-        by_table.push_bind(partition_hash.as_slice());
-        by_table.push(" AND table_name = ");
-        by_table.push_bind(declaration.table.as_str());
-        if let Some(row) = by_table
-            .build()
-            .fetch_optional(&mut **tx)
-            .await
-            .map_err(|error| {
-                protocol_storage_error::<DB>("load projection table ownership", error)
-            })?
-        {
-            let model: String = row.try_get("model_name").map_err(|error| {
-                protocol_storage_error::<DB>("decode projection table ownership", error)
-            })?;
+        if let Some((model, _)) = bound.iter().find(|(_, table)| table == &declaration.table) {
             return Err(ProjectionProtocolError::InvalidBatch(format!(
                 "projection table `{}` is already bound to model `{model}`",
                 declaration.table
@@ -130,12 +83,76 @@ where
                 "projection ownership changed while its partition lock was held",
             ));
         }
+        bound.push((declaration.model.clone(), declaration.table.clone()));
     }
+    Ok(())
+}
+
+/// The topology registered `declaration`'s model for its table.
+async fn verify_registered_model_in_tx<DB>(
+    tx: &mut Transaction<'_, DB>,
+    verified: &VerifiedRegistrations,
+    topology: &ProjectorTopologyId,
+    declaration: &ProjectionModelOwnership,
+) -> Result<(), ProjectionProtocolError>
+where
+    DB: SqlxRepoBackend,
+    for<'c> &'c mut DB::Connection: Executor<'c, Database = DB>,
+    DB::Arguments: IntoArguments<DB>,
+    for<'q> String: Type<DB> + sqlx::Decode<'q, DB>,
+    for<'q> Vec<u8>: Type<DB> + sqlx::Decode<'q, DB>,
+    for<'q> &'q str: Encode<'q, DB> + Type<DB>,
+    for<'q> &'q [u8]: Encode<'q, DB> + Type<DB>,
+    for<'r> &'r str: sqlx::ColumnIndex<DB::Row>,
+{
+    if verified.contains(topology, Some(declaration)) {
+        return Ok(());
+    }
+    let topology_hash = topology.digest();
+    let mut registered = QueryBuilder::<DB>::new(
+        "SELECT topology_bytes, table_name FROM projection_registered_models \
+         WHERE topology_hash = ",
+    );
+    registered.push_bind(topology_hash.as_slice());
+    registered.push(" AND model_name = ");
+    registered.push_bind(declaration.model.as_str());
+    let Some(row) = registered
+        .build()
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(|error| {
+            protocol_storage_error::<DB>("verify causal projection registration", error)
+        })?
+    else {
+        return Err(ProjectionProtocolError::InvalidBatch(format!(
+            "projection model `{}` was not registered before projector traffic",
+            declaration.model
+        )));
+    };
+    let registered_topology: Vec<u8> = row.try_get("topology_bytes").map_err(|error| {
+        protocol_storage_error::<DB>("decode causal projection registration", error)
+    })?;
+    verify_bytes(
+        &registered_topology,
+        &topology.canonical_bytes(),
+        "registered projector topology",
+    )?;
+    let registered_table: String = row.try_get("table_name").map_err(|error| {
+        protocol_storage_error::<DB>("decode causal projection registration", error)
+    })?;
+    if registered_table != declaration.table {
+        return Err(ProjectionProtocolError::InvalidBatch(format!(
+            "projection model `{}` was registered for table `{registered_table}`, not `{}`",
+            declaration.model, declaration.table
+        )));
+    }
+    verified.insert(topology, Some(declaration));
     Ok(())
 }
 
 pub(super) async fn verify_registered_topology_in_tx<DB>(
     tx: &mut Transaction<'_, DB>,
+    verified: &VerifiedRegistrations,
     topology: &ProjectorTopologyId,
 ) -> Result<(), ProjectionProtocolError>
 where
@@ -146,6 +163,9 @@ where
     for<'q> &'q [u8]: Encode<'q, DB> + Type<DB>,
     for<'r> &'r str: sqlx::ColumnIndex<DB::Row>,
 {
+    if verified.contains(topology, None) {
+        return Ok(());
+    }
     let topology_hash = topology.digest();
     let mut builder = QueryBuilder::<DB>::new(
         "SELECT topology_bytes FROM projection_registered_models WHERE topology_hash = ",
@@ -172,7 +192,83 @@ where
         &topology_bytes,
         &topology.canonical_bytes(),
         "registered projector topology",
-    )
+    )?;
+    verified.insert(topology, None);
+    Ok(())
+}
+
+/// The stored record rows of `scopes`, keyed by model and key digest.
+///
+/// One statement per bind-limit chunk. Every scope belongs to `topology` and
+/// `partition`; rows are decoded by [`decode_record_row`] where each is used.
+pub(super) async fn record_rows_in_tx<DB>(
+    tx: &mut Transaction<'_, DB>,
+    topology: &ProjectorTopologyId,
+    partition: &PartitionId,
+    scopes: &[&ProjectionRecordScope],
+) -> Result<HashMap<(String, Vec<u8>), DB::Row>, ProjectionProtocolError>
+where
+    DB: SqlxRepoBackend,
+    for<'c> &'c mut DB::Connection: Executor<'c, Database = DB>,
+    DB::Arguments: IntoArguments<DB>,
+    for<'q> String: Type<DB> + sqlx::Decode<'q, DB>,
+    for<'q> Vec<u8>: Type<DB> + sqlx::Decode<'q, DB>,
+    for<'q> &'q str: Encode<'q, DB> + Type<DB>,
+    for<'q> &'q [u8]: Encode<'q, DB> + Type<DB>,
+    for<'r> &'r str: sqlx::ColumnIndex<DB::Row>,
+{
+    let topology_hash = topology.digest();
+    let partition_hash = partition.digest();
+    let mut rows = HashMap::with_capacity(scopes.len());
+    for chunk in scopes.chunks((DB::MAX_BIND_PARAMS - 2) / 2) {
+        let mut builder = QueryBuilder::<DB>::new(
+            "SELECT model_name, canonical_key_bytes, canonical_key_hash, incarnation, revision, \
+             tombstone, change_epoch, change_position, source_snapshot \
+             FROM projection_records WHERE topology_hash = ",
+        );
+        builder.push_bind(topology_hash.as_slice());
+        builder.push(" AND partition_hash = ");
+        builder.push_bind(partition_hash.as_slice());
+        builder.push(" AND (model_name, canonical_key_hash) IN (");
+        builder.push_values(chunk, |mut key, scope| {
+            key.push_bind(scope.model());
+            key.push_bind(scope.key_digest().as_slice());
+        });
+        builder.push(")");
+        for row in builder
+            .build()
+            .fetch_all(&mut **tx)
+            .await
+            .map_err(|error| protocol_storage_error::<DB>("load projection record", error))?
+        {
+            let model: String = row.try_get("model_name").map_err(|error| {
+                protocol_storage_error::<DB>("decode projection record model", error)
+            })?;
+            let key_hash: Vec<u8> = row.try_get("canonical_key_hash").map_err(|error| {
+                protocol_storage_error::<DB>("decode projection record key hash", error)
+            })?;
+            rows.insert((model, key_hash), row);
+        }
+    }
+    Ok(rows)
+}
+
+/// The row [`record_rows_in_tx`] loaded for `scope`, decoded and verified.
+pub(super) fn stored_record<DB>(
+    rows: &HashMap<(String, Vec<u8>), DB::Row>,
+    scope: &ProjectionRecordScope,
+    expected_change_epoch: &ProjectionEpoch,
+) -> Result<Option<StoredRecord>, ProjectionProtocolError>
+where
+    DB: SqlxRepoBackend,
+    for<'q> i64: Type<DB> + sqlx::Decode<'q, DB>,
+    for<'q> String: Type<DB> + sqlx::Decode<'q, DB>,
+    for<'q> Vec<u8>: Type<DB> + sqlx::Decode<'q, DB>,
+    for<'r> &'r str: sqlx::ColumnIndex<DB::Row>,
+{
+    rows.get(&(scope.model().to_string(), scope.key_digest().to_vec()))
+        .map(|row| decode_record_row::<DB>(row, scope, expected_change_epoch))
+        .transpose()
 }
 
 pub(super) async fn record_in_tx<DB>(
@@ -191,28 +287,23 @@ where
     for<'q> &'q [u8]: Encode<'q, DB> + Type<DB>,
     for<'r> &'r str: sqlx::ColumnIndex<DB::Row>,
 {
-    let topology_hash = scope.topology().digest();
-    let partition_hash = scope.projection_partition().digest();
-    let key_hash = scope.key_digest();
-    let mut builder = QueryBuilder::<DB>::new(
-        "SELECT canonical_key_bytes, canonical_key_hash, incarnation, revision, tombstone, \
-         change_epoch, change_position FROM projection_records WHERE topology_hash = ",
-    );
-    builder.push_bind(topology_hash.as_slice());
-    builder.push(" AND partition_hash = ");
-    builder.push_bind(partition_hash.as_slice());
-    builder.push(" AND model_name = ");
-    builder.push_bind(scope.model());
-    builder.push(" AND canonical_key_hash = ");
-    builder.push_bind(key_hash.as_slice());
-    let Some(row) = builder
-        .build()
-        .fetch_optional(&mut **tx)
-        .await
-        .map_err(|error| protocol_storage_error::<DB>("load projection record", error))?
-    else {
-        return Ok(None);
-    };
+    let rows =
+        record_rows_in_tx(tx, scope.topology(), scope.projection_partition(), &[scope]).await?;
+    stored_record::<DB>(&rows, scope, expected_change_epoch)
+}
+
+pub(super) fn decode_record_row<DB>(
+    row: &DB::Row,
+    scope: &ProjectionRecordScope,
+    expected_change_epoch: &ProjectionEpoch,
+) -> Result<StoredRecord, ProjectionProtocolError>
+where
+    DB: SqlxRepoBackend,
+    for<'q> i64: Type<DB> + sqlx::Decode<'q, DB>,
+    for<'q> String: Type<DB> + sqlx::Decode<'q, DB>,
+    for<'q> Vec<u8>: Type<DB> + sqlx::Decode<'q, DB>,
+    for<'r> &'r str: sqlx::ColumnIndex<DB::Row>,
+{
     let key_bytes: Vec<u8> = row.try_get("canonical_key_bytes").map_err(|error| {
         protocol_storage_error::<DB>("decode projection record key bytes", error)
     })?;
@@ -266,8 +357,13 @@ where
         })?,
         "record change position",
     )?;
-    Ok(Some(StoredRecord {
+    Ok(StoredRecord {
         metadata: ProjectionRecordMetadata {
+            source_snapshot: decode_source_snapshot(
+                row.try_get("source_snapshot").map_err(|error| {
+                    protocol_storage_error::<DB>("decode source snapshot", error)
+                })?,
+            )?,
             revision: RecordRevision::new(scope.clone(), incarnation, revision)?,
             tombstone,
             change: ProjectionChangeCursor::new(
@@ -277,93 +373,7 @@ where
                 change_position,
             )?,
         },
-    }))
-}
-
-pub(super) fn next_record(
-    scope: &ProjectionRecordScope,
-    expectation: &ProjectionRecordExpectation,
-    kind: ProjectionMutationKind,
-    current: Option<&StoredRecord>,
-) -> Result<(RecordRevision, bool), ProjectionProtocolError> {
-    let current = current.map(|record| &record.metadata);
-    match (expectation, current, kind) {
-        (ProjectionRecordExpectation::Missing, None, ProjectionMutationKind::Upsert) => {
-            Ok((RecordRevision::new(scope.clone(), 1, 1)?, false))
-        }
-        (ProjectionRecordExpectation::Missing, Some(metadata), _) if metadata.tombstone => {
-            Err(ProjectionProtocolError::RecordTombstoned {
-                model: scope.model().to_string(),
-            })
-        }
-        (ProjectionRecordExpectation::Missing, Some(_), _) => {
-            Err(ProjectionProtocolError::RecordAlreadyExists {
-                model: scope.model().to_string(),
-            })
-        }
-        (ProjectionRecordExpectation::Exact(_), None, _) => {
-            Err(ProjectionProtocolError::RecordMissing {
-                model: scope.model().to_string(),
-            })
-        }
-        (ProjectionRecordExpectation::Exact(expected), Some(metadata), _) => {
-            if expected != &metadata.revision {
-                return Err(ProjectionProtocolError::RecordRevisionConflict {
-                    model: scope.model().to_string(),
-                    expected_incarnation: expected.incarnation(),
-                    expected_revision: expected.revision(),
-                    actual_incarnation: metadata.revision.incarnation(),
-                    actual_revision: metadata.revision.revision(),
-                });
-            }
-            match kind {
-                ProjectionMutationKind::Upsert if metadata.tombstone => {
-                    Err(ProjectionProtocolError::RecordTombstoned {
-                        model: scope.model().to_string(),
-                    })
-                }
-                ProjectionMutationKind::Upsert => Ok((
-                    RecordRevision::new(
-                        scope.clone(),
-                        metadata.revision.incarnation(),
-                        checked_next(metadata.revision.revision(), "record revision")?,
-                    )?,
-                    false,
-                )),
-                ProjectionMutationKind::Delete if metadata.tombstone => {
-                    Err(ProjectionProtocolError::RecordTombstoned {
-                        model: scope.model().to_string(),
-                    })
-                }
-                ProjectionMutationKind::Delete => Ok((
-                    RecordRevision::new(
-                        scope.clone(),
-                        metadata.revision.incarnation(),
-                        checked_next(metadata.revision.revision(), "record revision")?,
-                    )?,
-                    true,
-                )),
-                ProjectionMutationKind::Recreate if !metadata.tombstone => {
-                    Err(ProjectionProtocolError::RecreateRequiresTombstone {
-                        model: scope.model().to_string(),
-                    })
-                }
-                ProjectionMutationKind::Recreate => Ok((
-                    RecordRevision::new(
-                        scope.clone(),
-                        checked_next(metadata.revision.incarnation(), "record incarnation")?,
-                        1,
-                    )?,
-                    false,
-                )),
-            }
-        }
-        (_, _, ProjectionMutationKind::Delete | ProjectionMutationKind::Recreate) => {
-            Err(ProjectionProtocolError::InvalidBatch(
-                "delete/recreate requires an exact record expectation".into(),
-            ))
-        }
-    }
+    })
 }
 
 #[expect(
@@ -373,13 +383,14 @@ pub(super) fn next_record(
 pub(super) fn allocate_change(
     state: &mut PartitionState,
     topology: &ProjectorTopologyId,
-    partition: &ProjectionPartition,
+    partition: &PartitionId,
     kind: ProjectionChangeKind,
     causation_id: String,
     observation_kind: Option<ProjectionObservationKind>,
     scope: Option<ProjectionRecordScope>,
     revision: Option<RecordRevision>,
     failure_id: Option<String>,
+    program_id: Option<ProjectionProgramId>,
 ) -> Result<ProjectionChange, ProjectionProtocolError> {
     state.change_head = checked_next(state.change_head, "projection change")?;
     Ok(ProjectionChange {
@@ -395,12 +406,14 @@ pub(super) fn allocate_change(
         scope,
         revision,
         failure_id,
+        program_id,
     })
 }
 
-pub(super) async fn insert_change_in_tx<DB>(
+/// Append `changes`, one statement per bind-limit chunk.
+pub(super) async fn insert_changes_in_tx<DB>(
     tx: &mut Transaction<'_, DB>,
-    change: &ProjectionChange,
+    changes: &[ProjectionChange],
 ) -> Result<(), ProjectionProtocolError>
 where
     DB: SqlxRepoBackend,
@@ -410,88 +423,101 @@ where
     for<'q> &'q str: Encode<'q, DB> + Type<DB>,
     for<'q> &'q [u8]: Encode<'q, DB> + Type<DB>,
 {
-    let cursor = &change.cursor;
-    let position = to_i64::<DB>(cursor.position(), "projection change position")?;
-    let topology_hash = cursor.topology().digest();
-    let partition_hash = cursor.projection_partition().digest();
-    let mut builder = QueryBuilder::<DB>::new(
-        "INSERT INTO projection_changes \
-         (topology_hash, partition_hash, change_epoch, change_position, change_kind, \
-         causation_id, model_name, scope_kind, canonical_key_bytes, canonical_key_hash, \
-         incarnation, revision, failure_id) VALUES (",
-    );
-    builder.push_bind(topology_hash.as_slice());
-    builder.push(", ");
-    builder.push_bind(partition_hash.as_slice());
-    builder.push(", ");
-    builder.push_bind(cursor.epoch().as_str());
-    builder.push(", ");
-    builder.push_bind(position);
-    builder.push(", ");
-    builder.push_bind(change.kind.as_storage_str());
-    builder.push(", ");
-    builder.push_bind(change.causation_id.as_str());
-    builder.push(", ");
-    if let Some(scope) = &change.scope {
-        builder.push_bind(scope.model());
-    } else {
-        builder.push("NULL");
+    for chunk in changes.chunks(DB::MAX_BIND_PARAMS / 14) {
+        let mut builder = QueryBuilder::<DB>::new(
+            "INSERT INTO projection_changes \
+             (topology_hash, partition_hash, change_epoch, change_position, change_kind, \
+             causation_id, model_name, scope_kind, canonical_key_bytes, canonical_key_hash, \
+             incarnation, revision, failure_id, program_id) VALUES ",
+        );
+        for (index, change) in chunk.iter().enumerate() {
+            let cursor = &change.cursor;
+            let position = to_i64::<DB>(cursor.position(), "projection change position")?;
+            let topology_hash = cursor.topology().digest();
+            let partition_hash = cursor.projection_partition().digest();
+            builder.push(if index == 0 { "(" } else { ", (" });
+            builder.push_bind(topology_hash.as_slice());
+            builder.push(", ");
+            builder.push_bind(partition_hash.as_slice());
+            builder.push(", ");
+            builder.push_bind(cursor.epoch().as_str());
+            builder.push(", ");
+            builder.push_bind(position);
+            builder.push(", ");
+            builder.push_bind(change.kind.as_storage_str());
+            builder.push(", ");
+            builder.push_bind(change.causation_id.as_str());
+            builder.push(", ");
+            if let Some(scope) = &change.scope {
+                builder.push_bind(scope.model());
+            } else {
+                builder.push("NULL");
+            }
+            builder.push(", ");
+            if let Some(kind) = change.observation_kind {
+                builder.push_bind(kind.as_storage_str());
+            } else {
+                builder.push("NULL");
+            }
+            builder.push(", ");
+            if let Some(scope) = &change.scope {
+                builder.push_bind(scope.canonical_key_bytes());
+            } else {
+                builder.push("NULL");
+            }
+            builder.push(", ");
+            if let Some(scope) = &change.scope {
+                let key_hash = scope.key_digest();
+                builder.push_bind(key_hash.as_slice());
+            } else {
+                builder.push("NULL");
+            }
+            builder.push(", ");
+            if let Some(revision) = &change.revision {
+                builder.push_bind(to_i64::<DB>(
+                    revision.incarnation(),
+                    "projection record incarnation",
+                )?);
+            } else {
+                builder.push("NULL");
+            }
+            builder.push(", ");
+            if let Some(revision) = &change.revision {
+                builder.push_bind(to_i64::<DB>(
+                    revision.revision(),
+                    "projection record revision",
+                )?);
+            } else {
+                builder.push("NULL");
+            }
+            builder.push(", ");
+            if let Some(failure_id) = &change.failure_id {
+                builder.push_bind(failure_id.as_str());
+            } else {
+                builder.push("NULL");
+            }
+            builder.push(", ");
+            let program_id_value = change.program_id.map(|program_id| program_id.to_string());
+            if let Some(program_id) = program_id_value.as_deref() {
+                builder.push_bind(program_id);
+            } else {
+                builder.push("NULL");
+            }
+            builder.push(")");
+        }
+        builder
+            .build()
+            .execute(&mut **tx)
+            .await
+            .map_err(|error| protocol_storage_error::<DB>("append projection change", error))?;
     }
-    builder.push(", ");
-    if let Some(kind) = change.observation_kind {
-        builder.push_bind(kind.as_storage_str());
-    } else {
-        builder.push("NULL");
-    }
-    builder.push(", ");
-    if let Some(scope) = &change.scope {
-        builder.push_bind(scope.canonical_key_bytes());
-    } else {
-        builder.push("NULL");
-    }
-    builder.push(", ");
-    if let Some(scope) = &change.scope {
-        let key_hash = scope.key_digest();
-        builder.push_bind(key_hash.as_slice());
-    } else {
-        builder.push("NULL");
-    }
-    builder.push(", ");
-    if let Some(revision) = &change.revision {
-        builder.push_bind(to_i64::<DB>(
-            revision.incarnation(),
-            "projection record incarnation",
-        )?);
-    } else {
-        builder.push("NULL");
-    }
-    builder.push(", ");
-    if let Some(revision) = &change.revision {
-        builder.push_bind(to_i64::<DB>(
-            revision.revision(),
-            "projection record revision",
-        )?);
-    } else {
-        builder.push("NULL");
-    }
-    builder.push(", ");
-    if let Some(failure_id) = &change.failure_id {
-        builder.push_bind(failure_id.as_str());
-    } else {
-        builder.push("NULL");
-    }
-    builder.push(")");
-    builder
-        .build()
-        .execute(&mut **tx)
-        .await
-        .map_err(|error| protocol_storage_error::<DB>("append projection change", error))?;
     Ok(())
 }
 
-pub(super) async fn upsert_record_in_tx<DB>(
+/// Store `records`, one statement per bind-limit chunk. No scope repeats.
+pub(super) async fn upsert_records_in_tx<DB>(
     tx: &mut Transaction<'_, DB>,
-    metadata: &ProjectionRecordMetadata,
+    records: &[ProjectionRecordMetadata],
 ) -> Result<(), ProjectionProtocolError>
 where
     DB: SqlxRepoBackend,
@@ -501,56 +527,97 @@ where
     for<'q> &'q str: Encode<'q, DB> + Type<DB>,
     for<'q> &'q [u8]: Encode<'q, DB> + Type<DB>,
 {
-    let scope = metadata.revision.scope();
-    let topology_hash = scope.topology().digest();
-    let partition_hash = scope.projection_partition().digest();
-    let key_hash = scope.key_digest();
-    let mut builder = QueryBuilder::<DB>::new(
-        "INSERT INTO projection_records \
-         (topology_hash, partition_hash, model_name, canonical_key_bytes, canonical_key_hash, \
-         incarnation, revision, tombstone, change_epoch, change_position) VALUES (",
-    );
-    builder.push_bind(topology_hash.as_slice());
-    builder.push(", ");
-    builder.push_bind(partition_hash.as_slice());
-    builder.push(", ");
-    builder.push_bind(scope.model());
-    builder.push(", ");
-    builder.push_bind(scope.canonical_key_bytes());
-    builder.push(", ");
-    builder.push_bind(key_hash.as_slice());
-    builder.push(", ");
-    builder.push_bind(to_i64::<DB>(
-        metadata.revision.incarnation(),
-        "projection record incarnation",
-    )?);
-    builder.push(", ");
-    builder.push_bind(to_i64::<DB>(
-        metadata.revision.revision(),
-        "projection record revision",
-    )?);
-    builder.push(", ");
-    builder.push_bind(i64::from(metadata.tombstone));
-    builder.push(", ");
-    builder.push_bind(metadata.change.epoch().as_str());
-    builder.push(", ");
-    builder.push_bind(to_i64::<DB>(
-        metadata.change.position(),
-        "projection record change position",
-    )?);
-    builder.push(
-        ") ON CONFLICT (topology_hash, partition_hash, model_name, canonical_key_hash) \
-         DO UPDATE SET canonical_key_bytes = excluded.canonical_key_bytes, \
-         incarnation = excluded.incarnation, revision = excluded.revision, \
-         tombstone = excluded.tombstone, change_epoch = excluded.change_epoch, \
-         change_position = excluded.change_position",
-    );
-    builder
-        .build()
-        .execute(&mut **tx)
-        .await
-        .map_err(|error| protocol_storage_error::<DB>("store projection record", error))?;
+    for chunk in records.chunks(DB::MAX_BIND_PARAMS / 11) {
+        let mut builder = QueryBuilder::<DB>::new(
+            "INSERT INTO projection_records \
+             (topology_hash, partition_hash, model_name, canonical_key_bytes, canonical_key_hash, \
+             incarnation, revision, tombstone, change_epoch, change_position, source_snapshot) \
+             VALUES ",
+        );
+        for (index, metadata) in chunk.iter().enumerate() {
+            let scope = metadata.revision.scope();
+            let topology_hash = scope.topology().digest();
+            let partition_hash = scope.projection_partition().digest();
+            let key_hash = scope.key_digest();
+            builder.push(if index == 0 { "(" } else { ", (" });
+            builder.push_bind(topology_hash.as_slice());
+            builder.push(", ");
+            builder.push_bind(partition_hash.as_slice());
+            builder.push(", ");
+            builder.push_bind(scope.model());
+            builder.push(", ");
+            builder.push_bind(scope.canonical_key_bytes());
+            builder.push(", ");
+            builder.push_bind(key_hash.as_slice());
+            builder.push(", ");
+            builder.push_bind(to_i64::<DB>(
+                metadata.revision.incarnation(),
+                "projection record incarnation",
+            )?);
+            builder.push(", ");
+            builder.push_bind(to_i64::<DB>(
+                metadata.revision.revision(),
+                "projection record revision",
+            )?);
+            builder.push(", ");
+            builder.push_bind(i64::from(metadata.tombstone));
+            builder.push(", ");
+            builder.push_bind(metadata.change.epoch().as_str());
+            builder.push(", ");
+            builder.push_bind(to_i64::<DB>(
+                metadata.change.position(),
+                "projection record change position",
+            )?);
+            builder.push(", ");
+            let source_json = metadata
+                .source_snapshot
+                .as_ref()
+                .map(serde_json::to_string)
+                .transpose()
+                .map_err(|error| corrupt_storage(format!("encode source snapshot: {error}")))?;
+            if let Some(value) = &source_json {
+                builder.push_bind(value.as_str());
+            } else {
+                builder.push("NULL");
+            }
+            builder.push(")");
+        }
+        builder.push(
+            " ON CONFLICT (topology_hash, partition_hash, model_name, canonical_key_hash) \
+             DO UPDATE SET canonical_key_bytes = excluded.canonical_key_bytes, \
+             incarnation = excluded.incarnation, revision = excluded.revision, \
+             tombstone = excluded.tombstone, change_epoch = excluded.change_epoch, \
+             change_position = excluded.change_position, \
+             source_snapshot = excluded.source_snapshot",
+        );
+        builder
+            .build()
+            .execute(&mut **tx)
+            .await
+            .map_err(|error| protocol_storage_error::<DB>("store projection record", error))?;
+    }
     Ok(())
+}
+
+pub(super) fn decode_source_snapshot(
+    value: Option<String>,
+) -> Result<Option<crate::projection_protocol::SourceSnapshotVersion>, ProjectionProtocolError> {
+    value
+        .map(|value| {
+            if value.len() > 16384 {
+                return Err(corrupt_storage(
+                    "source snapshot exceeds bounded metadata size",
+                ));
+            }
+            let snapshot: crate::projection_protocol::SourceSnapshotVersion =
+                serde_json::from_str(&value)
+                    .map_err(|error| corrupt_storage(format!("decode source snapshot: {error}")))?;
+            snapshot
+                .validate_stored()
+                .map_err(|error| corrupt_storage(error.to_string()))?;
+            Ok(snapshot)
+        })
+        .transpose()
 }
 
 pub(super) fn decode_observation_row<DB>(
@@ -619,6 +686,9 @@ where
         })?,
         "observation change position",
     )?;
+    let program_id = decode_program_id(row.try_get("program_id").map_err(|error| {
+        protocol_storage_error::<DB>("decode observation program identity", error)
+    })?)?;
     Ok(ProjectionObservation {
         causation_id: causation_id.to_string(),
         kind,
@@ -630,7 +700,94 @@ where
             change_epoch,
             change_position,
         )?,
+        program_id,
     })
+}
+
+/// The stored observation rows of `causation_id` for `requests`, keyed by
+/// model, kind and key digest. One statement per bind-limit chunk.
+pub(super) async fn observation_rows_in_tx<DB>(
+    tx: &mut Transaction<'_, DB>,
+    topology: &ProjectorTopologyId,
+    partition: &PartitionId,
+    causation_id: &str,
+    requests: &[(&ProjectionRecordScope, ProjectionObservationKind)],
+) -> Result<HashMap<(String, String, Vec<u8>), DB::Row>, ProjectionProtocolError>
+where
+    DB: SqlxRepoBackend,
+    for<'c> &'c mut DB::Connection: Executor<'c, Database = DB>,
+    DB::Arguments: IntoArguments<DB>,
+    for<'q> String: Type<DB> + sqlx::Decode<'q, DB>,
+    for<'q> Vec<u8>: Type<DB> + sqlx::Decode<'q, DB>,
+    for<'q> &'q str: Encode<'q, DB> + Type<DB>,
+    for<'q> &'q [u8]: Encode<'q, DB> + Type<DB>,
+    for<'r> &'r str: sqlx::ColumnIndex<DB::Row>,
+{
+    let topology_hash = topology.digest();
+    let partition_hash = partition.digest();
+    let mut rows = HashMap::with_capacity(requests.len());
+    for chunk in requests.chunks((DB::MAX_BIND_PARAMS - 3) / 3) {
+        let mut builder = QueryBuilder::<DB>::new(
+            "SELECT model_name, scope_kind, canonical_key_bytes, canonical_key_hash, \
+             incarnation, revision, change_epoch, change_position, program_id \
+             FROM projection_observations WHERE topology_hash = ",
+        );
+        builder.push_bind(topology_hash.as_slice());
+        builder.push(" AND partition_hash = ");
+        builder.push_bind(partition_hash.as_slice());
+        builder.push(" AND causation_id = ");
+        builder.push_bind(causation_id);
+        builder.push(" AND (model_name, scope_kind, canonical_key_hash) IN (");
+        builder.push_values(chunk, |mut key, (scope, kind)| {
+            key.push_bind(scope.model());
+            key.push_bind(kind.as_storage_str());
+            key.push_bind(scope.key_digest().as_slice());
+        });
+        builder.push(")");
+        for row in builder
+            .build()
+            .fetch_all(&mut **tx)
+            .await
+            .map_err(|error| protocol_storage_error::<DB>("load projection observation", error))?
+        {
+            let model: String = row
+                .try_get("model_name")
+                .map_err(|error| protocol_storage_error::<DB>("decode observation model", error))?;
+            let kind: String = row
+                .try_get("scope_kind")
+                .map_err(|error| protocol_storage_error::<DB>("decode observation kind", error))?;
+            let key_hash: Vec<u8> = row.try_get("canonical_key_hash").map_err(|error| {
+                protocol_storage_error::<DB>("decode observation key hash", error)
+            })?;
+            rows.insert((model, kind, key_hash), row);
+        }
+    }
+    Ok(rows)
+}
+
+/// The row [`observation_rows_in_tx`] loaded for one request, decoded and
+/// verified.
+pub(super) fn stored_observation<DB>(
+    rows: &HashMap<(String, String, Vec<u8>), DB::Row>,
+    causation_id: &str,
+    scope: &ProjectionRecordScope,
+    kind: ProjectionObservationKind,
+    expected_change_epoch: &ProjectionEpoch,
+) -> Result<Option<ProjectionObservation>, ProjectionProtocolError>
+where
+    DB: SqlxRepoBackend,
+    for<'q> i64: Type<DB> + sqlx::Decode<'q, DB>,
+    for<'q> String: Type<DB> + sqlx::Decode<'q, DB>,
+    for<'q> Vec<u8>: Type<DB> + sqlx::Decode<'q, DB>,
+    for<'r> &'r str: sqlx::ColumnIndex<DB::Row>,
+{
+    rows.get(&(
+        scope.model().to_string(),
+        kind.as_storage_str().to_string(),
+        scope.key_digest().to_vec(),
+    ))
+    .map(|row| decode_observation_row::<DB>(row, causation_id, scope, kind, expected_change_epoch))
+    .transpose()
 }
 
 pub(super) async fn observation_in_tx<DB>(
@@ -651,38 +808,21 @@ where
     for<'q> &'q [u8]: Encode<'q, DB> + Type<DB>,
     for<'r> &'r str: sqlx::ColumnIndex<DB::Row>,
 {
-    let topology_hash = scope.topology().digest();
-    let partition_hash = scope.projection_partition().digest();
-    let key_hash = scope.key_digest();
-    let mut builder = QueryBuilder::<DB>::new(
-        "SELECT canonical_key_bytes, canonical_key_hash, incarnation, revision, \
-         change_epoch, change_position FROM projection_observations WHERE topology_hash = ",
-    );
-    builder.push_bind(topology_hash.as_slice());
-    builder.push(" AND partition_hash = ");
-    builder.push_bind(partition_hash.as_slice());
-    builder.push(" AND causation_id = ");
-    builder.push_bind(causation_id);
-    builder.push(" AND model_name = ");
-    builder.push_bind(scope.model());
-    builder.push(" AND scope_kind = ");
-    builder.push_bind(kind.as_storage_str());
-    builder.push(" AND canonical_key_hash = ");
-    builder.push_bind(key_hash.as_slice());
-    let Some(row) = builder
-        .build()
-        .fetch_optional(&mut **tx)
-        .await
-        .map_err(|error| protocol_storage_error::<DB>("load projection observation", error))?
-    else {
-        return Ok(None);
-    };
-    decode_observation_row::<DB>(&row, causation_id, scope, kind, expected_change_epoch).map(Some)
+    let rows = observation_rows_in_tx(
+        tx,
+        scope.topology(),
+        scope.projection_partition(),
+        causation_id,
+        &[(scope, kind)],
+    )
+    .await?;
+    stored_observation::<DB>(&rows, causation_id, scope, kind, expected_change_epoch)
 }
 
-pub(super) async fn insert_observation_in_tx<DB>(
+/// Insert `observations`, one statement per bind-limit chunk.
+pub(super) async fn insert_observations_in_tx<DB>(
     tx: &mut Transaction<'_, DB>,
-    observation: &ProjectionObservation,
+    observations: &[ProjectionObservation],
 ) -> Result<(), ProjectionProtocolError>
 where
     DB: SqlxRepoBackend,
@@ -692,60 +832,72 @@ where
     for<'q> &'q str: Encode<'q, DB> + Type<DB>,
     for<'q> &'q [u8]: Encode<'q, DB> + Type<DB>,
 {
-    let scope = &observation.scope;
-    let topology_hash = scope.topology().digest();
-    let partition_hash = scope.projection_partition().digest();
-    let key_hash = scope.key_digest();
-    let mut builder = QueryBuilder::<DB>::new(
-        "INSERT INTO projection_observations \
-         (topology_hash, partition_hash, causation_id, model_name, scope_kind, \
-         canonical_key_bytes, canonical_key_hash, incarnation, revision, \
-         change_epoch, change_position) VALUES (",
-    );
-    builder.push_bind(topology_hash.as_slice());
-    builder.push(", ");
-    builder.push_bind(partition_hash.as_slice());
-    builder.push(", ");
-    builder.push_bind(observation.causation_id.as_str());
-    builder.push(", ");
-    builder.push_bind(scope.model());
-    builder.push(", ");
-    builder.push_bind(observation.kind.as_storage_str());
-    builder.push(", ");
-    builder.push_bind(scope.canonical_key_bytes());
-    builder.push(", ");
-    builder.push_bind(key_hash.as_slice());
-    builder.push(", ");
-    if let Some(revision) = &observation.revision {
-        builder.push_bind(to_i64::<DB>(
-            revision.incarnation(),
-            "observation record incarnation",
-        )?);
-    } else {
-        builder.push("NULL");
+    for chunk in observations.chunks(DB::MAX_BIND_PARAMS / 12) {
+        let mut builder = QueryBuilder::<DB>::new(
+            "INSERT INTO projection_observations \
+             (topology_hash, partition_hash, causation_id, model_name, scope_kind, \
+             canonical_key_bytes, canonical_key_hash, incarnation, revision, \
+             change_epoch, change_position, program_id) VALUES ",
+        );
+        for (index, observation) in chunk.iter().enumerate() {
+            let scope = &observation.scope;
+            let topology_hash = scope.topology().digest();
+            let partition_hash = scope.projection_partition().digest();
+            let key_hash = scope.key_digest();
+            builder.push(if index == 0 { "(" } else { ", (" });
+            builder.push_bind(topology_hash.as_slice());
+            builder.push(", ");
+            builder.push_bind(partition_hash.as_slice());
+            builder.push(", ");
+            builder.push_bind(observation.causation_id.as_str());
+            builder.push(", ");
+            builder.push_bind(scope.model());
+            builder.push(", ");
+            builder.push_bind(observation.kind.as_storage_str());
+            builder.push(", ");
+            builder.push_bind(scope.canonical_key_bytes());
+            builder.push(", ");
+            builder.push_bind(key_hash.as_slice());
+            builder.push(", ");
+            if let Some(revision) = &observation.revision {
+                builder.push_bind(to_i64::<DB>(
+                    revision.incarnation(),
+                    "observation record incarnation",
+                )?);
+            } else {
+                builder.push("NULL");
+            }
+            builder.push(", ");
+            if let Some(revision) = &observation.revision {
+                builder.push_bind(to_i64::<DB>(
+                    revision.revision(),
+                    "observation record revision",
+                )?);
+            } else {
+                builder.push("NULL");
+            }
+            builder.push(", ");
+            builder.push_bind(observation.change.epoch().as_str());
+            builder.push(", ");
+            builder.push_bind(to_i64::<DB>(
+                observation.change.position(),
+                "observation change position",
+            )?);
+            builder.push(", ");
+            let program_id_value = observation
+                .program_id
+                .map(|program_id| program_id.to_string());
+            if let Some(program_id) = program_id_value.as_deref() {
+                builder.push_bind(program_id);
+            } else {
+                builder.push("NULL");
+            }
+            builder.push(")");
+        }
+        builder.build().execute(&mut **tx).await.map_err(|error| {
+            protocol_storage_error::<DB>("insert projection observation", error)
+        })?;
     }
-    builder.push(", ");
-    if let Some(revision) = &observation.revision {
-        builder.push_bind(to_i64::<DB>(
-            revision.revision(),
-            "observation record revision",
-        )?);
-    } else {
-        builder.push("NULL");
-    }
-    builder.push(", ");
-    builder.push_bind(observation.change.epoch().as_str());
-    builder.push(", ");
-    builder.push_bind(to_i64::<DB>(
-        observation.change.position(),
-        "observation change position",
-    )?);
-    builder.push(")");
-    builder
-        .build()
-        .execute(&mut **tx)
-        .await
-        .map_err(|error| protocol_storage_error::<DB>("insert projection observation", error))?;
     Ok(())
 }
 
@@ -897,15 +1049,42 @@ where
     }
 
     if let Some(existing) = input_identity_by_cursor_in_tx(tx, input).await? {
-        if input_identity_matches(&existing, input) {
+        if same_input(&existing, input) {
             return Ok(());
         }
         return Err(ProjectionProtocolError::InputCorruption);
     }
     if input_identity_by_message_in_tx(tx, input).await?.is_some() {
-        return Err(ProjectionProtocolError::MessageIdReuse {
-            message_id: input.message_id.clone(),
-        });
+        // The canonical unique binding wins races across projection partitions.
+        // Revalidate against it before retaining a distinct broker delivery.
+        validate_input_identity_in_tx(tx, input).await?;
+        let mut alias = QueryBuilder::<DB>::new(
+            "INSERT INTO projection_input_delivery_aliases \
+             (topology_hash, partition_hash, source_hash, source_partition_hash, \
+             source_epoch, source_position, message_id) VALUES (",
+        );
+        alias.push_bind(topology_hash.as_slice());
+        alias.push(", ").push_bind(partition_hash.as_slice());
+        alias.push(", ").push_bind(source_hash.as_slice());
+        alias.push(", ").push_bind(source_partition_hash.as_slice());
+        alias.push(", ").push_bind(cursor.epoch().as_str());
+        alias.push(", ").push_bind(to_i64::<DB>(
+            cursor.position(),
+            "projection alias position",
+        )?);
+        alias.push(", ").push_bind(input.message_id.as_str());
+        alias.push(") ON CONFLICT DO NOTHING");
+        alias.build().execute(&mut **tx).await.map_err(|error| {
+            protocol_storage_error::<DB>("insert projection delivery alias", error)
+        })?;
+        let stored = input_identity_by_cursor_in_tx(tx, input)
+            .await?
+            .ok_or_else(|| corrupt_storage("projection alias insert has no readable identity"))?;
+        return if same_input(&stored, input) {
+            Ok(())
+        } else {
+            Err(ProjectionProtocolError::InputCorruption)
+        };
     }
     Err(corrupt_storage(
         "projection input identity collided without a readable conflicting row",
@@ -1063,7 +1242,7 @@ where
 pub(super) async fn update_partition_head_in_tx<DB>(
     tx: &mut Transaction<'_, DB>,
     topology: &ProjectorTopologyId,
-    partition: &ProjectionPartition,
+    partition: &PartitionId,
     change_head: u64,
     clear_pending_retry: Option<&str>,
 ) -> Result<(), ProjectionProtocolError>
@@ -1105,7 +1284,7 @@ where
 pub(super) async fn retain_projection_change_suffix_in_tx<DB>(
     tx: &mut Transaction<'_, DB>,
     topology: &ProjectorTopologyId,
-    partition: &ProjectionPartition,
+    partition: &PartitionId,
     state: &PartitionState,
     retention: ProjectionChangeRetention,
 ) -> Result<u64, ProjectionProtocolError>
@@ -1180,7 +1359,7 @@ where
 pub(super) fn decode_failure_row<DB>(
     row: &DB::Row,
     topology: &ProjectorTopologyId,
-    partition: &ProjectionPartition,
+    partition: &PartitionId,
     expected_change_epoch: &ProjectionEpoch,
 ) -> Result<StoredFailure, ProjectionProtocolError>
 where
@@ -1310,7 +1489,7 @@ where
 pub(super) async fn failure_in_tx<DB>(
     tx: &mut Transaction<'_, DB>,
     topology: &ProjectorTopologyId,
-    partition: &ProjectionPartition,
+    partition: &PartitionId,
     failure_id: &str,
     expected_change_epoch: &ProjectionEpoch,
 ) -> Result<Option<StoredFailure>, ProjectionProtocolError>
@@ -1345,65 +1524,6 @@ where
         .map_err(|error| protocol_storage_error::<DB>("load projection failure", error))?;
     row.map(|row| decode_failure_row::<DB>(&row, topology, partition, expected_change_epoch))
         .transpose()
-}
-
-pub(super) fn failure_matches_batch(
-    failure: &StoredFailure,
-    batch: &ProjectionFailureBatch,
-) -> bool {
-    crate::projection_protocol::failure_matches_batch(&failure.failure, batch)
-}
-
-pub(super) async fn ensure_pending_retry_input_in_tx<DB>(
-    tx: &mut Transaction<'_, DB>,
-    state: &PartitionState,
-    input: &TrustedProjectionInput,
-) -> Result<(), ProjectionProtocolError>
-where
-    DB: SqlxRepoBackend,
-    for<'c> &'c mut DB::Connection: Executor<'c, Database = DB>,
-    DB::Arguments: IntoArguments<DB>,
-    for<'q> i64: Type<DB> + sqlx::Decode<'q, DB>,
-    for<'q> String: Type<DB> + sqlx::Decode<'q, DB>,
-    for<'q> Vec<u8>: Type<DB> + sqlx::Decode<'q, DB>,
-    for<'q> &'q str: Encode<'q, DB> + Type<DB>,
-    for<'q> &'q [u8]: Encode<'q, DB> + Type<DB>,
-    for<'r> &'r str: sqlx::ColumnIndex<DB::Row>,
-{
-    let Some(failure_id) = &state.pending_retry_failure_id else {
-        return Ok(());
-    };
-    let failure = failure_in_tx(
-        tx,
-        input.cursor.topology(),
-        input.cursor.projection_partition(),
-        failure_id,
-        &state.change_epoch,
-    )
-    .await?
-    .ok_or_else(|| {
-        corrupt_storage(format!(
-            "pending projection retry failure `{failure_id}` is missing"
-        ))
-    })?;
-    if failure.failure.generation.checked_next()? != state.active_generation {
-        return Err(corrupt_storage(format!(
-            "pending retry failure generation {} does not precede active generation {}",
-            failure.failure.generation.get(),
-            state.active_generation.get()
-        )));
-    }
-    if failure.failure.input != input.cursor {
-        return Err(ProjectionProtocolError::IncomparableInput);
-    }
-    if failure.failure.input_fingerprint != input.fingerprint
-        || failure.failure.message_id != input.message_id
-        || failure.failure.causation_id != input.causation_id
-        || failure.failure.gap_free != input.gap_free
-    {
-        return Err(ProjectionProtocolError::InputCorruption);
-    }
-    Ok(())
 }
 
 pub(super) async fn insert_failure_in_tx<DB>(

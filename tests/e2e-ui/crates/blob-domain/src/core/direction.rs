@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, distributed::table::JsonType,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum Direction {
     Up,
@@ -10,6 +12,8 @@ pub enum Direction {
 }
 
 impl Direction {
+    pub const ALL: [Self; 4] = [Self::Up, Self::Down, Self::Left, Self::Right];
+
     pub fn parse(s: &str) -> Option<Self> {
         match s.trim().to_ascii_lowercase().as_str() {
             "up" => Some(Self::Up),

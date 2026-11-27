@@ -9,7 +9,7 @@ use rand::rngs::StdRng;
 use rand::seq::SliceRandom;
 use rand::{Rng, SeedableRng};
 
-use crate::models::tile;
+use crate::core::Tile;
 
 /// Playfield size. Original is 12×12; we use 6×6 so Hamiltonian passability
 /// checks stay fast on the command path while still varying layouts.
@@ -18,26 +18,26 @@ pub const DEFAULT_SIZE: usize = 6;
 pub const DEFAULT_HOLES: usize = 2;
 
 /// Fixed map used only in unit tests that need determinism without RNG.
-pub fn demo_map() -> Vec<Vec<u8>> {
-    use tile::*;
+pub fn demo_map() -> Vec<Vec<Tile>> {
+    use Tile::*;
     vec![
-        vec![PLAYER, UNVISITED, UNVISITED, UNVISITED, HOLE],
-        vec![UNVISITED, UNVISITED, UNVISITED, UNVISITED, UNVISITED],
-        vec![UNVISITED, UNVISITED, HOLE, UNVISITED, UNVISITED],
-        vec![UNVISITED, UNVISITED, UNVISITED, UNVISITED, UNVISITED],
-        vec![UNVISITED, UNVISITED, UNVISITED, UNVISITED, UNVISITED],
+        vec![Player, Unvisited, Unvisited, Unvisited, Hole],
+        vec![Unvisited, Unvisited, Unvisited, Unvisited, Unvisited],
+        vec![Unvisited, Unvisited, Hole, Unvisited, Unvisited],
+        vec![Unvisited, Unvisited, Unvisited, Unvisited, Unvisited],
+        vec![Unvisited, Unvisited, Unvisited, Unvisited, Unvisited],
     ]
 }
 
 /// Generate a random, **solvable** level. Retries until passable or falls back
 /// to a dense no-hole grid (always solvable).
-pub fn generate_level(level_index: u32) -> Vec<Vec<u8>> {
+pub fn generate_level(level_index: u32) -> Vec<Vec<Tile>> {
     let mut rng = StdRng::from_entropy();
     generate_level_with(&mut rng, level_index)
 }
 
 /// Same as [`generate_level`] with an injected RNG (tests / seeds).
-pub fn generate_level_with<R: Rng>(rng: &mut R, level_index: u32) -> Vec<Vec<u8>> {
+pub fn generate_level_with<R: Rng>(rng: &mut R, level_index: u32) -> Vec<Vec<Tile>> {
     let size = DEFAULT_SIZE;
     // Slightly more holes as levels progress (capped).
     let holes = (DEFAULT_HOLES + level_index.saturating_sub(1) as usize).min(size / 2);
@@ -54,13 +54,13 @@ pub fn generate_level_with<R: Rng>(rng: &mut R, level_index: u32) -> Vec<Vec<u8>
     empty_playable(size)
 }
 
-fn empty_playable(size: usize) -> Vec<Vec<u8>> {
-    let mut map = vec![vec![tile::UNVISITED; size]; size];
-    map[0][0] = tile::PLAYER;
+fn empty_playable(size: usize) -> Vec<Vec<Tile>> {
+    let mut map = vec![vec![Tile::Unvisited; size]; size];
+    map[0][0] = Tile::Player;
     map
 }
 
-fn try_generate<R: Rng>(rng: &mut R, size: usize, hole_count: usize) -> Option<Vec<Vec<u8>>> {
+fn try_generate<R: Rng>(rng: &mut R, size: usize, hole_count: usize) -> Option<Vec<Vec<Tile>>> {
     let mut map = empty_playable(size);
     let mut candidates: Vec<(usize, usize)> = Vec::new();
     for r in 0..size {
@@ -85,7 +85,7 @@ fn try_generate<R: Rng>(rng: &mut R, size: usize, hole_count: usize) -> Option<V
             break;
         }
         if hole_ok(&placed, r, c, size) {
-            map[r][c] = tile::HOLE;
+            map[r][c] = Tile::Hole;
             placed.push((r, c));
         }
     }
@@ -123,11 +123,11 @@ fn hole_ok(placed: &[(usize, usize)], r: usize, c: usize, size: usize) -> bool {
     true
 }
 
-fn free_cells(map: &[Vec<u8>]) -> Vec<(usize, usize)> {
+fn free_cells(map: &[Vec<Tile>]) -> Vec<(usize, usize)> {
     let mut out = Vec::new();
     for (r, row) in map.iter().enumerate() {
         for (c, &t) in row.iter().enumerate() {
-            if t != tile::HOLE {
+            if t != Tile::Hole {
                 out.push((r, c));
             }
         }
@@ -135,7 +135,7 @@ fn free_cells(map: &[Vec<u8>]) -> Vec<(usize, usize)> {
     out
 }
 
-fn is_connected_free(map: &[Vec<u8>]) -> bool {
+fn is_connected_free(map: &[Vec<Tile>]) -> bool {
     let free = free_cells(map);
     if free.is_empty() {
         return false;
@@ -144,7 +144,7 @@ fn is_connected_free(map: &[Vec<u8>]) -> bool {
     let w = map[0].len();
     let mut seen = vec![vec![false; w]; h];
     let mut stack = vec![(0usize, 0usize)];
-    if map[0][0] == tile::HOLE {
+    if map[0][0] == Tile::Hole {
         return false;
     }
     seen[0][0] = true;
@@ -152,7 +152,7 @@ fn is_connected_free(map: &[Vec<u8>]) -> bool {
     while let Some((r, c)) = stack.pop() {
         count += 1;
         for (nr, nc) in neighbors(r, c, h, w) {
-            if map[nr][nc] != tile::HOLE && !seen[nr][nc] {
+            if map[nr][nc] != Tile::Hole && !seen[nr][nc] {
                 seen[nr][nc] = true;
                 stack.push((nr, nc));
             }
@@ -179,7 +179,7 @@ fn neighbors(r: usize, c: usize, h: usize, w: usize) -> Vec<(usize, usize)> {
 }
 
 /// True if some path visits every non-hole cell exactly once from the player.
-pub fn is_hamiltonian_passable(map: &[Vec<u8>]) -> bool {
+pub fn is_hamiltonian_passable(map: &[Vec<Tile>]) -> bool {
     let free = free_cells(map);
     let n = free.len();
     if n == 0 {
@@ -242,8 +242,8 @@ mod tests {
         assert!(is_hamiltonian_passable(&b));
         // Same seed stream still progresses — maps should usually differ
         assert_ne!(a, b, "expected variety across sequential generates");
-        assert_eq!(a[0][0], tile::PLAYER);
-        assert_eq!(b[0][0], tile::PLAYER);
+        assert_eq!(a[0][0], Tile::Player);
+        assert_eq!(b[0][0], Tile::Player);
     }
 
     #[test]
@@ -255,9 +255,9 @@ mod tests {
     fn disconnected_not_passable() {
         let mut m = empty_playable(3);
         // Wall of holes isolating bottom-right
-        m[0][1] = tile::HOLE;
-        m[1][0] = tile::HOLE;
-        m[1][1] = tile::HOLE;
+        m[0][1] = Tile::Hole;
+        m[1][0] = Tile::Hole;
+        m[1][1] = Tile::Hole;
         assert!(!is_connected_free(&m) || !is_hamiltonian_passable(&m));
     }
 }

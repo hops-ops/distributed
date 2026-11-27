@@ -20,7 +20,7 @@ use crate::js_framework::{
 use super::{
     digest_bytes, DistributedSourceIdentity, LifecycleBuildConfig, LifecycleDevConfig,
     LifecycleDevProbe, LifecycleDevProcess, LifecycleError, LifecycleExecutor,
-    LifecycleProjectPlan, LIFECYCLE_BUILD_CONFIG_SCHEMA_VERSION,
+    LifecycleProjectPlan, LIFECYCLE_BUILD_CONFIG_SCHEMA_VERSION, LIFECYCLE_CLI_EXECUTABLE_ENV,
 };
 
 const APPLICATION_NODE: &str = "application";
@@ -34,7 +34,7 @@ const COLD_RUNTIME_READY_TIMEOUT_MS: u64 = 300_000;
 pub struct DiscoveredLifecycleProject {
     /// Stable project name derived from the Cargo workspace directory.
     pub name: String,
-    /// Package exporting the typed `distributed::ApplicationManifest`.
+    /// Package exporting the typed `distributed::application::ApplicationManifest`.
     pub application_package: String,
     /// Fully-qualified zero-argument Rust export used for typed introspection.
     pub application_entrypoint: String,
@@ -47,14 +47,73 @@ pub struct DiscoveredLifecycleProject {
     /// Canonical Cargo workspace root. This can be narrower than the lifecycle
     /// root when the application owns a repository-local sibling UI.
     pub(crate) cargo_root: PathBuf,
-    /// Canonical SvelteKit root, discovered conventionally or from Cargo
-    /// workspace metadata.
-    pub ui: Option<PathBuf>,
+    /// The project's UI, discovered conventionally or from Cargo workspace
+    /// metadata.
+    pub ui: Option<UiAdapter>,
     /// Resolved Distributed browser runtime, when the UI consumes it.
     pub(crate) javascript: Option<JavascriptFrameworkPackage>,
     /// Internal lifecycle graph synthesized from the discovered project.
     pub plan: LifecycleProjectPlan,
 }
+
+/// A project's UI: where it is and how `build` and `dev` run it.
+///
+/// The defaults are a SvelteKit application under npm. A project replaces any
+/// of them in `[workspace.metadata.distributed.ui]` of its `Cargo.toml`, which
+/// is also where it names the environment its own dev server needs.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct UiAdapter {
+    /// UI directory, relative to the Cargo workspace root.
+    pub path: String,
+    /// Canonical UI directory resolved from `path`.
+    #[serde(skip)]
+    pub root: PathBuf,
+    /// Program that runs `install`, `check`, `build` and `dev`.
+    pub package_manager: String,
+    /// Arguments that install dependencies. When unset: `ci` beside a
+    /// `package-lock.json`, otherwise `install`.
+    pub install: Option<Vec<String>>,
+    /// Arguments that check the UI during `build`. Empty skips the step.
+    pub check: Vec<String>,
+    /// Arguments that compile the UI during `build`. Empty skips the step.
+    pub build: Vec<String>,
+    /// Arguments that start the dev server. `{host}` and `{port}` are the
+    /// address it must bind.
+    pub dev: Vec<String>,
+    /// Host of the dev server. `UI_HOST` overrides it; `UI_BIND` overrides
+    /// the bind address alone.
+    pub host: String,
+    /// Port of the dev server. `UI_PORT` overrides it.
+    pub port: u16,
+    /// Environment of the dev server. `{api_url}` and `{ui_url}` are the
+    /// addresses of the running session; a value that uses one is always set.
+    /// Any other value is a development default: a variable that the shell or
+    /// the project's `.env` file already sets keeps that value.
+    pub env: BTreeMap<String, String>,
+}
+
+impl Default for UiAdapter {
+    fn default() -> Self {
+        let args = |args: &[&str]| args.iter().map(|arg| (*arg).to_string()).collect();
+        Self {
+            path: "ui".to_string(),
+            root: PathBuf::new(),
+            package_manager: "npm".to_string(),
+            install: None,
+            check: args(&["run", "check", "--if-present"]),
+            build: args(&["run", "build"]),
+            dev: args(&["run", "dev", "--", "--host", "{host}", "--port", "{port}"]),
+            host: "localhost".to_string(),
+            port: 5180,
+            env: BTreeMap::new(),
+        }
+    }
+}
+
+/// Address the runtime binds unless `BIND` or
+/// `[workspace.metadata.distributed.runtime] bind` says otherwise.
+const DEFAULT_API_BIND: &str = "127.0.0.1:8791";
 
 #[derive(Debug, Deserialize)]
 struct CargoMetadata {
@@ -107,7 +166,6 @@ struct ClientLifecycle {
 pub fn discover_lifecycle_project(
     requested: impl AsRef<Path>,
     executable: impl AsRef<Path>,
-    command_prefix: &[&str],
     out: Option<&Path>,
 ) -> Result<DiscoveredLifecycleProject, LifecycleError> {
     let requested = requested.as_ref();
@@ -178,14 +236,14 @@ pub fn discover_lifecycle_project(
         .unwrap_or(&application.package)
         .to_string();
     let ui = discover_ui(&metadata.metadata, &root)?;
-    let lifecycle_root = lifecycle_root(&root, ui.as_deref())?;
-    let javascript = ui
-        .as_ref()
-        .map(|ui| discover_javascript_framework(ui))
+    let ui_root = ui.as_ref().map(|ui| ui.root.as_path());
+    let lifecycle_root = lifecycle_root(&root, ui_root)?;
+    let javascript = ui_root
+        .map(discover_javascript_framework)
         .transpose()?
         .flatten();
     let mut sources = workspace_sources(&lifecycle_root, &root, &workspace_packages)?;
-    let mut client_lifecycle = discover_client_lifecycle(&lifecycle_root, ui.as_deref())?;
+    let mut client_lifecycle = discover_client_lifecycle(&lifecycle_root, ui_root)?;
     if let Some(receipt) = javascript
         .as_ref()
         .and_then(|package| package.lifecycle_receipt(&root))
@@ -241,13 +299,11 @@ pub fn discover_lifecycle_project(
         provenance: ArtifactProvenance {
             sources,
             generator: "distributed.application-manifest".to_string(),
-            source_revision: None,
             glob_limit: None,
         },
         predecessor: None,
         outputs: BTreeMap::from([("manifest".to_string(), APPLICATION_OUTPUT.to_string())]),
         lifecycle: BTreeSet::from(["build".to_string(), "check".to_string(), "dev".to_string()]),
-        environment_policy: None,
     };
     let mut entries = BTreeMap::from([(APPLICATION_NODE.to_string(), application_entry)]);
     if let Some(client) = &client_lifecycle {
@@ -269,7 +325,6 @@ pub fn discover_lifecycle_project(
                 provenance: ArtifactProvenance {
                     sources: client_sources,
                     generator: "distributed.sveltekit-clients".to_string(),
-                    source_revision: None,
                     glob_limit: Some(MAX_CATALOG_GLOB_MATCHES),
                 },
                 predecessor: Some(ArtifactPredecessor {
@@ -282,7 +337,6 @@ pub fn discover_lifecycle_project(
                     "check".to_string(),
                     "dev".to_string(),
                 ]),
-                environment_policy: None,
             },
         );
     }
@@ -291,15 +345,21 @@ pub fn discover_lifecycle_project(
         entries,
     };
 
+    let api_bind = match metadata.metadata.pointer("/distributed/runtime/bind") {
+        None => DEFAULT_API_BIND,
+        Some(bind) => bind.as_str().ok_or_else(|| {
+            LifecycleError::new("workspace Distributed runtime `bind` must be a string")
+        })?,
+    };
     let dev = lifecycle_dev(
         &lifecycle_root,
         &root,
         &runtime,
-        ui.as_deref(),
+        api_bind,
+        ui.as_ref(),
         javascript.as_ref(),
         client_lifecycle.is_some(),
         &executable,
-        command_prefix,
     );
     let cargo_relative = root.strip_prefix(&lifecycle_root).map_err(|_| {
         LifecycleError::new("Cargo workspace escapes the application lifecycle root")
@@ -309,24 +369,20 @@ pub fn discover_lifecycle_project(
     } else {
         format!("{{root}}/{}/Cargo.toml", portable_path(cargo_relative)?)
     };
-    let mut describe_args = command_prefix
-        .iter()
-        .map(|arg| (*arg).to_string())
-        .chain([
-            "describe".to_string(),
-            "--manifest-path".to_string(),
-            cargo_manifest,
-            "--package".to_string(),
-            application.package.clone(),
-            "--entrypoint".to_string(),
-            entrypoint.clone(),
-            "--distributed-path".to_string(),
-            distributed_root.to_string_lossy().into_owned(),
-        ])
-        .collect::<Vec<_>>();
+    let mut describe_args = Vec::from([
+        "describe".to_string(),
+        "--manifest-path".to_string(),
+        cargo_manifest,
+        "--package".to_string(),
+        application.package.clone(),
+        "--entrypoint".to_string(),
+        entrypoint.clone(),
+        "--distributed-path".to_string(),
+        distributed_root.to_string_lossy().into_owned(),
+    ]);
     if let Some(wasm_pack_launcher) = javascript
         .as_ref()
-        .zip(ui.as_ref())
+        .zip(ui_root)
         .map(|(javascript, ui)| javascript.wasm_pack_launcher(ui))
     {
         describe_args.extend([
@@ -349,8 +405,7 @@ pub fn discover_lifecycle_project(
                 "distributed.clients.json requires @hops-ops/distributed in the UI package",
             )
         })?;
-        let compiler = ui
-            .as_ref()
+        let compiler = ui_root
             .expect("client lifecycle has a UI")
             .join("node_modules/@hops-ops/distributed/dist/sveltekit/lifecycle-compiler.js");
         let identity = digest_bytes(
@@ -409,6 +464,7 @@ pub fn discover_lifecycle_project(
             catalog,
             config,
             out: root.join(out.unwrap_or_else(|| Path::new(".distributed/lifecycle"))),
+            cli_executable: executable.clone(),
         },
     })
 }
@@ -434,34 +490,39 @@ fn cargo_metadata(manifest: &Path) -> Result<CargoMetadata, LifecycleError> {
 pub(crate) fn discover_ui(
     workspace_metadata: &Value,
     root: &Path,
-) -> Result<Option<PathBuf>, LifecycleError> {
-    let declared = match workspace_metadata.pointer("/distributed/ui") {
-        None => None,
-        Some(ui) => Some(ui.get("path").and_then(Value::as_str).ok_or_else(|| {
-            LifecycleError::new("workspace Distributed UI metadata requires a string `path`")
-        })?),
-    };
-    let candidate = match declared {
-        Some(path) => {
-            if path.is_empty()
-                || path.trim() != path
-                || Path::new(path).is_absolute()
-                || path.contains('\0')
-            {
-                return Err(LifecycleError::new(
-                    "workspace Distributed UI path must be a non-empty relative path",
-                ));
-            }
-            root.join(path)
-        }
+) -> Result<Option<UiAdapter>, LifecycleError> {
+    let mut adapter = match workspace_metadata.pointer("/distributed/ui") {
         None => {
-            let conventional = root.join("ui");
-            if !conventional.join("package.json").is_file() {
+            let conventional = UiAdapter::default();
+            if !root.join(&conventional.path).join("package.json").is_file() {
                 return Ok(None);
             }
             conventional
         }
+        Some(declared) => {
+            serde_json::from_value::<UiAdapter>(declared.clone()).map_err(|error| {
+                LifecycleError::new(format!(
+                    "invalid `[workspace.metadata.distributed.ui]`: {error}"
+                ))
+            })?
+        }
     };
+    let path = adapter.path.as_str();
+    if path.is_empty()
+        || path.trim() != path
+        || Path::new(path).is_absolute()
+        || path.contains('\0')
+    {
+        return Err(LifecycleError::new(
+            "workspace Distributed UI path must be a non-empty relative path",
+        ));
+    }
+    if adapter.package_manager.is_empty() || adapter.dev.is_empty() {
+        return Err(LifecycleError::new(
+            "workspace Distributed UI requires a `package_manager` and a `dev` command",
+        ));
+    }
+    let candidate = root.join(path);
     let ui = candidate.canonicalize().map_err(|error| {
         LifecycleError::new(format!(
             "failed to resolve Distributed UI `{}`: {error}",
@@ -491,7 +552,8 @@ pub(crate) fn discover_ui(
             )));
         }
     }
-    Ok(Some(ui))
+    adapter.root = ui;
+    Ok(Some(adapter))
 }
 
 fn discover_application(
@@ -997,21 +1059,15 @@ fn lifecycle_dev(
     root: &Path,
     cargo_root: &Path,
     runtime: &RuntimeTarget,
-    ui: Option<&Path>,
+    api_bind: &str,
+    ui: Option<&UiAdapter>,
     javascript: Option<&JavascriptFrameworkPackage>,
     lifecycle_owns_client_compile: bool,
     executable: &Path,
-    command_prefix: &[&str],
 ) -> LifecycleDevConfig {
-    let bind = std::env::var("BIND").unwrap_or_else(|_| "127.0.0.1:8791".to_string());
+    let bind = std::env::var("BIND").unwrap_or_else(|_| api_bind.to_string());
     let api_address = loopback_address(&bind);
     let api_url = format!("http://{api_address}");
-    let ui_host = std::env::var("UI_HOST").unwrap_or_else(|_| "localhost".to_string());
-    let ui_bind = std::env::var("UI_BIND").unwrap_or_else(|_| ui_host.clone());
-    let ui_port = std::env::var("UI_PORT").unwrap_or_else(|_| "5180".to_string());
-    let ui_url = std::env::var("UI_URL")
-        .or_else(|_| std::env::var("AUTH_URL"))
-        .unwrap_or_else(|_| format!("http://{ui_host}:{ui_port}"));
     let cargo_cwd = cargo_root
         .strip_prefix(root)
         .ok()
@@ -1039,7 +1095,7 @@ fn lifecycle_dev(
             ready_after_ms: 100,
             ready: Some(LifecycleDevProbe {
                 program: executable.to_string_lossy().into_owned(),
-                args: probe_args(command_prefix, api_address),
+                args: probe_args(api_address),
                 interval_ms: 250,
                 // `cargo run` may populate an empty target directory in a fresh
                 // worktree or development container. A real process failure is
@@ -1050,24 +1106,39 @@ fn lifecycle_dev(
         },
     )]);
     if let Some(ui) = ui {
-        let (cwd, external_cwd) = match ui.strip_prefix(root) {
+        let (cwd, external_cwd) = match ui.root.strip_prefix(root) {
             Ok(relative) if relative.as_os_str().is_empty() => (None, false),
             Ok(relative) => (
                 Some(portable_path(relative).expect("validated UI path")),
                 false,
             ),
-            Err(_) => (Some(ui.to_string_lossy().into_owned()), true),
+            Err(_) => (Some(ui.root.to_string_lossy().into_owned()), true),
         };
-        let mut ui_env = BTreeMap::from([
+        let ui_host = std::env::var("UI_HOST").unwrap_or_else(|_| ui.host.clone());
+        let ui_bind = std::env::var("UI_BIND").unwrap_or_else(|_| ui_host.clone());
+        let ui_port = std::env::var("UI_PORT").unwrap_or_else(|_| ui.port.to_string());
+        let ui_url = std::env::var("PUBLIC_ORIGIN")
+            .or_else(|_| std::env::var("UI_URL"))
+            .unwrap_or_else(|_| format!("http://{ui_host}:{ui_port}"));
+        let session = |value: &str| {
+            value
+                .replace("{api_url}", &api_url)
+                .replace("{ui_url}", &ui_url)
+        };
+        let mut ui_env = BTreeMap::new();
+        for (name, declared) in &ui.env {
+            let value = session(declared);
+            // A literal is the application's development default.
+            if value != *declared || std::env::var_os(name).is_none() {
+                ui_env.insert(name.clone(), value);
+            }
+        }
+        ui_env.extend([
             ("DISTRIBUTED_API_ORIGIN".to_string(), api_url.clone()),
-            ("E2E_API_ORIGIN".to_string(), api_url.clone()),
             (
-                "AUTH_SECRET".to_string(),
-                std::env::var("AUTH_SECRET")
-                    .unwrap_or_else(|_| "distributed-local-development-only-secret".to_string()),
+                LIFECYCLE_CLI_EXECUTABLE_ENV.to_string(),
+                executable.to_string_lossy().into_owned(),
             ),
-            ("AUTH_URL".to_string(), ui_url.clone()),
-            ("AUTH_USE_SECURE_COOKIES".to_string(), "false".to_string()),
         ]);
         if lifecycle_owns_client_compile {
             ui_env.insert(
@@ -1082,16 +1153,12 @@ fn lifecycle_dev(
         processes.insert(
             "ui".to_string(),
             LifecycleDevProcess {
-                program: "npm".to_string(),
-                args: vec![
-                    "run".to_string(),
-                    "dev".to_string(),
-                    "--".to_string(),
-                    "--host".to_string(),
-                    ui_bind.clone(),
-                    "--port".to_string(),
-                    ui_port.clone(),
-                ],
+                program: ui.package_manager.clone(),
+                args: ui
+                    .dev
+                    .iter()
+                    .map(|arg| arg.replace("{host}", &ui_bind).replace("{port}", &ui_port))
+                    .collect(),
                 cwd,
                 external_cwd,
                 env: ui_env,
@@ -1104,10 +1171,7 @@ fn lifecycle_dev(
                 ready_after_ms: 100,
                 ready: Some(LifecycleDevProbe {
                     program: executable.to_string_lossy().into_owned(),
-                    args: probe_args(
-                        command_prefix,
-                        loopback_address(&socket_address(&ui_bind, &ui_port)),
-                    ),
+                    args: probe_args(loopback_address(&socket_address(&ui_bind, &ui_port))),
                     interval_ms: 250,
                     timeout_ms: 60_000,
                 }),
@@ -1115,17 +1179,13 @@ fn lifecycle_dev(
         );
     }
     if let Some(package_root) = javascript.and_then(JavascriptFrameworkPackage::local_root) {
-        let args = command_prefix
-            .iter()
-            .map(|arg| (*arg).to_string())
-            .chain([
-                "__js-watch".to_string(),
-                "--package-root".to_string(),
-                package_root.to_string_lossy().into_owned(),
-                "--project-root".to_string(),
-                cargo_root.to_string_lossy().into_owned(),
-            ])
-            .collect();
+        let args = Vec::from([
+            "__js-watch".to_string(),
+            "--package-root".to_string(),
+            package_root.to_string_lossy().into_owned(),
+            "--project-root".to_string(),
+            cargo_root.to_string_lossy().into_owned(),
+        ]);
         processes.insert(
             "framework-js".to_string(),
             LifecycleDevProcess {
@@ -1133,7 +1193,10 @@ fn lifecycle_dev(
                 args,
                 cwd: None,
                 external_cwd: false,
-                env: BTreeMap::new(),
+                env: BTreeMap::from([(
+                    LIFECYCLE_CLI_EXECUTABLE_ENV.to_string(),
+                    executable.to_string_lossy().into_owned(),
+                )]),
                 url: None,
                 restart_on: BTreeSet::new(),
                 ready_after_ms: 100,
@@ -1150,12 +1213,8 @@ fn lifecycle_dev(
     }
 }
 
-fn probe_args(command_prefix: &[&str], address: String) -> Vec<String> {
-    command_prefix
-        .iter()
-        .map(|arg| (*arg).to_string())
-        .chain(["__probe".to_string(), "--address".to_string(), address])
-        .collect()
+fn probe_args(address: String) -> Vec<String> {
+    vec!["__probe".to_string(), "--address".to_string(), address]
 }
 
 fn loopback_address(bind: &str) -> String {
@@ -1251,8 +1310,8 @@ mod tests {
         assert_eq!(loopback_address("[::1]:8791"), "[::1]:8791");
         assert_eq!(socket_address("localhost", "5180"), "localhost:5180");
         assert_eq!(
-            probe_args(&["service"], "localhost:5180".to_string()),
-            ["service", "__probe", "--address", "localhost:5180"]
+            probe_args("localhost:5180".to_string()),
+            ["__probe", "--address", "localhost:5180"]
         );
     }
 
@@ -1280,7 +1339,139 @@ mod tests {
         .unwrap()
         .unwrap();
 
-        assert_eq!(discovered, ui.canonicalize().unwrap());
+        assert_eq!(discovered.root, ui.canonicalize().unwrap());
+        assert_eq!(
+            UiAdapter {
+                root: PathBuf::new(),
+                ..discovered
+            },
+            UiAdapter {
+                path: "../../clients/web".to_string(),
+                ..UiAdapter::default()
+            },
+            "an undeclared key keeps its default"
+        );
+    }
+
+    #[test]
+    fn a_conventional_ui_needs_no_metadata_and_a_misspelled_key_is_refused() {
+        let project = tempfile::tempdir().unwrap();
+        let root = project.path().canonicalize().unwrap();
+        assert_eq!(discover_ui(&Value::Null, &root).unwrap(), None);
+        fs::create_dir_all(root.join("ui")).unwrap();
+        fs::write(root.join("ui/package.json"), "{}").unwrap();
+
+        let conventional = discover_ui(&Value::Null, &root).unwrap().unwrap();
+        assert_eq!(
+            conventional,
+            UiAdapter {
+                root: root.join("ui"),
+                ..UiAdapter::default()
+            }
+        );
+        // Declaring only what the application needs keeps the conventional path.
+        let declared = discover_ui(
+            &serde_json::json!({ "distributed": { "ui": { "env": { "API": "{api_url}" } } } }),
+            &root,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(declared.root, root.join("ui"));
+
+        let error = discover_ui(
+            &serde_json::json!({ "distributed": { "ui": { "pakage_manager": "pnpm" } } }),
+            &root,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("[workspace.metadata.distributed.ui]")
+                && error.contains("pakage_manager"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn the_ui_adapter_owns_the_dev_command_and_its_environment() {
+        let project = tempfile::tempdir().unwrap();
+        let ui = project.path().join("ui");
+        fs::create_dir_all(&ui).unwrap();
+        let adapter = UiAdapter {
+            root: ui,
+            package_manager: "pnpm".to_string(),
+            dev: vec!["dev".into(), "{host}:{port}".into()],
+            env: BTreeMap::from([
+                ("FIXTURE_API".to_string(), "{api_url}/graphql".to_string()),
+                ("FIXTURE_ORIGIN".to_string(), "{ui_url}".to_string()),
+                // No test process has this variable; every one has `PATH`.
+                (
+                    "DISTRIBUTED_FIXTURE_DEFAULT".to_string(),
+                    "development".to_string(),
+                ),
+                ("PATH".to_string(), "never".to_string()),
+            ]),
+            ..UiAdapter::default()
+        };
+        let executable = std::env::current_exe().unwrap();
+        let config = lifecycle_dev(
+            project.path(),
+            project.path(),
+            &RuntimeTarget {
+                package: "fixture-runner".into(),
+                binary: "fixture".into(),
+            },
+            "127.0.0.1:9000",
+            Some(&adapter),
+            None,
+            false,
+            &executable,
+        );
+
+        config.validate().unwrap();
+        let api_url = config.processes["api"].url.clone().unwrap();
+        let process = &config.processes["ui"];
+        let ui_url = process.url.clone().unwrap();
+        assert_eq!(process.program, "pnpm");
+        assert_eq!(process.args[0], "dev");
+        assert!(!process.args[1].contains('{'), "{:?}", process.args);
+        assert_eq!(process.env["FIXTURE_API"], format!("{api_url}/graphql"));
+        assert_eq!(process.env["FIXTURE_ORIGIN"], ui_url);
+        assert_eq!(process.env["DISTRIBUTED_FIXTURE_DEFAULT"], "development");
+        assert!(
+            !process.env.contains_key("PATH"),
+            "a variable the shell sets keeps its value"
+        );
+        assert_eq!(process.env["DISTRIBUTED_API_ORIGIN"], api_url);
+        // Nothing application-specific is passed unless the application asks.
+        let conventional = lifecycle_dev(
+            project.path(),
+            project.path(),
+            &RuntimeTarget {
+                package: "fixture-runner".into(),
+                binary: "fixture".into(),
+            },
+            DEFAULT_API_BIND,
+            Some(&UiAdapter {
+                root: adapter.root.clone(),
+                ..UiAdapter::default()
+            }),
+            None,
+            false,
+            &executable,
+        );
+        assert_eq!(
+            conventional.processes["ui"]
+                .env
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            ["DISTRIBUTED_API_ORIGIN", LIFECYCLE_CLI_EXECUTABLE_ENV]
+        );
+        assert_eq!(conventional.processes["ui"].program, "npm");
+        assert_eq!(
+            conventional.processes["ui"].args[..5],
+            ["run", "dev", "--", "--host", "localhost"][..],
+        );
     }
 
     #[test]
@@ -1330,11 +1521,14 @@ mod tests {
                 package: "fixture-runner".into(),
                 binary: "fixture".into(),
             },
-            Some(&ui),
+            DEFAULT_API_BIND,
+            Some(&UiAdapter {
+                root: ui.clone(),
+                ..UiAdapter::default()
+            }),
             Some(&javascript),
             true,
             &executable,
-            &[],
         );
 
         config.validate().unwrap();
@@ -1359,6 +1553,13 @@ mod tests {
             .find(|args| args[0] == "--project-root")
             .map(|args| args[1].as_str());
         assert_eq!(project_root, application.to_str());
+        assert_eq!(
+            framework
+                .env
+                .get(LIFECYCLE_CLI_EXECUTABLE_ENV)
+                .map(String::as_str),
+            executable.to_str()
+        );
     }
 
     #[test]
@@ -1448,11 +1649,14 @@ mod tests {
                 package: "fixture-runner".into(),
                 binary: "fixture".into(),
             },
-            Some(&ui),
+            DEFAULT_API_BIND,
+            Some(&UiAdapter {
+                root: ui.clone(),
+                ..UiAdapter::default()
+            }),
             None,
             true,
             &executable,
-            &[],
         );
 
         config.validate().unwrap();
@@ -1470,6 +1674,13 @@ mod tests {
                 .get("DISTRIBUTED_LIFECYCLE_PROJECT_ROOT")
                 .map(String::as_str),
             project.path().to_str()
+        );
+        assert_eq!(
+            process
+                .env
+                .get(LIFECYCLE_CLI_EXECUTABLE_ENV)
+                .map(String::as_str),
+            executable.to_str()
         );
         assert!(process.restart_on.is_empty());
     }

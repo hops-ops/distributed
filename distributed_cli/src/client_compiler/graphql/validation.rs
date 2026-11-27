@@ -2,8 +2,8 @@ use super::*;
 
 pub(super) fn validate_execution_limits(
     root: &CompiledRoot,
-    kind: RootKind,
-    execution: &ManifestExecutionLimits,
+    kind: ClientRootKind,
+    execution: &ClientExecutionLimits,
     document: &ClientDocument,
     position: Pos,
 ) -> Result<(), ClientCompileError> {
@@ -20,21 +20,13 @@ pub(super) fn validate_execution_limits(
         ));
     }
 
-    let weights = &execution.complexity;
-    let child = compiled_object_complexity(&root.selection, weights);
-    let complexity = match kind {
-        RootKind::List => weights
-            .list_root
-            .saturating_add(weights.list_fanout.saturating_mul(child)),
-        RootKind::ByPk => weights.by_pk.saturating_add(child),
-        RootKind::Aggregate => weights.aggregate.saturating_add(child),
-    };
-    if complexity > execution.max_complexity {
+    let rows = compiled_root_rows(root, kind);
+    if rows > execution.max_rows {
         return Err(source_error(
-            "client.operation.complexity_limit",
+            "client.operation.row_limit",
             format!(
-                "compiled operation complexity {complexity} exceeds the selected service max_complexity {}",
-                execution.max_complexity
+                "compiled operation may return {rows} rows, exceeding the selected service max_rows {}",
+                execution.max_rows
             ),
             document,
             position,
@@ -60,45 +52,74 @@ pub(super) fn compiled_object_depth(selection: &CompiledObject, parent_depth: u6
         .unwrap_or(parent_depth)
 }
 
-pub(super) fn compiled_object_complexity(
-    selection: &CompiledObject,
-    weights: &ManifestComplexityWeights,
-) -> u64 {
-    selection.members.iter().fold(0, |total, member| {
-        let cost = match member {
-            CompiledMember::Scalar(_) => weights.scalar,
-            CompiledMember::Branch(branch) => match branch.semantic {
-                CompiledBranchSemantic::Relationship => {
-                    let child = compiled_object_complexity(&branch.selection, weights);
-                    match branch
-                        .relationship
-                        .as_ref()
-                        .expect("relationship branches retain their compiled descriptor")
-                        .kind
-                    {
-                        ManifestRelationshipKind::BelongsTo => {
-                            weights.belongs_to.saturating_add(child)
+/// The service's row cost ([`row_cost`]) of a compiled root: every list
+/// counts its page size, so nested lists cost about the product of their
+/// limits.
+///
+/// A literal `limit` counts as given (capped by the field's `max_limit`); an
+/// absent one, or a variable whose value is unknown until run time, counts as
+/// the field's `default_limit`. The service checks the actual values again
+/// for every request, so this build-time check refuses only what the defaults
+/// already put over budget.
+pub(super) fn compiled_root_rows(root: &CompiledRoot, kind: ClientRootKind) -> u64 {
+    let limit = page_limit(&root.arguments, root.coverage.as_ref());
+    match kind {
+        ClientRootKind::List => row_cost::page(limit, compiled_object_rows(&root.selection, limit)),
+        ClientRootKind::ByPk => row_cost::one(compiled_object_rows(&root.selection, limit)),
+        ClientRootKind::Aggregate => compiled_object_rows(&root.selection, limit),
+    }
+}
+
+/// Rows nested under one object. `nodes_limit` is the page size of an
+/// aggregate's `nodes`, which take their arguments from the aggregate field.
+fn compiled_object_rows(selection: &CompiledObject, nodes_limit: u64) -> u64 {
+    selection
+        .members
+        .iter()
+        .map(|member| match member {
+            CompiledMember::Scalar(_) => 0,
+            CompiledMember::Branch(branch) => {
+                let limit = page_limit(&branch.arguments, branch.coverage.as_ref());
+                match branch.semantic {
+                    CompiledBranchSemantic::Relationship => {
+                        let nested = compiled_object_rows(&branch.selection, limit);
+                        match branch.cardinality {
+                            Cardinality::Many => row_cost::page(limit, nested),
+                            Cardinality::One => row_cost::one(nested),
                         }
-                        ManifestRelationshipKind::HasMany => weights
-                            .has_many
-                            .saturating_add(weights.list_fanout.saturating_mul(child)),
-                        ManifestRelationshipKind::ManyToMany => weights
-                            .m2m
-                            .saturating_add(weights.list_fanout.saturating_mul(child)),
                     }
+                    CompiledBranchSemantic::Aggregate => {
+                        compiled_object_rows(&branch.selection, limit)
+                    }
+                    CompiledBranchSemantic::AggregateFields => 0,
+                    CompiledBranchSemantic::AggregateNodes => row_cost::page(
+                        nodes_limit,
+                        compiled_object_rows(&branch.selection, nodes_limit),
+                    ),
                 }
-                CompiledBranchSemantic::Aggregate => weights
-                    .aggregate
-                    .saturating_add(compiled_object_complexity(&branch.selection, weights)),
-                CompiledBranchSemantic::AggregateFields => weights.scalar,
-                CompiledBranchSemantic::AggregateNodes => weights
-                    .list_fanout
-                    .saturating_mul(compiled_object_complexity(&branch.selection, weights))
-                    .max(weights.scalar),
-            },
-        };
-        total.saturating_add(cost)
-    })
+            }
+        })
+        .fold(0, u64::saturating_add)
+}
+
+fn page_limit(
+    arguments: &BTreeMap<String, CompiledArgument>,
+    coverage: Option<&CompiledCoverage>,
+) -> u64 {
+    let Some(coverage) = coverage else {
+        return 1;
+    };
+    let default = coverage.default_limit.unwrap_or(1);
+    let literal = coverage
+        .limit_argument
+        .as_ref()
+        .and_then(|name| arguments.get(name))
+        .and_then(|argument| match argument {
+            CompiledArgument::Literal { value, .. } => value.as_u64(),
+            _ => None,
+        });
+    let limit = literal.unwrap_or(default);
+    coverage.max_limit.map_or(limit, |max| limit.min(max))
 }
 
 pub(super) fn filter_depth_from_selection(selection_depth: usize, root_offset: usize) -> u64 {
@@ -109,12 +130,12 @@ pub(super) fn filter_depth_from_selection(selection_depth: usize, root_offset: u
 #[allow(clippy::too_many_arguments)]
 pub(super) fn validate_filter_source(
     source: &CompiledArgument,
-    model: &ManifestModel,
-    input: &ManifestFilterInput,
+    model: &ClientModel,
+    input: &ClientFilterInput,
     expected_type: &str,
     variables: &[CompiledVariable],
     manifest: &ClientManifest,
-    execution: &ManifestExecutionLimits,
+    execution: &ClientExecutionLimits,
     document: &ClientDocument,
     position: Pos,
     depth: u64,
@@ -310,8 +331,8 @@ pub(super) fn validate_filter_source(
 }
 
 pub(super) fn validate_filter_depth(
-    model: &ManifestModel,
-    execution: &ManifestExecutionLimits,
+    model: &ClientModel,
+    execution: &ClientExecutionLimits,
     depth: u64,
     document: &ClientDocument,
     position: Pos,
@@ -376,11 +397,11 @@ pub(super) fn constrain_variable(
 #[allow(clippy::too_many_arguments)]
 pub(super) fn validate_filter_comparison_source(
     source: &CompiledArgument,
-    model: &ManifestModel,
-    field: &ManifestField,
-    semantics: &ManifestFilterField,
+    model: &ClientModel,
+    field: &ClientField,
+    semantics: &ClientFilterField,
     variables: &[CompiledVariable],
-    execution: &ManifestExecutionLimits,
+    execution: &ClientExecutionLimits,
     document: &ClientDocument,
     position: Pos,
     constraints: &mut BTreeMap<String, VariableUseConstraint>,
@@ -583,8 +604,8 @@ pub(super) fn validate_filter_comparison_source(
 
 pub(super) fn validate_compiled_filter_literal(
     source: &CompiledArgument,
-    model: &ManifestModel,
-    field: &ManifestField,
+    model: &ClientModel,
+    field: &ClientField,
     nullable: bool,
     document: &ClientDocument,
     position: Pos,
@@ -604,8 +625,8 @@ pub(super) fn validate_compiled_filter_literal(
 #[allow(clippy::too_many_arguments)]
 pub(super) fn validate_compiled_filter_typed_literal(
     source: &CompiledArgument,
-    model: &ManifestModel,
-    field: &ManifestField,
+    model: &ClientModel,
+    field: &ClientField,
     scalar: &str,
     codec: &str,
     nullable: bool,
@@ -647,8 +668,8 @@ pub(super) fn compiled_literal_json(source: &CompiledArgument) -> Option<JsonVal
 
 pub(super) fn validate_filter_scalar_literal(
     value: &JsonValue,
-    model: &ManifestModel,
-    field: &ManifestField,
+    model: &ClientModel,
+    field: &ClientField,
     nullable: bool,
     document: &ClientDocument,
     position: Pos,
@@ -668,8 +689,8 @@ pub(super) fn validate_filter_scalar_literal(
 #[allow(clippy::too_many_arguments)]
 pub(super) fn validate_filter_typed_literal(
     value: &JsonValue,
-    model: &ManifestModel,
-    field: &ManifestField,
+    model: &ClientModel,
+    field: &ClientField,
     scalar: &str,
     codec: &str,
     nullable: bool,
@@ -805,10 +826,10 @@ pub(super) fn json_singleton(name: &str, value: JsonValue) -> JsonValue {
 #[allow(clippy::too_many_arguments)]
 pub(super) fn validate_filter_literal(
     value: &JsonValue,
-    model: &ManifestModel,
-    input: &ManifestFilterInput,
+    model: &ClientModel,
+    input: &ClientFilterInput,
     manifest: &ClientManifest,
-    execution: &ManifestExecutionLimits,
+    execution: &ClientExecutionLimits,
     document: &ClientDocument,
     position: Pos,
     depth: u64,
@@ -1018,7 +1039,7 @@ pub(super) fn validate_filter_literal(
 
 pub(super) fn validate_order_literal(
     value: &JsonValue,
-    semantics: &ManifestOrderSemantics,
+    semantics: &ClientOrderSemantics,
     document: &ClientDocument,
     position: Pos,
 ) -> Result<(), ClientCompileError> {
@@ -1081,8 +1102,8 @@ pub(super) fn validate_order_literal(
 
 pub(super) fn validate_order_source(
     source: &CompiledArgument,
-    semantics: &ManifestOrderSemantics,
-    argument: Option<&ManifestArgument>,
+    semantics: &ClientOrderSemantics,
+    argument: Option<&ClientArgument>,
     variables: &[CompiledVariable],
     document: &ClientDocument,
     position: Pos,
@@ -1092,14 +1113,12 @@ pub(super) fn validate_order_source(
             validate_order_literal(value, semantics, document, position)
         }
         CompiledArgument::Variable(name) => {
-            let expected = argument
-                .map(ManifestArgument::graphql_type)
-                .ok_or_else(|| {
-                    ClientCompileError::manifest(
-                        "client.manifest.order_argument",
-                        "order semantics exist without an order argument",
-                    )
-                })?;
+            let expected = argument.map(ClientArgument::graphql_type).ok_or_else(|| {
+                ClientCompileError::manifest(
+                    "client.manifest.order_argument",
+                    "order semantics exist without an order argument",
+                )
+            })?;
             validate_nested_variable(name, &expected, variables, document, position)
         }
         CompiledArgument::List(entries) => {
@@ -1156,7 +1175,7 @@ pub(super) fn validate_order_source(
 
 pub(super) fn validate_order_entry_source(
     fields: &BTreeMap<String, CompiledArgument>,
-    semantics: &ManifestOrderSemantics,
+    semantics: &ClientOrderSemantics,
     variables: &[CompiledVariable],
     document: &ClientDocument,
     position: Pos,
@@ -1210,5 +1229,112 @@ pub(super) fn validate_order_entry_source(
             document,
             position,
         )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn object(members: Vec<CompiledMember>) -> CompiledObject {
+        CompiledObject {
+            typename: "todo".into(),
+            storage: CompiledStorage::Embedded,
+            members,
+        }
+    }
+
+    fn branch(
+        semantic: CompiledBranchSemantic,
+        cardinality: Cardinality,
+        limit: Option<u64>,
+        selection: CompiledObject,
+    ) -> CompiledMember {
+        let mut arguments = BTreeMap::new();
+        if let Some(limit) = limit {
+            arguments.insert(
+                "limit".to_owned(),
+                CompiledArgument::Literal {
+                    value: JsonValue::from(limit),
+                    wire: limit.to_string(),
+                },
+            );
+        }
+        CompiledMember::Branch(Box::new(CompiledBranch {
+            semantic,
+            response_key: "items".into(),
+            field: "items".into(),
+            cardinality,
+            nullable: false,
+            arguments,
+            dependencies: Vec::new(),
+            coverage: Some(CompiledCoverage {
+                kind: "offset".into(),
+                offset_argument: None,
+                limit_argument: Some("limit".into()),
+                default_limit: Some(100),
+                max_limit: Some(1000),
+            }),
+            filter: None,
+            order: None,
+            pagination: None,
+            relationship: None,
+            selection,
+        }))
+    }
+
+    /// The compiler's arithmetic is the service's: nested lists multiply,
+    /// one-to-one relationships add one row, aggregates count their nodes.
+    #[test]
+    fn row_cost_matches_the_service() {
+        let many = |limit, selection| {
+            branch(
+                CompiledBranchSemantic::Relationship,
+                Cardinality::Many,
+                limit,
+                selection,
+            )
+        };
+        // orders(limit: 1000) { items(limit: 1000) { id } }
+        let nested = object(vec![many(Some(1000), object(Vec::new()))]);
+        assert_eq!(compiled_object_rows(&nested, 1), 1000);
+        assert_eq!(
+            row_cost::page(1000, compiled_object_rows(&nested, 1)),
+            1_001_000
+        );
+        // An absent limit is the default page.
+        assert_eq!(
+            compiled_object_rows(&object(vec![many(None, object(Vec::new()))]), 1),
+            100
+        );
+        // A belongs-to costs one row plus what it carries.
+        let one = branch(
+            CompiledBranchSemantic::Relationship,
+            Cardinality::One,
+            None,
+            object(Vec::new()),
+        );
+        assert_eq!(compiled_object_rows(&object(vec![one]), 1), 1);
+        // items_aggregate(limit: 7) { aggregate { count } nodes { id } }
+        let aggregate = branch(
+            CompiledBranchSemantic::Aggregate,
+            Cardinality::One,
+            Some(7),
+            object(vec![
+                branch(
+                    CompiledBranchSemantic::AggregateFields,
+                    Cardinality::One,
+                    None,
+                    object(Vec::new()),
+                ),
+                branch(
+                    CompiledBranchSemantic::AggregateNodes,
+                    Cardinality::Many,
+                    None,
+                    object(Vec::new()),
+                ),
+            ]),
+        );
+        assert_eq!(compiled_object_rows(&object(vec![aggregate]), 1), 7);
     }
 }

@@ -1,9 +1,7 @@
 import {
 	type DistributedCommandMetadata
 } from '../../../protocol.js';
-import {
-	type ReplicaCommandArtifact
-} from '../../commands.js';
+import type { ReplicaCommandArtifact } from '../../commands/types.js';
 import type {
 	ReplicaValue
 } from '../../types.js';
@@ -13,6 +11,7 @@ import {
 import { ReplicaCommandRuntimeError } from '../errors.js';
 import { compareCodeUnits } from '../../../lib/compare-code-units.js';
 import { isPlainRecord } from '../../../lib/is-plain-record.js';
+import { isUnsignedInteger, unsignedIntegerMaximum } from '../../../unsigned-integer.js';
 import {
 	comparePropertyKeys,
 	outputInvalid
@@ -164,6 +163,11 @@ export function cloneOutputScalar(
 	value: unknown,
 	path: string
 ): ReplicaValue {
+	const unsignedMaximum = unsignedIntegerMaximum(codec);
+	if (unsignedMaximum !== undefined) {
+		if (!isUnsignedInteger(value, unsignedMaximum)) outputInvalid(path);
+		return value;
+	}
 	switch (codec) {
 		case 'string':
 		case 'string_unvalidated_timestamp':
@@ -251,4 +255,3 @@ export function cloneOutputJson(
 	active.delete(value);
 	return Object.freeze(output);
 }
-

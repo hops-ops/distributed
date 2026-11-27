@@ -6,7 +6,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::table::{TableKind, TableSchema};
+use crate::table::TableSchema;
 
 use super::naming::{
     causal_protocol_type_names, comparison_exp_name, include_postgres_json_comparison_ops,
@@ -58,7 +58,7 @@ impl SdlOptions {
 
 /// Render GraphQL SDL for the given tables (ReadModel only; operational filtered).
 ///
-/// Builds the shared [[surface]] IR first, then emits SDL only from that IR so
+/// Builds the shared [`Surface`](super::Surface) IR first, then emits SDL only from that IR so
 /// dialect ops and model set cannot diverge from `build_surface`.
 pub fn graphql_sdl_for_tables(tables: &[TableSchema]) -> Result<String, String> {
     graphql_sdl_for_tables_with_options(tables, &SdlOptions::default())
@@ -95,12 +95,12 @@ pub fn graphql_sdl_from_surface(surface: &super::surface::Surface) -> Result<Str
 /// ```
 ///
 /// Prefer this over filtering full SDL as text. `grants` maps model_name →
-/// [`RoleGrant`](super::surface::RoleGrant) for the role.
+/// [`ReadPermission`](super::permissions::ReadPermission) for the role.
 pub fn graphql_sdl_for_role(
     tables: &[TableSchema],
     options: &SdlOptions,
     role: &str,
-    grants: &std::collections::BTreeMap<String, super::surface::RoleGrant>,
+    grants: &std::collections::BTreeMap<String, super::permissions::ReadPermission>,
 ) -> Result<String, String> {
     let surface_opts = super::surface::SurfaceOptions {
         dialect: if options.jsonb_operators {
@@ -116,6 +116,22 @@ pub fn graphql_sdl_for_role(
     let full = super::surface::build_surface(tables, &surface_opts)?;
     let role_surface = super::surface::surface_for_role(&full, role, grants)?;
     graphql_sdl_from_surface(&role_surface)
+}
+
+fn external_root_sdl(root: &super::surface::ExternalRoot) -> String {
+    let arguments = if root.arguments.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "({})",
+            root.arguments
+                .iter()
+                .map(|argument| format!("{}: {}", argument.name, argument.graphql_type()))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    };
+    format!("  {}{arguments}: {}\n", root.name, root.graphql_type())
 }
 
 /// Internal renderer over an already IR-filtered set of read models.
@@ -188,6 +204,21 @@ fn graphql_sdl_from_read_models(surface: &super::surface::Surface) -> Result<Str
     for root in &surface.subscription_fields {
         claim_name(&mut subscription_fields, &root.name)?;
     }
+    let external_roots = surface
+        .external
+        .iter()
+        .flat_map(|source| source.roots())
+        .collect::<Vec<_>>();
+    let external_types = super::surface::external::external_types(&surface.external);
+    for name in external_types.keys() {
+        claim_name(&mut type_names, name)?;
+    }
+    for root in &external_roots {
+        claim_name(&mut query_fields, &root.name)?;
+        if surface.subscriptions && root.live {
+            claim_name(&mut subscription_fields, &root.name)?;
+        }
+    }
 
     let mut out = String::new();
 
@@ -228,6 +259,14 @@ fn graphql_sdl_from_read_models(surface: &super::surface::Surface) -> Result<Str
         }
     }
 
+    for ty in external_types.values() {
+        out.push_str(&format!("type {} {{\n", ty.name));
+        for field in &ty.fields {
+            out.push_str(&format!("  {}: {}\n", field.name, field.graphql_type()));
+        }
+        out.push_str("}\n\n");
+    }
+
     emit_command_types(&mut out, &surface.commands, &surface.models)?;
     if has_causal_commands {
         emit_causal_command_protocol_types(&mut out);
@@ -237,7 +276,7 @@ fn graphql_sdl_from_read_models(surface: &super::surface::Surface) -> Result<Str
     // schemas. This is what keeps hidden/partial by-PK identity and per-model
     // aggregate grants aligned with runtime and client manifest output.
     out.push_str("type Query {\n");
-    if surface.query_fields.is_empty() && !has_causal_commands {
+    if surface.query_fields.is_empty() && external_roots.is_empty() && !has_causal_commands {
         // async-graphql requires a non-empty Query object and the runtime uses
         // this same fail-closed sentinel for roles with no readable models.
         // It is intentionally not a client-manifest root.
@@ -247,6 +286,9 @@ fn graphql_sdl_from_read_models(surface: &super::surface::Surface) -> Result<Str
             out.push_str(&surface_root_sdl(field));
             out.push('\n');
         }
+        for root in &external_roots {
+            out.push_str(&external_root_sdl(root));
+        }
         if has_causal_commands {
             out.push_str(&format!(
                 "  {COMMAND_STATUS_ROOT_FIELD}(commandId: ID!): {DISTRIBUTED_COMMAND_STATUS_TYPE}!\n"
@@ -255,11 +297,18 @@ fn graphql_sdl_from_read_models(surface: &super::surface::Surface) -> Result<Str
     }
     out.push_str("}\n");
 
-    if !surface.subscription_fields.is_empty() {
+    let live_external_roots = external_roots
+        .iter()
+        .filter(|root| surface.subscriptions && root.live)
+        .collect::<Vec<_>>();
+    if !surface.subscription_fields.is_empty() || !live_external_roots.is_empty() {
         out.push_str("\ntype Subscription {\n");
         for field in &surface.subscription_fields {
             out.push_str(&surface_root_sdl(field));
             out.push('\n');
+        }
+        for root in live_external_roots {
+            out.push_str(&external_root_sdl(root));
         }
         out.push_str("}\n");
     }
@@ -456,7 +505,7 @@ fn emit_comparison_exp(out: &mut String, scalar: &str, operators: &[String]) {
         let operand = match operator.as_str() {
             "_in" | "_nin" => format!("[{scalar}!]"),
             "_is_null" => "Boolean".into(),
-            "_like" | "_ilike" | "_has_key" => "String".into(),
+            "_like" | "_ilike" | "_icontains" | "_has_key" => "String".into(),
             _ => scalar.to_string(),
         };
         out.push_str(&format!("  {operator}: {operand}\n"));
@@ -574,21 +623,10 @@ fn surface_arguments_sdl(arguments: &[super::surface::SurfaceArgument]) -> Strin
     format!("({arguments})")
 }
 
-/// Filter operational tables and render SDL for a read-model schema catalog.
-pub fn graphql_sdl_from_schemas(
-    schemas: impl IntoIterator<Item = TableSchema>,
-) -> Result<String, String> {
-    let tables: Vec<TableSchema> = schemas
-        .into_iter()
-        .filter(|t| matches!(t.kind, TableKind::ReadModel))
-        .collect();
-    graphql_sdl_for_tables(&tables)
-}
-
 #[cfg(test)]
 mod causal_command_sdl_tests {
     use super::*;
-    use crate::graphql::command_contract::{CommandConsistency, CommandEffects};
+    use crate::command::CommandConsistency;
     use crate::graphql::surface::{SurfaceCommandShape, SurfaceTypeDef};
 
     fn command_surface() -> crate::graphql::surface::Surface {
@@ -615,6 +653,7 @@ mod causal_command_sdl_tests {
                 input: SurfaceCommandShape::Typed(SurfaceTypeDef {
                     name: "CompleteTodoInput".into(),
                     fields: vec![crate::graphql::surface::SurfaceTypeField {
+                        unsigned_integer: None,
                         name: "id".into(),
                         type_name: "String".into(),
                         nullable: false,
@@ -626,6 +665,7 @@ mod causal_command_sdl_tests {
                 output: SurfaceCommandShape::Typed(SurfaceTypeDef {
                     name: "CompleteTodoPayload".into(),
                     fields: vec![crate::graphql::surface::SurfaceTypeField {
+                        unsigned_integer: None,
                         name: "id".into(),
                         type_name: "String".into(),
                         nullable: false,
@@ -636,17 +676,15 @@ mod causal_command_sdl_tests {
                 }),
                 consistency: CommandConsistency::Succeeded,
                 input_defaults: Vec::new(),
-                effects: Some(CommandEffects::revalidate()),
-                confirmations: Vec::new(),
                 projected_model: None,
                 direct_projection: None,
                 projections: Default::default(),
-                confirmation_unavailable: false,
             }],
             commands_attached: true,
             projectors: Vec::new(),
             projectors_attached: false,
             service_binding: None,
+            external: Vec::new(),
         }
     }
 

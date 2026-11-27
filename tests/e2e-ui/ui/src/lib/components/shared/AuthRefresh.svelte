@@ -2,6 +2,9 @@
 	import { browser } from '$app/environment';
 	import { invalidateAll } from '$app/navigation';
 	import { page } from '$app/state';
+	import type { SveltekitDistributedPageData } from '@hops-ops/distributed/sveltekit';
+
+	let { onRefresh }: { onRefresh: (data: SveltekitDistributedPageData) => void } = $props();
 
 	const MIN_REFRESH_DELAY_MS = 5_000;
 	const RETRY_DELAY_MS = 30_000;
@@ -23,9 +26,20 @@
 				method: 'POST',
 				credentials: 'same-origin',
 				headers: {
-					accept: 'application/json'
-				}
+					accept: 'application/json',
+					'content-type': 'application/json'
+				},
+				body: JSON.stringify({
+					id: page.route.id,
+					path: page.url.pathname + page.url.search,
+					params: page.params
+				})
 			});
+
+			if (response.ok) {
+				const result = await response.json();
+				if (result.pageData) onRefresh(result.pageData);
+			}
 
 			if (response.ok || response.status === 401) {
 				await invalidateAll();

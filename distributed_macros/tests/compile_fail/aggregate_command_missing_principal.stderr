@@ -1,0 +1,5 @@
+error: a #[command] method needs a `#[principal]` parameter (`&str` or `String`): the actor comes from the verified session, never from the input
+  --> tests/compile_fail/aggregate_command_missing_principal.rs:18:18
+   |
+18 |     pub fn equip(&mut self, input: EquipInput) -> Result<(), String> {
+   |                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^

@@ -1,4 +1,4 @@
-//! Celld example runner (not `tests/e2e-ui` / `make run`).
+//! e2e-celld runner: the e2e-ui application with Todo and Chat on celld cells.
 //!
 //! Env:
 //! - `CELLD_URL` — required
@@ -9,8 +9,8 @@
 
 use std::env;
 
-use distributed::cell_host::{InternalHttpSecret, CELL_INTERNAL_SECRET_ENV};
-use e2e_celld_graphql::{identity_from_env, run, HostOptions};
+use distributed::microsvc::cell_host::{InternalHttpSecret, CELL_INTERNAL_SECRET_ENV};
+use e2e_celld_runner::{identity_from_env, run, HostOptions};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -33,6 +33,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         &database_url,
         HostOptions {
             bind,
+            public_origin: env::var("PUBLIC_ORIGIN")
+                .unwrap_or_else(|_| "http://localhost:8791".into()),
+            ui_origin: env::var("UI_INTERNAL_ORIGIN")
+                .unwrap_or_else(|_| "http://localhost:5180".into()),
             identity: identity_from_env(),
             celld_url,
             nats_url,

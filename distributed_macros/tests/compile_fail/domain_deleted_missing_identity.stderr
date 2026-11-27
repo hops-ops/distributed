@@ -1,5 +1,0 @@
-error: `domain = deleted` requires `aggregate_type = "..."` in #[sourced(...)] so the deletion has stable typed identity
- --> tests/compile_fail/domain_deleted_missing_identity.rs:9:13
-  |
-9 |     #[event("todo.purged", domain = deleted)]
-  |             ^^^^^^^^^^^^^

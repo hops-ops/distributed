@@ -43,7 +43,7 @@ pub fn permissions() -> ModelPermissions<OrderView> {
 }
 ```
 
-3. Register it in `src/query/mod.rs` via `graphql_models!(builder, order_view)` or
+3. Register it in `src/query/mod.rs` with
    `.model::<OrderView>(order_view::permissions())`.
 
 ### Roles
@@ -66,9 +66,12 @@ let service = service.try_with_graphql(engine)?;
 // GET  /graphql  — GraphiQL IDE when `.graphiql(true)`
 ```
 
-`POST /{command}` stays off unless you call `with_http_command_routes()`.
-Call that only for an intentional, independently authenticated ingress.
-GraphQL mutations do not need it.
+`POST /{command}` stays off. For an intentional, independently authenticated
+ingress, expose that one command with `with_http_command(command, edge)`: the
+edge checks the request and returns the dispatch (command ID, input, session,
+principal). `with_http_command_routes()` opens every command to trusted-proxy
+headers. Behind a gateway, `command_gateway_routes(binding)` keeps every
+command path on the service. GraphQL mutations need none of these.
 
 Build the executable `Service` first and pass that exact instance to
 `GraphqlEngineBuilder::service`. For `Atomic<M>`, pass the repository handle
@@ -79,11 +82,11 @@ protocol key on every replica serving the same endpoint.
 ### GraphiQL (local visual explorer)
 
 ```bash
-# Framework playground (seeded orders, no scaffold needed):
+# Framework playground (seeded orders, no service needed):
 cargo run --example graphiql --features "graphql,sqlite"
 # → http://127.0.0.1:4000/graphql
 
-# Or run your scaffolded service and open GET /graphql
+# Or run your service and open GET /graphql
 GRAPHIQL=0 cargo run   # disable IDE in production
 ```
 
@@ -92,17 +95,18 @@ Headers panel. See `README § GraphQL query service`.
 
 ### Identity (public GraphQL)
 
-Scaffold **always** wires `public_oidc_identity_from_env()` → **`OidcBearer`** +
+A public service **always** wires `public_oidc_identity_from_env()` → **`OidcBearer`** +
 `require_auth=true` (D6). Set `OIDC_ISSUER` + `OIDC_AUDIENCE` (or `OIDC_CLIENT_ID`).
 If unset, placeholder issuer still uses OidcBearer (401 without Bearer) — **never**
-ambient `DevHeaders` on the public scaffold path.
+ambient `DevHeaders` on a public endpoint.
 
 | Mode | Use |
 |---|---|
 | `OidcBearer` | Public API — validate `Authorization: Bearer` JWT (access token) |
-| `Hybrid` | Bearer preferred; else gateway-injected headers |
-| `TrustedProxy` | Mesh — strip client identity denylist at process |
+| `Gateway` | Behind an authenticating gateway — `IdentityConfig::gateway(header, secret)`; headers are trusted only with the shared secret |
 | `DevHeaders` | Local GraphiQL / unit tests only (explicit opt-in) |
+
+There is no default mode: `build()` fails without `.identity(..)`.
 
 Wire via `.identity(distributed::graphql::public_oidc_identity_from_env())`.
 Never trust raw client `x-user-id` / `x-roles` on a public edge.
@@ -175,15 +179,6 @@ git diff --exit-code schema.graphql
 ```
 
 `--dialect` is ignored with `--format graphql` (dialect-independent core surface).
-
-## Scaffold
-
-```bash
-distributed scaffold my-service --query-api --read-models --store sqlite
-```
-
-Emits typed causal handlers, a service-derived GraphQL engine, `src/query/`
-permissions, the `graphql` feature, and repository/token-key wiring.
 
 ## Client / replica drift (dogfood)
 

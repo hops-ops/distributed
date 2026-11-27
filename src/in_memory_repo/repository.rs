@@ -8,30 +8,27 @@ use std::future::Future;
 use std::sync::{Arc, RwLock};
 
 use super::projection_protocol::{
-    reject_causal_owned_plans, stage_same_transaction_projection, InMemoryProjectionProtocolState,
+    stage_same_transaction_projection, InMemoryProjectionProtocolState,
 };
 use crate::command_ledger::{
     AttemptFence, CausalCommitBatch, CausalGetStream, CausalRepositoryIdentity,
     CausalStorageIdentity, CausalTransactionalCommit, CommandCompletion, CommandLedgerError,
     CommandLedgerKey, CommandLedgerRecord, CommandLedgerStore, CommandLookup, CommandLookupScope,
-    CommandReservation, ReservationDecision, ReservationOutcome,
+    CommandReservation, ExternalCommandCompletion, ReservationDecision, ReservationOutcome,
 };
 use crate::entity::{Entity, EventRecord};
 use crate::outbox::OutboxMessage;
 use crate::projection_protocol::{
     ProjectionChangeRetention, ProjectionProtocolError, SameTransactionProjectionBatch,
 };
-use crate::read_model::in_memory::apply_read_model_write_plan;
-use crate::read_model::{
-    InMemoryReadModelStore, ReadModelLoadGraph, ReadModelLoadRequest, ReadModelQueryCapabilities,
-};
+use crate::read_model::{InMemoryReadModelStore, ReadModelLoadGraph, ReadModelLoadRequest};
 use crate::repository::{
-    validate_commit_batch, validate_snapshot_identity, CommitBatch, GetStream, InboxStore,
-    ReadModelWritePlanStore, RelationalReadModelQueryStore, RepositoryError, SnapshotStore,
-    SnapshotWrite, StreamIdentity, TransactionalCommit,
+    validate_commit_batch, CommitBatch, GetStream, InboxStore, ReadModelWritePlanStore,
+    RelationalReadModelQueryStore, RepositoryError, SnapshotStore, SnapshotWrite, StreamIdentity,
+    TransactionalCommit,
 };
 use crate::snapshot::{InMemorySnapshotStore, SnapshotRecord};
-use crate::table::{TableAdapterCapabilities, TableCommitOutcome, TableStoreError, TableWritePlan};
+use crate::table::{TableStoreError, TableWritePlan};
 
 /// In-memory repository implementation using HashMap.
 ///
@@ -44,8 +41,8 @@ use crate::table::{TableAdapterCapabilities, TableCommitOutcome, TableStoreError
 /// or SQLite repository for a production inbox with retention control.
 #[derive(Clone)]
 pub struct InMemoryRepository {
-    event_store: Arc<RwLock<HashMap<String, Vec<EventRecord>>>>,
-    outbox_store: Arc<RwLock<HashMap<String, OutboxMessage>>>,
+    pub(crate) event_store: Arc<RwLock<HashMap<String, Vec<EventRecord>>>>,
+    pub(crate) outbox_store: Arc<RwLock<HashMap<String, OutboxMessage>>>,
     pub(super) model_store: InMemoryReadModelStore,
     snapshot_store: InMemorySnapshotStore,
     /// Consumer inbox: the set of recorded `(consumer, message_id)` receipts.
@@ -56,12 +53,20 @@ pub struct InMemoryRepository {
     /// deployment with the Postgres or SQLite inbox, which support
     /// [`purge_inbox_older_than`](crate::repository::InboxStore::purge_inbox_older_than).
     pub(super) inbox_store: Arc<RwLock<HashSet<(String, String)>>>,
-    command_ledger: Arc<RwLock<HashMap<CommandLedgerKey, CommandLedgerRecord>>>,
+    pub(crate) command_ledger: Arc<RwLock<HashMap<CommandLedgerKey, CommandLedgerRecord>>>,
     pub(super) projection_protocol: Arc<RwLock<InMemoryProjectionProtocolState>>,
     pub(super) causal_tables: Arc<RwLock<HashSet<String>>>,
     pub(super) projection_change_retention: ProjectionChangeRetention,
     #[cfg_attr(not(feature = "graphql"), allow(dead_code))]
     causal_storage_identity: CausalStorageIdentity,
+    /// Schedule rows per owning stream (`storage_key`), committed with the
+    /// owner's events. Dispatched only once a schedule worker is attached
+    /// (`ScheduleWorker::attach`).
+    schedules: Arc<RwLock<HashMap<String, (StreamIdentity, crate::schedule::MemorySchedules)>>>,
+    /// A schedule worker was attached: [`Capability::Scheduling`](crate::schedule::Capability::Scheduling).
+    schedule_dispatch: bool,
+    /// The store clock: `ctx.now()` and relative schedules.
+    clock: Arc<dyn crate::clock::Clock>,
 }
 
 /// In-memory outbox table handle.
@@ -93,7 +98,31 @@ impl InMemoryRepository {
             causal_tables,
             projection_change_retention: ProjectionChangeRetention::default(),
             causal_storage_identity: CausalStorageIdentity::new(),
+            schedules: Arc::new(RwLock::new(HashMap::new())),
+            schedule_dispatch: false,
+            clock: Arc::new(crate::clock::SystemClock),
         }
+    }
+
+    /// Use `clock` as the store clock (`ctx.now()`, relative schedules),
+    /// e.g. a [`ManualClock`](crate::clock::ManualClock) in tests.
+    pub fn with_clock(mut self, clock: impl crate::clock::Clock + 'static) -> Self {
+        self.clock = Arc::new(clock);
+        self
+    }
+
+    /// Armed schedules of the aggregate stream `owner`, earliest first.
+    pub fn armed_schedules(
+        &self,
+        owner: &StreamIdentity,
+    ) -> Result<Vec<crate::schedule::ArmedSchedule>, RepositoryError> {
+        Ok(self
+            .schedules
+            .read()
+            .map_err(|_| RepositoryError::LockPoisoned("schedule read"))?
+            .get(&owner.storage_key())
+            .map(|(_, table)| table.armed())
+            .unwrap_or_default())
     }
 
     /// Configure the maximum newest projection changes retained per partition.
@@ -112,6 +141,16 @@ impl InMemoryRepository {
     #[cfg(test)]
     pub(crate) fn causal_storage_identity(&self) -> CausalStorageIdentity {
         self.causal_storage_identity
+    }
+
+    /// The stored state of a ledger row, without the lookup's expiry rule.
+    #[cfg(all(test, feature = "runtime-tokio"))]
+    pub(crate) fn command_ledger_state(
+        &self,
+        key: &CommandLedgerKey,
+    ) -> Option<crate::command_ledger::CommandLedgerState> {
+        let ledger = self.command_ledger.read().unwrap();
+        ledger.get(key).map(|record| record.state)
     }
 
     #[cfg(test)]
@@ -134,104 +173,6 @@ impl InMemoryRepository {
     /// Access the embedded snapshot store directly.
     pub fn snapshot_store(&self) -> &InMemorySnapshotStore {
         &self.snapshot_store
-    }
-
-    /// Clone the event log for Durable Object SQLite persistence.
-    pub fn clone_events(&self) -> Result<HashMap<String, Vec<EventRecord>>, RepositoryError> {
-        Ok(self
-            .event_store
-            .read()
-            .map_err(|_| RepositoryError::LockPoisoned("event log read"))?
-            .clone())
-    }
-
-    /// Replace the event log from Durable Object SQLite restore.
-    pub fn replace_events(
-        &self,
-        events: HashMap<String, Vec<EventRecord>>,
-    ) -> Result<(), RepositoryError> {
-        *self
-            .event_store
-            .write()
-            .map_err(|_| RepositoryError::LockPoisoned("event log write"))? = events;
-        Ok(())
-    }
-
-    /// Clone outbox rows for Durable Object SQLite persistence.
-    pub fn clone_outbox(&self) -> Result<Vec<OutboxMessage>, RepositoryError> {
-        Ok(self
-            .outbox_store
-            .read()
-            .map_err(|_| RepositoryError::LockPoisoned("outbox read"))?
-            .values()
-            .cloned()
-            .collect())
-    }
-
-    /// Replace outbox rows from Durable Object SQLite restore.
-    pub fn replace_outbox(&self, messages: Vec<OutboxMessage>) -> Result<(), RepositoryError> {
-        let mut map = HashMap::new();
-        for message in messages {
-            map.insert(message.id.clone(), message);
-        }
-        *self
-            .outbox_store
-            .write()
-            .map_err(|_| RepositoryError::LockPoisoned("outbox write"))? = map;
-        Ok(())
-    }
-
-    /// Clone snapshot cache records for Durable Object SQLite persistence.
-    pub fn clone_snapshots(&self) -> Result<HashMap<String, SnapshotRecord>, RepositoryError> {
-        Ok(self
-            .snapshot_store
-            .storage
-            .read()
-            .map_err(|_| RepositoryError::LockPoisoned("snapshot log read"))?
-            .clone())
-    }
-
-    /// Replace snapshot cache records from Durable Object SQLite restore.
-    pub fn replace_snapshots(
-        &self,
-        snapshots: HashMap<String, SnapshotRecord>,
-    ) -> Result<(), RepositoryError> {
-        *self
-            .snapshot_store
-            .storage
-            .write()
-            .map_err(|_| RepositoryError::LockPoisoned("snapshot log write"))? = snapshots;
-        Ok(())
-    }
-
-    pub(crate) fn clone_command_ledger(&self) -> Result<Vec<CommandLedgerRecord>, RepositoryError> {
-        Ok(self
-            .command_ledger
-            .read()
-            .map_err(|_| RepositoryError::LockPoisoned("command ledger read"))?
-            .values()
-            .cloned()
-            .collect())
-    }
-
-    pub(crate) fn replace_command_ledger(
-        &self,
-        records: Vec<CommandLedgerRecord>,
-    ) -> Result<(), RepositoryError> {
-        let mut ledger = HashMap::with_capacity(records.len());
-        for record in records {
-            let key = record.key.clone();
-            if ledger.insert(key, record).is_some() {
-                return Err(RepositoryError::Model(
-                    "cell command ledger restore contains a duplicate key".into(),
-                ));
-            }
-        }
-        *self
-            .command_ledger
-            .write()
-            .map_err(|_| RepositoryError::LockPoisoned("command ledger write"))? = ledger;
-        Ok(())
     }
 
     /// Whether a consumer inbox receipt for `(consumer, message_id)` is recorded.
@@ -293,10 +234,13 @@ impl InMemoryRepository {
     fn commit_batch_inner<'a>(
         &'a self,
         batch: CommitBatch<'a>,
-        mut completion: Option<CommandCompletion>,
+        mut completion: Option<&mut CommandCompletion<'_>>,
         direct_projection: Option<SameTransactionProjectionBatch>,
     ) -> Result<(), InMemoryCommitError> {
-        let prepared = validate_commit_batch(&batch)?;
+        let mut batch = batch;
+        let schedule_owner = crate::schedule::schedule_owner(&batch)?;
+        crate::schedule::resolve_schedule_writes(&mut batch.schedules, self.clock.now())?;
+        let prepared = validate_commit_batch(&batch, direct_projection.as_ref())?;
         if let Some(direct_projection) = &direct_projection {
             direct_projection.validate()?;
             let completion = completion.as_ref().ok_or_else(|| {
@@ -330,7 +274,6 @@ impl InMemoryRepository {
             .causal_tables
             .read()
             .map_err(|_| RepositoryError::LockPoisoned("projection ownership read"))?;
-        reject_causal_owned_plans(&causal_tables, &batch.read_model_plans)?;
         if let Some(unregistered) = direct_projection.as_ref().and_then(|direct| {
             direct
                 .mutations
@@ -384,6 +327,13 @@ impl InMemoryRepository {
                 .ok_or_else(|| CommandLedgerError::AttemptFenced {
                     command_id: completion.attempt().key().command_id().to_string(),
                 })?;
+            if completion.attempt().external_binding().is_some() {
+                return Err(CommandLedgerError::Invalid(
+                    "local causal completion cannot complete an externally bound reservation"
+                        .into(),
+                )
+                .into());
+            }
             record.validate_live_attempt(&completion.attempt_fence(), crate::time::now())?;
         }
 
@@ -402,27 +352,16 @@ impl InMemoryRepository {
         }
 
         // Read models can fail mid-application, so stage only touched rows.
-        let mut touched_rows: HashSet<String> = batch
-            .read_model_plans
+        let touched_rows: HashSet<String> = direct_projection
             .iter()
-            .flat_map(|plan| plan.mutations.iter().map(|mutation| mutation.lock_key()))
+            .flat_map(|direct| direct.mutations.iter())
+            .map(|mutation| mutation.mutation.lock_key())
             .collect();
-        if let Some(direct_projection) = &direct_projection {
-            touched_rows.extend(
-                direct_projection
-                    .mutations
-                    .iter()
-                    .map(|mutation| mutation.mutation.lock_key()),
-            );
-        }
         let mut staged_rows = HashMap::with_capacity(touched_rows.len());
         for key in &touched_rows {
             if let Some(row) = relational_rows.get(key) {
                 staged_rows.insert(key.clone(), row.clone());
             }
-        }
-        for plan in batch.read_model_plans.iter().cloned() {
-            apply_read_model_write_plan(plan, &mut staged_rows)?;
         }
         let mut staged_protocol = protocol.as_deref().cloned();
         let direct_evidence = match (&mut staged_protocol, &direct_projection) {
@@ -447,7 +386,7 @@ impl InMemoryRepository {
 
         for message in &batch.outbox_messages {
             if outbox_storage.contains_key(message.id()) {
-                return Err(RepositoryError::DuplicateOutboxMessageInBatch {
+                return Err(RepositoryError::DuplicateOutboxMessage {
                     id: message.id().to_string(),
                 }
                 .into());
@@ -488,7 +427,32 @@ impl InMemoryRepository {
             })
             .transpose()?;
 
+        // Schedules: plan on a copy of the owner's table (may fail), install
+        // with the other writes below.
+        let mut schedule_storage = self
+            .schedules
+            .write()
+            .map_err(|_| RepositoryError::LockPoisoned("schedule write"))?;
+        let planned_schedules = match &schedule_owner {
+            Some(owner) => Some((
+                owner.storage_key(),
+                (
+                    owner.clone(),
+                    schedule_storage
+                        .get(&owner.storage_key())
+                        .map(|(_, table)| table.clone())
+                        .unwrap_or_default()
+                        .plan(&batch.schedules)?,
+                ),
+            )),
+            None => None,
+        };
+
         // Nothing below can fail: mutate the live stores.
+        if let Some((owner, planned)) = planned_schedules {
+            schedule_storage.insert(owner, planned);
+        }
+        drop(schedule_storage);
         for append in prepared {
             storage
                 .entry(append.identity.storage_key())
@@ -588,6 +552,14 @@ impl GetStream for InMemoryRepository {
 }
 
 impl CausalGetStream for InMemoryRepository {
+    fn get_causal_stream_tail<'a>(
+        &'a self,
+        identity: &'a StreamIdentity,
+        after_version: u64,
+    ) -> impl std::future::Future<Output = Result<Option<Entity>, RepositoryError>> + Send + 'a
+    {
+        GetStream::get_stream_tail(self, identity, after_version)
+    }
     fn get_causal_stream<'a>(
         &'a self,
         identity: &'a StreamIdentity,
@@ -684,6 +656,24 @@ impl CommandLedgerStore for InMemoryRepository {
         }
     }
 
+    fn complete_external_command(
+        &self,
+        completion: ExternalCommandCompletion,
+    ) -> impl Future<Output = Result<(), CommandLedgerError>> + Send + '_ {
+        async move {
+            let mut ledger = self
+                .command_ledger
+                .write()
+                .map_err(|_| RepositoryError::LockPoisoned("external command completion"))?;
+            let record = ledger.get_mut(completion.attempt().key()).ok_or_else(|| {
+                CommandLedgerError::AttemptFenced {
+                    command_id: completion.attempt().key().command_id().to_string(),
+                }
+            })?;
+            record.complete_external(&completion, crate::time::now())
+        }
+    }
+
     fn compact_expired_commands(
         &self,
         limit: usize,
@@ -755,14 +745,15 @@ impl CausalTransactionalCommit for InMemoryRepository {
     fn commit_causal_batch<'a>(
         &'a self,
         batch: CausalCommitBatch<'a>,
-    ) -> impl Future<Output = Result<(), CommandLedgerError>> + Send + 'a {
+    ) -> impl Future<Output = Result<CommandCompletion<'a>, CommandLedgerError>> + Send + 'a {
         async move {
+            let mut completion = batch.completion;
             match self.commit_batch_inner(
                 batch.domain,
-                Some(batch.completion),
+                Some(&mut completion),
                 batch.direct_projection,
             ) {
-                Ok(()) => Ok(()),
+                Ok(()) => Ok(completion),
                 Err(InMemoryCommitError::Repository(error)) => {
                     Err(CommandLedgerError::Storage(error))
                 }
@@ -801,21 +792,21 @@ fn stored_stream_version(events: Option<&Vec<EventRecord>>) -> u64 {
 }
 
 impl ReadModelWritePlanStore for InMemoryRepository {
-    fn read_model_capabilities(&self) -> TableAdapterCapabilities {
-        self.model_store.read_model_capabilities()
-    }
-
     fn commit_write_plan(
         &self,
         plan: TableWritePlan,
-    ) -> impl Future<Output = Result<TableCommitOutcome, TableStoreError>> + Send + '_ {
+    ) -> impl Future<Output = Result<(), TableStoreError>> + Send + '_ {
         self.model_store.commit_write_plan(plan)
     }
 }
 
 impl RelationalReadModelQueryStore for InMemoryRepository {
-    fn read_model_query_capabilities(&self) -> ReadModelQueryCapabilities {
-        self.model_store.read_model_query_capabilities()
+    fn scan_read_model(
+        &self,
+        request: crate::read_model::ReadModelScanRequest,
+    ) -> impl Future<Output = Result<crate::read_model::ReadModelScanPage, TableStoreError>> + Send + '_
+    {
+        self.model_store.scan_read_model(request)
     }
 
     fn load_graph(
@@ -826,36 +817,20 @@ impl RelationalReadModelQueryStore for InMemoryRepository {
     }
 }
 
+/// Its snapshots are its [`InMemorySnapshotStore`].
 impl SnapshotStore for InMemoryRepository {
     fn get_snapshot<'a>(
         &'a self,
         identity: &'a StreamIdentity,
     ) -> impl Future<Output = Result<Option<SnapshotRecord>, RepositoryError>> + Send + 'a {
-        async move {
-            let storage = self
-                .snapshot_store
-                .storage
-                .read()
-                .map_err(|_| RepositoryError::LockPoisoned("async snapshot read"))?;
-            Ok(storage.get(&identity.storage_key()).cloned())
-        }
+        self.snapshot_store.get_snapshot(identity)
     }
 
     fn get_snapshots<'a>(
         &'a self,
         identities: &'a [StreamIdentity],
     ) -> impl Future<Output = Result<Vec<SnapshotRecord>, RepositoryError>> + Send + 'a {
-        async move {
-            let storage = self
-                .snapshot_store
-                .storage
-                .read()
-                .map_err(|_| RepositoryError::LockPoisoned("async snapshot read"))?;
-            Ok(identities
-                .iter()
-                .filter_map(|identity| storage.get(&identity.storage_key()).cloned())
-                .collect())
-        }
+        self.snapshot_store.get_snapshots(identities)
     }
 
     fn save_snapshot<'a>(
@@ -863,30 +838,14 @@ impl SnapshotStore for InMemoryRepository {
         identity: &'a StreamIdentity,
         record: SnapshotRecord,
     ) -> impl Future<Output = Result<(), RepositoryError>> + Send + 'a {
-        async move {
-            validate_snapshot_identity(identity, &record)?;
-            let mut storage = self
-                .snapshot_store
-                .storage
-                .write()
-                .map_err(|_| RepositoryError::LockPoisoned("async snapshot write"))?;
-            storage.insert(identity.storage_key(), record);
-            Ok(())
-        }
+        self.snapshot_store.save_snapshot(identity, record)
     }
 
     fn delete_snapshot<'a>(
         &'a self,
         identity: &'a StreamIdentity,
     ) -> impl Future<Output = Result<bool, RepositoryError>> + Send + 'a {
-        async move {
-            let mut storage = self
-                .snapshot_store
-                .storage
-                .write()
-                .map_err(|_| RepositoryError::LockPoisoned("async snapshot write"))?;
-            Ok(storage.remove(&identity.storage_key()).is_some())
-        }
+        self.snapshot_store.delete_snapshot(identity)
     }
 }
 
@@ -909,12 +868,6 @@ mod tests {
             entity,
         )]))
         .await
-    }
-
-    #[test]
-    fn new() {
-        let repo = InMemoryRepository::new();
-        assert!(repo.event_store.read().unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -1048,5 +1001,87 @@ mod tests {
         assert!(!repo.inbox_contains("proj", "m1"));
         assert!(!repo.inbox_contains("proj", "m2"));
         assert_eq!(repo.clear_inbox(), 0);
+    }
+}
+
+/// Stores schedules; dispatches them once a schedule worker is attached
+/// (`ScheduleWorker::attach`). The store clock is the injected
+/// [`Clock`](crate::clock::Clock).
+impl crate::schedule::BackendHost for InMemoryRepository {
+    fn capabilities(&self) -> crate::schedule::Capabilities {
+        crate::schedule::Capabilities {
+            scheduling: self.schedule_dispatch,
+            clock: true,
+        }
+    }
+
+    fn host_now(
+        &self,
+    ) -> impl Future<Output = Result<std::time::SystemTime, RepositoryError>> + Send + '_ {
+        std::future::ready(Ok(self.clock.now()))
+    }
+}
+
+/// Clones share the schedule table.
+#[cfg(feature = "runtime-tokio")]
+#[async_trait::async_trait]
+impl crate::schedule::ScheduleStore for InMemoryRepository {
+    fn with_schedule_dispatch(mut self) -> Self {
+        self.schedule_dispatch = true;
+        self
+    }
+
+    async fn schedule_now(&self) -> Result<std::time::SystemTime, RepositoryError> {
+        Ok(self.clock.now())
+    }
+
+    async fn claim_due_schedules(
+        &self,
+        now_ms: i64,
+        claim_until_ms: i64,
+        limit: usize,
+    ) -> Result<Vec<(StreamIdentity, crate::schedule::ArmedSchedule)>, RepositoryError> {
+        let mut storage = self
+            .schedules
+            .write()
+            .map_err(|_| RepositoryError::LockPoisoned("schedule write"))?;
+        let mut claimed = Vec::new();
+        for (owner, table) in storage.values_mut() {
+            for schedule in table.claim_due(now_ms, claim_until_ms, limit) {
+                claimed.push((owner.clone(), schedule));
+            }
+        }
+        claimed.sort_by(|(a_owner, a), (b_owner, b)| {
+            (a.due_at_ms, a_owner.storage_key(), &a.name).cmp(&(
+                b.due_at_ms,
+                b_owner.storage_key(),
+                &b.name,
+            ))
+        });
+        // Claims beyond `limit` across owners go back unclaimed.
+        for (owner, schedule) in claimed.drain(limit.min(claimed.len())..) {
+            if let Some((_, table)) = storage.get_mut(&owner.storage_key()) {
+                table.release_claim(&schedule.name, schedule.generation);
+            }
+        }
+        Ok(claimed)
+    }
+
+    async fn settle_schedule(
+        &self,
+        owner: &StreamIdentity,
+        name: &str,
+        generation: u64,
+        settlement: &crate::schedule::ScheduleSettlement,
+    ) -> Result<(), RepositoryError> {
+        if let Some((_, table)) = self
+            .schedules
+            .write()
+            .map_err(|_| RepositoryError::LockPoisoned("schedule write"))?
+            .get_mut(&owner.storage_key())
+        {
+            table.settle(name, generation, settlement);
+        }
+        Ok(())
     }
 }

@@ -83,7 +83,6 @@ impl TableSchemaRegistry {
         for schema in self.schemas() {
             schema.validate()?;
             self.validate_column_foreign_keys(schema, &table_names)?;
-            self.validate_schema_foreign_keys(schema, &table_names)?;
             self.validate_relationships(schema, &table_names)?;
         }
 
@@ -103,24 +102,6 @@ impl TableSchemaRegistry {
                 &schema.model_name,
                 &schema.table_name,
                 &column.column_name,
-                &foreign_key.table,
-                &foreign_key.column,
-                table_names,
-            )?;
-        }
-        Ok(())
-    }
-
-    fn validate_schema_foreign_keys(
-        &self,
-        schema: &TableSchema,
-        table_names: &BTreeSet<String>,
-    ) -> Result<(), TableStoreError> {
-        for foreign_key in &schema.foreign_keys {
-            self.validate_foreign_key_target(
-                &schema.model_name,
-                &schema.table_name,
-                "",
                 &foreign_key.table,
                 &foreign_key.column,
                 table_names,
@@ -158,6 +139,12 @@ impl TableSchemaRegistry {
                     let _ = resolve_direct_join_keys(schema, relationship, target_schema)?;
                 }
                 RelationshipKind::ManyToMany => {
+                    if relationship.references.is_some() {
+                        return Err(TableStoreError::Metadata(format!(
+                            "model `{}` relationship `{}` references requires a direct relationship",
+                            schema.model_name, relationship.field_name,
+                        )));
+                    }
                     let through = relationship.through.as_deref().ok_or_else(|| {
                         TableStoreError::Metadata(format!(
                             "model `{}` relationship `{}` many-to-many must declare `through`",
@@ -203,13 +190,8 @@ impl TableSchemaRegistry {
             .iter()
             .any(|column| column.column_name == target_column)
         {
-            let local_column = if column_name.is_empty() {
-                "schema".to_string()
-            } else {
-                format!("column `{column_name}`")
-            };
             return Err(TableStoreError::Metadata(format!(
-                "model `{model_name}` {local_column} references missing foreign-key column `{target_table}.{target_column}`"
+                "model `{model_name}` column `{column_name}` references missing foreign-key column `{target_table}.{target_column}`"
             )));
         }
 
@@ -243,7 +225,8 @@ pub struct M2mJoinKeys {
     pub target: Vec<JoinColumnPair>,
 }
 
-/// One foreign-key column paired with one primary-key column for a direct join.
+/// One foreign-key column paired with a referenced key column for a direct join.
+/// The referenced key defaults to the primary key, or is selected by `references`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DirectJoinPair {
     pub foreign_key_column: String,
@@ -264,11 +247,11 @@ impl DirectJoinPair {
 
 /// Resolve `has_many` / `belongs_to` join equalities.
 ///
-/// `foreign_key` lists the FK-holding table's columns in the other end's PK
-/// order, same arity as that PK (comma-separated when more than one).
+/// `foreign_key` lists the FK-holding table's columns in the order of `references`,
+/// or the other end's primary key when references are omitted. Arity must match.
 ///
-/// - **HasMany**: FK columns live on the target; PK is the source.
-/// - **BelongsTo**: FK columns live on the source; PK is the target.
+/// - **HasMany**: FK columns live on the target; referenced key is on the source.
+/// - **BelongsTo**: FK columns live on the source; referenced key is on the target.
 pub fn resolve_direct_join_keys(
     source: &TableSchema,
     relationship: &RelationshipDef,
@@ -284,7 +267,54 @@ pub fn resolve_direct_join_keys(
             )));
         }
     };
-    let pk_columns = &pk_schema.primary_key.columns;
+    let explicit = parse_explicit_through_columns(
+        source,
+        relationship,
+        "references",
+        relationship.references.as_deref(),
+    )?;
+    let referenced_columns = if let Some(names) = explicit {
+        let columns = names
+            .iter()
+            .map(|name| {
+                column_name_on(pk_schema, name)
+                    .map(str::to_owned)
+                    .ok_or_else(|| {
+                        TableStoreError::Metadata(format!(
+                "model `{}` relationship `{}` references unknown column `{name}` on `{}`",
+                source.model_name, relationship.field_name, pk_schema.model_name,
+            ))
+                    })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        if columns.iter().collect::<BTreeSet<_>>().len() != columns.len() {
+            return Err(TableStoreError::Metadata(format!(
+                "model `{}` relationship `{}` references repeats a physical column",
+                source.model_name, relationship.field_name,
+            )));
+        }
+        let unique = (columns.len() == pk_schema.primary_key.columns.len()
+            && pk_schema
+                .primary_key
+                .columns
+                .iter()
+                .all(|column| columns.contains(column)))
+            || pk_schema.indexes.iter().any(|index| {
+                index.unique
+                    && index.columns.len() == columns.len()
+                    && index.columns.iter().all(|column| columns.contains(column))
+            });
+        if !unique {
+            return Err(TableStoreError::Metadata(format!(
+                "model `{}` relationship `{}` references must name a declared unique key on `{}`",
+                source.model_name, relationship.field_name, pk_schema.model_name,
+            )));
+        }
+        columns
+    } else {
+        pk_schema.primary_key.columns.clone()
+    };
+    let pk_columns = &referenced_columns;
     if pk_columns.is_empty() {
         return Err(TableStoreError::Metadata(format!(
             "model `{}` relationship `{}` cannot join because `{}` has an empty primary key",
@@ -305,15 +335,21 @@ pub fn resolve_direct_join_keys(
     };
     if fk_names.len() != pk_columns.len() {
         return Err(TableStoreError::Metadata(format!(
-            "model `{}` relationship `{}` foreign_key lists {} column(s) but `{}` primary key has {}",
+            "model `{}` relationship `{}` foreign_key lists {} column(s) but `{}` {} has {}",
             source.model_name,
             relationship.field_name,
             fk_names.len(),
             pk_schema.model_name,
+            if relationship.references.is_some() {
+                "referenced key"
+            } else {
+                "primary key"
+            },
             pk_columns.len()
         )));
     }
     let mut pairs = Vec::with_capacity(pk_columns.len());
+    let mut seen_foreign_columns = BTreeSet::new();
     for (fk_name, pk_column) in fk_names.iter().zip(pk_columns) {
         let foreign_key_column = column_name_on(fk_schema, fk_name).ok_or_else(|| {
             let side = match relationship.kind {
@@ -325,6 +361,30 @@ pub fn resolve_direct_join_keys(
                 source.model_name, relationship.field_name, fk_schema.model_name
             ))
         })?;
+        if !seen_foreign_columns.insert(foreign_key_column) {
+            return Err(TableStoreError::Metadata(format!(
+                "model `{}` relationship `{}` foreign_key repeats a physical column",
+                source.model_name, relationship.field_name,
+            )));
+        }
+        let foreign = fk_schema
+            .columns
+            .iter()
+            .find(|column| column.column_name == foreign_key_column)
+            .unwrap();
+        let referenced = pk_schema
+            .columns
+            .iter()
+            .find(|column| column.column_name == *pk_column)
+            .ok_or_else(|| {
+                TableStoreError::Metadata(format!("referenced key column `{pk_column}` is missing"))
+            })?;
+        if foreign.column_type != referenced.column_type {
+            return Err(TableStoreError::Metadata(format!(
+                "model `{}` relationship `{}` joins incompatible column types for `{foreign_key_column}` and `{pk_column}`",
+                source.model_name, relationship.field_name,
+            )));
+        }
         pairs.push(DirectJoinPair::new(foreign_key_column, pk_column.clone()));
     }
     Ok(pairs)
@@ -345,6 +405,12 @@ pub fn resolve_m2m_join_keys(
     through_schema: &TableSchema,
     target_schema: &TableSchema,
 ) -> Result<M2mJoinKeys, TableStoreError> {
+    if relationship.references.is_some() {
+        return Err(TableStoreError::Metadata(format!(
+            "model `{}` relationship `{}` references requires a direct relationship",
+            source.model_name, relationship.field_name,
+        )));
+    }
     if !matches!(relationship.kind, RelationshipKind::ManyToMany) {
         return Err(TableStoreError::Metadata(format!(
             "model `{}` relationship `{}` must be many-to-many to resolve join keys",
@@ -504,24 +570,6 @@ fn column_name_on<'a>(schema: &'a TableSchema, name: &str) -> Option<&'a str> {
     })
 }
 
-/// Schema lifecycle operations an adapter can support.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct TableSchemaAdapterCapabilities {
-    pub migration_artifacts: bool,
-    pub schema_verification: bool,
-    pub dev_bootstrap: bool,
-}
-
-impl TableSchemaAdapterCapabilities {
-    pub fn all() -> Self {
-        Self {
-            migration_artifacts: true,
-            schema_verification: true,
-            dev_bootstrap: true,
-        }
-    }
-}
-
 /// Generated or user-consumable migration artifact for registered schemas.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TableMigrationArtifact {
@@ -538,61 +586,6 @@ impl TableMigrationArtifact {
     }
 }
 
-/// Result of verifying registered metadata against an adapter-owned schema.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct TableSchemaVerification {
-    pub issues: Vec<TableSchemaIssue>,
-}
-
-impl TableSchemaVerification {
-    pub fn verified() -> Self {
-        Self::default()
-    }
-
-    pub fn is_verified(&self) -> bool {
-        self.issues.is_empty()
-    }
-}
-
-/// Adapter-facing schema verification issue.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct TableSchemaIssue {
-    pub table_name: String,
-    pub column_name: Option<String>,
-    pub kind: TableSchemaIssueKind,
-    pub message: String,
-}
-
-impl TableSchemaIssue {
-    pub fn new(
-        table_name: impl Into<String>,
-        column_name: Option<impl Into<String>>,
-        kind: TableSchemaIssueKind,
-        message: impl Into<String>,
-    ) -> Self {
-        Self {
-            table_name: table_name.into(),
-            column_name: column_name.map(Into::into),
-            kind,
-            message: message.into(),
-        }
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum TableSchemaIssueKind {
-    MissingTable,
-    MissingColumn,
-    TypeMismatch,
-    PrimaryKeyMismatch,
-    ForeignKeyMismatch,
-    IndexMismatch,
-    NullabilityMismatch,
-    DefaultMismatch,
-    VersionColumnMismatch,
-    Unsupported(String),
-}
-
 /// Result of an explicit dev/test schema bootstrap operation.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct TableSchemaBootstrap {
@@ -604,38 +597,6 @@ impl TableSchemaBootstrap {
         Self {
             bootstrapped_tables: bootstrapped_tables.into_iter().collect(),
         }
-    }
-}
-
-/// Adapter contract for schema generation, verification, and dev/test bootstrap.
-pub trait TableSchemaAdapter {
-    fn schema_capabilities(&self) -> TableSchemaAdapterCapabilities;
-
-    fn generate_migration_artifacts(
-        &self,
-        _registry: &TableSchemaRegistry,
-    ) -> Result<Vec<TableMigrationArtifact>, TableStoreError> {
-        Err(TableStoreError::Metadata(
-            "read-model schema adapter does not support migration artifact generation".into(),
-        ))
-    }
-
-    fn verify_schema(
-        &self,
-        _registry: &TableSchemaRegistry,
-    ) -> Result<TableSchemaVerification, TableStoreError> {
-        Err(TableStoreError::Metadata(
-            "read-model schema adapter does not support startup schema verification".into(),
-        ))
-    }
-
-    fn bootstrap_schema_for_dev(
-        &self,
-        _registry: &TableSchemaRegistry,
-    ) -> Result<TableSchemaBootstrap, TableStoreError> {
-        Err(TableStoreError::Metadata(
-            "read-model schema adapter does not support explicit dev/test bootstrap".into(),
-        ))
     }
 }
 
@@ -671,7 +632,6 @@ mod m2m_join_key_tests {
             columns,
             primary_key: PrimaryKey::new(pk.iter().copied()),
             version_column: None,
-            foreign_keys: Vec::new(),
             indexes: Vec::new(),
             relationships,
             kind: TableKind::ReadModel,
@@ -714,6 +674,7 @@ mod m2m_join_key_tests {
 
     fn labels_rel(foreign_key: Option<&str>, target_foreign_key: Option<&str>) -> RelationshipDef {
         RelationshipDef {
+            references: None,
             field_name: "labels".into(),
             kind: RelationshipKind::ManyToMany,
             target_model: "LabelView".into(),
@@ -842,6 +803,7 @@ mod m2m_join_key_tests {
 
     fn files_rel(foreign_key: &str) -> RelationshipDef {
         RelationshipDef {
+            references: None,
             field_name: "files".into(),
             kind: RelationshipKind::HasMany,
             target_model: "ProjectFileView".into(),
@@ -892,6 +854,7 @@ mod m2m_join_key_tests {
             ],
             &["workspace_id", "path", "file_id"],
             vec![RelationshipDef {
+                references: None,
                 field_name: "project".into(),
                 kind: RelationshipKind::BelongsTo,
                 target_model: "ProjectView".into(),
@@ -940,5 +903,105 @@ mod m2m_join_key_tests {
                 DirectJoinPair::new("project_path", "path"),
             ]
         );
+    }
+
+    #[test]
+    fn direct_join_can_reference_a_composite_candidate_key() {
+        let mut target = schema(
+            "Object",
+            "objects",
+            vec![pk_column("id"), column("namespace"), column("oid")],
+            &["id"],
+            vec![],
+        );
+        target.indexes.push(crate::table::TableIndex {
+            name: None,
+            columns: vec!["namespace".into(), "oid".into()],
+            unique: true,
+        });
+        let relation = RelationshipDef {
+            references: Some("namespace,oid".into()),
+            field_name: "object".into(),
+            kind: RelationshipKind::BelongsTo,
+            target_model: "Object".into(),
+            foreign_key: Some("scope,object_oid".into()),
+            through: None,
+            target_foreign_key: None,
+        };
+        let source = schema(
+            "Ref",
+            "refs",
+            vec![pk_column("ref_id"), column("scope"), column("object_oid")],
+            &["ref_id"],
+            vec![relation.clone()],
+        );
+        assert_eq!(
+            resolve_direct_join_keys(&source, &relation, &target).unwrap(),
+            vec![
+                DirectJoinPair::new("scope", "namespace"),
+                DirectJoinPair::new("object_oid", "oid"),
+            ]
+        );
+        assert_eq!(target.primary_key.columns, vec!["id"]);
+        let reverse = RelationshipDef {
+            field_name: "refs".into(),
+            kind: RelationshipKind::HasMany,
+            target_model: "Ref".into(),
+            ..relation
+        };
+        assert_eq!(
+            resolve_direct_join_keys(&target, &reverse, &source).unwrap(),
+            vec![
+                DirectJoinPair::new("scope", "namespace"),
+                DirectJoinPair::new("object_oid", "oid"),
+            ]
+        );
+    }
+
+    #[test]
+    fn direct_join_rejects_non_unique_candidate_key() {
+        let source = projects(files_rel("workspace_id,path"));
+        let target = project_files();
+        let mut relation = source.relationships[0].clone();
+        relation.references = Some("kind".into());
+        let error = resolve_direct_join_keys(&source, &relation, &target)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("declared unique key"), "{error}");
+        relation.references = Some("missing".into());
+        assert!(resolve_direct_join_keys(&source, &relation, &target)
+            .unwrap_err()
+            .to_string()
+            .contains("unknown column"));
+    }
+
+    #[test]
+    fn direct_join_rejects_alias_duplicates_and_incompatible_types() {
+        let mut source = projects(files_rel("workspace_id,path"));
+        let mut target = project_files();
+        let mut relation = source.relationships[0].clone();
+        source.columns[0].field_name = "workspace_alias".into();
+        relation.references = Some("workspace_alias,workspace_id".into());
+        assert!(resolve_direct_join_keys(&source, &relation, &target)
+            .unwrap_err()
+            .to_string()
+            .contains("repeats a physical column"));
+        relation.references = Some("workspace_id,path".into());
+        target.columns[0].column_type = ColumnType::Integer;
+        assert!(resolve_direct_join_keys(&source, &relation, &target)
+            .unwrap_err()
+            .to_string()
+            .contains("incompatible column types"));
+    }
+
+    #[test]
+    fn programmatic_many_to_many_cannot_silently_ignore_references() {
+        let source = projects(labels_rel(None, None));
+        let mut relation = source.relationships[0].clone();
+        relation.references = Some("path".into());
+        let error = resolve_m2m_join_keys(&source, &relation, &source, &labels())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("requires a direct relationship"), "{error}");
     }
 }

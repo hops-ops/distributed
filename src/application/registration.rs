@@ -2,9 +2,12 @@ use std::sync::Arc;
 
 use super::error::ApplicationResult;
 use super::manifest::{ApplicationExtension, ApplicationManifest, ManifestProvenance};
-use super::module::{Module, SurfaceSpec};
+use super::module::Module;
+use super::surface::SurfaceSpec;
 use crate::graphql::surface::Surface;
-use crate::graphql::{ClientManifestError, DistributedClientManifest, DistributedClientSurfaceExport};
+use crate::graphql::{
+    ClientManifestError, DistributedClientManifest, DistributedClientSurfaceExport,
+};
 
 /// Explicit application registration. No linker inventory or source scan is
 /// consulted; only the values supplied to this constructor participate.
@@ -62,6 +65,21 @@ impl Application {
         })
     }
 
+    /// Declare a gateway's logical capabilities beside the typed Service surface.
+    /// Origins, routes, credentials and adapter resources remain host bindings.
+    #[cfg(feature = "gateway")]
+    pub fn with_gateway(
+        mut self,
+        id: impl Into<String>,
+        gateway: &crate::gateway::Gateway,
+    ) -> ApplicationResult<Self> {
+        self.manifest
+            .extensions
+            .push(gateway.application_extension(id)?);
+        self.manifest.refresh_fingerprints()?;
+        Ok(self)
+    }
+
     pub fn name(&self) -> &str {
         &self.name
     }
@@ -92,7 +110,6 @@ pub struct ApplicationBuilder {
     name: String,
     modules: Vec<Module>,
     surfaces: Vec<SurfaceSpec>,
-    required_capabilities: Vec<String>,
     extensions: Vec<ApplicationExtension>,
     provenance: Option<ManifestProvenance>,
 }
@@ -103,7 +120,6 @@ impl ApplicationBuilder {
             name: name.into(),
             modules: Vec::new(),
             surfaces: Vec::new(),
-            required_capabilities: Vec::new(),
             extensions: Vec::new(),
             provenance: None,
         }
@@ -129,20 +145,6 @@ impl ApplicationBuilder {
         self
     }
 
-    pub fn required_capability(mut self, capability: impl Into<String>) -> Self {
-        self.required_capabilities.push(capability.into());
-        self
-    }
-
-    pub fn required_capabilities(
-        mut self,
-        capabilities: impl IntoIterator<Item = impl Into<String>>,
-    ) -> Self {
-        self.required_capabilities
-            .extend(capabilities.into_iter().map(Into::into));
-        self
-    }
-
     pub fn extension(mut self, extension: ApplicationExtension) -> Self {
         self.extensions.push(extension);
         self
@@ -163,12 +165,6 @@ impl ApplicationBuilder {
 
     pub fn build(self) -> ApplicationResult<Application> {
         let mut application = Application::try_new(self.name, self.modules, self.surfaces)?;
-        application
-            .manifest
-            .required_capabilities
-            .extend(self.required_capabilities);
-        application.manifest.required_capabilities.sort();
-        application.manifest.required_capabilities.dedup();
         application.manifest.extensions.extend(self.extensions);
         if let Some(provenance) = self.provenance {
             application.manifest = application.manifest.with_provenance(provenance);
@@ -217,7 +213,9 @@ impl ContractCompiler {
                     "ContractCompiler already has a different authoritative Surface contract"
                 ));
             }
-            return Err("ContractCompiler accepts exactly one authoritative Surface contract".into());
+            return Err(
+                "ContractCompiler accepts exactly one authoritative Surface contract".into(),
+            );
         }
         self.surface = Some(surface);
         self.surface_spec = Some(spec);

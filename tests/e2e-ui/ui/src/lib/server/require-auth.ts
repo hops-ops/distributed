@@ -5,16 +5,23 @@
  */
 import { redirect } from '@sveltejs/kit';
 
+type AuthSession = { user?: unknown; error?: string; expiresAt?: number };
 type AuthLocals = {
-	auth: () => Promise<{ user?: unknown } | null>;
+	auth: () => Promise<AuthSession | null>;
 };
+
+/** Share the current-session check between protected UI and refresh/API routes. */
+export function isCurrentSession(session: AuthSession | null): session is AuthSession & { user: NonNullable<unknown> } {
+	return !!session?.user && !session.error &&
+		(session.expiresAt === undefined || session.expiresAt > Date.now() / 1000);
+}
 
 export async function requireAuth(
 	event: { locals: AuthLocals; url: URL },
 	options?: { fallbackPath?: string }
 ): Promise<NonNullable<Awaited<ReturnType<AuthLocals['auth']>>>> {
 	const session = await event.locals.auth();
-	if (session?.user) {
+	if (isCurrentSession(session)) {
 		return session;
 	}
 

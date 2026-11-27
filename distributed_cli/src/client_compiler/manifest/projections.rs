@@ -3,22 +3,19 @@ use std::collections::{BTreeMap, BTreeSet};
 use super::*;
 
 const MAX_PROJECTION_ITEMS: usize = 128;
-// Frozen with `distributed::MAX_PROJECTION_EXPRESSION_DEPTH`. The CLI crate is
+// Retained event versions grow the catalog without expanding a command's
+// selected capabilities or an occurrence's executable operation budget.
+const MAX_PROJECTION_PROGRAM_ARMS: usize = 256;
+// Frozen with `distributed::projection::MAX_PROJECTION_EXPRESSION_DEPTH`. The CLI crate is
 // intentionally dependency-free from the runtime crate, so keep a boundary
 // test below to prevent this executable-contract limit from drifting.
 const MAX_EXPRESSION_DEPTH: usize = 64;
 
 pub(crate) fn validate_projection_manifest(
-    mut programs: Vec<ManifestProjectionProgram>,
-    mut bindings: Vec<ManifestProjectionBinding>,
-    models: &BTreeMap<String, ManifestModel>,
-) -> Result<
-    (
-        Vec<ManifestProjectionProgram>,
-        Vec<ManifestProjectionBinding>,
-    ),
-    ClientCompileError,
-> {
+    mut programs: Vec<ClientProjectionProgram>,
+    mut bindings: Vec<ClientProjectionBinding>,
+    models: &BTreeMap<String, ClientModel>,
+) -> Result<(Vec<ClientProjectionProgram>, Vec<ClientProjectionBinding>), ClientCompileError> {
     if programs.len() > MAX_PROJECTION_ITEMS || bindings.len() > MAX_PROJECTION_ITEMS {
         return Err(projection_error(
             "client.manifest.projection_inventory",
@@ -30,7 +27,6 @@ pub(crate) fn validate_projection_manifest(
         (
             &left.program_id,
             &left.binding_id,
-            &left.epoch,
             left.placement as u8,
             left.execution_class as u8,
             left.state as u8,
@@ -38,7 +34,6 @@ pub(crate) fn validate_projection_manifest(
             .cmp(&(
                 &right.program_id,
                 &right.binding_id,
-                &right.epoch,
                 right.placement as u8,
                 right.execution_class as u8,
                 right.state as u8,
@@ -82,7 +77,7 @@ pub(crate) fn validate_projection_manifest(
                 format!("duplicate projection binding `{}`", binding.binding_id),
             ));
         }
-        if binding.state == ManifestProjectionBindingState::Active
+        if binding.state == ProjectionBindingState::Active
             && !active_programs.insert(binding.program_id.as_str())
         {
             return Err(projection_error(
@@ -93,7 +88,7 @@ pub(crate) fn validate_projection_manifest(
                 ),
             ));
         }
-        if binding.placement == ManifestProjectionPlacement::Eventual
+        if binding.placement == ProjectionPlacement::Eventual
             && !program_ids.contains(binding.program_id.as_str())
         {
             return Err(projection_error(
@@ -107,9 +102,9 @@ pub(crate) fn validate_projection_manifest(
         // Direct may export the same portable program for `.applies` previews.
         // Server apply site is still the command handler (Atomic response);
         // client never runs this as an async eventual obligation.
-        if binding.placement == ManifestProjectionPlacement::Direct
+        if binding.placement == ProjectionPlacement::Direct
             && program_ids.contains(binding.program_id.as_str())
-            && binding.execution_class != ManifestProjectionExecutionClass::Causal
+            && binding.execution_class != ProjectionExecutionClass::Causal
         {
             return Err(projection_error(
                 "client.manifest.projection_placement",
@@ -127,20 +122,20 @@ pub(crate) fn validate_projection_manifest(
 ///
 /// Eventual: async projector path + local `.applies` previews.
 /// Direct: same mutation IR; handler-owned Atomic apply; previews optional.
-fn is_preview_eligible_binding(binding: &ManifestProjectionBinding) -> bool {
-    binding.state == ManifestProjectionBindingState::Active
-        && binding.execution_class == ManifestProjectionExecutionClass::Causal
+fn is_preview_eligible_binding(binding: &ClientProjectionBinding) -> bool {
+    binding.state == ProjectionBindingState::Active
+        && binding.execution_class == ProjectionExecutionClass::Causal
         && matches!(
             binding.placement,
-            ManifestProjectionPlacement::Eventual | ManifestProjectionPlacement::Direct
+            ProjectionPlacement::Eventual | ProjectionPlacement::Direct
         )
 }
 
 pub(crate) fn validate_command_projections(
-    commands: &[ManifestCommand],
-    programs: &[ManifestProjectionProgram],
-    bindings: &[ManifestProjectionBinding],
-    models: &BTreeMap<String, ManifestModel>,
+    commands: &[ClientCommand],
+    programs: &[ClientProjectionProgram],
+    bindings: &[ClientProjectionBinding],
+    models: &BTreeMap<String, ClientModel>,
 ) -> Result<BTreeSet<String>, ClientCompileError> {
     let programs = programs
         .iter()
@@ -215,10 +210,8 @@ pub(crate) fn validate_command_projections(
             ));
         }
 
-        let mut selected_slots = BTreeMap::<
-            ManifestProjectionEventRef,
-            BTreeMap<String, ManifestProjectionValueType>,
-        >::new();
+        let mut selected_slots =
+            BTreeMap::<ClientProjectionEventRef, BTreeMap<String, ProjectionValueType>>::new();
         let mut selected_programs = BTreeSet::new();
         for selected in &projection.program_arms {
             validate_event_ref(&selected.event)?;
@@ -330,8 +323,8 @@ pub(crate) fn validate_command_projections(
 }
 
 fn validate_program(
-    program: &ManifestProjectionProgram,
-    models: &BTreeMap<String, ManifestModel>,
+    program: &ClientProjectionProgram,
+    models: &BTreeMap<String, ClientModel>,
 ) -> Result<(), ClientCompileError> {
     if program.version != CLIENT_PROJECTION_PROGRAM_VERSION
         || program.ir_version != PROJECTION_PROGRAM_IR_VERSION
@@ -348,11 +341,11 @@ fn validate_program(
     }
     validate_program_id(&program.program_id)?;
     validate_nonempty(&program.name, "projection program name")?;
-    if program.arms.is_empty() || program.arms.len() > MAX_PROJECTION_ITEMS {
+    if program.arms.is_empty() || program.arms.len() > MAX_PROJECTION_PROGRAM_ARMS {
         return Err(projection_error(
             "client.manifest.projection_program_arms",
             format!(
-                "projection program `{}` must contain 1..={MAX_PROJECTION_ITEMS} arms",
+                "projection program `{}` must contain 1..={MAX_PROJECTION_PROGRAM_ARMS} arms",
                 program.program_id
             ),
         ));
@@ -418,7 +411,7 @@ fn validate_program(
     Ok(())
 }
 
-fn validate_binding(binding: &ManifestProjectionBinding) -> Result<(), ClientCompileError> {
+fn validate_binding(binding: &ClientProjectionBinding) -> Result<(), ClientCompileError> {
     if binding.version != CLIENT_PROJECTION_BINDING_VERSION {
         return Err(projection_error(
             "client.manifest.projection_binding_version",
@@ -429,15 +422,14 @@ fn validate_binding(binding: &ManifestProjectionBinding) -> Result<(), ClientCom
         ));
     }
     validate_binding_id(&binding.binding_id)?;
-    validate_program_id(&binding.program_id)?;
-    validate_projection_epoch(&binding.epoch, "projection binding epoch")
+    validate_program_id(&binding.program_id)
 }
 
 fn validate_operation(
-    program: &ManifestProjectionProgram,
-    arm: &ManifestProjectionArm,
-    operation: &ManifestProjectionOperation,
-    models: &BTreeMap<String, ManifestModel>,
+    program: &ClientProjectionProgram,
+    arm: &ClientProjectionArm,
+    operation: &ClientProjectionOperation,
+    models: &BTreeMap<String, ClientModel>,
 ) -> Result<(), ClientCompileError> {
     validate_nonempty(&operation.operation, "projection operation id")?;
     let model = models.get(&operation.model).ok_or_else(|| {
@@ -450,7 +442,7 @@ fn validate_operation(
         )
     })?;
     let Some(identity) = model.identity() else {
-        if operation.kind != ManifestProjectionMutationKind::InvalidateModel {
+        if operation.kind != ClientProjectionMutationKind::InvalidateModel {
             return Err(projection_error(
                 "client.manifest.projection_model",
                 format!(
@@ -475,7 +467,7 @@ fn validate_operation(
         validate_invalidations(operation, models)?;
         if !matches!(
             operation.invalidations.as_slice(),
-            [ManifestProjectionInvalidation::Model { model }] if model == &operation.model
+            [ClientProjectionInvalidation::Model { model }] if model == &operation.model
         ) {
             return Err(projection_error(
                 "client.manifest.projection_invalidation",
@@ -492,12 +484,20 @@ fn validate_operation(
     validate_projection_fields(operation, model)?;
 
     match operation.kind {
-        ManifestProjectionMutationKind::Insert
-        | ManifestProjectionMutationKind::Upsert
-        | ManifestProjectionMutationKind::Recreate
-        | ManifestProjectionMutationKind::InsertRelated
-        | ManifestProjectionMutationKind::UpsertRelated => {
-            if operation.fields.is_empty() {
+        ClientProjectionMutationKind::Insert
+        | ClientProjectionMutationKind::Upsert
+        | ClientProjectionMutationKind::Recreate
+        | ClientProjectionMutationKind::InsertRelated
+        | ClientProjectionMutationKind::UpsertRelated => {
+            // Identity assignments live in `key`, so a key-only normalized
+            // model has a complete row even with an empty non-key field mask.
+            if operation.fields.is_empty()
+                && model.fields.iter().any(|field| {
+                    !identity
+                        .iter()
+                        .any(|key_field| key_field.name == field.name)
+                })
+            {
                 return Err(projection_error(
                     "client.manifest.projection_field_mask",
                     format!(
@@ -507,7 +507,7 @@ fn validate_operation(
                 ));
             }
         }
-        ManifestProjectionMutationKind::Patch | ManifestProjectionMutationKind::UpsertPatch => {
+        ClientProjectionMutationKind::Patch | ClientProjectionMutationKind::UpsertPatch => {
             if operation.fields.is_empty() {
                 return Err(projection_error(
                     "client.manifest.projection_field_mask",
@@ -518,7 +518,7 @@ fn validate_operation(
                 ));
             }
         }
-        ManifestProjectionMutationKind::Delete => {
+        ClientProjectionMutationKind::Delete => {
             if !operation.fields.is_empty() {
                 return Err(projection_error(
                     "client.manifest.projection_field_mask",
@@ -526,8 +526,8 @@ fn validate_operation(
                 ));
             }
         }
-        ManifestProjectionMutationKind::InvalidateModel => {}
-        ManifestProjectionMutationKind::InvalidateRelationship => {
+        ClientProjectionMutationKind::InvalidateModel => {}
+        ClientProjectionMutationKind::InvalidateRelationship => {
             return Err(projection_error(
                 "client.manifest.projection_invalidation",
                 "top-level relationship invalidation has no source-key provenance; use an \
@@ -540,8 +540,8 @@ fn validate_operation(
 }
 
 fn validate_projection_fields(
-    operation: &ManifestProjectionOperation,
-    model: &ManifestModel,
+    operation: &ClientProjectionOperation,
+    model: &ClientModel,
 ) -> Result<(), ClientCompileError> {
     let identity = model
         .identity()
@@ -573,7 +573,7 @@ fn validate_projection_fields(
                 ),
             ));
         }
-        if let ManifestProjectionAssignment::Set { expression } = &field.assignment {
+        if let ClientProjectionAssignment::Set { expression } = &field.assignment {
             validate_expression(expression, 1)?;
         }
     }
@@ -581,8 +581,8 @@ fn validate_projection_fields(
 }
 
 fn validate_relationships(
-    operation: &ManifestProjectionOperation,
-    models: &BTreeMap<String, ManifestModel>,
+    operation: &ClientProjectionOperation,
+    models: &BTreeMap<String, ClientModel>,
 ) -> Result<(), ClientCompileError> {
     let mut identities = BTreeSet::new();
     for (index, effect) in operation.relationships.iter().enumerate() {
@@ -658,13 +658,13 @@ fn validate_relationships(
 }
 
 fn validate_invalidations(
-    operation: &ManifestProjectionOperation,
-    models: &BTreeMap<String, ManifestModel>,
+    operation: &ClientProjectionOperation,
+    models: &BTreeMap<String, ClientModel>,
 ) -> Result<(), ClientCompileError> {
     let mut identities = BTreeSet::new();
     for invalidation in &operation.invalidations {
         let identity = match invalidation {
-            ManifestProjectionInvalidation::Model { model } => {
+            ClientProjectionInvalidation::Model { model } => {
                 if !models.contains_key(model) {
                     return Err(projection_error(
                         "client.manifest.projection_invalidation",
@@ -673,7 +673,7 @@ fn validate_invalidations(
                 }
                 format!("model:{model}")
             }
-            ManifestProjectionInvalidation::Relationship {
+            ClientProjectionInvalidation::Relationship {
                 source_model,
                 relationship,
                 target_model,
@@ -707,8 +707,8 @@ fn validate_invalidations(
 }
 
 fn validate_key(
-    key: &[ManifestProjectionKeyField],
-    identity: &[ManifestKeyField],
+    key: &[ClientProjectionKeyField],
+    identity: &[ClientKeyField],
     label: &str,
 ) -> Result<(), ClientCompileError> {
     if key.len() != identity.len() {
@@ -729,15 +729,15 @@ fn validate_key(
     Ok(())
 }
 
-fn validate_partition(partition: &ManifestProjectionPartition) -> Result<(), ClientCompileError> {
-    if let ManifestProjectionPartition::Expression { expression } = partition {
+fn validate_partition(partition: &ClientProjectionPartition) -> Result<(), ClientCompileError> {
+    if let ClientProjectionPartition::Expression { expression } = partition {
         validate_expression(expression, 1)?;
     }
     Ok(())
 }
 
 fn validate_expression(
-    expression: &ManifestProjectionExpression,
+    expression: &ClientProjectionExpression,
     depth: usize,
 ) -> Result<(), ClientCompileError> {
     if depth > MAX_EXPRESSION_DEPTH {
@@ -747,23 +747,33 @@ fn validate_expression(
         ));
     }
     match expression {
-        ManifestProjectionExpression::Slot {
+        ClientProjectionExpression::Slot {
             slot,
             value_type: _,
         } => validate_nonempty(slot, "projection expression slot"),
-        ManifestProjectionExpression::Envelope { field: _ } => Ok(()),
-        ManifestProjectionExpression::Constant { value } => validate_value(value, depth),
-        ManifestProjectionExpression::Enum { enum_type, variant } => {
+        ClientProjectionExpression::Envelope { field } => {
+            if field.is_client_intrinsic() {
+                Ok(())
+            } else {
+                Err(projection_error(
+                    "client.manifest.projection_envelope",
+                    "projection envelope expressions carry only client-intrinsic fields; \
+                     other envelope fields are typed slots",
+                ))
+            }
+        }
+        ClientProjectionExpression::Constant { value } => validate_value(value, depth),
+        ClientProjectionExpression::Enum { enum_type, variant } => {
             validate_nonempty(enum_type, "projection enum type")?;
             validate_nonempty(variant, "projection enum variant")
         }
-        ManifestProjectionExpression::List { values } => {
+        ClientProjectionExpression::List { values } => {
             for value in values {
                 validate_expression(value, depth + 1)?;
             }
             Ok(())
         }
-        ManifestProjectionExpression::Object { fields } => {
+        ClientProjectionExpression::Object { fields } => {
             if fields.windows(2).any(|pair| pair[0].name >= pair[1].name) {
                 return Err(projection_error(
                     "client.manifest.projection_expression_object",
@@ -776,7 +786,7 @@ fn validate_expression(
             }
             Ok(())
         }
-        ManifestProjectionExpression::Transform {
+        ClientProjectionExpression::Transform {
             transform: _,
             arguments,
         } => {
@@ -794,19 +804,18 @@ fn validate_expression(
     }
 }
 
-fn validate_value(value: &ManifestProjectionValue, depth: usize) -> Result<(), ClientCompileError> {
+/// Deserializing a [`ProjectionValue`] already proved its numbers canonical,
+/// its object members sorted and unique, and its own depth; the depth here is
+/// that of the expression holding it plus the value's.
+fn validate_value(value: &ProjectionValue, depth: usize) -> Result<(), ClientCompileError> {
     if depth > MAX_EXPRESSION_DEPTH {
         return Err(projection_error(
             "client.manifest.projection_value_depth",
             "projection value exceeds maximum depth 64",
         ));
     }
-    match value {
-        ManifestProjectionValue::Null | ManifestProjectionValue::Boolean(_) => Ok(()),
-        ManifestProjectionValue::I64(value) => validate_canonical_i64(value),
-        ManifestProjectionValue::U64(value) => validate_canonical_u64(value),
-        ManifestProjectionValue::F64(value) => validate_canonical_f64(value),
-        ManifestProjectionValue::String(value) => {
+    match value.as_ref() {
+        ProjectionValueRef::String(value) => {
             if value.chars().any(char::is_control) {
                 return Err(projection_error(
                     "client.manifest.projection_value",
@@ -815,42 +824,41 @@ fn validate_value(value: &ManifestProjectionValue, depth: usize) -> Result<(), C
             }
             Ok(())
         }
-        ManifestProjectionValue::Enum { enum_type, variant } => {
+        ProjectionValueRef::Enum { enum_type, variant } => {
             validate_nonempty(enum_type, "projection enum type")?;
             validate_nonempty(variant, "projection enum variant")
         }
-        ManifestProjectionValue::List(values) => {
+        ProjectionValueRef::List(values) => {
             for value in values {
                 validate_value(value, depth + 1)?;
             }
             Ok(())
         }
-        ManifestProjectionValue::Object(fields) => {
-            if fields.windows(2).any(|pair| pair[0].name >= pair[1].name) {
-                return Err(projection_error(
-                    "client.manifest.projection_value_object",
-                    "projection object value fields must be sorted and unique",
-                ));
-            }
+        ProjectionValueRef::Object(fields) => {
             for field in fields {
-                validate_value(&field.value, depth + 1)?;
+                validate_value(field.value(), depth + 1)?;
             }
             Ok(())
         }
+        ProjectionValueRef::Null
+        | ProjectionValueRef::Boolean(_)
+        | ProjectionValueRef::I64(_)
+        | ProjectionValueRef::U64(_)
+        | ProjectionValueRef::F64(_) => Ok(()),
     }
 }
 
 fn validate_preview_source(
-    command: &ManifestCommand,
-    source: &ManifestProjectionPreviewSource,
-    expected: &ManifestProjectionValueType,
+    command: &ClientCommand,
+    source: &ClientProjectionPreviewSource,
+    expected: &ProjectionValueType,
 ) -> Result<(), ClientCompileError> {
     match source {
-        ManifestProjectionPreviewSource::Input { path } => {
+        ClientProjectionPreviewSource::Input { path } => {
             let field = validate_shape_path(&command.input, path, "input")?;
             validate_input_source_type(command, field, expected, "input")
         }
-        ManifestProjectionPreviewSource::GeneratedDefault { path } => {
+        ClientProjectionPreviewSource::GeneratedDefault { path } => {
             let field = validate_shape_path(&command.input, path, "generated default")?;
             let declared = command
                 .extensions
@@ -871,7 +879,7 @@ fn validate_preview_source(
             }
             validate_input_source_type(command, field, expected, "generated default")
         }
-        ManifestProjectionPreviewSource::TrustedPreset { name, codec } => {
+        ClientProjectionPreviewSource::TrustedPreset { name, codec } => {
             let declared = command
                 .extensions
                 .trusted_presets
@@ -893,7 +901,7 @@ fn validate_preview_source(
             }
             Ok(())
         }
-        ManifestProjectionPreviewSource::Constant { value } => {
+        ClientProjectionPreviewSource::Constant { value } => {
             validate_value(value, 1)?;
             if !constant_compatible(value, expected) {
                 return Err(command_projection_error(
@@ -904,18 +912,18 @@ fn validate_preview_source(
             }
             Ok(())
         }
-        ManifestProjectionPreviewSource::Null
-        | ManifestProjectionPreviewSource::Absent
-        | ManifestProjectionPreviewSource::Unknown => Ok(()),
+        ClientProjectionPreviewSource::Null
+        | ClientProjectionPreviewSource::Absent
+        | ClientProjectionPreviewSource::Unknown => Ok(()),
     }
 }
 
 fn validate_shape_path<'a>(
-    shape: &'a ManifestCommandShape,
+    shape: &'a ClientCommandShape,
     path: &[String],
     label: &str,
-) -> Result<&'a ManifestTypeField, ClientCompileError> {
-    let ManifestCommandShape::Object { definition } = shape else {
+) -> Result<&'a ClientTypeField, ClientCompileError> {
+    let ClientCommandShape::Object { definition } = shape else {
         return Err(projection_error(
             "client.manifest.command_projection_path",
             format!("{label} path cannot target a command without input"),
@@ -953,9 +961,9 @@ fn validate_shape_path<'a>(
 }
 
 fn validate_input_source_type(
-    command: &ManifestCommand,
-    field: &ManifestTypeField,
-    expected: &ManifestProjectionValueType,
+    command: &ClientCommand,
+    field: &ClientTypeField,
+    expected: &ProjectionValueType,
     label: &str,
 ) -> Result<(), ClientCompileError> {
     let compatible = !field.list
@@ -974,69 +982,61 @@ fn validate_input_source_type(
     Ok(())
 }
 
-fn input_codec_compatible(
-    type_name: &str,
-    codec: &str,
-    expected: &ManifestProjectionValueType,
-) -> bool {
+fn input_codec_compatible(type_name: &str, codec: &str, expected: &ProjectionValueType) -> bool {
     match expected {
-        ManifestProjectionValueType::Boolean => type_name == "Boolean" && codec == "boolean",
-        ManifestProjectionValueType::I64 => matches!(
+        ProjectionValueType::Boolean => type_name == "Boolean" && codec == "boolean",
+        ProjectionValueType::I64 => matches!(
             (type_name, codec),
             ("Int", "int32") | ("BigInt", "json_number_precision_limited")
         ),
-        // Both numeric command codecs admit negative values. Without a
-        // non-negative refinement in the frozen manifest, neither proves U64.
-        ManifestProjectionValueType::U64 => false,
-        ManifestProjectionValueType::F64 => type_name == "Float" && codec == "float64",
-        ManifestProjectionValueType::String => matches!(
+        ProjectionValueType::U64 => type_name == "BigInt" && unsigned_codec(codec),
+        ProjectionValueType::F64 => type_name == "Float" && codec == "float64",
+        ProjectionValueType::String => matches!(
             (type_name, codec),
             ("ID" | "String", "string") | ("Timestamptz", "string_unvalidated_timestamp")
         ),
-        ManifestProjectionValueType::Enum(enum_type) => type_name == enum_type && codec == "string",
-        ManifestProjectionValueType::Json => type_name == "JSON" && codec == "json",
+        ProjectionValueType::Enum(enum_type) => type_name == enum_type && codec == "string",
+        ProjectionValueType::Json => type_name == "JSON" && codec == "json",
     }
 }
 
-fn codec_compatible(codec: &str, expected: &ManifestProjectionValueType) -> bool {
+fn codec_compatible(codec: &str, expected: &ProjectionValueType) -> bool {
     match expected {
-        ManifestProjectionValueType::Boolean => codec == "boolean",
-        ManifestProjectionValueType::I64 => {
+        ProjectionValueType::Boolean => codec == "boolean",
+        ProjectionValueType::I64 => {
             matches!(codec, "int32" | "json_number_precision_limited")
         }
-        ManifestProjectionValueType::U64 => false,
-        ManifestProjectionValueType::F64 => codec == "float64",
-        ManifestProjectionValueType::String | ManifestProjectionValueType::Enum(_) => {
-            codec == "string"
-        }
-        ManifestProjectionValueType::Json => codec == "json",
+        ProjectionValueType::U64 => unsigned_codec(codec),
+        ProjectionValueType::F64 => codec == "float64",
+        ProjectionValueType::String | ProjectionValueType::Enum(_) => codec == "string",
+        ProjectionValueType::Json => codec == "json",
     }
 }
 
-fn constant_compatible(
-    value: &ManifestProjectionValue,
-    expected: &ManifestProjectionValueType,
-) -> bool {
-    match (value, expected) {
-        (ManifestProjectionValue::Boolean(_), ManifestProjectionValueType::Boolean)
-        | (ManifestProjectionValue::I64(_), ManifestProjectionValueType::I64)
-        | (ManifestProjectionValue::U64(_), ManifestProjectionValueType::U64)
-        | (ManifestProjectionValue::F64(_), ManifestProjectionValueType::F64)
-        | (ManifestProjectionValue::String(_), ManifestProjectionValueType::String) => true,
-        (
-            ManifestProjectionValue::Enum { enum_type, .. },
-            ManifestProjectionValueType::Enum(expected),
-        ) => enum_type == expected,
-        (_, ManifestProjectionValueType::Json) => true,
+fn unsigned_codec(codec: &str) -> bool {
+    matches!(codec, "uint8" | "uint16" | "uint32" | "uint64_safe_integer")
+}
+
+fn constant_compatible(value: &ProjectionValue, expected: &ProjectionValueType) -> bool {
+    match (value.as_ref(), expected) {
+        (ProjectionValueRef::Boolean(_), ProjectionValueType::Boolean)
+        | (ProjectionValueRef::I64(_), ProjectionValueType::I64)
+        | (ProjectionValueRef::U64(_), ProjectionValueType::U64)
+        | (ProjectionValueRef::F64(_), ProjectionValueType::F64)
+        | (ProjectionValueRef::String(_), ProjectionValueType::String) => true,
+        (ProjectionValueRef::Enum { enum_type, .. }, ProjectionValueType::Enum(expected)) => {
+            enum_type == expected
+        }
+        (_, ProjectionValueType::Json) => true,
         _ => false,
     }
 }
 
 fn collect_arm_slots(
-    arm: &ManifestProjectionArm,
-    slots: &mut BTreeMap<String, ManifestProjectionValueType>,
+    arm: &ClientProjectionArm,
+    slots: &mut BTreeMap<String, ProjectionValueType>,
 ) -> Result<(), ClientCompileError> {
-    if let ManifestProjectionPartition::Expression { expression } = &arm.partition {
+    if let ClientProjectionPartition::Expression { expression } = &arm.partition {
         collect_expression_slots(expression, slots)?;
     }
     for operation in &arm.operations {
@@ -1044,7 +1044,7 @@ fn collect_arm_slots(
             collect_expression_slots(&field.expression, slots)?;
         }
         for field in &operation.fields {
-            if let ManifestProjectionAssignment::Set { expression } = &field.assignment {
+            if let ClientProjectionAssignment::Set { expression } = &field.assignment {
                 collect_expression_slots(expression, slots)?;
             }
         }
@@ -1062,11 +1062,11 @@ fn collect_arm_slots(
 }
 
 fn collect_expression_slots(
-    expression: &ManifestProjectionExpression,
-    slots: &mut BTreeMap<String, ManifestProjectionValueType>,
+    expression: &ClientProjectionExpression,
+    slots: &mut BTreeMap<String, ProjectionValueType>,
 ) -> Result<(), ClientCompileError> {
     match expression {
-        ManifestProjectionExpression::Slot { slot, value_type } => {
+        ClientProjectionExpression::Slot { slot, value_type } => {
             if slots
                 .insert(slot.clone(), value_type.clone())
                 .is_some_and(|existing| existing != *value_type)
@@ -1077,29 +1077,29 @@ fn collect_expression_slots(
                 ));
             }
         }
-        ManifestProjectionExpression::List { values } => {
+        ClientProjectionExpression::List { values } => {
             for value in values {
                 collect_expression_slots(value, slots)?;
             }
         }
-        ManifestProjectionExpression::Object { fields } => {
+        ClientProjectionExpression::Object { fields } => {
             for field in fields {
                 collect_expression_slots(&field.value, slots)?;
             }
         }
-        ManifestProjectionExpression::Transform { arguments, .. } => {
+        ClientProjectionExpression::Transform { arguments, .. } => {
             for argument in arguments {
                 collect_expression_slots(argument, slots)?;
             }
         }
-        ManifestProjectionExpression::Envelope { .. }
-        | ManifestProjectionExpression::Constant { .. }
-        | ManifestProjectionExpression::Enum { .. } => {}
+        ClientProjectionExpression::Envelope { .. }
+        | ClientProjectionExpression::Constant { .. }
+        | ClientProjectionExpression::Enum { .. } => {}
     }
     Ok(())
 }
 
-fn validate_event_ref(event: &ManifestProjectionEventRef) -> Result<(), ClientCompileError> {
+fn validate_event_ref(event: &ClientProjectionEventRef) -> Result<(), ClientCompileError> {
     validate_nonempty(&event.id, "projection event id")?;
     validate_nonempty(&event.name, "projection event name")?;
     if event.version == 0 {
@@ -1133,59 +1133,12 @@ fn validate_prefixed_hash(
     validate_hash(hash, label)
 }
 
-fn validate_canonical_i64(value: &str) -> Result<(), ClientCompileError> {
-    value
-        .parse::<i64>()
-        .ok()
-        .filter(|parsed| parsed.to_string() == value)
-        .map(|_| ())
-        .ok_or_else(|| {
-            projection_error(
-                "client.manifest.projection_number",
-                "projection i64 must be canonical and in range",
-            )
-        })
-}
-
-fn validate_canonical_u64(value: &str) -> Result<(), ClientCompileError> {
-    value
-        .parse::<u64>()
-        .ok()
-        .filter(|parsed| parsed.to_string() == value)
-        .map(|_| ())
-        .ok_or_else(|| {
-            projection_error(
-                "client.manifest.projection_number",
-                "projection u64 must be canonical and in range",
-            )
-        })
-}
-
-fn validate_canonical_f64(value: &str) -> Result<(), ClientCompileError> {
-    let Some(parsed) = value.parse::<f64>().ok().filter(|value| value.is_finite()) else {
-        return Err(projection_error(
-            "client.manifest.projection_number",
-            "projection f64 must be finite and canonical",
-        ));
-    };
-    let canonical = serde_json::Number::from_f64(if parsed == 0.0 { 0.0 } else { parsed })
-        .expect("finite float")
-        .to_string();
-    if canonical != value {
-        return Err(projection_error(
-            "client.manifest.projection_number",
-            "projection f64 must be finite and canonical",
-        ));
-    }
-    Ok(())
-}
-
 fn projection_error(code: &'static str, message: impl Into<String>) -> ClientCompileError {
     ClientCompileError::manifest(code, message)
 }
 
 fn command_projection_error(
-    command: &ManifestCommand,
+    command: &ClientCommand,
     code: &'static str,
     message: impl Into<String>,
 ) -> ClientCompileError {
@@ -1199,16 +1152,26 @@ fn command_projection_error(
 mod tests {
     use super::*;
 
-    fn nested_expression(depth: usize) -> ManifestProjectionExpression {
-        let mut expression = ManifestProjectionExpression::Constant {
-            value: ManifestProjectionValue::Null,
+    fn nested_expression(depth: usize) -> ClientProjectionExpression {
+        let mut expression = ClientProjectionExpression::Constant {
+            value: ProjectionValue::null(),
         };
         for _ in 1..depth {
-            expression = ManifestProjectionExpression::List {
+            expression = ClientProjectionExpression::List {
                 values: vec![expression],
             };
         }
         expression
+    }
+
+    #[test]
+    fn envelope_expressions_admit_only_client_intrinsic_fields() {
+        let envelope = |field| ClientProjectionExpression::Envelope { field };
+        validate_expression(&envelope(ProjectionEnvelopeField::EventName), 1)
+            .expect("event name is known to the command");
+        let error = validate_expression(&envelope(ProjectionEnvelopeField::OccurrenceId), 1)
+            .expect_err("occurrence id is written by the server");
+        assert_eq!(error.code, "client.manifest.projection_envelope");
     }
 
     #[test]

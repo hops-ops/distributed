@@ -1,56 +1,67 @@
 import {
 	parseGraphqlResponseExtensions,
+	type DistributedCommandMetadata,
 	type DistributedProtocolEnvelope
 } from '../../protocol.js';
-import {
-	matchReplicaTrustedPresetInventory,
-	prepareReplicaCommandWithTrustedPresets,
-	verifyReplicaCommandReceipt,
-	type ReplicaCommandArtifact,
-	type ReplicaCommandRevalidationPlan,
-	type ReplicaPreparedCommand
-} from '../commands.js';
+import { sameScope } from '../distributed-replica/hydration.js';
+import { compareCodeUnits } from '../../lib/compare-code-units.js';
+import { matchReplicaTrustedPresetInventory } from '../commands/presets.js';
+import { prepareReplicaCommandWithTrustedPresets } from '../commands/prepare.js';
+import { verifyReplicaCommandReceipt } from '../commands/receipt.js';
+import type {
+	ReplicaCommandArtifact,
+	ReplicaCommandRevalidationPlan,
+	ReplicaPreparedCommand
+} from '../commands/types.js';
 import type { ReplicaResultEnvelope } from '../types.js';
 import {
 	applyOptimisticEffects,
+	preparedDispatchKeys,
+	preparedSemanticChanges
+} from './lib/effects.js';
+import {
 	attachAuthorityAbort,
 	callerProjectedPromise,
-	cloneScope,
-	commandOutput,
-	commandStatusArtifact,
-	commandStatusRequest,
-	commandSurfaceContract,
-	commandTransportRequest,
 	confirmDirectProjection,
-	defineBoundCommand,
-	dispatchPrepared,
 	failTrackedProjection,
-	freezeCommandTree,
-	graphqlCommandRejection,
-	linkAbortSignals,
 	monitorPendingProjection,
-	normalizeInventory,
-	normalizeRetries,
 	pendingProjection,
-	preparedDispatchKeys,
-	preparedSemanticChanges,
-	requireCommandEnvelope,
-	requireCommandRejectionEnvelope,
-	requireStatusEnvelope,
-	sameScope,
 	settleProjectionFailure,
 	settleProjectionSuccess,
-	settleTrackedProjection,
-	validateStatusProgression,
+	settleTrackedProjection
+} from './lib/projection.js';
+import {
+	cloneScope,
+	linkAbortSignals,
+	normalizeRetries,
 	waitForCommandOperation
-} from './lib/index.js';
+} from './lib/util.js';
+import { commandOutput, projectionExpectationFingerprint } from './lib/output.js';
+import {
+	commandStatusArtifact,
+	commandSurfaceContract,
+	normalizeInventory
+} from './lib/inventory.js';
+import {
+	commandStatusRequest,
+	commandTransportRequest,
+	dispatchPrepared,
+	graphqlCommandRejection,
+	requireCommandEnvelope,
+	requireCommandRejectionEnvelope
+} from './lib/transport.js';
+import { defineBoundCommand, freezeCommandTree } from './lib/binding.js';
+import { sendCommand } from './lib/sent.js';
+import { requireStatusEnvelope, validateStatusProgression } from './lib/status.js';
 import { ReplicaCommandRuntimeError } from './errors.js';
 import {
 	replicaCommandAuthority,
+	replicaCommandFreshness,
 	replicaCommandProjectionDelta,
-	replicaCommandProjectedLifecycle,
 	replicaCommandReadRecord,
-	replicaResultObservation
+	replicaResultObservation,
+	replicaCommandAwaitsFetch,
+	replicaCommandLayerHeld
 } from './symbols.js';
 import type {
 	CapturedAuthority,
@@ -71,18 +82,34 @@ import type {
 	ReplicaCommandTransportResult,
 	SemanticReplica
 } from './types.js';
-import {
-	operationsFromProjectionDelta,
-	validateProjectionMetadataAuthority,
-	type ProjectionCapabilityArm,
-	type ProjectionCapabilityMutation,
-	type ProjectionDelta,
-	type ProjectionDeltaMutation,
-	type ProjectionDeltaRecoveryTarget,
-	type ProjectionDeltaScope,
-	type PreparedProjectionOperation,
-	type ReplicaCommandProjection
-} from '../projection-delta/index.js';
+import { operationsFromProjectionDelta } from '../projection-delta/resolve.js';
+import { validateProjectionMetadataAuthority } from '../projection-delta/validate.js';
+import type {
+	ProjectionCapabilityArm,
+	ProjectionCapabilityMutation,
+	ProjectionDelta,
+	ProjectionDeltaMutation,
+	ProjectionDeltaRecoveryTarget,
+	ProjectionDeltaScope,
+	PreparedProjectionOperation,
+	ReplicaCommandProjection
+} from '../projection-delta/types.js';
+
+function hasCompleteProjectionObservations(
+	metadata: DistributedCommandMetadata
+): boolean {
+	if (metadata.expects.length === 0 || metadata.observations.length === 0) {
+		return false;
+	}
+	const observed = new Set(
+		metadata.observations
+			.filter((observation) => observation.causationId === metadata.causationId)
+			.map(projectionExpectationFingerprint)
+	);
+	return metadata.expects.every((expectation) =>
+		observed.has(projectionExpectationFingerprint(expectation))
+	);
+}
 
 function assertActualProjectionCapabilities(
 	contract: ReplicaCommandProjection,
@@ -312,10 +339,6 @@ function unionNames(values: readonly string[]): readonly string[] {
 	return Object.freeze([...new Set(values)].sort(compareCodeUnits));
 }
 
-function compareCodeUnits(left: string, right: string): number {
-	return left < right ? -1 : left > right ? 1 : 0;
-}
-
 function sameStrings(left: readonly string[], right: readonly string[]): boolean {
 	return (
 		left.length === right.length &&
@@ -459,16 +482,70 @@ export function createReplicaCommandRuntime<
 		);
 	}
 	const registration = replica[replicaCommandAuthority]?.(contract);
+	/*
+	 * Per-command state. Every entry ends with its command's optimistic layer:
+	 *
+	 * - `pending`: an accepted command whose `projected` promise waits for a
+	 *   proving frame. Deleted when that promise settles (proof, terminal
+	 *   status, scope change, dispose).
+	 * - `unmanagedLayers`: a layer with no `pending` controller that this
+	 *   runtime still has to retire or roll back (in flight, recovery, required
+	 *   revalidation). Deleted when the runtime retires or rejects it, or by
+	 *   `sweep` once the replica no longer holds the layer.
+	 * - `appliedProjections`: the actual projection delta applied to a layer,
+	 *   kept so a replayed status or live envelope is recognised instead of
+	 *   applied twice, and so revalidation covers the models that delta
+	 *   touched. Deleted by `sweep` once the replica no longer holds the layer.
+	 *   A revalidation reads its plan when it starts, so a sweep never drops
+	 *   the plan of a revalidation already under way.
+	 * - `dispatchTails`: the last dispatch per record key. Deleted when that
+	 *   dispatch settles.
+	 */
 	const pending = new Map<string, PendingProjection>();
-	const projectionReplays = new Map<string, string>();
-	const projectionRevalidations = new Map<
-		string,
-		ReplicaCommandRevalidationPlan
+	const appliedProjections = new Map<
+		ReplicaPreparedCommand<unknown, unknown>,
+		Readonly<{
+			canonical: string;
+			revalidation: ReplicaCommandRevalidationPlan | undefined;
+		}>
 	>();
 	const dispatchTails = new Map<string, Promise<void>>();
 	const unmanagedLayers = new Set<string>();
 	const runtimeAbort = new AbortController();
 	let disposed = false;
+
+	/*
+	 * A layer can leave the replica without this runtime retiring it: a frame
+	 * proves its receipt, or a scope change empties the cache. A host without
+	 * the layer question keeps its entries until the runtime is disposed.
+	 */
+	const layerHeld = (commandId: string): boolean =>
+		replica[replicaCommandLayerHeld]?.(commandId) ?? true;
+	/*
+	 * Drop the entries of commands whose layer is gone. Runs at the end of
+	 * every entry point (dispatch, status read, observed result, background
+	 * revalidation), after the synchronous work that may still read them.
+	 */
+	const sweep = (): void => {
+		for (const commandId of unmanagedLayers) {
+			if (!layerHeld(commandId)) unmanagedLayers.delete(commandId);
+		}
+		for (const prepared of appliedProjections.keys()) {
+			if (!layerHeld(prepared.commandId)) appliedProjections.delete(prepared);
+		}
+	};
+	let sweptGeneration: AbortSignal | undefined;
+	/*
+	 * A closed authorization generation empties the replica right after it
+	 * aborts this signal, so sweep once that purge has run.
+	 */
+	const sweepWhenGenerationCloses = (signal: AbortSignal | undefined): void => {
+		if (signal === undefined || signal === sweptGeneration) return;
+		sweptGeneration = signal;
+		signal.addEventListener('abort', () => queueMicrotask(sweep), {
+			once: true
+		});
+	};
 
 	const reserveDispatch = (
 		prepared: ReplicaPreparedCommand<unknown, unknown>
@@ -558,14 +635,18 @@ export function createReplicaCommandRuntime<
 		) {
 			throw new Error('projection obligations do not match command expectations');
 		}
-		const previous = projectionReplays.get(prepared.commandId);
+		const previous = appliedProjections.get(prepared);
 		if (previous !== undefined) {
-			if (previous !== canonical) {
+			if (previous.canonical !== canonical) {
 				throw new Error('projection delta changed during command replay');
 			}
 			return Object.freeze({
 				requiresRevalidation: actual.revalidate
 			});
+		}
+		if (!layerHeld(prepared.commandId)) {
+			// The layer already retired: there is nothing left to replace.
+			return Object.freeze({ requiresRevalidation: actual.revalidate });
 		}
 		assertActualProjectionCapabilities(
 			prepared.projection.contract,
@@ -601,6 +682,7 @@ export function createReplicaCommandRuntime<
 			return validated.requiresRevalidation;
 		}
 		const seam = replica[replicaCommandProjectionDelta]!;
+		if (validated.revalidation !== undefined) replica[replicaCommandFreshness]?.(prepared.commandId, validated.revalidation);
 		const actualPrepared = Object.freeze({
 			...prepared,
 			optimistic: Object.freeze({
@@ -615,13 +697,13 @@ export function createReplicaCommandRuntime<
 			(writer) => applyOptimisticEffects(writer, validated.operations!),
 			preparedSemanticChanges(actualPrepared)
 		);
-		projectionReplays.set(prepared.commandId, validated.canonical);
-		if (validated.revalidation !== undefined) {
-			projectionRevalidations.set(
-				prepared.commandId,
-				validated.revalidation
-			);
-		}
+		appliedProjections.set(
+			prepared,
+			Object.freeze({
+				canonical: validated.canonical,
+				revalidation: validated.revalidation
+			})
+		);
 		return validated.requiresRevalidation;
 	};
 
@@ -723,6 +805,17 @@ export function createReplicaCommandRuntime<
 		);
 	};
 
+	const revalidationPlan = (
+		prepared: ReplicaPreparedCommand<unknown, unknown>
+	) => appliedProjections.get(prepared)?.revalidation ?? prepared.revalidation;
+	const awaitsFetch = (
+		prepared: ReplicaPreparedCommand<unknown, unknown>
+	): boolean =>
+		replica[replicaCommandAwaitsFetch]?.(
+			prepared.commandId,
+			revalidationPlan(prepared)
+		) ?? false;
+
 	const revalidate = async (
 		prepared: ReplicaPreparedCommand<unknown, unknown>,
 		authoritySignal?: AbortSignal
@@ -734,10 +827,7 @@ export function createReplicaCommandRuntime<
 		]);
 		try {
 			await waitForCommandOperation(
-				replicaRevalidate(
-					projectionRevalidations.get(prepared.commandId) ??
-						prepared.revalidation
-				),
+				replicaRevalidate(revalidationPlan(prepared)),
 				revalidationSignals.signal
 			);
 			return true;
@@ -776,11 +866,13 @@ export function createReplicaCommandRuntime<
 						prepared.commandId
 					);
 				}
+				sweep();
 			})
 			.catch(() => undefined);
 	};
 	const revalidateDispositionAndRetireInBackground = (
-		controller: PendingProjection
+		controller: PendingProjection,
+		onFailure?: () => void
 	): void => {
 		void revalidate(controller.prepared, controller.authority.signal)
 			.then((refreshed) => {
@@ -795,9 +887,10 @@ export function createReplicaCommandRuntime<
 					);
 					settleProjectionSuccess(controller);
 					pending.delete(controller.commandId);
-				}
+					sweep();
+				} else if (!refreshed) onFailure?.();
 			})
-			.catch(() => undefined);
+			.catch(() => onFailure?.());
 	};
 
 	const commitStatusProgression = (
@@ -1031,36 +1124,50 @@ export function createReplicaCommandRuntime<
 						prepared.commandId,
 						metadata
 					);
+					const exactDelta =
+						!prepared.revalidation.required &&
+						!statusRequiresRevalidation;
+					const proven =
+						metadata.state === 'atomic' ||
+						hasCompleteProjectionObservations(metadata);
 					if (!remainsPending) {
 						unmanagedLayers.delete(prepared.commandId);
 						if (tracker.pending !== undefined) {
 							settleTrackedProjection(tracker, pending);
 						}
 					} else if (
-						metadata.state === 'atomic' &&
-						!prepared.revalidation.required &&
-						!statusRequiresRevalidation
+						exactDelta &&
+						proven &&
+						!awaitsFetch(prepared)
 					) {
 						/*
-						 * An exact terminal delta proves delivery but carries no
-						 * canonical revision. Keep its accepted overlay until a later
-						 * comparable authoritative result seals it, without racing
-						 * sibling commands with a command-triggered query.
+						 * An exact delta already shows the server's effect, and
+						 * every row it shows is one the base holds (or an open
+						 * live stream will deliver it). The proof settles the
+						 * projected wait without a command-triggered query. The
+						 * accepted layer stays until the base holds each row at
+						 * or past the revision the status observed (the replica
+						 * retires it on the frame or fetch that brings it), or,
+						 * without observed revisions, until a later comparable
+						 * authoritative result seals it.
 						 */
 						settleTrackedProjection(tracker, pending);
 					} else if (
 						metadata.state === 'atomic' ||
+						(exactDelta && proven) ||
 						(metadata.state === 'succeeded' &&
 							metadata.expects.length === 0 &&
-							(prepared.revalidation.required ||
-								statusRequiresRevalidation))
+							!exactDelta)
 					) {
 						/*
 						 * Status is causal truth, but it carries no canonical
-						 * query payload. `projected` fences asynchronous
-						 * projection; `succeeded` is terminal when the generated
-						 * contract has no confirmations. In both cases, only a
-						 * query started after that fence may retire optimism.
+						 * query payload. `atomic` fences asynchronous projection;
+						 * `succeeded` is terminal when the generated contract has
+						 * no confirmations; a proven exact delta whose layer
+						 * shows a row the base lacks can get that row only from
+						 * a fetch when no live stream covers it (`@load` only, or
+						 * no live delivery). In every case only a query started
+						 * after the proof may retire optimism.
 						 */
 						let refreshed = false;
 						try {
@@ -1148,6 +1255,7 @@ export function createReplicaCommandRuntime<
 			let current: Promise<ReplicaCommandStatus>;
 			current = read().finally(() => {
 				if (tracker.inFlight === current) tracker.inFlight = undefined;
+				sweep();
 			});
 			tracker.inFlight = current;
 			return current;
@@ -1159,7 +1267,20 @@ export function createReplicaCommandRuntime<
 		input: TInput,
 		callOptions: ReplicaCommandCallOptions<TOutput>
 	): Promise<ReplicaCommandReceipt<TOutput>> => {
+		try {
+			return await dispatchCommand(artifact, input, callOptions);
+		} finally {
+			sweep();
+		}
+	};
+
+	const dispatchCommand = async <TInput, TOutput>(
+		artifact: ReplicaCommandArtifact<TInput, TOutput>,
+		input: TInput,
+		callOptions: ReplicaCommandCallOptions<TOutput>
+	): Promise<ReplicaCommandReceipt<TOutput>> => {
 		const authority = currentAuthority();
+		sweepWhenGenerationCloses(authority.signal);
 		const prepared = prepareReplicaCommandWithTrustedPresets(
 			artifact,
 			input,
@@ -1188,6 +1309,7 @@ export function createReplicaCommandRuntime<
 				readRecord: replica[replicaCommandReadRecord]?.bind(replica),
 				pureFunctions: options.pureFunctions
 			};
+			replica[replicaCommandFreshness]?.(prepared.commandId, prepared.revalidation);
 			(replica as SemanticReplica).createOptimisticLayer(
 				prepared.commandId,
 				(writer) =>
@@ -1287,6 +1409,17 @@ export function createReplicaCommandRuntime<
 				'REPLICA_COMMAND_SCOPE_INVALIDATED',
 				{ commandId: prepared.commandId }
 			);
+		}
+
+		// The HTTP lifecycle gate rejects before dispatch and before a receipt
+		// exists. Classify only its exact failure shape, never a success/receipt.
+		if (result.status === 503 && result.data == null && result.extensions === undefined &&
+			result.errors?.length === 1 && result.errors[0].extensions?.code === 'APPLICATION_RELOADING') {
+			rejectUnmanagedLayer(prepared.commandId);
+			revalidateInBackground(prepared, authority);
+			throw new ReplicaCommandRuntimeError('REPLICA_COMMAND_RELOADING', {
+				commandId: prepared.commandId
+			});
 		}
 
 		const rejection = graphqlCommandRejection(result);
@@ -1433,9 +1566,6 @@ export function createReplicaCommandRuntime<
 		let projected:
 			| Promise<ReplicaCommandProjectedOutcome<TOutput>>
 			| undefined;
-		let projectionLifecycle:
-			| Promise<ReplicaCommandProjectedOutcome<TOutput>>
-			| undefined;
 		if (prepared.consistency === 'atomic') {
 			if (metadata.state !== 'atomic') {
 				statusTracker.state = metadata.state;
@@ -1496,30 +1626,48 @@ export function createReplicaCommandRuntime<
 					/*
 					 * Receipt/status observations prove durable causality, not
 					 * that canonical query data was atomically ingested. Keep
-					 * the layer and await DistributedReplica retirement even
-					 * when every observation is already present here.
+					 * the layer until a canonical frame retires it, or until
+					 * a query started after a complete proof settles.
 					 */
 					pending.set(prepared.commandId, controller);
 					unmanagedLayers.delete(prepared.commandId);
 					attachAuthorityAbort(controller, () =>
 						pending.delete(prepared.commandId)
 					);
+					const monitor = () => {
+						if (
+							statusArtifact !== undefined &&
+							replicaRevalidate !== undefined
+						) {
+							monitorPendingProjection(
+								controller,
+								readStatus,
+								() =>
+									pending.get(prepared.commandId) === controller,
+								options.onBackgroundError
+							);
+						}
+					};
 					if (
-						statusArtifact !== undefined &&
-						replicaRevalidate !== undefined
+						replicaRevalidate !== undefined &&
+						hasCompleteProjectionObservations(metadata) &&
+						awaitsFetch(prepared)
 					) {
-						monitorPendingProjection(
+						/*
+						 * The receipt already proves the projection committed,
+						 * but it carries no canonical data, and the layer shows
+						 * a row the base lacks that no live stream will deliver.
+						 * Fetch canonical data started after this proof, then
+						 * retire. The status monitor retries a failed fetch.
+						 */
+						revalidateDispositionAndRetireInBackground(
 							controller,
-							readStatus,
-							() => pending.get(prepared.commandId) === controller,
-							options.onBackgroundError
+							monitor
 						);
+					} else {
+						monitor();
 					}
 				}
-				projectionLifecycle =
-					controller.promise as Promise<
-						ReplicaCommandProjectedOutcome<TOutput>
-					>;
 				projected = callerProjectedPromise(
 					controller,
 					callOptions.signal
@@ -1539,14 +1687,6 @@ export function createReplicaCommandRuntime<
 			status: readStatus,
 			...(projected === undefined ? {} : { projected })
 		};
-		if (projectionLifecycle !== undefined) {
-			Object.defineProperty(receiptValue, replicaCommandProjectedLifecycle, {
-				value: projectionLifecycle,
-				enumerable: false,
-				configurable: false,
-				writable: false
-			});
-		}
 		const receipt = Object.freeze(
 			receiptValue
 		) as ReplicaCommandReceipt<TOutput>;
@@ -1563,22 +1703,45 @@ export function createReplicaCommandRuntime<
 		unknown
 	>;
 	for (const { key, artifact } of inventory) {
+		const defaults = artifact.inputDefaults?.defaults;
+		const send = (
+			input: unknown,
+			callOptions: ReplicaCommandCallOptions<unknown>
+		) =>
+			sendCommand(
+				defaults,
+				artifact.input.kind !== 'none',
+				input,
+				callOptions,
+				(sent, options) => invoke(artifact, sent, options)
+			);
 		defineBoundCommand(
 			commands,
 			key,
 			artifact.input.kind === 'none'
 				? (callOptions: ReplicaCommandCallOptions<unknown> = {}) =>
-						invoke(artifact, undefined, callOptions)
+						send(undefined, callOptions)
 				: (
 						input: unknown,
 						callOptions: ReplicaCommandCallOptions<unknown> = {}
-					) => invoke(artifact, input, callOptions)
+					) => send(input, callOptions)
 		);
 	}
 	freezeCommandTree(commands);
 
 	const observeResult = (envelope: ReplicaResultEnvelope<unknown>): void => {
-		if (disposed || pending.size === 0) return;
+		if (disposed) return;
+		try {
+			settlePendingProjections(envelope);
+		} finally {
+			// The frame may have retired layers this runtime does not track.
+			sweep();
+		}
+	};
+	const settlePendingProjections = (
+		envelope: ReplicaResultEnvelope<unknown>
+	): void => {
+		if (pending.size === 0) return;
 		let distributed: DistributedProtocolEnvelope | undefined;
 		try {
 			distributed = parseGraphqlResponseExtensions(envelope.extensions)
@@ -1708,16 +1871,17 @@ export function createReplicaCommandRuntime<
 			 * snapshot/observations were admissible. This callback runs only
 			 * after that exact frame committed.
 			 *
-			 * Eventual list membership fences may keep the optimistic overlay
-			 * until @live includes the new row. `projected` is delivery, not
-			 * overlay retirement. Query/live frames have no command payload;
-			 * settle those so Send/busy can clear. Frames that name a command
-			 * still wait for overlay retirement or the command-state paths
-			 * above (status regression must be able to reject `projected`).
+			 * Settle only once the overlay is retired. A frame without a
+			 * command payload (a query refetch, perhaps one that raced the
+			 * receipt) proves nothing about this command. Settling on it would
+			 * stop the status monitor while the accepted layer remains, and
+			 * with no live delivery nothing else would ever retire the layer:
+			 * its row would stay pending. The command-state paths above still
+			 * settle or reject `projected` (status regression can reject it).
 			 */
 			const remainsPending =
 				replica.markOptimisticLayerAccepted(commandId);
-			if (!remainsPending || command === undefined) {
+			if (!remainsPending) {
 				settleProjectionSuccess(controller);
 				pending.delete(commandId);
 			}
@@ -1756,6 +1920,19 @@ export function createReplicaCommandRuntime<
 				);
 			}
 			pending.clear();
+			appliedProjections.clear();
+		},
+		/**
+		 * Package-internal: how many entries each per-command structure holds.
+		 * The retention test compares it with a baseline.
+		 */
+		_sizes(): Readonly<Record<string, number>> {
+			return Object.freeze({
+				pendingProjections: pending.size,
+				unmanagedLayers: unmanagedLayers.size,
+				appliedProjections: appliedProjections.size,
+				dispatchTails: dispatchTails.size
+			});
 		}
 	});
 }

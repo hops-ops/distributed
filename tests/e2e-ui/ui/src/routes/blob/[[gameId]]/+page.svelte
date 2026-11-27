@@ -4,15 +4,14 @@
 	 *
 	 * - URL (`/blob` | `/blob/{gameId}`) selects which game is active.
 	 * - Board and history derive from `BlobGames.use()`.
-	 * - Commands are Atomic: thin input (`game_id` + `direction`). Known-row pure
-	 *   optimism runs `blob.simulate_move` via blob-domain WASM; Atomic seal is
-	 *   still server authority.
+	 * - `map` (tiles) and `moves` (legal directions) are typed JSON columns: the
+	 *   page holds no board rules. Known-row optimism runs blob-domain's own
+	 *   `simulate_move` (WASM); the Atomic seal is still server authority.
 	 */
 	import { onMount } from 'svelte';
 	import { goto } from '$app/navigation';
 	import { page } from '$app/state';
-	import { BlobGames, ensurePureFunctionsReady, useCommands } from '$distributed';
-	import { parseBoard, TILE, type Direction } from '$lib/blob/board';
+	import { BlobGames, useCommands } from '$distributed';
 	import { Button } from '$lib/components/shared/ui';
 	import SelectedBlobGame from '$lib/components/blob/SelectedBlobGame.svelte';
 	import { AppPage, InlineAlert, PageHeader } from '$lib/components/product';
@@ -21,9 +20,9 @@
 
 	let { data } = $props();
 	let actionError = $state<string | null>(null);
-	let pendingCommandCount = $state(0);
+	/** A new game has no row to mark pending until its atomic row lands. */
+	let starting = $state(false);
 	let hydrated = $state(false);
-	const commandPending = $derived(pendingCommandCount > 0);
 
 	const routeGameId = $derived(page.params.gameId ?? null);
 
@@ -42,101 +41,47 @@
 	const selected = $derived(
 		routeGameId ? (games.find((game) => game.game_id === routeGameId) ?? null) : null
 	);
-	const board = $derived.by(() => {
-		if (!selected) return [];
-		try {
-			return parseBoard(selected.map_json || '[]');
-		} catch {
-			return [];
-		}
-	});
+	type Direction = (typeof games)[number]['moves'][number];
+	const board = $derived(selected?.map ?? []);
 
 	const cols = $derived(board[0]?.length ?? 0);
 	const hasBoard = $derived(board.length > 0 && cols > 0);
-	const score = $derived(Number(selected?.score ?? 0));
-	const playerDead = $derived(!!selected?.player_dead);
-	const levelComplete = $derived(!!selected?.current_level_completed);
-	const currentLevel = $derived(Number(selected?.current_level ?? 0));
+	const score = $derived(selected?.score ?? 0);
+	const playerDead = $derived(selected?.player_dead ?? false);
+	const levelComplete = $derived(selected?.current_level_completed ?? false);
+	const currentLevel = $derived(selected?.current_level ?? 0);
 	const status = $derived(selected?.status ?? 'active');
-
-	function newGameId() {
-		const rand =
-			typeof crypto !== 'undefined' && 'randomUUID' in crypto
-				? crypto.randomUUID().replace(/-/g, '').slice(0, 12)
-				: `${Date.now().toString(16)}${Math.random().toString(16).slice(2, 8)}`;
-		return `blob-${rand}`;
-	}
-
-	function tileClass(t: number): string {
-		switch (t) {
-			case TILE.player:
-				return 'tile-player';
-			case TILE.hole:
-				return 'tile-hole';
-			case TILE.unvisited:
-				return 'tile-unvisited';
-			case TILE.visited:
-				return 'tile-visited';
-			case TILE.deadBySuicide:
-				return 'tile-dead-suicide';
-			case TILE.deadByHole:
-				return 'tile-dead-hole';
-			default:
-				return 'tile-unknown';
-		}
-	}
-
-	function tileLabel(t: number): string {
-		if (t === TILE.player) return '●';
-		if (t === TILE.deadByHole || t === TILE.deadBySuicide) return '✕';
-		return '';
-	}
+	/*
+	 * Blob commands are Atomic: their preview is sealed by the response, so an
+	 * existing game is never a pending row. Next level waits for this page's own
+	 * in-flight moves and level starts instead.
+	 */
+	let commandsInFlight = $state(0);
+	const commandPending = $derived(commandsInFlight > 0);
 
 	async function startGame() {
-		if (commandPending) return;
-		pendingCommandCount += 1;
+		if (starting) return;
+		starting = true;
 		actionError = null;
-		const game_id = newGameId();
 		try {
-			const receipt = await commands.blob.start({ game_id });
+			// `game_id` is the command's `uuid_v7()` default.
+			const call = commands.blob.start({});
+			await call;
 			// Atomic response row is already in the replica before resolve.
-			await navigateToGame(receipt.result.game_id, true);
+			await navigateToGame(call.input.game_id, true);
 		} catch (e) {
 			actionError = e instanceof Error ? e.message : 'Start failed';
 		} finally {
-			pendingCommandCount = Math.max(0, pendingCommandCount - 1);
+			starting = false;
 		}
-	}
-
-	function canMove(direction: Direction): boolean {
-		let playerRow = -1;
-		let playerCol = -1;
-		for (const [rowIndex, row] of board.entries()) {
-			const colIndex = row.indexOf(TILE.player);
-			if (colIndex >= 0) {
-				playerRow = rowIndex;
-				playerCol = colIndex;
-				break;
-			}
-		}
-		if (playerRow < 0 || playerCol < 0) return true;
-		return (
-			(direction !== 'up' || playerRow > 0) &&
-			(direction !== 'down' || playerRow < board.length - 1) &&
-			(direction !== 'left' || playerCol > 0) &&
-			(direction !== 'right' || playerCol < cols - 1)
-		);
 	}
 
 	async function move(direction: Direction) {
 		if (!selected || playerDead || levelComplete || !hasBoard) return;
-		// Edge no-op: don't dispatch a predictably rejected command.
-		if (!canMove(direction)) {
-			actionError = null;
-			return;
-		}
-		pendingCommandCount += 1;
 		actionError = null;
+		// The domain lists the legal moves: an edge move dispatches nothing.
+		if (!selected.moves.includes(direction)) return;
+		commandsInFlight += 1;
 		try {
 			await commands.blob.move({
 				game_id: selected.game_id,
@@ -145,20 +90,20 @@
 		} catch (error) {
 			actionError = error instanceof Error ? error.message : 'Move failed';
 		} finally {
-			pendingCommandCount = Math.max(0, pendingCommandCount - 1);
+			commandsInFlight -= 1;
 		}
 	}
 
 	async function nextLevel() {
 		if (!selected || playerDead || !levelComplete || commandPending) return;
-		pendingCommandCount += 1;
 		actionError = null;
+		commandsInFlight += 1;
 		try {
 			await commands.blob.start_level({ game_id: selected.game_id });
 		} catch (error) {
 			actionError = error instanceof Error ? error.message : 'Next level failed';
 		} finally {
-			pendingCommandCount = Math.max(0, pendingCommandCount - 1);
+			commandsInFlight -= 1;
 		}
 	}
 
@@ -192,19 +137,8 @@
 
 	onMount(() => {
 		hydrated = true;
-		// Warm generated WASM pure hosts (blob.simulate_move) before pure-reduce optimism.
-		void ensurePureFunctionsReady().catch(() => {
-			/* fail-closed pure until reload */
-		});
-		const testWindow = window as Window & {
-			__distributedBlobRefetch?: () => Promise<void>;
-		};
-		testWindow.__distributedBlobRefetch = () => query.refetch();
 		window.addEventListener('keydown', onKey);
-		return () => {
-			window.removeEventListener('keydown', onKey);
-			delete testWindow.__distributedBlobRefetch;
-		};
+		return () => window.removeEventListener('keydown', onKey);
 	});
 </script>
 
@@ -224,7 +158,7 @@
 			>
 				Board and history render from the same generated <code>BlobGames</code>
 				operation. Moves use the same client optimism path as todos/chat
-				(domain-owned <code>blob.simulate_move</code> pure + projection mapping);
+				(blob-domain's own <code>simulate_move</code>, compiled to WASM);
 				the handler applies the same mutation IR and seals the atomic row before
 				await resolves.
 			</PageHeader>
@@ -265,7 +199,7 @@
 					variant="ink"
 					data-testid="blob-start-game"
 					onclick={() => void startGame()}
-					disabled={commandPending || !hydrated}
+					disabled={starting || !hydrated}
 				>
 					Start game
 				</Button>
@@ -303,8 +237,8 @@
 				<div class="blob-board" style="--cols: {cols}" role="grid" aria-label="Blob game board">
 					{#each board as row, r}
 						{#each row as cell, c}
-							<div class="cell {tileClass(cell)}" role="gridcell" aria-label="r{r} c{c}">
-								{tileLabel(cell)}
+							<div class="cell tile-{cell}" role="gridcell" aria-label="r{r} c{c}">
+								{#if cell === 'player'}●{:else if cell === 'dead_by_hole' || cell === 'dead_by_suicide'}✕{/if}
 							</div>
 						{/each}
 					{/each}
@@ -315,7 +249,7 @@
 					<span><i class="swatch tile-unvisited"></i> Unvisited</span>
 					<span><i class="swatch tile-visited"></i> Visited</span>
 					<span><i class="swatch tile-hole"></i> Hole</span>
-					<span><i class="swatch tile-dead-hole"></i> Death</span>
+					<span><i class="swatch tile-dead_by_hole"></i> Death</span>
 				</div>
 
 				<div class="blob-pad" aria-label="Move controls">
@@ -503,13 +437,10 @@
 	.tile-visited {
 		background: #243528;
 	}
-	.tile-dead-suicide,
-	.tile-dead-hole {
+	.tile-dead_by_suicide,
+	.tile-dead_by_hole {
 		background: #a33a3a;
 		color: #fff;
-	}
-	.tile-unknown {
-		background: #444;
 	}
 	.blob-legend {
 		display: flex;

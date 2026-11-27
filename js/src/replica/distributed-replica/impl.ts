@@ -3,51 +3,49 @@ import {
 	createCacheEngine,
 	type BaseCacheWriter,
 	type CacheEngine,
-	type CacheEngineSnapshot,
+	type CacheReader,
 	type DerivedIndexMutation,
 	type DerivedIndexReconciler,
 	type OptimisticLayerView
 } from '../../internal/cache-engine.js';
+import {
+	defaultScheduler,
+	unrefTimer,
+	type Scheduler
+} from '../../lib/backoff.js';
 import type { GraphqlVariables } from '../../types.js';
 import {
 	compareDistributedDecimal,
 	DistributedProtocolError,
 	parseGraphqlResponseExtensions,
 	type DistributedCommandMetadata,
-	type DistributedLiveCursor,
-	type DistributedOpaqueString,
-	type DistributedProjectionObservation,
+	type DistributedObservedRecord,
 	type DistributedProtocolEnvelope,
-	type DistributedQuerySnapshot,
-	type DistributedRecordRevision,
-	type DistributedTrustedPreset
+	type DistributedQuerySnapshot
 } from '../../protocol.js';
 import {
-	matchReplicaTrustedPresetInventory
-} from '../commands.js';
-import type {
-	ReplicaDiagnosticEventInput,
-	ReplicaDiagnosticLayerInput,
-	ReplicaDiagnosticsSink
-} from '../diagnostics.js';
-import {
 	replicaCommandAuthority,
+	replicaCommandAwaitsFetch,
 	replicaCommandDirectProjection,
+	replicaCommandFreshness,
+	replicaCommandLayerHeld,
 	replicaCommandProjectionDelta,
 	replicaCommandReadRecord,
-	replicaResultObservation,
-	type ReplicaCommandAuthorityRegistration,
-	type ReplicaCommandAuthoritySnapshot,
-	type ReplicaCommandDirectProjection,
-	type ReplicaCommandSurfaceContract,
-	type ReplicaResultObservationRegistration
-} from '../command-runtime.js';
+	replicaResultObservation
+} from '../command-runtime/symbols.js';
+import type {
+	ReplicaCommandAuthorityRegistration,
+	ReplicaCommandAuthoritySnapshot,
+	ReplicaCommandDirectProjection,
+	ReplicaCommandSurfaceContract,
+	ReplicaResultObservationRegistration
+} from '../command-runtime/types.js';
+import { canonicalizeOperationVariables } from '../identity/codec.js';
 import {
-	canonicalizeOperationVariables,
 	replicaIndexKey,
 	replicaRecordKey,
 	resolveArguments
-} from '../identity.js';
+} from '../identity/keys.js';
 import {
 	materializeReplicaOperation,
 	type MaterializedReplicaResult
@@ -58,15 +56,12 @@ import {
 	type ReplicaProtocolRecordResolution
 } from '../normalize.js';
 import { createReplicaRevalidationMatcher } from '../revalidation.js';
-import {
-	validateReplicaOperationBinding as validatedArtifactBinding
-} from '../operation-binding.js';
-import {
-	createReplicaIndexMaintenanceRegistry,
-	formatReplicaIndexStaleReason,
-	type ReplicaIndexPlanRegistration,
-	type ReplicaIndexSemanticChange
-} from '../index-maintenance.js';
+import { formatReplicaIndexStaleReason } from '../index-maintenance/engine.js';
+import { createReplicaIndexMaintenanceRegistry } from '../index-maintenance/registry.js';
+import type {
+	ReplicaIndexPlanRegistration,
+	ReplicaIndexSemanticChange
+} from '../index-maintenance/types.js';
 import type {
 	DistributedReplicaOptions,
 	DistributedReplica as DistributedReplicaApi,
@@ -80,158 +75,101 @@ import type {
 	ReplicaOperationArtifact,
 	ReplicaOptimisticWriter,
 	ReplicaRecordInspection,
-	ReplicaRecordPatch,
 	ReplicaRevalidationPlan,
 	ReplicaRevision,
 	ReplicaResultEnvelope,
 	ReplicaSnapshot,
-	ReplicaTransport,
 	ReplicaValue,
 	ReplicaWatch,
 	ReplicaWriteSource,
-	WatchReplicaOptions
+	WatchReplicaOptions,
+	ReplicaLiveConnection
 } from '../types.js';
 import {
-	EMPTY_ERRORS,
-	EMPTY_TRUSTED_PRESETS,
-	MAX_ANONYMOUS_RECORD_CLOCKS
+	EMPTY_CACHE_SNAPSHOT,
+	IDLE_QUERY_STATE,
+	OPERATION_RETENTION_GRACE_MS
 } from './constants.js';
 import type {
-	AnonymousRecordProtocolClock,
 	IndexDisposition,
-	LiveEntry,
-	OperationProtocolGroup,
-	OperationProtocolSource,
-	OperationProtocolState,
-	OptimisticReceiptState,
-	ProjectedRecordFence,
+	ParsedReplicaHydration,
 	ProtocolGeneration,
 	QueryState,
-	RecordProtocolClock,
-	RegisteredCommandAuthorityContract,
 	RenderedOperation,
-	ReplicaArtifactBinding,
-	SharedIndexDisposition,
-	ValidatedArtifactBinding
+	RetiredOperation,
+	ReplicaDehydratedPayloadV1,
+	SharedIndexDisposition
 } from './types.js';
 import {
-	compareCanonicalDecimalStrings,
-	compareEvidenceToProjectedFence,
-	compareIndexVector,
-	compareProjectedRecordFields,
 	compareRecordClock,
 	compareSnapshotToOperationState,
-	incrementCanonicalDecimal,
-	indexClockMap,
 	isComparableHandoffDisposition,
-	latestCursors,
 	protocolInvalid,
-	recordKeyMatchesModel,
-	responsePathKey,
-	sameRecordClock,
-	sameRecordRevision
+	modelFromRecordKey,
+	responsePathKey
 } from './clocks.js';
-import { diagnosticReceiptCounts } from './optimistic.js';
 import {
 	assertWriteSource,
-	baseWriter,
 	indexKeyFromTarget,
 	indexMaintenanceSnapshot,
 	indexSemanticLayer,
+	isGraphqlFailurePayload,
 	operationKey,
 	prepareRecordEvidence,
 	protocolOperationSource,
 	replicaResultIndexKeys,
+	type ReplicaIndexMemberships,
 	reportSafely,
 	reportUnhandledObserverError,
 	snapshotFrom,
-	stableErrors,
-	trustedPresetDescriptorFingerprint,
-	validatedCommandAuthorityContract
+	stableErrors
 } from './helpers.js';
+import {
+	hydrationTables,
+	parseAuthoritativeScope,
+	parseDehydratedState,
+	reachableConfirmedState
+} from './hydration.js';
 import { ReplicaWatchState } from './watch.js';
-import {
-	closeActiveTransports as closeActiveTransportsOn,
-	emitWatchState,
-	fetchWatch,
-	releaseLive as releaseLiveOn,
-	restartLive as restartLiveOn,
-	retainLive as retainLiveOn,
-	resumeLiveWatches as resumeLiveWatchesOn,
-	type FetchLiveHost
-} from './impl-fetch-live.js';
-import {
-	closeAuthorizationGeneration as closeAuthorizationGenerationOn,
-	purgeProtocolGeneration as purgeProtocolGenerationOn,
-	stageProtocolGeneration as stageProtocolGenerationOn,
-	stageTrustedPresets as stageTrustedPresetsOn,
-	validateProtocolBinding as validateProtocolBindingOn,
-	type ProtocolHost
-} from './impl-protocol.js';
-import {
-	applyReceiptOnly as applyReceiptOnlyOn,
-	confirmOptimisticLayerOn,
-	confirmOptimisticLayerWithCacheWriterOn,
-	createOptimisticLayerOn,
-	markOptimisticLayerAcceptedOn,
-	planOptimisticReceipts as planOptimisticReceiptsOn,
-	rejectOptimisticLayerOn,
-	replaceReplicaOptimisticLayerOn,
-	type OptimisticHost
-} from './impl-optimistic.js';
-import {
-	dehydrateReplica,
-	finishDehydration as finishDehydrationOn,
-	hydrateReplica,
-	type HydrationHost
-} from './impl-hydration-orchestrate.js';
-import {
-	diagnosticEvent as diagnosticEventOn,
-	diagnosticOperation as diagnosticOperationOn,
-	diagnosticScopeTransition as diagnosticScopeTransitionOn,
-	retireDiagnosticLayer as retireDiagnosticLayerOn,
-	syncDiagnostics as syncDiagnosticsOn,
-	type DiagnosticsHost
-} from './impl-diagnostics.js';
+import { ReplicaAuthority } from './authority.js';
+import { DiagnosticsReporter } from './diagnostics.js';
+import { LiveCoordinator } from './live-coordinator.js';
+import { OperationProtocols } from './operation-protocols.js';
+import { OptimisticLayers } from './optimistic-layers.js';
+import { RecordClocks } from './record-clocks.js';
 
+/**
+ * The replica: one cache engine and the modules that own its protocol state.
+ *
+ * - `ReplicaAuthority`: scope, trusted presets, bound contracts, generation.
+ * - `RecordClocks`: per-record causal clocks and projected-record fences.
+ * - `OperationProtocols`: per-operation query/live protocol state and the
+ *   local index revision counter.
+ * - `OptimisticLayers`: per-command receipts, membership fences, freshness.
+ * - `LiveCoordinator`: watches, query state, HTTP requests, live streams.
+ * - `DiagnosticsReporter`: the optional sink and its layer mirror.
+ *
+ * This class composes them: it admits results (one cache transaction that
+ * spans clocks, protocols and receipts), hydrates, and owns the rendered
+ * operations, their index plans and their retention.
+ */
 export class DistributedReplicaImpl implements DistributedReplicaApi {
 	readonly #engine: CacheEngine;
-	readonly #transport: ReplicaTransport | undefined;
+	readonly #scheduler: Scheduler;
+	readonly #retentionGraceMs: number;
 	readonly #reportObserverError: (error: AggregateError) => void;
-	readonly #onAuthorizationGenerationDispose: (() => void) | undefined;
-	readonly #diagnostics: ReplicaDiagnosticsSink | undefined;
-	readonly #diagnosticLayers:
-		| Map<string, ReplicaDiagnosticLayerInput>
-		| undefined;
-	readonly #inFlight = new Map<string, Promise<void>>();
-	readonly #inFlightAborts = new Map<string, AbortController>();
-	readonly #queryStates = new Map<string, QueryState>();
-	readonly #watches = new Map<string, Set<ReplicaWatchState<unknown, GraphqlVariables>>>();
-	readonly #lives = new Map<string, LiveEntry>();
-	readonly #operationProtocols = new Map<string, OperationProtocolGroup>();
-	readonly #operationGenerations = new Map<string, number>();
-	readonly #recordClocks = new Map<string, RecordProtocolClock>();
-	readonly #recordKeysByScope = new Map<DistributedOpaqueString, string>();
-	readonly #projectedRecordFences = new Map<string, ProjectedRecordFence>();
-	/**
-	 * Record keys inserted by Eventual projection-delta. A later complete
-	 * query/live index that omits them is behind command confirmation and
-	 * must not shrink the visible list. Atomic rows use projected-record
-	 * fences only — they have no @live that would otherwise clear this map.
-	 */
-	readonly #membershipFences = new Map<
-		string,
-		Map<string, Set<string>>
-	>();
-	readonly #deferredMembershipConfirms = new Set<string>();
-	readonly #anonymousRecordClocks = new Map<
-		DistributedOpaqueString,
-		AnonymousRecordProtocolClock
-	>();
-	readonly #optimisticReceipts = new Map<string, OptimisticReceiptState>();
+	readonly #authority: ReplicaAuthority;
+	readonly #diagnostics: DiagnosticsReporter;
+	readonly #clocks = new RecordClocks();
+	readonly #operations: OperationProtocols;
+	readonly #optimistic: OptimisticLayers;
+	readonly #live: LiveCoordinator;
 	readonly #renderedOperations = new Map<string, RenderedOperation>();
-	readonly #readOperationKeys = new Set<string>();
-	readonly #watchRenderCounts = new Map<string, number>();
+	/** Watches and retained operations holding each rendered operation. */
+	readonly #renderCounts = new Map<string, number>();
+	/** Operations whose last holder left, awaiting collection. */
+	readonly #retired = new Map<string, RetiredOperation>();
+	#retentionTimer: unknown;
 	readonly #resultObservers = new Set<
 		(envelope: ReplicaResultEnvelope<unknown>) => void
 	>();
@@ -244,98 +182,49 @@ export class DistributedReplicaImpl implements DistributedReplicaApi {
 		confirmed,
 		layers
 	) => this.#deriveMaintainedIndexes(confirmed, layers);
-	#commandAuthorityContract: RegisteredCommandAuthorityContract | undefined;
-	#trustedPresets: readonly DistributedTrustedPreset[] = EMPTY_TRUSTED_PRESETS;
-	#authorizationAbort = new AbortController();
-	#artifactBinding: ReplicaArtifactBinding | undefined;
-	#protocolGeneration: ProtocolGeneration | undefined;
-	#protocolGenerationSequence = 0;
-	#projectionGeneration = 0;
-	#nextIndexRevision = '0';
-	#diagnosticLayerSequence = 0;
-
-	#fetchLiveHostCache: FetchLiveHost | undefined;
-	#protocolHostCache: ProtocolHost | undefined;
-	#optimisticHostCache: OptimisticHost | undefined;
-	#hydrationHostCache: HydrationHost | undefined;
-	#diagnosticsHostCache: DiagnosticsHost | undefined;
 
 	constructor(options: DistributedReplicaOptions = {}) {
-		this.#transport = options.transport;
+		this.#scheduler = options.scheduler ?? defaultScheduler;
+		this.#retentionGraceMs =
+			options.retentionGraceMs ?? OPERATION_RETENTION_GRACE_MS;
 		this.#reportObserverError = options.onObserverError ?? reportUnhandledObserverError;
-		this.#onAuthorizationGenerationDispose =
-			options.onAuthorizationGenerationDispose;
-		this.#diagnostics = options.diagnostics;
-		this.#diagnosticLayers =
-			options.diagnostics === undefined ? undefined : new Map();
 		this.#engine = createCacheEngine({ onWatcherError: this.#reportObserverError });
-		this.#engine.setDerivedIndexReconciler(this.#derivedIndexReconciler);
-		this.#syncDiagnostics();
-	}
-
-	#diagnosticsEnabled(): { readonly enabled: boolean } {
-		return Object.freeze({ enabled: this.#diagnostics !== undefined });
-	}
-
-	#diagnosticsHost(): DiagnosticsHost {
-		if (this.#diagnosticsHostCache !== undefined) return this.#diagnosticsHostCache;
-		const self = this;
-		this.#diagnosticsHostCache = {
-			get engine() {
-				return self.#engine;
-			},
-			get diagnostics() {
-				return self.#diagnostics;
-			},
-			get diagnosticLayers() {
-				return self.#diagnosticLayers;
-			},
-			get optimisticReceipts() {
-				return self.#optimisticReceipts;
-			},
-			get reportObserverError() {
-				return self.#reportObserverError;
-			},
-			getProtocolGeneration: () => self.#protocolGeneration,
-			getProtocolGenerationSequence: () => self.#protocolGenerationSequence
-		};
-		return this.#diagnosticsHostCache;
-	}
-
-	#fetchLiveHost(): FetchLiveHost {
-		if (this.#fetchLiveHostCache !== undefined) return this.#fetchLiveHostCache;
-		const self = this;
-		this.#fetchLiveHostCache = {
-			get transport() {
-				return self.#transport;
-			},
-			get inFlight() {
-				return self.#inFlight;
-			},
-			get inFlightAborts() {
-				return self.#inFlightAborts;
-			},
-			get lives() {
-				return self.#lives;
-			},
-			get watches() {
-				return self.#watches;
-			},
-			get operationProtocols() {
-				return self.#operationProtocols;
-			},
-			get diagnostics() {
-				return self.#diagnosticsEnabled();
-			},
-			protocolGenerationSequence: () => self.#protocolGenerationSequence,
-			projectionGeneration: () => self.#projectionGeneration,
-			protocolGeneration: () => self.#protocolGeneration,
-			queryState: (key) => self.#queryState(key),
-			emitState: (key, allowFetch) => self.#emitState(key, allowFetch),
-			operationGeneration: (key) => self.#operationGeneration(key),
-			allocateIndexRevision: () => self.#allocateIndexRevision(),
-			writeCanonicalResult: (artifact, stableVariables, envelope, source, requestRevision, responseProjectionGeneration) =>
-				self.#writeCanonicalResult(
+		this.#authority = new ReplicaAuthority({
+			onDispose: options.onAuthorizationGenerationDispose,
+			reportObserverErrors: (errors) => this._reportObserverErrors(errors),
+			purge: () => this.#purge()
+		});
+		this.#diagnostics = new DiagnosticsReporter({
+			sink: options.diagnostics,
+			engine: this.#engine,
+			reportObserverError: this.#reportObserverError,
+			scope: () => this.#authority.scope,
+			generation: () => this.#authority.sequence,
+			receipt: (id) => this.#optimistic.receipt(id)
+		});
+		this.#optimistic = new OptimisticLayers(
+			this.#engine,
+			this.#diagnostics,
+			(revision) => this.#baseHolds(revision)
+		);
+		this.#operations = new OperationProtocols(this.#engine);
+		this.#live = new LiveCoordinator({
+			transport: options.transport,
+			scheduler: this.#scheduler,
+			random: options.random,
+			authority: this.#authority,
+			operations: this.#operations,
+			clocks: this.#clocks,
+			diagnostics: this.#diagnostics,
+			write: (
+				artifact,
+				stableVariables,
+				envelope,
+				source,
+				requestRevision,
+				responseProjectionGeneration
+			) =>
+				this.#writeCanonicalResult(
 					artifact,
 					stableVariables,
 					envelope,
@@ -343,313 +232,40 @@ export class DistributedReplicaImpl implements DistributedReplicaApi {
 					requestRevision,
 					responseProjectionGeneration
 				),
-			diagnosticEvent: (event) => self.#diagnosticEvent(event),
-			resumeCursors: (key) => self.#resumeCursors(key)
-		};
-		return this.#fetchLiveHostCache;
-	}
-
-	#protocolHost(): ProtocolHost {
-		if (this.#protocolHostCache !== undefined) return this.#protocolHostCache;
-		const self = this;
-		this.#protocolHostCache = {
-			get engine() {
-				return self.#engine;
-			},
-			get queryStates() {
-				return self.#queryStates;
-			},
-			get operationProtocols() {
-				return self.#operationProtocols;
-			},
-			get operationGenerations() {
-				return self.#operationGenerations;
-			},
-			get recordClocks() {
-				return self.#recordClocks;
-			},
-			get recordKeysByScope() {
-				return self.#recordKeysByScope;
-			},
-			get projectedRecordFences() {
-				return self.#projectedRecordFences;
-			},
-			get membershipFences() {
-				return self.#membershipFences;
-			},
-			get deferredMembershipConfirms() {
-				return self.#deferredMembershipConfirms;
-			},
-			get anonymousRecordClocks() {
-				return self.#anonymousRecordClocks;
-			},
-			get optimisticReceipts() {
-				return self.#optimisticReceipts;
-			},
-			get diagnosticLayers() {
-				return self.#diagnosticLayers;
-			},
-			get indexPlanRegistrations() {
-				return self.#indexPlanRegistrations;
-			},
-			get renderedOperations() {
-				return self.#renderedOperations;
-			},
-			get readOperationKeys() {
-				return self.#readOperationKeys;
-			},
-			get watchRenderCounts() {
-				return self.#watchRenderCounts;
-			},
-			get watches() {
-				return self.#watches;
-			},
-			get diagnostics() {
-				return self.#diagnosticsEnabled();
-			},
-			getProtocolGeneration: () => self.#protocolGeneration,
-			setProtocolGeneration: (value) => {
-				self.#protocolGeneration = value;
-			},
-			getProtocolGenerationSequence: () => self.#protocolGenerationSequence,
-			bumpProtocolGenerationSequence: () => {
-				self.#protocolGenerationSequence += 1;
-			},
-			disposeAuthorizationGeneration: () => {
-				try {
-					self.#onAuthorizationGenerationDispose?.();
-				} catch (error) {
-					self._reportObserverErrors([error]);
-				}
-			},
-			getTrustedPresets: () => self.#trustedPresets,
-			setTrustedPresets: (value) => {
-				self.#trustedPresets = value;
-			},
-			getCommandAuthorityContract: () => self.#commandAuthorityContract,
-			setProjectionGeneration: (value) => {
-				self.#projectionGeneration = value;
-			},
-			setNextIndexRevision: (value) => {
-				self.#nextIndexRevision = value;
-			},
-			setDiagnosticLayerSequence: (value) => {
-				self.#diagnosticLayerSequence = value;
-			},
-			clearIndexMaintenance: () => {
-				self.#indexMaintenance.clear();
-			},
-			abortAuthorization: () => {
-				self.#authorizationAbort.abort();
-				self.#authorizationAbort = new AbortController();
-			},
-			closeActiveTransports: () => self.#closeActiveTransports(),
-			syncDiagnostics: () => self.#syncDiagnostics(),
-			emitState: (key, allowFetch) => self.#emitState(key, allowFetch),
-			diagnosticEvent: (event) => self.#diagnosticEvent(event),
-			rememberRenderedOperation: (key, artifact, variables, source) =>
-				self.#rememberRenderedOperation(key, artifact, variables, source)
-		};
-		return this.#protocolHostCache;
-	}
-
-	#optimisticHost(): OptimisticHost {
-		if (this.#optimisticHostCache !== undefined) return this.#optimisticHostCache;
-		const self = this;
-		this.#optimisticHostCache = {
-			get engine() {
-				return self.#engine;
-			},
-			get optimisticReceipts() {
-				return self.#optimisticReceipts;
-			},
-			get diagnosticLayers() {
-				return self.#diagnosticLayers;
-			},
-			get diagnostics() {
-				return self.#diagnosticsEnabled();
-			},
-			getDiagnosticLayerSequence: () => self.#diagnosticLayerSequence,
-			setDiagnosticLayerSequence: (value) => {
-				self.#diagnosticLayerSequence = value;
-			},
-			diagnosticEvent: (event) => self.#diagnosticEvent(event),
-			syncDiagnostics: () => self.#syncDiagnostics(),
-			retireDiagnosticLayer: (id, action, receiptState, receipt) =>
-				self.#retireDiagnosticLayer(id, action, receiptState, receipt)
-		};
-		return this.#optimisticHostCache;
-	}
-
-	#hydrationHost(): HydrationHost {
-		if (this.#hydrationHostCache !== undefined) return this.#hydrationHostCache;
-		const self = this;
-		this.#hydrationHostCache = {
-			get engine() {
-				return self.#engine;
-			},
-			get operationProtocols() {
-				return self.#operationProtocols;
-			},
-			get operationGenerations() {
-				return self.#operationGenerations;
-			},
-			get recordClocks() {
-				return self.#recordClocks;
-			},
-			get recordKeysByScope() {
-				return self.#recordKeysByScope;
-			},
-			get anonymousRecordClocks() {
-				return self.#anonymousRecordClocks;
-			},
-			get optimisticReceipts() {
-				return self.#optimisticReceipts;
-			},
-			get diagnosticLayers() {
-				return self.#diagnosticLayers;
-			},
-			get renderedOperations() {
-				return self.#renderedOperations;
-			},
-			get readOperationKeys() {
-				return self.#readOperationKeys;
-			},
-			get watchRenderCounts() {
-				return self.#watchRenderCounts;
-			},
-			get indexPlanRegistrations() {
-				return self.#indexPlanRegistrations;
-			},
-			get queryStates() {
-				return self.#queryStates;
-			},
-			get diagnostics() {
-				return self.#diagnosticsEnabled();
-			},
-			getProtocolGeneration: () => self.#protocolGeneration,
-			setProtocolGeneration: (value) => {
-				self.#protocolGeneration = value;
-			},
-			getProtocolGenerationSequence: () => self.#protocolGenerationSequence,
-			getTrustedPresets: () => self.#trustedPresets,
-			setTrustedPresets: (value) => {
-				self.#trustedPresets = value;
-			},
-			getNextIndexRevision: () => self.#nextIndexRevision,
-			setNextIndexRevision: (value) => {
-				self.#nextIndexRevision = value;
-			},
-			getArtifactBinding: () => self.#artifactBinding,
-			setArtifactBinding: (value) => {
-				self.#artifactBinding = value;
-			},
-			getCommandAuthorityContract: () => self.#commandAuthorityContract,
-			setDiagnosticLayerSequence: (value) => {
-				self.#diagnosticLayerSequence = value;
-			},
-			operationGeneration: (key) => self.#operationGeneration(key),
-			closeActiveTransports: () => self.#closeActiveTransports(),
-			closeAuthorizationGeneration: () => self.#closeAuthorizationGeneration(),
-			resumeLiveWatches: () => self.#resumeLiveWatches(),
-			syncDiagnostics: () => self.#syncDiagnostics(),
-			diagnosticEvent: (event) => self.#diagnosticEvent(event),
-			refreshIndexMaintenance: () => self.#refreshIndexMaintenance(),
-			finishDehydration: () => self.#finishDehydration()
-		};
-		return this.#hydrationHostCache;
+			freshness: (artifact, key) => this.#freshness(artifact, key)
+		});
+		this.#engine.setDerivedIndexReconciler(this.#derivedIndexReconciler);
+		this.#diagnostics.sync();
 	}
 
 	get scope(): ReplicaAuthoritativeScope | undefined {
-		const scope = this.#protocolGeneration;
-		return scope === undefined
-			? undefined
-			: Object.freeze({
-					protocolVersion: scope.protocolVersion,
-					schemaHash: scope.schemaHash,
-					authorizationGeneration: scope.authorizationGeneration,
-					cacheScope: scope.cacheScope
-				});
+		return this.#authority.publicScope();
 	}
 
 	get authorizationGeneration(): number {
-		return this.#protocolGenerationSequence;
+		return this.#authority.sequence;
+	}
+
+	get liveConnection(): ReplicaLiveConnection {
+		return this.#live.connection;
+	}
+
+	subscribeLiveConnection(
+		listener: (connection: ReplicaLiveConnection) => void
+	): () => void {
+		return this.#live.subscribeConnection(listener);
 	}
 
 	[replicaCommandAuthority](
 		contract: ReplicaCommandSurfaceContract
 	): ReplicaCommandAuthorityRegistration {
-		const next = validatedCommandAuthorityContract(contract);
-		const current = this.#commandAuthorityContract;
-		if (current !== undefined && current.fingerprint !== next.fingerprint) {
-			throw new TypeError(
-				'command inventory does not match the active replica client surface'
-			);
-		}
-
-		const binding = this.#artifactBinding;
-		if (binding === undefined) {
-			this.#artifactBinding = Object.freeze({
-				version: 1,
-				schemaHash: next.schemaHash,
-				surfaceIdentity: next.surfaceIdentity,
-				trustedPresets: next.trustedPresets
-			});
-		} else if (
-			binding.version !== 1 ||
-			binding.schemaHash !== next.schemaHash ||
-			(
-				binding.surfaceIdentity !== undefined &&
-				binding.surfaceIdentity !== next.surfaceIdentity
-			) ||
-			(
-				binding.trustedPresets !== undefined &&
-				trustedPresetDescriptorFingerprint(binding.trustedPresets) !==
-					trustedPresetDescriptorFingerprint(next.trustedPresets)
-			)
-		) {
-			throw new TypeError(
-				'command inventory does not match the active replica client surface'
-			);
-		} else if (
-			binding.surfaceIdentity === undefined ||
-			binding.trustedPresets === undefined
-		) {
-			this.#artifactBinding = Object.freeze({
-				...binding,
-				...(binding.surfaceIdentity === undefined
-					? { surfaceIdentity: next.surfaceIdentity }
-					: {}),
-				...(binding.trustedPresets === undefined
-					? { trustedPresets: next.trustedPresets }
-					: {})
-			});
-		}
-
-		if (this.#protocolGeneration !== undefined) {
-			try {
-				matchReplicaTrustedPresetInventory(
-					next.trustedPresets,
-					this.#trustedPresets
-				);
-			} catch (error) {
-				this.#purgeProtocolGeneration();
-				throw error;
-			}
-		}
-		this.#commandAuthorityContract = next;
-
+		this.#authority.registerCommands(contract);
 		let active = true;
 		const read = (): ReplicaCommandAuthoritySnapshot => {
 			if (!active) {
 				throw new TypeError('replica command authority registration is disposed');
 			}
-			return Object.freeze({
-				generation: this.#protocolGenerationSequence,
-				scope: this.scope,
-				trustedPresets: this.#trustedPresets,
-				signal: this.#authorizationAbort.signal
-			});
+			return this.#authority.commandSnapshot();
 		};
 		return Object.freeze({
 			read,
@@ -657,6 +273,63 @@ export class DistributedReplicaImpl implements DistributedReplicaApi {
 				active = false;
 			}
 		});
+	}
+
+	[replicaCommandFreshness](commandId: string, plan: ReplicaRevalidationPlan): void {
+		// Validate before dispatch, using the existing generated dependency matcher.
+		createReplicaRevalidationMatcher(plan);
+		this.#optimistic.registerFreshness(commandId, plan, this.#authority.sequence);
+	}
+
+	#freshness(artifact: ReplicaOperationArtifact<unknown, GraphqlVariables>, key: string): Readonly<Record<string, unknown>> | undefined {
+		const scope = this.#authority.scope;
+		const protocolHash = artifact.protocol.protocolHash ?? this.#authority.protocolHash;
+		if (scope === undefined || protocolHash === undefined) return undefined;
+		const pending: unknown[] = [];
+		for (const plan of this.#optimistic.pendingFreshness(this.#authority.sequence)) {
+			if (!createReplicaRevalidationMatcher(plan)(artifact)) continue;
+			// Overlap already uses full generated list/filter/count/relationship
+			// dependencies. An overlapping request must use primary even when an
+			// incomplete producer only supplied an opaque dependency name.
+			pending.push({ complete: false, models: [...plan.models], relationships: [] });
+		}
+		const minimum: unknown[] = [];
+		// Retained clocks live independently of pending layer state. Index scopes
+		// belong to this query/live plan; never compare a different query's clock.
+		const group = this.#operations.group(key);
+		for (const state of [group?.query, group?.live]) {
+			for (const [projection, clock] of state?.indexClocks ?? []) {
+				minimum.push({ kind: 'index', projection, scopeToken: clock.scopeToken, position: clock.position });
+			}
+		}
+		// Direct Atomic effects have not yet acquired a query index checkpoint.
+		// Once a proving query retires this fence, its retained index clock covers
+		// membership (including later deletion) without requiring an absent row.
+		for (const [recordKey, { clock }] of this.#clocks.projectedFences()) {
+			const model = modelFromRecordKey(recordKey);
+			if (model === undefined || !createReplicaRevalidationMatcher({ dependencies: [], models: [model], relationships: [] })(artifact)) continue;
+			minimum.push({ kind: 'record', model, scopeToken: clock.scopeToken, incarnation: clock.incarnation, revision: clock.revision });
+		}
+		if (pending.length + minimum.length > 256) throw new Error('causal delivery context exceeds bounded evidence budget');
+		return Object.freeze({ version: 1, schemaHash: scope.schemaHash, protocolHash, authorizationGeneration: scope.authorizationGeneration, cacheScope: scope.cacheScope, pending, minimum });
+	}
+
+	[replicaCommandAwaitsFetch](
+		commandId: string,
+		plan: ReplicaRevalidationPlan
+	): boolean {
+		if (!this.#engine.optimisticLayerProvisional(commandId)) return false;
+		const matches = createReplicaRevalidationMatcher(plan);
+		for (const watch of this.#live.watchedOperations()) {
+			if (matches(watch.artifact) && this.#live.streaming(watch.key)) {
+				return false;
+			}
+		}
+		return true;
+	}
+
+	[replicaCommandLayerHeld](commandId: string): boolean {
+		return this.#engine.optimisticLayerState(commandId) !== undefined;
 	}
 
 	[replicaResultObservation](
@@ -685,21 +358,8 @@ export class DistributedReplicaImpl implements DistributedReplicaApi {
 			protocolInvalid('extensions.distributed.command.records');
 		}
 		const recordKey = replicaRecordKey(model, identity);
-		const pendingRecordClocks = new Map<string, RecordProtocolClock>();
-		const pendingRecordScopes = new Map<DistributedOpaqueString, string>();
-		const pendingAnonymousRecordClocks = new Map<
-			DistributedOpaqueString,
-			AnonymousRecordProtocolClock
-		>();
-		const consumedAnonymousRecordClocks = new Set<DistributedOpaqueString>();
-		const apply = this.#resolveRecordEvidence(
-			recordKey,
-			evidence,
-			pendingRecordClocks,
-			pendingRecordScopes,
-			pendingAnonymousRecordClocks,
-			consumedAnonymousRecordClocks
-		);
+		const admitted = this.#clocks.evidence();
+		const apply = admitted.resolve(recordKey, evidence);
 		/*
 		 * The Atomic output is a complete authoritative row. Seal every active
 		 * collection membership that the compiler plan can prove from that row in
@@ -717,87 +377,49 @@ export class DistributedReplicaImpl implements DistributedReplicaApi {
 		const indexRevision =
 			indexMutations.length === 0
 				? undefined
-				: this.#allocateIndexRevision();
+				: this.#operations.allocateIndexRevision();
 
-		confirmOptimisticLayerWithCacheWriterOn(
-			this.#optimisticHost(),
-			commandId,
-			(writer) => {
-				if (!apply) return false;
-				const wrote = writer.writeRecord({
-					key: recordKey,
-					revision: evidence.revision,
-					incarnation: evidence.incarnation,
-					fields
-				});
-				if (indexRevision !== undefined) {
-					for (const mutation of indexMutations) {
-						switch (mutation.kind) {
-							case 'write':
-								writer.writeIndex({
-									...mutation.write,
-									revision: indexRevision
-								});
-								break;
-							case 'stale':
-								writer.markIndexStale(
-									mutation.key,
-									mutation.reason,
-									indexRevision
-								);
-								break;
-							case 'delete':
-								writer.deleteIndex(mutation.key, indexRevision);
-								break;
-						}
+		this.#optimistic.confirmWithCacheWriter(commandId, (writer) => {
+			if (!apply) return false;
+			const wrote = writer.writeRecord({
+				key: recordKey,
+				revision: evidence.revision,
+				incarnation: evidence.incarnation,
+				fields
+			});
+			if (indexRevision !== undefined) {
+				for (const mutation of indexMutations) {
+					switch (mutation.kind) {
+						case 'write':
+							writer.writeIndex({
+								...mutation.write,
+								revision: indexRevision
+							});
+							break;
+						case 'stale':
+							writer.markIndexStale(
+								mutation.key,
+								mutation.reason,
+								indexRevision
+							);
+							break;
+						case 'delete':
+							writer.deleteIndex(mutation.key, indexRevision);
+							break;
 					}
 				}
-				return wrote;
 			}
-		);
+			return wrote;
+		});
 
-		for (const [key, clock] of pendingRecordClocks) {
-			this.#recordClocks.set(key, clock);
-			this.#recordKeysByScope.set(clock.scopeToken, key);
-		}
-		for (const [scopeToken, key] of pendingRecordScopes) {
-			this.#recordKeysByScope.set(scopeToken, key);
-		}
-		for (const [scopeToken, clock] of pendingAnonymousRecordClocks) {
-			if (!consumedAnonymousRecordClocks.has(scopeToken)) {
-				this.#anonymousRecordClocks.set(scopeToken, clock);
-			}
-		}
-		for (const scopeToken of consumedAnonymousRecordClocks) {
-			this.#anonymousRecordClocks.delete(scopeToken);
-		}
-		if (apply) {
-			this.#projectionGeneration += 1;
-			/*
-			 * The command result is authoritative before an asynchronous read
-			 * model necessarily catches up. Retain its complete row and causal
-			 * clock as a write fence until a query acknowledges it or a newer
-			 * record/tombstone supersedes it.
-			 *
-			 * Do not also take a membership fence: Atomic lists are @load, not
-			 * @live. A membership fence would reject later complete snapshots
-			 * until a live frame that never comes, stalling blob/new games and
-			 * client-side navigations.
-			 */
-			this.#projectedRecordFences.set(
-				recordKey,
-				Object.freeze({
-					fields: Object.freeze({ ...fields }),
-					clock: Object.freeze({
-						scopeToken: evidence.scopeToken,
-						incarnation: evidence.incarnation,
-						revision: evidence.revision,
-						tombstone: false
-					}),
-					projectionGeneration: this.#projectionGeneration
-				})
-			);
-		}
+		admitted.commit();
+		/*
+		 * Do not also take a membership fence: Atomic lists are @load, not
+		 * @live. A membership fence would reject later complete snapshots
+		 * until a live frame that never comes, stalling blob/new games and
+		 * client-side navigations.
+		 */
+		if (apply) this.#clocks.project(recordKey, fields, evidence);
 	}
 
 	[replicaCommandProjectionDelta](
@@ -805,26 +427,40 @@ export class DistributedReplicaImpl implements DistributedReplicaApi {
 		update: (writer: ReplicaOptimisticWriter) => void,
 		semanticChanges: readonly ReplicaIndexSemanticChange[]
 	): boolean {
-		return replaceReplicaOptimisticLayerOn(
-			this.#optimisticHost(),
-			commandId,
-			(writer) => update(this.#capturingOptimisticWriter(commandId, writer)),
-			semanticChanges
-		);
+		return this.#optimistic.replace(commandId, update, semanticChanges);
 	}
 
 	read<TData, TVariables extends GraphqlVariables>(
 		artifact: ReplicaOperationArtifact<TData, TVariables>,
 		variables: TVariables
 	): ReplicaSnapshot<TData> {
-		this.#bindArtifact(artifact);
+		this.#authority.bindArtifact(artifact);
 		const stableVariables = canonicalizeOperationVariables(artifact, variables);
 		const key = operationKey(artifact, stableVariables);
-		this.#rememberRenderedOperation(key, artifact, stableVariables, 'read');
 		const materialized = this.#engine.read((reader) =>
 			materializeReplicaOperation(reader, artifact, stableVariables)
 		);
-		return snapshotFrom(materialized, this.#queryState(key));
+		// A read registers nothing, so it must not create query state either.
+		return snapshotFrom(
+			materialized,
+			this.#live.peekState(key) ?? IDLE_QUERY_STATE
+		);
+	}
+
+	retainOperation<TData, TVariables extends GraphqlVariables>(
+		artifact: ReplicaOperationArtifact<TData, TVariables>,
+		variables: TVariables
+	): () => void {
+		this.#authority.bindArtifact(artifact);
+		const stableVariables = canonicalizeOperationVariables(artifact, variables);
+		const key = operationKey(artifact, stableVariables);
+		this.#rememberRenderedOperation(key, artifact, stableVariables);
+		let retained = true;
+		return () => {
+			if (!retained) return;
+			retained = false;
+			this.#forgetRenderedOperation(key);
+		};
 	}
 
 	watch<TData, TVariables extends GraphqlVariables>(
@@ -832,7 +468,7 @@ export class DistributedReplicaImpl implements DistributedReplicaApi {
 		variables: TVariables,
 		options: WatchReplicaOptions = {}
 	): ReplicaWatch<TData> {
-		this.#bindArtifact(artifact);
+		this.#authority.bindArtifact(artifact);
 		return new ReplicaWatchState(this, artifact, variables, options);
 	}
 
@@ -843,23 +479,20 @@ export class DistributedReplicaImpl implements DistributedReplicaApi {
 		source: ReplicaWriteSource
 	): void {
 		assertWriteSource(source);
-		this.#bindArtifact(artifact);
+		this.#authority.bindArtifact(artifact);
 		const stableVariables = canonicalizeOperationVariables(artifact, variables);
 		this.#writeCanonicalResult(artifact, stableVariables, envelope, source);
 	}
 
 	revalidate(plan: ReplicaRevalidationPlan): Promise<void> {
 		const matches = createReplicaRevalidationMatcher(plan);
-		const generation = this.#protocolGenerationSequence;
+		const generation = this.#authority.sequence;
 		const active = new Map<
 			string,
 			ReplicaWatchState<unknown, GraphqlVariables>
 		>();
-		for (const [key, watches] of this.#watches) {
-			const watch = watches.values().next().value;
-			if (watch !== undefined && matches(watch.artifact)) {
-				active.set(key, watch);
-			}
+		for (const watch of this.#live.watchedOperations()) {
+			if (matches(watch.artifact)) active.set(watch.key, watch);
 		}
 		/*
 		 * A command-status observation may arrive while an older query is
@@ -867,12 +500,12 @@ export class DistributedReplicaImpl implements DistributedReplicaApi {
 		 * revalidation below must start after the command fence.
 		 */
 		const prior = [...active.keys()].flatMap((key) => {
-			const request = this.#inFlight.get(key);
+			const request = this.#live.request(key);
 			return request === undefined ? [] : [request];
 		});
 		return Promise.all(prior)
 			.then(() => {
-				if (this.#protocolGenerationSequence !== generation) return [];
+				if (this.#authority.sequence !== generation) return [];
 
 				/*
 				 * Stale every rendered matching root before fetching. This both
@@ -913,9 +546,9 @@ export class DistributedReplicaImpl implements DistributedReplicaApi {
 			})
 			.then((requests) => Promise.all(requests))
 			.then((watches) => {
-				if (this.#protocolGenerationSequence !== generation) return;
+				if (this.#authority.sequence !== generation) return;
 				const failed = watches.some((watch) => {
-					const state = this.#queryState(watch.key);
+					const state = this.#live.state(watch.key);
 					/*
 					 * Revalidation proves that the authoritative HTTP response
 					 * refreshed the confirmed graph. A surviving accepted layer
@@ -945,94 +578,198 @@ export class DistributedReplicaImpl implements DistributedReplicaApi {
 	}
 
 	invalidateAuthorization(): void {
-		this.#purgeProtocolGeneration();
+		this.#purge();
 	}
 
 	dehydrate(): ReplicaDehydratedState {
-		return dehydrateReplica(this.#hydrationHost());
+		const scope = this.#authority.scope;
+		if (scope === undefined) {
+			throw new Error(
+				'cannot dehydrate replica before the server establishes an authoritative scope'
+			);
+		}
+		const reachable = reachableConfirmedState(
+			this.#engine.extract(),
+			this.#renderedOperations,
+			(key) => this.#operations.group(key)
+		);
+		const payload: ReplicaDehydratedPayloadV1 = Object.freeze({
+			cache: reachable.cache,
+			operations: this.#operations.dehydrate(
+				this.#renderedOperations.keys(),
+				new Set(reachable.cache.indexes.map((index) => index.key)),
+				reachable.clockRecordKeys
+			),
+			...this.#clocks.dehydrate(reachable.clockRecordKeys, reachable.models),
+			trustedPresets: this.#authority.trustedPresets,
+			nextIndexRevision: this.#operations.nextIndexRevision
+		});
+		return Object.freeze({
+			version: 1 as const,
+			scope: Object.freeze({
+				protocolVersion: 1 as const,
+				schemaHash: scope.schemaHash,
+				authorizationGeneration: scope.authorizationGeneration,
+				cacheScope: scope.cacheScope
+			}),
+			payload
+		});
 	}
 
-		hydrate(
+	hydrate(
 		state: ReplicaDehydratedState,
 		authoritativeScope: ReplicaAuthoritativeScope
 	): boolean {
-		return hydrateReplica(this.#hydrationHost(), state, authoritativeScope);
+		return this.#hydrate(state, authoritativeScope, 'merge');
 	}
 
-	#bindArtifact<TData, TVariables extends GraphqlVariables>(
-		artifact: ReplicaOperationArtifact<TData, TVariables>
-	): void {
-		const next = validatedArtifactBinding(artifact);
-		this.#validateActiveArtifactTrustedPresets(next);
-		const current = this.#artifactBinding;
-		if (current === undefined) {
-			this.#artifactBinding = Object.freeze({
-				version: next.version,
-				schemaHash: next.schemaHash,
-				surfaceIdentity: next.surfaceIdentity,
-				trustedPresets: next.trustedPresets
-			});
-			return;
-		}
-		if (
-			(
-				current.surfaceIdentity === undefined ||
-				current.trustedPresets === undefined
-			) &&
-			current.version === next.version &&
-			current.schemaHash === next.schemaHash &&
-			(
-				current.surfaceIdentity === undefined ||
-				current.surfaceIdentity === next.surfaceIdentity
-			) &&
-			(
-				current.trustedPresets === undefined ||
-				trustedPresetDescriptorFingerprint(current.trustedPresets) ===
-					trustedPresetDescriptorFingerprint(next.trustedPresets)
-			)
-		) {
-			this.#artifactBinding = Object.freeze({
-				...current,
-				surfaceIdentity: next.surfaceIdentity,
-				trustedPresets: next.trustedPresets
-			});
-			return;
-		}
-		if (
-			current.version !== next.version ||
-			current.schemaHash !== next.schemaHash ||
-			(
-				current.surfaceIdentity !== undefined &&
-				current.surfaceIdentity !== next.surfaceIdentity
-			) ||
-			(
-				current.trustedPresets !== undefined &&
-				trustedPresetDescriptorFingerprint(
-					current.trustedPresets
-				) !== trustedPresetDescriptorFingerprint(next.trustedPresets)
-			)
-		) {
-			throw new TypeError(
-				'replica artifact schema does not match the active replica binding'
-			);
-		}
+	reauthorize(
+		state: ReplicaDehydratedState,
+		authoritativeScope: ReplicaAuthoritativeScope
+	): boolean {
+		return this.#hydrate(state, authoritativeScope, 'reauthorize');
 	}
 
-	#validateActiveArtifactTrustedPresets(
-		binding: ValidatedArtifactBinding
-	): void {
-		if (this.#protocolGeneration === undefined) {
-			return;
-		}
+	#hydrate(
+		state: ReplicaDehydratedState,
+		authoritativeScope: ReplicaAuthoritativeScope,
+		mode: 'merge' | 'reauthorize'
+	): boolean {
+		const rejected = (
+			reason:
+				| 'invalid'
+				| 'scope-mismatch'
+				| 'artifact-mismatch'
+				| 'active-scope-mismatch'
+		): false => {
+			if (this.#diagnostics.enabled) {
+				this.#diagnostics.event(
+					Object.freeze({ kind: 'hydration', action: 'rejected', reason })
+				);
+			}
+			return false;
+		};
+		let parsed: ParsedReplicaHydration;
+		let expectedScope: ProtocolGeneration;
 		try {
-			matchReplicaTrustedPresetInventory(
-				binding.trustedPresets,
-				this.#trustedPresets
-			);
-		} catch (error) {
-			this.#purgeProtocolGeneration();
-			throw error;
+			// Parsed whole, cache included, before any transport closes or any live
+			// state changes.
+			parsed = hydrationTables(parseDehydratedState(state));
+			expectedScope = parseAuthoritativeScope(authoritativeScope);
+		} catch {
+			return rejected('invalid');
 		}
+		if (
+			parsed.scope.protocolVersion !== expectedScope.protocolVersion ||
+			parsed.scope.schemaHash !== expectedScope.schemaHash ||
+			parsed.scope.authorizationGeneration !==
+				expectedScope.authorizationGeneration ||
+			parsed.scope.cacheScope !== expectedScope.cacheScope
+		) {
+			return rejected('scope-mismatch');
+		}
+		const rejection = this.#authority.hydrationRejection(
+			parsed.scope,
+			parsed.trustedPresets,
+			mode
+		);
+		if (rejection !== undefined) return rejected(rejection);
+		const preserveLocalCommandState = this.#authority.scope !== undefined;
+
+		if (mode === 'reauthorize') {
+			// The independent scope authorizes continued use of the current replica.
+			// The accompanying snapshot may predate an intervening command: do not
+			// merge its records, clocks, indexes, or freshness evidence into that state.
+			this.#live.closeTransports();
+			this.#live.clearStates();
+			this.#live.resumeLive();
+			this.#live.refreshWatches();
+			this.#diagnostics.sync();
+			return true;
+		}
+
+		if (preserveLocalCommandState) {
+			// Warm same-scope re-hydrate (soft nav / second SSR seed): keep confirmed
+			// records and indexes the route seed omitted. Seed keys upsert; purge only
+			// happens on auth/scope change (closeAuthorizationGeneration path).
+			const retainedIndexes = this.#operations.merge(parsed);
+			const retainedRecords = this.#clocks.merge(parsed);
+			this.#authority.hydrate(parsed.scope, parsed.trustedPresets);
+			this.#operations.advanceIndexRevisionTo(parsed.nextIndexRevision);
+			this.#engine.mergeConfirmed({
+				...parsed.cache,
+				records: parsed.cache.records.filter(
+					(record) => !retainedRecords.has(record.key)
+				),
+				indexes: parsed.cache.indexes.filter(
+					(index) => !retainedIndexes.has(index.key)
+				)
+			});
+		} else {
+			this.#closeAuthorizationGeneration();
+			this.#live.clearStates();
+			this.#operations.restore(parsed);
+			this.#clocks.restore(parsed);
+			this.#optimistic.clearReceipts();
+			this.#diagnostics.clearLayers();
+			this.#authority.hydrate(parsed.scope, parsed.trustedPresets);
+			this.#engine.restore(parsed.cache);
+		}
+		this.#live.resumeLive();
+		this.#diagnostics.sync();
+		if (this.#diagnostics.enabled) {
+			this.#diagnostics.event(
+				Object.freeze({
+					kind: 'hydration',
+					action: 'accepted',
+					reason: preserveLocalCommandState ? 'same-scope-merge' : 'accepted'
+				})
+			);
+			this.#diagnostics.event(
+				Object.freeze({
+					kind: 'scope',
+					action: 'established',
+					generation: this.#authority.sequence,
+					schemaHash: parsed.scope.schemaHash
+				})
+			);
+		}
+		return true;
+	}
+
+	/**
+	 * Empty the replica: end the authorization generation and drop every
+	 * protocol, clock, receipt and cached row it established. Watches and
+	 * retained operations outlive it; their index plans are registered again.
+	 */
+	#purge(): void {
+		this.#closeAuthorizationGeneration();
+		this.#live.clearStates();
+		this.#operations.clear();
+		this.#clocks.clear();
+		this.#optimistic.clear();
+		this.#diagnostics.clearLayers();
+		this.#indexMaintenance.clear();
+		this.#indexPlanRegistrations.clear();
+		this.#authority.reset();
+		this.#engine.restore(EMPTY_CACHE_SNAPSHOT);
+		this.#diagnostics.sync();
+		this.#restoreIndexPlans();
+		this.#live.refreshWatches();
+		if (this.#diagnostics.enabled) {
+			this.#diagnostics.event(
+				Object.freeze({
+					kind: 'scope',
+					action: 'invalidated',
+					generation: this.#authority.sequence
+				})
+			);
+		}
+	}
+
+	#closeAuthorizationGeneration(): void {
+		this.#authority.close();
+		this.#live.closeTransports();
 	}
 
 	#writeCanonicalResult<TData, TVariables extends GraphqlVariables>(
@@ -1077,23 +814,28 @@ export class DistributedReplicaImpl implements DistributedReplicaApi {
 		requestRevision: string | undefined,
 		responseProjectionGeneration: number | undefined
 	): boolean {
-			this.#validateProtocolBinding(artifact, distributed, source);
-			const previousProtocolGeneration = this.#protocolGeneration;
-			const nextProtocolGeneration =
-				this.#stageProtocolGeneration(distributed);
-			const nextTrustedPresets = this.#stageTrustedPresets(
-				distributed.trustedPresets,
-				nextProtocolGeneration,
-				artifact
-			);
+		const previousScope = this.#authority.scope;
+		const staged = this.#authority.stage(artifact, distributed, source);
 
 		const snapshot = distributed.snapshot;
 		const live = distributed.live;
 		if (live !== undefined && snapshot === undefined) {
 			protocolInvalid('extensions.distributed.snapshot');
 		}
+		// A failed live execution has no result: an error-only frame with only
+		// the base envelope. It is receipt-only, like an HTTP error response,
+		// and must not carry a command receipt or create stream state.
+		const liveFailure =
+			source === 'live' &&
+			snapshot === undefined &&
+			live === undefined &&
+			isGraphqlFailurePayload(envelope);
+		if (liveFailure && distributed.command !== undefined) {
+			protocolInvalid('extensions.distributed.command');
+		}
 		if (
 			source === 'live' &&
+			!liveFailure &&
 			(envelope.data !== undefined || envelope.errors !== undefined) &&
 			(snapshot === undefined || live === undefined)
 		) {
@@ -1106,38 +848,22 @@ export class DistributedReplicaImpl implements DistributedReplicaApi {
 		}
 		const operationSource = protocolOperationSource(source);
 		const operationState =
-			operation === undefined
+			operation === undefined || liveFailure
 				? undefined
-				: this.#operationProtocol(key, operation, operationSource);
-			if (snapshot === undefined || operationState === undefined) {
-				this.#applyReceiptOnly(distributed.command);
-				this.#trustedPresets = nextTrustedPresets;
-				this.#protocolGeneration = nextProtocolGeneration;
-				this.#resumeLiveWatches();
-				this.#diagnosticScopeTransition(
-					previousProtocolGeneration,
-					nextProtocolGeneration
-				);
-				this.#syncDiagnostics();
-				return true;
+				: this.#operations.state(key, operation, operationSource);
+		if (snapshot === undefined || operationState === undefined) {
+			this.#optimistic.applyReceiptOnly(distributed.command);
+			this.#authority.commit(staged);
+			this.#live.resumeLive();
+			this.#diagnostics.scopeTransition(previousScope, staged.scope);
+			this.#diagnostics.sync();
+			return true;
 		}
 
 		this.#validateLiveSnapshot(snapshot, live);
-		const unsupportedLive =
-			source === 'live' && live?.supported === false;
+		const snapshotLive = source === 'live' && live?.mode === 'snapshot';
 		const reset = live?.reset === true;
-		const group = this.#operationProtocols.get(key)!;
-		/*
-		 * An unsupported subscription response is an authorized fallback
-		 * snapshot, not a live source. In particular, a row-filtered snapshot
-		 * has no comparable index vector, so retaining live ownership here
-		 * would reject every later query handoff. Relinquish any prior live
-		 * ownership without advancing the generation; the forced HTTP fallback
-		 * starts against the generation that remains after this frame.
-		 */
-		if (unsupportedLive && group.active === 'live') {
-			group.active = undefined;
-		}
+		const group = this.#operations.group(key)!;
 		const previousActiveSource = group.active;
 		const handoff =
 			previousActiveSource !== undefined &&
@@ -1153,20 +879,54 @@ export class DistributedReplicaImpl implements DistributedReplicaApi {
 			handoff && activeState !== undefined
 				? compareSnapshotToOperationState(activeState, snapshot)
 				: 'fresh';
-		const sharedDisposition = this.#sharedIndexDisposition(
+		const incomingMemberships: ReplicaIndexMemberships = new Map();
+		const fencedSharedDisposition = this.#operations.sharedIndexDisposition(
 			key,
 			replicaResultIndexKeys(
 				artifact,
 				stableVariables,
 				envelope,
-				snapshot
+				snapshot,
+				incomingMemberships
 			),
 			snapshot,
 			requestRevision,
-			source
+			source,
+			source === 'live' && !snapshot.indexesComparable
+				? this.#live.liveStartRevision(key)
+				: undefined
 		);
+		/*
+		 * A snapshot frame that agrees with an independent owner on every
+		 * index they share is exactly its server result once admitted: the
+		 * owner keeps those indexes and this frame writes only the rest
+		 * (docs/live-query-delivery.md). Disagreement keeps the atomic fence.
+		 */
+		const fencedIndexKeys =
+			snapshotLive ? fencedSharedDisposition.fencedIndexKeys : undefined;
+		const sharedMembershipAdmitted =
+			fencedIndexKeys !== undefined &&
+			(envelope.errors ?? []).length === 0 &&
+			this.#fencedMembershipsMatch(fencedIndexKeys, incomingMemberships);
+		const sharedDisposition: SharedIndexDisposition = sharedMembershipAdmitted
+			? { compared: false }
+			: fencedSharedDisposition;
+		// A non-resumable stream has no causal vector to compare. An HTTP
+		// refresh may replace it only if the request began after its last
+		// accepted membership. fetchWatch also fences intervening live frames.
+		// Taking query ownership restarts the stream, fencing queued callbacks.
+		const snapshotRefresh =
+			source === 'network' &&
+			previousActiveSource === 'live' &&
+			!snapshot.indexesComparable &&
+			activeState?.snapshotScope === undefined &&
+			activeState?.indexRevision !== undefined &&
+			requestRevision !== undefined &&
+			compareDistributedDecimal(requestRevision, activeState.indexRevision) > 0;
 		const handoffBlocked =
 			handoff &&
+			!snapshotLive &&
+			!snapshotRefresh &&
 			(
 				!snapshot.indexesComparable ||
 				!isComparableHandoffDisposition(ownDisposition) ||
@@ -1190,10 +950,9 @@ export class DistributedReplicaImpl implements DistributedReplicaApi {
 					: sharedDisposition.disposition ?? disposition;
 		}
 		const sourceSwitched =
-			!unsupportedLive &&
 			!handoffBlocked &&
 			isComparableHandoffDisposition(disposition) &&
-			this.#activateOperationSource(
+			this.#operations.activate(
 				key,
 				operationSource,
 				artifact,
@@ -1205,9 +964,9 @@ export class DistributedReplicaImpl implements DistributedReplicaApi {
 			(reset || ownDisposition === 'incomparable')
 		) {
 			if (rejectedHandoff) {
-				this.#resetOperationState(operationState);
+				this.#operations.reset(operationState);
 			} else {
-				this.#discardOperationSnapshot(
+				this.#operations.discardSnapshot(
 					operationState,
 					artifact,
 					stableVariables
@@ -1223,7 +982,7 @@ export class DistributedReplicaImpl implements DistributedReplicaApi {
 
 		if (!snapshot.indexesComparable) {
 			if (rejectedHandoff) {
-				this.#resetOperationState(operationState);
+				this.#operations.reset(operationState);
 			} else {
 				/*
 				 * The server-authorized GraphQL payload is still an exact
@@ -1232,7 +991,7 @@ export class DistributedReplicaImpl implements DistributedReplicaApi {
 				 * would leak denied-row activity). Preserve local membership,
 				 * while dropping every capability that requires comparison.
 				 */
-				this.#resetOperationCausalState(operationState);
+				this.#operations.resetCausal(operationState);
 			}
 			disposition = rejectedHandoff
 				? 'incomparable'
@@ -1241,9 +1000,9 @@ export class DistributedReplicaImpl implements DistributedReplicaApi {
 					: 'fresh';
 		} else if (disposition === 'incomparable') {
 			if (rejectedHandoff) {
-				this.#resetOperationState(operationState);
+				this.#operations.reset(operationState);
 			} else {
-				this.#discardOperationSnapshot(
+				this.#operations.discardSnapshot(
 					operationState,
 					artifact,
 					stableVariables
@@ -1255,56 +1014,35 @@ export class DistributedReplicaImpl implements DistributedReplicaApi {
 			!rejectedHandoff &&
 			disposition !== 'lower' &&
 			disposition !== 'incomparable';
-		/*
-		 * Revision zero is the cache engine's lowest legal checkpoint. It lets
-		 * an unsupported live response fill an empty cache immediately while
-		 * guaranteeing that any HTTP request revision can replace it.
-		 */
+		// Snapshot frames receive local membership revisions, not fabricated
+		// projection clocks. Live ownership fences older overlapping HTTP work.
 		const indexRevision =
-			unsupportedLive
-				? '0'
+			writeIndexes &&
+			(sourceSwitched || sharedDisposition.disposition === 'higher')
+				? this.#operations.allocateIndexRevision()
 				: writeIndexes &&
-					  (
-							sourceSwitched ||
-							sharedDisposition.disposition === 'higher'
-						)
-					? this.#allocateIndexRevision()
-					: writeIndexes &&
-						  sharedDisposition.disposition === 'equal' &&
-						  sharedDisposition.indexRevision !== undefined
-						? sharedDisposition.indexRevision
+					  sharedDisposition.disposition === 'equal' &&
+					  sharedDisposition.indexRevision !== undefined
+					? sharedDisposition.indexRevision
 				: snapshot.indexesComparable &&
 					  disposition === 'equal' &&
 					  operationState.indexRevision !== undefined
 					? operationState.indexRevision
-					: (requestRevision ?? this.#allocateIndexRevision());
+					: (requestRevision ?? this.#operations.allocateIndexRevision());
 		const recordEvidence = prepareRecordEvidence(
 			snapshot,
 			distributed.command?.records ?? Object.freeze([])
 		);
-		const pendingRecordClocks = new Map<string, RecordProtocolClock>();
-		const pendingRecordScopes = new Map<DistributedOpaqueString, string>();
-		const pendingAnonymousRecordClocks = new Map<
-			DistributedOpaqueString,
-			AnonymousRecordProtocolClock
-		>();
-		const consumedAnonymousRecordClocks = new Set<
-			DistributedOpaqueString
-		>();
+		const admitted = this.#clocks.evidence();
 		const pendingPathRecords = new Map<string, string>();
-		const pendingProjectedRecordFenceClears = new Map<
-			string,
-			ProjectedRecordFence
-		>();
 		const consumedRecordPaths = new Set<string>();
 		const observationsAdmissible =
 			snapshot.recordsComplete &&
 				snapshot.indexesComparable &&
 				disposition !== 'incomparable' &&
 				(disposition !== 'lower' ||
-					this.#operationProtocols.get(key)?.active ===
-						operationSource);
-		const receiptPlan = this.#planOptimisticReceipts(
+					this.#operations.group(key)?.active === operationSource);
+		const receiptPlan = this.#optimistic.planReceipts(
 			distributed.command,
 			[
 				...(distributed.command?.observations ?? []),
@@ -1349,87 +1087,32 @@ export class DistributedReplicaImpl implements DistributedReplicaApi {
 					);
 				}
 				consumedRecordPaths.add(encodedPath);
-				const projectedFence =
-					this.#projectedRecordFences.get(recordKey);
-				const projectedDisposition =
-					projectedFence === undefined
-						? undefined
-						: compareProjectedRecordFields(
-								projectedFence.fields,
-								fields
-							);
-				const projectedClockComparison =
-					projectedFence === undefined
-						? undefined
-						: compareEvidenceToProjectedFence(
-								evidence,
-								projectedFence
-							);
-				const newerPostProjectionRow =
-					projectedFence !== undefined &&
-					projectedDisposition === 'conflict' &&
-					projectedClockComparison === 1 &&
-					responseProjectionGeneration !== undefined &&
-					responseProjectionGeneration >=
-						projectedFence.projectionGeneration;
-				/*
-				 * Snapshot bodies can race: SQL may be read before a command
-				 * while response evidence is stamped after it. Conflicting
-				 * pre-command responses therefore cannot override a projected
-				 * fence, even when their evidence revision is numerically later.
-				 * A causally newer row from an HTTP request or live frame that
-				 * began after the command is an atomic supersession and may
-				 * release the fence without first echoing the projected body.
-				 */
-				if (projectedFence !== undefined) {
-					const exactEcho =
-						projectedDisposition === 'complete' &&
-						(
-							projectedClockComparison === 0 ||
-							projectedClockComparison === 1
-						);
-					const newerPartial =
-						projectedDisposition === 'partial' &&
-						projectedClockComparison === 1;
-					if (exactEcho || newerPartial || newerPostProjectionRow) {
-						pendingProjectedRecordFenceClears.set(
-							recordKey,
-							projectedFence
-						);
-					}
-				}
-				const resolution = this.#resolveRecordEvidence(
+				const apply = admitted.row(
 					recordKey,
 					evidence,
-					pendingRecordClocks,
-					pendingRecordScopes,
-					pendingAnonymousRecordClocks,
-					consumedAnonymousRecordClocks,
-					projectedDisposition === 'conflict' &&
-						!newerPostProjectionRow
+					fields,
+					responseProjectionGeneration
 				);
 				pendingPathRecords.set(encodedPath, recordKey);
-				return Object.freeze({ evidence, apply: resolution });
+				return Object.freeze({ evidence, apply });
 			}
 		};
 
-		const state = this.#queryState(key);
+		const state = this.#live.state(key);
 		const previousErrors = state.errors;
 		state.errors = stableErrors(previousErrors, envelope.errors ?? []);
 		let summary: ReturnType<typeof normalizeReplicaResult>;
 		try {
 			const update = (writer: BaseCacheWriter) => {
-				const guarded = this.#guardIndexWriter(writer);
-				this.#applyTombstoneEvidence(
+				const guarded = this.#optimistic.guardIndexWriter(
+					writer,
+					sharedMembershipAdmitted ? fencedIndexKeys : undefined
+				);
+				admitted.tombstones(
 					guarded,
 					recordEvidence.tombstones,
-					operationState,
-					pendingRecordClocks,
-					pendingRecordScopes,
-					pendingAnonymousRecordClocks,
-					consumedAnonymousRecordClocks,
-					consumedRecordPaths,
-					pendingProjectedRecordFenceClears
+					operationState.pathRecords,
+					consumedRecordPaths
 				);
 				const normalized = normalizeReplicaResult(
 					guarded,
@@ -1445,16 +1128,11 @@ export class DistributedReplicaImpl implements DistributedReplicaApi {
 						);
 					}
 				}
-				this.#applyPathlessEvidence(
+				admitted.pathless(
 					guarded,
 					recordEvidence.pathless,
 					recordEvidence.byPath,
-					consumedRecordPaths,
-					pendingRecordClocks,
-					pendingRecordScopes,
-					pendingAnonymousRecordClocks,
-					consumedAnonymousRecordClocks,
-					pendingProjectedRecordFenceClears
+					consumedRecordPaths
 				);
 				return normalized;
 			};
@@ -1471,108 +1149,66 @@ export class DistributedReplicaImpl implements DistributedReplicaApi {
 				error instanceof CacheRevisionConflictError ||
 				error instanceof DistributedProtocolError
 			) {
-				this.#discardOperationSnapshot(
+				this.#operations.discardSnapshot(
 					operationState,
 					artifact,
 					stableVariables
 				);
 			}
-			this.#emitState(key, false);
+			this.#live.emit(key, false);
 			throw error;
 		}
 
-		for (const [recordKey, clock] of pendingRecordClocks) {
-			this.#recordClocks.set(recordKey, clock);
-			this.#recordKeysByScope.set(clock.scopeToken, recordKey);
+		admitted.commit();
+		this.#operations.rememberPaths(operationState, pendingPathRecords);
+		this.#optimistic.commitReceipts(receiptPlan);
+		this.#operations.commitSnapshot(operationState, {
+			writeIndexes,
+			indexRevision,
+			indexKeys: summary.indexKeys,
+			snapshot,
+			live
+		});
+		if (source === 'live') {
+			this.#operations.advance(key);
 		}
-		for (const [scopeToken, recordKey] of pendingRecordScopes) {
-			this.#recordKeysByScope.set(scopeToken, recordKey);
+		if (source !== 'live' && sourceSwitched) {
+			this.#live.restartLive(key);
 		}
-		for (const [scopeToken, clock] of pendingAnonymousRecordClocks) {
-			if (!consumedAnonymousRecordClocks.has(scopeToken)) {
-				this.#anonymousRecordClocks.set(scopeToken, clock);
-			}
-		}
-		for (const scopeToken of consumedAnonymousRecordClocks) {
-			this.#anonymousRecordClocks.delete(scopeToken);
-		}
-		for (const [path, recordKey] of pendingPathRecords) {
-			operationState.pathRecords.set(path, recordKey);
-		}
-		for (const [recordKey, projectedFields] of pendingProjectedRecordFenceClears) {
-			if (this.#projectedRecordFences.get(recordKey) === projectedFields) {
-				this.#projectedRecordFences.delete(recordKey);
-			}
-		}
-		for (const [id, receipt] of receiptPlan.updates) {
-			if (receiptPlan.satisfied.includes(id)) {
-				this.#retireDiagnosticLayer(id, 'retired', 'atomic', receipt);
-				this.#optimisticReceipts.delete(id);
-			} else {
-				this.#optimisticReceipts.set(id, receipt);
-				this.#engine.markOptimisticLayerAccepted(id);
-				const layer = this.#diagnosticLayers?.get(id);
-				if (layer !== undefined) {
-					this.#diagnosticLayers!.set(
-						id,
-						Object.freeze({ ...layer, state: 'accepted' as const })
-					);
-				}
-				if (this.#diagnostics !== undefined) {
-					const counts = diagnosticReceiptCounts(receipt);
-					this.#diagnosticEvent(
-						Object.freeze({
-							kind: 'receipt',
-							command: id,
-							state:
-								counts.obligations === 0
-									? ('succeeded' as const)
-									: ('succeeded_pending_projection' as const),
-							obligations: counts.obligations,
-							observed: counts.observed
-						})
-					);
-				}
-			}
+		if (source === 'live') {
+			this.#live.fenceLive(
+				key,
+				fencedIndexKeys !== undefined && !sharedMembershipAdmitted
+					? fencedIndexKeys
+					: undefined
+			);
 		}
 		if (writeIndexes) {
-			operationState.indexRevision = indexRevision;
-			for (const indexKey of summary.indexKeys) {
-				operationState.indexKeys.add(indexKey);
-			}
-			if (snapshot.indexesComparable) {
-				operationState.snapshotScope = snapshot.scopeToken;
-				operationState.indexClocks = indexClockMap(snapshot.indexes);
-				operationState.cursors = latestCursors(snapshot, live);
-			} else {
-				this.#resetOperationCausalState(operationState);
-				operationState.indexRevision = indexRevision;
-				for (const indexKey of summary.indexKeys) {
-					operationState.indexKeys.add(indexKey);
-				}
-			}
-		} else if (live?.reset === true || !snapshot.indexesComparable) {
-			operationState.cursors = Object.freeze([]);
+			this.#live.reopenFencedBy(
+				key,
+				summary.indexKeys.filter(
+					(indexKey) =>
+						!(sharedMembershipAdmitted && fencedIndexKeys!.has(indexKey))
+				)
+			);
 		}
-		if (source === 'live' && !unsupportedLive) {
-			this.#advanceOperationGeneration(key);
+		if (source === 'live' && sharedDisposition.restartAfterRetirement) {
+			// This receiver began before a shared owner retired. Its buffered
+			// frame stays fenced, but a fresh receiver starts after that boundary
+			// and can obtain an authoritative replacement without polling.
+			this.#live.restartLive(key);
 		}
-			if (source !== 'live' && sourceSwitched) {
-				this.#restartLive(key);
-			}
-			this.#trustedPresets = nextTrustedPresets;
-			this.#protocolGeneration = nextProtocolGeneration;
-		this.#resumeLiveWatches();
-		this.#emitState(key, false);
-		this.#flushDeferredMembershipConfirms();
-		if (this.#diagnostics !== undefined) {
-			const cache = this.#engine.extract();
-			this.#diagnosticEvent(
+		this.#authority.commit(staged);
+		this.#live.resumeLive();
+		this.#live.emit(key, false);
+		this.#optimistic.flushDeferredConfirms();
+		this.#optimistic.retireHeld();
+		if (this.#diagnostics.enabled) {
+			this.#diagnostics.event(
 				Object.freeze({
 					kind: 'normalization',
 					operation: artifact.id,
 					source,
-					records: cache.records.length,
 					indexes: summary.indexKeys.length,
 					partial:
 						summary.partial ||
@@ -1582,11 +1218,10 @@ export class DistributedReplicaImpl implements DistributedReplicaApi {
 				})
 			);
 			for (const indexKey of summary.indexKeys) {
-				const index = cache.indexes.find(
-					(candidate) => candidate.key === indexKey && !candidate.deleted
+				const staleReason = this.#engine.readConfirmed(
+					(confirmed) => confirmed.index(indexKey)?.metadata?.staleReason
 				);
-				const staleReason = index?.metadata?.staleReason;
-				this.#diagnosticEvent(
+				this.#diagnostics.event(
 					Object.freeze({
 						kind: 'index-decision',
 						index: indexKey,
@@ -1604,11 +1239,8 @@ export class DistributedReplicaImpl implements DistributedReplicaApi {
 					})
 				);
 			}
-			this.#diagnosticScopeTransition(
-				previousProtocolGeneration,
-				nextProtocolGeneration
-			);
-			this.#syncDiagnostics();
+			this.#diagnostics.scopeTransition(previousScope, staged.scope);
+			this.#diagnostics.sync();
 		}
 		if (disposition === 'incomparable' || rejectedHandoff) return false;
 		if (disposition !== 'lower') return true;
@@ -1637,174 +1269,74 @@ export class DistributedReplicaImpl implements DistributedReplicaApi {
 		update: (writer: ReplicaOptimisticWriter) => void,
 		semanticChanges: readonly ReplicaIndexSemanticChange[] = Object.freeze([])
 	): void {
-		createOptimisticLayerOn(this.#optimisticHost(), id, update, semanticChanges);
+		this.#optimistic.create(id, update, semanticChanges);
+	}
+
+	/**
+	 * Whether the authoritative base holds the row an observed revision names
+	 * at or past that revision. The record must be known by its scope token
+	 * and stored (or tombstoned) at a comparable clock; evidence that only
+	 * discarded a stale row proves nothing.
+	 */
+	#baseHolds(revision: DistributedObservedRecord): boolean {
+		const known = this.#clocks.byScope(revision.scopeToken);
+		if (known === undefined || compareRecordClock(known.clock, revision) < 0) {
+			return false;
+		}
+		if (known.clock.tombstone) return true;
+		const stored = this.#engine.readConfirmed((reader) =>
+			reader.record(known.key)
+		);
+		return (
+			stored !== undefined &&
+			compareRecordClock(stored, revision) >= 0
+		);
 	}
 
 	markOptimisticLayerAccepted(
 		id: string,
 		receipt?: DistributedCommandMetadata
 	): boolean {
-		return markOptimisticLayerAcceptedOn(this.#optimisticHost(), id, receipt);
+		return this.#optimistic.markAccepted(id, receipt);
 	}
 
 	confirmOptimisticLayer<T>(
 		id: string,
 		update: (writer: ReplicaBaseWriter) => T
 	): T {
-		if (this.#commandHasMembershipFence(id)) {
-			this.#deferredMembershipConfirms.add(id);
-			return this.#engine.batch((writer) => update(baseWriter(writer)));
-		}
-		return confirmOptimisticLayerOn(this.#optimisticHost(), id, update);
+		return this.#optimistic.confirm(id, update);
 	}
 
 	rejectOptimisticLayer(id: string): boolean {
-		this.#clearMembershipFencesForCommand(id);
-		this.#deferredMembershipConfirms.delete(id);
-		return rejectOptimisticLayerOn(this.#optimisticHost(), id);
+		return this.#optimistic.reject(id);
 	}
 
-	#capturingOptimisticWriter(
-		commandId: string,
-		writer: ReplicaOptimisticWriter
-	): ReplicaOptimisticWriter {
-		const touchedRecords = new Set<string>();
-		return {
-			writeRecord: (
-				model: ReplicaModelArtifact,
-				identity: ReplicaIdentity,
-				patch: ReplicaRecordPatch
-			) => {
-				touchedRecords.add(replicaRecordKey(model, identity));
-				writer.writeRecord(model, identity, patch);
-			},
-			tombstoneRecord: (model, identity) => {
-				const recordKey = replicaRecordKey(model, identity);
-				touchedRecords.delete(recordKey);
-				this.#clearMembershipFenceOwner(commandId, recordKey);
-				writer.tombstoneRecord(model, identity);
-			},
-			writeIndex: (target, records) => {
-				const indexKey = indexKeyFromTarget(target);
-				for (const recordKey of records) {
-					if (!touchedRecords.has(recordKey)) continue;
-					let recordsForIndex = this.#membershipFences.get(indexKey);
-					if (recordsForIndex === undefined) {
-						recordsForIndex = new Map();
-						this.#membershipFences.set(indexKey, recordsForIndex);
-					}
-					let owners = recordsForIndex.get(recordKey);
-					if (owners === undefined) {
-						owners = new Set();
-						recordsForIndex.set(recordKey, owners);
-					}
-					owners.add(commandId);
+	#fencedMembershipsMatch(
+		fencedIndexKeys: ReadonlySet<string>,
+		incoming: ReplicaIndexMemberships
+	): boolean {
+		return this.#engine.readConfirmed((reader) => {
+			for (const indexKey of fencedIndexKeys) {
+				const membership = incoming.get(indexKey);
+				const current = reader.index(indexKey);
+				if (
+					membership === undefined ||
+					membership === null ||
+					current === undefined ||
+					!current.complete ||
+					(current.staleRevision !== undefined &&
+						compareDistributedDecimal(current.staleRevision, current.revision) > 0) ||
+					(current.metadata?.nullValue === true) !== membership.nullValue ||
+					current.records.length !== membership.records.length ||
+					current.records.some(
+						(record, ordinal) => record !== membership.records[ordinal]
+					)
+				) {
+					return false;
 				}
-				writer.writeIndex(target, records);
-			},
-			deleteIndex: (target) => {
-				const indexKey = indexKeyFromTarget(target);
-				const recordsForIndex = this.#membershipFences.get(indexKey);
-				if (recordsForIndex !== undefined) {
-					for (const [recordKey, owners] of recordsForIndex) {
-						owners.delete(commandId);
-						if (owners.size === 0) recordsForIndex.delete(recordKey);
-					}
-					if (recordsForIndex.size === 0) {
-						this.#membershipFences.delete(indexKey);
-					}
-				}
-				writer.deleteIndex(target);
 			}
-		};
-	}
-
-	#commandHasMembershipFence(commandId: string): boolean {
-		for (const recordsForIndex of this.#membershipFences.values()) {
-			for (const owners of recordsForIndex.values()) {
-				if (owners.has(commandId)) return true;
-			}
-		}
-		return false;
-	}
-
-	#clearMembershipFencesForCommand(commandId: string): void {
-		for (const [indexKey, recordsForIndex] of this.#membershipFences) {
-			for (const [recordKey, owners] of recordsForIndex) {
-				owners.delete(commandId);
-				if (owners.size === 0) recordsForIndex.delete(recordKey);
-			}
-			if (recordsForIndex.size === 0) {
-				this.#membershipFences.delete(indexKey);
-			}
-		}
-	}
-
-	#clearMembershipFenceOwner(commandId: string, recordKey: string): void {
-		for (const [indexKey, recordsForIndex] of this.#membershipFences) {
-			const owners = recordsForIndex.get(recordKey);
-			if (owners === undefined) continue;
-			owners.delete(commandId);
-			if (owners.size === 0) recordsForIndex.delete(recordKey);
-			if (recordsForIndex.size === 0) {
-				this.#membershipFences.delete(indexKey);
-			}
-		}
-	}
-
-	#guardIndexWriter(writer: BaseCacheWriter): BaseCacheWriter {
-		return {
-			recordClock: (key) => writer.recordClock(key),
-			writeRecord: (write) => writer.writeRecord(write),
-			tombstoneRecord: (key, revision, incarnation) =>
-				writer.tombstoneRecord(key, revision, incarnation),
-			discardRecord: (key) => writer.discardRecord(key),
-			writeIndex: (write) => {
-				const recordsForIndex = this.#membershipFences.get(write.key);
-				if (write.complete === true && recordsForIndex !== undefined) {
-					const visible =
-						this.#engine.read(
-							(reader) => reader.index(write.key)?.records
-						) ?? [];
-					for (const recordKey of recordsForIndex.keys()) {
-						if (
-							visible.includes(recordKey) &&
-							!write.records.includes(recordKey)
-						) {
-							return false;
-						}
-					}
-				}
-				const wrote = writer.writeIndex(write);
-				if (wrote && recordsForIndex !== undefined) {
-					for (const recordKey of write.records) {
-						recordsForIndex.delete(recordKey);
-					}
-					if (recordsForIndex.size === 0) {
-						this.#membershipFences.delete(write.key);
-					}
-				}
-				return wrote;
-			},
-			markIndexStale: (key, reason, revision) =>
-				writer.markIndexStale(key, reason, revision),
-			deleteIndex: (key, revision) => writer.deleteIndex(key, revision)
-		};
-	}
-
-	#flushDeferredMembershipConfirms(): void {
-		for (const commandId of [...this.#deferredMembershipConfirms]) {
-			if (this.#commandHasMembershipFence(commandId)) continue;
-			this.#deferredMembershipConfirms.delete(commandId);
-			if (this.#engine.optimisticLayerState(commandId) === undefined) {
-				continue;
-			}
-			confirmOptimisticLayerOn(
-				this.#optimisticHost(),
-				commandId,
-				() => undefined
-			);
-		}
+			return true;
+		});
 	}
 
 	tombstoneRecord(
@@ -1815,7 +1347,7 @@ export class DistributedReplicaImpl implements DistributedReplicaApi {
 		const wrote = this.#engine.batch((writer) =>
 			writer.tombstoneRecord(replicaRecordKey(model, identity), revision)
 		);
-		if (wrote) this.#syncDiagnostics();
+		if (wrote) this.#diagnostics.sync();
 		return wrote;
 	}
 
@@ -1825,8 +1357,8 @@ export class DistributedReplicaImpl implements DistributedReplicaApi {
 			writer.markIndexStale(key, reason)
 		);
 		if (marked) {
-			if (this.#diagnostics !== undefined) {
-				this.#diagnosticEvent(
+			if (this.#diagnostics.enabled) {
+				this.#diagnostics.event(
 					Object.freeze({
 						kind: 'index-decision',
 						index: key,
@@ -1835,31 +1367,9 @@ export class DistributedReplicaImpl implements DistributedReplicaApi {
 					})
 				);
 			}
-			this.#syncDiagnostics();
+			this.#diagnostics.sync();
 		}
 		return marked;
-	}
-
-	retainRecord(model: ReplicaModelArtifact, identity: ReplicaIdentity): void {
-		this.#engine.retain(replicaRecordKey(model, identity));
-	}
-
-	releaseRecord(model: ReplicaModelArtifact, identity: ReplicaIdentity): void {
-		this.#engine.release(replicaRecordKey(model, identity));
-	}
-
-	gc(): readonly string[] {
-		const collected = this.#engine.gc();
-		if (this.#diagnostics !== undefined) {
-			this.#diagnosticEvent(
-				Object.freeze({
-					kind: 'gc',
-					records: collected.length
-				})
-			);
-		}
-		this.#syncDiagnostics();
-		return collected;
 	}
 
 	inspectRecord(
@@ -1923,96 +1433,12 @@ export class DistributedReplicaImpl implements DistributedReplicaApi {
 		});
 	}
 
-	#syncDiagnostics(): void {
-		syncDiagnosticsOn(this.#diagnosticsHost());
-	}
-
-	#diagnosticEvent(event: ReplicaDiagnosticEventInput): void {
-		diagnosticEventOn(this.#diagnosticsHost(), event);
-	}
-
-	#diagnosticOperation<TData, TVariables extends GraphqlVariables>(
-		artifact: ReplicaOperationArtifact<TData, TVariables>
-	): void {
-		diagnosticOperationOn(this.#diagnosticsHost(), artifact);
-	}
-
-	#diagnosticScopeTransition(
-		previous: ProtocolGeneration | undefined,
-		next: ProtocolGeneration
-	): void {
-		diagnosticScopeTransitionOn(this.#diagnosticsHost(), previous, next);
-	}
-
-	#retireDiagnosticLayer(
-		id: string,
-		action: 'retired' | 'rejected',
-		receiptState: 'atomic' | 'rejected',
-		receipt?: OptimisticReceiptState
-	): void {
-		retireDiagnosticLayerOn(this.#diagnosticsHost(), id, action, receiptState, receipt);
-	}
-
-	#validateProtocolBinding<TData, TVariables extends GraphqlVariables>(
-		artifact: ReplicaOperationArtifact<TData, TVariables>,
-		envelope: DistributedProtocolEnvelope,
-		source: ReplicaWriteSource
-	): void {
-		validateProtocolBindingOn(this.#protocolHost(), artifact, envelope, source);
-	}
-
-	#stageProtocolGeneration(
-		envelope: DistributedProtocolEnvelope
-	): ProtocolGeneration {
-		return stageProtocolGenerationOn(this.#protocolHost(), envelope);
-	}
-
-	#stageTrustedPresets<TData, TVariables extends GraphqlVariables>(
-		incoming: readonly DistributedTrustedPreset[],
-		nextGeneration: ProtocolGeneration,
-		artifact: ReplicaOperationArtifact<TData, TVariables>
-	): readonly DistributedTrustedPreset[] {
-		return stageTrustedPresetsOn(
-			this.#protocolHost(),
-			incoming,
-			nextGeneration,
-			artifact
-		);
-	}
-
-	#purgeProtocolGeneration(): void {
-		purgeProtocolGenerationOn(this.#protocolHost());
-	}
-
-	#closeAuthorizationGeneration(): void {
-		closeAuthorizationGenerationOn(this.#protocolHost());
-	}
-
-	#closeActiveTransports(): void {
-		closeActiveTransportsOn(this.#fetchLiveHost());
-	}
-
 	#rememberRenderedOperation<TData, TVariables extends GraphqlVariables>(
 		key: string,
 		artifact: ReplicaOperationArtifact<TData, TVariables>,
-		variables: TVariables,
-		source: 'read' | 'watch'
+		variables: TVariables
 	): void {
-		this.#diagnosticOperation(artifact);
-		if (!this.#indexPlanRegistrations.has(key)) {
-			const registration = this.#indexMaintenance.registerOperation(
-				artifact,
-				variables
-			);
-			this.#indexPlanRegistrations.set(key, registration);
-			try {
-				this.#refreshIndexMaintenance();
-			} catch (error) {
-				this.#indexPlanRegistrations.delete(key);
-				registration.dispose();
-				throw error;
-			}
-		}
+		this.#registerIndexPlan(key, artifact, variables);
 		this.#renderedOperations.set(
 			key,
 			Object.freeze({
@@ -2020,32 +1446,131 @@ export class DistributedReplicaImpl implements DistributedReplicaApi {
 				variables
 			})
 		);
-		if (source === 'read') {
-			this.#readOperationKeys.add(key);
-		} else {
-			this.#watchRenderCounts.set(
-				key,
-				(this.#watchRenderCounts.get(key) ?? 0) + 1
-			);
+		this.#renderCounts.set(key, (this.#renderCounts.get(key) ?? 0) + 1);
+		this.#retired.delete(key);
+	}
+
+	#registerIndexPlan<TData, TVariables extends GraphqlVariables>(
+		key: string,
+		artifact: ReplicaOperationArtifact<TData, TVariables>,
+		variables: TVariables
+	): void {
+		this.#diagnostics.operation(artifact);
+		if (this.#indexPlanRegistrations.has(key)) return;
+		const registration = this.#indexMaintenance.registerOperation(
+			artifact,
+			variables
+		);
+		this.#indexPlanRegistrations.set(key, registration);
+		try {
+			this.#refreshIndexMaintenance();
+		} catch (error) {
+			this.#indexPlanRegistrations.delete(key);
+			registration.dispose();
+			throw error;
 		}
 	}
 
-	#forgetRenderedWatch(key: string): void {
-		const count = this.#watchRenderCounts.get(key);
+	#restoreIndexPlans(): void {
+		for (const [key, rendered] of this.#renderedOperations) {
+			this.#registerIndexPlan(key, rendered.artifact, rendered.variables);
+		}
+	}
+
+	#forgetRenderedOperation(key: string): void {
+		const count = this.#renderCounts.get(key);
 		if (count === undefined) return;
 		if (count > 1) {
-			this.#watchRenderCounts.set(key, count - 1);
+			this.#renderCounts.set(key, count - 1);
 			return;
 		}
-		this.#watchRenderCounts.delete(key);
-		if (!this.#readOperationKeys.has(key)) {
-			this.#renderedOperations.delete(key);
-			this.#disposeIndexPlan(key);
-		}
+		this.#renderCounts.delete(key);
+		const rendered = this.#renderedOperations.get(key);
+		this.#renderedOperations.delete(key);
+		this.#disposeIndexPlan(key);
+		if (rendered !== undefined) this.#retireOperation(key, rendered);
 	}
 
-	#finishDehydration(): void {
-		finishDehydrationOn(this.#hydrationHost());
+	/**
+	 * The last watch or retained handle of an operation left. Its protocol
+	 * state and cached result stay for a grace period, so a remount finds
+	 * them; then they are collected.
+	 */
+	#retireOperation(key: string, rendered: RenderedOperation): void {
+		if (!Number.isFinite(this.#retentionGraceMs)) return;
+		this.#retired.set(key, {
+			...rendered,
+			due: this.#scheduler.now() + this.#retentionGraceMs,
+			written: this.#operations.written(key)
+		});
+		this.#scheduleCollection();
+	}
+
+	#scheduleCollection(): void {
+		// Every due time is "now + grace", so a pending timer is the earliest.
+		if (this.#retentionTimer !== undefined || this.#retired.size === 0) return;
+		let due = Infinity;
+		for (const retired of this.#retired.values()) due = Math.min(due, retired.due);
+		this.#retentionTimer = this.#scheduler.setTimeout(
+			() => {
+				this.#retentionTimer = undefined;
+				this.#collectRetiredOperations();
+			},
+			Math.max(0, due - this.#scheduler.now())
+		);
+		unrefTimer(this.#retentionTimer);
+	}
+
+	/**
+	 * Drop every retired operation whose grace period ended: its protocol and
+	 * query state, its in-flight request, and the indexes only it owned. Then
+	 * collect the records no remaining index, optimistic layer or retained
+	 * record reaches, with their clocks, scopes and projected fences.
+	 *
+	 * A result written for the operation during the grace period (a route
+	 * seed for a page about to mount, a late response) restarts the period
+	 * instead: something still produces this operation.
+	 */
+	#collectRetiredOperations(): void {
+		const now = this.#scheduler.now();
+		let dropped = false;
+		for (const [key, retired] of this.#retired) {
+			if (retired.due > now) continue;
+			const written = this.#operations.written(key);
+			if (
+				written.group !== retired.written.group ||
+				written.query !== retired.written.query ||
+				written.live !== retired.written.live
+			) {
+				retired.written = written;
+				retired.due = now + this.#retentionGraceMs;
+				continue;
+			}
+			this.#retired.delete(key);
+			this.#live.forget(key);
+			for (const state of [written.group?.query, written.group?.live]) {
+				if (state !== undefined) {
+					this.#operations.discardSnapshot(
+						state,
+						retired.artifact,
+						retired.variables
+					);
+				}
+			}
+			this.#operations.delete(key);
+			dropped = true;
+		}
+		if (dropped) {
+			const collected = this.#engine.gc();
+			if (collected.length > 0) this.#clocks.forget(collected);
+			if (this.#diagnostics.enabled) {
+				this.#diagnostics.event(
+					Object.freeze({ kind: 'gc', records: collected.length })
+				);
+			}
+			this.#diagnostics.sync();
+		}
+		this.#scheduleCollection();
 	}
 
 	#disposeIndexPlan(key: string): void {
@@ -2061,18 +1586,17 @@ export class DistributedReplicaImpl implements DistributedReplicaApi {
 	}
 
 	#deriveMaintainedIndexes(
-		confirmed: CacheEngineSnapshot,
+		confirmed: CacheReader,
 		layers: readonly OptimisticLayerView[]
 	): readonly DerivedIndexMutation[] {
 		const snapshot = indexMaintenanceSnapshot(confirmed);
-		const indexes = new Map(snapshot.indexes.map((index) => [index.key, index]));
 		const semanticLayers = layers.map(indexSemanticLayer);
 		const mutations: DerivedIndexMutation[] = [];
-			for (const decision of this.#indexMaintenance.evaluate(
-				snapshot,
-				semanticLayers,
-				this.#trustedPresets
-			)) {
+		for (const decision of this.#indexMaintenance.evaluate(
+			snapshot,
+			semanticLayers,
+			this.#authority.trustedPresets
+		)) {
 			if (decision.kind === 'unchanged') continue;
 			if (decision.kind === 'stale') {
 				mutations.push({
@@ -2082,7 +1606,7 @@ export class DistributedReplicaImpl implements DistributedReplicaApi {
 				});
 				continue;
 			}
-			const index = indexes.get(decision.indexKey);
+			const index = confirmed.index(decision.indexKey);
 			if (index === undefined) {
 				throw new Error(
 					`index maintenance returned an unknown index: ${decision.indexKey}`
@@ -2122,662 +1646,16 @@ export class DistributedReplicaImpl implements DistributedReplicaApi {
 				changes: Object.freeze([change])
 			})
 		});
-		return this.#deriveMaintainedIndexes(this.#engine.extract(), [layer]);
-	}
-
-	#operationProtocol(
-		key: string,
-		operation: string,
-		source: OperationProtocolSource
-	): OperationProtocolState {
-		let group = this.#operationProtocols.get(key);
-		if (group === undefined) {
-			group = {};
-			this.#operationProtocols.set(key, group);
-		}
-		const current = group[source];
-		if (current !== undefined) {
-			if (current.operation !== operation) {
-				protocolInvalid('extensions.distributed.operation');
-			}
-			return current;
-		}
-		const created: OperationProtocolState = {
-			operation,
-			indexClocks: new Map(),
-			indexKeys: new Set(),
-			pathRecords: new Map(),
-			cursors: Object.freeze([])
-		};
-		group[source] = created;
-		return created;
-	}
-
-	#activateOperationSource<TData, TVariables extends GraphqlVariables>(
-		key: string,
-		source: OperationProtocolSource,
-		artifact: ReplicaOperationArtifact<TData, TVariables>,
-		variables: TVariables
-	): boolean {
-		const group = this.#operationProtocols.get(key);
-		if (group === undefined) return false;
-		const previous = group.active;
-		if (previous === source) return false;
-		if (previous !== undefined) {
-			const discardedStates = new Set(
-				[group.query, group.live].filter(
-					(state): state is OperationProtocolState =>
-						state !== undefined
-				)
-			);
-			const revisionsByKey = new Map<string, Set<string>>();
-			for (const state of [group.query, group.live]) {
-				if (state?.indexRevision === undefined) continue;
-				for (const indexKey of state.indexKeys) {
-					let revisions = revisionsByKey.get(indexKey);
-					if (revisions === undefined) {
-						revisions = new Set();
-						revisionsByKey.set(indexKey, revisions);
-					}
-					revisions.add(state.indexRevision);
-				}
-			}
-			for (const root of artifact.roots) {
-				const indexKey = replicaIndexKey({
-					field: root.field,
-					arguments: resolveArguments(
-						root.arguments,
-						variables,
-						root.coverage
-					)
-				});
-				let revisions = revisionsByKey.get(indexKey);
-				if (revisions === undefined) {
-					revisions = new Set();
-					revisionsByKey.set(indexKey, revisions);
-				}
-				for (const state of [group.query, group.live]) {
-					if (state?.indexRevision !== undefined) {
-						revisions.add(state.indexRevision);
-					}
-				}
-			}
-			const confirmedFences = this.#confirmedIndexFences(
-				revisionsByKey.keys()
-			);
-			const ownedKeys = [...revisionsByKey].flatMap(
-				([indexKey, revisions]) => {
-					const revision = confirmedFences.get(indexKey);
-					return revision !== undefined &&
-						revisions.has(revision) &&
-						!this.#indexClaimedByAnotherOperationState(
-							indexKey,
-							revision,
-							discardedStates
-						)
-						? [indexKey]
-						: [];
-				}
-			);
-			this.#engine.discardIndexes(ownedKeys);
-		}
-		group.active = source;
-		this.#advanceOperationGeneration(key);
-		return previous !== undefined;
-	}
-
-	#operationGeneration(key: string): number {
-		return this.#operationGenerations.get(key) ?? 0;
-	}
-
-	#indexClaimedByAnotherOperationState(
-		indexKey: string,
-		revision: string,
-		excluded: ReadonlySet<OperationProtocolState>
-	): boolean {
-		for (const group of this.#operationProtocols.values()) {
-			for (const state of [group.query, group.live]) {
-				if (
-					state !== undefined &&
-					!excluded.has(state) &&
-					state.indexRevision === revision &&
-					state.indexKeys.has(indexKey)
-				) {
-					return true;
-				}
-			}
-		}
-		return false;
-	}
-
-	#confirmedIndexFences(
-		indexKeys: Iterable<string>
-	): ReadonlyMap<string, string> {
-		return this.#engine.confirmedIndexFences([...indexKeys]);
-	}
-
-	#sharedIndexDisposition(
-		currentKey: string,
-		incomingIndexKeys: ReadonlySet<string>,
-		snapshot: DistributedQuerySnapshot,
-		requestRevision: string | undefined,
-		source: ReplicaWriteSource
-	): SharedIndexDisposition {
-		if (incomingIndexKeys.size === 0) return { compared: false };
-		const confirmedRevisions =
-			this.#confirmedIndexFences(incomingIndexKeys);
-		let compared = false;
-		let lower = false;
-		let higher = false;
-		let incomparable = false;
-		let equalRevision: string | undefined;
-		let latestOwnerRevision: string | undefined;
-		for (const [key, group] of this.#operationProtocols) {
-			if (key === currentKey) continue;
-			for (const state of [group.query, group.live]) {
-				if (state?.indexRevision === undefined) continue;
-				let ownsIncomingIndex = false;
-				for (const indexKey of state.indexKeys) {
-					if (
-						incomingIndexKeys.has(indexKey) &&
-						confirmedRevisions.get(indexKey) === state.indexRevision
-					) {
-						ownsIncomingIndex = true;
-						break;
-					}
-				}
-				if (!ownsIncomingIndex) continue;
-				latestOwnerRevision =
-					latestOwnerRevision === undefined ||
-					compareCanonicalDecimalStrings(
-						state.indexRevision,
-						latestOwnerRevision
-					) > 0
-						? state.indexRevision
-						: latestOwnerRevision;
-				/*
-				 * Snapshot scope is bound to one operation plan instance and is
-				 * not a cross-artifact identity. Shared semantic indexes are
-				 * comparable through their projection/scope/position vector.
-				 */
-				const disposition =
-					!snapshot.indexesComparable
-						? 'incomparable'
-						: state.indexClocks.size === 0 ||
-							  snapshot.indexes.length === 0
-							? state.indexClocks.size === snapshot.indexes.length
-								? 'equal'
-								: 'incomparable'
-							: compareIndexVector(
-									state.indexClocks,
-									snapshot.indexes
-								);
-				if (
-					disposition === 'fresh' ||
-					disposition === 'incomparable'
-				) {
-					incomparable = true;
-					continue;
-				}
-				compared = true;
-				if (disposition === 'lower') lower = true;
-				else if (disposition === 'higher') higher = true;
-				else {
-					equalRevision =
-						equalRevision === undefined ||
-						compareCanonicalDecimalStrings(
-							state.indexRevision,
-							equalRevision
-						) > 0
-							? state.indexRevision
-							: equalRevision;
-				}
-			}
-		}
-		/*
-		 * One response is a coherent replacement graph. If its vector straddles
-		 * the owners of two shared indexes, accepting only part would fabricate
-		 * a snapshot the server never produced, so preserve the current graph.
-		 */
-		if (lower) return { compared: true, disposition: 'lower' };
-		if (incomparable) {
-			/*
-			 * A comparable sibling must not promote an incomparable membership
-			 * to response-arrival order. Fall back to request-start order for
-			 * the whole graph, and reject it atomically when that request began
-			 * before any owner it would replace. Independent live streams have
-			 * no shared request-start fence, so they cannot safely replace it;
-			 * explicit synchronous ingress retains its caller-defined order.
-			 */
-			if (requestRevision === undefined && source === 'live') {
-				return { compared: true, disposition: 'lower' };
-			}
-			if (requestRevision === undefined) return { compared: false };
-			return latestOwnerRevision !== undefined &&
-				compareCanonicalDecimalStrings(requestRevision, latestOwnerRevision) <
-					0
-				? { compared: true, disposition: 'lower' }
-				: { compared: false };
-		}
-		if (!compared) return { compared: false };
-		if (higher) return { compared: true, disposition: 'higher' };
-		return {
-			compared: true,
-			disposition: 'equal',
-			...(equalRevision === undefined
-				? {}
-				: { indexRevision: equalRevision })
-		};
-	}
-
-	#advanceOperationGeneration(key: string): void {
-		this.#operationGenerations.set(
-			key,
-			this.#operationGeneration(key) + 1
+		return this.#engine.readConfirmed((confirmed) =>
+			this.#deriveMaintainedIndexes(confirmed, [layer])
 		);
-	}
-
-	#resumeCursors(key: string): readonly DistributedLiveCursor[] {
-		const group = this.#operationProtocols.get(key);
-		if (group?.active === 'query' && group.query?.cursors.length) {
-			return group.query.cursors;
-		}
-		if (group?.active === 'live' && group.live?.cursors.length) {
-			return group.live.cursors;
-		}
-		return group?.live?.cursors.length
-			? group.live.cursors
-			: (group?.query?.cursors ?? Object.freeze([]));
-	}
-
-	#discardOperationSnapshot<TData, TVariables extends GraphqlVariables>(
-		state: OperationProtocolState,
-		artifact: ReplicaOperationArtifact<TData, TVariables>,
-		variables: TVariables
-	): void {
-		const keys = new Set(state.indexKeys);
-		for (const root of artifact.roots) {
-			keys.add(
-				replicaIndexKey({
-					field: root.field,
-					arguments: resolveArguments(
-						root.arguments,
-						variables,
-						root.coverage
-					)
-				})
-			);
-		}
-		const indexRevision = state.indexRevision;
-		const discardedStates = new Set([state]);
-		const confirmedFence = this.#confirmedIndexFences(keys);
-		const ownedKeys =
-			indexRevision === undefined
-				? []
-				: [...keys].filter(
-						(key) =>
-							confirmedFence.get(key) === indexRevision &&
-							!this.#indexClaimedByAnotherOperationState(
-								key,
-								indexRevision,
-								discardedStates
-							)
-					);
-		this.#engine.discardIndexes(ownedKeys);
-		this.#resetOperationState(state);
-	}
-
-	#resetOperationState(state: OperationProtocolState): void {
-		this.#resetOperationCausalState(state);
-		state.indexRevision = undefined;
-		state.indexKeys.clear();
-		state.pathRecords.clear();
-	}
-
-	#resetOperationCausalState(state: OperationProtocolState): void {
-		state.snapshotScope = undefined;
-		state.indexClocks = new Map();
-		state.cursors = Object.freeze([]);
-	}
-
-	#allocateIndexRevision(): string {
-		this.#nextIndexRevision = incrementCanonicalDecimal(
-			this.#nextIndexRevision
-		);
-		return this.#nextIndexRevision;
-	}
-
-	#resolveRecordEvidence(
-		recordKey: string,
-		evidence: DistributedRecordRevision,
-		pendingClocks: Map<string, RecordProtocolClock>,
-		pendingScopes: Map<DistributedOpaqueString, string>,
-		pendingAnonymousClocks: Map<
-			DistributedOpaqueString,
-			AnonymousRecordProtocolClock
-		>,
-		consumedAnonymousClocks: Set<DistributedOpaqueString>,
-		projectedConflict = false
-	): boolean {
-		if (!recordKeyMatchesModel(recordKey, evidence.model)) {
-			protocolInvalid('extensions.distributed.snapshot.records.model');
-		}
-		const scopedKey =
-			pendingScopes.get(evidence.scopeToken) ??
-			this.#recordKeysByScope.get(evidence.scopeToken);
-		if (scopedKey !== undefined && scopedKey !== recordKey) {
-			protocolInvalid('extensions.distributed.snapshot.records.scopeToken');
-		}
-		pendingScopes.set(evidence.scopeToken, recordKey);
-
-		const incoming: RecordProtocolClock = {
-			scopeToken: evidence.scopeToken,
-			incarnation: evidence.incarnation,
-			revision: evidence.revision,
-			tombstone: evidence.tombstone
-		};
-		const pending = pendingClocks.get(recordKey);
-		if (pending !== undefined) {
-			if (!sameRecordClock(pending, incoming)) {
-				protocolInvalid('extensions.distributed.snapshot.records');
-			}
-			return true;
-		}
-		let current = this.#recordClocks.get(recordKey);
-		const anonymous =
-			pendingAnonymousClocks.get(evidence.scopeToken) ??
-			this.#anonymousRecordClocks.get(evidence.scopeToken);
-		if (anonymous !== undefined) {
-			if (anonymous.model !== evidence.model) {
-				protocolInvalid(
-					'extensions.distributed.snapshot.records.model'
-				);
-			}
-			consumedAnonymousClocks.add(evidence.scopeToken);
-			if (current === undefined) {
-				current = anonymous.clock;
-			} else {
-				if (current.scopeToken !== anonymous.clock.scopeToken) {
-					protocolInvalid(
-						'extensions.distributed.snapshot.records.scopeToken'
-					);
-				}
-				const anonymousComparison = compareRecordClock(
-					anonymous.clock,
-					current
-				);
-				if (
-					anonymousComparison === 0 &&
-					anonymous.clock.tombstone !== current.tombstone
-				) {
-					protocolInvalid(
-						'extensions.distributed.snapshot.records.tombstone'
-					);
-				}
-				if (anonymousComparison > 0) current = anonymous.clock;
-			}
-		}
-		if (current === undefined) {
-			pendingClocks.set(recordKey, incoming);
-			return true;
-		}
-		if (current.scopeToken !== incoming.scopeToken) {
-			protocolInvalid('extensions.distributed.snapshot.records.scopeToken');
-		}
-		if (projectedConflict) {
-			pendingClocks.set(recordKey, current);
-			return false;
-		}
-		const comparison = compareRecordClock(incoming, current);
-		if (comparison < 0) {
-			pendingClocks.set(recordKey, current);
-			return false;
-		}
-		if (comparison === 0) {
-			if (current.tombstone !== incoming.tombstone) {
-				protocolInvalid('extensions.distributed.snapshot.records.tombstone');
-			}
-			pendingClocks.set(recordKey, incoming);
-			return true;
-		}
-		if (
-			current.tombstone &&
-			!incoming.tombstone &&
-			compareDistributedDecimal(
-				incoming.incarnation,
-				current.incarnation
-			) <= 0
-		) {
-			protocolInvalid('extensions.distributed.snapshot.records.incarnation');
-		}
-		pendingClocks.set(recordKey, incoming);
-		return true;
-	}
-
-	#retainAnonymousRecordEvidence(
-		evidence: DistributedRecordRevision,
-		pendingAnonymousClocks: Map<
-			DistributedOpaqueString,
-			AnonymousRecordProtocolClock
-		>
-	): void {
-		const incoming: AnonymousRecordProtocolClock = {
-			model: evidence.model,
-			clock: {
-				scopeToken: evidence.scopeToken,
-				incarnation: evidence.incarnation,
-				revision: evidence.revision,
-				tombstone: evidence.tombstone
-			}
-		};
-		const current =
-			pendingAnonymousClocks.get(evidence.scopeToken) ??
-			this.#anonymousRecordClocks.get(evidence.scopeToken);
-		if (current === undefined) {
-			let retained = this.#anonymousRecordClocks.size;
-			for (const scopeToken of pendingAnonymousClocks.keys()) {
-				if (!this.#anonymousRecordClocks.has(scopeToken)) retained += 1;
-			}
-			if (retained >= MAX_ANONYMOUS_RECORD_CLOCKS) {
-				protocolInvalid(
-					'extensions.distributed.snapshot.records.capacity'
-				);
-			}
-			pendingAnonymousClocks.set(evidence.scopeToken, incoming);
-			return;
-		}
-		if (current.model !== incoming.model) {
-			protocolInvalid('extensions.distributed.snapshot.records.model');
-		}
-		const comparison = compareRecordClock(
-			incoming.clock,
-			current.clock
-		);
-		if (comparison < 0) return;
-		if (comparison === 0) {
-			if (current.clock.tombstone !== incoming.clock.tombstone) {
-				protocolInvalid(
-					'extensions.distributed.snapshot.records.tombstone'
-				);
-			}
-			return;
-		}
-		if (
-			current.clock.tombstone &&
-			!incoming.clock.tombstone &&
-			compareDistributedDecimal(
-				incoming.clock.incarnation,
-				current.clock.incarnation
-			) <= 0
-		) {
-			protocolInvalid(
-				'extensions.distributed.snapshot.records.incarnation'
-			);
-		}
-		pendingAnonymousClocks.set(evidence.scopeToken, incoming);
-	}
-
-	#applyTombstoneEvidence(
-		writer: BaseCacheWriter,
-		evidenceItems: readonly DistributedRecordRevision[],
-		operation: OperationProtocolState,
-		pendingClocks: Map<string, RecordProtocolClock>,
-		pendingScopes: Map<DistributedOpaqueString, string>,
-		pendingAnonymousClocks: Map<
-			DistributedOpaqueString,
-			AnonymousRecordProtocolClock
-		>,
-		consumedAnonymousClocks: Set<DistributedOpaqueString>,
-		consumedPaths: Set<string>,
-		pendingProjectedRecordFenceClears: Map<
-			string,
-			ProjectedRecordFence
-		>
-	): void {
-		for (const evidence of evidenceItems) {
-			const encodedPath =
-				evidence.path === undefined
-					? undefined
-					: responsePathKey(evidence.path);
-			const recordKey =
-				this.#recordKeysByScope.get(evidence.scopeToken) ??
-				(encodedPath === undefined
-					? undefined
-					: operation.pathRecords.get(encodedPath));
-			if (recordKey === undefined) {
-				this.#retainAnonymousRecordEvidence(
-					evidence,
-					pendingAnonymousClocks
-				);
-				continue;
-			}
-			if (encodedPath !== undefined) consumedPaths.add(encodedPath);
-			const projectedFence =
-				this.#projectedRecordFences.get(recordKey);
-			const projectedClockComparison =
-				projectedFence === undefined
-					? undefined
-					: compareEvidenceToProjectedFence(
-							evidence,
-							projectedFence
-						);
-			if (
-				projectedFence !== undefined &&
-				projectedClockComparison === 1
-			) {
-				pendingProjectedRecordFenceClears.set(
-					recordKey,
-					projectedFence
-				);
-			}
-			if (
-				this.#resolveRecordEvidence(
-					recordKey,
-					evidence,
-					pendingClocks,
-					pendingScopes,
-					pendingAnonymousClocks,
-					consumedAnonymousClocks,
-					projectedFence !== undefined &&
-						projectedClockComparison !== 1
-				)
-			) {
-				writer.tombstoneRecord(
-					recordKey,
-					evidence.revision,
-					evidence.incarnation
-				);
-			}
-		}
-	}
-
-	#applyPathlessEvidence(
-		writer: BaseCacheWriter,
-		evidenceItems: readonly DistributedRecordRevision[],
-		pathEvidence: ReadonlyMap<string, DistributedRecordRevision>,
-		consumedPaths: ReadonlySet<string>,
-		pendingClocks: Map<string, RecordProtocolClock>,
-		pendingScopes: Map<DistributedOpaqueString, string>,
-		pendingAnonymousClocks: Map<
-			DistributedOpaqueString,
-			AnonymousRecordProtocolClock
-		>,
-		consumedAnonymousClocks: Set<DistributedOpaqueString>,
-		pendingProjectedRecordFenceClears: Map<
-			string,
-			ProjectedRecordFence
-		>
-	): void {
-		for (const evidence of evidenceItems) {
-			const recordKey =
-				pendingScopes.get(evidence.scopeToken) ??
-				this.#recordKeysByScope.get(evidence.scopeToken);
-			if (recordKey === undefined) {
-				this.#retainAnonymousRecordEvidence(
-					evidence,
-					pendingAnonymousClocks
-				);
-				continue;
-			}
-			if (!recordKeyMatchesModel(recordKey, evidence.model)) {
-				protocolInvalid(
-					'extensions.distributed.snapshot.records.model'
-				);
-			}
-			let certifiedByPath = false;
-			for (const [path, candidate] of pathEvidence) {
-				if (
-					consumedPaths.has(path) &&
-					candidate.scopeToken === evidence.scopeToken &&
-					sameRecordRevision(candidate, evidence)
-				) {
-					certifiedByPath = true;
-					break;
-				}
-			}
-			if (certifiedByPath) continue;
-			const projectedFence =
-				this.#projectedRecordFences.get(recordKey);
-			const projectedClockComparison =
-				projectedFence === undefined
-					? undefined
-					: compareEvidenceToProjectedFence(
-							evidence,
-							projectedFence
-						);
-			if (
-				projectedFence !== undefined &&
-				projectedClockComparison === 1
-			) {
-				pendingProjectedRecordFenceClears.set(
-					recordKey,
-					projectedFence
-				);
-			}
-			if (
-				this.#resolveRecordEvidence(
-					recordKey,
-					evidence,
-					pendingClocks,
-					pendingScopes,
-					pendingAnonymousClocks,
-					consumedAnonymousClocks,
-					projectedFence !== undefined &&
-						projectedClockComparison !== 1
-				)
-			) {
-				// A change-log upsert proves only that a newer row exists. It
-				// advances the tuple fence, but cannot certify any cached field.
-				writer.discardRecord(recordKey);
-			}
-		}
 	}
 
 	#validateLiveSnapshot(
 		snapshot: DistributedQuerySnapshot,
 		live: DistributedProtocolEnvelope['live']
 	): void {
-		if (live === undefined || !live.supported) return;
+		if (live === undefined || live.mode === 'snapshot') return;
 		if (!snapshot.indexesComparable) {
 			protocolInvalid(
 				'extensions.distributed.snapshot.indexesComparable'
@@ -2802,64 +1680,52 @@ export class DistributedReplicaImpl implements DistributedReplicaApi {
 		}
 	}
 
-	#planOptimisticReceipts(
-		command: DistributedCommandMetadata | undefined,
-		observations: readonly DistributedProjectionObservation[],
-		satisfactionAdmissible: boolean
-	): {
-		updates: Map<string, OptimisticReceiptState>;
-		satisfied: string[];
-	} {
-		return planOptimisticReceiptsOn(
-			this.#optimisticHost(),
-			command,
-			observations,
-			satisfactionAdmissible
-		);
-	}
-
-	#applyReceiptOnly(command: DistributedCommandMetadata | undefined): void {
-		applyReceiptOnlyOn(this.#optimisticHost(), command);
-	}
-
-		/** Package-internal hook used by one watched operation. */
+	/** Package-internal hook used by one watched operation. */
 	_register<TData, TVariables extends GraphqlVariables>(
 		watch: ReplicaWatchState<TData, TVariables>
 	): () => void {
-		this.#rememberRenderedOperation(
-			watch.key,
-			watch.artifact,
-			watch.variables,
-			'watch'
-		);
-		let watches = this.#watches.get(watch.key);
-		if (!watches) {
-			watches = new Set();
-			this.#watches.set(
-				watch.key,
-				watches as Set<ReplicaWatchState<unknown, GraphqlVariables>>
-			);
-		}
-		watches.add(watch as ReplicaWatchState<unknown, GraphqlVariables>);
+		const watched = watch as ReplicaWatchState<unknown, GraphqlVariables>;
+		this.#rememberRenderedOperation(watch.key, watch.artifact, watch.variables);
+		this.#live.addWatch(watched);
 		const unwatch = this.#engine.watch(
 			(reader) => materializeReplicaOperation(reader, watch.artifact, watch.variables),
 			(materialized) => watch._cacheChanged(materialized),
 			{ immediate: true }
 		);
-		if (watch.liveRequested) this.#retainLive(watch);
+		if (watch.liveRequested) this.#live.retainLive(watch);
 		void this._fetch(watch, false);
 		return () => {
 			unwatch();
-			watches?.delete(watch as ReplicaWatchState<unknown, GraphqlVariables>);
-			if (watches?.size === 0) this.#watches.delete(watch.key);
-			this.#forgetRenderedWatch(watch.key);
-			if (watch.liveRequested) this.#releaseLive(watch.key);
+			this.#live.removeWatch(watched);
+			this.#forgetRenderedOperation(watch.key);
+			if (watch.liveRequested) this.#live.releaseLive(watch.key);
 		};
+	}
+
+	/**
+	 * Package-internal: how many entries each per-operation and per-record
+	 * structure holds. The retention test compares it with a baseline.
+	 */
+	_sizes(): Readonly<Record<string, number>> {
+		const cache = this.#engine.extract();
+		return Object.freeze({
+			records: cache.records.length,
+			indexes: cache.indexes.length,
+			optimisticLayers: this.#engine.optimisticLayerCount,
+			...this.#live.sizes(),
+			...this.#operations.sizes(),
+			...this.#clocks.sizes(),
+			...this.#optimistic.sizes(),
+			renderedOperations: this.#renderedOperations.size,
+			renderCounts: this.#renderCounts.size,
+			retired: this.#retired.size,
+			indexPlans: this.#indexPlanRegistrations.size
+		});
 	}
 
 	/** Package-internal query-state lookup. */
 	_state(key: string): QueryState {
-		return this.#queryState(key);
+		return this.#live.state(key);
 	}
 
 	/** Package-internal materialization for watch construction. */
@@ -2877,45 +1743,14 @@ export class DistributedReplicaImpl implements DistributedReplicaApi {
 		watch: ReplicaWatchState<TData, TVariables>,
 		force: boolean
 	): Promise<void> {
-		return fetchWatch(this.#fetchLiveHost(), watch, force);
+		return this.#live.fetch(watch, force);
 	}
 
-		_reportObserverErrors(errors: unknown[]): void {
+	_reportObserverErrors(errors: unknown[]): void {
 		if (errors.length === 0) return;
 		reportSafely(
 			this.#reportObserverError,
 			new AggregateError(errors, 'replica observer delivery failed')
 		);
-	}
-
-	#queryState(key: string): QueryState {
-		let state = this.#queryStates.get(key);
-		if (!state) {
-			state = { fetching: false, errors: EMPTY_ERRORS, live: 'off' };
-			this.#queryStates.set(key, state);
-		}
-		return state;
-	}
-
-	#emitState(key: string, allowFetch: boolean): void {
-		emitWatchState(this.#fetchLiveHost(), key, allowFetch);
-	}
-
-	#retainLive<TData, TVariables extends GraphqlVariables>(
-		watch: ReplicaWatchState<TData, TVariables>
-	): void {
-		retainLiveOn(this.#fetchLiveHost(), watch);
-	}
-
-	#restartLive(key: string): void {
-		restartLiveOn(this.#fetchLiveHost(), key);
-	}
-
-	#resumeLiveWatches(): void {
-		resumeLiveWatchesOn(this.#fetchLiveHost());
-	}
-
-	#releaseLive(key: string): void {
-		releaseLiveOn(this.#fetchLiveHost(), key);
 	}
 }

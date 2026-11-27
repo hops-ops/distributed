@@ -1,46 +1,43 @@
 //! Causal execution of already-resolved authoritative projection plans.
 //!
-//! This module chooses protocol lifecycle operations from one coherent,
-//! explicitly scoped snapshot batch. It never commits the physical
-//! [`crate::TableWritePlan`] directly.
+//! This module chooses each record's lifecycle from one coherent, explicitly
+//! scoped snapshot batch and builds its one physical table mutation from
+//! that choice.
 
+#[cfg(any(feature = "graphql", test))]
 use std::collections::{HashMap, HashSet};
 
-use super::lower::LoweredProjectionPlan;
-use super::{
-    ProjectionMutationKind as LogicalMutationKind, ProjectionValueRef, ResolvedProjectionKey,
-    ResolvedProjectionPartitionRef, MAX_PROJECTION_OPERATIONS_PER_OCCURRENCE,
-};
+#[cfg(any(feature = "graphql", test))]
+use super::lower::{LoweredProjectionPlan, LoweredRecord};
+#[cfg(any(feature = "graphql", test))]
+use super::{MutationKind, ResolvedProjectionKey, MAX_PROJECTION_OPERATIONS_PER_OCCURRENCE};
+use super::{ProjectionValueRef, ResolvedProjectionPartitionRef};
+#[cfg(any(feature = "graphql", test))]
 use crate::projection_protocol::{
     ProjectionExecutionSnapshotBatch, ProjectionExecutionSnapshotBatchRequest,
-    ProjectionMutationKind, ProjectionProtocolError, ProjectionRecordExpectation,
-    ProjectionRecordScope, ProjectionScopedRowSnapshot, ProjectionWorkspace, RecordRevision,
+    ProjectionRecordExpectation, ProjectionRecordScope, ProjectionWorkspace, RecordRevision,
+    RecordTransition,
 };
-use crate::table::{
-    key_from_row, ExpectedVersion, PatchMode, RowKey, RowValue, RowValues, RowWriteMode,
-    TableMutation, TableRowMutation, TableSchema, TableWritePlan,
-};
+use crate::projection_protocol::{ProjectionProtocolError, ProjectionScopedRowSnapshot};
+#[cfg(test)]
+use crate::table::TableWritePlan;
+#[cfg(any(feature = "graphql", test))]
+use crate::table::{key_from_row, RowKey, RowValue, TableMutation, TableSchema};
 
 /// Maximum distinct protocol/query scopes one occurrence may inspect.
+#[cfg(any(feature = "graphql", test))]
 pub(crate) const MAX_PROJECTION_EXECUTION_SCOPES: usize = 4_096;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum LifecycleIntent {
-    Insert,
-    Upsert,
-    Patch,
-    UpsertPatch,
-    Delete,
-    Recreate,
-}
-
+#[cfg(any(feature = "graphql", test))]
 #[derive(Clone, Debug)]
 struct ExecutionMutation {
     scope: ProjectionRecordScope,
-    intent: LifecycleIntent,
-    mutation: TableMutation,
+    kind: MutationKind,
+    record: LoweredRecord,
+    source_snapshot: Option<crate::projection_protocol::SourceSnapshotVersion>,
 }
 
+#[cfg(any(feature = "graphql", test))]
 /// Store-free execution preflight produced before any adapter read.
 #[derive(Debug)]
 pub(crate) struct PreparedProjectionExecution {
@@ -49,6 +46,7 @@ pub(crate) struct PreparedProjectionExecution {
     cached: HashMap<ProjectionRecordScope, ProjectionScopedRowSnapshot>,
 }
 
+#[cfg(any(feature = "graphql", test))]
 impl PreparedProjectionExecution {
     pub(crate) fn snapshot_request(&self) -> &ProjectionExecutionSnapshotBatchRequest {
         &self.snapshots
@@ -118,7 +116,7 @@ impl PreparedProjectionExecution {
             ));
         }
 
-        let mut staged = Vec::with_capacity(self.mutations.len());
+        let mut next = workspace.clone();
         for mutation in self.mutations {
             let snapshot = snapshots.get(&mutation.scope).ok_or_else(|| {
                 ProjectionProtocolError::InvalidBatch(format!(
@@ -127,12 +125,32 @@ impl PreparedProjectionExecution {
                 ))
             })?;
             validate_snapshot_scope(snapshot)?;
-            staged.push(stage_for_snapshot(mutation, snapshot)?);
-        }
-
-        let mut next = workspace.clone();
-        for (mutation, expectation, kind) in staged {
-            next.stage_execution_mutation(mutation, expectation, kind)?;
+            let source = mutation.source_snapshot.clone();
+            if let Some(record) = &snapshot.record {
+                match (&source, &record.source_snapshot) {
+                    (Some(incoming), Some(current)) if !incoming.advances(current)? => {
+                        // A stale command still observes the current authoritative
+                        // revision. The commit validates that exact revision, so a
+                        // racing writer cannot turn this into a false confirmation.
+                        next.confirm_existing(mutation.record.schema, record.revision.clone())?;
+                        continue;
+                    }
+                    (Some(_), None) | (None, Some(_)) => {
+                        return Err(ProjectionProtocolError::InvalidBatch(
+                            "projection source-ordering policy changed; rebuild the read model"
+                                .into(),
+                        ));
+                    }
+                    _ => {}
+                }
+            }
+            let (physical, expectation, transition) = if source.is_some() {
+                stage_source_snapshot(mutation, snapshot)?
+            } else {
+                stage_for_snapshot(mutation, snapshot)?
+            };
+            physical.validate()?;
+            next.stage_execution_mutation(physical, expectation, transition, source)?;
         }
         *workspace = next;
         Ok(())
@@ -140,13 +158,14 @@ impl PreparedProjectionExecution {
 }
 
 /// Prepare one portable resolved plan without touching an adapter.
+#[cfg(any(feature = "graphql", test))]
 pub(crate) fn prepare_portable_projection(
     workspace: &ProjectionWorkspace,
     lowered: LoweredProjectionPlan,
 ) -> Result<PreparedProjectionExecution, ProjectionProtocolError> {
-    validate_resolved_partition(workspace, lowered.resolved.partition())?;
-    let client_visible = lowered
-        .resolved
+    let LoweredProjectionPlan { resolved, records } = lowered;
+    validate_resolved_partition(workspace, resolved.partition())?;
+    let client_visible = resolved
         .mutations()
         .iter()
         .try_fold(0usize, |count, mutation| {
@@ -162,63 +181,54 @@ pub(crate) fn prepare_portable_projection(
             "portable projection client-visible mutation count overflowed".into(),
         ));
     };
-    validate_execution_bounds(lowered.write_plan.mutations.len(), client_visible)?;
-    lowered.write_plan.validate()?;
+    validate_execution_bounds(records.len(), client_visible)?;
+    let source_snapshot = resolved
+        .source_snapshots()
+        .then(|| {
+            crate::projection_protocol::SourceSnapshotVersion::from_occurrence(
+                resolved.occurrence(),
+            )
+        })
+        .transpose()?;
 
-    let mut used_logical = vec![false; lowered.resolved.mutations().len()];
-    let mut mutations = Vec::with_capacity(lowered.write_plan.mutations.len());
+    let mut mutations = Vec::with_capacity(records.len());
     let mut scopes = HashSet::new();
-    for physical in lowered.write_plan.mutations {
-        let (schema, physical_key) = mutation_schema_key(&physical);
-        let scope = workspace.record_scope(schema, physical_key)?;
+    for (index, record) in records {
+        let logical = &resolved.mutations()[index];
+        let schema = record.schema;
+        if logical.target().model() != schema.model_name
+            || logical.target().storage() != schema.table_name
+            || !resolved_row_key(schema, logical.key()).is_ok_and(|key| key == record.key)
+        {
+            return Err(ProjectionProtocolError::InvalidBatch(format!(
+                "lowered projection record for model `{}` does not match its resolved mutation's target and key",
+                schema.model_name
+            )));
+        }
+        let scope = workspace.record_scope(schema, &record.key)?;
         if !scopes.insert(scope.clone()) {
             return Err(ProjectionProtocolError::InvalidBatch(format!(
                 "projection execution repeats model `{}` record scope",
                 scope.model()
             )));
         }
-
-        let matches = lowered
-            .resolved
-            .mutations()
-            .iter()
-            .enumerate()
-            .filter(|(index, logical)| {
-                !used_logical[*index]
-                    && logical.target().model() == schema.model_name
-                    && logical.target().storage() == schema.table_name
-                    && resolved_row_key(schema, logical.key()).is_ok_and(|key| key == *physical_key)
-            })
-            .collect::<Vec<_>>();
-        let [(logical_index, logical)] = matches.as_slice() else {
-            return Err(ProjectionProtocolError::InvalidBatch(format!(
-                "physical projection mutation for model `{}` does not have one exact logical key match",
-                schema.model_name
-            )));
-        };
-        used_logical[*logical_index] = true;
-        let intent = intent_for_logical(logical.kind());
-        validate_physical_intent(intent, &physical)?;
         mutations.push(ExecutionMutation {
             scope,
-            intent,
-            mutation: physical,
+            kind: logical.kind(),
+            record,
+            source_snapshot: source_snapshot.clone(),
         });
-    }
-    if used_logical.iter().any(|used| !used) {
-        return Err(ProjectionProtocolError::InvalidBatch(
-            "resolved projection contains a logical mutation with no physical ORM lowering".into(),
-        ));
     }
     prepare(workspace, mutations, HashMap::new())
 }
 
+#[cfg(any(feature = "graphql", test))]
 /// Prepare a stateful graph diff, retaining exact already-loaded revisions and
 /// querying only previously unseen mutation scopes.
 ///
 /// Used by projection protocol unit tests; portable/modeled handlers use
 /// [`prepare_portable_projection`].
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 pub(crate) fn prepare_graph_projection(
     workspace: &ProjectionWorkspace,
     plan: TableWritePlan,
@@ -229,8 +239,8 @@ pub(crate) fn prepare_graph_projection(
     let mut scopes = HashSet::new();
     let mut mutations = Vec::with_capacity(plan.mutations.len());
     for mutation in plan.mutations {
-        let (schema, key) = mutation_schema_key(&mutation);
-        let scope = workspace.record_scope(schema, key)?;
+        let (kind, record) = tests::kind_and_record(mutation);
+        let scope = workspace.record_scope(record.schema, &record.key)?;
         if !scopes.insert(scope.clone()) {
             return Err(ProjectionProtocolError::InvalidBatch(format!(
                 "projection graph diff repeats model `{}` record scope",
@@ -239,13 +249,15 @@ pub(crate) fn prepare_graph_projection(
         }
         mutations.push(ExecutionMutation {
             scope,
-            intent: intent_for_physical(&mutation),
-            mutation,
+            kind,
+            record,
+            source_snapshot: None,
         });
     }
     prepare(workspace, mutations, cached)
 }
 
+#[cfg(any(feature = "graphql", test))]
 fn prepare(
     workspace: &ProjectionWorkspace,
     mutations: Vec<ExecutionMutation>,
@@ -269,8 +281,7 @@ fn prepare(
     for mutation in &mutations {
         if let Some(snapshot) = cached.get(&mutation.scope) {
             if let Some(row) = &snapshot.row {
-                let (schema, expected_key) = mutation_schema_key(&mutation.mutation);
-                if key_from_row(schema, row)? != *expected_key {
+                if key_from_row(mutation.record.schema, row)? != mutation.record.key {
                     return Err(ProjectionProtocolError::ScopeMismatch {
                         field: "cached projection execution snapshot row key",
                     });
@@ -281,7 +292,7 @@ fn prepare(
     let pending = mutations
         .iter()
         .filter(|mutation| !cached.contains_key(&mutation.scope))
-        .map(|mutation| mutation.mutation.clone())
+        .map(|mutation| (mutation.record.schema, &mutation.record.key))
         .collect::<Vec<_>>();
     let total = cached.len().checked_add(pending.len()).ok_or_else(|| {
         ProjectionProtocolError::InvalidBatch("projection execution scope count overflowed".into())
@@ -299,6 +310,7 @@ fn prepare(
     })
 }
 
+#[cfg(any(feature = "graphql", test))]
 fn validate_resolved_partition(
     workspace: &ProjectionWorkspace,
     partition: &super::ResolvedProjectionPartition,
@@ -384,6 +396,7 @@ pub(crate) fn resolved_partition_json(
     }
 }
 
+#[cfg(any(feature = "graphql", test))]
 fn validate_execution_bounds(
     scopes: usize,
     client_visible: usize,
@@ -433,17 +446,67 @@ pub(crate) fn validate_snapshot_scope(
     }
 }
 
+/// A source-snapshot record holds the latest full state, so it is upserted
+/// or deleted whatever the current record is; ordering against the current
+/// record was decided by the caller.
+#[cfg(any(feature = "graphql", test))]
+fn stage_source_snapshot(
+    execution: ExecutionMutation,
+    snapshot: &ProjectionScopedRowSnapshot,
+) -> Result<(TableMutation, ProjectionRecordExpectation, RecordTransition), ProjectionProtocolError>
+{
+    let expected = snapshot
+        .record
+        .as_ref()
+        .map_or(ProjectionRecordExpectation::Missing, |record| {
+            ProjectionRecordExpectation::Exact(record.revision.clone())
+        });
+    match execution.kind {
+        MutationKind::Upsert | MutationKind::UpsertRelated => {
+            let tombstone = snapshot
+                .record
+                .as_ref()
+                .is_some_and(|record| record.tombstone);
+            let mutation = if snapshot.row.is_some() {
+                execution.record.upsert()
+            } else {
+                execution.record.insert()
+            };
+            let transition = if tombstone {
+                RecordTransition::Recreate
+            } else {
+                RecordTransition::Upsert
+            };
+            Ok((mutation, expected, transition))
+        }
+        MutationKind::Delete => Ok((
+            execution.record.delete(),
+            expected,
+            RecordTransition::Delete,
+        )),
+        MutationKind::Insert
+        | MutationKind::InsertRelated
+        | MutationKind::Patch
+        | MutationKind::UpsertPatch
+        | MutationKind::Recreate => Err(ProjectionProtocolError::InvalidBatch(
+            "source snapshots cannot apply partial/delta mutations".into(),
+        )),
+    }
+}
+
+/// Choose the record's lifecycle from its current state and build its one
+/// physical mutation.
+#[cfg(any(feature = "graphql", test))]
 fn stage_for_snapshot(
     execution: ExecutionMutation,
     snapshot: &ProjectionScopedRowSnapshot,
-) -> Result<
-    (
-        TableMutation,
-        ProjectionRecordExpectation,
-        ProjectionMutationKind,
-    ),
-    ProjectionProtocolError,
-> {
+) -> Result<(TableMutation, ProjectionRecordExpectation, RecordTransition), ProjectionProtocolError>
+{
+    use MutationKind::{
+        Delete, Insert, InsertRelated, Patch, Recreate, Upsert, UpsertPatch, UpsertRelated,
+    };
+    use ProjectionRecordExpectation::{Exact, Missing};
+
     enum State<'a> {
         Missing,
         Live(&'a RecordRevision),
@@ -461,201 +524,48 @@ fn stage_for_snapshot(
         }
     };
     let model = snapshot.scope.model().to_owned();
-    match (execution.intent, state) {
-        (LifecycleIntent::Insert, State::Missing) => Ok((
-            normalize_create(execution.mutation)?,
-            ProjectionRecordExpectation::Missing,
-            ProjectionMutationKind::Upsert,
+    let record = execution.record;
+    match (execution.kind, state) {
+        (Insert | InsertRelated | Upsert | UpsertRelated, State::Missing) => {
+            Ok((record.insert(), Missing, RecordTransition::Upsert))
+        }
+        (Insert | InsertRelated, State::Live(_) | State::Tombstone(_)) => {
+            Err(ProjectionProtocolError::RecordAlreadyExists { model })
+        }
+        (Upsert | UpsertRelated, State::Live(revision)) => Ok((
+            record.upsert(),
+            Exact(revision.clone()),
+            RecordTransition::Upsert,
         )),
-        (LifecycleIntent::Insert, _) => Err(ProjectionProtocolError::RecordAlreadyExists { model }),
-        (LifecycleIntent::Upsert, State::Missing) => Ok((
-            normalize_create(execution.mutation)?,
-            ProjectionRecordExpectation::Missing,
-            ProjectionMutationKind::Upsert,
+        (Patch | UpsertPatch, State::Live(revision)) => Ok((
+            record.patch(),
+            Exact(revision.clone()),
+            RecordTransition::Upsert,
         )),
-        (LifecycleIntent::Upsert, State::Live(revision)) => Ok((
-            normalize_save(execution.mutation)?,
-            ProjectionRecordExpectation::Exact(revision.clone()),
-            ProjectionMutationKind::Upsert,
+        (UpsertPatch, State::Missing) => {
+            Ok((record.insert_patched()?, Missing, RecordTransition::Upsert))
+        }
+        (Delete, State::Live(revision)) => Ok((
+            record.delete(),
+            Exact(revision.clone()),
+            RecordTransition::Delete,
         )),
-        (LifecycleIntent::Upsert, State::Tombstone(_)) => {
+        (Patch | Delete, State::Missing) => Err(ProjectionProtocolError::RecordMissing { model }),
+        (Upsert | UpsertRelated | Patch | UpsertPatch | Delete, State::Tombstone(_)) => {
             Err(ProjectionProtocolError::RecordTombstoned { model })
         }
-        (LifecycleIntent::Patch, State::Live(revision)) => Ok((
-            normalize_patch(execution.mutation)?,
-            ProjectionRecordExpectation::Exact(revision.clone()),
-            ProjectionMutationKind::Upsert,
+        (Recreate, State::Tombstone(revision)) => Ok((
+            record.insert(),
+            Exact(revision.clone()),
+            RecordTransition::Recreate,
         )),
-        (LifecycleIntent::Patch, State::Missing) => {
-            Err(ProjectionProtocolError::RecordMissing { model })
-        }
-        (LifecycleIntent::Patch, State::Tombstone(_)) => {
-            Err(ProjectionProtocolError::RecordTombstoned { model })
-        }
-        (LifecycleIntent::UpsertPatch, State::Missing) => Ok((
-            upsert_patch_create(execution.mutation)?,
-            ProjectionRecordExpectation::Missing,
-            ProjectionMutationKind::Upsert,
-        )),
-        (LifecycleIntent::UpsertPatch, State::Live(revision)) => Ok((
-            normalize_patch(execution.mutation)?,
-            ProjectionRecordExpectation::Exact(revision.clone()),
-            ProjectionMutationKind::Upsert,
-        )),
-        (LifecycleIntent::UpsertPatch, State::Tombstone(_)) => {
-            Err(ProjectionProtocolError::RecordTombstoned { model })
-        }
-        (LifecycleIntent::Delete, State::Live(revision)) => Ok((
-            normalize_delete(execution.mutation)?,
-            ProjectionRecordExpectation::Exact(revision.clone()),
-            ProjectionMutationKind::Delete,
-        )),
-        (LifecycleIntent::Delete, State::Missing) => {
-            Err(ProjectionProtocolError::RecordMissing { model })
-        }
-        (LifecycleIntent::Delete, State::Tombstone(_)) => {
-            Err(ProjectionProtocolError::RecordTombstoned { model })
-        }
-        (LifecycleIntent::Recreate, State::Tombstone(revision)) => Ok((
-            normalize_create(execution.mutation)?,
-            ProjectionRecordExpectation::Exact(revision.clone()),
-            ProjectionMutationKind::Recreate,
-        )),
-        (LifecycleIntent::Recreate, State::Missing | State::Live(_)) => {
+        (Recreate, State::Missing | State::Live(_)) => {
             Err(ProjectionProtocolError::RecreateRequiresTombstone { model })
         }
     }
 }
 
-fn normalize_create(mutation: TableMutation) -> Result<TableMutation, ProjectionProtocolError> {
-    let TableMutation::UpsertRow(mut row) = mutation else {
-        return Err(invalid_shape("create", &mutation));
-    };
-    row.mode = RowWriteMode::Insert;
-    row.expected_version = ExpectedVersion::NotExists;
-    Ok(TableMutation::UpsertRow(row))
-}
-
-fn normalize_save(mutation: TableMutation) -> Result<TableMutation, ProjectionProtocolError> {
-    let TableMutation::UpsertRow(mut row) = mutation else {
-        return Err(invalid_shape("save", &mutation));
-    };
-    row.mode = RowWriteMode::Upsert;
-    row.expected_version = ExpectedVersion::Any;
-    Ok(TableMutation::UpsertRow(row))
-}
-
-fn normalize_patch(mutation: TableMutation) -> Result<TableMutation, ProjectionProtocolError> {
-    let TableMutation::PatchRow(mut patch) = mutation else {
-        return Err(invalid_shape("patch", &mutation));
-    };
-    patch.mode = PatchMode::UpdateExisting;
-    patch.expected_version = ExpectedVersion::Any;
-    Ok(TableMutation::PatchRow(patch))
-}
-
-fn normalize_delete(mutation: TableMutation) -> Result<TableMutation, ProjectionProtocolError> {
-    let TableMutation::DeleteRow(mut delete) = mutation else {
-        return Err(invalid_shape("delete", &mutation));
-    };
-    delete.expected_version = ExpectedVersion::Any;
-    Ok(TableMutation::DeleteRow(delete))
-}
-
-fn upsert_patch_create(mutation: TableMutation) -> Result<TableMutation, ProjectionProtocolError> {
-    let TableMutation::PatchRow(patch) = mutation else {
-        return Err(invalid_shape("upsert-patch", &mutation));
-    };
-    let mut values = RowValues::new();
-    for (column, value) in patch.key.iter() {
-        values.insert(column, value.clone());
-    }
-    for (column, value) in patch.patch.iter() {
-        if patch.key.get(column).is_some_and(|key| key != value) {
-            return Err(ProjectionProtocolError::InvalidBatch(format!(
-                "projection upsert-patch changes primary-key column `{column}`"
-            )));
-        }
-        values.insert(column, value.clone());
-    }
-    Ok(TableMutation::UpsertRow(TableRowMutation {
-        schema: patch.schema,
-        key: patch.key,
-        values,
-        expected_version: ExpectedVersion::NotExists,
-        mode: RowWriteMode::Insert,
-    }))
-}
-
-fn invalid_shape(operation: &str, mutation: &TableMutation) -> ProjectionProtocolError {
-    ProjectionProtocolError::InvalidBatch(format!(
-        "projection {operation} lifecycle is incompatible with physical mutation `{}`",
-        mutation_kind_name(mutation)
-    ))
-}
-
-fn mutation_kind_name(mutation: &TableMutation) -> &'static str {
-    match mutation {
-        TableMutation::UpsertRow(_) => "full_row",
-        TableMutation::PatchRow(_) => "patch",
-        TableMutation::DeleteRow(_) => "delete",
-    }
-}
-
-fn intent_for_logical(kind: LogicalMutationKind) -> LifecycleIntent {
-    match kind {
-        LogicalMutationKind::Insert | LogicalMutationKind::InsertRelated => LifecycleIntent::Insert,
-        LogicalMutationKind::Upsert | LogicalMutationKind::UpsertRelated => LifecycleIntent::Upsert,
-        LogicalMutationKind::Patch => LifecycleIntent::Patch,
-        LogicalMutationKind::UpsertPatch => LifecycleIntent::UpsertPatch,
-        LogicalMutationKind::Delete => LifecycleIntent::Delete,
-        LogicalMutationKind::Recreate => LifecycleIntent::Recreate,
-    }
-}
-
-fn intent_for_physical(mutation: &TableMutation) -> LifecycleIntent {
-    match mutation {
-        TableMutation::UpsertRow(row) if row.mode == RowWriteMode::Insert => {
-            LifecycleIntent::Insert
-        }
-        TableMutation::UpsertRow(_) => LifecycleIntent::Upsert,
-        TableMutation::PatchRow(patch) if patch.mode == PatchMode::InsertMissing => {
-            LifecycleIntent::UpsertPatch
-        }
-        TableMutation::PatchRow(_) => LifecycleIntent::Patch,
-        TableMutation::DeleteRow(_) => LifecycleIntent::Delete,
-    }
-}
-
-fn validate_physical_intent(
-    intent: LifecycleIntent,
-    mutation: &TableMutation,
-) -> Result<(), ProjectionProtocolError> {
-    let compatible = matches!(
-        (intent, mutation),
-        (
-            LifecycleIntent::Insert | LifecycleIntent::Upsert | LifecycleIntent::Recreate,
-            TableMutation::UpsertRow(_)
-        ) | (
-            LifecycleIntent::Patch | LifecycleIntent::UpsertPatch,
-            TableMutation::PatchRow(_)
-        ) | (LifecycleIntent::Delete, TableMutation::DeleteRow(_))
-    );
-    if compatible {
-        Ok(())
-    } else {
-        Err(invalid_shape("logical", mutation))
-    }
-}
-
-fn mutation_schema_key(mutation: &TableMutation) -> (&'static TableSchema, &RowKey) {
-    match mutation {
-        TableMutation::UpsertRow(mutation) => (mutation.schema, &mutation.key),
-        TableMutation::PatchRow(mutation) => (mutation.schema, &mutation.key),
-        TableMutation::DeleteRow(mutation) => (mutation.schema, &mutation.key),
-    }
-}
-
+#[cfg(any(feature = "graphql", test))]
 fn resolved_row_key(
     schema: &TableSchema,
     key: &ResolvedProjectionKey,
@@ -719,28 +629,41 @@ mod tests {
     use std::sync::Arc;
 
     use crate::projection_protocol::{
-        ProjectionChangeCursor, ProjectionEpoch, ProjectionGeneration, ProjectionInputCursor,
-        ProjectionInputFingerprint, ProjectionPartition, ProjectionRecordMetadata,
+        PartitionId, ProjectionChangeCursor, ProjectionEpoch, ProjectionGeneration,
+        ProjectionInputCursor, ProjectionInputFingerprint, ProjectionRecordMetadata,
         ProjectionScopeCodec, ProjectionSource, ProjectorTopologyId, TrustedProjectionInput,
     };
     use crate::read_model::{ReadModelWritePlanBuilder, RelationalReadModel};
-    use crate::table::RowPatch;
+    use crate::table::{
+        ExpectedVersion, PatchMode, RowPatch, RowValues, RowWriteMode, TableRowMutation,
+    };
 
-    #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize, crate::ReadModel)]
+    #[derive(
+        Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize, crate::read_model::ReadModel,
+    )]
     #[readmodel(table = "executor_todos", primary_key = ["id"])]
     struct TodoView {
         id: String,
         title: String,
     }
 
-    #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize, crate::ReadModel)]
+    #[derive(
+        Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize, crate::read_model::ReadModel,
+    )]
     #[readmodel(table = "executor_audits", primary_key = ["id"])]
     struct AuditView {
         id: String,
         action: String,
     }
 
-    #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize, crate::DomainState)]
+    #[derive(
+        Clone,
+        Debug,
+        PartialEq,
+        serde::Serialize,
+        serde::Deserialize,
+        crate::domain_event::DomainState,
+    )]
     #[domain_state(version = 1)]
     struct ExecutorState {
         id: String,
@@ -749,213 +672,82 @@ mod tests {
     }
 
     fn executor_multi_table_program(
-    ) -> Result<crate::ProjectionProgram, crate::ProjectionProgramError> {
+    ) -> Result<crate::projection::ProjectionProgram, crate::projection::ProjectionProgramError>
+    {
         use crate::mutation::{
-            body_field_binding, compile_projection, MutationAssignment, MutationConflictTarget,
-            MutationEventBinding, MutationExpression, MutationField, MutationKeyField,
-            MutationKind, MutationOperation, MutationProgram, ProjectionHandler,
+            body_field_binding, compile_projection, MutationColumn, MutationOperation,
+            MutationProgram, ProjectionHandler,
         };
+        use crate::projection::MutationKind;
         use crate::projection::{
             ProjectionEventSelector, ProjectionPartition, ProjectionTarget, ProjectionValueType,
         };
 
-        let todo_target = ProjectionTarget::try_new("TodoView", "executor_todos")?;
-        let audit_target = ProjectionTarget::try_new("AuditView", "executor_audits")?;
-        let todo_op = MutationOperation::try_new(
-            "upsert-todo",
-            0,
-            MutationKind::Upsert,
-            todo_target,
-            vec![MutationKeyField::try_new(
-                0,
-                "id",
-                MutationExpression::input_path(ProjectionValueType::String, ["id"]).map_err(
-                    |e| crate::ProjectionProgramError::InvalidOperation {
-                        operation: "executor multi".into(),
-                        reason: e.to_string(),
-                    },
-                )?,
-            )
-            .map_err(|e| crate::ProjectionProgramError::InvalidOperation {
-                operation: "executor multi".into(),
-                reason: e.to_string(),
-            })?],
-            vec![
-                MutationField::try_new(
-                    0,
-                    "id",
-                    MutationAssignment::set(
-                        MutationExpression::input_path(ProjectionValueType::String, ["id"])
-                            .map_err(|e| crate::ProjectionProgramError::InvalidOperation {
-                                operation: "executor multi".into(),
-                                reason: e.to_string(),
-                            })?,
-                    ),
-                )
-                .map_err(|e| crate::ProjectionProgramError::InvalidOperation {
-                    operation: "executor multi".into(),
-                    reason: e.to_string(),
-                })?,
-                MutationField::try_new(
-                    1,
-                    "title",
-                    MutationAssignment::set(
-                        MutationExpression::input_path(ProjectionValueType::String, ["title"])
-                            .map_err(|e| crate::ProjectionProgramError::InvalidOperation {
-                                operation: "executor multi".into(),
-                                reason: e.to_string(),
-                            })?,
-                    ),
-                )
-                .map_err(|e| crate::ProjectionProgramError::InvalidOperation {
-                    operation: "executor multi".into(),
-                    reason: e.to_string(),
-                })?,
-            ],
-            Some(MutationConflictTarget::PrimaryKey),
-            Vec::new(),
-            Vec::new(),
-            None,
-        )
-        .map_err(|e| crate::ProjectionProgramError::InvalidOperation {
-            operation: "executor multi".into(),
-            reason: e.to_string(),
-        })?;
-        let audit_op = MutationOperation::try_new(
-            "upsert-audit",
+        let column =
+            |name: &str| MutationColumn::try_new(name, ProjectionValueType::String, [name]);
+        let mutation = MutationProgram::try_new(
+            "executor_multi_mutation",
             1,
-            MutationKind::Upsert,
-            audit_target,
-            vec![MutationKeyField::try_new(
-                0,
-                "id",
-                MutationExpression::input_path(ProjectionValueType::String, ["id"]).map_err(
-                    |e| crate::ProjectionProgramError::InvalidOperation {
-                        operation: "executor multi".into(),
-                        reason: e.to_string(),
-                    },
-                )?,
-            )
-            .map_err(|e| crate::ProjectionProgramError::InvalidOperation {
-                operation: "executor multi".into(),
-                reason: e.to_string(),
-            })?],
             vec![
-                MutationField::try_new(
-                    0,
-                    "id",
-                    MutationAssignment::set(
-                        MutationExpression::input_path(ProjectionValueType::String, ["id"])
-                            .map_err(|e| crate::ProjectionProgramError::InvalidOperation {
-                                operation: "executor multi".into(),
-                                reason: e.to_string(),
-                            })?,
-                    ),
-                )
-                .map_err(|e| crate::ProjectionProgramError::InvalidOperation {
-                    operation: "executor multi".into(),
-                    reason: e.to_string(),
-                })?,
-                MutationField::try_new(
-                    1,
-                    "action",
-                    MutationAssignment::set(
-                        MutationExpression::input_path(ProjectionValueType::String, ["action"])
-                            .map_err(|e| crate::ProjectionProgramError::InvalidOperation {
-                                operation: "executor multi".into(),
-                                reason: e.to_string(),
-                            })?,
-                    ),
-                )
-                .map_err(|e| crate::ProjectionProgramError::InvalidOperation {
-                    operation: "executor multi".into(),
-                    reason: e.to_string(),
-                })?,
+                MutationOperation::try_new(
+                    "upsert-todo",
+                    MutationKind::Upsert,
+                    ProjectionTarget::try_new("TodoView", "executor_todos")?,
+                    vec![column("id")?],
+                    vec![column("id")?, column("title")?],
+                )?,
+                MutationOperation::try_new(
+                    "upsert-audit",
+                    MutationKind::Upsert,
+                    ProjectionTarget::try_new("AuditView", "executor_audits")?,
+                    vec![column("id")?],
+                    vec![column("id")?, column("action")?],
+                )?,
             ],
-            Some(MutationConflictTarget::PrimaryKey),
-            Vec::new(),
-            Vec::new(),
-            None,
-        )
-        .map_err(|e| crate::ProjectionProgramError::InvalidOperation {
-            operation: "executor multi".into(),
-            reason: e.to_string(),
-        })?;
-        let mutation_program =
-            MutationProgram::try_new("executor_multi_mutation", 1, vec![todo_op, audit_op])
-                .map_err(|e| crate::ProjectionProgramError::InvalidOperation {
-                    operation: "executor multi".into(),
-                    reason: e.to_string(),
-                })?;
-        let selector =
-            ProjectionEventSelector::try_from_descriptor(&crate::DomainEventDescriptor::state::<
-                ExecutorState,
-            >("executor.changed", 1))?;
-        let bindings = vec![
-            body_field_binding(["id"], ["id"], ProjectionValueType::String).map_err(|e| {
-                crate::ProjectionProgramError::InvalidOperation {
-                    operation: "executor multi".into(),
-                    reason: e.to_string(),
-                }
-            })?,
-            body_field_binding(["title"], ["title"], ProjectionValueType::String).map_err(|e| {
-                crate::ProjectionProgramError::InvalidOperation {
-                    operation: "executor multi".into(),
-                    reason: e.to_string(),
-                }
-            })?,
-            body_field_binding(["action"], ["action"], ProjectionValueType::String).map_err(
-                |e| crate::ProjectionProgramError::InvalidOperation {
-                    operation: "executor multi".into(),
-                    reason: e.to_string(),
-                },
-            )?,
-        ];
-        let binding =
-            MutationEventBinding::try_new(selector, bindings, mutation_program).map_err(|e| {
-                crate::ProjectionProgramError::InvalidOperation {
-                    operation: "executor multi".into(),
-                    reason: e.to_string(),
-                }
-            })?;
+        )?;
+        let selector = ProjectionEventSelector::try_from_descriptor(
+            &crate::domain_event::DomainEventDescriptor::state::<ExecutorState>(
+                "executor.changed",
+                1,
+            ),
+        )?;
         compile_projection(
             "executor-generated-multi-table",
             1,
             ProjectionPartition::Unit,
-            [ProjectionHandler::from_binding("changed", binding)],
+            [ProjectionHandler::try_new(
+                "changed",
+                selector,
+                vec![
+                    body_field_binding(["id"], ["id"], ProjectionValueType::String)?,
+                    body_field_binding(["title"], ["title"], ProjectionValueType::String)?,
+                    body_field_binding(["action"], ["action"], ProjectionValueType::String)?,
+                ],
+                mutation,
+            )?],
         )
-        .map_err(|e| crate::ProjectionProgramError::InvalidOperation {
-            operation: "executor multi".into(),
-            reason: e.to_string(),
-        })
-    }
-
-    fn executor_multi_table_resolve(
-        occurrence: &crate::DomainEventOccurrence,
-    ) -> Result<crate::ResolvedProjectionPlan, crate::ProjectionProgramError> {
-        crate::mutation::resolve_mutation_program(&executor_multi_table_program()?, occurrence)
     }
 
     fn executor_multi_table_lower(
-        plan: &crate::ResolvedProjectionPlan,
+        plan: &crate::projection::ResolvedProjectionPlan,
     ) -> Result<
         crate::projection::lower::LoweredProjectionPlan,
         crate::projection::lower::ProjectionLoweringError,
     > {
         use crate::projection::lower::{finish_lowering, lower_model_mutation};
-        let mut builder = ReadModelWritePlanBuilder::new();
+        let mut records = Vec::new();
         for mutation in plan.mutations() {
             match mutation.target().model() {
-                "TodoView" => lower_model_mutation::<TodoView>(&mut builder, mutation)?,
-                "AuditView" => lower_model_mutation::<AuditView>(&mut builder, mutation)?,
+                "TodoView" => records.push(lower_model_mutation::<TodoView>(mutation)?),
+                "AuditView" => records.push(lower_model_mutation::<AuditView>(mutation)?),
                 other => {
                     return Err(crate::projection::lower::ProjectionLoweringError::Table(
-                        crate::TableStoreError::Metadata(format!("unknown model `{other}`")),
+                        crate::table::TableStoreError::Metadata(format!("unknown model `{other}`")),
                     ));
                 }
             }
         }
-        finish_lowering(builder, plan)
+        finish_lowering(plan, records)
     }
 
     fn executor_multi_table_inventory() -> Result<
@@ -974,12 +766,14 @@ mod tests {
 
     const GENERATED_MULTI_TABLE: crate::projection::lower::ProjectionDescriptor<
         crate::projection::lower::EventualOnly,
-    > = crate::mutation::descriptor_from_factories(
+    > = crate::projection::lower::ProjectionDescriptor::new(
         "executor-generated-multi-table",
         1,
-        "executor-generated-v1",
-        executor_multi_table_program,
-        executor_multi_table_resolve,
+        || {
+            static PROGRAM: crate::projection::lower::ProjectionProgramCell =
+                crate::projection::lower::ProjectionProgramCell::new();
+            PROGRAM.get_or_build(executor_multi_table_program)
+        },
         executor_multi_table_lower,
         executor_multi_table_inventory,
     );
@@ -988,7 +782,7 @@ mod tests {
         ProjectorTopologyId::new(1, "executor-tests", [31; 32]).unwrap()
     }
 
-    fn partition() -> ProjectionPartition {
+    fn partition() -> PartitionId {
         ProjectionScopeCodec::new(topology())
             .encode_partition(None)
             .unwrap()
@@ -1025,13 +819,7 @@ mod tests {
             true,
         )
         .unwrap();
-        ProjectionWorkspace::new(
-            Arc::new(codec),
-            partition_value,
-            input,
-            ProjectionEpoch::new("changes-v1").unwrap(),
-        )
-        .unwrap()
+        ProjectionWorkspace::new(Arc::new(codec), partition_value, input).unwrap()
     }
 
     fn todo(id: &str, title: &str) -> TodoView {
@@ -1057,16 +845,54 @@ mod tests {
             .unwrap()
     }
 
+    /// The logical kind a hand-built physical mutation stands for, and its
+    /// lifecycle-free record.
+    pub(super) fn kind_and_record(mutation: TableMutation) -> (MutationKind, LoweredRecord) {
+        let (kind, schema, key, values) = match mutation {
+            TableMutation::UpsertRow(row) => {
+                let kind = if row.mode == RowWriteMode::Insert {
+                    MutationKind::Insert
+                } else {
+                    MutationKind::Upsert
+                };
+                (kind, row.schema, row.key, row.values)
+            }
+            TableMutation::PatchRow(patch) => {
+                let kind = if patch.mode == PatchMode::InsertMissing {
+                    MutationKind::UpsertPatch
+                } else {
+                    MutationKind::Patch
+                };
+                (kind, patch.schema, patch.key, patch.patch.into_values())
+            }
+            TableMutation::DeleteRow(delete) => (
+                MutationKind::Delete,
+                delete.schema,
+                delete.key,
+                RowValues::new(),
+            ),
+        };
+        (
+            kind,
+            LoweredRecord {
+                schema,
+                key,
+                values,
+            },
+        )
+    }
+
     fn execution(
         workspace: &ProjectionWorkspace,
-        intent: LifecycleIntent,
+        kind: MutationKind,
         mutation: TableMutation,
     ) -> ExecutionMutation {
-        let (schema, key) = mutation_schema_key(&mutation);
+        let (_, record) = kind_and_record(mutation);
         ExecutionMutation {
-            scope: workspace.record_scope(schema, key).unwrap(),
-            intent,
-            mutation,
+            scope: workspace.record_scope(record.schema, &record.key).unwrap(),
+            kind,
+            record,
+            source_snapshot: None,
         }
     }
 
@@ -1076,6 +902,7 @@ mod tests {
         revision: u64,
     ) -> ProjectionRecordMetadata {
         ProjectionRecordMetadata {
+            source_snapshot: None,
             revision: RecordRevision::new(scope, 1, revision).unwrap(),
             tombstone,
             change: ProjectionChangeCursor::new(
@@ -1116,10 +943,13 @@ mod tests {
         }
     }
 
-    fn generated_occurrence() -> crate::DomainEventOccurrence {
-        crate::DomainEventOccurrence::capture(
-            crate::DomainEventDescriptor::state::<ExecutorState>("executor.changed", 1),
-            crate::DomainEventEnvelope {
+    fn generated_occurrence() -> crate::domain_event::DomainEventOccurrence {
+        crate::domain_event::DomainEventOccurrence::capture(
+            crate::domain_event::DomainEventDescriptor::state::<ExecutorState>(
+                "executor.changed",
+                1,
+            ),
+            crate::domain_event::DomainEventEnvelope {
                 aggregate_type: "executor".into(),
                 aggregate_id: "todo-1".into(),
                 aggregate_sequence: 1,
@@ -1187,7 +1017,7 @@ mod tests {
             .unwrap();
 
         let (mutation, expectation, kind) = stage_for_snapshot(
-            execution(&workspace, LifecycleIntent::Insert, full()),
+            execution(&workspace, MutationKind::Insert, full()),
             &missing(scope.clone()),
         )
         .unwrap();
@@ -1200,15 +1030,12 @@ mod tests {
             })
         ));
         assert_eq!(expectation, ProjectionRecordExpectation::Missing);
-        assert_eq!(kind, ProjectionMutationKind::Upsert);
+        assert_eq!(kind, RecordTransition::Upsert);
 
         let live = live(scope.clone(), &model, 7);
         let expected_revision = live.record.as_ref().unwrap().revision.clone();
-        let (mutation, expectation, kind) = stage_for_snapshot(
-            execution(&workspace, LifecycleIntent::Upsert, full()),
-            &live,
-        )
-        .unwrap();
+        let (mutation, expectation, kind) =
+            stage_for_snapshot(execution(&workspace, MutationKind::Upsert, full()), &live).unwrap();
         assert!(matches!(
             mutation,
             TableMutation::UpsertRow(TableRowMutation {
@@ -1221,13 +1048,10 @@ mod tests {
             expectation,
             ProjectionRecordExpectation::Exact(expected_revision.clone())
         );
-        assert_eq!(kind, ProjectionMutationKind::Upsert);
+        assert_eq!(kind, RecordTransition::Upsert);
 
-        let (mutation, expectation, kind) = stage_for_snapshot(
-            execution(&workspace, LifecycleIntent::Patch, patch()),
-            &live,
-        )
-        .unwrap();
+        let (mutation, expectation, kind) =
+            stage_for_snapshot(execution(&workspace, MutationKind::Patch, patch()), &live).unwrap();
         assert!(matches!(
             mutation,
             TableMutation::PatchRow(crate::table::PatchTableRowMutation {
@@ -1240,13 +1064,11 @@ mod tests {
             expectation,
             ProjectionRecordExpectation::Exact(expected_revision.clone())
         );
-        assert_eq!(kind, ProjectionMutationKind::Upsert);
+        assert_eq!(kind, RecordTransition::Upsert);
 
-        let (mutation, expectation, kind) = stage_for_snapshot(
-            execution(&workspace, LifecycleIntent::Delete, delete()),
-            &live,
-        )
-        .unwrap();
+        let (mutation, expectation, kind) =
+            stage_for_snapshot(execution(&workspace, MutationKind::Delete, delete()), &live)
+                .unwrap();
         assert!(matches!(
             mutation,
             TableMutation::DeleteRow(crate::table::DeleteTableRowMutation {
@@ -1258,12 +1080,12 @@ mod tests {
             expectation,
             ProjectionRecordExpectation::Exact(expected_revision)
         );
-        assert_eq!(kind, ProjectionMutationKind::Delete);
+        assert_eq!(kind, RecordTransition::Delete);
 
         let tombstone = tombstone(scope, 8);
         let tombstone_revision = tombstone.record.as_ref().unwrap().revision.clone();
         let (mutation, expectation, kind) = stage_for_snapshot(
-            execution(&workspace, LifecycleIntent::Recreate, full()),
+            execution(&workspace, MutationKind::Recreate, full()),
             &tombstone,
         )
         .unwrap();
@@ -1279,7 +1101,7 @@ mod tests {
             expectation,
             ProjectionRecordExpectation::Exact(tombstone_revision)
         );
-        assert_eq!(kind, ProjectionMutationKind::Recreate);
+        assert_eq!(kind, RecordTransition::Recreate);
     }
 
     #[test]
@@ -1301,7 +1123,7 @@ mod tests {
             .unwrap();
 
         let (created, expectation, _) = stage_for_snapshot(
-            execution(&workspace, LifecycleIntent::UpsertPatch, upsert_patch()),
+            execution(&workspace, MutationKind::UpsertPatch, upsert_patch()),
             &missing(scope.clone()),
         )
         .unwrap();
@@ -1321,7 +1143,7 @@ mod tests {
         assert_eq!(expectation, ProjectionRecordExpectation::Missing);
 
         let (patched, expectation, _) = stage_for_snapshot(
-            execution(&workspace, LifecycleIntent::UpsertPatch, upsert_patch()),
+            execution(&workspace, MutationKind::UpsertPatch, upsert_patch()),
             &live(scope, &model, 9),
         )
         .unwrap();
@@ -1334,6 +1156,238 @@ mod tests {
             })
         ));
         assert!(matches!(expectation, ProjectionRecordExpectation::Exact(_)));
+    }
+
+    /// Every logical kind against every record state builds exactly the
+    /// physical mutation, expectation and transition the removed
+    /// lower-then-normalise pass produced, or fails the same way.
+    #[test]
+    fn every_kind_and_record_state_builds_one_exact_record_mutation() {
+        #[derive(Debug, PartialEq)]
+        enum Outcome {
+            Row(RowWriteMode, ExpectedVersion, bool, RecordTransition),
+            Patch(bool, RecordTransition),
+            Delete(bool, RecordTransition),
+            AlreadyExists,
+            Missing,
+            Tombstoned,
+            RecreateRequiresTombstone,
+        }
+        use Outcome::*;
+        use RecordTransition::{Delete as Del, Recreate as Rec, Upsert as Up};
+        use RowWriteMode::{Insert as Ins, Upsert as Ups};
+        let (any, not_exists) = (ExpectedVersion::Any, ExpectedVersion::NotExists);
+
+        let workspace = workspace();
+        let model = todo("todo-1", "before");
+        let scope = workspace
+            .record_scope(TodoView::schema(), &todo_key("todo-1"))
+            .unwrap();
+        let row = || {
+            one_mutation(|builder| {
+                builder.upsert(&model).unwrap();
+            })
+        };
+        let patch = || {
+            one_mutation(|builder| {
+                builder
+                    .patch::<TodoView>(
+                        todo_key("todo-1"),
+                        RowPatch::new().set("title", RowValue::String("after".into())),
+                    )
+                    .unwrap();
+            })
+        };
+        let delete = || {
+            one_mutation(|builder| {
+                builder.delete::<TodoView>(todo_key("todo-1")).unwrap();
+            })
+        };
+        let outcome = |kind: MutationKind, snapshot: &ProjectionScopedRowSnapshot| {
+            let physical = match kind {
+                MutationKind::Patch | MutationKind::UpsertPatch => patch(),
+                MutationKind::Delete => delete(),
+                _ => row(),
+            };
+            match stage_for_snapshot(execution(&workspace, kind, physical), snapshot) {
+                Ok((mutation, expectation, transition)) => {
+                    let exact = matches!(expectation, ProjectionRecordExpectation::Exact(_));
+                    match mutation {
+                        TableMutation::UpsertRow(row) => {
+                            Row(row.mode, row.expected_version, exact, transition)
+                        }
+                        TableMutation::PatchRow(patch) => {
+                            assert_eq!(patch.mode, PatchMode::UpdateExisting);
+                            assert_eq!(patch.expected_version, ExpectedVersion::Any);
+                            Patch(exact, transition)
+                        }
+                        TableMutation::DeleteRow(delete) => {
+                            assert_eq!(delete.expected_version, ExpectedVersion::Any);
+                            Delete(exact, transition)
+                        }
+                    }
+                }
+                Err(ProjectionProtocolError::RecordAlreadyExists { .. }) => AlreadyExists,
+                Err(ProjectionProtocolError::RecordMissing { .. }) => Missing,
+                Err(ProjectionProtocolError::RecordTombstoned { .. }) => Tombstoned,
+                Err(ProjectionProtocolError::RecreateRequiresTombstone { .. }) => {
+                    RecreateRequiresTombstone
+                }
+                Err(other) => panic!("{kind:?}: unexpected error {other}"),
+            }
+        };
+
+        let missing = missing(scope.clone());
+        let live = live(scope.clone(), &model, 3);
+        let tombstone = tombstone(scope, 4);
+        let cases = [
+            (
+                MutationKind::Insert,
+                [
+                    Row(Ins, not_exists.clone(), false, Up),
+                    AlreadyExists,
+                    AlreadyExists,
+                ],
+            ),
+            (
+                MutationKind::InsertRelated,
+                [
+                    Row(Ins, not_exists.clone(), false, Up),
+                    AlreadyExists,
+                    AlreadyExists,
+                ],
+            ),
+            (
+                MutationKind::Upsert,
+                [
+                    Row(Ins, not_exists.clone(), false, Up),
+                    Row(Ups, any.clone(), true, Up),
+                    Tombstoned,
+                ],
+            ),
+            (
+                MutationKind::UpsertRelated,
+                [
+                    Row(Ins, not_exists.clone(), false, Up),
+                    Row(Ups, any.clone(), true, Up),
+                    Tombstoned,
+                ],
+            ),
+            (MutationKind::Patch, [Missing, Patch(true, Up), Tombstoned]),
+            (
+                MutationKind::UpsertPatch,
+                [
+                    Row(Ins, not_exists.clone(), false, Up),
+                    Patch(true, Up),
+                    Tombstoned,
+                ],
+            ),
+            (
+                MutationKind::Delete,
+                [Missing, Delete(true, Del), Tombstoned],
+            ),
+            (
+                MutationKind::Recreate,
+                [
+                    RecreateRequiresTombstone,
+                    RecreateRequiresTombstone,
+                    Row(Ins, not_exists, true, Rec),
+                ],
+            ),
+        ];
+        for (kind, [on_missing, on_live, on_tombstone]) in cases {
+            assert_eq!(
+                outcome(kind, &missing),
+                on_missing,
+                "{kind:?} on a missing record"
+            );
+            assert_eq!(outcome(kind, &live), on_live, "{kind:?} on a live record");
+            assert_eq!(
+                outcome(kind, &tombstone),
+                on_tombstone,
+                "{kind:?} on a tombstone"
+            );
+        }
+    }
+
+    /// A source-snapshot record upserts or deletes whatever the record
+    /// state; it never applies a partial mutation.
+    #[test]
+    fn source_snapshot_records_upsert_or_delete_unfenced() {
+        let workspace = workspace();
+        let model = todo("todo-1", "before");
+        let scope = workspace
+            .record_scope(TodoView::schema(), &todo_key("todo-1"))
+            .unwrap();
+        let row = || {
+            one_mutation(|builder| {
+                builder.upsert(&model).unwrap();
+            })
+        };
+        let stage = |kind, mutation, snapshot: &ProjectionScopedRowSnapshot| {
+            stage_source_snapshot(execution(&workspace, kind, mutation), snapshot)
+        };
+
+        let (created, expectation, transition) =
+            stage(MutationKind::Upsert, row(), &missing(scope.clone())).unwrap();
+        assert!(matches!(
+            created,
+            TableMutation::UpsertRow(TableRowMutation {
+                mode: RowWriteMode::Insert,
+                expected_version: ExpectedVersion::NotExists,
+                ..
+            })
+        ));
+        assert_eq!(expectation, ProjectionRecordExpectation::Missing);
+        assert_eq!(transition, RecordTransition::Upsert);
+
+        let (saved, expectation, transition) =
+            stage(MutationKind::Upsert, row(), &live(scope.clone(), &model, 5)).unwrap();
+        assert!(matches!(
+            saved,
+            TableMutation::UpsertRow(TableRowMutation {
+                mode: RowWriteMode::Upsert,
+                expected_version: ExpectedVersion::Any,
+                ..
+            })
+        ));
+        assert!(matches!(expectation, ProjectionRecordExpectation::Exact(_)));
+        assert_eq!(transition, RecordTransition::Upsert);
+
+        let (recreated, expectation, transition) =
+            stage(MutationKind::Upsert, row(), &tombstone(scope.clone(), 6)).unwrap();
+        assert!(matches!(
+            recreated,
+            TableMutation::UpsertRow(TableRowMutation {
+                mode: RowWriteMode::Insert,
+                ..
+            })
+        ));
+        assert!(matches!(expectation, ProjectionRecordExpectation::Exact(_)));
+        assert_eq!(transition, RecordTransition::Recreate);
+
+        let delete = one_mutation(|builder| {
+            builder.delete::<TodoView>(todo_key("todo-1")).unwrap();
+        });
+        let (deleted, expectation, transition) =
+            stage(MutationKind::Delete, delete, &missing(scope.clone())).unwrap();
+        assert!(matches!(deleted, TableMutation::DeleteRow(_)));
+        assert_eq!(expectation, ProjectionRecordExpectation::Missing);
+        assert_eq!(transition, RecordTransition::Delete);
+
+        for kind in [
+            MutationKind::Insert,
+            MutationKind::InsertRelated,
+            MutationKind::Patch,
+            MutationKind::UpsertPatch,
+            MutationKind::Recreate,
+        ] {
+            let error = stage(kind, row(), &missing(scope.clone())).unwrap_err();
+            assert!(
+                error.to_string().contains("partial/delta"),
+                "{kind:?}: {error}"
+            );
+        }
     }
 
     #[test]
@@ -1366,14 +1420,14 @@ mod tests {
 
         assert!(matches!(
             stage_for_snapshot(
-                execution(&workspace, LifecycleIntent::Patch, patch()),
+                execution(&workspace, MutationKind::Patch, patch()),
                 &missing(scope.clone())
             ),
             Err(ProjectionProtocolError::RecordMissing { .. })
         ));
         assert!(matches!(
             stage_for_snapshot(
-                execution(&workspace, LifecycleIntent::Delete, delete()),
+                execution(&workspace, MutationKind::Delete, delete()),
                 &missing(scope.clone())
             ),
             Err(ProjectionProtocolError::RecordMissing { .. })
@@ -1381,21 +1435,21 @@ mod tests {
         let tombstone = tombstone(scope.clone(), 10);
         assert!(matches!(
             stage_for_snapshot(
-                execution(&workspace, LifecycleIntent::Upsert, full()),
+                execution(&workspace, MutationKind::Upsert, full()),
                 &tombstone
             ),
             Err(ProjectionProtocolError::RecordTombstoned { .. })
         ));
         assert!(matches!(
             stage_for_snapshot(
-                execution(&workspace, LifecycleIntent::Recreate, full()),
+                execution(&workspace, MutationKind::Recreate, full()),
                 &missing(scope.clone())
             ),
             Err(ProjectionProtocolError::RecreateRequiresTombstone { .. })
         ));
         assert!(matches!(
             stage_for_snapshot(
-                execution(&workspace, LifecycleIntent::Recreate, full()),
+                execution(&workspace, MutationKind::Recreate, full()),
                 &live(scope, &model, 11)
             ),
             Err(ProjectionProtocolError::RecreateRequiresTombstone { .. })
@@ -1501,10 +1555,8 @@ mod tests {
             .plan(&generated_occurrence())
             .unwrap();
         let expected_order = lowered
-            .write_plan
-            .mutations
-            .iter()
-            .map(|mutation| mutation.table_name().to_owned())
+            .records()
+            .map(|(_, record)| record.schema().table_name.clone())
             .collect::<Vec<_>>();
         let prepared = prepare_portable_projection(&workspace, lowered.clone()).unwrap();
         assert_eq!(prepared.snapshot_request().requests.len(), 2);
@@ -1530,21 +1582,17 @@ mod tests {
         );
 
         let mut divergent = lowered;
-        let first = divergent.write_plan.mutations.first_mut().unwrap();
-        match first {
-            TableMutation::UpsertRow(row) => {
-                row.key = RowKey::new([("id", RowValue::String("wrong-key".into()))]);
-                row.values
-                    .insert("id", RowValue::String("wrong-key".into()));
-            }
-            _ => panic!("generated fixture uses full-row upserts"),
-        }
+        let (_, first) = divergent.records.first_mut().unwrap();
+        first.key = RowKey::new([("id", RowValue::String("wrong-key".into()))]);
+        first
+            .values
+            .insert("id", RowValue::String("wrong-key".into()));
         let error = prepare_portable_projection(&workspace, divergent).unwrap_err();
         assert!(
             error
                 .to_string()
-                .contains("does not have one exact logical key match"),
-            "physical rows cannot be positionally paired with unrelated logical mutations"
+                .contains("does not match its resolved mutation's target and key"),
+            "a lowered record cannot stand for an unrelated logical mutation"
         );
 
         let divergent_partition = workspace_with_partition(Some(serde_json::json!("tenant-b")));

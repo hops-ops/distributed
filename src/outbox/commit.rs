@@ -1,118 +1,49 @@
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::time::Duration;
 
-use crate::aggregate::{Aggregate, AggregateRepository};
+use crate::aggregate::{stream_identity_for, Aggregate, AggregateRepository};
 use crate::domain_event::{DomainEvent, DomainEventCaptureError, DomainEventCommitGuardError};
 use crate::outbox::{OutboxMessage, PreparedDomainEvent};
-use crate::read_model::ReadModelWritePlanBuilder;
-use crate::repository::{
-    CommitBatch, RepositoryError, StreamIdentity, StreamWrite, TransactionalCommit,
-};
-use crate::table::TableWritePlan;
+use crate::repository::{CommitBatch, RepositoryError, StreamWrite, TransactionalCommit};
+use crate::schedule::{Schedule, ScheduleWrite};
 
-/// Publishes already-committed outbox rows and settles their claims.
+/// What a commit does with the ids of the outbox rows it just inserted.
+type AfterCommit =
+    Arc<dyn Fn(Vec<String>) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
+
+/// Installed on a repository so that a commit starts publishing its outbox
+/// rows without waiting for the next poll.
 ///
-/// Implemented by the outbox → bus bridge. `Service::with_bus` prefers a
-/// bounded worker mailbox over this hook; the hook is the fallback when no
-/// mailbox is installed. It is object-safe so the repository can hold it
-/// without naming the transport/store types.
-pub trait OutboxPublishHook: Send + Sync {
-    /// Publish committed, claimed outbox rows and settle their claims. Publish
-    /// failures are absorbed (the rows stay retryable for the worker); only a
-    /// store error surfaces.
-    fn publish_claimed<'a>(
-        &'a self,
-        claimed: Vec<OutboxMessage>,
-    ) -> Pin<Box<dyn Future<Output = Result<(), RepositoryError>> + Send + 'a>>;
-}
-
-/// Outbox publisher installed on a repository so commits publish immediately.
+/// There is one publish path: rows are committed **pending**, and whoever
+/// receives the ids claims, publishes and settles them through
+/// `OutboxDispatcher::dispatch_ids`. `Service::with_bus` hands the ids to a
+/// bounded worker mailbox, so the commit does not wait for the broker.
+#[derive(Clone)]
 pub struct OutboxPublisherConfig {
-    pub(crate) hook: Arc<dyn OutboxPublishHook>,
-    pub(crate) worker_id: String,
-    pub(crate) lease: Duration,
-    /// Bounded worker mailbox. When set, commit `try_send`s ids and returns;
-    /// the worker claims and publishes. When unset, the hook is the fallback
-    /// (tests, no-runtime builds).
-    pub(crate) schedule: Option<Arc<dyn Fn(Vec<String>) + Send + Sync>>,
-}
-
-/// Detach immediate publish from command completion.
-///
-/// Prefer `config.schedule`: enqueue ids onto the bounded worker and return.
-/// Without a mailbox, the hook runs on a spawned task when a Tokio runtime is
-/// current, or inline when it is not, so publish is not dropped.
-pub(crate) async fn start_immediate_publish(
-    config: &OutboxPublisherConfig,
-    ids: Vec<String>,
-    fallback_rows: Vec<OutboxMessage>,
-) {
-    if let Some(schedule) = &config.schedule {
-        if !ids.is_empty() {
-            schedule(ids);
-        }
-        return;
-    }
-    if fallback_rows.is_empty() {
-        return;
-    }
-    let hook = Arc::clone(&config.hook);
-    #[cfg(any(
-        feature = "http",
-        feature = "grpc",
-        feature = "postgres",
-        feature = "sqlite",
-        feature = "nats",
-        feature = "rabbitmq",
-        feature = "kafka",
-        test,
-    ))]
-    {
-        if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            let _ = handle.spawn(async move {
-                let _ = hook.publish_claimed(fallback_rows).await;
-            });
-            return;
-        }
-        let _ = hook.publish_claimed(fallback_rows).await;
-    }
-    #[cfg(not(any(
-        feature = "http",
-        feature = "grpc",
-        feature = "postgres",
-        feature = "sqlite",
-        feature = "nats",
-        feature = "rabbitmq",
-        feature = "kafka",
-        test,
-    )))]
-    {
-        let _ = hook.publish_claimed(fallback_rows).await;
-    }
+    after_commit: AfterCommit,
 }
 
 impl OutboxPublisherConfig {
-    /// Build the config from a publish hook, the worker id used to scope
-    /// claims, and the publish lease.
+    /// `after_commit` receives the ids of the rows each commit inserted. The
+    /// commit awaits the returned future, so it must not wait on the broker
+    /// unless the host has no background task to hand the ids to.
     pub fn new(
-        hook: Arc<dyn OutboxPublishHook>,
-        worker_id: impl Into<String>,
-        lease: Duration,
+        after_commit: impl Fn(Vec<String>) -> Pin<Box<dyn Future<Output = ()> + Send>>
+            + Send
+            + Sync
+            + 'static,
     ) -> Self {
         Self {
-            hook,
-            worker_id: worker_id.into(),
-            lease,
-            schedule: None,
+            after_commit: Arc::new(after_commit),
         }
     }
 
-    /// Install a non-blocking after-commit scheduler (bounded worker mailbox).
-    pub fn with_schedule(mut self, schedule: Arc<dyn Fn(Vec<String>) + Send + Sync>) -> Self {
-        self.schedule = Some(schedule);
-        self
+    /// Hand the ids a commit just inserted to the publisher.
+    pub(crate) async fn publish_after_commit(&self, ids: Vec<String>) {
+        if !ids.is_empty() {
+            (self.after_commit)(ids).await;
+        }
     }
 }
 
@@ -140,31 +71,31 @@ impl CommitReceipt {
     }
 }
 
-/// Builder returned by [`AggregateRepository::outbox`] and
-/// [`AggregateRepository::read_models`] that commits an aggregate together with
-/// outbox rows, relational read-model writes, and (when the repository has
-/// snapshots configured) a snapshot — all in one async transactional batch.
+/// The commit builder: commits aggregates together with their published
+/// domain events, outbox rows, schedule writes and (when the repository has
+/// snapshots configured) a snapshot, all in one transactional batch.
+/// [`AggregateRepository::commit`] is its zero-option form.
 ///
 /// Borrows the repository so it can be called through `ctx.repo()` inside async
-/// handlers. Chain `.outbox(..)` / `.read_models(..)` to stage more, then
-/// `.commit(&mut aggregate)`.
+/// handlers. Chain `.publish_events()` / `.outbox(..)` / `.schedule(..)` to
+/// stage more, then `.commit(&mut aggregate)` or `.commit_all(&mut [..])`.
 pub struct AggregateCommit<'a, R, A> {
     repo: &'a AggregateRepository<R, A>,
     publish_captured_events: bool,
     explicit_domain_events: Vec<PreparedDomainEvent>,
     outbox_messages: Vec<OutboxMessage>,
-    read_model_plans: Vec<TableWritePlan>,
+    schedules: Vec<ScheduleWrite>,
     error: Option<RepositoryError>,
 }
 
 impl<'a, R, A> AggregateCommit<'a, R, A> {
-    fn empty(repo: &'a AggregateRepository<R, A>) -> Self {
+    pub(crate) fn new(repo: &'a AggregateRepository<R, A>) -> Self {
         Self {
             repo,
             publish_captured_events: false,
             explicit_domain_events: Vec::new(),
             outbox_messages: Vec::new(),
-            read_model_plans: Vec::new(),
+            schedules: Vec::new(),
             error: None,
         }
     }
@@ -201,14 +132,19 @@ impl<'a, R, A> AggregateCommit<'a, R, A> {
         self
     }
 
-    /// Stage relational read-model writes to apply in the same transaction.
-    pub fn read_models(mut self, read_models: ReadModelWritePlanBuilder) -> Self {
-        if self.error.is_none() {
-            match read_models.into_write_plan() {
-                Ok(plan) => self.read_model_plans.push(plan),
-                Err(err) => self.error = Some(err.into()),
-            }
-        }
+    /// Schedule (or re-schedule) work for the committed aggregate
+    /// ([`crate::schedule`]), in the same transaction. It fires only where
+    /// the repository's schedules are dispatched (a schedule worker
+    /// attached, or a host that fires its own).
+    pub fn schedule(mut self, schedule: Schedule) -> Self {
+        self.schedules.push(ScheduleWrite::Arm(schedule));
+        self
+    }
+
+    /// Cancel a schedule of the committed aggregate in the same transaction
+    /// (no-op when it is not armed).
+    pub fn cancel_schedule(mut self, name: impl Into<String>) -> Self {
+        self.schedules.push(ScheduleWrite::Cancel(name.into()));
         self
     }
 }
@@ -218,8 +154,8 @@ where
     R: TransactionalCommit,
     A: Aggregate + Send,
 {
-    /// Commit the aggregate together with the staged outbox rows, read-model
-    /// writes, and a snapshot (when due) in one transaction. Command completion
+    /// Commit the aggregate together with the staged outbox rows and a
+    /// snapshot (when due) in one transaction. Command completion
     /// is this commit. When the repository has a bus (`Service::with_bus`),
     /// pending outbox ids are handed to a bounded worker after commit and do
     /// not delay the returned receipt.
@@ -229,18 +165,39 @@ where
     /// pending for the drain loop. A publish failure leaves them retryable.
     /// Without a bus, rows stay pending for a separately operated worker.
     ///
+    /// Outbox messages without a source are stamped with this aggregate.
     /// Returns a [`CommitReceipt`] carrying the inserted outbox message ids.
-    pub async fn commit(mut self, aggregate: &mut A) -> Result<CommitReceipt, RepositoryError> {
+    pub async fn commit(self, aggregate: &mut A) -> Result<CommitReceipt, RepositoryError> {
+        self.commit_all(&mut [aggregate]).await
+    }
+
+    /// Commit several aggregates of this type in one transaction, as
+    /// [`commit`](Self::commit) does one. Outbox messages are stamped with a
+    /// source only when exactly one aggregate is committed, and an explicit
+    /// [`publish`](Self::publish) needs exactly one aggregate to bind to.
+    pub async fn commit_all(
+        mut self,
+        aggregates: &mut [&mut A],
+    ) -> Result<CommitReceipt, RepositoryError> {
         if let Some(err) = self.error.take() {
             return Err(err);
         }
-        self.prepare_domain_publications(aggregate)?;
-        for message in &mut self.outbox_messages {
-            if message.source_aggregate_type.is_none()
-                && message.source_aggregate_id.is_none()
-                && message.source_sequence.is_none()
-            {
-                message.set_source(aggregate);
+        if !self.explicit_domain_events.is_empty() && aggregates.len() != 1 {
+            return Err(RepositoryError::Model(
+                "an explicit `publish` binds to one aggregate; commit exactly one".into(),
+            ));
+        }
+        for aggregate in aggregates.iter() {
+            self.prepare_domain_publications(aggregate)?;
+        }
+        if let [aggregate] = &*aggregates {
+            for message in &mut self.outbox_messages {
+                if message.source_aggregate_type.is_none()
+                    && message.source_aggregate_id.is_none()
+                    && message.source_sequence.is_none()
+                {
+                    message.set_source(&**aggregate);
+                }
             }
         }
         let outbox_message_ids: Vec<String> = self
@@ -249,62 +206,52 @@ where
             .map(|message| message.id().to_string())
             .collect();
 
-        let publisher = self.repo.outbox_publisher();
-        let mut fallback_rows = Vec::new();
-        if let Some(config) = publisher {
-            if config.schedule.is_none() {
-                let now = crate::time::now();
-                for message in &mut self.outbox_messages {
-                    message.claim_at(&config.worker_id, config.lease, now)?;
-                }
-                fallback_rows = self.outbox_messages.clone();
-            }
+        let mut snapshots = Vec::new();
+        let mut snapshot_versions = Vec::with_capacity(aggregates.len());
+        for aggregate in aggregates.iter() {
+            let (mut writes, version) = self.repo.snapshot_writes(aggregate)?;
+            snapshots.append(&mut writes);
+            snapshot_versions.push(version);
         }
-
-        let (snapshots, snapshot_version) = self.repo.snapshot_writes_for(aggregate)?;
-        let identity = StreamIdentity::new(A::aggregate_type(), aggregate.entity().id())?;
-        let stream = StreamWrite::new(identity, aggregate.entity_mut());
+        let mut streams = Vec::with_capacity(aggregates.len());
+        for aggregate in aggregates.iter_mut() {
+            let identity = stream_identity_for::<A>(aggregate.entity().id())?;
+            streams.push(StreamWrite::new(identity, aggregate.entity_mut()));
+        }
         self.repo
             .repo()
             .commit_batch(CommitBatch {
-                streams: vec![stream],
+                streams,
                 outbox_messages: self.outbox_messages,
-                read_model_plans: self.read_model_plans,
                 snapshots,
                 inbox_receipts: Vec::new(),
+                schedules: self.schedules,
             })
             .await?;
-        if let Some(version) = snapshot_version {
-            aggregate.entity_mut().set_snapshot_version(version);
+        for (aggregate, version) in aggregates.iter_mut().zip(snapshot_versions) {
+            if let Some(version) = version {
+                aggregate.entity_mut().set_snapshot_version(version);
+            }
         }
-        aggregate
-            .entity_mut()
-            .mark_domain_events_committed()
-            .map_err(domain_event_guard_repository_error)?;
 
         // Best-effort after-commit publish. Command completion is this commit;
         // publish must not delay the caller.
-        if let Some(config) = publisher {
-            start_immediate_publish(config, outbox_message_ids.clone(), fallback_rows).await;
+        if let Some(config) = self.repo.outbox_publisher() {
+            config
+                .publish_after_commit(outbox_message_ids.clone())
+                .await;
         }
 
         Ok(CommitReceipt { outbox_message_ids })
     }
 
     fn prepare_domain_publications(&mut self, aggregate: &A) -> Result<(), RepositoryError> {
-        let entity = aggregate.entity();
-        entity
-            .domain_event_commit_guard()
-            .map_err(domain_event_guard_repository_error)?;
-        let pending = entity
+        // Whether every captured event is published is checked by the
+        // commit's validation, on every path.
+        let pending = aggregate
+            .entity()
             .pending_domain_events_for_commit()
             .map_err(domain_event_guard_repository_error)?;
-        if !pending.is_empty() && !self.publish_captured_events {
-            return Err(RepositoryError::Model(
-                "aggregate has captured domain events; add `publish_events()` to the commit".into(),
-            ));
-        }
-
         if self.publish_captured_events {
             self.outbox_messages.extend(
                 pending
@@ -345,23 +292,29 @@ impl<R, A> AggregateRepository<R, A> {
     /// Start an aggregate commit that publishes its exact captured domain
     /// events.
     pub fn publish_events(&self) -> AggregateCommit<'_, R, A> {
-        AggregateCommit::empty(self).publish_events()
+        AggregateCommit::new(self).publish_events()
     }
 
     /// Start an aggregate commit with one explicitly authored outward event.
     pub fn publish<E: DomainEvent>(&self, event: E) -> AggregateCommit<'_, R, A> {
-        AggregateCommit::empty(self).publish(event)
+        AggregateCommit::new(self).publish(event)
     }
 
     /// Start a commit with an outbox message attached.
     pub fn outbox(&self, message: OutboxMessage) -> AggregateCommit<'_, R, A> {
-        AggregateCommit::empty(self).outbox(message)
+        AggregateCommit::new(self).outbox(message)
     }
 
-    /// Start a commit with relational read-model writes attached. Composes with
-    /// `.outbox(..)`, the aggregate's events, and snapshots in one transaction.
-    pub fn read_models(&self, read_models: ReadModelWritePlanBuilder) -> AggregateCommit<'_, R, A> {
-        AggregateCommit::empty(self).read_models(read_models)
+    /// Start a commit that schedules work for the aggregate
+    /// ([`AggregateCommit::schedule`]).
+    pub fn schedule(&self, schedule: Schedule) -> AggregateCommit<'_, R, A> {
+        AggregateCommit::new(self).schedule(schedule)
+    }
+
+    /// Start a commit that cancels a schedule of the aggregate
+    /// ([`AggregateCommit::cancel_schedule`]).
+    pub fn cancel_schedule(&self, name: impl Into<String>) -> AggregateCommit<'_, R, A> {
+        AggregateCommit::new(self).cancel_schedule(name)
     }
 }
 
@@ -378,7 +331,9 @@ fn domain_event_guard_repository_error(error: DomainEventCommitGuardError) -> Re
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{sourced, AggregateBuilder, Entity, InMemoryRepository, OutboxStore};
+    use crate::outbox_worker::OutboxStore;
+    use crate::repository::StreamIdentity;
+    use crate::{sourced, AggregateBuilder, Entity, InMemoryRepository, Queueable};
     use std::sync::Mutex;
 
     #[derive(Default)]
@@ -386,7 +341,7 @@ mod tests {
         entity: Entity,
     }
 
-    #[sourced(entity)]
+    #[sourced(entity, aggregate_type = "dummy")]
     impl Dummy {
         #[event("Touched")]
         fn touch(&mut self) {
@@ -423,67 +378,33 @@ mod tests {
         }
     }
 
-    struct HoldingHook {
-        started: tokio::sync::Notify,
-        gate: tokio::sync::Notify,
-        finished: Mutex<bool>,
-    }
-
-    impl OutboxPublishHook for HoldingHook {
-        fn publish_claimed<'a>(
-            &'a self,
-            claimed: Vec<OutboxMessage>,
-        ) -> Pin<Box<dyn Future<Output = Result<(), RepositoryError>> + Send + 'a>> {
-            Box::pin(async move {
-                let _ = claimed;
-                self.started.notify_waiters();
-                self.gate.notified().await;
-                *self.finished.lock().unwrap() = true;
-                Ok(())
-            })
-        }
-    }
-
     #[tokio::test]
-    async fn immediate_publish_does_not_delay_commit() {
-        let hook = Arc::new(HoldingHook {
-            started: tokio::sync::Notify::new(),
-            gate: tokio::sync::Notify::new(),
-            finished: Mutex::new(false),
-        });
+    async fn a_commit_hands_over_its_ids_and_leaves_every_row_pending() {
+        let handed_over = Arc::new(Mutex::new(Vec::new()));
+        let seen = Arc::clone(&handed_over);
         let mut repo = InMemoryRepository::new().aggregate::<Dummy>();
-        repo.set_outbox_publisher(OutboxPublisherConfig::new(
-            Arc::clone(&hook) as Arc<dyn OutboxPublishHook>,
-            "immediate:test",
-            Duration::from_secs(5),
-        ));
-
+        repo.set_outbox_publisher(OutboxPublisherConfig::new(move |ids| {
+            seen.lock().unwrap().extend(ids);
+            Box::pin(async {})
+        }));
         let mut aggregate = Dummy::default();
         aggregate.touch().unwrap();
-        let event = OutboxMessage::create("msg-hold", "DummyTouched", b"{}".to_vec()).unwrap();
+        let first = OutboxMessage::create("first", "T", vec![]).unwrap();
+        let second = OutboxMessage::create("second", "T", vec![]).unwrap();
 
-        let started = hook.started.notified();
-        let receipt = repo.outbox(event).commit(&mut aggregate).await.unwrap();
-        assert_eq!(receipt.outbox_message_ids(), ["msg-hold".to_string()]);
-        assert!(
-            !*hook.finished.lock().unwrap(),
-            "commit must return before the holding publish hook finishes"
-        );
-
-        tokio::time::timeout(Duration::from_secs(1), started)
+        repo.outbox(first)
+            .outbox(second)
+            .commit(&mut aggregate)
             .await
-            .expect("immediate publish should start");
-        hook.gate.notify_one();
-        tokio::time::timeout(Duration::from_secs(1), async {
-            loop {
-                if *hook.finished.lock().unwrap() {
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("immediate publish should finish after the gate opens");
+            .unwrap();
+
+        assert_eq!(
+            *handed_over.lock().unwrap(),
+            vec!["first".to_string(), "second".to_string()]
+        );
+        // Nothing is claimed inside the commit: the publisher claims.
+        let pending = repo.repo().outbox_store().pending(10).await.unwrap();
+        assert_eq!(pending.len(), 2);
     }
 
     #[tokio::test]
@@ -536,7 +457,13 @@ mod tests {
     }
 
     #[derive(
-        Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, crate::DomainState,
+        Clone,
+        Debug,
+        PartialEq,
+        Eq,
+        serde::Serialize,
+        serde::Deserialize,
+        crate::domain_event::DomainState,
     )]
     #[domain_state(version = 1)]
     struct PublishedCounterState {
@@ -544,7 +471,7 @@ mod tests {
         value: i64,
     }
 
-    #[derive(Default)]
+    #[derive(Default, crate::Snapshot)]
     struct PublishedCounter {
         entity: Entity,
         value: i64,
@@ -577,11 +504,64 @@ mod tests {
     }
 
     #[derive(
-        Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, crate::DomainEvent,
+        Clone,
+        Debug,
+        PartialEq,
+        Eq,
+        serde::Serialize,
+        serde::Deserialize,
+        crate::domain_event::DomainEvent,
     )]
     #[domain_event(name = "counter.notified", version = 1)]
     struct CounterNotified {
         public_value: i64,
+    }
+
+    #[tokio::test]
+    async fn a_commit_that_would_drop_captured_events_is_refused_on_every_path() {
+        let repo = InMemoryRepository::new()
+            .queued()
+            .aggregate::<PublishedCounter>()
+            .with_snapshots(1);
+        let mut counter = PublishedCounter::default();
+        counter.open("counter-plain".into()).unwrap();
+
+        // The plain commit, the batch form, an outbox commit without
+        // `publish_events()`, and a hand-built batch all refuse.
+        let plain = repo.commit(&mut counter).await.unwrap_err();
+        assert!(plain.to_string().contains("publish_events"), "{plain}");
+        let all = repo.commit_all(&mut [&mut counter]).await.unwrap_err();
+        assert!(all.to_string().contains("publish_events"), "{all}");
+        let other = OutboxMessage::create("unrelated", "T", vec![]).unwrap();
+        let outbox = repo.outbox(other).commit(&mut counter).await.unwrap_err();
+        assert!(outbox.to_string().contains("publish_events"), "{outbox}");
+        let identity =
+            StreamIdentity::new(PublishedCounter::aggregate_type(), "counter-plain").unwrap();
+        let raw = repo
+            .repo()
+            .commit_batch(CommitBatch::new(vec![StreamWrite::new(
+                identity,
+                &mut counter.entity,
+            )]))
+            .await
+            .unwrap_err();
+        assert!(raw.to_string().contains("publish_events"), "{raw}");
+        // Nothing was stored, and the occurrences are intact for a retry.
+        assert!(repo.peek("counter-plain").await.unwrap().is_none());
+        assert_eq!(counter.entity.committed_version(), 0);
+        assert_eq!(counter.entity.pending_domain_events().len(), 1);
+
+        repo.publish_events().commit(&mut counter).await.unwrap();
+        assert!(counter.entity.pending_domain_events().is_empty());
+        assert!(repo.peek("counter-plain").await.unwrap().is_some());
+        let published = repo
+            .repo()
+            .inner()
+            .outbox_store()
+            .pending(10)
+            .await
+            .unwrap();
+        assert_eq!(published.len(), 1);
     }
 
     #[tokio::test]
@@ -652,14 +632,14 @@ mod tests {
         counter.open("counter-guard".into()).unwrap();
 
         let error = repo
-            .read_models(ReadModelWritePlanBuilder::new())
+            .outbox(OutboxMessage::create("guard-msg", "counter.guard", vec![]).unwrap())
             .commit(&mut counter)
             .await
             .unwrap_err();
         assert!(matches!(
             error,
             RepositoryError::Model(ref message)
-                if message.contains("add `publish_events()`")
+                if message.contains("publish_events()")
         ));
         assert_eq!(counter.entity.committed_version(), 0);
         assert_eq!(counter.entity.pending_domain_events().len(), 1);
@@ -674,7 +654,7 @@ mod tests {
 
     #[tokio::test]
     async fn explicit_publish_serializes_its_dto_instead_of_replay_bytes() {
-        use crate::DomainEventBodyKind;
+        use crate::domain_event::DomainEventBodyKind;
 
         let repo = InMemoryRepository::new().aggregate::<Dummy>();
         let mut aggregate = Dummy::default();
@@ -709,14 +689,6 @@ mod tests {
         assert_eq!(occurrence.aggregate_sequence(), 1);
     }
 
-    #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize, crate::ReadModel)]
-    #[table("agg_commit_views")]
-    struct ComposeView {
-        #[id]
-        id: String,
-        n: i32,
-    }
-
     #[derive(Default, crate::Snapshot)]
     struct ComposeCounter {
         entity: Entity,
@@ -733,11 +705,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn read_models_and_snapshot_commit_in_one_transaction() {
-        use crate::read_model::ReadModelWritePlanBuilder;
-        use crate::{
-            Aggregate, ReadModelWorkspaceExt, RowKey, RowValue, SnapshotStore, StreamIdentity,
-        };
+    async fn aggregate_outbox_and_snapshot_commit_in_one_transaction() {
+        use crate::{Aggregate, GetStream, SnapshotStore, StreamIdentity};
 
         let repo = InMemoryRepository::new()
             .aggregate::<ComposeCounter>()
@@ -745,69 +714,11 @@ mod tests {
 
         let mut counter = ComposeCounter::default();
         counter.bump("c1".to_string()).unwrap();
-
-        let mut plan = ReadModelWritePlanBuilder::new();
-        plan.upsert(&ComposeView {
-            id: "c1".into(),
-            n: 1,
-        })
-        .unwrap();
-
-        // Read-model writes + the aggregate's events + a snapshot — one commit.
-        repo.read_models(plan).commit(&mut counter).await.unwrap();
-
-        // The read-model row is committed...
-        let loaded = repo
-            .repo()
-            .model_store()
-            .workspace()
-            .load::<ComposeView>(RowKey::new([("id", RowValue::String("c1".into()))]))
-            .one()
-            .await
-            .unwrap();
-        assert!(loaded.is_some(), "read-model row should be committed");
-
-        // ...and a snapshot was staged in the same transaction (frequency 1).
-        let identity = StreamIdentity::new(ComposeCounter::aggregate_type(), "c1").unwrap();
-        let snapshot = repo.repo().get_snapshot(&identity).await.unwrap();
-        assert!(
-            snapshot.is_some(),
-            "snapshot should be staged alongside the read-model commit"
-        );
-    }
-
-    #[tokio::test]
-    async fn aggregate_outbox_read_model_and_snapshot_commit_in_one_transaction() {
-        use crate::read_model::ReadModelWritePlanBuilder;
-        use crate::{
-            Aggregate, GetStream, ReadModelWorkspaceExt, RowKey, RowValue, SnapshotStore,
-            StreamIdentity,
-        };
-
-        let repo = InMemoryRepository::new()
-            .aggregate::<ComposeCounter>()
-            .with_snapshots(1);
-
-        let mut counter = ComposeCounter::default();
-        counter.bump("c1".to_string()).unwrap();
-
-        let mut plan = ReadModelWritePlanBuilder::new();
-        plan.upsert(&ComposeView {
-            id: "c1".into(),
-            n: 1,
-        })
-        .unwrap();
 
         let message = OutboxMessage::create("evt-c1", "counter.bumped", b"{}".to_vec()).unwrap();
 
-        // All four in one commit: aggregate events + outbox row + read-model
-        // write + snapshot.
-        let receipt = repo
-            .outbox(message)
-            .read_models(plan)
-            .commit(&mut counter)
-            .await
-            .unwrap();
+        // All three in one commit: aggregate events + outbox row + snapshot.
+        let receipt = repo.outbox(message).commit(&mut counter).await.unwrap();
         assert_eq!(receipt.outbox_message_ids(), ["evt-c1".to_string()]);
 
         let identity = StreamIdentity::new(ComposeCounter::aggregate_type(), "c1").unwrap();
@@ -828,18 +739,7 @@ mod tests {
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].id(), "evt-c1");
 
-        // 3) read-model row written
-        let loaded = repo
-            .repo()
-            .model_store()
-            .workspace()
-            .load::<ComposeView>(RowKey::new([("id", RowValue::String("c1".into()))]))
-            .one()
-            .await
-            .unwrap();
-        assert!(loaded.is_some(), "read-model row should be committed");
-
-        // 4) snapshot staged
+        // 3) snapshot staged
         assert!(
             repo.repo().get_snapshot(&identity).await.unwrap().is_some(),
             "snapshot should be staged"

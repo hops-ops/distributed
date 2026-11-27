@@ -1,13 +1,14 @@
 //! Pure, framework-neutral compiler for Distributed client artifacts.
 //!
-//! This module deliberately owns no filesystem or glob behavior. Callers load
-//! one role/application-selected manifest and the colocated GraphQL documents,
-//! then decide how to write or check the returned files.
+//! The compiler deliberately owns no filesystem or glob behavior. Callers load
+//! one role/application-selected manifest and the colocated GraphQL documents;
+//! `output` writes or checks the returned files in a directory.
 
 mod command_manifest;
 mod graphql;
 mod islands;
 mod manifest;
+mod output;
 mod projection_delta;
 mod render;
 
@@ -17,28 +18,31 @@ mod command_manifest_tests;
 use std::collections::BTreeMap;
 use std::fmt;
 
-use serde::{Deserialize, Serialize};
+pub use distributed::graphql::{ClientSurfaceIdentity, DistributedClientManifest};
+use serde::Serialize;
 use serde_json::Value as JsonValue;
 
 use graphql::compile_document;
 use manifest::ClientManifest;
+pub(crate) use output::{check_client_project, write_client_project};
 use render::render_project;
 
 /// Complete input to one deterministic client compilation.
 #[derive(Clone, Debug)]
 pub struct ClientCompileInput {
     /// The role/application-selected Distributed client manifest.
-    pub manifest: JsonValue,
-    /// Exact authorization surface expected by the caller.
-    pub selector: ClientSurfaceSelector,
+    pub manifest: DistributedClientManifest,
+    /// Exact authorization surface expected by the caller. This value only
+    /// verifies manifest provenance; it can never relabel a broader manifest.
+    pub selector: ClientSurfaceIdentity,
     /// GraphQL sources. Filesystem traversal and glob expansion stay in the CLI.
     pub documents: Vec<ClientDocument>,
 }
 
 impl ClientCompileInput {
     pub fn new(
-        manifest: JsonValue,
-        selector: ClientSurfaceSelector,
+        manifest: DistributedClientManifest,
+        selector: ClientSurfaceIdentity,
         documents: Vec<ClientDocument>,
     ) -> Self {
         Self {
@@ -47,42 +51,26 @@ impl ClientCompileInput {
             documents,
         }
     }
-}
 
-/// Explicit client authorization surface. This value only verifies manifest
-/// provenance; it can never relabel a broader manifest.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum ClientSurfaceSelector {
-    Role { name: String },
-    Application {
-        name: String,
-        eligible_roles: Vec<String>,
-        schema_roles: Vec<String>,
-    },
-}
-
-impl ClientSurfaceSelector {
-    pub fn role(name: impl Into<String>) -> Self {
-        Self::Role { name: name.into() }
-    }
-
-    pub fn application(
-        name: impl Into<String>,
-        eligible_roles: impl IntoIterator<Item = impl Into<String>>,
-        schema_roles: impl IntoIterator<Item = impl Into<String>>,
-    ) -> Self {
-        let mut eligible_roles = eligible_roles.into_iter().map(Into::into).collect::<Vec<_>>();
-        let mut schema_roles = schema_roles.into_iter().map(Into::into).collect::<Vec<_>>();
-        eligible_roles.sort();
-        eligible_roles.dedup();
-        schema_roles.sort();
-        schema_roles.dedup();
-        Self::Application {
-            name: name.into(),
-            eligible_roles,
-            schema_roles,
-        }
+    /// The same input from manifest JSON, as `distributed client-manifest`
+    /// writes it.
+    ///
+    /// # Errors
+    ///
+    /// `client.manifest.invalid` when the JSON is not exactly the manifest
+    /// shape and versions this compiler was built with.
+    pub fn from_manifest_json(
+        manifest: JsonValue,
+        selector: ClientSurfaceIdentity,
+        documents: Vec<ClientDocument>,
+    ) -> Result<Self, ClientCompileError> {
+        let manifest = serde_json::from_value(manifest).map_err(|error| {
+            ClientCompileError::manifest(
+                "client.manifest.invalid",
+                format!("invalid Distributed client manifest: {error}"),
+            )
+        })?;
+        Ok(Self::new(manifest, selector, documents))
     }
 }
 

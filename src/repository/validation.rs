@@ -12,7 +12,8 @@ use std::collections::HashSet;
 use crate::entity::{
     EventRecord, EventRecordError, BITCODE_PAYLOAD_CODEC, BITCODE_PAYLOAD_CODEC_VERSION,
 };
-use crate::outbox::{validate_outbox_message_table_write, OutboxMessage};
+use crate::outbox::OutboxMessage;
+use crate::projection_protocol::SameTransactionProjectionBatch;
 use crate::snapshot::SnapshotRecord;
 
 use super::{
@@ -23,15 +24,26 @@ use super::{
 ///
 /// This is the single validation preamble every backend runs before touching
 /// storage: duplicate-stream and duplicate-outbox rejection, entity/identity
-/// agreement, sequence-contiguity of the prepared appends, and snapshot
-/// identity agreement. Backends must not add or skip batch-shape checks
-/// locally — extending this function is what keeps them from drifting.
+/// agreement, sequence-contiguity of the prepared appends, snapshot identity
+/// agreement, and the domain-event guard. Backends must not add or skip
+/// batch-shape checks locally — extending this function is what keeps them
+/// from drifting.
+///
+/// The domain-event guard: an aggregate's capture poison fails the commit,
+/// and every domain event it captured must leave in the same commit, as an
+/// outbox row with the occurrence's id, so no commit path can persist the
+/// replay events and silently drop the publication. The one exception is
+/// `projection`: a causal command commit whose same-transaction projection
+/// consumes the occurrences (the causal workspace has already required a
+/// publication or that projection for each of them).
 pub(crate) fn validate_commit_batch<'a>(
     batch: &'a CommitBatch<'_>,
+    projection: Option<&SameTransactionProjectionBatch>,
 ) -> Result<Vec<PreparedEventAppend<'a>>, RepositoryError> {
     reject_duplicate_streams(&batch.streams)?;
     reject_duplicate_outbox_messages(&batch.outbox_messages)?;
     validate_entity_id_matches_identity(&batch.streams)?;
+    require_captured_events_are_published(batch, projection.is_some())?;
 
     let prepared = batch
         .streams
@@ -51,6 +63,37 @@ pub(crate) fn validate_commit_batch<'a>(
     Ok(prepared)
 }
 
+fn require_captured_events_are_published(
+    batch: &CommitBatch<'_>,
+    projected: bool,
+) -> Result<(), RepositoryError> {
+    for stream in &batch.streams {
+        let pending = stream
+            .entity
+            .pending_domain_events_for_commit()
+            .map_err(|error| RepositoryError::Model(error.to_string()))?;
+        if projected {
+            continue;
+        }
+        for occurrence in pending {
+            let id = occurrence.id();
+            if !batch
+                .outbox_messages
+                .iter()
+                .any(|message| message.id() == id)
+            {
+                return Err(RepositoryError::Model(format!(
+                    "aggregate `{}` captured domain event `{}` but this commit does not publish \
+                     it; commit with `publish_events()`",
+                    stream.identity,
+                    occurrence.descriptor().name
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn reject_duplicate_streams(streams: &[StreamWrite<'_>]) -> Result<(), RepositoryError> {
     let mut seen = HashSet::with_capacity(streams.len());
     for stream in streams {
@@ -67,8 +110,6 @@ fn reject_duplicate_streams(streams: &[StreamWrite<'_>]) -> Result<(), Repositor
 fn reject_duplicate_outbox_messages(messages: &[OutboxMessage]) -> Result<(), RepositoryError> {
     let mut seen = HashSet::with_capacity(messages.len());
     for message in messages {
-        validate_outbox_message_table_write(message)
-            .map_err(|err| RepositoryError::Model(err.to_string()))?;
         let id = message.id();
         if id.trim().is_empty() {
             return Err(RepositoryError::Model(
@@ -80,8 +121,13 @@ fn reject_duplicate_outbox_messages(messages: &[OutboxMessage]) -> Result<(), Re
                 "outbox message `{id}` event type must not be empty"
             )));
         }
+        if message.payload_codec.trim().is_empty() || message.payload_codec_version == 0 {
+            return Err(RepositoryError::Model(format!(
+                "outbox message `{id}` needs a payload codec and a version above zero"
+            )));
+        }
         if !seen.insert(id.to_string()) {
-            return Err(RepositoryError::DuplicateOutboxMessageInBatch { id: id.into() });
+            return Err(RepositoryError::DuplicateOutboxMessage { id: id.into() });
         }
     }
     Ok(())

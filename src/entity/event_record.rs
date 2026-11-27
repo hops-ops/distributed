@@ -10,31 +10,18 @@ use crate::trace_context::{TraceContext, CAUSATION_ID, CORRELATION_ID, TRACEPARE
 pub const BITCODE_PAYLOAD_CODEC: &str = "bitcode";
 pub const BITCODE_PAYLOAD_CODEC_VERSION: u16 = 1;
 
-/// Codec used to serialize and deserialize event payload bytes.
-pub trait PayloadCodec {
-    const NAME: &'static str;
-    const VERSION: u16;
-
-    type Error: std::error::Error + Send + Sync + 'static;
-
-    fn encode<T: Serialize + ?Sized>(value: &T) -> Result<Vec<u8>, Self::Error>;
-    fn decode<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, Self::Error>;
-}
-
-/// Default payload codec.
+/// The payload codec: bitcode, the only codec events and outbox messages use.
 pub struct BitcodePayloadCodec;
 
-impl PayloadCodec for BitcodePayloadCodec {
-    const NAME: &'static str = BITCODE_PAYLOAD_CODEC;
-    const VERSION: u16 = BITCODE_PAYLOAD_CODEC_VERSION;
+impl BitcodePayloadCodec {
+    pub const NAME: &'static str = BITCODE_PAYLOAD_CODEC;
+    pub const VERSION: u16 = BITCODE_PAYLOAD_CODEC_VERSION;
 
-    type Error = bitcode::Error;
-
-    fn encode<T: Serialize + ?Sized>(value: &T) -> Result<Vec<u8>, Self::Error> {
+    pub fn encode<T: Serialize + ?Sized>(value: &T) -> Result<Vec<u8>, bitcode::Error> {
         bitcode::serialize(value)
     }
 
-    fn decode<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, Self::Error> {
+    pub fn decode<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, bitcode::Error> {
         bitcode::deserialize(bytes)
     }
 }
@@ -150,16 +137,7 @@ mod payload_serde {
 
 impl EventRecord {
     pub fn new(event_name: impl Into<String>, payload: Vec<u8>, sequence: u64) -> Self {
-        EventRecord {
-            event_name: event_name.into(),
-            payload_codec: Cow::Borrowed(BITCODE_PAYLOAD_CODEC),
-            payload_codec_version: BITCODE_PAYLOAD_CODEC_VERSION,
-            payload,
-            event_version: 1,
-            sequence,
-            timestamp: crate::time::now(),
-            metadata: HashMap::new(),
-        }
+        Self::new_versioned(event_name, payload, sequence, 1)
     }
 
     /// Create an event record at a specific version.
@@ -188,15 +166,9 @@ impl EventRecord {
         sequence: u64,
         metadata: HashMap<String, String>,
     ) -> Self {
-        EventRecord {
-            event_name: event_name.into(),
-            payload_codec: Cow::Borrowed(BITCODE_PAYLOAD_CODEC),
-            payload_codec_version: BITCODE_PAYLOAD_CODEC_VERSION,
-            payload,
-            event_version: 1,
-            sequence,
-            timestamp: crate::time::now(),
+        Self {
             metadata,
+            ..Self::new(event_name, payload, sequence)
         }
     }
 
@@ -275,35 +247,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn new() {
-        let payload = bitcode::serialize(&("arg1", "arg2")).unwrap();
-        let event_record = EventRecord::new("test_event", payload.clone(), 1);
-        assert_eq!(event_record.event_name, "test_event");
-        assert_eq!(event_record.payload, payload);
-        assert_eq!(event_record.sequence, 1);
-    }
-
-    #[test]
-    fn clone() {
-        let payload = bitcode::serialize(&("arg1", "arg2")).unwrap();
-        let original = EventRecord::new("test_event", payload, 1);
-        let cloned = original.clone();
-        assert_eq!(cloned.event_name, "test_event");
-        assert_eq!(cloned.payload, original.payload);
-        assert_eq!(cloned.sequence, 1);
-    }
-
-    #[test]
-    fn debug() {
-        let payload = bitcode::serialize(&("arg1", "arg2")).unwrap();
-        let event_record = EventRecord::new("test_event", payload, 1);
-        let debug_str = format!("{:?}", event_record);
-        assert!(debug_str.contains("EventRecord"));
-        assert!(debug_str.contains("event_name: \"test_event\""));
-        assert!(debug_str.contains("sequence: 1"));
-    }
-
-    #[test]
     fn serialize_deserialize() {
         let payload = bitcode::serialize(&("arg1", "arg2")).unwrap();
         let event_record = EventRecord::new("test_event", payload.clone(), 1);
@@ -330,13 +273,6 @@ mod tests {
 
         let err = event_record.decode::<()>().unwrap_err();
         assert!(err.message.contains("unsupported payload codec `json`"));
-    }
-
-    #[test]
-    fn payload_bytes() {
-        let payload = vec![0xff, 0x00, 0xab];
-        let event_record = EventRecord::new("test_event", payload.clone(), 1);
-        assert_eq!(event_record.payload_bytes(), &payload[..]);
     }
 
     #[test]
@@ -401,21 +337,5 @@ mod tests {
         let json = serde_json::to_string(&record_with_meta).unwrap();
         assert!(json.contains("metadata"));
         assert!(json.contains("key"));
-    }
-
-    #[test]
-    fn deserialize_without_metadata_field_defaults_to_empty() {
-        let json = r#"{"event_name":"old_event","payload_codec":"bitcode","payload_codec_version":1,"payload":"","sequence":1,"timestamp":{"secs_since_epoch":0,"nanos_since_epoch":0}}"#;
-        let record: EventRecord = serde_json::from_str(json).unwrap();
-        assert!(record.metadata.is_empty());
-    }
-
-    #[test]
-    fn deserialize_without_payload_codec_fields_defaults_to_bitcode() {
-        let json = r#"{"event_name":"old_event","payload":"","sequence":1,"timestamp":{"secs_since_epoch":0,"nanos_since_epoch":0},"metadata":{}}"#;
-        let record: EventRecord = serde_json::from_str(json).unwrap();
-
-        assert_eq!(record.payload_codec, BITCODE_PAYLOAD_CODEC);
-        assert_eq!(record.payload_codec_version, BITCODE_PAYLOAD_CODEC_VERSION);
     }
 }

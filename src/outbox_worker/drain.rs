@@ -174,7 +174,7 @@ where
                         match self.dispatcher.dispatch_ids(&ids).await {
                             Ok(_) => backoff = self.error_backoff,
                             Err(error) => {
-                                eprintln!("outbox drain: {error}");
+                                tracing::warn!(%error, "outbox drain failed; backing off");
                                 backoff = backoff.saturating_mul(2).min(self.max_error_backoff);
                                 sleep_for = backoff;
                             }
@@ -195,7 +195,7 @@ where
                     };
                 }
                 Err(error) => {
-                    eprintln!("outbox drain: {error}");
+                    tracing::warn!(%error, "outbox drain failed; backing off");
                     sleep_for = backoff;
                     backoff = backoff.saturating_mul(2).min(self.max_error_backoff);
                 }
@@ -271,7 +271,7 @@ async fn wake_notified(wake: &Option<Arc<Notify>>) {
     }
 }
 
-/// Handle for a spawned [`OutboxDrainRunner`]. Abort-only on [`stop`]; drop
+/// Handle for a spawned [`OutboxDrainRunner`]. Abort-only on [`stop`](Self::stop); drop
 /// leaves the task running so fire-and-forget hosts stay drained.
 pub struct OutboxDrainHandle {
     join: JoinHandle<Result<(), TransportError>>,
@@ -308,10 +308,8 @@ mod tests {
         let ids = coalesce_hints(&mut rx, vec!["a".into(), "a".into(), "b".into()], 4);
         assert_eq!(ids, vec!["a", "b", "c", "d"]);
     }
-    use crate::{
-        CommitBatch, InMemoryOutboxStore, InMemoryRepository, OutboxMessage, OutboxMessageStatus,
-        TransactionalCommit,
-    };
+    use crate::outbox::{OutboxMessage, OutboxMessageStatus};
+    use crate::{CommitBatch, InMemoryOutboxStore, InMemoryRepository, TransactionalCommit};
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
@@ -358,15 +356,6 @@ mod tests {
         crate::outbox_worker::testing::block_on(future)
     }
 
-    fn load(repo: &InMemoryRepository, id: &str) -> OutboxMessage {
-        repo.outbox_storage()
-            .read()
-            .unwrap()
-            .get(id)
-            .unwrap()
-            .clone()
-    }
-
     #[tokio::test]
     async fn immediate_publish_leaves_nothing_for_the_drainer() {
         let repo = InMemoryRepository::new();
@@ -384,7 +373,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(outcome.published, 1);
-        assert_eq!(load(&repo, &id).status, OutboxMessageStatus::Published);
+        assert!(!repo.outbox_storage().read().unwrap().contains_key(&id));
 
         let drain = OutboxDrainRunner::new(OutboxDispatcher::new(
             repo.outbox_store(),
@@ -423,10 +412,11 @@ mod tests {
         .await
         .expect("drain should publish the unclaimed row");
         handle.stop().await.unwrap();
-        assert_eq!(
-            load(&repo, "evt-crash").status,
-            OutboxMessageStatus::Published
-        );
+        assert!(!repo
+            .outbox_storage()
+            .read()
+            .unwrap()
+            .contains_key("evt-crash"));
     }
 
     #[tokio::test]
@@ -584,8 +574,16 @@ mod tests {
             &'a self,
             claim: &'a OutboxClaimRef,
             error: &'a str,
+            retry_after: Duration,
         ) -> impl Future<Output = Result<(), RepositoryError>> + Send + 'a {
-            self.inner.release(claim, error)
+            self.inner.release(claim, error, retry_after)
+        }
+
+        fn requeue_failed<'a>(
+            &'a self,
+            message_id: &'a str,
+        ) -> impl Future<Output = Result<(), RepositoryError>> + Send + 'a {
+            self.inner.requeue_failed(message_id)
         }
 
         fn fail<'a>(

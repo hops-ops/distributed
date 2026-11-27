@@ -4,6 +4,8 @@ import test from 'node:test';
 
 import { build } from 'esbuild';
 
+import { FakeScheduler } from './fixtures/game-harness.mjs';
+
 import {
 	createDistributedReplica,
 	createReplicaCommandRuntime,
@@ -197,7 +199,6 @@ const commandArtifact = Object.freeze({
 			Object.freeze({
 				programId: `pp1:sha256:${'1'.repeat(64)}`,
 				bindingId: `pb1:sha256:${'2'.repeat(64)}`,
-				epoch: 'todos-v1',
 				programIrVersion: 1,
 				operationSemanticsVersion: 1
 			})
@@ -409,7 +410,7 @@ test('default snapshots redact identities, arguments, field values, and scope ma
 	assert.equal(encoded.includes('cacheScope'), false);
 });
 
-test('snapshot identity is stable for Svelte stores and React external stores', () => {
+test('snapshot identity is stable for Svelte stores and external-store readers', () => {
 	const diagnostics = createReplicaDiagnostics({ now: () => 10 });
 	const initial = diagnostics.snapshot();
 	assert.equal(diagnostics.snapshot(), initial);
@@ -419,8 +420,8 @@ test('snapshot identity is stable for Svelte stores and React external stores', 
 	const unsubscribe = subscribe((snapshot) =>
 		svelteEmissions.push(snapshot)
 	);
-	const reactSnapshot = getSnapshot();
-	assert.equal(svelteEmissions[0], reactSnapshot);
+	const externalSnapshot = getSnapshot();
+	assert.equal(svelteEmissions[0], externalSnapshot);
 
 	diagnostics.event({ kind: 'gc', records: 0 });
 	const changed = diagnostics.snapshot();
@@ -618,7 +619,7 @@ test('one diagnostics store receives both replica state and generated command ar
 			trustedPresets: commandArtifact.protocol.trustedPresets
 		})
 	});
-	replica.read(protocolTodos, {});
+	replica.retainOperation(protocolTodos, {});
 	const runtime = createReplicaCommandRuntime(
 		replica,
 		{
@@ -641,14 +642,32 @@ test('one diagnostics store receives both replica state and generated command ar
 	runtime.dispose();
 });
 
-test('replica integration exposes structural normalization, index, layer, receipt, rebase, and GC reasons', () => {
+const OtherTodos = Object.freeze({
+	...Todos,
+	id: 'Todos.v2',
+	protocol: Object.freeze({ ...Todos.protocol, operation: 'Todos.v2' }),
+	roots: Object.freeze([
+		Object.freeze({
+			...Todos.roots[0],
+			responseKey: 'otherTodos',
+			field: 'otherTodos'
+		})
+	])
+});
+
+test('replica integration exposes structural normalization, index, layer, receipt, rebase, and GC reasons', async () => {
 	let tick = 0;
 	const diagnostics = createReplicaDiagnostics({
 		maxEvents: 50,
 		now: () => ++tick
 	});
-	const replica = createDistributedReplica({ diagnostics });
-	replica.read(Todos, {});
+	const scheduler = new FakeScheduler();
+	const replica = createDistributedReplica({
+		diagnostics,
+		scheduler,
+		retentionGraceMs: 10
+	});
+	replica.retainOperation(Todos, {});
 	replica.writeResult(
 		Todos,
 		{},
@@ -702,7 +721,10 @@ test('replica integration exposes structural normalization, index, layer, receip
 	assert.equal(acceptedReceipt?.state, 'succeeded_pending_projection');
 	assert.equal(acceptedReceipt?.expectations[0].projection, 'todos');
 	replica.rejectOptimisticLayer('command-private-a');
-	replica.gc();
+	// An operation that was held and released is collected after the grace
+	// period; the one still held keeps its index and record.
+	replica.retainOperation(OtherTodos, {})();
+	await scheduler.advance(10);
 
 	const snapshot = diagnostics.snapshot();
 	assert.equal(snapshot.records.length, 1);

@@ -3,8 +3,7 @@ use sqlx::{Database, Encode, Executor, IntoArguments, QueryBuilder, Row, Transac
 use super::{
     initial_row_version, patch_values_preserving_key, push_key_predicates, quote_identifier,
     row_concurrency_conflict, row_values_from_key_and_patch, row_write_values,
-    validate_row_expected_version, validate_sql_write_plan, validate_values_match_key,
-    version_column, SqlxReadModelBackend,
+    validate_row_expected_version, validate_values_match_key, version_column, SqlxReadModelBackend,
 };
 use crate::sqlx_repo::{
     read_model_i64_from_u64, read_model_storage_error, read_model_u64_from_i64,
@@ -12,17 +11,8 @@ use crate::sqlx_repo::{
 use crate::table::{
     key_fingerprint, validate_key, validate_row_values, DeleteTableRowMutation, ExpectedVersion,
     PatchMode, PatchTableRowMutation, RowKey, RowValue, RowValues, RowWriteMode, TableColumn,
-    TableCommitOutcome, TableMutation, TableRowMutation, TableSchema, TableStoreError,
-    TableWritePlan,
+    TableMutation, TableRowMutation, TableSchema, TableStoreError, TableWritePlan,
 };
-
-pub(crate) async fn begin_read_model_tx<DB: SqlxReadModelBackend>(
-    pool: &sqlx::Pool<DB>,
-) -> Result<Transaction<'_, DB>, TableStoreError> {
-    pool.begin()
-        .await
-        .map_err(|err| read_model_storage_error(DB::BACKEND, "begin transaction", err))
-}
 
 pub(crate) async fn commit_read_model_tx<DB: SqlxReadModelBackend>(
     tx: Transaction<'_, DB>,
@@ -32,40 +22,10 @@ pub(crate) async fn commit_read_model_tx<DB: SqlxReadModelBackend>(
         .map_err(|err| read_model_storage_error(DB::BACKEND, "commit transaction", err))
 }
 
-/// Full pool→tx→commit helper kept for adapter authors; production paths use the
-/// split begin/apply/commit helpers above.
-#[allow(dead_code)]
-pub(crate) async fn commit_read_model_write_plan<DB>(
-    pool: &sqlx::Pool<DB>,
-    plan: TableWritePlan,
-    notify_enabled: bool,
-) -> Result<TableCommitOutcome, TableStoreError>
-where
-    DB: SqlxReadModelBackend,
-    for<'c> &'c mut <DB as Database>::Connection: Executor<'c, Database = DB>,
-    <DB as Database>::Arguments: IntoArguments<DB>,
-    for<'q> i64: Encode<'q, DB> + Type<DB> + sqlx::Decode<'q, DB>,
-    for<'r> &'r str: sqlx::ColumnIndex<<DB as Database>::Row>,
-{
-    validate_sql_write_plan(&plan)?;
-    let tables: std::collections::BTreeSet<String> = plan
-        .mutations
-        .iter()
-        .map(|m| m.table_name().to_string())
-        .collect();
-    let mut tx = begin_read_model_tx(pool).await?;
-    let outcome = apply_read_model_write_plan_in_tx(&mut tx, plan).await?;
-    if notify_enabled && !tables.is_empty() {
-        DB::push_change_notify(&mut *tx, &tables).await?;
-    }
-    commit_read_model_tx(tx).await?;
-    Ok(outcome)
-}
-
 pub(crate) async fn apply_read_model_write_plan_in_tx<DB>(
     tx: &mut Transaction<'_, DB>,
     plan: TableWritePlan,
-) -> Result<TableCommitOutcome, TableStoreError>
+) -> Result<(), TableStoreError>
 where
     DB: SqlxReadModelBackend,
     for<'c> &'c mut <DB as Database>::Connection: Executor<'c, Database = DB>,
@@ -73,7 +33,7 @@ where
     for<'q> i64: Encode<'q, DB> + Type<DB> + sqlx::Decode<'q, DB>,
     for<'r> &'r str: sqlx::ColumnIndex<<DB as Database>::Row>,
 {
-    validate_sql_write_plan(&plan)?;
+    plan.validate()?;
 
     for mutation in plan.mutations {
         match mutation {
@@ -89,7 +49,7 @@ where
         }
     }
 
-    Ok(TableCommitOutcome::applied())
+    Ok(())
 }
 
 pub(crate) async fn upsert_relational_row_in_tx<DB>(

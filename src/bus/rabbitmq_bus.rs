@@ -20,7 +20,7 @@
 //! queues. `{ns}` (namespace) scopes queue and exchange names so multiple apps can
 //! share a broker.
 //!
-//! Requires the `rabbitmq` feature. Integration-tested in `tests/rabbitmq_transport`.
+//! Requires the `rabbitmq` feature. Integration-tested in `tests/transports/rabbitmq_transport`.
 
 use std::collections::HashSet;
 use std::future::{Future, IntoFuture};
@@ -28,16 +28,15 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
 use lapin::options::{
-    BasicPublishOptions, ConfirmSelectOptions, ExchangeDeclareOptions, QueueBindOptions,
-    QueueDeclareOptions,
+    ConfirmSelectOptions, ExchangeDeclareOptions, QueueBindOptions, QueueDeclareOptions,
 };
 use lapin::types::{FieldTable, ShortString};
 use lapin::{Channel, ExchangeKind};
 
-use super::rabbitmq::{connect_channel, message_properties, RabbitSource};
+use super::rabbitmq::{connect_channel, publish_confirmed, RabbitSource};
 use super::{
-    retryable, run_source, Bus, BusConsumer, BusTopologyConfig, MessageRouter, RunOptions,
-    TransportError,
+    retryable, run_source, Bus, BusConsumer, BusTopologyConfig, MessageRouter, PublishDeadLetters,
+    RunOptions, TransportError,
 };
 use super::{validate_message_name, Message};
 
@@ -48,6 +47,19 @@ fn checked_name(name: &str) -> Result<(), TransportError> {
     validate_message_name(name)
         .map(|_| ())
         .map_err(|e| TransportError::permanent(format!("rabbitmq message name {e}")))
+}
+
+impl Clone for RabbitBus {
+    /// The clone shares the channel and starts with an empty declaration
+    /// cache, so it re-declares each name once.
+    fn clone(&self) -> Self {
+        Self {
+            uri: self.uri.clone(),
+            channel: self.channel.clone(),
+            topology: self.topology.clone(),
+            declared: Mutex::new(HashSet::new()),
+        }
+    }
 }
 
 /// RabbitMQ [`Bus`] + [`BusConsumer`].
@@ -251,33 +263,6 @@ impl RabbitBus {
         Ok(())
     }
 
-    async fn publish_confirmed(
-        &self,
-        exchange: &str,
-        routing_key: &str,
-        message: &Message,
-    ) -> Result<(), TransportError> {
-        let confirm = self
-            .channel
-            .basic_publish(
-                ShortString::from(exchange),
-                ShortString::from(routing_key),
-                BasicPublishOptions::default(),
-                &message.payload,
-                message_properties(message),
-            )
-            .await
-            .map_err(|err| retryable("amqp publish", err))?;
-        if confirm
-            .await
-            .map_err(|err| retryable("amqp publisher confirm", err))?
-            .is_nack()
-        {
-            return Err(TransportError::retryable("amqp publisher confirm: nack"));
-        }
-        Ok(())
-    }
-
     /// Declare the topic exchange, this group's queue, and bind it to the
     /// service's event names — the durable setup `subscribe` needs. Exposed so a
     /// producer can ensure all subscriber bindings exist *before* publishing
@@ -320,7 +305,7 @@ impl Bus for RabbitBus {
         let queue = self.command_queue(message.name())?;
         self.ensure_command_queue(&queue).await?;
         message.name = queue.clone();
-        self.publish_confirmed("", &queue, &message).await
+        publish_confirmed(&self.channel, "", &queue, message).await
     }
 
     async fn publish_message(&self, message: Message) -> Result<(), TransportError> {
@@ -328,8 +313,7 @@ impl Bus for RabbitBus {
         let exchange = self.events_exchange()?;
         self.ensure_events_exchange(&exchange).await?;
         let routing_key = message.name().to_string();
-        self.publish_confirmed(&exchange, &routing_key, &message)
-            .await
+        publish_confirmed(&self.channel, &exchange, &routing_key, message).await
     }
 }
 
@@ -351,6 +335,7 @@ impl BusConsumer for RabbitBus {
             queues.push(queue);
         }
         let source = RabbitSource::multi(channel, queues, Some(self.command_prefix()?));
+        let options = options.or_dead_letters(|| Arc::new(PublishDeadLetters(self.clone())));
         run_source(router, source, options).await
     }
 
@@ -369,6 +354,7 @@ impl BusConsumer for RabbitBus {
         let channel = connect_channel(&self.uri).await?;
         // Events are published with routing key == the bare event name.
         let source = RabbitSource::multi(channel, vec![self.group_queue(&group)?], None);
+        let options = options.or_dead_letters(|| Arc::new(PublishDeadLetters(self.clone())));
         run_source(router, source, options).await
     }
 }

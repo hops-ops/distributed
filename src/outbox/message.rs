@@ -8,7 +8,7 @@ use crate::domain_event::{
     DomainEvent, DomainEventCaptureError, DomainEventDescriptor, DomainEventEnvelope,
     DomainEventOccurrence,
 };
-use crate::entity::{BitcodePayloadCodec, Entity, EventRecordError, PayloadCodec};
+use crate::entity::{BitcodePayloadCodec, Entity, EventRecordError};
 use crate::trace_context::{TraceContext, CAUSATION_ID, CORRELATION_ID, TRACEPARENT, TRACESTATE};
 use crate::SourcedResult;
 
@@ -68,7 +68,6 @@ pub enum OutboxMessageStatus {
     #[default]
     Pending,
     InFlight,
-    Published,
     Failed,
 }
 
@@ -77,7 +76,6 @@ impl OutboxMessageStatus {
         match self {
             Self::Pending => "pending",
             Self::InFlight => "in_flight",
-            Self::Published => "published",
             Self::Failed => "failed",
         }
     }
@@ -90,7 +88,6 @@ impl std::str::FromStr for OutboxMessageStatus {
         match value {
             "pending" => Ok(Self::Pending),
             "in_flight" => Ok(Self::InFlight),
-            "published" => Ok(Self::Published),
             "failed" => Ok(Self::Failed),
             _ => Err(()),
         }
@@ -125,6 +122,12 @@ pub struct OutboxMessage {
     pub source_aggregate_type: Option<String>,
     pub source_aggregate_id: Option<String>,
     pub source_sequence: Option<u64>,
+    /// Earliest time a worker may claim this message again after a failed
+    /// publish was released with a backoff (`next_available_at` in SQL).
+    /// Worker-owned delivery state: a new message is always claimable at
+    /// once. Durable timers are [`Schedule`](crate::schedule::Schedule)s.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) available_at: Option<SystemTime>,
 }
 
 impl Default for OutboxMessage {
@@ -146,6 +149,7 @@ impl Default for OutboxMessage {
             source_aggregate_type: None,
             source_aggregate_id: None,
             source_sequence: None,
+            available_at: None,
         }
     }
 }
@@ -297,9 +301,11 @@ impl OutboxMessage {
                 ),
             )
             .map_err(|error| DomainEventCaptureError::BodyEncoding(error.to_string()))?;
-        message.source_aggregate_type = Some(occurrence.aggregate_type().to_string());
-        message.source_aggregate_id = Some(occurrence.aggregate_id().to_string());
-        message.source_sequence = Some(occurrence.aggregate_sequence());
+        if occurrence.external_source().is_none() {
+            message.source_aggregate_type = Some(occurrence.aggregate_type().to_string());
+            message.source_aggregate_id = Some(occurrence.aggregate_id().to_string());
+            message.source_sequence = Some(occurrence.aggregate_sequence());
+        }
         Ok(message)
     }
 
@@ -348,6 +354,13 @@ impl OutboxMessage {
         &self.id
     }
 
+    /// When a released message may be claimed again: the release time plus
+    /// its retry backoff. `None` for a message never released with a delay
+    /// (claimable at once).
+    pub fn available_at(&self) -> Option<SystemTime> {
+        self.available_at
+    }
+
     pub fn payload_str(&self) -> Option<&str> {
         std::str::from_utf8(&self.payload).ok()
     }
@@ -360,10 +373,6 @@ impl OutboxMessage {
         self.status == OutboxMessageStatus::InFlight
     }
 
-    pub fn is_published(&self) -> bool {
-        self.status == OutboxMessageStatus::Published
-    }
-
     pub fn is_failed(&self) -> bool {
         self.status == OutboxMessageStatus::Failed
     }
@@ -372,8 +381,11 @@ impl OutboxMessage {
         self.is_in_flight() && self.leased_until.map(|until| until <= now).unwrap_or(true)
     }
 
+    /// Whether the message is claimable at `now`: pending and past any
+    /// release backoff, or in flight with an expired lease.
     pub fn is_claimable_at(&self, now: SystemTime) -> bool {
-        self.is_pending() || self.has_expired_lease_at(now)
+        (self.is_pending() && self.available_at.is_none_or(|at| at <= now))
+            || self.has_expired_lease_at(now)
     }
 
     pub fn is_claimed_by(&self, worker_id: &str) -> bool {
@@ -439,6 +451,7 @@ impl OutboxMessage {
         self.source_aggregate_type = None;
         self.source_aggregate_id = None;
         self.source_sequence = None;
+        self.available_at = None;
         Ok(())
     }
 
@@ -516,25 +529,16 @@ impl OutboxMessage {
         Ok(until)
     }
 
-    pub fn complete(&mut self) -> SourcedResult {
-        if !self.is_in_flight() {
-            return Err(EventRecordError {
-                message: format!("outbox message `{}` is not in flight", self.id),
-            });
-        }
-        self.status = OutboxMessageStatus::Published;
-        self.worker_id = None;
-        self.leased_until = None;
-        Ok(())
-    }
-
-    pub fn release(&mut self, error: String) -> SourcedResult {
+    /// Hand an in-flight message back for another attempt, claimable from
+    /// `available_at` on.
+    pub fn release(&mut self, error: String, available_at: SystemTime) -> SourcedResult {
         if !self.is_in_flight() {
             return Err(EventRecordError {
                 message: format!("outbox message `{}` is not in flight", self.id),
             });
         }
         self.status = OutboxMessageStatus::Pending;
+        self.available_at = Some(available_at);
         self.last_error = if error.is_empty() { None } else { Some(error) };
         self.worker_id = None;
         self.leased_until = None;
@@ -542,7 +546,7 @@ impl OutboxMessage {
     }
 
     pub fn fail(&mut self, error: String) -> SourcedResult {
-        if !self.can_fail() {
+        if self.is_failed() {
             return Err(EventRecordError {
                 message: format!("outbox message `{}` cannot be failed", self.id),
             });
@@ -554,8 +558,18 @@ impl OutboxMessage {
         Ok(())
     }
 
-    fn can_fail(&self) -> bool {
-        self.status != OutboxMessageStatus::Published && self.status != OutboxMessageStatus::Failed
+    /// Put a failed message back in the queue with a fresh attempt count,
+    /// claimable at once.
+    pub fn requeue(&mut self) -> SourcedResult {
+        if self.status != OutboxMessageStatus::Failed {
+            return Err(EventRecordError {
+                message: format!("outbox message `{}` is not failed", self.id),
+            });
+        }
+        self.status = OutboxMessageStatus::Pending;
+        self.attempts = 0;
+        self.available_at = None;
+        Ok(())
     }
 
     /// Set a single metadata key-value pair.
@@ -657,7 +671,7 @@ mod tests {
     }
 
     #[test]
-    fn claim_and_complete() {
+    fn claim_moves_the_message_in_flight() {
         let mut message = OutboxMessage::new();
         message
             .initialize(
@@ -673,9 +687,6 @@ mod tests {
             .unwrap();
         assert!(message.is_in_flight());
         assert_eq!(message.attempts, 1);
-
-        message.complete().unwrap();
-        assert!(message.is_published());
     }
 
     #[test]
@@ -870,7 +881,9 @@ mod tests {
             .claim_for("worker-1", Duration::from_secs(60))
             .unwrap();
 
-        message.release("timeout".into()).unwrap();
+        message
+            .release("timeout".into(), SystemTime::UNIX_EPOCH)
+            .unwrap();
         assert!(message.is_pending());
         assert_eq!(message.last_error.as_deref(), Some("timeout"));
 

@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use super::*;
 
 pub(crate) fn canonicalize_projectors(
-    projectors: &mut [ManifestProjector],
+    projectors: &mut [ClientProjector],
 ) -> Result<(), ClientCompileError> {
     for projector in projectors.iter_mut() {
         canonicalize_string_set(
@@ -24,8 +24,8 @@ pub(crate) fn canonicalize_projectors(
 }
 
 pub(crate) fn validate_projectors(
-    projectors: &[ManifestProjector],
-    models: &BTreeMap<String, ManifestModel>,
+    projectors: &[ClientProjector],
+    models: &BTreeMap<String, ClientModel>,
 ) -> Result<(), ClientCompileError> {
     let mut names = BTreeSet::new();
     for projector in projectors {
@@ -47,15 +47,6 @@ pub(crate) fn validate_projectors(
                 "client.manifest.projector_inventory",
                 format!(
                     "projection owner `{}` must declare at least one model",
-                    projector.name
-                ),
-            ));
-        }
-        if projector.facts.is_empty() && projector.causal_confirmation {
-            return Err(ClientCompileError::manifest(
-                "client.manifest.projector_inventory",
-                format!(
-                    "direct-only projection owner `{}` cannot provide asynchronous confirmation",
                     projector.name
                 ),
             ));
@@ -92,16 +83,16 @@ pub(crate) fn validate_projectors(
 }
 
 pub(crate) fn validate_direct_projections(
-    commands: &[ManifestCommand],
-    models: &BTreeMap<String, ManifestModel>,
-    projectors: &[ManifestProjector],
+    commands: &[ClientCommand],
+    models: &BTreeMap<String, ClientModel>,
+    projectors: &[ClientProjector],
 ) -> Result<BTreeSet<String>, ClientCompileError> {
     let mut requiring_revalidation = BTreeSet::new();
     for command in commands {
         let consistency = command.extensions.consistency.kind;
         let direct = command.extensions.direct_projection.as_ref();
         match (consistency, direct) {
-            (ManifestConsistencyKind::Atomic, None) => {
+            (CommandConsistency::Atomic, None) => {
                 return Err(ClientCompileError::manifest(
                     "client.manifest.direct_projection_required",
                     format!(
@@ -110,7 +101,7 @@ pub(crate) fn validate_direct_projections(
                     ),
                 ));
             }
-            (ManifestConsistencyKind::Atomic, Some(direct)) => {
+            (CommandConsistency::Atomic, Some(direct)) => {
                 if validate_direct_projection(command, direct, models, projectors)? {
                     requiring_revalidation.insert(command.name.clone());
                 }
@@ -131,10 +122,10 @@ pub(crate) fn validate_direct_projections(
 }
 
 pub(crate) fn validate_direct_projection(
-    command: &ManifestCommand,
-    direct: &ManifestDirectProjection,
-    models: &BTreeMap<String, ManifestModel>,
-    projectors: &[ManifestProjector],
+    command: &ClientCommand,
+    direct: &CommandDirectProjectionExtension,
+    models: &BTreeMap<String, ClientModel>,
+    projectors: &[ClientProjector],
 ) -> Result<bool, ClientCompileError> {
     if direct.topology.version != 1 {
         return Err(ClientCompileError::manifest(
@@ -159,13 +150,6 @@ pub(crate) fn validate_direct_projection(
             command.name
         ),
     )?;
-    validate_projection_epoch(
-        &direct.change_epoch,
-        &format!(
-            "manifest command `{}` direct projection change_epoch",
-            command.name
-        ),
-    )?;
     validate_graphql_name(
         &direct.model,
         &format!(
@@ -182,10 +166,7 @@ pub(crate) fn validate_direct_projection(
             ),
         )
     })?;
-    if !matches!(
-        &model.normalization,
-        ManifestNormalization::Normalized { .. }
-    ) {
+    if !matches!(&model.normalization, ModelNormalization::Normalized { .. }) {
         return Err(ClientCompileError::manifest(
             "client.manifest.direct_projection_model",
             format!(
@@ -194,7 +175,7 @@ pub(crate) fn validate_direct_projection(
             ),
         ));
     }
-    let ManifestCommandShape::Object { definition } = &command.output else {
+    let ClientCommandShape::Object { definition } = &command.output else {
         return Err(ClientCompileError::manifest(
             "client.manifest.direct_projection_output",
             format!(
@@ -305,26 +286,12 @@ pub(crate) fn validate_projection_name(value: &str, label: &str) -> Result<(), C
     Ok(())
 }
 
-pub(crate) fn validate_projection_epoch(
-    value: &str,
-    label: &str,
-) -> Result<(), ClientCompileError> {
-    validate_nonempty(value, label)?;
-    if value.len() > 128 || value.chars().any(char::is_control) {
-        return Err(ClientCompileError::manifest(
-            "client.manifest.direct_projection_epoch",
-            format!("{label} must be at most 128 bytes without control characters"),
-        ));
-    }
-    Ok(())
-}
-
 pub(crate) fn validate_direct_projection_partition(
-    command: &ManifestCommand,
-    partition: &ManifestEffectExpression,
+    command: &ClientCommand,
+    partition: &EffectExpression,
 ) -> Result<bool, ClientCompileError> {
     match partition {
-        ManifestEffectExpression::Input { path } => {
+        EffectExpression::Input { path } => {
             if path.is_empty() {
                 return Err(ClientCompileError::manifest(
                     "client.manifest.direct_projection_partition",
@@ -341,7 +308,7 @@ pub(crate) fn validate_direct_projection_partition(
                     command.name
                 ),
             )?;
-            let ManifestCommandShape::Object { definition } = &command.input else {
+            let ClientCommandShape::Object { definition } = &command.input else {
                 return Err(ClientCompileError::manifest(
                     "client.manifest.direct_projection_partition",
                     format!(
@@ -402,7 +369,7 @@ pub(crate) fn validate_direct_projection_partition(
             }
             unreachable!("non-empty direct projection path resolves or returns an error")
         }
-        ManifestEffectExpression::TrustedPreset { name } => {
+        EffectExpression::TrustedPreset { name } => {
             let declared = command
                 .extensions
                 .trusted_presets
@@ -419,6 +386,6 @@ pub(crate) fn validate_direct_projection_partition(
             }
             Ok(false)
         }
-        ManifestEffectExpression::Constant { .. } | ManifestEffectExpression::Null => Ok(false),
+        EffectExpression::Constant { .. } | EffectExpression::Null => Ok(false),
     }
 }

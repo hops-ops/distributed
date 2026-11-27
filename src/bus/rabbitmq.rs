@@ -8,21 +8,21 @@
 //! exchange when one is configured on the queue).
 //!
 //! Requires the `rabbitmq` feature. Integration-tested in
-//! `tests/rabbitmq_transport` against a broker (see `compose.yaml`).
+//! `tests/transports/rabbitmq_transport` against a broker (see `compose.yaml`).
+
+use std::time::Duration;
 
 use lapin::message::Delivery;
 use lapin::options::{
-    BasicAckOptions, BasicGetOptions, BasicNackOptions, BasicPublishOptions, BasicRejectOptions,
-    ConfirmSelectOptions, QueueDeclareOptions,
+    BasicAckOptions, BasicGetOptions, BasicNackOptions, BasicPublishOptions, ConfirmSelectOptions,
+    QueueDeclareOptions,
 };
 use lapin::types::{AMQPValue, FieldTable, ShortString};
 use lapin::{BasicProperties, Channel, Connection, ConnectionProperties};
 
 use super::source::{MessageSource, ReceivedMessage};
-use super::{message_from_wire, strip_address_prefix, Message};
 use super::{retryable, MessagePublisher, TransportError};
-
-const MESSAGE_KIND_HEADER: &str = "x-sourced-kind";
+use super::{strip_address_prefix, Message, WireEnvelope};
 
 fn settle_result(context: &str, settled: bool) -> Result<(), TransportError> {
     if settled {
@@ -66,47 +66,44 @@ impl RabbitPublisher {
     }
 }
 
-pub(super) fn message_properties(message: &Message) -> BasicProperties {
+/// Publish `message` to `exchange` with `routing_key` and wait for the
+/// publisher confirm. The message travels as a [`WireEnvelope`]: its headers
+/// are the AMQP header table, its payload the body.
+pub(super) async fn publish_confirmed(
+    channel: &Channel,
+    exchange: &str,
+    routing_key: &str,
+    message: Message,
+) -> Result<(), TransportError> {
+    let envelope = WireEnvelope::encode(message)?;
     let mut headers = FieldTable::default();
-    headers.insert(
-        ShortString::from(MESSAGE_KIND_HEADER),
-        AMQPValue::LongString(message.kind.as_str().into()),
-    );
-    for (key, value) in &message.metadata {
-        headers.insert(
-            ShortString::from(key.as_str()),
-            AMQPValue::LongString(value.as_str().into()),
-        );
+    for (key, value) in envelope.headers {
+        headers.insert(ShortString::from(key), AMQPValue::LongString(value.into()));
     }
-    let mut properties = BasicProperties::default()
-        .with_headers(headers)
-        .with_content_type(ShortString::from(message.content_type.as_str()));
-    if let Some(id) = message.id() {
-        properties = properties.with_message_id(ShortString::from(id));
+    let confirm = channel
+        .basic_publish(
+            ShortString::from(exchange),
+            ShortString::from(routing_key),
+            BasicPublishOptions::default(),
+            &envelope.payload,
+            BasicProperties::default().with_headers(headers),
+        )
+        .await
+        .map_err(|err| retryable("amqp publish", err))?;
+    let confirmation = confirm
+        .await
+        .map_err(|err| retryable("amqp publisher confirm", err))?;
+    if confirmation.is_nack() {
+        return Err(TransportError::retryable("amqp publisher confirm: nack"));
     }
-    properties
+    Ok(())
 }
 
 impl MessagePublisher for RabbitPublisher {
     async fn publish(&self, message: Message) -> Result<(), TransportError> {
-        let confirm = self
-            .channel
-            .basic_publish(
-                ShortString::from(""), // default exchange: routes to the queue named by the routing key
-                ShortString::from(message.name()),
-                BasicPublishOptions::default(),
-                &message.payload,
-                message_properties(&message),
-            )
-            .await
-            .map_err(|err| retryable("amqp publish", err))?;
-        let confirmation = confirm
-            .await
-            .map_err(|err| retryable("amqp publisher confirm", err))?;
-        if confirmation.is_nack() {
-            return Err(TransportError::retryable("amqp publisher confirm: nack"));
-        }
-        Ok(())
+        // The default exchange routes to the queue named by the routing key.
+        let routing_key = message.name.clone();
+        publish_confirmed(&self.channel, "", &routing_key, message).await
     }
 }
 
@@ -116,10 +113,12 @@ impl MessagePublisher for RabbitPublisher {
 ///
 /// Polling is *sticky*: each `recv` starts at the queue that last yielded a
 /// message, so draining a busy queue costs one `basic_get` per message instead
-/// of re-polling every just-empty queue each time. A full empty cycle over all
-/// queues is still required before returning `Ok(None)`, preserving the
-/// drain-to-idle contract. (`basic_consume` with prefetch would push messages
-/// with no broker-side "drained" signal, so `basic_get` stays.)
+/// of re-polling every just-empty queue each time. `recv` reports nothing
+/// available after one empty cycle over all queues; an idle consumer then
+/// waits [`POLL_INTERVAL`] before the next cycle.
+/// How long an idle [`RabbitSource`] waits between polls.
+pub const POLL_INTERVAL: Duration = Duration::from_millis(50);
+
 pub struct RabbitSource {
     channel: Channel,
     queues: Vec<String>,
@@ -201,12 +200,17 @@ impl MessageSource for RabbitSource {
         }
         Ok(None)
     }
+
+    async fn ready(&mut self) {
+        tokio::time::sleep(POLL_INTERVAL).await
+    }
 }
 
 /// An AMQP delivery plus its settle handle.
 pub struct RabbitReceived {
     delivery: Delivery,
     message: Message,
+    decode_error: Option<TransportError>,
 }
 
 impl RabbitReceived {
@@ -223,25 +227,37 @@ impl RabbitReceived {
             .flat_map(|headers| headers.inner())
             .map(|(key, value)| (key.to_string(), amqp_value_to_string(value)))
             .collect();
-        // The id rides in the AMQP `message_id` property, not a header.
-        let mut message = message_from_wire(name, payload, None, MESSAGE_KIND_HEADER, headers);
-        message.id = delivery
-            .properties
-            .message_id()
-            .as_ref()
-            .map(|s| s.to_string());
-        // Preserve the publisher's content type instead of the Message::new
-        // default, so non-JSON payloads survive the round-trip.
-        if let Some(content_type) = delivery.properties.content_type().as_ref() {
-            message.content_type = content_type.to_string();
+        let (message, decode_error) = WireEnvelope {
+            name,
+            headers,
+            payload,
         }
-        Self { delivery, message }
+        .decode();
+        Self {
+            delivery,
+            message,
+            decode_error,
+        }
     }
 }
 
 impl ReceivedMessage for RabbitReceived {
     fn message(&self) -> &Message {
         &self.message
+    }
+
+    /// AMQP reports only whether a delivery is a redelivery, so this is 1 or
+    /// 2: a retry limit above 2 never triggers on RabbitMQ.
+    fn attempts(&self) -> u32 {
+        if self.delivery.redelivered {
+            2
+        } else {
+            1
+        }
+    }
+
+    fn decode_error(&self) -> Option<&TransportError> {
+        self.decode_error.as_ref()
     }
 
     async fn ack(self) -> Result<(), TransportError> {
@@ -253,8 +269,10 @@ impl ReceivedMessage for RabbitReceived {
         settle_result("amqp ack", settled)
     }
 
-    async fn nack(self, _reason: &str) -> Result<(), TransportError> {
-        // Requeue for redelivery.
+    async fn nack(self, delay: Duration) -> Result<(), TransportError> {
+        // The delivery stays unacknowledged for the delay, then is requeued.
+        // If this consumer dies first, the broker requeues it at once.
+        tokio::time::sleep(delay).await;
         let settled = self
             .delivery
             .nack(BasicNackOptions {
@@ -264,26 +282,6 @@ impl ReceivedMessage for RabbitReceived {
             .await
             .map_err(|err| retryable("amqp nack", err))?;
         settle_result("amqp nack", settled)
-    }
-
-    async fn dead_letter(self, _reason: &str) -> Result<(), TransportError> {
-        // Reject without requeue: routes to the queue's dead-letter exchange if
-        // one is configured, otherwise drops.
-        let settled = self
-            .delivery
-            .reject(BasicRejectOptions { requeue: false })
-            .await
-            .map_err(|err| retryable("amqp reject", err))?;
-        settle_result("amqp reject", settled)
-    }
-
-    async fn park(self, _reason: &str) -> Result<(), TransportError> {
-        let settled = self
-            .delivery
-            .reject(BasicRejectOptions { requeue: false })
-            .await
-            .map_err(|err| retryable("amqp reject", err))?;
-        settle_result("amqp reject", settled)
     }
 }
 

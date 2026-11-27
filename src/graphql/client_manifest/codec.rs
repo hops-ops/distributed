@@ -6,7 +6,7 @@ pub(super) fn row_policy_manifest(policy: &SurfaceRowPolicy) -> ClientRowPolicy 
         SurfaceRowPolicy::Predicate(predicate) => ClientRowPolicy::Predicate {
             expression: predicate.clone(),
         },
-        SurfaceRowPolicy::ServerOnly => ClientRowPolicy::ServerOnly,
+        SurfaceRowPolicy::ServerOnly(_) => ClientRowPolicy::ServerOnly,
     }
 }
 
@@ -52,6 +52,13 @@ pub(super) fn filter_input(
     })
 }
 
+/// The filter operators a generated client may use: the dialect-neutral set.
+///
+/// One application presents one client contract (and schema hash) whatever
+/// database serves it. Postgres also accepts its `jsonb` operators
+/// (`_contains`, `_contained_in`, `_has_key`) on JSON columns, but only in its
+/// GraphQL schema: a client compiled from this manifest cannot emit an
+/// operator a SQLite server would reject.
 fn filter_fields(
     surface: &Surface,
     model: &crate::graphql::surface::SurfaceModel,
@@ -64,6 +71,9 @@ fn filter_fields(
             operators: surface
                 .comparison_ops_for_scalar(&field.scalar)
                 .into_iter()
+                .filter(|op| {
+                    crate::graphql::naming::comparison_op_fields(&field.scalar, false).contains(op)
+                })
                 .map(str::to_string)
                 .collect(),
         })
@@ -184,7 +194,17 @@ fn client_type(definition: &SurfaceTypeDef) -> Result<ClientTypeDef, ClientManif
             .map(client_type)
             .transpose()?
             .map(Box::new);
-        let codec = scalar_codec(&field.type_name).map(str::to_string);
+        if field.unsigned_integer.is_some() && (field.type_name != "BigInt" || nested.is_some()) {
+            return Err(ClientManifestError(format!(
+                "command type `{}` field `{}` has an invalid unsigned refinement",
+                definition.name, field.name
+            )));
+        }
+        let codec = field
+            .unsigned_integer
+            .map(|unsigned| unsigned.client_codec())
+            .or_else(|| scalar_codec(&field.type_name))
+            .map(str::to_string);
         if codec.is_none() && nested.is_none() {
             return Err(ClientManifestError(format!(
                 "command type `{}` field `{}` uses unknown scalar/object `{}`",
@@ -245,23 +265,27 @@ pub(super) fn scalar_codec(scalar: &str) -> Option<&'static str> {
     }
 }
 
-pub(super) fn protocol_fingerprint() -> Result<String, ClientManifestError> {
-    #[derive(Serialize)]
-    struct ProtocolMaterial {
-        manifest_version: u32,
-        protocol_version: u32,
-        key_encoding: &'static str,
-        command_extension_slots_version: u32,
-        projector_entry_version: u32,
-        protocol_operations_version: u32,
-        query_capabilities_version: u32,
-        projection_program_version: u32,
-        projection_binding_version: u32,
-        projection_operation_semantics_version: u32,
-        command_projection_extension_version: u32,
-        scalar_codecs: Vec<ScalarCodec>,
-    }
-    hash_json(&ProtocolMaterial {
+/// Everything the client protocol fingerprint commits to: the wire versions
+/// and scalar codecs every manifest this crate exports (or accepts) uses.
+#[derive(Serialize)]
+pub(super) struct ProtocolMaterial {
+    manifest_version: u32,
+    protocol_version: u32,
+    key_encoding: &'static str,
+    command_extension_slots_version: u32,
+    projector_entry_version: u32,
+    protocol_operations_version: u32,
+    query_capabilities_version: u32,
+    projection_program_version: u32,
+    projection_binding_version: u32,
+    projection_operation_semantics_version: u32,
+    command_projection_extension_version: u32,
+    unsigned_command_codecs_version: u32,
+    scalar_codecs: Vec<ScalarCodec>,
+}
+
+pub(super) fn protocol_material() -> ProtocolMaterial {
+    ProtocolMaterial {
         manifest_version: DISTRIBUTED_CLIENT_PROTOCOL_MANIFEST_EPOCH,
         protocol_version: DISTRIBUTED_CLIENT_PROTOCOL_VERSION,
         key_encoding: KEY_ENCODING,
@@ -275,8 +299,19 @@ pub(super) fn protocol_fingerprint() -> Result<String, ClientManifestError> {
             super::projections::CLIENT_PROJECTION_OPERATION_SEMANTICS_VERSION,
         command_projection_extension_version:
             super::projections::COMMAND_PROJECTION_EXTENSION_VERSION,
+        unsigned_command_codecs_version: 1,
         scalar_codecs: supported_scalar_codecs(),
-    })
+    }
+}
+
+/// Fingerprint of the client protocol family this crate speaks: the hash of
+/// `protocol_material`.
+///
+/// # Errors
+///
+/// Never in practice; the material is plain data.
+pub fn client_protocol_fingerprint() -> Result<String, ClientManifestError> {
+    hash_json(&protocol_material())
 }
 
 pub(super) fn hash_json(value: &impl Serialize) -> Result<String, ClientManifestError> {
@@ -290,7 +325,7 @@ pub(super) fn hash_json(value: &impl Serialize) -> Result<String, ClientManifest
 /// enabled serde_json's `preserve_order` feature in the final Cargo graph.
 /// Client-manifest bytes must be identical in the server harness and the
 /// distributed CLI.
-pub(super) fn canonical_json_value(value: serde_json::Value) -> serde_json::Value {
+pub fn canonical_json_value(value: serde_json::Value) -> serde_json::Value {
     match value {
         serde_json::Value::Array(values) => {
             serde_json::Value::Array(values.into_iter().map(canonical_json_value).collect())
@@ -306,7 +341,8 @@ pub(super) fn canonical_json_value(value: serde_json::Value) -> serde_json::Valu
     }
 }
 
-pub(super) fn hash_bytes(bytes: &[u8]) -> String {
+/// The manifest's fingerprint format, `sha256:<lowercase hex>`, of `bytes`.
+pub fn hash_bytes(bytes: &[u8]) -> String {
     let digest = Sha256::digest(bytes);
     format!("sha256:{digest:x}")
 }

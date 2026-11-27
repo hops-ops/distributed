@@ -4,24 +4,21 @@
 //! authorization boundary. It never derives client semantics from physical
 //! table write plans.
 
+#[cfg(any(feature = "graphql", test))]
 pub(crate) mod authorization;
 mod canonical;
+#[cfg(any(feature = "graphql", test))]
 pub(crate) mod lower;
 #[cfg(feature = "graphql")]
 pub(crate) mod runtime;
 mod types;
-
-#[allow(
-    unused_imports,
-    reason = "Task 11 names this authenticated request seam"
-)]
-pub(crate) use types::ProjectionDeltaCacheScopeToken;
 
 #[cfg(test)]
 mod tests;
 #[cfg(test)]
 mod vector_tests;
 
+pub use canonical::{canonicalize_operations, canonicalize_recoveries};
 pub use types::{
     DeltaField, DeltaKeyField, DeltaValue, ProjectionDelta, ProjectionDeltaError,
     ProjectionDeltaIdentity, ProjectionDeltaMutation, ProjectionDeltaOccurrence,

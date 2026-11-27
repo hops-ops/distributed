@@ -21,23 +21,21 @@ pub(crate) enum ProjectionScopeCodecError {
         expected: String,
         actual: String,
     },
-    #[allow(dead_code)]
-    StoredScopeMismatch {
-        projector: String,
-        model: String,
-    },
     UnknownModel {
         projector: String,
         model: String,
     },
+    #[cfg(any(feature = "graphql", test))]
     DuplicateKeyField {
         model: String,
         field: String,
     },
+    #[cfg(any(feature = "graphql", test))]
     ExtraKeyField {
         model: String,
         field: String,
     },
+    #[cfg(any(feature = "graphql", test))]
     MissingKeyField {
         model: String,
         field: String,
@@ -54,6 +52,7 @@ pub(crate) enum ProjectionScopeCodecError {
         model: String,
         field: String,
     },
+    #[cfg(any(feature = "graphql", test))]
     WrongJsonShape {
         model: String,
         field: String,
@@ -66,6 +65,7 @@ pub(crate) enum ProjectionScopeCodecError {
         expected: &'static str,
         actual: &'static str,
     },
+    #[cfg(any(feature = "graphql", test))]
     IntegerOutOfRange {
         model: String,
         field: String,
@@ -75,6 +75,7 @@ pub(crate) enum ProjectionScopeCodecError {
         model: String,
         field: String,
     },
+    #[cfg(any(feature = "graphql", test))]
     InvalidBytes {
         model: String,
         field: String,
@@ -109,24 +110,23 @@ impl fmt::Display for ProjectionScopeCodecError {
                 formatter,
                 "projection scope belongs to projector `{expected}`, not `{actual}`"
             ),
-            Self::StoredScopeMismatch { projector, model } => write!(
-                formatter,
-                "stored projection obligation `{projector}`/`{model}` scope does not match its canonical logical fields"
-            ),
             Self::UnknownModel { projector, model } => write!(
                 formatter,
                 "projector `{projector}` does not register projection model `{model}`"
             ),
+            #[cfg(any(feature = "graphql", test))]
             Self::DuplicateKeyField { model, field } => {
                 write!(
                     formatter,
                     "projection key for `{model}` repeats field `{field}`"
                 )
             }
+            #[cfg(any(feature = "graphql", test))]
             Self::ExtraKeyField { model, field } => write!(
                 formatter,
                 "projection key for `{model}` contains non-key field `{field}`"
             ),
+            #[cfg(any(feature = "graphql", test))]
             Self::MissingKeyField { model, field } => {
                 write!(
                     formatter,
@@ -147,6 +147,7 @@ impl fmt::Display for ProjectionScopeCodecError {
                     "projection key `{model}.{field}` must not be null"
                 )
             }
+            #[cfg(any(feature = "graphql", test))]
             Self::WrongJsonShape {
                 model,
                 field,
@@ -165,6 +166,7 @@ impl fmt::Display for ProjectionScopeCodecError {
                 formatter,
                 "projector row key `{model}.{column}` must be {expected}, got {actual}"
             ),
+            #[cfg(any(feature = "graphql", test))]
             Self::IntegerOutOfRange {
                 model,
                 field,
@@ -177,6 +179,7 @@ impl fmt::Display for ProjectionScopeCodecError {
                 formatter,
                 "projection key `{model}.{field}` must be a finite float"
             ),
+            #[cfg(any(feature = "graphql", test))]
             Self::InvalidBytes { model, field } => write!(
                 formatter,
                 "projection key `{model}.{field}` must be canonical standard base64"

@@ -26,13 +26,14 @@ pub(crate) use error::CommandLedgerError;
     allow(unused_imports)
 )]
 pub(crate) use ids::{
-    AttemptToken, CanonicalInputHash, CausalStorageIdentity, CausationId,
+    deterministic_command_id, AttemptToken, CanonicalInputHash, CausalStorageIdentity, CausationId,
     CommandContractFingerprint, CommandId, CommandLedgerKey, PrincipalPartitionId, SHA256_BYTES,
 };
 pub(crate) use record::{CommandLedgerRecord, ReservationDecision};
 pub(crate) use reservation::{
     AttemptFence, CausalCommitBatch, CommandAttempt, CommandCompletion, CommandLookup,
-    CommandLookupScope, CommandReplay, CommandReservation, ReservationOutcome,
+    CommandLookupScope, CommandReplay, CommandReservation, ExternalCommandCompletion,
+    ExternalDispatchBinding, ReservationOutcome,
 };
 pub(crate) use state::{CommandLedgerState, TerminalCommandState};
 pub(crate) use traits::{

@@ -1,13 +1,11 @@
-import {
-	type ReplicaPreparedCommand,
-} from '../../commands.js';
+import type { ReplicaPreparedCommand } from '../../commands/types.js';
 import type {
 	PreparedProjectionOperation,
 	PreparedProjectionScope,
 	ReplicaPureFunction
-} from '../../projection-delta/index.js';
-import { replicaRecordKey } from '../../identity.js';
-import type { ReplicaIndexSemanticChange } from '../../index-maintenance.js';
+} from '../../projection-delta/types.js';
+import { replicaRecordKey } from '../../identity/keys.js';
+import type { ReplicaIndexSemanticChange } from '../../index-maintenance/types.js';
 import type {
 	ReplicaIdentity,
 	ReplicaModelArtifact,

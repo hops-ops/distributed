@@ -5,10 +5,8 @@ import {
 	DistributedProtocolError,
 	parseDistributedProtocolEnvelope
 } from '../dist/index.js';
-import {
-	matchReplicaTrustedPresetInventory,
-	prepareReplicaCommandWithTrustedPresets
-} from '../dist/replica/commands.js';
+import { matchReplicaTrustedPresetInventory } from '../dist/replica/commands/presets.js';
+import { prepareReplicaCommandWithTrustedPresets } from '../dist/replica/commands/prepare.js';
 import {
 	prepareReplicaCommand,
 	ReplicaCommandContractError
@@ -85,7 +83,6 @@ function presetArtifact(overrides = {}) {
 				{
 					programId: `pp1:sha256:${'1'.repeat(64)}`,
 					bindingId: `pb1:sha256:${'2'.repeat(64)}`,
-					epoch: 'todos-v1',
 					programIrVersion: 1,
 					operationSemanticsVersion: 1
 				}

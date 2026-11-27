@@ -112,10 +112,19 @@ export type BaseRecordClock = {
 
 export interface CacheReader {
 	recordMeta(key: RecordKey): SparseRecordMeta | undefined;
+	/**
+	 * Whether this record is visible only through an optimistic layer: an
+	 * unsettled command created it and the base (server data) does not hold
+	 * it yet. A layer that edits a record the base holds does not make it
+	 * provisional.
+	 */
+	provisional(key: RecordKey): boolean;
 	field(key: RecordKey, name: string): CachePresence<CacheValue>;
 	link(key: RecordKey, name: string): CachePresence<RecordLink>;
 	record(key: RecordKey): SparseRecord | undefined;
 	index(key: IndexKey): CacheIndex | undefined;
+	/** Every index key this reader may hold; `index(key)` says whether it is live. */
+	indexKeys(): Iterable<IndexKey>;
 }
 
 export interface BaseCacheWriter {
@@ -211,9 +220,12 @@ export type DerivedIndexMutation =
 /**
  * Rebuild the complete derived-index overlay from confirmed state and the
  * ordered semantic contexts of every surviving optimistic layer.
+ *
+ * `confirmed` reads the authoritative base graph by key and is valid only
+ * during the call: the reconciler pays for what it reads, not for the cache.
  */
 export type DerivedIndexReconciler = (
-	confirmed: CacheEngineSnapshot,
+	confirmed: CacheReader,
 	layers: readonly OptimisticLayerView[]
 ) => readonly DerivedIndexMutation[];
 
@@ -260,6 +272,10 @@ export interface CacheEngine {
 	): T;
 	rejectOptimisticLayer(id: string): boolean;
 	optimisticLayerState(id: string): OptimisticLayerState | undefined;
+	/** Whether this layer shows a record the base does not hold yet. */
+	optimisticLayerProvisional(id: string): boolean;
+	/** How many optimistic layers are pending. */
+	readonly optimisticLayerCount: number;
 	extract(): CacheEngineSnapshot;
 	restore(snapshot: CacheEngineSnapshot): void;
 	/**
@@ -283,26 +299,31 @@ export interface CacheEngine {
 	gc(): readonly RecordKey[];
 }
 
+/*
+ * Stored and visible values are immutable: a write replaces the value under
+ * its key. That is what lets a transaction roll back by putting old values
+ * back, and lets readers hand out the same frozen object until it changes.
+ */
 export type StoredField<T> = {
-	revision: bigint;
-	value: T;
+	readonly revision: bigint;
+	readonly value: T;
 };
 
 export type StoredRecord = {
-	revision: bigint;
-	incarnation: bigint;
-	tombstoneRevision?: bigint;
-	fields: Map<string, StoredField<CacheValue>>;
-	links: Map<string, StoredField<RecordLink>>;
+	readonly revision: bigint;
+	readonly incarnation: bigint;
+	readonly tombstoneRevision?: bigint;
+	readonly fields: ReadonlyMap<string, StoredField<CacheValue>>;
+	readonly links: ReadonlyMap<string, StoredField<RecordLink>>;
 };
 
 export type StoredIndex = {
-	revision: bigint;
-	staleRevision?: bigint;
-	records: RecordKey[];
-	complete: boolean;
-	deleted: boolean;
-	metadata?: CacheIndexMetadata;
+	readonly revision: bigint;
+	readonly staleRevision?: bigint;
+	readonly records: readonly RecordKey[];
+	readonly complete: boolean;
+	readonly deleted: boolean;
+	readonly metadata?: CacheIndexMetadata;
 };
 
 export type OverlayOperation =
@@ -312,11 +333,11 @@ export type OverlayOperation =
 	| { kind: 'delete-index'; key: IndexKey };
 
 export type OptimisticLayer = {
-	id: string;
-	sequence: number;
-	state: OptimisticLayerState;
-	operations: OverlayOperation[];
-	context?: OptimisticLayerContext;
+	readonly id: string;
+	readonly sequence: number;
+	readonly state: OptimisticLayerState;
+	readonly operations: readonly OverlayOperation[];
+	readonly context?: OptimisticLayerContext;
 };
 
 export type DerivedIndexOperation =
@@ -325,41 +346,38 @@ export type DerivedIndexOperation =
 	| { kind: 'delete-index'; key: IndexKey };
 
 export type VisibleRecord = {
-	revision: bigint;
-	incarnation: bigint;
-	tombstoned: boolean;
-	fields: Map<string, CacheValue>;
-	links: Map<string, RecordLink>;
+	readonly revision: bigint;
+	readonly incarnation: bigint;
+	readonly tombstoned: boolean;
+	readonly fields: ReadonlyMap<string, CacheValue>;
+	readonly links: ReadonlyMap<string, RecordLink>;
 };
 
-export type VisibleIndex = {
-	revision: bigint;
-	staleRevision?: bigint;
-	records: RecordKey[];
-	complete: boolean;
-	deleted: boolean;
-	metadata?: CacheIndexMetadata;
-};
+/** A stored index is already in its visible shape. */
+export type VisibleIndex = StoredIndex;
 
-export type MaterializedCacheGraph = {
-	records: Map<RecordKey, VisibleRecord>;
-	indexes: Map<IndexKey, VisibleIndex>;
+/** The base graph, or the base graph under the optimistic overlay. */
+export type CacheGraph = {
+	record(key: RecordKey): VisibleRecord | undefined;
+	index(key: IndexKey): VisibleIndex | undefined;
+	indexKeys(): Iterable<IndexKey>;
+	/** Only an optimistic overlay holds provisional records. */
+	provisional?(key: RecordKey): boolean;
 };
 
 export type Watcher<T = unknown> = {
-	selector: CacheSelector<T>;
-	listener: CacheListener<T>;
+	readonly selector: CacheSelector<T>;
+	readonly listener: CacheListener<T>;
+	/** Registration order; delivery follows it. */
+	readonly order: number;
 	value: T;
 	dependencies: Set<string>;
 };
 
-export type EngineBackup = {
-	records: Map<RecordKey, StoredRecord>;
-	indexes: Map<IndexKey, StoredIndex>;
-	layers: OptimisticLayer[];
-	derivedIndexOperations: DerivedIndexOperation[];
-	confirmedFloors: Map<string, number>;
-	retained: Map<RecordKey, number>;
-	nextLayerSequence: number;
-	changedDependencies: Set<string>;
+/** What one transaction needs to put back if it fails. */
+export type TransactionUndo = {
+	readonly layers: readonly OptimisticLayer[];
+	readonly derivedIndexOperations: readonly DerivedIndexOperation[];
+	readonly confirmedFloors: ReadonlyMap<string, number>;
+	readonly nextLayerSequence: number;
 };

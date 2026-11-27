@@ -23,7 +23,8 @@ const removedSubpaths = Object.freeze([
 	'@hops-ops/distributed/cache',
 	'@hops-ops/distributed/commands',
 	'@hops-ops/distributed/codegen',
-	'@hops-ops/distributed/internal/cache-engine'
+	'@hops-ops/distributed/internal/cache-engine',
+	'@hops-ops/distributed/react'
 ]);
 
 async function run(command, args, cwd) {
@@ -79,10 +80,14 @@ function inspectPackageContract(packageJson) {
 	assert.deepEqual(Object.keys(packageJson.exports).sort(), [
 		'.',
 		'./diagnostics',
+		'./game',
+		'./game/vite',
 		'./package.json',
-		'./react',
 		'./replica',
+		'./replica/lazy',
 		'./sveltekit',
+		'./sveltekit/game',
+		'./sveltekit/game/server',
 		'./sveltekit/vite'
 	]);
 	assert.equal(
@@ -90,17 +95,22 @@ function inspectPackageContract(packageJson) {
 		undefined,
 		'the npm package must not expose a package-owned generator'
 	);
-	for (const subpath of ['./cache', './commands', './codegen']) {
+	for (const subpath of ['./cache', './commands', './codegen', './react']) {
 		assert.equal(
 			Object.hasOwn(packageJson.exports, subpath),
 			false,
 			`${subpath} must not remain public`
 		);
 	}
+	assert.deepEqual(
+		Object.keys(packageJson.dependencies ?? {}),
+		[],
+		'the browser package must have no runtime dependencies'
+	);
 	assert.equal(
-		packageJson.peerDependenciesMeta?.react?.optional,
+		packageJson.peerDependenciesMeta?.['wasm-pack']?.optional,
 		true,
-		'React must remain an optional peer'
+		'wasm-pack must remain an optional peer'
 	);
 	assert.equal(
 		packageJson.peerDependenciesMeta?.svelte?.optional,
@@ -148,16 +158,13 @@ function inspectPackResult(packResult, packageJson) {
 const consumerTypeSource = `
 import {
   DISTRIBUTED_PROTOCOL_VERSION,
-  documentToString,
   parseDistributedProtocolEnvelope,
   requestGraphql,
-  type GqlAuth,
-  type GqlDocument
+  type GqlAuth
 } from '@hops-ops/distributed';
 import {
   createDistributedReplica,
   createReplicaGraphqlTransport,
-  createReplicaIndexedDbPersistence,
   type ReplicaOperationArtifact,
   type ReplicaSnapshot,
   type ReplicaSparse
@@ -166,6 +173,10 @@ import {
   createReplicaDiagnostics,
   type ReplicaDiagnosticsSnapshot
 } from '@hops-ops/distributed/diagnostics';
+import {
+  distributedGames,
+  type DistributedGamesViteOptions
+} from '@hops-ops/distributed/game/vite';
 // @ts-expect-error The removed document-cache type must stay absent.
 import type { QueryCache } from '@hops-ops/distributed';
 // @ts-expect-error The removed handwritten cache target must stay absent.
@@ -249,7 +260,6 @@ const operation: ReplicaOperationArtifact<TodosData, TodosVariables> = {
 };
 
 const auth: GqlAuth = { accessToken: 'token' };
-const document: GqlDocument<TodosData, TodosVariables> = operation.document;
 const diagnostics = createReplicaDiagnostics();
 const diagnosticSnapshot: ReplicaDiagnosticsSnapshot = diagnostics.getSnapshot();
 const transport = createReplicaGraphqlTransport({
@@ -263,18 +273,23 @@ if (snapshot.complete) snapshot.data.todos.map((todo) => todo.title);
 
 void [
   DISTRIBUTED_PROTOCOL_VERSION,
-  documentToString(document),
   parseDistributedProtocolEnvelope,
-  requestGraphql,
-  createReplicaIndexedDbPersistence,
+  requestGraphql<TodosData, TodosVariables>('/graphql', operation.document, auth, { limit: 10 }),
   diagnosticSnapshot,
   sparse
 ];
+
+const games: DistributedGamesViteOptions = {
+  games: [{ manifest: 'surface.json', out: 'src/generated/arena' }]
+};
+void distributedGames(games);
 `;
 
 const consumerRuntimeSource = `
 import assert from 'node:assert/strict';
 import * as rootSurface from '@hops-ops/distributed';
+import * as lazySurface from '@hops-ops/distributed/replica/lazy';
+assert.deepEqual(Object.keys(lazySurface), ['createLazyReplicaCommandRuntime']);
 import * as replicaSurface from '@hops-ops/distributed/replica';
 import * as diagnosticsSurface from '@hops-ops/distributed/diagnostics';
 import {
@@ -402,12 +417,12 @@ assert.equal(result.data.health, 'ok');
 assert.deepEqual(Object.keys(rootSurface).sort(), [
   'DISTRIBUTED_PROTOCOL_VERSION',
   'DistributedProtocolError',
-  'applyWsDevHeaderParams',
+  'GraphqlWsError',
   'authIdentityKey',
   'buildAuthHeaders',
   'compareDistributedDecimal',
+  'createGraphqlWsConnection',
   'distributedLiveResumeExtensions',
-  'documentToString',
   'graphqlWsUrl',
   'httpUrlToWsUrl',
   'jwtPayloadSub',
@@ -415,13 +430,9 @@ assert.deepEqual(Object.keys(rootSurface).sort(), [
   'parseDistributedProtocolEnvelope',
   'parseGraphqlResponseExtensions',
   'requestGraphql',
-  'subscribe',
   'wsConnectionInitPayload'
 ]);
 assert.deepEqual(Object.keys(replicaSurface).sort(), [
-  'MUTATION_CACHE_VISIBILITY_FULL',
-  'MUTATION_CACHE_VISIBILITY_UNAUTHORIZED',
-  'REPLICA_OFFLINE_COMMAND_OUTBOX_SUPPORTED',
   'ReplicaCommandContractError',
   'ReplicaCommandRuntimeError',
   'canonicalizeOperationVariables',
@@ -432,7 +443,6 @@ assert.deepEqual(Object.keys(replicaSurface).sort(), [
   'createReplicaDiagnostics',
   'createReplicaGraphqlTransport',
   'createReplicaIndexMaintenanceRegistry',
-  'createReplicaIndexedDbPersistence',
   'createReplicaUuidV7',
   'createWasmJsonPure',
   'decideReplicaPaginationMaintenance',
@@ -440,7 +450,6 @@ assert.deepEqual(Object.keys(replicaSurface).sort(), [
   'formatReplicaIndexStaleReason',
   'inspectReplicaCommandArtifact',
   'inspectReplicaOperationArtifact',
-  'lowerMutationCache',
   'prepareReplicaCommand',
   'replicaIndexKey',
   'replicaRecordKey',
@@ -451,6 +460,13 @@ assert.deepEqual(Object.keys(diagnosticsSurface).sort(), [
   'createReplicaDiagnostics',
   'inspectReplicaCommandArtifact',
   'inspectReplicaOperationArtifact'
+]);
+// A plain Vite app without svelte loads the game plugin.
+const gameViteSurface = await import('@hops-ops/distributed/game/vite');
+assert.deepEqual(Object.keys(gameViteSurface).sort(), [
+  'checkDistributedGames',
+  'distributedGames',
+  'generateDistributedGames'
 ]);
 for (const subpath of ${JSON.stringify(removedSubpaths)}) {
   await assert.rejects(
@@ -578,6 +594,7 @@ assert.deepEqual(Object.keys(sveltekitSurface).sort(), [
   'authFromPageData',
   'bindSveltekitOperation',
   'constant',
+  'createDistributedLeaderboardStore',
   'createDistributedSvelteKit',
   'createDistributedSvelteKitServer',
   'createPageDataSessionSource',
@@ -587,6 +604,7 @@ assert.deepEqual(Object.keys(sveltekitSurface).sort(), [
   'defineGraphqlIslandBindings',
   'distributedReloadLifecycle',
   'forwardedProp',
+  'loadDistributedLeaderboard',
   'omitVariable',
   'parseDistributedGenerationEnvelope',
   'provideDistributedSvelteKitClient',
@@ -597,6 +615,8 @@ assert.deepEqual(Object.keys(sveltekitSurface).sort(), [
   'searchParam',
   'sessionClaim',
   'sessionSourceFromPageData',
+  'useDistributedLeaderboard',
+  'useDistributedLiveConnection',
   'useDistributedSvelteKitClient',
   'useDistributedSvelteKitCommands',
   'validateDistributedReloadLocation',
@@ -604,12 +624,35 @@ assert.deepEqual(Object.keys(sveltekitSurface).sort(), [
 ]);
 assert.deepEqual(Object.keys(sveltekitViteSurface).sort(), [
   'analyzeDistributedSvelteKitBoundaries',
+  'checkDistributedGames',
   'distributedGraphqlProxy',
   'distributedSvelteKit',
   'distributedSvelteKitAliases',
+  'generateDistributedGames',
   'validateDistributedSvelteKitBoundaryPlan'
 ]);
 assert.equal(typeof sveltekitViteSurface.distributedSvelteKit, 'function');
+const sveltekitGameSurface = await import('@hops-ops/distributed/sveltekit/game');
+assert.deepEqual(Object.keys(sveltekitGameSurface).sort(), [
+  'GameState',
+  'createGameState',
+  'gameTicketSource',
+  'useGame'
+]);
+const sveltekitGameServerSurface = await import('@hops-ops/distributed/sveltekit/game/server');
+assert.deepEqual(Object.keys(sveltekitGameServerSurface).sort(), [
+  'GAME_TICKET_RATE_LIMIT_SCRIPT',
+  'GameTicketRateLimiterUnavailable',
+  'MAX_GAME_TICKET_EXTENSION_BYTES',
+  'MAX_GAME_TICKET_TTL_SECONDS',
+  'MIN_GAME_TICKET_SECRET_BYTES',
+  'TRUSTED_FIELD_DENYLIST',
+  'checkGameTicketExtensions',
+  'createGameTicketHandler',
+  'createGameTicketRateLimiter',
+  'createRedisGameTicketRateLimiter',
+  'mintGameTicket'
+]);
 
 const pageData = createPageDataSessionSource({
   session: null,
@@ -643,53 +686,6 @@ assert.deepEqual(distributedGraphqlProxy('http://127.0.0.1:8791'), {
     ws: true
   }
 });
-`;
-
-const reactTypeSource = `
-import { createElement } from 'react';
-import {
-  DistributedProvider,
-  useDistributedQuery
-} from '@hops-ops/distributed/react';
-import type {
-  DistributedReplica,
-  ReplicaOperationArtifact
-} from '@hops-ops/distributed/replica';
-
-type TodosData = { todos: readonly { id: string; title: string }[] };
-declare const replica: DistributedReplica;
-declare const Todos: ReplicaOperationArtifact<
-  TodosData,
-  Readonly<Record<never, never>>
->;
-
-function App() {
-  const todos = useDistributedQuery(Todos);
-  if (todos.complete) todos.data.todos.map((todo) => todo.title);
-  void todos.refresh;
-  return null;
-}
-
-createElement(DistributedProvider, { replica }, createElement(App));
-`;
-
-const reactRuntimeSource = `
-import assert from 'node:assert/strict';
-import * as reactSurface from '@hops-ops/distributed/react';
-import {
-  DistributedProvider,
-  useDistributedQuery,
-  useDistributedReplica
-} from '@hops-ops/distributed/react';
-
-assert.equal(typeof DistributedProvider, 'function');
-assert.equal(typeof useDistributedQuery, 'function');
-assert.equal(typeof useDistributedReplica, 'function');
-assert.deepEqual(Object.keys(reactSurface).sort(), [
-  'DistributedProvider',
-  'useDistributedQuery',
-  'useDistributedReplica'
-]);
 `;
 
 const tsconfig = (types) =>
@@ -793,12 +789,10 @@ async function smokePack() {
 		const packDirectory = join(temporaryRoot, 'pack');
 		const consumerDirectory = join(temporaryRoot, 'consumer');
 		const svelteConsumerDirectory = join(temporaryRoot, 'svelte-consumer');
-		const reactConsumerDirectory = join(temporaryRoot, 'react-consumer');
 		await Promise.all([
 			mkdir(packDirectory),
 			mkdir(consumerDirectory),
-			mkdir(svelteConsumerDirectory),
-			mkdir(reactConsumerDirectory)
+			mkdir(svelteConsumerDirectory)
 		]);
 
 		const { stdout } = await run(
@@ -835,11 +829,11 @@ async function smokePack() {
 		);
 		await typecheck(consumerDirectory, []);
 		await run(nodeCommand, ['runtime.mjs'], consumerDirectory);
-		for (const peer of ['react', 'svelte']) {
+		for (const absent of ['svelte', 'wasm-pack', 'graphql']) {
 			await assert.rejects(
-				stat(join(consumerDirectory, 'node_modules', peer)),
+				stat(join(consumerDirectory, 'node_modules', absent)),
 				(error) => error?.code === 'ENOENT',
-				`${peer} must remain optional for root/replica consumers`
+				`${absent} must not be installed for root/replica consumers`
 			);
 		}
 
@@ -850,11 +844,6 @@ async function smokePack() {
 				import '@hops-ops/distributed/replica';
 				import '@hops-ops/distributed/diagnostics';
 			`
-		);
-		assert.equal(
-			baseInputs.some((path) => /node_modules\/react(?:\/|$)/.test(path)),
-			false,
-			'framework-neutral entry points must not pull React into browser bundles'
 		);
 		assert.equal(
 			baseInputs.some((path) => /node_modules\/svelte(?:\/|$)/.test(path)),
@@ -895,11 +884,6 @@ async function smokePack() {
 				'lifecycle-compiler.js'
 			)
 		);
-		await assert.rejects(
-			stat(join(svelteConsumerDirectory, 'node_modules', 'react')),
-			(error) => error?.code === 'ENOENT',
-			'the SvelteKit entry point must not install React'
-		);
 
 		const svelteInputs = await bundleInputs(
 			svelteConsumerDirectory,
@@ -911,55 +895,9 @@ async function smokePack() {
 			'the SvelteKit entry point must bind the installed Svelte peer'
 		);
 		assert.equal(
-			svelteInputs.some((path) => /node_modules\/react(?:\/|$)/.test(path)),
-			false,
-			'the SvelteKit entry point must not pull React'
-		);
-		assert.equal(
 			svelteInputs.some((path) => path.endsWith('/dist/sveltekit/vite.js')),
 			false,
 			'the browser SvelteKit entry point must not pull the Node-only Vite integration'
-		);
-
-		await installConsumer(
-			reactConsumerDirectory,
-			'distributed-react-pack-smoke-consumer',
-			tarballPath,
-			typescriptVersion,
-			[
-				`react@${packageJson.devDependencies.react}`,
-				`@types/react@${packageJson.devDependencies['@types/react']}`
-			]
-		);
-		await writeFile(
-			join(reactConsumerDirectory, 'consumer.ts'),
-			reactTypeSource
-		);
-		await writeFile(
-			join(reactConsumerDirectory, 'runtime.mjs'),
-			reactRuntimeSource
-		);
-		await typecheck(reactConsumerDirectory, ['react']);
-		await run(nodeCommand, ['runtime.mjs'], reactConsumerDirectory);
-		await assert.rejects(
-			stat(join(reactConsumerDirectory, 'node_modules', 'svelte')),
-			(error) => error?.code === 'ENOENT',
-			'the React entry point must not install Svelte'
-		);
-
-		const reactInputs = await bundleInputs(
-			reactConsumerDirectory,
-			`import '@hops-ops/distributed/react';`
-		);
-		assert.equal(
-			reactInputs.some((path) => /node_modules\/react(?:\/|$)/.test(path)),
-			true,
-			'the React entry point must bind the installed peer'
-		);
-		assert.equal(
-			reactInputs.some((path) => path.includes('/dist/sveltekit/')),
-			false,
-			'the React entry point must not pull the SvelteKit adapter'
 		);
 
 		console.log(

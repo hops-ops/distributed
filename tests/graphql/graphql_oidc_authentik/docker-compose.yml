@@ -1,0 +1,68 @@
+# Authentik for GraphQL OIDC e2e (local + CI).
+# Bootstrap creates provider/app via API after first boot.
+#   ./scripts/oidc-authentik-up.sh
+services:
+  postgresql:
+    image: docker.io/library/postgres:16-alpine
+    environment:
+      POSTGRES_PASSWORD: authentik
+      POSTGRES_USER: authentik
+      POSTGRES_DB: authentik
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U authentik"]
+      interval: 5s
+      timeout: 5s
+      retries: 15
+    networks: [authentik]
+
+  redis:
+    image: docker.io/library/redis:alpine
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    networks: [authentik]
+
+  server:
+    image: ghcr.io/goauthentik/server:2024.10.4
+    command: server
+    environment:
+      AUTHENTIK_SECRET_KEY: "graphqlE2eSecretKeyChangeMe0123456789"
+      AUTHENTIK_REDIS__HOST: redis
+      AUTHENTIK_POSTGRESQL__HOST: postgresql
+      AUTHENTIK_POSTGRESQL__USER: authentik
+      AUTHENTIK_POSTGRESQL__NAME: authentik
+      AUTHENTIK_POSTGRESQL__PASSWORD: authentik
+      AUTHENTIK_BOOTSTRAP_PASSWORD: "akadmin-e2e-pass"
+      AUTHENTIK_BOOTSTRAP_EMAIL: "akadmin@localhost"
+    ports:
+      - "9000:9000"
+    depends_on:
+      postgresql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks: [authentik]
+
+  worker:
+    image: ghcr.io/goauthentik/server:2024.10.4
+    command: worker
+    environment:
+      AUTHENTIK_SECRET_KEY: "graphqlE2eSecretKeyChangeMe0123456789"
+      AUTHENTIK_REDIS__HOST: redis
+      AUTHENTIK_POSTGRESQL__HOST: postgresql
+      AUTHENTIK_POSTGRESQL__USER: authentik
+      AUTHENTIK_POSTGRESQL__NAME: authentik
+      AUTHENTIK_POSTGRESQL__PASSWORD: authentik
+      AUTHENTIK_BOOTSTRAP_PASSWORD: "akadmin-e2e-pass"
+      AUTHENTIK_BOOTSTRAP_EMAIL: "akadmin@localhost"
+    depends_on:
+      postgresql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks: [authentik]
+
+networks:
+  authentik:

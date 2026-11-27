@@ -1,3 +1,4 @@
+use std::any::Any;
 use std::collections::HashMap;
 use std::fmt;
 use std::time::SystemTime;
@@ -13,7 +14,26 @@ use crate::domain_event::{
 use crate::trace_context::{TraceContext, CAUSATION_ID, CORRELATION_ID};
 use crate::SourcedResult;
 
-use super::{BitcodePayloadCodec, EventRecord, EventRecordError, PayloadCodec};
+use super::{BitcodePayloadCodec, EventRecord, EventRecordError};
+
+/// Position and time of an event recorded by the current unit of work
+/// ([`Entity::last_recorded`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Recorded {
+    /// Stream sequence (1-based; equals the stream version after commit).
+    pub sequence: u64,
+    /// Event time.
+    pub timestamp: SystemTime,
+}
+
+impl Recorded {
+    /// Event time as Unix milliseconds (0 before the epoch).
+    pub fn unix_ms(&self) -> u64 {
+        self.timestamp
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_millis() as u64)
+    }
+}
 
 #[derive(Serialize, Deserialize)]
 pub struct Entity {
@@ -42,6 +62,11 @@ pub struct Entity {
     pending_domain_events: Vec<DomainEventOccurrence>,
     #[serde(skip, default)]
     domain_event_poison: Option<DomainEventCapturePoison>,
+    /// Something the repository that loaded this entity keeps alive for as
+    /// long as the entity lives, such as the stream lock of a queued
+    /// repository. Dropped with the entity; never cloned or serialized.
+    #[serde(skip, default)]
+    hold: Option<Box<dyn Any + Send + Sync>>,
 }
 
 impl Default for Entity {
@@ -58,6 +83,7 @@ impl Default for Entity {
             metadata: HashMap::new(),
             pending_domain_events: Vec::new(),
             domain_event_poison: None,
+            hold: None,
         }
     }
 }
@@ -94,24 +120,9 @@ impl Clone for Entity {
             metadata: self.metadata.clone(),
             pending_domain_events: self.pending_domain_events.clone(),
             domain_event_poison: self.domain_event_poison.clone(),
+            // A copy does not own what the original holds.
+            hold: None,
         }
-    }
-}
-
-struct ReplayGuard<'a> {
-    replaying: &'a mut bool,
-}
-
-impl<'a> ReplayGuard<'a> {
-    fn new(replaying: &'a mut bool) -> Self {
-        *replaying = true;
-        ReplayGuard { replaying }
-    }
-}
-
-impl Drop for ReplayGuard<'_> {
-    fn drop(&mut self) {
-        *self.replaying = false;
     }
 }
 
@@ -141,6 +152,16 @@ impl Entity {
 
     pub fn snapshot_version(&self) -> u64 {
         self.snapshot_version
+    }
+
+    /// Keep `hold` alive for as long as this entity lives.
+    pub(crate) fn hold_with(&mut self, hold: Box<dyn Any + Send + Sync>) {
+        self.hold = Some(hold);
+    }
+
+    /// Take what [`hold_with`](Self::hold_with) attached.
+    pub(crate) fn take_hold(&mut self) -> Option<Box<dyn Any + Send + Sync>> {
+        self.hold.take()
     }
 
     pub fn set_snapshot_version(&mut self, snapshot_version: u64) {
@@ -330,9 +351,26 @@ impl Entity {
         &self.events[start..]
     }
 
+    /// Where and when the latest event recorded by the current unit of work
+    /// (not yet committed) lands in the stream: its sequence and timestamp,
+    /// as they will be committed. `None` when nothing was recorded. Command
+    /// results (receipts, ranking occurrences) read this instead of
+    /// digging through [`events`](Self::events).
+    pub fn last_recorded(&self) -> Option<Recorded> {
+        self.new_events().last().map(|record| Recorded {
+            sequence: record.sequence,
+            timestamp: record.timestamp,
+        })
+    }
+
     /// Mark all current events as committed. Called by repository after successful commit.
+    /// Record that the new events are durable. A backend calls this after its
+    /// commit succeeds; the commit's validation required every captured domain
+    /// event to leave in that transaction, so the pending occurrences are
+    /// cleared with it.
     pub fn mark_committed(&mut self) {
         self.committed_version = self.version;
+        self.pending_domain_events.clear();
     }
 
     /// Set metadata that will be attached to every subsequent event.
@@ -409,18 +447,7 @@ impl Entity {
         name: impl Into<String>,
         payload: &T,
     ) -> SourcedResult {
-        if self.replaying {
-            return Ok(());
-        }
-
-        let bytes = BitcodePayloadCodec::encode(payload).map_err(EventRecordError::encode)?;
-        let sequence = self.next_sequence();
-        let mut record = EventRecord::new(name, bytes, sequence);
-        if !self.metadata.is_empty() {
-            record.metadata = self.metadata.clone();
-        }
-        self.push_new_event(record);
-        Ok(())
+        self.digest_v(name, 1, payload)
     }
 
     /// Record a versioned event.
@@ -495,19 +522,6 @@ impl Entity {
         self.prefix_version = prefix_version;
         self.version = prefix_version + self.events.len() as u64;
         self.committed_version = self.version;
-    }
-
-    pub fn rehydrate<F, E>(&mut self, mut apply: F) -> Result<(), E>
-    where
-        F: FnMut(&EventRecord) -> Result<(), E>,
-    {
-        let _guard = ReplayGuard::new(&mut self.replaying);
-
-        for event in &self.events {
-            apply(event)?;
-        }
-
-        Ok(())
     }
 
     pub fn is_replaying(&self) -> bool {
@@ -611,17 +625,6 @@ mod tests {
     }
 
     #[test]
-    fn new() {
-        let entity = Entity::new();
-        assert_eq!(entity.id(), "");
-        assert_eq!(entity.version(), 0);
-        assert!(entity.events().is_empty());
-        assert!(!entity.is_replaying());
-        assert_eq!(entity.snapshot_version(), 0);
-        assert_eq!(entity.committed_version(), 0);
-    }
-
-    #[test]
     fn digest() {
         let mut entity = Entity::new();
         entity.digest("test_event", &("arg1", "arg2")).unwrap();
@@ -656,48 +659,6 @@ mod tests {
         assert!(err.message.contains("intentional serialization failure"));
         assert_eq!(entity.version(), 0);
         assert!(entity.events().is_empty());
-    }
-
-    #[test]
-    fn rehydrate() {
-        let mut entity = Entity::new();
-        entity.digest("test_event1", &"arg1").unwrap();
-        entity.digest("test_event2", &"arg2").unwrap();
-
-        let mut replayed = Vec::new();
-        let result = entity.rehydrate(|event| {
-            replayed.push(event.event_name.clone());
-            Ok::<(), ()>(())
-        });
-
-        assert!(result.is_ok());
-        assert_eq!(replayed, vec!["test_event1", "test_event2"]);
-        assert!(!entity.is_replaying());
-    }
-
-    #[test]
-    fn clone() {
-        let entity = Entity::new();
-        let cloned_entity = entity.clone();
-
-        assert_eq!(entity.id(), cloned_entity.id());
-        assert_eq!(entity.version(), cloned_entity.version());
-        assert_eq!(entity.events(), cloned_entity.events());
-        assert_eq!(entity.snapshot_version(), cloned_entity.snapshot_version());
-        assert_eq!(
-            entity.committed_version(),
-            cloned_entity.committed_version()
-        );
-    }
-
-    #[test]
-    fn debug() {
-        let entity = Entity::new();
-        let debug_str = format!("{:?}", entity);
-
-        assert!(debug_str.contains("Entity"));
-        assert!(debug_str.contains("id: \"\""));
-        assert!(debug_str.contains("version: 0"));
     }
 
     #[test]

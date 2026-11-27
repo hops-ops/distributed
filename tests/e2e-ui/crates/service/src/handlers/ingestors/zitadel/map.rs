@@ -1,7 +1,8 @@
-//! Map Zitadel Action / fixture payloads → provider bus subjects + envelopes.
+//! Map Zitadel Action / fixture payloads → the provider event they name and
+//! the user profile they carry.
 
-use e2e_projections::{ZitadelEmail, ZitadelUserPayload};
-use serde::Deserialize;
+use e2e_projections::ZitadelUserProfile;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 pub const HUMAN_CREATED: &str = "zitadel.user.human.created.v1";
@@ -10,51 +11,77 @@ pub const HUMAN_DEACTIVATED: &str = "zitadel.user.human.deactivated.v1";
 pub const HUMAN_REACTIVATED: &str = "zitadel.user.human.reactivated.v1";
 pub const MACHINE_CREATED: &str = "zitadel.user.machine.created.v1";
 
-/// Ingress body accepted from Zitadel Action HTTP or local fixtures.
-#[derive(Debug, Clone, Deserialize)]
-pub struct ActionDelivery {
-    #[serde(default, alias = "event_id", alias = "id")]
+/// Input of `zitadel.ingress.v1`: one provider delivery, normalized by the
+/// HTTP edge from a Zitadel Action event or a local fixture body.
+///
+/// It holds nothing that differs between two deliveries of one event, so a
+/// redelivery is the same command.
+#[derive(Debug, Clone, Serialize, Deserialize, distributed::command::CommandInput)]
+pub struct ZitadelIngressInput {
     pub delivery_id: Option<String>,
-    #[serde(default, alias = "event_type", alias = "action_event", alias = "type")]
     pub event_type: Option<String>,
-    #[serde(default, alias = "user_id", alias = "userId")]
     pub provider_subject: Option<String>,
-    #[serde(default, alias = "user_kind", alias = "kind")]
     pub user_kind: Option<String>,
-    #[serde(default)]
     pub email: Option<String>,
-    #[serde(default)]
-    pub emails: Option<Vec<EmailIn>>,
-    #[serde(default, alias = "display_name", alias = "displayName")]
+    pub emails: Option<Vec<ZitadelIngressEmail>>,
     pub display_name: Option<String>,
-    #[serde(default, alias = "approval_status")]
     pub approval_status: Option<String>,
-    #[serde(default)]
     pub grants: Option<Vec<String>>,
-    #[serde(default)]
     pub roles: Option<Vec<String>>,
-    #[serde(default)]
-    pub payload: Option<Value>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
-pub struct EmailIn {
+#[derive(Debug, Clone, Serialize, Deserialize, distributed::command::CommandInput)]
+pub struct ZitadelIngressEmail {
     pub address: String,
-    #[serde(default)]
-    pub primary: bool,
-    #[serde(default = "default_true")]
-    pub verified: bool,
+    /// Absent means not primary.
+    pub primary: Option<bool>,
+    /// Absent means verified.
+    pub verified: Option<bool>,
 }
 
-fn default_true() -> bool {
-    true
-}
-
+/// One provider delivery: which Zitadel event it is, and the user's profile
+/// after it.
 #[derive(Debug, Clone)]
 pub struct MappedDelivery {
     pub message_name: String,
     pub delivery_id: String,
-    pub payload: ZitadelUserPayload,
+    pub profile: ZitadelUserProfile,
+}
+
+/// The profile a provider event leaves a user with. A deactivation leaves
+/// them `deactivated`, every other event `active`; an empty display name
+/// falls back to the email, then the subject.
+pub fn user_profile(
+    message_name: &str,
+    user_id: &str,
+    user_kind: String,
+    email: String,
+    display_name: Option<String>,
+    approval_status: String,
+) -> ZitadelUserProfile {
+    let display_name = display_name
+        .filter(|name| !name.trim().is_empty())
+        .unwrap_or_else(|| {
+            if email.is_empty() {
+                user_id.to_string()
+            } else {
+                email.clone()
+            }
+        });
+    let status = if message_name == HUMAN_DEACTIVATED {
+        "deactivated"
+    } else {
+        "active"
+    };
+    ZitadelUserProfile {
+        user_id: user_id.to_string(),
+        email,
+        display_name,
+        user_kind,
+        approval_status,
+        status: status.into(),
+        updated_at: now_ms(),
+    }
 }
 
 pub fn looks_like_action_event(raw: &Value) -> bool {
@@ -63,26 +90,36 @@ pub fn looks_like_action_event(raw: &Value) -> bool {
         || (raw.get("aggregateType").is_some() && raw.get("sequence").is_some())
 }
 
-pub fn normalize_ingress_body(raw: &Value) -> ActionDelivery {
+/// Normalize a webhook body into the command input. A fixture body may name
+/// a field by any of the spellings listed here.
+pub fn normalize_ingress_body(raw: &Value) -> ZitadelIngressInput {
     if looks_like_action_event(raw) {
         return action_event_to_delivery(raw);
     }
-    serde_json::from_value(raw.clone()).unwrap_or(ActionDelivery {
-        delivery_id: None,
-        event_type: None,
-        provider_subject: None,
-        user_kind: None,
-        email: None,
-        emails: None,
-        display_name: None,
-        approval_status: None,
-        grants: None,
-        roles: None,
-        payload: Some(raw.clone()),
-    })
+    let text = |names: &[&str]| {
+        names
+            .iter()
+            .find_map(|name| raw.get(name)?.as_str())
+            .map(str::to_string)
+    };
+    let list = |name: &str| serde_json::from_value(raw.get(name)?.clone()).ok();
+    ZitadelIngressInput {
+        delivery_id: text(&["delivery_id", "event_id", "id"]),
+        event_type: text(&["event_type", "action_event", "type"]),
+        provider_subject: text(&["provider_subject", "user_id", "userId"]),
+        user_kind: text(&["user_kind", "kind"]),
+        email: text(&["email"]),
+        emails: raw
+            .get("emails")
+            .and_then(|emails| serde_json::from_value(emails.clone()).ok()),
+        display_name: text(&["display_name", "displayName"]),
+        approval_status: text(&["approval_status"]),
+        grants: list("grants"),
+        roles: list("roles"),
+    }
 }
 
-fn action_event_to_delivery(raw: &Value) -> ActionDelivery {
+fn action_event_to_delivery(raw: &Value) -> ZitadelIngressInput {
     let aggregate_id = raw
         .get("aggregateID")
         .or_else(|| raw.get("aggregateId"))
@@ -105,7 +142,8 @@ fn action_event_to_delivery(raw: &Value) -> ActionDelivery {
     let delivery_id = match (&aggregate_id, &event_type, &sequence) {
         (Some(a), Some(t), Some(s)) => Some(format!("zitadel-action:{t}:{a}:{s}")),
         (Some(a), Some(t), None) => Some(format!("zitadel-action:{t}:{a}")),
-        _ => sequence.clone(),
+        // A sequence alone does not name an event.
+        _ => None,
     };
 
     let event_payload = raw
@@ -162,7 +200,7 @@ fn action_event_to_delivery(raw: &Value) -> ActionDelivery {
         Some("human".into())
     };
 
-    ActionDelivery {
+    ZitadelIngressInput {
         delivery_id,
         event_type,
         provider_subject: subject,
@@ -173,11 +211,10 @@ fn action_event_to_delivery(raw: &Value) -> ActionDelivery {
         approval_status: None,
         grants,
         roles: None,
-        payload: Some(raw.clone()),
     }
 }
 
-pub fn map_action_delivery(input: &ActionDelivery) -> Option<MappedDelivery> {
+pub fn map_action_delivery(input: &ZitadelIngressInput) -> Option<MappedDelivery> {
     let subject = input
         .provider_subject
         .as_deref()
@@ -205,26 +242,20 @@ pub fn map_action_delivery(input: &ActionDelivery) -> Option<MappedDelivery> {
         .filter(|s| !s.trim().is_empty())
         .unwrap_or_else(|| format!("zitadel:{message_name}:{subject}"));
 
-    let emails = normalize_emails(input);
     let approval_status = derive_approval(input, &user_kind);
-
-    let payload = ZitadelUserPayload {
-        schema_version: 1,
-        source: "zitadel".into(),
-        delivery_id: delivery_id.clone(),
-        provider: "zitadel".into(),
-        provider_subject: subject.to_string(),
+    let profile = user_profile(
+        message_name,
+        subject,
         user_kind,
-        emails,
-        display_name: input.display_name.clone().filter(|s| !s.trim().is_empty()),
+        primary_email(input),
+        input.display_name.clone(),
         approval_status,
-        ingested_at: now_rfc3339ish(),
-    };
+    );
 
     Some(MappedDelivery {
         message_name: message_name.to_string(),
         delivery_id,
-        payload,
+        profile,
     })
 }
 
@@ -279,30 +310,25 @@ fn resolve_message_name(event_type: &str, user_kind: Option<&str>) -> Option<&'s
     None
 }
 
-fn normalize_emails(input: &ActionDelivery) -> Vec<ZitadelEmail> {
-    if let Some(list) = &input.emails {
-        if !list.is_empty() {
-            return list
-                .iter()
-                .map(|e| ZitadelEmail {
-                    address: e.address.clone(),
-                    primary: e.primary,
-                    verified: e.verified,
-                })
-                .collect();
-        }
+/// The delivery's primary email (the first listed when none is marked), or
+/// its single `email`; empty when it has none.
+fn primary_email(input: &ZitadelIngressInput) -> String {
+    let listed = input.emails.iter().flatten();
+    if let Some(email) = listed
+        .clone()
+        .find(|email| email.primary == Some(true))
+        .or_else(|| listed.clone().next())
+    {
+        return email.address.clone();
     }
-    if let Some(email) = input.email.as_ref().filter(|s| !s.trim().is_empty()) {
-        return vec![ZitadelEmail {
-            address: email.clone(),
-            primary: true,
-            verified: true,
-        }];
-    }
-    Vec::new()
+    input
+        .email
+        .clone()
+        .filter(|email| !email.trim().is_empty())
+        .unwrap_or_default()
 }
 
-fn derive_approval(input: &ActionDelivery, user_kind: &str) -> String {
+fn derive_approval(input: &ZitadelIngressInput, user_kind: &str) -> String {
     if user_kind == "machine" {
         return "approved".into();
     }
@@ -327,12 +353,12 @@ fn derive_approval(input: &ActionDelivery, user_kind: &str) -> String {
     }
 }
 
-fn now_rfc3339ish() -> String {
+/// Milliseconds since the epoch: a sortable timestamp without chrono.
+fn now_ms() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
     let d = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default();
-    // Sortable timestamp without chrono dependency.
     format!("{}", d.as_millis())
 }
 
@@ -343,7 +369,7 @@ mod tests {
 
     #[test]
     fn maps_human_created_with_waitlist_pending() {
-        let input = ActionDelivery {
+        let input = ZitadelIngressInput {
             delivery_id: Some("d1".into()),
             event_type: Some("user.human.created".into()),
             provider_subject: Some("sub-1".into()),
@@ -354,19 +380,20 @@ mod tests {
             approval_status: None,
             grants: None,
             roles: None,
-            payload: None,
         };
         let m = map_action_delivery(&input).expect("mapped");
         assert_eq!(m.message_name, HUMAN_CREATED);
         assert_eq!(m.delivery_id, "d1");
-        assert_eq!(m.payload.approval_status, "pending");
-        assert_eq!(m.payload.user_kind, "human");
-        assert_eq!(m.payload.emails[0].address, "ada@example.com");
+        assert_eq!(m.profile.approval_status, "pending");
+        assert_eq!(m.profile.user_kind, "human");
+        assert_eq!(m.profile.email, "ada@example.com");
+        assert_eq!(m.profile.display_name, "Ada");
+        assert_eq!(m.profile.status, "active");
     }
 
     #[test]
     fn maps_updated_with_approved_grant() {
-        let input = ActionDelivery {
+        let input = ZitadelIngressInput {
             delivery_id: Some("d2".into()),
             event_type: Some("user.human.updated".into()),
             provider_subject: Some("sub-1".into()),
@@ -377,16 +404,15 @@ mod tests {
             approval_status: None,
             grants: Some(vec!["approved".into()]),
             roles: None,
-            payload: None,
         };
         let m = map_action_delivery(&input).unwrap();
         assert_eq!(m.message_name, HUMAN_UPDATED);
-        assert_eq!(m.payload.approval_status, "approved");
+        assert_eq!(m.profile.approval_status, "approved");
     }
 
     #[test]
     fn unmapped_type_returns_none() {
-        let input = ActionDelivery {
+        let input = ZitadelIngressInput {
             delivery_id: Some("d3".into()),
             event_type: Some("org.metadata.set".into()),
             provider_subject: Some("sub-1".into()),
@@ -397,7 +423,6 @@ mod tests {
             approval_status: None,
             grants: None,
             roles: None,
-            payload: None,
         };
         assert!(map_action_delivery(&input).is_none());
     }
@@ -419,6 +444,47 @@ mod tests {
         assert_eq!(d.provider_subject.as_deref(), Some("user-99"));
         let m = map_action_delivery(&d).expect("mapped");
         assert_eq!(m.message_name, HUMAN_CREATED);
-        assert_eq!(m.payload.provider_subject, "user-99");
+        assert_eq!(m.profile.user_id, "user-99");
+    }
+
+    #[test]
+    fn a_deactivation_leaves_the_user_deactivated_and_names_fall_back() {
+        let input = ZitadelIngressInput {
+            delivery_id: Some("d4".into()),
+            event_type: Some("user.human.deactivated".into()),
+            provider_subject: Some("sub-1".into()),
+            user_kind: None,
+            email: None,
+            emails: Some(vec![
+                ZitadelIngressEmail {
+                    address: "old@example.com".into(),
+                    primary: None,
+                    verified: None,
+                },
+                ZitadelIngressEmail {
+                    address: "ada@example.com".into(),
+                    primary: Some(true),
+                    verified: None,
+                },
+            ]),
+            display_name: Some(" ".into()),
+            approval_status: None,
+            grants: None,
+            roles: None,
+        };
+        let m = map_action_delivery(&input).unwrap();
+        assert_eq!(m.message_name, HUMAN_DEACTIVATED);
+        assert_eq!(m.profile.status, "deactivated");
+        assert_eq!(m.profile.email, "ada@example.com");
+        assert_eq!(m.profile.display_name, "ada@example.com");
+
+        let reactivated = map_action_delivery(&ZitadelIngressInput {
+            event_type: Some("user.human.reactivated".into()),
+            emails: None,
+            ..input
+        })
+        .unwrap();
+        assert_eq!(reactivated.profile.status, "active");
+        assert_eq!(reactivated.profile.display_name, "sub-1");
     }
 }

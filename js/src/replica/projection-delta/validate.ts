@@ -1,4 +1,6 @@
 import { isPlainRecord } from '../../lib/is-plain-record.js';
+import { compareUtf8 } from '../../lib/compare-utf8.js';
+import { oncePerIdentity } from '../../lib/once-per-identity.js';
 import {
 	canonicalCommandProjectionMetadata,
 	canonicalProjectionDelta,
@@ -375,9 +377,26 @@ export function parseCommandProjectionMetadata(
 	return parsed;
 }
 
+/**
+ * A command's projection is an immutable generated constant, validated once.
+ * A caller that names its own error path is validated every time.
+ */
 export function validateCommandProjectionArtifact(
 	value: unknown,
 	path = 'artifact.projection'
+): ReplicaCommandProjection {
+	return path === 'artifact.projection'
+		? oncePerIdentity(validatedProjections, value, (projection) =>
+				parseCommandProjectionArtifact(projection, path)
+			)
+		: parseCommandProjectionArtifact(value, path);
+}
+
+const validatedProjections = new WeakMap<object, ReplicaCommandProjection>();
+
+function parseCommandProjectionArtifact(
+	value: unknown,
+	path: string
 ): ReplicaCommandProjection {
 	preflightProjectionPayload(value, path);
 	const projection = exactRecord(
@@ -416,7 +435,6 @@ export function validateCommandProjectionArtifact(
 			[
 				'programId',
 				'bindingId',
-				'epoch',
 				'programIrVersion',
 				'operationSemanticsVersion'
 			],
@@ -435,7 +453,6 @@ export function validateCommandProjectionArtifact(
 			return Object.freeze({
 				programId: identityString(identity.programId, `${itemPath}.programId`),
 				bindingId: identityString(identity.bindingId, `${itemPath}.bindingId`),
-				epoch: projectionEpoch(identity.epoch, `${itemPath}.epoch`),
 				programIrVersion: 1 as const,
 				operationSemanticsVersion: 1 as const
 			});
@@ -447,14 +464,12 @@ export function validateCommandProjectionArtifact(
 				[
 					left.programId,
 					left.bindingId,
-					left.epoch,
 					left.programIrVersion,
 					left.operationSemanticsVersion
 				],
 				[
 					right.programId,
 					right.bindingId,
-					right.epoch,
 					right.programIrVersion,
 					right.operationSemanticsVersion
 				]
@@ -834,7 +849,6 @@ export function validateProjectionMetadataAuthority(
 		if (
 			expected.programId !== actual.program_id ||
 			expected.bindingId !== actual.binding_id ||
-			expected.epoch !== actual.epoch ||
 			expected.programIrVersion !== actual.program_ir_version ||
 			expected.operationSemanticsVersion !==
 				actual.operation_semantics_version
@@ -854,7 +868,6 @@ function parseProjectionIdentity(
 		[
 			'program_id',
 			'binding_id',
-			'epoch',
 			'program_ir_version',
 			'operation_semantics_version'
 		],
@@ -875,7 +888,6 @@ function parseProjectionIdentity(
 	return Object.freeze({
 		program_id: identity.program_id,
 		binding_id: identity.binding_id,
-		epoch: projectionEpoch(identity.epoch, `${path}.epoch`),
 		program_ir_version: 1 as const,
 		operation_semantics_version: 1 as const
 	});
@@ -2183,14 +2195,12 @@ function compareProjectionIdentity(
 		[
 			left.program_id,
 			left.binding_id,
-			left.epoch,
 			left.program_ir_version,
 			left.operation_semantics_version
 		],
 		[
 			right.program_id,
 			right.binding_id,
-			right.epoch,
 			right.program_ir_version,
 			right.operation_semantics_version
 		]
@@ -2225,20 +2235,6 @@ function compareStringArrays(
 }
 
 /** Rust `String::cmp` is lexicographic over UTF-8 bytes, not UTF-16 units. */
-function compareUtf8(left: string, right: string): number {
-	const leftBytes = encoder.encode(left);
-	const rightBytes = encoder.encode(right);
-	for (
-		let index = 0;
-		index < Math.min(leftBytes.length, rightBytes.length);
-		index += 1
-	) {
-		const compared = leftBytes[index]! - rightBytes[index]!;
-		if (compared !== 0) return compared;
-	}
-	return leftBytes.length - rightBytes.length;
-}
-
 function exactRecord(
 	value: unknown,
 	required: readonly string[],
@@ -2410,17 +2406,6 @@ function identityString(value: unknown, path: string): string {
 		invalid(path);
 	}
 	return value;
-}
-
-function projectionEpoch(value: unknown, path: string): string {
-	const epoch = identityString(value, path);
-	if (
-		encoder.encode(epoch).byteLength > 128 ||
-		[...epoch].some((character) => /\p{Cc}/u.test(character))
-	) {
-		invalid(path);
-	}
-	return epoch;
 }
 
 function projectionModel(value: unknown, path: string): string {

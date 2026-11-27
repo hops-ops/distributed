@@ -5,11 +5,59 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::bus::{Bus, RunOptions};
+use crate::bus::{Bus, RetryBackoff, RunOptions, Shutdown};
+use crate::microsvc::service::LedgerCompaction;
 use crate::microsvc::Service;
 use crate::outbox_worker::{
     drain_worker_id, BusPublisher, OutboxDispatcher, OutboxDrainRunner, OutboxStore,
 };
+
+/// Rows one compaction pass tombstones per command ledger.
+pub(crate) const LEDGER_COMPACTION_BATCH: usize = 256;
+
+/// Time between compaction passes once the expired backlog is below a batch.
+pub(crate) const LEDGER_COMPACTION_INTERVAL: Duration = Duration::from_secs(60);
+
+/// One compaction pass: up to `batch` expired rows in each ledger. Returns
+/// the rows compacted; a ledger that fails is logged and left for the next
+/// pass.
+pub(crate) async fn compact_command_ledgers(ledgers: &[LedgerCompaction], batch: usize) -> u64 {
+    let mut compacted = 0;
+    for compact in ledgers {
+        match compact(batch).await {
+            Ok(count) => compacted += count,
+            Err(error) => tracing::warn!(%error, "command ledger compaction failed"),
+        }
+    }
+    compacted
+}
+
+/// The command-ledger compaction loop of one [`Service`]; dropping it stops
+/// the loop.
+pub(crate) struct LedgerCompactionWorker(tokio::task::JoinHandle<()>);
+
+impl LedgerCompactionWorker {
+    /// Compact `ledgers` every [`LEDGER_COMPACTION_INTERVAL`], and again at
+    /// once while a pass still finds a full batch.
+    pub(crate) fn spawn(ledgers: Vec<LedgerCompaction>) -> Self {
+        Self(tokio::spawn(async move {
+            loop {
+                let compacted = compact_command_ledgers(&ledgers, LEDGER_COMPACTION_BATCH).await;
+                if compacted < LEDGER_COMPACTION_BATCH as u64 {
+                    tokio::time::sleep(LEDGER_COMPACTION_INTERVAL).await;
+                } else {
+                    tokio::task::yield_now().await;
+                }
+            }
+        }))
+    }
+}
+
+impl Drop for LedgerCompactionWorker {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
 
 /// Spawn the standard outbox drain loop for a bus-backed store.
 ///
@@ -40,40 +88,50 @@ pub fn spawn_outbox_publish_loop<S, B>(
         .spawn();
 }
 
-/// Idle poll for long-running SQL `listen`/`subscribe` hosts.
-///
-/// Drain-to-idle is for tests. A host that lets `Service::run` return `Ok(())`
-/// would otherwise reconstruct routes and bootstrap projectors on every quiet
-/// stretch — seconds of delay on the next Eventual command.
-pub const CONSUMER_IDLE_POLL: Duration = Duration::from_millis(25);
-
 /// Spawn the bus consumer for a long-running host.
 ///
-/// `build_service` constructs the heavy route/projector graph **once**, then
-/// again only after `run` fails. A successful return means the bus drained to
-/// idle; that is a host bug for SQL buses (use `with_idle_poll` /
-/// [`CONSUMER_IDLE_POLL`]). We log and stop instead of reconstructing, so an
-/// idle drain cannot hide behind a rebuild storm.
+/// The consumer runs until the process ends. `build_service` constructs the
+/// route and projector graph once, and again only after a run fails; restarts
+/// are spaced by the default [`RetryBackoff`], which resets after a run that
+/// lasted longer than its longest delay.
 pub fn spawn_service_consumer_loop<F>(build_service: F)
 where
     F: Fn() -> Service + Send + Sync + 'static,
 {
+    spawn_service_consumer_loop_until(build_service, Shutdown::new());
+}
+
+/// [`spawn_service_consumer_loop`] that stops when `shutdown` is triggered:
+/// the consumer settles the delivery it is handling and the task ends.
+pub fn spawn_service_consumer_loop_until<F>(
+    build_service: F,
+    shutdown: Shutdown,
+) -> tokio::task::JoinHandle<()>
+where
+    F: Fn() -> Service + Send + Sync + 'static,
+{
     tokio::spawn(async move {
-        loop {
-            let service = build_service();
-            match service.run(RunOptions::idempotent()).await {
-                Ok(()) => {
-                    eprintln!(
-                        "consumer: bus drained to idle; not reconstructing Service. \
-                         Long-running SQL hosts must call with_idle_poll({CONSUMER_IDLE_POLL:?})"
-                    );
-                    return;
-                }
-                Err(e) => {
-                    eprintln!("consumer: {e}");
-                    tokio::time::sleep(Duration::from_millis(100)).await;
-                }
+        let backoff = RetryBackoff::default();
+        let mut failures = 0u32;
+        while !shutdown.is_triggered() {
+            let started = std::time::Instant::now();
+            let options = RunOptions::until_shutdown(shutdown.clone());
+            let Err(error) = build_service().run(options).await else {
+                return;
+            };
+            // A run that ends on shutdown still reports a projector that had
+            // stopped; that is not a reason to wait and restart.
+            if shutdown.is_triggered() {
+                tracing::error!(%error, "bus consumer ended with a stopped projector");
+                return;
             }
+            if started.elapsed() > crate::bus::DEFAULT_RETRY_BACKOFF_MAX {
+                failures = 0;
+            }
+            failures = failures.saturating_add(1);
+            let delay = backoff.delay(failures);
+            tracing::error!(%error, ?delay, "bus consumer stopped; restarting");
+            tokio::time::sleep(delay).await;
         }
-    });
+    })
 }

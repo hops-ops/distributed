@@ -3,7 +3,7 @@ use super::*;
 pub(super) fn decode_partition_row<DB>(
     row: &DB::Row,
     topology: &ProjectorTopologyId,
-    partition: &crate::projection_protocol::ProjectionPartition,
+    partition: &crate::projection_protocol::PartitionId,
 ) -> Result<PartitionState, ProjectionProtocolError>
 where
     DB: SqlxRepoBackend,
@@ -72,11 +72,13 @@ where
     })
 }
 
+/// Lock a partition and return its stored state, creating it with a newly
+/// minted change epoch when it does not exist yet. An existing partition
+/// keeps the epoch it was created with.
 pub(super) async fn lock_partition_in_tx<DB>(
     tx: &mut Transaction<'_, DB>,
     topology: &ProjectorTopologyId,
-    partition: &crate::projection_protocol::ProjectionPartition,
-    change_epoch: &ProjectionEpoch,
+    partition: &crate::projection_protocol::PartitionId,
 ) -> Result<PartitionState, ProjectionProtocolError>
 where
     DB: SqlxRepoBackend,
@@ -92,6 +94,9 @@ where
     let topology_hash = topology.digest();
     let partition_hash = partition.digest();
     let topology_bytes = topology.canonical_bytes();
+    // Only a partition this statement creates takes the minted epoch. An
+    // existing partition keeps the epoch it has and returns it.
+    let minted_epoch = ProjectionEpoch::mint();
     let mut builder = QueryBuilder::<DB>::new(
         "INSERT INTO projection_partitions \
          (topology_bytes, topology_hash, partition_bytes, partition_hash, active_generation, change_epoch) \
@@ -105,7 +110,7 @@ where
     builder.push(", ");
     builder.push_bind(partition_hash.as_slice());
     builder.push(", 1, ");
-    builder.push_bind(change_epoch.as_str());
+    builder.push_bind(minted_epoch.as_str());
     builder.push(
         ") ON CONFLICT (topology_hash, partition_hash) DO UPDATE \
          SET topology_hash = excluded.topology_hash \
@@ -118,10 +123,14 @@ where
         .await
         .map_err(|error| protocol_storage_error::<DB>("lock projection partition", error))?;
     let state = decode_partition_row::<DB>(&row, topology, partition)?;
-    if state.change_epoch != *change_epoch {
-        return Err(ProjectionProtocolError::IncomparableInput);
-    }
 
+    if generation_exists_in_tx::<DB>(tx, topology, partition, state.active_generation).await? {
+        return Ok(state);
+    }
+    // Only a partition this statement just created has no generation yet.
+    if state.active_generation != ProjectionGeneration::initial() {
+        return Err(missing_generation(state.active_generation));
+    }
     let mut generation = QueryBuilder::<DB>::new(
         "INSERT INTO projection_generations \
          (topology_hash, partition_hash, generation, retry_of_generation, retry_of_failure_id) \
@@ -140,14 +149,13 @@ where
         .map_err(|error| {
             protocol_storage_error::<DB>("ensure initial projection generation", error)
         })?;
-    verify_generation_exists_in_tx::<DB>(tx, topology, partition, state.active_generation).await?;
     Ok(state)
 }
 
 pub(super) async fn lock_existing_partition_in_tx<DB>(
     tx: &mut Transaction<'_, DB>,
     topology: &ProjectorTopologyId,
-    partition: &crate::projection_protocol::ProjectionPartition,
+    partition: &crate::projection_protocol::PartitionId,
 ) -> Result<Option<PartitionState>, ProjectionProtocolError>
 where
     DB: SqlxRepoBackend,
@@ -184,7 +192,7 @@ where
 pub(super) async fn load_partition<DB>(
     pool: &Pool<DB>,
     topology: &ProjectorTopologyId,
-    partition: &crate::projection_protocol::ProjectionPartition,
+    partition: &crate::projection_protocol::PartitionId,
 ) -> Result<Option<PartitionState>, ProjectionProtocolError>
 where
     DB: SqlxRepoBackend,
@@ -218,7 +226,7 @@ where
 pub(super) async fn load_partition_in_tx<DB>(
     tx: &mut Transaction<'_, DB>,
     topology: &ProjectorTopologyId,
-    partition: &ProjectionPartition,
+    partition: &PartitionId,
 ) -> Result<Option<PartitionState>, ProjectionProtocolError>
 where
     DB: SqlxRepoBackend,
@@ -236,7 +244,7 @@ where
 pub(super) async fn load_partition_in_connection<DB>(
     connection: &mut DB::Connection,
     topology: &ProjectorTopologyId,
-    partition: &ProjectionPartition,
+    partition: &PartitionId,
 ) -> Result<Option<PartitionState>, ProjectionProtocolError>
 where
     DB: SqlxRepoBackend,
@@ -271,8 +279,7 @@ where
 pub(crate) async fn read_projection_partition_snapshot_in_executor<DB>(
     connection: &mut DB::Connection,
     topology: &ProjectorTopologyId,
-    partition: &ProjectionPartition,
-    declared_epoch: &ProjectionEpoch,
+    partition: &PartitionId,
 ) -> Result<ProjectionPartitionSnapshot, ProjectionProtocolError>
 where
     DB: SqlxRepoBackend,
@@ -286,24 +293,23 @@ where
 {
     let Some(state) = load_partition_in_connection(connection, topology, partition).await? else {
         return Ok(ProjectionPartitionSnapshot {
+            epoch: None,
             head: None,
             compacted_through: 0,
         });
     };
-    if &state.change_epoch != declared_epoch {
-        return Err(ProjectionProtocolError::IncomparableInput);
-    }
     let head = (state.change_head != 0)
         .then(|| {
             ProjectionChangeCursor::new(
                 topology.clone(),
                 partition.clone(),
-                state.change_epoch,
+                state.change_epoch.clone(),
                 state.change_head,
             )
         })
         .transpose()?;
     Ok(ProjectionPartitionSnapshot {
+        epoch: Some(state.change_epoch),
         head,
         compacted_through: state.compacted_through,
     })
@@ -316,7 +322,7 @@ where
 pub(super) async fn load_partition_runtime_state<DB>(
     pool: &Pool<DB>,
     topology: &ProjectorTopologyId,
-    partition: &ProjectionPartition,
+    partition: &PartitionId,
 ) -> Result<Option<ProjectionPartitionRuntimeState>, ProjectionProtocolError>
 where
     DB: SqlxRepoBackend,
@@ -526,9 +532,37 @@ where
 pub(super) async fn verify_generation_exists_in_tx<DB>(
     tx: &mut Transaction<'_, DB>,
     topology: &ProjectorTopologyId,
-    partition: &crate::projection_protocol::ProjectionPartition,
+    partition: &crate::projection_protocol::PartitionId,
     generation: ProjectionGeneration,
 ) -> Result<(), ProjectionProtocolError>
+where
+    DB: SqlxRepoBackend,
+    for<'c> &'c mut DB::Connection: Executor<'c, Database = DB>,
+    DB::Arguments: IntoArguments<DB>,
+    for<'q> i64: Encode<'q, DB> + Type<DB>,
+    for<'q> &'q str: Encode<'q, DB> + Type<DB>,
+    for<'q> &'q [u8]: Encode<'q, DB> + Type<DB>,
+{
+    if generation_exists_in_tx::<DB>(tx, topology, partition, generation).await? {
+        Ok(())
+    } else {
+        Err(missing_generation(generation))
+    }
+}
+
+fn missing_generation(generation: ProjectionGeneration) -> ProjectionProtocolError {
+    corrupt_storage(format!(
+        "active projection generation {} is missing",
+        generation.get()
+    ))
+}
+
+async fn generation_exists_in_tx<DB>(
+    tx: &mut Transaction<'_, DB>,
+    topology: &ProjectorTopologyId,
+    partition: &crate::projection_protocol::PartitionId,
+    generation: ProjectionGeneration,
+) -> Result<bool, ProjectionProtocolError>
 where
     DB: SqlxRepoBackend,
     for<'c> &'c mut DB::Connection: Executor<'c, Database = DB>,
@@ -548,17 +582,10 @@ where
     builder.push(" AND generation = ");
     builder.push_bind(generation_value);
     builder.push(" LIMIT 1");
-    if builder
+    Ok(builder
         .build()
         .fetch_optional(&mut **tx)
         .await
         .map_err(|error| protocol_storage_error::<DB>("verify projection generation", error))?
-        .is_none()
-    {
-        return Err(corrupt_storage(format!(
-            "active projection generation {} is missing",
-            generation.get()
-        )));
-    }
-    Ok(())
+        .is_some())
 }

@@ -16,38 +16,49 @@ impl Routes<()> {
         Self::from_dependencies(())
     }
 
-    /// Framework helper: wire an aggregate repository + read-model store without
-    /// application code naming `QueuedRepository` / `RepoReadModelDependencies`.
+    /// Start one aggregate's routes over a service's stores: commands load
+    /// and commit `A` through the locked event store and write read models
+    /// to the read-model store.
     ///
-    /// Product modules should start here, then register `typed_command` mounts.
-    pub fn for_aggregate<R, L, A, S>(
-        repo: R,
-        locks: L,
-        read_models: S,
-    ) -> Routes<
-        RepoReadModelDependencies<
-            crate::AggregateRepository<crate::QueuedRepository<R, L>, A>,
-            S,
-        >,
-    >
+    /// Product modules start here, then `mount` their commands:
+    ///
+    /// ```ignore
+    /// pub fn routes<St: ServiceStores>(stores: &St) -> Routes<AggregateDependencies<St, Todo>> {
+    ///     Routes::for_aggregate(stores).mount(todo_domain::commands::create())
+    /// }
+    /// ```
+    pub fn for_aggregate<A, St>(
+        stores: &St,
+    ) -> Routes<crate::microsvc::AggregateDependencies<St, A>>
     where
-        R: crate::GetStream + crate::TransactionalCommit + Clone + Send + Sync + 'static,
-        L: crate::LockManager + Clone + 'static,
         A: crate::Aggregate + Send + Sync + 'static,
+        St: crate::microsvc::ServiceStores,
+    {
+        use crate::AggregateBuilder;
+        Routes::new()
+            .with_repo(stores.queued().aggregate::<A>())
+            .with_read_model_store(stores.read_models().clone())
+    }
+
+    /// Wire a repository and a read-model store with no aggregate, for
+    /// commands that own no stream (a provider webhook, a reconciliation).
+    ///
+    /// Typed commands registered here run the same ledgered pipeline as an
+    /// aggregate's. Their handlers receive `CausalCommandContext<'_, ()>` and
+    /// seal outbox messages and read-model plans with
+    /// `ctx.outbox(message).commit()`, or return `PreparedCommand::prepare`
+    /// when they stage nothing.
+    pub fn for_stores<R, S>(
+        repo: R,
+        read_models: S,
+    ) -> Routes<RepoReadModelDependencies<crate::AggregateRepository<R, ()>, S>>
+    where
         S: HasReadModelStore + Send + Sync + 'static,
-        crate::QueuedRepository<R, L>: Clone
-            + crate::AggregateBuilder
-            + HasOutboxStore
-            + crate::TransactionalCommit
-            + Send
-            + Sync
-            + 'static,
-        crate::AggregateRepository<crate::QueuedRepository<R, L>, A>:
+        crate::AggregateRepository<R, ()>:
             HasRepo + HasOutboxStore + ConfigurableOutboxPublisher + Send + Sync + 'static,
     {
-        use crate::{AggregateBuilder, Queueable};
         Routes::new()
-            .with_repo(repo.queued_with(locks).aggregate::<A>())
+            .with_repo(crate::AggregateRepository::new(repo))
             .with_read_model_store(read_models)
     }
 

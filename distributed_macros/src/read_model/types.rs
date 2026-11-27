@@ -9,43 +9,65 @@ pub(super) fn option_string_tokens(value: Option<&str>) -> proc_macro2::TokenStr
 }
 
 pub(super) fn column_type_tokens(ty: &Type, jsonb: bool, text: bool) -> proc_macro2::TokenStream {
+    let framework = crate::shared::framework();
     if jsonb {
-        return quote! { distributed::ColumnType::Json };
+        return quote! { #framework::table::ColumnType::Json };
     }
     if text {
-        return quote! { distributed::ColumnType::Text };
+        return quote! { #framework::table::ColumnType::Text };
     }
 
     let ty = option_inner_type(ty).unwrap_or(ty);
     if let Some(last) = last_type_segment(ty) {
         let ident = last.ident.to_string();
         return match ident.as_str() {
-            "String" | "str" => quote! { distributed::ColumnType::Text },
-            "bool" => quote! { distributed::ColumnType::Boolean },
+            "String" | "str" => quote! { #framework::table::ColumnType::Text },
+            "bool" => quote! { #framework::table::ColumnType::Boolean },
             "i8" | "i16" | "i32" | "i64" | "isize" => {
-                quote! { distributed::ColumnType::Integer }
+                quote! { #framework::table::ColumnType::Integer }
             }
             "u8" | "u16" | "u32" | "u64" | "usize" => {
-                quote! { distributed::ColumnType::UnsignedInteger }
+                quote! { #framework::table::ColumnType::UnsignedInteger }
             }
-            "f32" | "f64" => quote! { distributed::ColumnType::Float },
+            "f32" | "f64" => quote! { #framework::table::ColumnType::Float },
             "Vec" => {
                 if vec_inner_is_u8(last) {
-                    quote! { distributed::ColumnType::Bytes }
+                    quote! { #framework::table::ColumnType::Bytes }
                 } else {
-                    quote! { distributed::ColumnType::Json }
+                    quote! { #framework::table::ColumnType::Json }
                 }
             }
-            "HashMap" | "BTreeMap" | "Value" => quote! { distributed::ColumnType::Json },
+            "HashMap" | "BTreeMap" | "Value" => quote! { #framework::table::ColumnType::Json },
             _ => {
                 let type_name = ty.to_token_stream().to_string();
-                quote! { distributed::ColumnType::Unsupported(#type_name.to_string()) }
+                quote! { #framework::table::ColumnType::Unsupported(#type_name.to_string()) }
             }
         };
     }
 
     let type_name = ty.to_token_stream().to_string();
-    quote! { distributed::ColumnType::Unsupported(#type_name.to_string()) }
+    quote! { #framework::table::ColumnType::Unsupported(#type_name.to_string()) }
+}
+
+/// The column's JSON shape (`Some(<T as JsonType>::json_shape())`) when the
+/// column stores JSON, so generated clients type it exactly; `None` otherwise.
+pub(super) fn json_type_tokens(ty: &Type, jsonb: bool, text: bool) -> proc_macro2::TokenStream {
+    let framework = crate::shared::framework();
+    let inner = option_inner_type(ty).unwrap_or(ty);
+    let json = jsonb
+        || (!text
+            && last_type_segment(inner).is_some_and(|last| {
+                match last.ident.to_string().as_str() {
+                    "Vec" => !vec_inner_is_u8(last),
+                    "HashMap" | "BTreeMap" | "Value" => true,
+                    _ => false,
+                }
+            }));
+    if json {
+        quote! { Some(<#inner as #framework::table::JsonType>::json_shape()) }
+    } else {
+        quote! { None }
+    }
 }
 
 pub(super) fn effect_model_wire_tokens(
@@ -53,28 +75,29 @@ pub(super) fn effect_model_wire_tokens(
     jsonb: bool,
     text: bool,
 ) -> proc_macro2::TokenStream {
+    let framework = crate::shared::framework();
     if jsonb {
-        return quote! { distributed::graphql::EffectWireJson };
+        return quote! { #framework::command::EffectWireJson };
     }
     if text {
-        return quote! { distributed::graphql::EffectWireString };
+        return quote! { #framework::command::EffectWireString };
     }
     let ty = option_inner_type(ty).unwrap_or(ty);
     let Some(last) = last_type_segment(ty) else {
-        return quote! { distributed::graphql::EffectWireUnsupported };
+        return quote! { #framework::command::EffectWireUnsupported };
     };
     match last.ident.to_string().as_str() {
-        "String" | "str" => quote! { distributed::graphql::EffectWireString },
-        "bool" => quote! { distributed::graphql::EffectWireBoolean },
+        "String" | "str" => quote! { #framework::command::EffectWireString },
+        "bool" => quote! { #framework::command::EffectWireBoolean },
         "i8" | "i16" | "i32" | "i64" | "isize" | "u8" | "u16" | "u32" | "u64" | "usize" => {
-            quote! { distributed::graphql::EffectWireBigInt }
+            quote! { #framework::command::EffectWireBigInt }
         }
-        "f32" | "f64" => quote! { distributed::graphql::EffectWireFloat },
-        "Vec" if vec_inner_is_u8(last) => quote! { distributed::graphql::EffectWireBytea },
+        "f32" | "f64" => quote! { #framework::command::EffectWireFloat },
+        "Vec" if vec_inner_is_u8(last) => quote! { #framework::command::EffectWireBytea },
         "Vec" | "HashMap" | "BTreeMap" | "Value" => {
-            quote! { distributed::graphql::EffectWireJson }
+            quote! { #framework::command::EffectWireJson }
         }
-        _ => quote! { distributed::graphql::EffectWireUnsupported },
+        _ => quote! { #framework::command::EffectWireUnsupported },
     }
 }
 
@@ -82,6 +105,7 @@ pub(super) fn bytes_row_value_tokens(
     ty: &Type,
     value: proc_macro2::TokenStream,
 ) -> Option<proc_macro2::TokenStream> {
+    let framework = crate::shared::framework();
     let option_inner = option_inner_type(ty);
     let ty = option_inner.unwrap_or(ty);
     let segment = last_type_segment(ty)?;
@@ -92,13 +116,13 @@ pub(super) fn bytes_row_value_tokens(
     if option_inner.is_some() {
         Some(quote! {
             match &#value {
-                Some(value) => distributed::RowValue::Bytes(value.clone()),
-                None => distributed::RowValue::Null,
+                Some(value) => #framework::table::RowValue::Bytes(value.clone()),
+                None => #framework::table::RowValue::Null,
             }
         })
     } else {
         Some(quote! {
-            distributed::RowValue::Bytes(#value.clone())
+            #framework::table::RowValue::Bytes(#value.clone())
         })
     }
 }
@@ -129,6 +153,24 @@ pub(super) fn vec_inner_type(ty: &Type) -> Option<&Type> {
         GenericArgument::Type(ty) => Some(ty),
         _ => None,
     })
+}
+
+/// One allocation wrapper for a singular relationship, not a model or column.
+pub(super) fn box_inner_type(ty: &Type) -> Option<&Type> {
+    let segment = last_type_segment(ty)?;
+    if segment.ident != "Box" {
+        return None;
+    }
+    let PathArguments::AngleBracketed(args) = &segment.arguments else {
+        return None;
+    };
+    if args.args.len() != 1 {
+        return None;
+    }
+    match args.args.first()? {
+        GenericArgument::Type(ty) => Some(ty),
+        _ => None,
+    }
 }
 
 pub(super) fn validate_relationship_target_type(

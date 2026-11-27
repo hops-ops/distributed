@@ -2,11 +2,13 @@
 	import '../app.css';
 	import '$lib/styles/chrome.css';
 	import { browser } from '$app/environment';
+	import { createReplicaDiagnostics } from '@hops-ops/distributed/replica';
 	import { page } from '$app/state';
 	import { onDestroy, untrack } from 'svelte';
 	import type { Snippet } from 'svelte';
 	import {
 		createPageDataSessionSource,
+		type SveltekitDistributedPageData,
 		type SveltekitReplicaHydration
 	} from '@hops-ops/distributed/sveltekit';
 	import { DISTRIBUTED_BOUNDARY_OPERATIONS, provideDistributed } from '$distributed';
@@ -19,7 +21,7 @@
 	let { data, children }: { data: LayoutData; children: Snippet } = $props();
 
 	const initialData = untrack(() => data);
-	const pageData = createPageDataSessionSource(initialData);
+	const pageData = createPageDataSessionSource<SveltekitDistributedPageData>(initialData);
 	let appliedHydration: SveltekitReplicaHydration | undefined =
 		initialData.distributed;
 	let hydrationTimer: ReturnType<typeof setTimeout> | undefined;
@@ -34,7 +36,13 @@
 		diagnostics.__distributedReloadState = lifecycleDemoState;
 	}
 
+	const replicaDiagnostics = browser && (globalThis as typeof globalThis & Record<string, unknown>).__captureReplicaDiagnostics === true
+		? createReplicaDiagnostics() : undefined;
+	if (replicaDiagnostics) {
+		(globalThis as typeof globalThis & Record<string, unknown>).__replicaDiagnosticSnapshot = () => replicaDiagnostics.snapshot();
+	}
 	const client = provideDistributed({
+		...(replicaDiagnostics ? { replica: { diagnostics: replicaDiagnostics } } : {}),
 		boundaries: DISTRIBUTED_BOUNDARY_OPERATIONS,
 		session: pageData.session,
 		browser,
@@ -59,17 +67,17 @@
 			: {})
 	});
 
-	$effect(() => {
-		pageData.set(data);
+	function applyPageData(next: SveltekitDistributedPageData) {
+		pageData.set(next);
 		if (
-			data.distributed === undefined ||
-			data.distributedAuthority === undefined ||
-			data.distributed === appliedHydration
+			next.distributed === undefined ||
+			next.distributedAuthority === undefined ||
+			next.distributed === appliedHydration
 		) {
 			return;
 		}
 
-		appliedHydration = data.distributed;
+		appliedHydration = next.distributed;
 		if (hydrationTimer !== undefined) clearTimeout(hydrationTimer);
 		// Session listeners fence an old credential in the microtask queue.
 		// Apply the separately-authorized navigation seed after that fence.
@@ -77,9 +85,11 @@
 		// confirmed keys omitted from this route seed are retained.
 		hydrationTimer = setTimeout(() => {
 			hydrationTimer = undefined;
-			client.hydrate(data.distributed!, data.distributedAuthority!);
+			client.hydrate(next.distributed!, next.distributedAuthority!);
 		}, 0);
-	});
+	}
+
+	$effect(() => applyPageData(data));
 
 	$effect(() => {
 		if (!browser || !data.session?.user) return;
@@ -121,7 +131,8 @@
 </script>
 
 <svelte:window onpointerover={prefetchLink} />
-<AuthRefresh />
+<!-- Refresh uses its seed as scope evidence; keep newer local command state. -->
+<AuthRefresh onRefresh={(next) => pageData.set(next)} />
 <Navbar />
 <main>
 	{@render children()}

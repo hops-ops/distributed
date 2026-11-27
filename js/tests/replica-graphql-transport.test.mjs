@@ -4,6 +4,7 @@ import test from 'node:test';
 import {
 	createReplicaGraphqlTransport
 } from '../dist/replica/index.js';
+import { FakeScheduler } from './fixtures/game-harness.mjs';
 
 function jsonResponse(body, status = 200) {
 	return {
@@ -133,10 +134,12 @@ test('replica GraphQL live work merges surface binding with resume and closes on
 	const next = [];
 	const errors = [];
 	let completions = 0;
+	const scheduler = new FakeScheduler();
 	const transport = createReplicaGraphqlTransport({
 		getUrl: () => '/graphql',
 		getAuth: () => ({ userId: 'alice', role: 'user' }),
-		webSocket: FakeWebSocket
+		webSocket: FakeWebSocket,
+		scheduler
 	});
 	const extensions = {
 		distributed: {
@@ -176,7 +179,7 @@ test('replica GraphQL live work merges surface binding with resume and closes on
 	const socket = FakeWebSocket.instances[0];
 	assert.equal(socket.protocol, 'graphql-transport-ws');
 	assert.match(socket.url, /graphql\/ws/);
-	assert.match(socket.url, /x-user-id=alice/);
+	assert.doesNotMatch(socket.url, /x-user-id|x-roles/, 'identity never travels in the URL');
 	socket.open();
 	assert.deepEqual(socket.sent[0], {
 		type: 'connection_init',
@@ -197,19 +200,34 @@ test('replica GraphQL live work merges surface binding with resume and closes on
 			}
 		}
 	});
-	socket.message({ type: 'next', payload: { data: { todos: [{ id: '1' }] } } });
+	const credit = { gatewayOperation: '1', gatewayDeliveryAck: 'opaque-credit' };
+	socket.message({ type: 'ping', payload: credit });
+	assert.deepEqual(socket.sent.at(-1), { type: 'pong', payload: credit });
+	socket.message({ type: 'ping' });
+	assert.deepEqual(socket.sent.at(-1), { type: 'pong' });
+	socket.message({ type: 'next', id: '1', payload: { data: { todos: [{ id: '1' }] } } });
 	assert.deepEqual(next, [{ data: { todos: [{ id: '1' }] } }]);
 	assert.deepEqual(errors, []);
 	socket.message({ type: 'complete', id: '1' });
 	assert.equal(completions, 1);
-	assert.equal(socket.closed, true);
+	assert.equal(socket.closed, false);
+	await scheduler.advance(1_000);
+	assert.equal(socket.closed, true, 'a socket without subscriptions closes');
 
 	const stopError = transport.subscribe(liveRequest, observer);
 	await tick();
 	const errorSocket = FakeWebSocket.instances[1];
 	errorSocket.open();
-	errorSocket.message({ type: 'error', id: '1', payload: 'terminal error' });
-	assert.deepEqual(errors, ['terminal error']);
+	errorSocket.message({ type: 'connection_ack' });
+	// Operation ids are never reused, so a stale frame matches nothing.
+	assert.equal(errorSocket.sent[1].id, '2');
+	errorSocket.message({ type: 'error', id: '1', payload: [{ message: 'stale' }] });
+	assert.deepEqual(errors, []);
+	errorSocket.message({ type: 'error', id: '2', payload: [{ message: 'terminal error' }] });
+	assert.equal(errors.length, 1);
+	assert.equal(errors[0].message, 'terminal error');
+	assert.equal(errors[0].retryable, false);
+	await scheduler.advance(1_000);
 	assert.equal(errorSocket.closed, true);
 	assert.equal(completions, 1);
 

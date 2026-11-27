@@ -1,5 +1,0 @@
-error: command roles must not contain duplicates
- --> tests/compile_fail/application_command_duplicate_role.rs:6:17
-  |
-6 |     roles(user, user),
-  |                 ^^^^

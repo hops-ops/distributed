@@ -22,7 +22,7 @@ impl<'a> ModelCompileContext<'a> {
 
 pub(super) fn compile_model_object<'ast>(
     field: &MergedField<'ast>,
-    model: &ManifestModel,
+    model: &ClientModel,
     context: &ModelCompileContext<'_>,
     used_variables: &mut BTreeSet<String>,
     expander: &mut FragmentExpander<'ast, '_>,
@@ -287,6 +287,7 @@ pub(super) fn compile_model_object<'ast>(
                 codec: "string".into(),
                 nullable: false,
                 expose: true,
+                json_type: None,
             },
         }));
     }
@@ -308,7 +309,7 @@ pub(super) fn compile_model_object<'ast>(
     Ok(object)
 }
 
-pub(super) fn compiled_storage(model: &ManifestModel) -> CompiledStorage {
+pub(super) fn compiled_storage(model: &ClientModel) -> CompiledStorage {
     match model.identity() {
         Some(identity) => CompiledStorage::Normalized {
             model_id: model.id.clone(),
@@ -319,13 +320,15 @@ pub(super) fn compiled_storage(model: &ManifestModel) -> CompiledStorage {
 }
 
 pub(super) fn compiled_relationship_plan(
-    relationship: &ManifestRelationship,
+    relationship: &ClientRelationship,
 ) -> CompiledRelationshipPlan {
     let maintenance = match &relationship.key_mapping {
-        ManifestRelationshipKeyMapping::Direct { .. }
-        | ManifestRelationshipKeyMapping::Through { .. } => relationship.maintenance,
-        ManifestRelationshipKeyMapping::ThroughOpaque { .. }
-        | ManifestRelationshipKeyMapping::Embedded => ManifestRelationshipMaintenance::Revalidate,
+        RelationshipKeyMapping::Direct { .. } | RelationshipKeyMapping::Through { .. } => {
+            relationship.maintenance
+        }
+        RelationshipKeyMapping::ThroughOpaque { .. } | RelationshipKeyMapping::Embedded => {
+            ClientRelationshipMaintenance::Revalidate
+        }
     };
     CompiledRelationshipPlan {
         field: relationship.name.clone(),
@@ -337,26 +340,24 @@ pub(super) fn compiled_relationship_plan(
     }
 }
 
-pub(super) fn relationship_key_fields(
-    mapping: &ManifestRelationshipKeyMapping,
-) -> (&[String], &[String]) {
+pub(super) fn relationship_key_fields(mapping: &RelationshipKeyMapping) -> (&[String], &[String]) {
     match mapping {
-        ManifestRelationshipKeyMapping::Direct { local, remote }
-        | ManifestRelationshipKeyMapping::Through { local, remote, .. }
-        | ManifestRelationshipKeyMapping::ThroughOpaque { local, remote, .. } => (local, remote),
-        ManifestRelationshipKeyMapping::Embedded => (&[], &[]),
+        RelationshipKeyMapping::Direct { local, remote }
+        | RelationshipKeyMapping::Through { local, remote, .. }
+        | RelationshipKeyMapping::ThroughOpaque { local, remote, .. } => (local, remote),
+        RelationshipKeyMapping::Embedded => (&[], &[]),
     }
 }
 
 #[allow(clippy::too_many_arguments)]
 pub(super) fn compile_aggregate_object<'ast>(
     field: &MergedField<'ast>,
-    model: &ManifestModel,
-    semantics: &ManifestAggregateSemantics,
-    arguments: &[ManifestArgument],
+    model: &ClientModel,
+    semantics: &ClientAggregateSemantics,
+    arguments: &[ClientArgument],
     compiled_arguments: &BTreeMap<String, CompiledArgument>,
-    filter_semantics: Option<&ManifestFilterSemantics>,
-    order_semantics: Option<&ManifestOrderSemantics>,
+    filter_semantics: Option<&ClientFilterSemantics>,
+    order_semantics: Option<&ClientOrderSemantics>,
     dependencies: &[String],
     manifest: &ClientManifest,
     variables: &[CompiledVariable],
@@ -509,6 +510,7 @@ pub(super) fn compile_aggregate_object<'ast>(
                     codec: "string".into(),
                     nullable: false,
                     expose: true,
+                    json_type: None,
                 }));
             }
             "aggregate" | "nodes" => {
@@ -543,7 +545,7 @@ pub(super) fn compile_aggregate_object<'ast>(
 
 pub(super) fn compile_aggregate_fields_object<'ast>(
     field: &MergedField<'ast>,
-    semantics: &ManifestAggregateSemantics,
+    semantics: &ClientAggregateSemantics,
     document: &ClientDocument,
     expander: &mut FragmentExpander<'ast, '_>,
     depth: usize,
@@ -581,6 +583,7 @@ pub(super) fn compile_aggregate_fields_object<'ast>(
                 codec: "int32".into(),
                 nullable: false,
                 expose: true,
+                json_type: None,
             })),
             "__typename" => members.push(CompiledMember::Scalar(CompiledScalar {
                 response_key,
@@ -588,6 +591,7 @@ pub(super) fn compile_aggregate_fields_object<'ast>(
                 codec: "string".into(),
                 nullable: false,
                 expose: true,
+                json_type: None,
             })),
             "sum" | "avg" | "min" | "max" => {
                 return Err(source_error(
@@ -621,7 +625,7 @@ pub(super) fn compile_aggregate_fields_object<'ast>(
 
 pub(super) fn compiled_scalar(
     response_key: &str,
-    field: &ManifestField,
+    field: &ClientField,
     expose: bool,
 ) -> CompiledScalar {
     CompiledScalar {
@@ -630,5 +634,6 @@ pub(super) fn compiled_scalar(
         codec: field.codec.clone(),
         nullable: field.nullable,
         expose,
+        json_type: field.json_type.clone(),
     }
 }

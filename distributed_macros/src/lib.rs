@@ -1,14 +1,11 @@
 mod aggregate;
-mod application;
+mod aggregate_command;
 mod command;
 mod command_input_defaults;
-mod portable_command;
-mod digest;
+mod command_types;
 mod domain_event;
 mod domain_state;
-mod enqueue;
-mod graphql_types;
-mod module;
+mod json_type;
 mod mutation;
 // Event-owning `projection!` authoring removed (mutation projectors cutover).
 mod read_model;
@@ -19,64 +16,16 @@ mod sourced;
 use proc_macro::TokenStream;
 use syn::DeriveInput;
 
-/// Generate one typed command's portable contract and optional executable
-/// mount from the same handler declaration.
-#[proc_macro_attribute]
-pub fn command(attr: TokenStream, item: TokenStream) -> TokenStream {
-    command::expand(attr.into(), item.into())
-        .unwrap_or_else(|error| error.to_compile_error())
-        .into()
-}
-
-/// Domain-owned portable command mount (`PCH-DEC-001`).
+/// Declare a command on an aggregate transition: name, shard, load, payload
+/// and outcome, with `handle:` for a hand-written handler.
 ///
-/// Spec sketches used `command!`; that name is the handler attribute
-/// [`command`]. This is the function-like form for shard + invoke + Eventual
-/// (or a `handle:` escape hatch).
+/// The method form, `#[command("aggregate.verb", ..)]` on a method inside a
+/// `#[sourced]` impl, is read by `#[sourced]` and declares the same thing
+/// next to the transition.
 #[proc_macro]
-pub fn portable_command(input: TokenStream) -> TokenStream {
-    portable_command::expand(input.into())
+pub fn command(input: TokenStream) -> TokenStream {
+    command::expand(input.into())
         .unwrap_or_else(|error| error.to_compile_error())
-        .into()
-}
-
-/// Register an explicit logical module.
-#[proc_macro]
-pub fn module(input: TokenStream) -> TokenStream {
-    module::expand(input.into())
-        .unwrap_or_else(|error| error.to_compile_error())
-        .into()
-}
-
-/// Register an explicit application and its selected modules/surfaces.
-#[proc_macro]
-pub fn application(input: TokenStream) -> TokenStream {
-    application::expand(input.into())
-        .unwrap_or_else(|error| error.to_compile_error())
-        .into()
-}
-
-/// Attribute macro that automatically queues a local event for emission.
-#[proc_macro_attribute]
-pub fn enqueue(attr: TokenStream, item: TokenStream) -> TokenStream {
-    enqueue::expand_enqueue(attr.into(), item.into())
-        .unwrap_or_else(|e| e.to_compile_error())
-        .into()
-}
-
-/// Attribute macro that automatically inserts a digest call at the beginning of a method.
-#[proc_macro_attribute]
-pub fn digest(attr: TokenStream, item: TokenStream) -> TokenStream {
-    digest::expand_digest(attr.into(), item.into())
-        .unwrap_or_else(|e| e.to_compile_error())
-        .into()
-}
-
-/// Generates the Aggregate trait impl with replay logic.
-#[proc_macro]
-pub fn aggregate(input: TokenStream) -> TokenStream {
-    aggregate::expand_aggregate(input.into())
-        .unwrap_or_else(|e| e.to_compile_error())
         .into()
 }
 
@@ -151,16 +100,6 @@ pub fn command_input_defaults(input: TokenStream) -> TokenStream {
 ///     }
 /// }
 /// ```
-///
-/// Classic sugar still works:
-///
-/// ```ignore
-/// mutation! {
-///     name: "SaveTodo";
-///     version: 1;
-///     upsert Todos from input.todo;
-/// }
-/// ```
 #[proc_macro]
 pub fn mutation(input: TokenStream) -> TokenStream {
     mutation::expand(input)
@@ -182,21 +121,32 @@ pub fn mutation_file(input: TokenStream) -> TokenStream {
     mutation::expand_file(input)
 }
 
-/// Derive `GraphqlInputType` for command mutation input structs.
-#[proc_macro_derive(GraphqlInput, attributes(serde))]
-pub fn derive_graphql_input(input: TokenStream) -> TokenStream {
+/// Derive transport-neutral command input metadata from Serde field shapes.
+#[proc_macro_derive(CommandInput, attributes(serde))]
+pub fn derive_command_input(input: TokenStream) -> TokenStream {
     let input = syn::parse_macro_input!(input as DeriveInput);
-    match graphql_types::expand_graphql_input(input) {
+    match command_types::expand_command_input(input) {
         Ok(tokens) => tokens.into(),
         Err(err) => err.to_compile_error().into(),
     }
 }
 
-/// Derive `GraphqlOutputType` for command mutation output structs.
-#[proc_macro_derive(GraphqlOutput, attributes(serde))]
-pub fn derive_graphql_output(input: TokenStream) -> TokenStream {
+/// Derive transport-neutral command output metadata from Serde field shapes.
+#[proc_macro_derive(CommandOutput, attributes(serde))]
+pub fn derive_command_output(input: TokenStream) -> TokenStream {
     let input = syn::parse_macro_input!(input as DeriveInput);
-    match graphql_types::expand_graphql_output(input) {
+    match command_types::expand_command_output(input) {
+        Ok(tokens) => tokens.into(),
+        Err(err) => err.to_compile_error().into(),
+    }
+}
+
+/// Derive the serialized JSON shape (`distributed::table::JsonType`) of a
+/// named-field struct or a unit-only enum, following its Serde names.
+#[proc_macro_derive(JsonType, attributes(serde))]
+pub fn derive_json_type(input: TokenStream) -> TokenStream {
+    let input = syn::parse_macro_input!(input as DeriveInput);
+    match json_type::expand(input) {
         Ok(tokens) => tokens.into(),
         Err(err) => err.to_compile_error().into(),
     }

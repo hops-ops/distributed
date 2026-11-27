@@ -192,6 +192,10 @@ impl Lock for InMemoryLock {
     async fn unlock(&self) -> Result<(), LockError> {
         self.unlock_core()
     }
+
+    fn release_detached(self: Arc<Self>) {
+        let _ = self.unlock_core();
+    }
 }
 
 /// In-memory [`LockManager`] backed by a `HashMap<String, Arc<InMemoryLock>>`.
@@ -199,7 +203,9 @@ impl Lock for InMemoryLock {
 /// Lazily creates one [`InMemoryLock`] per unique key and returns the same
 /// `Arc` for repeated lookups. An entry is evicted on unlock once it is idle
 /// and no handle beyond the map's own remains, so the map does not grow
-/// unboundedly with every aggregate id ever locked.
+/// unboundedly with every aggregate id ever locked. Clones share one lock
+/// table.
+#[derive(Clone)]
 pub struct InMemoryLockManager {
     locks: Arc<Mutex<HashMap<String, Arc<InMemoryLock>>>>,
 }

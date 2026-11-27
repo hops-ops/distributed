@@ -1,18 +1,15 @@
 use std::collections::BTreeSet;
-use std::future::Future;
-use std::pin::Pin;
-use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
 use super::error::{ApplicationError, ApplicationResult};
 use super::identity::{canonical_json, sha256_fingerprint, LogicalId};
-use crate::graphql::command_contract::{
-    CommandConsistency, CommandOutcome, TypedCommand, TypedCommandContract,
+use crate::command::{
+    CommandConsistency, CommandInputType, CommandOutcome, CommandTypeDef, TypedCommand,
+    TypedCommandContract,
 };
-use crate::graphql::{GraphqlInputType, GraphqlTypeDef};
 
-/// Serializable GraphQL type field used by a portable command contract.
+/// Serializable command type field used by a portable command contract.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct CommandTypeField {
@@ -22,10 +19,12 @@ pub struct CommandTypeField {
     pub list: bool,
     pub item_nullable: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unsigned_integer: Option<crate::command::CommandUnsignedInteger>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub nested: Option<Box<CommandTypeSpec>>,
 }
 
-/// Serializable GraphQL input/output type used by a portable command contract.
+/// Serializable command input/output type used by a portable command contract.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct CommandTypeSpec {
@@ -35,14 +34,15 @@ pub struct CommandTypeSpec {
 
 pub type TypeSpec = CommandTypeSpec;
 
-impl From<&GraphqlTypeDef> for CommandTypeSpec {
-    fn from(definition: &GraphqlTypeDef) -> Self {
+impl From<&CommandTypeDef> for CommandTypeSpec {
+    fn from(definition: &CommandTypeDef) -> Self {
         Self {
             name: definition.name.clone(),
             fields: definition
                 .fields
                 .iter()
                 .map(|field| CommandTypeField {
+                    unsigned_integer: field.unsigned_integer,
                     name: field.name.clone(),
                     type_name: field.type_name.clone(),
                     nullable: field.nullable,
@@ -71,7 +71,7 @@ pub struct EventSpec {
 
 /// The portable half of one typed command declaration.
 ///
-/// The effect, default, confirmation, and projection values are copied from
+/// The default and projection values are copied from
 /// the existing typed-command IR. They remain explicit JSON-shaped data; no
 /// handler symbol, Rust `TypeId`, closure, or machine path is retained.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -84,15 +84,9 @@ pub struct CommandSpec {
     pub output: CommandTypeSpec,
     pub consistency: CommandConsistency,
     pub defaults: serde_json::Value,
-    pub effects: serde_json::Value,
     pub emits: Vec<EventSpec>,
     pub applies: serde_json::Value,
     pub projection_contract: serde_json::Value,
-    /// Declaration-owned projector/model/key confirmations. These are the
-    /// portable proof inputs; topology pointers and schemas are intentionally
-    /// reduced to their canonical identities by `canonical_value()`.
-    #[serde(default)]
-    pub confirmations: Vec<serde_json::Value>,
     /// Canonical direct-projection proof material, if the outcome is Atomic.
     /// The erased Rust type identity is never copied into this value.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -113,9 +107,7 @@ pub fn admit_command_session(
     user_id: Option<&str>,
     session_roles: &[&str],
 ) -> Result<(), &'static str> {
-    if command_roles_require_principal(roles)
-        && user_id.map(str::trim).unwrap_or("").is_empty()
-    {
+    if command_roles_require_principal(roles) && user_id.map(str::trim).unwrap_or("").is_empty() {
         return Err("unauthenticated");
     }
     if roles.is_empty() {
@@ -140,7 +132,7 @@ pub struct CommandDefinition {
     spec: CommandSpec,
     /// The exact typed declaration that produced `spec`. This is retained for
     /// contract-only composition so Surface authorization can bind from the
-    /// declaration-owned GraphQL shapes and effects without reconstructing a
+    /// declaration-owned GraphQL shapes without reconstructing a
     /// lossy command from public JSON.
     typed_contract: Option<TypedCommandContract>,
     mount: Option<CommandMount>,
@@ -201,7 +193,7 @@ impl CommandDefinition {
         mount: Option<CommandMount>,
     ) -> ApplicationResult<Self>
     where
-        I: GraphqlInputType + serde::de::DeserializeOwned + Send + 'static,
+        I: CommandInputType + serde::de::DeserializeOwned + Send + 'static,
         K: CommandOutcome,
     {
         let (_, typed_contract) = command.into_parts();
@@ -234,8 +226,7 @@ fn validate_mount_spec(spec: &CommandSpec, mount: &CommandMount) -> ApplicationR
         return Err(ApplicationError::Collision {
             kind: "command",
             identity: spec.id.clone(),
-            reason: "command definition and executable mount do not share one spec identity"
-                .into(),
+            reason: "command definition and executable mount do not share one spec identity".into(),
         });
     }
     Ok(())
@@ -270,11 +261,9 @@ impl CommandSpec {
             output,
             consistency,
             defaults: serde_json::Value::Array(Vec::new()),
-            effects: serde_json::Value::Null,
             emits: Vec::new(),
             applies: serde_json::Value::Array(Vec::new()),
             projection_contract: serde_json::Value::Null,
-            confirmations: Vec::new(),
             direct_projection: None,
             projected_model: None,
             fingerprint: String::new(),
@@ -291,7 +280,8 @@ impl CommandSpec {
         proof: serde_json::Value,
     ) -> ApplicationResult<Self> {
         self.consistency = CommandConsistency::Atomic;
-        self.projected_model = Some(LogicalId::try_new("projected model", projected_model)?.into_string());
+        self.projected_model =
+            Some(LogicalId::try_new("projected model", projected_model)?.into_string());
         self.direct_projection = Some(proof);
         self.refresh_fingerprint()?;
         self.validate()?;
@@ -302,7 +292,7 @@ impl CommandSpec {
     /// an already compiled application Surface back to its portable command.
     pub fn with_surface_binding(
         mut self,
-        exposed: &super::module::SurfaceCommandSpec,
+        exposed: &super::surface::SurfaceCommandSpec,
     ) -> ApplicationResult<Self> {
         let mut mismatches = Vec::new();
         if self.id != exposed.id {
@@ -314,9 +304,6 @@ impl CommandSpec {
         if self.consistency != exposed.consistency {
             mismatches.push("consistency");
         }
-        if exposed.confirmation_unavailable {
-            mismatches.push("confirmation availability");
-        }
         if !mismatches.is_empty() {
             return Err(ApplicationError::Collision {
                 kind: "command",
@@ -327,9 +314,6 @@ impl CommandSpec {
                 ),
             });
         }
-        let confirmations = exposed.confirmations.as_array().cloned().ok_or_else(|| {
-            ApplicationError::InvalidSpec("surface confirmations must be an array".into())
-        })?;
         self.input = exposed
             .input
             .clone()
@@ -346,10 +330,8 @@ impl CommandSpec {
             })?;
         self.roles = exposed.roles.clone();
         self.defaults = exposed.defaults.clone();
-        self.effects = exposed.effects.clone();
-        self.applies = exposed.applies.clone();
+        self.applies = exposed.applies();
         self.projection_contract = exposed.projection_contract.clone();
-        self.confirmations = confirmations;
         self.direct_projection = exposed.direct_projection.clone();
         self.projected_model = exposed.projected_model.clone();
         self.refresh_fingerprint()?;
@@ -360,7 +342,7 @@ impl CommandSpec {
     /// Build a portable spec from the framework's existing typed declaration.
     pub fn from_typed_command<I, K>(command: &TypedCommand<I, K>) -> ApplicationResult<Self>
     where
-        I: GraphqlInputType + serde::de::DeserializeOwned + Send + 'static,
+        I: CommandInputType + serde::de::DeserializeOwned + Send + 'static,
         K: CommandOutcome,
     {
         let (_, contract) = command.clone().into_parts();
@@ -368,19 +350,19 @@ impl CommandSpec {
     }
 
     pub(crate) fn from_contract(
-        contract: &crate::graphql::command_contract::TypedCommandContract,
+        contract: &crate::command::TypedCommandContract,
     ) -> ApplicationResult<Self> {
+        contract
+            .projections
+            .clone()
+            .canonicalize_and_validate(&contract.name)
+            .map_err(ApplicationError::InvalidSpec)?;
         let projection_contract = serde_json::to_value(&contract.projections)?;
         let applies = serde_json::to_value(&contract.projections.previews)?;
-        let confirmations = contract
-            .confirmations
-            .iter()
-            .map(crate::graphql::command_contract::CommandProjectionConfirmation::canonical_value)
-            .collect();
         let direct_projection = contract
             .direct_projection
             .as_ref()
-            .map(crate::graphql::command_contract::CommandDirectProjectionTarget::canonical_value);
+            .map(crate::command::CommandDirectProjectionTarget::canonical_value);
         let mut emits: Vec<EventSpec> = contract
             .projections
             .selectors
@@ -397,11 +379,16 @@ impl CommandSpec {
             })
             .collect();
         emits.sort_by(|left, right| {
-            (left.name.as_str(), left.version, left.body_fingerprint.as_str()).cmp(&(
-                right.name.as_str(),
-                right.version,
-                right.body_fingerprint.as_str(),
-            ))
+            (
+                left.name.as_str(),
+                left.version,
+                left.body_fingerprint.as_str(),
+            )
+                .cmp(&(
+                    right.name.as_str(),
+                    right.version,
+                    right.body_fingerprint.as_str(),
+                ))
         });
         let mut roles = contract.roles.clone();
         roles.sort();
@@ -414,11 +401,9 @@ impl CommandSpec {
             output: CommandTypeSpec::from(&contract.output),
             consistency: contract.consistency,
             defaults: serde_json::to_value(&contract.input_defaults)?,
-            effects: serde_json::to_value(&contract.effects)?,
             emits,
             applies,
             projection_contract,
-            confirmations,
             direct_projection,
             projected_model: contract
                 .projected_model
@@ -484,12 +469,8 @@ impl CommandSpec {
             validate_text("event body codec", &event.body_codec)?;
         }
         validate_json_contract("command defaults", &self.defaults)?;
-        validate_json_contract("command effects", &self.effects)?;
         validate_json_contract("command applies", &self.applies)?;
         validate_json_contract("command projection contract", &self.projection_contract)?;
-        for confirmation in &self.confirmations {
-            validate_json_contract("command confirmation", confirmation)?;
-        }
         if let Some(direct) = &self.direct_projection {
             validate_json_contract("command direct projection", direct)?;
         }
@@ -597,11 +578,7 @@ fn validate_json_contract(kind: &'static str, value: &serde_json::Value) -> Appl
             super::manifest::MAX_MANIFEST_JSON_BYTES
         )));
     }
-    fn walk(
-        kind: &'static str,
-        value: &serde_json::Value,
-        depth: usize,
-    ) -> ApplicationResult<()> {
+    fn walk(kind: &'static str, value: &serde_json::Value, depth: usize) -> ApplicationResult<()> {
         if depth > super::manifest::MAX_MANIFEST_JSON_DEPTH {
             return Err(ApplicationError::InvalidSpec(format!(
                 "{kind} exceeds JSON depth {}",
@@ -610,7 +587,8 @@ fn validate_json_contract(kind: &'static str, value: &serde_json::Value) -> Appl
         }
         match value {
             serde_json::Value::String(value) => {
-                if value.len() > super::manifest::MAX_MANIFEST_STRING_BYTES || value.contains('\0') {
+                if value.len() > super::manifest::MAX_MANIFEST_STRING_BYTES || value.contains('\0')
+                {
                     return Err(ApplicationError::InvalidSpec(format!(
                         "{kind} contains oversized or NUL string material"
                     )));
@@ -633,8 +611,7 @@ fn validate_json_contract(kind: &'static str, value: &serde_json::Value) -> Appl
                     )));
                 }
                 for (key, value) in fields {
-                    if key.len() > super::manifest::MAX_MANIFEST_STRING_BYTES
-                        || key.contains('\0')
+                    if key.len() > super::manifest::MAX_MANIFEST_STRING_BYTES || key.contains('\0')
                     {
                         return Err(ApplicationError::InvalidSpec(format!(
                             "{kind} contains oversized or NUL object-key material"
@@ -643,141 +620,31 @@ fn validate_json_contract(kind: &'static str, value: &serde_json::Value) -> Appl
                     walk(kind, value, depth + 1)?;
                 }
             }
-            serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {}
+            serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {
+            }
         }
         Ok(())
     }
     walk(kind, value, 0)
 }
 
-/// Executable command material retained only at the heterogeneous runtime
-/// boundary. Its handler is intentionally absent from serialization. The
-/// boundary is deliberately a callable request/response trait rather than an
-/// `Any` value: a runtime can invoke it without knowing the concrete function
-/// item type or attempting a downcast.
-pub type CommandMountFuture<'a> = Pin<
-    Box<dyn Future<Output = Result<crate::microsvc::CommandResponse, crate::microsvc::HandlerError>>
-        + Send
-        + 'a>,
->;
-
-pub trait CommandMountHandler: Send + Sync {
-    fn call(&self, request: crate::microsvc::CommandRequest) -> CommandMountFuture<'_>;
-}
-
 /// Explicit registration seam used by service/runtime adapters. A mount is
 /// not executable merely because it contains a value; an adapter must accept
 /// it into its registry before it can be dispatched.
 pub trait CommandMountRegistrar {
-    fn register_command_mount(&mut self, mount: CommandMount) -> Result<(), crate::microsvc::HandlerError>;
+    fn register_command_mount(
+        &mut self,
+        mount: CommandMount,
+    ) -> Result<(), crate::microsvc::HandlerError>;
 }
 
-/// Invocation context for the heterogeneous runtime boundary. The ordinary
-/// transport variant is deliberately unable to execute a typed causal mount;
-/// only the authenticated variant carries the framework-issued principal and
-/// bearer-scoped command identity needed by the existing causal ledger path.
-#[cfg(feature = "graphql")]
-#[allow(dead_code)]
-#[derive(Debug)]
-pub(crate) enum CommandMountInvocation {
-    Transport,
-    Authenticated {
-        command_id: String,
-        session: crate::microsvc::Session,
-        principal: crate::graphql::identity::VerifiedPrincipal,
-    },
-}
-
-#[cfg(not(feature = "graphql"))]
-#[allow(dead_code)]
-#[derive(Debug)]
-pub(crate) enum CommandMountInvocation {
-    Transport,
-}
-
-#[cfg(feature = "graphql")]
-#[allow(dead_code)]
-#[derive(Debug)]
-pub(crate) enum CommandMountExecutionResult {
-    Transport(crate::microsvc::CommandResponse),
-    Causal(crate::microsvc::CausalDispatchResult),
-}
-
-#[cfg(not(feature = "graphql"))]
-#[allow(dead_code)]
-#[derive(Debug)]
-pub(crate) enum CommandMountExecutionResult {
-    Transport(crate::microsvc::CommandResponse),
-}
-
-#[cfg(feature = "graphql")]
-#[allow(dead_code)]
-#[derive(Debug)]
-pub(crate) enum CommandMountExecutionError {
-    Handler(crate::microsvc::HandlerError),
-    Causal(crate::microsvc::CausalDispatchError),
-}
-
-#[cfg(not(feature = "graphql"))]
-#[allow(dead_code)]
-#[derive(Debug)]
-pub(crate) enum CommandMountExecutionError {
-    Handler(crate::microsvc::HandlerError),
-}
-
-#[allow(dead_code)]
-pub(crate) type CommandMountExecutionFuture<'a> = Pin<
-    Box<
-        dyn Future<
-                Output = Result<CommandMountExecutionResult, CommandMountExecutionError>,
-            > + Send
-            + 'a,
-    >,
->;
-
-/// Runtime adapter for mounts whose authorization and causal commit protocol
-/// lives in a service/router. Adapters receive the same mount spec and must
-/// route through the existing `CommandRequest`/`CommandResponse` boundary;
-/// authenticated typed mounts additionally enter the existing causal receipt
-/// and projection-proof protocol.
-#[allow(dead_code)]
-pub(crate) trait CommandMountExecution: Send + Sync {
-    fn invoke_mount<'a>(
-        &'a self,
-        mount: &'a CommandMount,
-        request: crate::microsvc::CommandRequest,
-        invocation: CommandMountInvocation,
-    ) -> CommandMountExecutionFuture<'a>;
-}
-
-struct RequestCommandMountHandler<H>(H);
-
-impl<H, F> CommandMountHandler for RequestCommandMountHandler<H>
-where
-    H: Fn(crate::microsvc::CommandRequest) -> F + Send + Sync,
-    F: Future<Output = Result<crate::microsvc::CommandResponse, crate::microsvc::HandlerError>>
-        + Send
-        + 'static,
-{
-    fn call(&self, request: crate::microsvc::CommandRequest) -> CommandMountFuture<'_> {
-        Box::pin((self.0)(request))
-    }
-}
-
+/// The runtime-facing identity of one command declaration. It carries no
+/// handler: execution is owned by the typed route it names and enters only
+/// through the ledgered causal dispatch path.
+#[derive(Clone)]
 pub struct CommandMount {
     spec: CommandSpec,
-    handler: Option<Arc<dyn CommandMountHandler>>,
     typed_route: Option<String>,
-}
-
-impl Clone for CommandMount {
-    fn clone(&self) -> Self {
-        Self {
-            spec: self.spec.clone(),
-            handler: self.handler.clone(),
-            typed_route: self.typed_route.clone(),
-        }
-    }
 }
 
 impl std::fmt::Debug for CommandMount {
@@ -785,56 +652,24 @@ impl std::fmt::Debug for CommandMount {
         formatter
             .debug_struct("CommandMount")
             .field("command", &self.spec.id)
-            .field("callable", &self.handler.is_some())
             .field("typed_route", &self.typed_route)
             .finish()
     }
 }
 
 impl CommandMount {
-    /// Create a contract-only mount with no executable handler.
+    /// Create a contract-only mount bound to no route.
     pub fn contract(spec: CommandSpec) -> Self {
         Self {
             spec,
-            handler: None,
             typed_route: None,
         }
-    }
-
-    /// Erase one executable handler without changing the portable spec.
-    pub fn from_handler<H>(spec: CommandSpec, handler: H) -> Self
-    where
-        H: CommandMountHandler + 'static,
-    {
-        Self {
-            spec,
-            handler: Some(Arc::new(handler)),
-            typed_route: None,
-        }
-    }
-
-    /// Adapt an owned request handler to the type-erased mount boundary.
-    /// Request and response values remain the existing transport types and
-    /// failures retain the framework's typed [`HandlerError`].
-    pub fn from_request_handler<H, F>(spec: CommandSpec, handler: H) -> Self
-    where
-        H: Fn(crate::microsvc::CommandRequest) -> F + Send + Sync + 'static,
-        F: Future<
-                Output = Result<crate::microsvc::CommandResponse, crate::microsvc::HandlerError>,
-            > + Send
-            + 'static,
-    {
-        Self::from_handler(spec, RequestCommandMountHandler(handler))
     }
 
     /// Create the runtime-facing registration token for a typed causal route.
-    /// The token deliberately contains no fake handler closure: execution is
-    /// owned by the registered typed route and can only enter through the
-    /// authenticated causal protocol.
     pub fn from_typed_route(spec: CommandSpec, route_name: impl Into<String>) -> Self {
         Self {
             spec,
-            handler: None,
             typed_route: Some(route_name.into()),
         }
     }
@@ -845,34 +680,6 @@ impl CommandMount {
 
     pub(crate) fn typed_route_name(&self) -> Option<&str> {
         self.typed_route.as_deref()
-    }
-
-    /// Invoke the erased handler. Contract-only mounts fail closed with a
-    /// typed authorization error instead of pretending that a mount is
-    /// executable.
-    pub fn invoke(&self, request: &crate::microsvc::CommandRequest) -> CommandMountFuture<'_> {
-        match &self.handler {
-            Some(handler) => handler.call(request.clone()),
-            None => Box::pin(async {
-                Err(crate::microsvc::HandlerError::Unauthorized(
-                    "command mount has no runtime handler".into(),
-                ))
-            }),
-        }
-    }
-
-    /// Invoke through a registered runtime adapter. Typed mounts must receive
-    /// an authenticated invocation context; the adapter then enters the
-    /// existing causal route, preserving authorization, receipts, and
-    /// projection proofs. A transport-only invocation remains fail-closed.
-    #[allow(dead_code)]
-    pub(crate) fn invoke_with<'a, E: CommandMountExecution>(
-        &'a self,
-        executor: &'a E,
-        request: &crate::microsvc::CommandRequest,
-        invocation: CommandMountInvocation,
-    ) -> CommandMountExecutionFuture<'a> {
-        executor.invoke_mount(self, request.clone(), invocation)
     }
 
     /// Register this mount with an explicit runtime adapter.
@@ -886,7 +693,7 @@ impl CommandMount {
 
 impl<I, K> TypedCommand<I, K>
 where
-    I: GraphqlInputType + serde::de::DeserializeOwned + Send + 'static,
+    I: CommandInputType + serde::de::DeserializeOwned + Send + 'static,
     K: CommandOutcome,
 {
     /// Compile the exact declaration into its portable, serializable spec.

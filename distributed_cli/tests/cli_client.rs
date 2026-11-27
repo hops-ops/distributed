@@ -16,24 +16,12 @@ const ROLE_MANIFEST: &str = r#"{
     "kind": "role",
     "name": "user"
   },
-  "schema_fingerprint": "sha256:758a97e4f7e1e538e8be86d24abd3d50a8da2d5813d29abd7a04bfa092d05189",
-  "protocol_fingerprint": "sha256:00fb342f3acb4dc1c1716a43cc3001c748d5f6c500ff831690d820e9e43e2782",
   "execution": {
     "max_depth": 8,
-    "max_complexity": 500,
+    "max_fields": 500,
+    "max_rows": 200000,
     "max_bool_width": 256,
-    "max_in_list": 1000,
-    "complexity": {
-      "version": 1,
-      "scalar": 1,
-      "belongs_to": 2,
-      "has_many": 10,
-      "m2m": 12,
-      "aggregate": 8,
-      "list_root": 3,
-      "by_pk": 1,
-      "list_fanout": 5
-    }
+    "max_in_list": 1000
   },
   "capabilities": {
     "live_queries": false,
@@ -296,11 +284,33 @@ const SECOND_TODOS_QUERY: &str = r#"query SecondTodos {
 }
 "#;
 
+/// Stamp a test manifest with the crate's protocol fingerprint and the schema
+/// fingerprint of its own content, as the exporter does, so an edited fixture
+/// stays a valid export without pasting digests.
+fn sealed_manifest(json: &str) -> String {
+    let mut value: serde_json::Value = serde_json::from_str(json).expect("test manifest is JSON");
+    value["protocol_fingerprint"] = distributed::graphql::client_protocol_fingerprint()
+        .expect("protocol fingerprint")
+        .into();
+    value["schema_fingerprint"] = "".into();
+    let manifest: distributed::graphql::DistributedClientManifest =
+        serde_json::from_value(value.clone()).expect("test manifest decodes");
+    value["schema_fingerprint"] = manifest
+        .computed_schema_fingerprint()
+        .expect("test manifest is serializable")
+        .into();
+    serde_json::to_string_pretty(&value).expect("serialize test manifest")
+}
+
 fn project_dir(name: &str) -> PathBuf {
     let project = Path::new(env!("CARGO_TARGET_TMPDIR")).join(name);
     let _ = fs::remove_dir_all(&project);
     fs::create_dir_all(&project).expect("create disposable client project");
-    fs::write(project.join("client-manifest.json"), ROLE_MANIFEST).expect("write client manifest");
+    fs::write(
+        project.join("client-manifest.json"),
+        sealed_manifest(ROLE_MANIFEST),
+    )
+    .expect("write client manifest");
     project
 }
 
@@ -380,6 +390,49 @@ fn snapshot_tree(root: &Path) -> BTreeMap<String, Vec<u8>> {
     let mut snapshot = BTreeMap::new();
     visit(root, root, &mut snapshot);
     snapshot
+}
+
+#[test]
+fn literal_text_search_generates_a_typed_load_island() {
+    let project = project_dir("client-literal-text");
+    fs::write(
+        project.join("client-manifest.json"),
+        // Adding a filter changes the selected schema contract; sealing
+        // re-stamps the fingerprint of the edited content.
+        sealed_manifest(&ROLE_MANIFEST.replace("\"_ilike\"", "\"_ilike\", \"_icontains\"")),
+    )
+    .unwrap();
+    write_document(
+        &project,
+        "queries/search.graphql",
+        r#"
+        query SearchTodos($q: String! = "") @load {
+            todos(where: {title: {_icontains: $q}}, limit: 20) { id title }
+        }
+    "#,
+    );
+    assert_success(
+        &generate(&project, "queries/*.graphql", &[]),
+        "literal search generation",
+    );
+    assert_success(
+        &generate(&project, "queries/*.graphql", &["--check"]),
+        "literal search drift check",
+    );
+    let inventory = fs::read_to_string(project.join("generated/islands.json")).unwrap();
+    assert!(inventory.contains("SearchTodos"));
+    assert!(inventory.contains("\"load\": true"));
+    assert!(inventory.contains("String!"));
+    write_document(
+        &project,
+        "queries/search.graphql",
+        r#"
+        query SearchTodos { todos(where: {title: {_icontains: 1}}) { id } }
+    "#,
+    );
+    assert!(!generate(&project, "queries/*.graphql", &[])
+        .status
+        .success());
 }
 
 #[test]
@@ -584,7 +637,7 @@ fn unmatched_document_glob_fails_before_creating_output() {
 
 #[test]
 fn component_load_intent_remains_framework_neutral_outside_route_conventions() {
-	let project = project_dir("client-component-load");
+    let project = project_dir("client-component-load");
     write_document(&project, "queries/todos.graphql", LOAD_TODOS_QUERY);
 
     let unplaced = generate(&project, "queries/*.graphql", &[]);
@@ -596,10 +649,10 @@ fn component_load_intent_remains_framework_neutral_outside_route_conventions() {
         "unplaced component island must retain its load intent for the adapter"
     );
 
-	assert!(
-		!project.join("generated/routes.ts").exists(),
-		"the framework-neutral compiler must not invent adapter route ownership"
-	);
+    assert!(
+        !project.join("generated/routes.ts").exists(),
+        "the framework-neutral compiler must not invent adapter route ownership"
+    );
 }
 
 #[test]

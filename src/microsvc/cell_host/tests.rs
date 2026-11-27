@@ -1,12 +1,13 @@
 use super::{
-    instance_name, parent_cell_name, AggregateCell, CellCommandIdentity, CellDispatchError,
+    instance_name, parent_cell_name, AggregateCell, CellBatchCommand, CellCommandIdentity,
     CellNamespace, CellStreamStore, DURABLE_AGGREGATE_CELL_STATE_VERSION,
 };
 use crate::aggregate::{Aggregate, AggregateRepository};
+use crate::command::{typed_command, PreparedCommand, Succeeded};
 use crate::entity::Entity;
-use crate::graphql::{typed_command, PreparedCommand, Succeeded};
 use crate::microsvc::service::{CausalCommandContext, PortableCommand, Routes};
 use crate::microsvc::session::{Session, USER_ID_KEY};
+use crate::microsvc::CausalDispatchError;
 use crate::microsvc::HandlerError;
 use crate::repository::{
     CommitBatch, GetStream, RepositoryError, StreamIdentity, StreamWrite, TransactionalCommit,
@@ -24,7 +25,7 @@ struct CellItem {
     done: bool,
 }
 
-#[sourced(entity, aggregate_type = "CellItem")]
+#[sourced(entity, aggregate_type = "CellItem", events = "CellItemEvent")]
 impl CellItem {
     #[event("cell_item.created", version = 1)]
     fn create(&mut self, id: String, title: String) {
@@ -37,25 +38,31 @@ impl CellItem {
     fn complete(&mut self) {
         self.done = true;
     }
+
+    #[event("cell_item.published", version = 1, domain = event)]
+    fn publish(&mut self, id: String, title: String) {
+        self.entity.set_id(id);
+        self.title = title;
+    }
 }
 
-#[derive(Debug, Deserialize, crate::GraphqlInput)]
+#[derive(Debug, Deserialize, crate::command::CommandInput)]
 struct CreateInput {
     id: String,
     title: String,
 }
 
-#[derive(Debug, Serialize, crate::GraphqlOutput)]
+#[derive(Debug, Serialize, crate::command::CommandOutput)]
 struct CreatePayload {
     id: String,
 }
 
-#[derive(Debug, Deserialize, crate::GraphqlInput)]
+#[derive(Debug, Deserialize, crate::command::CommandInput)]
 struct CompleteInput {
     id: String,
 }
 
-#[derive(Debug, Serialize, crate::GraphqlOutput)]
+#[derive(Debug, Serialize, crate::command::CommandOutput)]
 struct CompletePayload {
     id: String,
     done: bool,
@@ -104,7 +111,7 @@ where
             ))
             .load_by(|input: &CompleteInput| Complete::shard(input))
             .invoke(|item, _input, _owner| item.complete())
-            .succeeded(|item| CompletePayload {
+            .succeeded(|item, _principal| CompletePayload {
                 id: item.entity().id().to_string(),
                 done: item.done,
             })
@@ -132,6 +139,100 @@ fn owner_session() -> Session {
     let mut session = Session::new();
     session.set(USER_ID_KEY, "user-1");
     session
+}
+
+fn command_identity(command_id: &str) -> CellCommandIdentity {
+    CellCommandIdentity::new("cell-test-service", "principal-alice", command_id).unwrap()
+}
+
+struct Publish;
+
+impl<D> PortableCommand<D> for Publish
+where
+    D: crate::microsvc::CausalRouteDependencies<Aggregate = CellItem> + Send + Sync + 'static,
+{
+    fn install(self, routes: Routes<D>) -> Routes<D> {
+        routes
+            .typed_command(typed_command::<CreateInput, Succeeded<CreatePayload>>(
+                "cell_item.publish",
+            ))
+            .guarded(
+                |ctx: &CausalCommandContext<'_, CellItem>| ctx.session().user_id().is_some(),
+                handle_publish,
+            )
+    }
+}
+
+async fn handle_publish(
+    ctx: &CausalCommandContext<'_, CellItem>,
+    input: CreateInput,
+) -> Result<PreparedCommand<Succeeded<CreatePayload>>, HandlerError> {
+    let repo = ctx.repo();
+    let mut item = repo.create();
+    item.publish(input.id.clone(), input.title)
+        .map_err(|error| HandlerError::Rejected(error.to_string()))?;
+    repo.publish_events()
+        .commit(item)?
+        .succeeded(CreatePayload { id: input.id })
+}
+
+#[tokio::test]
+async fn command_replay_retains_confirmation_evidence_without_outbox_history() {
+    let cell = AggregateCell::<CellItem>::new("published-item")
+        .unwrap()
+        .mount(Publish);
+    let identity = CellCommandIdentity::new(
+        "cell-test-service",
+        "principal-alice",
+        "0190a000-0000-7000-8000-000000000405",
+    )
+    .unwrap();
+    let input = json!({ "id": "published-item", "title": "once" });
+    let first = cell
+        .dispatch_idempotent(
+            "cell_item.publish",
+            &identity,
+            input.clone(),
+            owner_session(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(first.projection_events().len(), 1);
+    assert_eq!(
+        first.projection_events()[0].event_type,
+        "cell_item.published"
+    );
+    assert_eq!(cell.durable_outbox().unwrap().len(), 1);
+
+    // Restore only domain history and the receipt, as after a completed drain.
+    // The retry must not require a single delivery record to be retained.
+    let reopened = AggregateCell::<CellItem>::new("published-item")
+        .unwrap()
+        .mount(Publish);
+    reopened
+        .restore_durable_events(cell.durable_events().unwrap())
+        .unwrap();
+    reopened
+        .restore_durable_commands(cell.durable_commands().unwrap())
+        .unwrap();
+    assert!(reopened.durable_outbox().unwrap().is_empty());
+    let replay = reopened
+        .dispatch_idempotent("cell_item.publish", &identity, input, owner_session())
+        .await
+        .unwrap();
+    assert!(replay.replayed());
+    assert_eq!(replay.payload(), first.payload());
+    assert_eq!(replay.projection_events(), first.projection_events());
+    assert!(
+        reopened.durable_outbox().unwrap().is_empty(),
+        "replay must not republish"
+    );
+    assert_eq!(reopened.durable_events().unwrap()[0].events.len(), 1);
+    // History reads the same log through the store.
+    let history = reopened.history().await.unwrap();
+    assert_eq!(history, cell.durable_events().unwrap()[0].events);
+    let foreign = StreamIdentity::new("CellItem", "someone-else").unwrap();
+    assert!(reopened.stream_events(&foreign).await.is_err());
 }
 
 fn fn_send_sync<T: Send + Sync>(_: &T) {}
@@ -210,27 +311,29 @@ async fn cell_dispatches_complete_with_the_same_portable_command_as_soa() {
     fn_send_sync(&cell);
 
     let created = cell
-        .dispatch(
+        .dispatch_idempotent(
             "cell_item.create",
+            &command_identity("0190a000-0000-7000-8000-000000000430"),
             json!({ "id": "item-1", "title": "ship" }),
             owner_session(),
         )
         .await
         .expect("create");
-    assert_eq!(created["id"], "item-1");
+    assert_eq!(created.payload()["id"], "item-1");
     let loaded = cell.load().await.expect("load");
     assert_eq!(loaded.expect("resident").title, "ship");
 
     let completed = cell
-        .dispatch(
+        .dispatch_idempotent(
             "cell_item.complete",
+            &command_identity("0190a000-0000-7000-8000-000000000431"),
             json!({ "id": "item-1" }),
             owner_session(),
         )
         .await
         .expect("complete");
-    assert_eq!(completed["id"], "item-1");
-    assert_eq!(completed["done"], true);
+    assert_eq!(completed.payload()["id"], "item-1");
+    assert_eq!(completed.payload()["done"], true);
 
     let snap = cell
         .cached_snapshot()
@@ -272,6 +375,41 @@ async fn cell_dispatches_complete_with_the_same_portable_command_as_soa() {
     assert_eq!(loaded.entity.snapshot_version(), 2);
 }
 
+/// The first dispatch answers from the completion it committed, a retry from
+/// the stored row: the two must be the same receipt.
+#[tokio::test]
+async fn first_dispatch_returns_the_receipt_its_replay_returns() {
+    let cell = AggregateCell::<CellItem>::new("receipt-item")
+        .unwrap()
+        .mount(Publish);
+    let identity = CellCommandIdentity::new(
+        "cell-test-service",
+        "principal-alice",
+        "0190a000-0000-7000-8000-000000000406",
+    )
+    .unwrap();
+    let input = json!({ "id": "receipt-item", "title": "once" });
+
+    let first = cell
+        .dispatch_idempotent(
+            "cell_item.publish",
+            &identity,
+            input.clone(),
+            owner_session(),
+        )
+        .await
+        .unwrap();
+    let replay = cell
+        .dispatch_idempotent("cell_item.publish", &identity, input, owner_session())
+        .await
+        .unwrap();
+
+    assert!(!first.replayed());
+    assert!(replay.replayed());
+    assert_eq!(first.projection_events().len(), 1);
+    assert_eq!(first, replay.fresh());
+}
+
 #[tokio::test]
 async fn cell_wait_path_replays_the_same_command_without_new_domain_effects() {
     let cell = AggregateCell::<CellItem>::new("item-ledger")
@@ -304,6 +442,7 @@ async fn cell_wait_path_replays_the_same_command_without_new_domain_effects() {
     assert!(replay.replayed());
     assert_eq!(replay.payload(), first.payload());
     assert_eq!(replay.causation_id(), first.causation_id());
+    assert_eq!(replay.projection_events(), first.projection_events());
     let events = cell.durable_events().unwrap();
     assert_eq!(
         events
@@ -341,6 +480,12 @@ async fn cell_wait_path_replays_the_same_command_without_new_domain_effects() {
         .expect("durable replay after restart");
     assert!(replay_after_restart.replayed());
     assert_eq!(replay_after_restart.causation_id(), first.causation_id());
+    assert!(restored.durable_outbox().unwrap().is_empty());
+    assert_eq!(
+        replay_after_restart.projection_events(),
+        first.projection_events(),
+        "confirmation evidence must survive restart with no outbox history"
+    );
     assert_eq!(
         restored
             .durable_events()
@@ -350,6 +495,98 @@ async fn cell_wait_path_replays_the_same_command_without_new_domain_effects() {
             .sum::<usize>(),
         1
     );
+}
+
+fn batch_command(command: &str, id: &str, input: serde_json::Value) -> CellBatchCommand {
+    CellBatchCommand {
+        command: command.into(),
+        identity: CellCommandIdentity::new("cell-test-service", "principal-alice", id).unwrap(),
+        input,
+        session: owner_session(),
+    }
+}
+
+fn event_count(cell: &AggregateCell<CellItem>) -> usize {
+    cell.durable_events()
+        .unwrap()
+        .iter()
+        .map(|stream| stream.events.len())
+        .sum()
+}
+
+#[tokio::test]
+async fn a_batch_runs_in_order_and_replays_as_a_whole() {
+    let cell = AggregateCell::<CellItem>::new("item-batch")
+        .unwrap()
+        .mount(Create)
+        .mount(Complete);
+    let batch = || {
+        vec![
+            batch_command(
+                "cell_item.create",
+                "0190a000-0000-7000-8000-000000000410",
+                json!({ "id": "item-batch", "title": "once" }),
+            ),
+            // Sees the create before it.
+            batch_command(
+                "cell_item.complete",
+                "0190a000-0000-7000-8000-000000000411",
+                json!({ "id": "item-batch" }),
+            ),
+        ]
+    };
+    let first = cell.dispatch_idempotent_batch(batch()).await;
+    assert_eq!(first.len(), 2);
+    assert!(first.iter().all(|r| !r.as_ref().unwrap().replayed()));
+    assert_eq!(first[1].as_ref().unwrap().payload()["done"], json!(true));
+    assert_eq!(event_count(&cell), 2);
+
+    let replay = cell.dispatch_idempotent_batch(batch()).await;
+    assert_eq!(replay.len(), 2);
+    for (replayed, original) in replay.iter().zip(&first) {
+        let (replayed, original) = (replayed.as_ref().unwrap(), original.as_ref().unwrap());
+        assert!(replayed.replayed());
+        assert_eq!(replayed.payload(), original.payload());
+        assert_eq!(replayed.causation_id(), original.causation_id());
+    }
+    assert_eq!(event_count(&cell), 2, "a replayed batch appends nothing");
+}
+
+#[tokio::test]
+async fn a_rejected_batch_entry_leaves_the_others_committed() {
+    let cell = AggregateCell::<CellItem>::new("item-batch-reject")
+        .unwrap()
+        .mount(Create)
+        .mount(Complete);
+    let create = json!({ "id": "item-batch-reject", "title": "once" });
+    let results = cell
+        .dispatch_idempotent_batch(vec![
+            batch_command(
+                "cell_item.create",
+                "0190a000-0000-7000-8000-000000000420",
+                create.clone(),
+            ),
+            // Already exists: rejected by the handler.
+            batch_command(
+                "cell_item.create",
+                "0190a000-0000-7000-8000-000000000421",
+                create,
+            ),
+            batch_command(
+                "cell_item.complete",
+                "0190a000-0000-7000-8000-000000000422",
+                json!({ "id": "item-batch-reject" }),
+            ),
+        ])
+        .await;
+    assert_eq!(results.len(), 3);
+    assert!(results[0].is_ok());
+    assert!(matches!(
+        results[1],
+        Err(CausalDispatchError::Rejected { .. })
+    ));
+    assert!(results[2].is_ok());
+    assert_eq!(event_count(&cell), 2);
 }
 
 #[tokio::test]
@@ -382,7 +619,7 @@ async fn cell_wait_path_rejects_command_id_reuse_with_different_input() {
         )
         .await
         .unwrap_err();
-    assert!(matches!(error, CellDispatchError::CommandIdReuse));
+    assert!(matches!(error, CausalDispatchError::CommandIdReuse));
     assert_eq!(error.code(), "COMMAND_ID_REUSE");
     assert_eq!(error.status_code(), 409);
 }
@@ -393,8 +630,9 @@ async fn cell_complete_rejects_a_different_shard_id() {
         .unwrap()
         .mount(Create)
         .mount(Complete);
-    cell.dispatch(
+    cell.dispatch_idempotent(
         "cell_item.create",
+        &command_identity("0190a000-0000-7000-8000-000000000432"),
         json!({ "id": "item-1", "title": "ship" }),
         owner_session(),
     )
@@ -402,8 +640,9 @@ async fn cell_complete_rejects_a_different_shard_id() {
     .unwrap();
 
     let error = cell
-        .dispatch(
+        .dispatch_idempotent(
             "cell_item.complete",
+            &command_identity("0190a000-0000-7000-8000-000000000433"),
             json!({ "id": "item-2" }),
             owner_session(),
         )
@@ -501,30 +740,43 @@ async fn parent_cells_are_isolated_and_have_no_cross_cell_commit() {
     assert!(GetStream::get_stream(&game_2, &player_id).await.is_err());
 }
 
-#[test]
-fn cargo_features_keep_sqlite_and_do_not_add_celld() {
-    let manifest = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml"));
-    assert!(
-        manifest
-            .lines()
-            .any(|line| line.trim_start().starts_with("sqlite =")),
-        "sqlite feature must remain next to postgres"
-    );
-    assert!(
-        manifest
-            .lines()
-            .any(|line| line.trim_start().starts_with("postgres =")),
-        "postgres feature must remain next to sqlite"
-    );
-    let features = manifest
-        .split("[features]")
-        .nth(1)
-        .and_then(|rest| rest.split("\n[").next())
-        .expect("features table");
-    assert!(
-        !features
-            .lines()
-            .any(|line| line.trim_start().starts_with("celld")),
-        "PCH-DEC-005: do not add a celld Cargo feature beside sqlite/postgres"
-    );
+#[tokio::test]
+async fn reference_host_applies_the_sealed_row_reducer_on_commit() {
+    let store = CellStreamStore::new("CellItem", "item-s")
+        .unwrap()
+        .with_sealed_row_reducer(|current, appends| {
+            let seen = current.and_then(|row| row["events"].as_u64()).unwrap_or(0);
+            let added = appends
+                .iter()
+                .map(|append| append.events.len() as u64)
+                .sum::<u64>();
+            Ok(Some(json!({ "events": seen + added })))
+        });
+    let cell = AggregateCell::<CellItem>::from_store(store)
+        .unwrap()
+        .mount(Create)
+        .mount(Complete);
+    cell.dispatch_idempotent(
+        "cell_item.create",
+        &command_identity("0190a000-0000-7000-8000-000000000434"),
+        json!({ "id": "item-s", "title": "seal" }),
+        owner_session(),
+    )
+    .await
+    .unwrap();
+    cell.dispatch_idempotent(
+        "cell_item.complete",
+        &command_identity("0190a000-0000-7000-8000-000000000435"),
+        json!({ "id": "item-s" }),
+        owner_session(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(cell.sealed_row().unwrap(), Some(json!({ "events": 2 })));
+    assert!(AggregateCell::<CellItem>::from_store(
+        CellStreamStore::for_parent_shard("game", "g1", |_| true).unwrap()
+    )
+    .is_err());
 }
+
+mod alarms;

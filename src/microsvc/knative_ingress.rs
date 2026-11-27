@@ -11,6 +11,13 @@
 //! into the HTTP body and classifies a `HandlerError` to pick the status code —
 //! neither of which the bus's `MessageRouter::dispatch` (unit-returning) exposes.
 //!
+//! The CloudEvent is read as a [`WireEnvelope`]: `id` is the message id,
+//! `datacontenttype` the content type, the `distributedkind` extension
+//! attribute (which `KnativeBus` stamps) the kind, and every other attribute
+//! metadata. A CloudEvent without `distributedkind` is an event. A typed
+//! command delivered here runs through the command ledger as the transport
+//! identity, with the CloudEvent `id` as the message id it deduplicates on.
+//!
 //! Acknowledgement is the HTTP response:
 //!
 //! - handler success → `200 OK` (the only ack);
@@ -31,7 +38,7 @@ use axum::{Json, Router};
 use base64::Engine;
 use serde_json::{json, Value};
 
-use crate::bus::{validate_message_name, Message, MessageKind};
+use crate::bus::{Message, WireEnvelope, KNATIVE_KIND_ATTRIBUTE};
 use crate::microsvc::{Service, MAX_HTTP_BODY_BYTES};
 use crate::trace_context::{TraceContext, TRACEPARENT, TRACESTATE};
 
@@ -67,7 +74,7 @@ async fn ingress_handler(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    let message = match parse_cloud_event(&headers, &body) {
+    let message = match decode_cloud_event(&headers, &body) {
         Ok(message) => message,
         Err(reason) => return (StatusCode::BAD_REQUEST, reason).into_response(),
     };
@@ -86,7 +93,7 @@ async fn ingress_handler(
             // `err.to_string()` can carry SQL/driver/path detail. Log the real
             // error server-side; return only a safe message on the wire.
             if err.status_code() >= 500 {
-                eprintln!("knative ingress `{}` failed: {err}", message.name());
+                tracing::error!(message = message.name(), error = %err, "knative ingress failed");
             }
             (
                 status,
@@ -101,16 +108,33 @@ fn header<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
     headers.get(name).and_then(|value| value.to_str().ok())
 }
 
-/// Parse a CloudEvent in binary or structured HTTP mode into a [`Message`].
-fn parse_cloud_event(headers: &HeaderMap, body: &Bytes) -> Result<Message, String> {
+/// Decode a CloudEvent in binary or structured HTTP mode into a [`Message`],
+/// as [`cloud_events_router`] does before dispatch. A Knative broker emulator
+/// (a test harness) uses it to store what a [`KnativeBus`](crate::bus::KnativeBus)
+/// produced exactly as a subscriber would receive it.
+pub fn decode_cloud_event(headers: &HeaderMap, body: &Bytes) -> Result<Message, String> {
     let content_type = header(headers, "content-type").unwrap_or("");
-    let mut message = if content_type.starts_with(STRUCTURED_CONTENT_TYPE) {
+    let envelope = if content_type.starts_with(STRUCTURED_CONTENT_TYPE) {
         parse_structured(body)
     } else {
         parse_binary(headers, body)
     }?;
+    let (mut message, error) = envelope.decode();
+    if let Some(error) = error {
+        return Err(format!("invalid cloudevent: {error}"));
+    }
     inject_http_trace_context(headers, &mut message.metadata);
     Ok(message)
+}
+
+/// The [`WireEnvelope`] header a CloudEvent attribute carries.
+fn envelope_key(attribute: &str) -> String {
+    match attribute {
+        "id" => WireEnvelope::ID.to_string(),
+        "datacontenttype" => WireEnvelope::CONTENT_TYPE.to_string(),
+        kind if kind == KNATIVE_KIND_ATTRIBUTE => WireEnvelope::KIND.to_string(),
+        other => other.to_string(),
+    }
 }
 
 fn inject_http_trace_context(headers: &HeaderMap, metadata: &mut Vec<(String, String)>) {
@@ -128,63 +152,46 @@ fn inject_http_trace_context(headers: &HeaderMap, metadata: &mut Vec<(String, St
 }
 
 /// Binary mode: attributes are `ce-*` headers, the body is the data.
-fn parse_binary(headers: &HeaderMap, body: &Bytes) -> Result<Message, String> {
-    let id = header(headers, "ce-id").ok_or("missing ce-id header")?;
+fn parse_binary(headers: &HeaderMap, body: &Bytes) -> Result<WireEnvelope, String> {
+    header(headers, "ce-id").ok_or("missing ce-id header")?;
     let name = header(headers, "ce-type").ok_or("missing ce-type header")?;
-    // `ce-type` is attacker-controlled wire input that becomes Message.name and,
-    // downstream, a broker routing identifier — validate before trusting it.
-    validate_message_name(name).map_err(|e| format!("invalid ce-type: {e}"))?;
-    let content_type = header(headers, "content-type")
-        .unwrap_or("application/json")
-        .to_string();
-
-    let mut metadata = Vec::new();
+    let mut pairs = Vec::new();
     for (key, value) in headers.iter() {
+        let Ok(value) = value.to_str() else {
+            continue;
+        };
         let key = key.as_str();
-        if let Some(attr) = key.strip_prefix("ce-") {
-            if attr == "id" || attr == "type" {
-                continue;
-            }
-            if let Ok(value) = value.to_str() {
-                metadata.push((attr.to_string(), value.to_string()));
+        if key == "content-type" {
+            pairs.push((WireEnvelope::CONTENT_TYPE.to_string(), value.to_string()));
+        } else if let Some(attribute) = key.strip_prefix("ce-") {
+            if attribute != "type" && attribute != "specversion" {
+                pairs.push((envelope_key(attribute), value.to_string()));
             }
         }
     }
-
-    Ok(Message {
-        id: Some(id.to_string()),
+    Ok(WireEnvelope {
         name: name.to_string(),
-        kind: MessageKind::Event,
+        headers: pairs,
         payload: body.to_vec(),
-        content_type,
-        metadata,
     })
 }
 
 /// Structured mode: a single `application/cloudevents+json` document.
-fn parse_structured(body: &Bytes) -> Result<Message, String> {
+fn parse_structured(body: &Bytes) -> Result<WireEnvelope, String> {
     let event: Value =
         serde_json::from_slice(body).map_err(|e| format!("invalid cloudevents+json: {e}"))?;
     let object = event
         .as_object()
         .ok_or("cloudevent must be a JSON object")?;
 
-    let id = object
+    object
         .get("id")
         .and_then(Value::as_str)
-        .ok_or("missing cloudevent id")?
-        .to_string();
+        .ok_or("missing cloudevent id")?;
     let name = object
         .get("type")
         .and_then(Value::as_str)
         .ok_or("missing cloudevent type")?
-        .to_string();
-    // Same wire-input check as binary mode: `type` becomes Message.name.
-    validate_message_name(&name).map_err(|e| format!("invalid cloudevent type: {e}"))?;
-    let content_type = object
-        .get("datacontenttype")
-        .and_then(Value::as_str)
-        .unwrap_or("application/json")
         .to_string();
 
     // Data: `data` (any JSON; objects/arrays re-serialized to bytes) or
@@ -202,34 +209,23 @@ fn parse_structured(body: &Bytes) -> Result<Message, String> {
         Vec::new()
     };
 
-    // Remaining attributes (source, subject, extensions) become metadata.
-    let reserved = [
-        "specversion",
-        "id",
-        "type",
-        "datacontenttype",
-        "data",
-        "data_base64",
-    ];
-    let mut metadata = Vec::new();
+    // Every other attribute (id, source, subject, extensions) is a header.
+    let mut pairs = Vec::new();
     for (key, value) in object {
-        if reserved.contains(&key.as_str()) {
+        if ["specversion", "type", "data", "data_base64"].contains(&key.as_str()) {
             continue;
         }
         let value = match value {
             Value::String(s) => s.clone(),
             other => other.to_string(),
         };
-        metadata.push((key.clone(), value));
+        pairs.push((envelope_key(key), value));
     }
 
-    Ok(Message {
-        id: Some(id),
+    Ok(WireEnvelope {
         name,
-        kind: MessageKind::Event,
+        headers: pairs,
         payload,
-        content_type,
-        metadata,
     })
 }
 
@@ -258,7 +254,7 @@ mod tests {
             ("content-type", "application/json"),
         ]);
         let body = Bytes::from_static(br#"{"order":"o1"}"#);
-        let message = parse_cloud_event(&h, &body).unwrap();
+        let message = decode_cloud_event(&h, &body).unwrap();
         assert_eq!(message.id(), Some("evt-1"));
         assert_eq!(message.name(), "order.created");
         assert_eq!(message.payload(), br#"{"order":"o1"}"#);
@@ -278,7 +274,7 @@ mod tests {
         ]);
         let body = Bytes::from_static(br#"{"order":"o1"}"#);
 
-        let message = parse_cloud_event(&h, &body).unwrap();
+        let message = decode_cloud_event(&h, &body).unwrap();
 
         assert_eq!(message.traceparent(), Some(traceparent));
         assert_eq!(message.tracestate(), Some("vendor=value"));
@@ -304,7 +300,7 @@ mod tests {
         ]);
         let body = Bytes::from_static(br#"{"order":"o1"}"#);
 
-        let message = parse_cloud_event(&h, &body).unwrap();
+        let message = decode_cloud_event(&h, &body).unwrap();
 
         // Without an HTTP traceparent, headers must not disturb the trace
         // context the event itself carries.
@@ -325,7 +321,7 @@ mod tests {
             })
             .to_string(),
         );
-        let message = parse_cloud_event(&h, &body).unwrap();
+        let message = decode_cloud_event(&h, &body).unwrap();
         assert_eq!(message.id(), Some("evt-2"));
         assert_eq!(message.name(), "order.created");
         assert_eq!(message.payload(), br#"{"order":"o2"}"#);
@@ -350,7 +346,7 @@ mod tests {
             .to_string(),
         );
 
-        let message = parse_cloud_event(&h, &body).unwrap();
+        let message = decode_cloud_event(&h, &body).unwrap();
 
         assert_eq!(message.traceparent(), Some(traceparent));
     }
@@ -371,7 +367,7 @@ mod tests {
             .to_string(),
         );
 
-        let message = parse_cloud_event(&h, &body).unwrap();
+        let message = decode_cloud_event(&h, &body).unwrap();
 
         assert_eq!(message.traceparent(), Some(traceparent));
         assert_eq!(message.tracestate(), Some("vendor=value"));
@@ -380,7 +376,7 @@ mod tests {
     #[test]
     fn missing_id_is_rejected() {
         let h = headers(&[("ce-type", "order.created")]);
-        assert!(parse_cloud_event(&h, &Bytes::new()).is_err());
+        assert!(decode_cloud_event(&h, &Bytes::new()).is_err());
     }
 
     #[test]
@@ -388,8 +384,8 @@ mod tests {
         // A `ce-type` carrying a broker wildcard must not become a routing key.
         let h = headers(&[("ce-id", "evt-1"), ("ce-type", "order.*")]);
         let body = Bytes::from_static(br#"{}"#);
-        let err = parse_cloud_event(&h, &body).unwrap_err();
-        assert!(err.contains("invalid ce-type"), "got {err}");
+        let err = decode_cloud_event(&h, &body).unwrap_err();
+        assert!(err.contains("invalid message name"), "got {err}");
     }
 
     #[test]
@@ -404,7 +400,83 @@ mod tests {
             })
             .to_string(),
         );
-        let err = parse_cloud_event(&h, &body).unwrap_err();
-        assert!(err.contains("invalid cloudevent type"), "got {err}");
+        let err = decode_cloud_event(&h, &body).unwrap_err();
+        assert!(err.contains("invalid message name"), "got {err}");
+    }
+
+    #[test]
+    fn binary_cloud_event_carries_the_envelope_kind_and_content_type() {
+        let h = headers(&[
+            ("ce-id", "cmd-1"),
+            ("ce-type", "order.place"),
+            ("ce-distributedkind", "command"),
+            ("ce-correlation", "corr-1"),
+            ("content-type", "application/octet-stream"),
+        ]);
+        let message = decode_cloud_event(&h, &Bytes::from_static(b"\x00")).unwrap();
+        assert_eq!(message.id(), Some("cmd-1"));
+        assert_eq!(message.kind, crate::bus::MessageKind::Command);
+        assert_eq!(message.content_type, "application/octet-stream");
+        assert_eq!(message.metadata("correlation"), Some("corr-1"));
+        assert_eq!(message.metadata("distributedkind"), None);
+    }
+
+    #[test]
+    fn a_second_spelling_of_a_reserved_header_is_rejected() {
+        for (key, value) in [
+            ("ce-x-distributed-kind", "command"),
+            ("ce-x-distributed-id", "forged"),
+        ] {
+            let h = headers(&[
+                ("ce-id", "evt-1"),
+                ("ce-type", "order.created"),
+                ("ce-distributedkind", "event"),
+                (key, value),
+            ]);
+            assert!(decode_cloud_event(&h, &Bytes::new()).is_err(), "{key}");
+        }
+    }
+
+    /// What `KnativeBus` sends, this ingress reads back unchanged.
+    #[tokio::test]
+    async fn knative_bus_messages_round_trip_through_the_ingress() {
+        use crate::bus::{Bus, KnativeBus, MessageKind};
+        use std::sync::Mutex;
+
+        let received: Arc<Mutex<Vec<Message>>> = Arc::default();
+        let store = received.clone();
+        let app = Router::new().route(
+            "/{*path}",
+            axum::routing::post(move |headers: HeaderMap, body: Bytes| {
+                let store = store.clone();
+                async move {
+                    store
+                        .lock()
+                        .unwrap()
+                        .push(decode_cloud_event(&headers, &body).unwrap());
+                    StatusCode::OK
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let bus = KnativeBus::new(base, "ns", "orders", "billing-commands", "orders-events");
+        let mut sent = Message::new("order.place", MessageKind::Command, b"\x00bin".to_vec())
+            .with_id("cmd-1")
+            .with_metadata("correlation", "corr-1");
+        sent.content_type = "application/octet-stream".into();
+        bus.send_message(sent.clone()).await.unwrap();
+
+        let received = received.lock().unwrap();
+        let message = &received[0];
+        assert_eq!(message.id, sent.id);
+        assert_eq!(message.name, sent.name);
+        assert_eq!(message.kind, MessageKind::Command);
+        assert_eq!(message.payload, sent.payload);
+        assert_eq!(message.content_type, sent.content_type);
+        assert_eq!(message.metadata("correlation"), Some("corr-1"));
+        assert_eq!(message.metadata("source"), Some("orders"));
     }
 }

@@ -1,6 +1,6 @@
 ---
 name: distributed-usage
-description: Build Distributed CQRS/event-sourced Rust services where you mostly write models and handlers while the framework and distributed generate persistence, transports, manifests, and deploy wiring. Use model-first TDD to specify plain aggregate behavior with fast unit tests before implementing models and thin handlers. Use when designing, testing, writing, or modifying a Distributed service or domain model.
+description: Build Distributed CQRS/event-sourced Rust services where you mostly write models and handlers while the framework and distributed supply persistence, transports, manifests, and schema. Use model-first TDD to specify plain aggregate behavior with fast unit tests before implementing models and thin handlers. Use when creating, designing, testing, writing, or modifying a Distributed service or domain model.
 ---
 
 # Using the Distributed framework
@@ -10,26 +10,25 @@ description: Build Distributed CQRS/event-sourced Rust services where you mostly
 **The model-first advantage: specify and exhaustively test plain domain models
 first, then write thin handlers around proven behavior.**
 
-Everything else — service wiring, transports, persistence, manifests, schema,
-CI/GitOps — is deterministic structure the framework, macros, and `distributed`
-generate. Your authored surface is deliberately small: aggregate models
+Everything else — transports, persistence, manifests, schema — is
+deterministic structure the framework, macros, and `distributed` supply. Your authored surface is deliberately small: aggregate models
 (`#[sourced]` event methods), command/event handler bodies, and read-model
-shapes. If you find yourself hand-writing service plumbing, routing, broker
-topology, or deploy YAML, stop — the framework or CLI almost certainly
-generates it, and hand-rolled copies drift.
+shapes. If you find yourself hand-writing routing, replay, subscription plans or
+broker topology, stop — the framework almost certainly does it, and
+hand-rolled copies drift.
 
-**Composition direction (logical app vs runtime vs process role):** see
+**Composition (logical app vs runtime):** see
 [docs/application-composition.md](../../../docs/application-composition.md).
-Same packages re-cut as monolith or microservices; Eventual projectors may
-live in another process; Atomic seals stay collocated with the command
-handler (CAP). Persistence, locks, bus, and transports pair as one runtime
-plane — not open-coded per dialect in `main`.
+Modules list command mounts and projections; one `Service` composes them;
+the host is written once against `SqlStores`, so persistence, locks, bus and
+GraphQL pool pair as one runtime plane, not open-coded per dialect in `main`.
+Eventual projectors may live in another process; Atomic seals stay with the
+command's transaction.
 
 **Always reach for the highest-level API first.** The macros and one-call
 conveniences are the recommended surface, not sugar:
 
-- `#[sourced]` — not `#[digest]` + `aggregate!()` (its lower-level building
-  blocks, still supported but only for granular control you actually need)
+- `#[sourced]` — not a hand-written `Aggregate` impl and replay match
 - `#[derive(Snapshot)]` / `#[derive(ReadModel)]` — not hand-written snapshot
   payloads or table plumbing
 - `routes!` + `Service::routes(..)` — not manual handler registration
@@ -48,18 +47,86 @@ traits — production swaps are one constructor line, never a handler change.
 
 ## Workflow
 
-1. Scaffold a service instead of hand-rolling layout:
-   `distributed scaffold <name> --model <agg> --command <agg.action> --event <fact.happened> --store postgres --transport http --bus nats --gitops`
-   (from an event-storming board: aggregates → `--model`, commands →
-   `--command`, events/policies → `--event`, query views → `--read-models`).
+1. Lay a new crate out as in **Project layout** below.
 2. Write failing, colocated unit tests against the aggregate command API you
    want. Exercise the plain model directly, without a handler or infrastructure.
 3. Implement the model fields, event methods, validation, and guards until the
    contract tests pass. Refactor while they stay green.
-4. Implement thin handlers around the proven model behavior. Keep the generated
-   structure around them.
+4. Implement thin handlers around the proven model behavior.
 5. Start in-memory (`InMemoryRepository`, `InMemoryBus`); swap constructors for
    Postgres/a broker when deploying. Handlers do not change.
+
+## Project layout
+
+There is no generator. Write a new service crate in this shape:
+
+```text
+orders/
+  Cargo.toml
+  src/
+    lib.rs          # modules + the three exported functions
+    main.rs         # read the listen address, build the service, serve
+    manifest.rs     # application_manifest, read_model_catalog, service_descriptor
+    service.rs      # Service + Routes, and the ServiceDescriptor
+    models/         # #[sourced] aggregates, command input/output types
+    handlers/       # one module per command or event
+    read_models/    # #[derive(ReadModel)] structs (when the service has queries)
+    query/          # GraphQL roles and permissions (see distributed-graphql)
+```
+
+`Cargo.toml` tells `distributed build`, `dev`, `describe` and `schema` where to
+look. Enable only the features the executable needs (`http`, one of
+`sqlite`/`postgres`, `graphql`, a bus):
+
+```toml
+[package.metadata.distributed.application]
+entrypoint = "application_manifest"
+
+[package.metadata.distributed.runtime]
+binary = "orders"
+
+[dependencies]
+distributed = { version = "<same version as the CLI>", features = ["http", "postgres"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread"] }
+```
+
+`lib.rs` re-exports the entrypoints the CLI calls:
+
+```rust
+pub use manifest::{application_manifest, read_model_catalog, service_descriptor};
+```
+
+`service.rs` is the one place routes are wired:
+
+```rust
+pub fn build(repo: ServiceRepo) -> Arc<Service> {
+    let service = Service::new()
+        .named("orders")
+        // Under `distributed dev`, only the active generation may write.
+        .with_lifecycle(distributed::microsvc::LifecycleGate::from_env())
+        .with_http_command_routes()
+        .routes(
+            Routes::new()
+                .with_repo(AggregateRepository::<_, Order>::new(repo.clone()))
+                .typed_command(handlers::order_place::command())
+                .handle(handlers::order_place::handle),
+        )
+        .routes(distributed::routes!(
+            Routes::new().with_dependencies(repo.clone()),
+            event handlers::order_placed,
+        ));
+    Arc::new(service)
+}
+```
+
+`main.rs` stays a few lines: read `BIND` (default `127.0.0.1:3000`), call
+`service::build`, then `distributed::microsvc::serve(service, &addr).await`.
+
+From an event-storming board: aggregates → `models/`, commands → one handler
+module each, events and policies → event handlers, query views →
+`read_models/`. Deployment is covered by the `distributed-deploy` skill.
 
 ## Model-first TDD
 
@@ -149,70 +216,85 @@ Rules that prevent real bugs:
 - **Always set an explicit `aggregate_type`** — the default is the Rust type
   name, which silently changes the durable stream identity if the type is
   renamed.
-- **Event methods become fallible.** `#[event]`/`#[digest]` methods return
-  `SourcedResult` even without a declared return type — call them with `?`.
+- **Event methods become fallible.** An `#[event]` method declares no return
+  type and may not use `?` or `return`; the macro makes it return
+  `SourcedResult`, so call it with `?`. Validate in the public method that
+  calls it.
 - Event names are lowercase past-tense facts (`"initialized"`, `"completed"`).
   Use `when = <expr>` for intentional idempotent/no-op transitions so they
   record nothing; use explicit validation when the API promises a rejection.
 - Evolving an event's payload? Do not edit stored data — add an upcaster:
-  `#[sourced(entity, upcasters(("initialized", 1 => 2, V1 => V2, upcast_fn)))]`
+  `#[sourced(entity, aggregate_type = "todo", upcasters(("initialized", 1 => 2, V1 => V2, upcast_fn)))]`
   and mark new-format methods `#[event("initialized", version = 2)]`.
 
 ## Command handlers
 
-For a browser-facing GraphQL service, use the typed causal command path instead
-of exposing a raw `Context`/`serde_json::Value` handler as the mutation contract:
+Every command is typed, authorized by its declared roles, and recorded in the
+command ledger under its command ID, whichever ingress delivers it:
 
 - declare `.typed_command(typed_command::<Input, Succeeded<Payload> | Eventual<Payload> | Atomic<Model>>(...))`
   on the executable route;
 - implement the handler with `CausalCommandContext` and return a
   `PreparedCommand<_>` so the framework owns commit, ledger, outbox, and
   projection atomicity;
-- bind that exact `Service` through `GraphqlEngineBuilder::service`, configure
-  public OIDC. HTTP command routes stay off; browser writes use
-  only the GraphQL command proxy. Call `.with_http_command_routes()` only for
-  an intentional non-GraphQL ingress;
+- for a browser-facing GraphQL service, bind that exact `Service` through
+  `GraphqlEngineBuilder::service` and configure public OIDC. HTTP command
+  routes stay off; browser writes use only the GraphQL command proxy. Expose
+  one command for an intentional non-GraphQL ingress with
+  `.with_http_command(command, edge)` (the edge authenticates the request);
+  call `.with_http_command_routes()` only behind a trusted proxy;
 - generate the strictly typed client with `distributed client`.
 
 Use the `distributed-graphql` skill for the complete route, consistency,
-authorization, and client-generation contract. The raw handler form below
-remains valid for intentional non-GraphQL transports.
+authorization, and client-generation contract.
 
-One module per handler, exporting `COMMAND` (or `EVENT`/`EVENTS`), a `guard`,
-and an async `handle`:
+One module per command, exporting `COMMAND`, a `command()` declaration, and an
+async `handle`:
 
 ```rust
 pub const COMMAND: &str = "todo.initialize";
 
-pub fn guard(ctx: &Context<Repo>) -> bool {
-    ctx.has_fields(&["id", "task"])
+pub fn command() -> TypedCommand<CreateTodo, Succeeded<TodoCreated>> {
+    typed_command::<CreateTodo, Succeeded<TodoCreated>>(COMMAND).roles(["user"])
 }
 
-pub async fn handle(ctx: &Context<'_, Repo>) -> Result<Value, HandlerError> {
-    let input = ctx.input::<CreateTodo>()?;
-    let mut todo = Todo::default();
+pub async fn handle(
+    ctx: &CausalCommandContext<'_, Todo>,
+    input: CreateTodo,
+) -> Result<PreparedCommand<Succeeded<TodoCreated>>, HandlerError> {
+    let mut todo = ctx.repo().create();
     todo.initialize(input.id.clone(), input.task)?;
-    ctx.repo().publish_events().commit(&mut todo).await?;
-    Ok(json!({ "id": input.id }))
+    ctx.repo()
+        .publish_events()
+        .commit(todo)?
+        .succeeded(TodoCreated { id: input.id })
 }
 ```
 
-Register with `routes!` and serve — the same handlers work over direct
-dispatch, HTTP (`microsvc::serve`, feature `http`), gRPC (feature `grpc`), and
-the bus:
+`CreateTodo` derives `Deserialize` + `distributed::command::CommandInput`; `TodoCreated`
+derives `Serialize` + `distributed::command::CommandOutput`. Register on the route
+bundle and serve — the same handlers work over in-process dispatch
+(`Service::dispatch_causal`), HTTP (`microsvc::serve`, feature `http`; body
+`{ "commandId", "input" }`), gRPC (feature `grpc`), and the bus (the command
+declares `TRANSPORT_ROLE` and the message carries an id):
 
 ```rust
-let routes = distributed::routes!(
-    Routes::new().with_repo(repo.queued().aggregate::<Todo>()),
-    command handlers::todo_create,
-    command handlers::todo_complete,
-);
+let routes = Routes::new()
+    .with_repo(repo.queued().aggregate::<Todo>())
+    .typed_command(handlers::todo_create::command())
+    .handle(handlers::todo_create::handle)
+    .typed_command(handlers::todo_complete::command())
+    .handle(handlers::todo_complete::handle);
 let service = Service::new()
     .named("todo-api")
     .with_http_command_routes() // required for POST /{command}; GraphQL stays off by default
     .routes(routes);
-service.with_bus(bus).run(RunOptions::idempotent()).await?;
+service.with_bus(bus).run(RunOptions::default()).await?; // until the process ends
 ```
+
+Event handlers export `EVENT`/`EVENTS`, a `guard`, and an async
+`handle(ctx: &Context<'_, D>) -> Result<Value, HandlerError>`, and register
+with `distributed::routes!(routes, event handlers::todo_projection)`.
 
 ## Publication is explicit (outbox)
 
@@ -249,9 +331,9 @@ pub struct TodoView {
 
 Two update modes — pick deliberately:
 
-- **Atomic** (same service, response must reflect the write):
-  `repo.read_models(plan).commit(&mut agg).await?` commits rows and events in
-  one transaction.
+- **Atomic** (same service, response must reflect the write): declare the
+  command `Atomic<Model>`; its `projection!` program writes the row in the
+  command's transaction. Handlers never stage raw read-model rows.
 - **Eventual** (cross-service): a projector subscribes to published messages
   and commits through `ctx.read_model_store().workspace()`, which marks the
   message processed in the same transaction for idempotency.
@@ -275,7 +357,7 @@ Gotchas:
   app/environment. Names are validated: portable IDs only (`A-Za-z0-9_-`,
   `.` also allowed in namespaces, max 128 bytes).
 - Generic `microsvc` command routes do **not** authenticate themselves. Protect
-  intentional non-GraphQL routes at a trusted edge. Public GraphQL scaffolds
+  intentional non-GraphQL routes at a trusted edge. Public GraphQL services
   instead wire `OidcBearer` validation; generic command POST routes stay off;
   never trust client-supplied identity headers.
 - `connect_and_migrate` applies migrations; plain `connect` does not create
@@ -327,8 +409,8 @@ Every service should export `read_model_catalog()` registering its read
 models — `distributed describe` and `distributed schema` compile the crate and call it:
 
 ```rust
-pub fn read_model_catalog() -> distributed::ReadModelCatalog {
-    distributed::ReadModelCatalog::new("todos").read_model::<TodoView>()
+pub fn read_model_catalog() -> distributed::table::ReadModelCatalog {
+    distributed::table::ReadModelCatalog::new("todos").read_model::<TodoView>()
 }
 ```
 
@@ -340,5 +422,5 @@ Keep it updated when adding read models or tables; see the
 - Framework guide: the `distributed` crate README (https://crates.io/crates/distributed)
 - Read models: `README § Read Models`; transports: `README § Event Bus / transports`;
   repositories: `README § Repositories` in the Distributed repo
-- CI/GitOps scaffolding: the `distributed-ci` skill
+- Deployment: the `distributed-deploy` skill
 - Schema and manifest tooling: the `distributed-schema` skill

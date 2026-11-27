@@ -23,8 +23,8 @@ pub(super) fn single_root_field<'a>(
 pub(super) fn compile_arguments(
     field: &Field,
     owner: &str,
-    allowed_arguments: &[ManifestArgument],
-    model: &ManifestModel,
+    allowed_arguments: &[ClientArgument],
+    model: &ClientModel,
     manifest: &ClientManifest,
     variables: &[CompiledVariable],
     used_variables: &mut BTreeSet<String>,
@@ -243,11 +243,11 @@ pub(super) fn contains_variable(value: &Value) -> bool {
 
 pub(super) fn canonicalize_argument_literal(
     value: &Value,
-    argument: &ManifestArgument,
-    model: &ManifestModel,
+    argument: &ClientArgument,
+    model: &ClientModel,
     manifest: &ClientManifest,
 ) -> Value {
-    let value = if argument.kind == ManifestArgumentKind::Filter {
+    let value = if argument.kind == ClientArgumentKind::Filter {
         canonicalize_filter_literal(value, model, &model.filter_input, manifest)
     } else {
         value.clone()
@@ -275,8 +275,8 @@ pub(super) fn canonicalize_argument_literal(
 
 pub(super) fn canonicalize_filter_literal(
     value: &Value,
-    model: &ManifestModel,
-    input: &ManifestFilterInput,
+    model: &ClientModel,
+    input: &ClientFilterInput,
     manifest: &ClientManifest,
 ) -> Value {
     let Value::Object(fields) = value else {
@@ -314,8 +314,8 @@ pub(super) fn canonicalize_filter_literal(
 
 pub(super) fn canonicalize_filter_literal_list(
     value: &Value,
-    model: &ManifestModel,
-    input: &ManifestFilterInput,
+    model: &ClientModel,
+    input: &ClientFilterInput,
     manifest: &ClientManifest,
 ) -> Value {
     match value {
@@ -332,10 +332,7 @@ pub(super) fn canonicalize_filter_literal_list(
     }
 }
 
-pub(super) fn canonicalize_filter_comparison_literal(
-    value: &Value,
-    field: &ManifestField,
-) -> Value {
+pub(super) fn canonicalize_filter_comparison_literal(value: &Value, field: &ClientField) -> Value {
     let Value::Object(operators) = value else {
         return value.clone();
     };
@@ -442,7 +439,7 @@ pub(super) fn canonicalize_float_number(number: &serde_json::Number) -> Option<s
 
 pub(super) fn validate_literal(
     value: &Value,
-    argument: &ManifestArgument,
+    argument: &ClientArgument,
     document: &ClientDocument,
     position: Pos,
 ) -> Result<(), ClientCompileError> {

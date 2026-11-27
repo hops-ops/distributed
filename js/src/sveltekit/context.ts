@@ -1,8 +1,10 @@
 import { getContext, setContext } from 'svelte';
 
 import type {
+	ReplicaLiveConnection,
 	ReplicaOperationArtifact,
-	ReplicaSnapshot
+	ReplicaSnapshot,
+	ReplicaWindowOperationArtifact
 } from '../replica/index.js';
 import type { GraphqlVariables } from '../types.js';
 import {
@@ -18,7 +20,8 @@ import type {
 } from './boundary-lifecycle.js';
 import type {
 	DistributedSvelteKitClient,
-	SveltekitBoundOperation
+	SveltekitBoundOperation,
+	SveltekitWindowOperation
 } from './replica.js';
 
 const DISTRIBUTED_CLIENT_CONTEXT = Symbol(
@@ -74,6 +77,23 @@ export function useDistributedSvelteKitClient<
 	return client as DistributedSvelteKitClient<TCommands>;
 }
 
+/**
+ * The nearest client's live connection as a Svelte store: `reconnecting`
+ * while any watched live operation is reopening a lost stream. Render one
+ * notice from it; queries keep their data and report no error meanwhile.
+ */
+export function useDistributedLiveConnection(): Readonly<{
+	subscribe(run: (connection: ReplicaLiveConnection) => void): () => void;
+}> {
+	const replica = useDistributedSvelteKitClient().replica;
+	return Object.freeze({
+		subscribe(run: (connection: ReplicaLiveConnection) => void): () => void {
+			run(replica.liveConnection);
+			return replica.subscribeLiveConnection(run);
+		}
+	});
+}
+
 /** Resolve the nearest generated command surface without a global proxy. */
 export function useDistributedSvelteKitCommands<TCommands>(): TCommands {
 	return useDistributedSvelteKitClient<TCommands>().commands;
@@ -100,6 +120,18 @@ export function defineDistributedSvelteKitOperation<
 	TData,
 	TVariables extends GraphqlVariables
 >(
+	artifact: ReplicaWindowOperationArtifact<TData, TVariables>
+): SveltekitWindowOperation<TData, TVariables>;
+export function defineDistributedSvelteKitOperation<
+	TData,
+	TVariables extends GraphqlVariables
+>(
+	artifact: ReplicaOperationArtifact<TData, TVariables>
+): SveltekitBoundOperation<TData, TVariables>;
+export function defineDistributedSvelteKitOperation<
+	TData,
+	TVariables extends GraphqlVariables
+>(
 	artifact: ReplicaOperationArtifact<TData, TVariables>
 ): SveltekitBoundOperation<TData, TVariables> {
 	const use = ((...args: unknown[]) => {
@@ -111,9 +143,20 @@ export function defineDistributedSvelteKitOperation<
 		return invoke(...args);
 	}) as SveltekitBoundOperation<TData, TVariables>['use'];
 
+	const useWindow =
+		artifact.window === undefined
+			? undefined
+			: (...args: unknown[]) => {
+					const operation = useDistributedSvelteKitClient<unknown>().operation(
+						artifact as ReplicaWindowOperationArtifact<TData, TVariables>
+					);
+					return (operation.useWindow as (...values: unknown[]) => unknown)(...args);
+				};
+
 	return Object.freeze({
 		artifact,
 		use,
+		...(useWindow === undefined ? {} : { useWindow }),
 		read(variables: TVariables): ReplicaSnapshot<TData> {
 			return useDistributedSvelteKitClient<unknown>()
 				.operation(artifact)

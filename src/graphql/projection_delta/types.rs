@@ -7,8 +7,9 @@ use base64::Engine as _;
 use serde::de::{Error as _, IgnoredAny, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
 
+use crate::domain_event::MAX_DOMAIN_EVENT_BODY_BYTES;
+use crate::projection::MAX_PROJECTION_EXPRESSION_DEPTH;
 use crate::projection_protocol::{MAX_PROJECTION_PARTITION_BYTES, MAX_PROJECTION_RECORD_KEY_BYTES};
-use crate::{MAX_DOMAIN_EVENT_BODY_BYTES, MAX_PROJECTION_EXPRESSION_DEPTH};
 
 /// Version of the role-safe projection-delta wire contract.
 pub const PROJECTION_DELTA_WIRE_VERSION: u16 = 1;
@@ -35,6 +36,7 @@ impl ProjectionDeltaCacheScopeToken {
         Self::parse_wire(token.as_str())
     }
 
+    #[cfg(any(feature = "graphql", test))]
     pub(crate) fn as_str(&self) -> &str {
         &self.0
     }
@@ -99,7 +101,9 @@ pub struct ProjectionDeltaIdentity {
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ProjectionDeltaSurfaceIdentity {
-    Role { name: String },
+    Role {
+        name: String,
+    },
     Application {
         name: String,
         eligible_roles: Vec<String>,
@@ -113,7 +117,6 @@ pub enum ProjectionDeltaSurfaceIdentity {
 pub struct ProjectionDeltaProjectionIdentity {
     pub program_id: String,
     pub binding_id: String,
-    pub epoch: String,
     pub program_ir_version: u16,
     pub operation_semantics_version: u16,
 }
@@ -288,6 +291,7 @@ impl ProjectionDelta {
     ///
     /// Returns [`ProjectionDeltaError::ReplayScopeMismatch`] when any
     /// role/application/generation identity differs.
+    #[cfg(any(feature = "graphql", test))]
     pub(crate) fn validate_replay_scope(
         &self,
         manifest: &crate::graphql::client_manifest::DistributedClientManifest,
@@ -461,13 +465,11 @@ impl From<&crate::graphql::client_manifest::ClientSurfaceIdentity>
                 name,
                 eligible_roles,
                 schema_roles,
-            } => {
-                Self::Application {
-                    name: name.clone(),
-                    eligible_roles: eligible_roles.clone(),
-                    schema_roles: schema_roles.clone(),
-                }
-            }
+            } => Self::Application {
+                name: name.clone(),
+                eligible_roles: eligible_roles.clone(),
+                schema_roles: schema_roles.clone(),
+            },
         }
     }
 }
@@ -513,7 +515,6 @@ impl ProjectionDeltaProjectionIdentity {
         for (field, value) in [
             ("program_id", self.program_id.as_str()),
             ("binding_id", self.binding_id.as_str()),
-            ("epoch", self.epoch.as_str()),
         ] {
             validate_identity(field, value)?;
         }
@@ -531,7 +532,7 @@ impl ProjectionDeltaProjectionIdentity {
                 actual: self.operation_semantics_version,
             });
         }
-        crate::ProjectionProgramId::parse(&self.program_id).map_err(|_| {
+        crate::projection::ProjectionProgramId::parse(&self.program_id).map_err(|_| {
             ProjectionDeltaError::InvalidIdentity {
                 field: "program_id",
             }
@@ -541,8 +542,6 @@ impl ProjectionDeltaProjectionIdentity {
                 field: "binding_id",
             },
         )?;
-        crate::projection_protocol::ProjectionEpoch::new(&self.epoch)
-            .map_err(|_| ProjectionDeltaError::InvalidIdentity { field: "epoch" })?;
         Ok(())
     }
 }
@@ -557,12 +556,18 @@ pub struct ProjectionDeltaOccurrence {
 }
 
 /// A complete normalized-record scope.
+///
+/// `V` is the field value and `P` the partition. The server delta carries
+/// concrete [`DeltaValue`]s and opaque partitions; the client compiler's
+/// command preview carries symbolic input expressions in the same shape, so
+/// one canonical merge ([`canonicalize_operations`](super::canonicalize_operations))
+/// serves both.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct ProjectionDeltaScope {
-    pub partition: ProjectionDeltaPartition,
+pub struct ProjectionDeltaScope<V = DeltaValue, P = ProjectionDeltaPartition> {
+    pub partition: P,
     pub model: String,
-    pub key: Vec<DeltaKeyField>,
+    pub key: Vec<DeltaKeyField<V>>,
 }
 
 impl ProjectionDeltaScope {
@@ -603,18 +608,18 @@ impl ProjectionDeltaPartition {
 /// One authorized component of a composite normalized key.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct DeltaKeyField {
+pub struct DeltaKeyField<V = DeltaValue> {
     pub ordinal: u32,
     pub field: String,
-    pub value: DeltaValue,
+    pub value: V,
 }
 
 /// One authorized record-field assignment.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct DeltaField {
+pub struct DeltaField<V = DeltaValue> {
     pub field: String,
-    pub value: DeltaValue,
+    pub value: V,
 }
 
 /// Strict tagged value. Null is a value; omitted fields are unknown; unset is
@@ -639,27 +644,28 @@ pub enum DeltaValue {
 }
 
 impl DeltaValue {
+    #[cfg(any(feature = "graphql", test))]
     pub(crate) fn try_from_projection_ref(
-        value: crate::ProjectionValueRef<'_>,
+        value: crate::projection::ProjectionValueRef<'_>,
     ) -> Result<Self, ProjectionDeltaError> {
         let value = match value {
-            crate::ProjectionValueRef::Null => Self::Null,
-            crate::ProjectionValueRef::Boolean(value) => Self::Boolean(value),
-            crate::ProjectionValueRef::I64(value) => Self::I64(value.to_owned()),
-            crate::ProjectionValueRef::U64(value) => Self::U64(value.to_owned()),
-            crate::ProjectionValueRef::F64(value) => Self::F64(value.to_owned()),
-            crate::ProjectionValueRef::String(value) => Self::String(value.to_owned()),
-            crate::ProjectionValueRef::Enum { enum_type, variant } => Self::Enum {
+            crate::projection::ProjectionValueRef::Null => Self::Null,
+            crate::projection::ProjectionValueRef::Boolean(value) => Self::Boolean(value),
+            crate::projection::ProjectionValueRef::I64(value) => Self::I64(value.to_owned()),
+            crate::projection::ProjectionValueRef::U64(value) => Self::U64(value.to_owned()),
+            crate::projection::ProjectionValueRef::F64(value) => Self::F64(value.to_owned()),
+            crate::projection::ProjectionValueRef::String(value) => Self::String(value.to_owned()),
+            crate::projection::ProjectionValueRef::Enum { enum_type, variant } => Self::Enum {
                 enum_type: enum_type.to_owned(),
                 variant: variant.to_owned(),
             },
-            crate::ProjectionValueRef::List(values) => Self::List(
+            crate::projection::ProjectionValueRef::List(values) => Self::List(
                 values
                     .iter()
                     .map(|value| Self::try_from_projection_ref(value.as_ref()))
                     .collect::<Result<Vec<_>, _>>()?,
             ),
-            crate::ProjectionValueRef::Object(fields) => Self::Object(
+            crate::projection::ProjectionValueRef::Object(fields) => Self::Object(
                 fields
                     .iter()
                     .map(|field| {
@@ -743,6 +749,7 @@ impl DeltaValue {
 
 /// Whether provenance is an applied event or a compiler preview.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg(any(feature = "graphql", test))]
 pub(crate) enum ProjectionMutationSource {
     Actual,
     Preview,
@@ -750,6 +757,7 @@ pub(crate) enum ProjectionMutationSource {
 
 /// Authorization visibility independent of record existence or liveness.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg(any(feature = "graphql", test))]
 pub(crate) enum ProjectionDeltaVisibility {
     Authorized,
     Denied,
@@ -759,6 +767,7 @@ pub(crate) enum ProjectionDeltaVisibility {
 /// Explicit authorization transition. A domain delete under stable permission
 /// is `Authorized` to `Authorized`; it is not an authorization transition.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg(any(feature = "graphql", test))]
 pub(crate) struct AuthorizationTransition {
     pub before: ProjectionDeltaVisibility,
     pub after: ProjectionDeltaVisibility,
@@ -767,58 +776,55 @@ pub(crate) struct AuthorizationTransition {
 /// One final operation with exact contributing projection identities.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct ProjectionDeltaOperation {
+pub struct ProjectionDeltaOperation<V = DeltaValue, P = ProjectionDeltaPartition> {
     pub occurrence_ordinal: u32,
     pub projection_refs: Vec<u32>,
-    pub mutation: ProjectionDeltaMutation,
+    pub mutation: ProjectionDeltaMutation<V, P>,
 }
 
 /// Closed portable client mutation set.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
-pub enum ProjectionDeltaMutation {
+#[serde(bound(deserialize = "V: Deserialize<'de>, P: Deserialize<'de>"))]
+pub enum ProjectionDeltaMutation<V = DeltaValue, P = ProjectionDeltaPartition> {
     Upsert {
-        scope: ProjectionDeltaScope,
-        fields: Vec<DeltaField>,
+        scope: ProjectionDeltaScope<V, P>,
+        fields: Vec<DeltaField<V>>,
         replace: Vec<String>,
     },
     Patch {
-        scope: ProjectionDeltaScope,
+        scope: ProjectionDeltaScope<V, P>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
-        set: Vec<DeltaField>,
+        set: Vec<DeltaField<V>>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         unset: Vec<String>,
         if_present: bool,
     },
     Delete {
-        scope: ProjectionDeltaScope,
+        scope: ProjectionDeltaScope<V, P>,
     },
     Link {
         relationship: String,
-        source: ProjectionDeltaScope,
-        target: ProjectionDeltaScope,
+        source: ProjectionDeltaScope<V, P>,
+        target: ProjectionDeltaScope<V, P>,
     },
     Unlink {
         relationship: String,
-        source: ProjectionDeltaScope,
-        target: ProjectionDeltaScope,
+        source: ProjectionDeltaScope<V, P>,
+        target: ProjectionDeltaScope<V, P>,
     },
     InvalidateModel {
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        partition: Option<ProjectionDeltaPartition>,
+        partition: Option<P>,
         model: String,
     },
     InvalidateRelationship {
         relationship: String,
-        source: ProjectionDeltaScope,
+        source: ProjectionDeltaScope<V, P>,
     },
 }
 
 impl ProjectionDeltaOperation {
-    pub(crate) fn occurrence_ordinal(&self) -> u32 {
-        self.occurrence_ordinal
-    }
-
     pub(crate) fn validate(
         &self,
         projection_count: usize,
@@ -896,8 +902,10 @@ impl ProjectionDeltaOperation {
         }
         Ok(())
     }
+}
 
-    pub(crate) fn canonical_scope(&self) -> OperationScope {
+impl<V: Clone, P: Clone> ProjectionDeltaOperation<V, P> {
+    pub(crate) fn canonical_scope(&self) -> OperationScope<V, P> {
         match &self.mutation {
             ProjectionDeltaMutation::Upsert { scope, .. }
             | ProjectionDeltaMutation::Patch { scope, .. }
@@ -932,37 +940,37 @@ impl ProjectionDeltaOperation {
         }
     }
 
-    pub(crate) fn canonical_order(&self) -> (OperationScope, u32) {
-        (self.canonical_scope(), self.occurrence_ordinal())
+    pub(crate) fn canonical_order(&self) -> (OperationScope<V, P>, u32) {
+        (self.canonical_scope(), self.occurrence_ordinal)
     }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) enum OperationScope {
-    Record(ProjectionDeltaScope),
+pub(crate) enum OperationScope<V, P> {
+    Record(ProjectionDeltaScope<V, P>),
     Edge {
         relationship: String,
-        source: ProjectionDeltaScope,
-        target: ProjectionDeltaScope,
+        source: ProjectionDeltaScope<V, P>,
+        target: ProjectionDeltaScope<V, P>,
     },
     Model {
-        partition: Option<ProjectionDeltaPartition>,
+        partition: Option<P>,
         model: String,
     },
     Relationship {
         relationship: String,
-        source: ProjectionDeltaScope,
+        source: ProjectionDeltaScope<V, P>,
     },
 }
 
 /// A conservative client recovery request.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct ProjectionDeltaRecovery {
+pub struct ProjectionDeltaRecovery<V = DeltaValue, P = ProjectionDeltaPartition> {
     pub occurrence_ordinal: u32,
     pub projection_refs: Vec<u32>,
     pub condition: ProjectionDeltaRecoveryCondition,
-    pub target: ProjectionDeltaRecoveryTarget,
+    pub target: ProjectionDeltaRecoveryTarget<V, P>,
 }
 
 /// When a conservative recovery is applied by the client.
@@ -990,8 +998,10 @@ impl ProjectionDeltaRecovery {
         }
         self.target.validate()
     }
+}
 
-    pub(crate) fn canonical_order(&self) -> (ProjectionDeltaRecoveryTarget, u32) {
+impl<V: Clone, P: Clone> ProjectionDeltaRecovery<V, P> {
+    pub(crate) fn canonical_order(&self) -> (ProjectionDeltaRecoveryTarget<V, P>, u32) {
         (self.target.clone(), self.occurrence_ordinal)
     }
 }
@@ -999,17 +1009,18 @@ impl ProjectionDeltaRecovery {
 /// Narrowest safely addressable recovery scope.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
-pub enum ProjectionDeltaRecoveryTarget {
+#[serde(bound(deserialize = "V: Deserialize<'de>, P: Deserialize<'de>"))]
+pub enum ProjectionDeltaRecoveryTarget<V = DeltaValue, P = ProjectionDeltaPartition> {
     Record {
-        scope: ProjectionDeltaScope,
+        scope: ProjectionDeltaScope<V, P>,
     },
     Relationship {
         relationship: String,
-        source: ProjectionDeltaScope,
+        source: ProjectionDeltaScope<V, P>,
     },
     Model {
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        partition: Option<ProjectionDeltaPartition>,
+        partition: Option<P>,
         model: String,
     },
 }

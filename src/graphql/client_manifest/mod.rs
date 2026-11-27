@@ -27,8 +27,10 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use super::command_contract::{CommandConsistency, EffectExpression};
-use super::complexity_contract::{default_weights, DEFAULT_MAX_COMPLEXITY, DEFAULT_MAX_DEPTH};
+use super::cost::{
+    DEFAULT_MAX_BOOL_WIDTH, DEFAULT_MAX_DEPTH, DEFAULT_MAX_FIELDS, DEFAULT_MAX_IN_LIST,
+    DEFAULT_MAX_ROWS,
+};
 use super::filter::{FilterExpr, Operand};
 use super::naming::{aggregate_fields_type_name, aggregate_type_name};
 use super::surface::{
@@ -36,6 +38,7 @@ use super::surface::{
     SurfaceCommand, SurfaceCommandShape, SurfaceRelationshipKeys, SurfaceRowPolicy,
     SurfaceSelection, SurfaceTypeDef,
 };
+use crate::command::{CommandConsistency, CommandInputDefault, EffectExpression};
 use crate::table::RelationshipKind;
 
 use build::client_manifest_from_surface_with_execution;
@@ -48,38 +51,39 @@ use commands::*;
 use projections::{command_projection_extension, projection_manifest};
 use validation::validate_surface_structure;
 
-// Used by unit tests (and still a thin production-friendly wrapper).
-#[cfg_attr(not(test), allow(unused_imports))]
-pub(crate) use build::client_manifest_from_surface;
+#[cfg(test)]
+use build::client_manifest_from_surface;
+pub use codec::{canonical_json_value, client_protocol_fingerprint, hash_bytes};
+pub use commands::{command_operation, command_status_operation};
 pub use error::ClientManifestError;
 pub use export::{prune_client_manifest, DistributedClientSurfaceExport};
 pub use identity::ClientSurfaceIdentity;
-pub use limits::{ClientComplexityWeights, ClientExecutionLimits};
+pub use limits::{row_cost, ClientExecutionLimits};
+pub use projections::{
+    CLIENT_PROJECTION_BINDING_VERSION, CLIENT_PROJECTION_PROGRAM_VERSION,
+    COMMAND_PROJECTION_EXTENSION_VERSION,
+};
 pub use types::{
     ClientAggregateSemantics, ClientArgument, ClientArgumentKind, ClientCapabilities,
-    ClientCommand, ClientCommandExtensionSlots, ClientCommandShape, ClientField, ClientFilterField,
-    ClientFilterInput, ClientFilterInputRelationship, ClientFilterSemantics, ClientKeyField,
-    ClientModel, ClientOrderSemantics, ClientPaginationSemantics, ClientProjectionArm,
-    ClientProjectionAssignment, ClientProjectionBinding, ClientProjectionBindingState,
-    ClientProjectionEnvelopeField, ClientProjectionEventRef, ClientProjectionExecutionClass,
+    ClientCommand, ClientCommandExtensionSlots, ClientCommandPureArg, ClientCommandPureReduce,
+    ClientCommandShape, ClientField, ClientFilterField, ClientFilterInput,
+    ClientFilterInputRelationship, ClientFilterSemantics, ClientKeyField, ClientModel,
+    ClientOrderSemantics, ClientPaginationSemantics, ClientProjectionArm,
+    ClientProjectionAssignment, ClientProjectionBinding, ClientProjectionEventRef,
     ClientProjectionExpression, ClientProjectionFallback, ClientProjectionField,
     ClientProjectionInvalidation, ClientProjectionKeyField, ClientProjectionMutationKind,
     ClientProjectionObjectField, ClientProjectionOperation, ClientProjectionPartition,
-    ClientProjectionPlacement, ClientProjectionPreviewSource, ClientProjectionProgram,
-    ClientProjectionRelationshipEffect, ClientProjectionRelationshipEffectKind,
-    ClientProjectionScalarTransform, ClientProjectionTopologyIdentity, ClientProjectionValue,
-    ClientProjectionValueField, ClientProjectionValueType, ClientProjector,
-    ClientProtocolOperation, ClientProtocolOperations, ClientRelationship,
-    ClientRelationshipAggregate, ClientRelationshipKind, ClientRelationshipMaintenance, ClientRoot,
-    ClientRootKind, ClientRootOperation, ClientRowPolicy, ClientTrustedPresetDescriptor,
-    ClientTypeDef, ClientTypeField, CommandConfirmationsExtension, CommandConsistencyExtension,
-    CommandDirectProjectionExtension, CommandEffectsExtension, CommandInputDefaultsExtension,
-    ClientCommandPureArg, ClientCommandPureReduce, CommandProjectionArmRef,
-    CommandProjectionExtension, CommandProjectionPreviewOccurrence, CommandProjectionPreviewValue,
-    DistributedClientManifest, ModelNormalization,
-    RelationshipKeyMapping, ScalarCodec,
+    ClientProjectionPreviewSource, ClientProjectionProgram, ClientProjectionRelationshipEffect,
+    ClientProjectionTopologyIdentity, ClientProjector, ClientProtocolOperation,
+    ClientProtocolOperations, ClientRelationship, ClientRelationshipAggregate,
+    ClientRelationshipKind, ClientRelationshipMaintenance, ClientRoot, ClientRootKind,
+    ClientRootOperation, ClientRowPolicy, ClientTrustedPresetDescriptor, ClientTypeDef,
+    ClientTypeField, CommandConsistencyExtension, CommandDirectProjectionExtension,
+    CommandInputDefaultsExtension, CommandProjectionArmRef, CommandProjectionExtension,
+    CommandProjectionPreviewOccurrence, CommandProjectionPreviewValue, DistributedClientManifest,
+    ModelNormalization, RelationshipKeyMapping, ScalarCodec,
 };
-pub(crate) use validation::trusted_preset_descriptors;
+pub use validation::trusted_preset_descriptors;
 
 pub const DISTRIBUTED_CLIENT_MANIFEST_VERSION: u32 = 2;
 pub const DISTRIBUTED_CLIENT_PROTOCOL_VERSION: u32 = 1;
@@ -90,7 +94,4 @@ const COMMAND_EXTENSION_SLOTS_VERSION: u32 = 2;
 const PROJECTOR_ENTRY_VERSION: u32 = 1;
 const PROTOCOL_OPERATIONS_VERSION: u32 = 1;
 const QUERY_CAPABILITIES_VERSION: u32 = 1;
-const QUERY_COMPLEXITY_VERSION: u32 = 1;
 const KEY_ENCODING: &str = "canonical_json_tuple_v1";
-const DEFAULT_MAX_BOOL_WIDTH: u64 = 256;
-const DEFAULT_MAX_IN_LIST: u64 = 1_000;

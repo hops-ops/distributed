@@ -16,8 +16,8 @@ use crate::table::{
 };
 use crate::table::{
     DeleteTableRowMutation, ExpectedVersion, PatchMode, PatchTableRowMutation, RelationshipDef,
-    RelationshipKind, RowKey, RowPatch, RowValues, RowWriteMode, TableCommitOutcome, TableMutation,
-    TableRowMutation, TableSchema, TableStoreError, TableWritePlan,
+    RelationshipKind, RowKey, RowPatch, RowValues, RowWriteMode, TableMutation, TableRowMutation,
+    TableSchema, TableStoreError, TableWritePlan,
 };
 
 #[derive(Clone, Debug)]
@@ -450,7 +450,7 @@ where
     }
 
     /// Commit the staged write plan through the asynchronous store.
-    pub async fn commit(self) -> Result<TableCommitOutcome, TableStoreError> {
+    pub async fn commit(self) -> Result<(), TableStoreError> {
         self.writes.commit(self.store).await
     }
 }

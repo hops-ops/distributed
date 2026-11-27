@@ -1,21 +1,18 @@
-//! Periodic / on-demand Zitadel Management API scrape → same provider outbox path.
+//! Zitadel Management API scrape: configuration, listing, mapping, and the
+//! background loop that dispatches `zitadel.scrape.v1`.
 //!
 //! Actions cover the happy path. Scrape reconciles users we never got events for
 //! (Action downtime, misconfig, historical backfill).
 
 use std::env;
+use std::sync::Arc;
 use std::time::Duration;
 
-use distributed::read_model::ReadModelWritePlanBuilder;
-use distributed::{ReadModelWritePlanStore, TransactionalCommit};
-use e2e_projections::{
-    map_zitadel_user_status, map_zitadel_user_upsert, ZitadelEmail, ZitadelUserPayload,
-};
+use distributed::microsvc::Service;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use super::map::{MappedDelivery, HUMAN_DEACTIVATED, HUMAN_UPDATED, MACHINE_CREATED};
-use super::publish::publish_mapped_delivery;
+use super::map::{user_profile, MappedDelivery, HUMAN_DEACTIVATED, HUMAN_UPDATED, MACHINE_CREATED};
 
 /// Env: Management API base (no trailing slash). Falls back to `OIDC_ISSUER`.
 pub const API_URL_ENV: &str = "ZITADEL_API_URL";
@@ -86,96 +83,16 @@ impl ZitadelScrapeConfig {
     }
 }
 
-#[derive(Debug, Default, Clone)]
-pub struct ScrapeReport {
-    pub listed: usize,
-    pub published: usize,
-    pub skipped: usize,
-    pub errors: Vec<String>,
-}
-
-/// List users from Zitadel Management API and publish provider messages for each.
-pub async fn scrape_users_to_outbox<R, S>(
-    outbox: &R,
-    directory: &S,
+/// List users from the Zitadel Management API as provider deliveries:
+/// how many were listed, and the ones with a usable id.
+pub async fn list_mapped_users(
     cfg: &ZitadelScrapeConfig,
-) -> ScrapeReport
-where
-    R: TransactionalCommit,
-    S: ReadModelWritePlanStore,
-{
-    let mut report = ScrapeReport::default();
-    let users = match list_all_users(cfg).await {
-        Ok(u) => u,
-        Err(e) => {
-            report.errors.push(e);
-            return report;
-        }
-    };
-    report.listed = users.len();
-
-    for user in users {
-        let Some(mapped) = map_mgmt_user(&user) else {
-            report.skipped += 1;
-            continue;
-        };
-        // Directory joins (chat author, blob owner) must not wait on bus
-        // delivery. Scrape already has the profile; outbox is for other
-        // subscribers. Duplicate outbox ids used to skip this upsert, which
-        // left `auth_users` empty after a published-but-never-consumed scrape.
-        if let Err(e) = materialize_auth_user(directory, &mapped).await {
-            report.errors.push(format!(
-                "user {}: auth_users upsert failed: {e}",
-                mapped.payload.provider_subject
-            ));
-            continue;
-        }
-        match publish_mapped_delivery(outbox, &mapped).await {
-            Ok(()) => report.published += 1,
-            Err(e) => {
-                // Content-addressed scrape ids: unchanged profile re-scrape hits the
-                // outbox unique key. That is the durable "already emitted" cache —
-                // count as skip, not error.
-                if is_expected_scrape_duplicate(&e) {
-                    report.skipped += 1;
-                } else {
-                    report.errors.push(format!(
-                        "user {}: publish failed: {e}",
-                        mapped.payload.provider_subject
-                    ));
-                }
-            }
-        }
-    }
-    report
-}
-
-async fn materialize_auth_user<S: ReadModelWritePlanStore>(
-    store: &S,
-    mapped: &MappedDelivery,
-) -> Result<(), String> {
-    let name = mapped.message_name.as_str();
-    let row = if name.contains("deactivated") || name.contains("reactivated") {
-        map_zitadel_user_status(name, &mapped.payload)
-    } else {
-        map_zitadel_user_upsert(name, &mapped.payload)
-    };
-    let mut plan = ReadModelWritePlanBuilder::new();
-    plan.upsert(&row).map_err(|e| e.to_string())?;
-    plan.commit(store).await.map_err(|e| e.to_string())?;
-    Ok(())
-}
-
-/// True when publish failed because this scrape delivery id was already committed.
-///
-/// Matches repository `DuplicateOutboxMessageInBatch` display text and common
-/// SQL unique-violation wording from drivers.
-fn is_expected_scrape_duplicate(err: &str) -> bool {
-    let lower = err.to_ascii_lowercase();
-    lower.contains("duplicate outbox message id")
-        || lower.contains("duplicateoutboxmessageinbatch")
-        || lower.contains("unique")
-        || lower.contains("already exists")
+) -> Result<(usize, Vec<MappedDelivery>), String> {
+    let users = list_all_users(cfg).await?;
+    Ok((
+        users.len(),
+        users.iter().filter_map(map_mgmt_user).collect(),
+    ))
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -229,8 +146,6 @@ struct MgmtProfile {
 struct MgmtEmail {
     #[serde(default)]
     email: Option<String>,
-    #[serde(default, rename = "isEmailVerified")]
-    is_email_verified: Option<bool>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -355,43 +270,24 @@ fn map_mgmt_user(user: &MgmtUser) -> Option<MappedDelivery> {
         .clone()
         .or_else(|| user.details.as_ref().and_then(|d| d.change_date.clone()))
         .unwrap_or_else(|| "0".into());
-    // Stable when profile unchanged so re-scrape can skip duplicate outbox ids.
+    // Stable while the profile is unchanged: consumers can tell a repeat.
     let fingerprint = simple_fingerprint(&[&email, &display_name, state, &user_kind, &change]);
     let delivery_id = format!("zitadel-scrape:{id}:{fingerprint}");
 
-    let emails = if email.is_empty() {
-        Vec::new()
-    } else {
-        vec![ZitadelEmail {
-            address: email,
-            primary: true,
-            verified: user
-                .human
-                .as_ref()
-                .and_then(|h| h.email.as_ref())
-                .and_then(|e| e.is_email_verified)
-                .unwrap_or(true),
-        }]
-    };
-
-    let payload = ZitadelUserPayload {
-        schema_version: 1,
-        source: "zitadel-scrape".into(),
-        delivery_id: delivery_id.clone(),
-        provider: "zitadel".into(),
-        provider_subject: id.to_string(),
+    let profile = user_profile(
+        message_name,
+        id,
         user_kind,
-        emails,
-        display_name: Some(display_name),
+        email,
+        Some(display_name),
         // Scrape treats every listed identity as a directory member.
-        approval_status: "approved".into(),
-        ingested_at: now_ms(),
-    };
+        "approved".into(),
+    );
 
     Some(MappedDelivery {
         message_name: message_name.to_string(),
         delivery_id,
-        payload,
+        profile,
     })
 }
 
@@ -409,56 +305,58 @@ fn simple_fingerprint(parts: &[&str]) -> String {
     format!("{hash:016x}")
 }
 
-fn now_ms() -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let d = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default();
-    format!("{}", d.as_millis())
-}
-
 /// Background loop: optional immediate scrape, then every `cfg.interval`.
-pub fn spawn_scrape_loop<R>(repo: R, cfg: ZitadelScrapeConfig)
-where
-    R: TransactionalCommit + ReadModelWritePlanStore + Clone + Send + Sync + 'static,
-{
+/// Each scrape is one `zitadel.scrape.v1` command on `service`.
+pub fn spawn_scrape_loop(service: Arc<Service>, cfg: ZitadelScrapeConfig) {
     if !cfg.background_enabled() && !cfg.on_start {
         return;
     }
     tokio::spawn(async move {
         if cfg.on_start {
-            let r = scrape_users_to_outbox(&repo, &repo, &cfg).await;
-            eprintln!(
-                "zitadel scrape (start): listed={} published={} skipped={} errors={}",
-                r.listed,
-                r.published,
-                r.skipped,
-                r.errors.len()
-            );
-            for e in &r.errors {
-                eprintln!("zitadel scrape: {e}");
-            }
+            scrape_once(&service, "start").await;
         }
         if !cfg.background_enabled() {
             return;
         }
         loop {
             tokio::time::sleep(cfg.interval).await;
-            let r = scrape_users_to_outbox(&repo, &repo, &cfg).await;
-            if r.published > 0 || !r.errors.is_empty() {
-                eprintln!(
-                    "zitadel scrape: listed={} published={} skipped={} errors={}",
-                    r.listed,
-                    r.published,
-                    r.skipped,
-                    r.errors.len()
-                );
-            }
-            for e in &r.errors {
-                eprintln!("zitadel scrape: {e}");
-            }
+            scrape_once(&service, "interval").await;
         }
     });
+}
+
+/// The scrape loop configured from the environment, or a note saying why
+/// there is none. Every host of this application starts it the same way.
+pub fn spawn_scrape_from_env(service: Arc<Service>) {
+    match ZitadelScrapeConfig::from_env() {
+        Some(cfg) if cfg.background_enabled() || cfg.on_start => {
+            eprintln!(
+                "zitadel scrape: enabled (api={}, interval={}s, on_start={})",
+                cfg.api_base,
+                cfg.interval.as_secs(),
+                cfg.on_start
+            );
+            spawn_scrape_loop(service, cfg);
+        }
+        Some(_) => {
+            eprintln!(
+                "zitadel scrape: credentials present, background off (interval=0); use POST /zitadel.scrape.v1"
+            );
+        }
+        None => {
+            eprintln!(
+                "zitadel scrape: disabled (set ZITADEL_SERVICE_USER_TOKEN + OIDC_ISSUER/ZITADEL_API_URL)"
+            );
+        }
+    }
+}
+
+async fn scrape_once(service: &Service, trigger: &str) {
+    match crate::handlers::ingestors::zitadel_scrape::scrape(service, trigger).await {
+        Ok(report) => eprintln!("zitadel scrape ({trigger}): {report}"),
+        // The operator's log: the full cause, not the client-facing message.
+        Err(error) => eprintln!("zitadel scrape ({trigger}) failed: {error:?}"),
+    }
 }
 
 #[cfg(test)]
@@ -480,9 +378,10 @@ mod tests {
         });
         let m = map_management_user(&raw).expect("mapped");
         assert_eq!(m.message_name, HUMAN_UPDATED);
-        assert_eq!(m.payload.provider_subject, "user-1");
-        assert_eq!(m.payload.display_name.as_deref(), Some("Alice"));
-        assert_eq!(m.payload.emails[0].address, "alice@e2e.local");
+        assert_eq!(m.profile.user_id, "user-1");
+        assert_eq!(m.profile.display_name, "Alice");
+        assert_eq!(m.profile.email, "alice@e2e.local");
+        assert_eq!(m.profile.approval_status, "approved");
         assert!(m.delivery_id.starts_with("zitadel-scrape:user-1:"));
     }
 
@@ -498,6 +397,7 @@ mod tests {
         });
         let m = map_management_user(&raw).unwrap();
         assert_eq!(m.message_name, HUMAN_DEACTIVATED);
+        assert_eq!(m.profile.status, "deactivated");
     }
 
     #[test]
@@ -509,22 +409,7 @@ mod tests {
         });
         let m = map_management_user(&raw).unwrap();
         assert_eq!(m.message_name, MACHINE_CREATED);
-        assert_eq!(m.payload.user_kind, "machine");
-    }
-
-    #[test]
-    fn expected_duplicate_classifies_outbox_unique() {
-        assert!(is_expected_scrape_duplicate(
-            "duplicate outbox message id in commit batch: zitadel-scrape:u1:abc"
-        ));
-        assert!(is_expected_scrape_duplicate(
-            "error: UNIQUE constraint failed: outbox_messages.message_id"
-        ));
-        assert!(is_expected_scrape_duplicate(
-            "duplicate key value violates unique constraint \"outbox_messages_pkey\""
-        ));
-        assert!(!is_expected_scrape_duplicate("connection refused"));
-        assert!(!is_expected_scrape_duplicate("zitadel search HTTP 401"));
+        assert_eq!(m.profile.user_kind, "machine");
     }
 
     #[test]

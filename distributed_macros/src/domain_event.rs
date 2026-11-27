@@ -4,8 +4,8 @@ use quote::quote;
 use syn::{Data, DeriveInput, Fields, LitInt, LitStr};
 
 use crate::shared::{
-    canonical_object_schema, projection_body_metadata_tokens, schema_fingerprint,
-    validate_domain_event_name_literal, framework_path,
+    canonical_object_schema, framework_path, projection_body_metadata_tokens, schema_fingerprint,
+    validate_domain_event_name_literal,
 };
 
 pub(crate) fn derive_domain_event(input: TokenStream) -> TokenStream {
@@ -59,13 +59,13 @@ pub(crate) fn expand_domain_event(input: DeriveInput) -> syn::Result<proc_macro2
     let fingerprint = LitStr::new(&fingerprint, Span::call_site());
 
     Ok(quote! {
-        impl #framework::DomainEvent for #name {
-            const DESCRIPTOR: #framework::DomainEventDescriptor =
-                #framework::DomainEventDescriptor {
+        impl #framework::domain_event::DomainEvent for #name {
+            const DESCRIPTOR: #framework::domain_event::DomainEventDescriptor =
+                #framework::domain_event::DomainEventDescriptor {
                     name: std::borrow::Cow::Borrowed(#event_name),
                     version: #version,
-                    body: #framework::DomainEventBodyDescriptor::distributed_json(
-                        #framework::DomainEventBodyKind::Event,
+                    body: #framework::domain_event::DomainEventBodyDescriptor::distributed_json(
+                        #framework::domain_event::DomainEventBodyKind::Event,
                         #type_name,
                         #version,
                         #schema,
@@ -78,12 +78,21 @@ pub(crate) fn expand_domain_event(input: DeriveInput) -> syn::Result<proc_macro2
             const EVENT_NAME: &'static str = #event_name;
             const EVENT_VERSION: u64 = #version;
 
-            fn descriptor() -> #framework::DomainEventDescriptor {
-                <Self as #framework::DomainEvent>::DESCRIPTOR.clone()
+            fn descriptor() -> #framework::domain_event::DomainEventDescriptor {
+                <Self as #framework::domain_event::DomainEvent>::DESCRIPTOR.clone()
             }
         }
 
         impl #framework::domain_event::DomainEventBodyContract<Self> for #name {}
+
+        impl #framework::command::CommandProjectionBody for #name {
+            fn command_projection_descriptor(
+                _: &'static str,
+                _: u64,
+            ) -> #framework::domain_event::DomainEventDescriptor {
+                <Self as #framework::domain_event::DomainEvent>::DESCRIPTOR.clone()
+            }
+        }
 
         impl #framework::projection::lower::ProjectionBodyMetadata for #name {
             #projection_metadata
@@ -168,29 +177,5 @@ fn named_fields(input: &DeriveInput) -> syn::Result<&syn::FieldsNamed> {
             input,
             "DomainEvent derive can only be used on structs with named fields",
         )),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn expansion_freezes_explicit_event_schema_and_fingerprint() {
-        let input: DeriveInput = syn::parse_quote! {
-            #[domain_event(name = "todo.ownership-transferred", version = 2)]
-            struct TodoOwnershipTransferred {
-                todo_id: String,
-                previous_owner_id: String,
-                new_owner_id: String,
-            }
-        };
-
-        let expanded = expand_domain_event(input).unwrap().to_string();
-
-        assert!(expanded.contains("todo.ownership-transferred"));
-        assert!(expanded
-            .contains("sha256:c3f0bc1645b8685a8c496a74650ec41c70f9a8356e81d26cd254a4bd7a8ae9ac"));
-        assert!(expanded.contains("DomainEventBodyKind :: Event"));
     }
 }

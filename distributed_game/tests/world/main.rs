@@ -1,0 +1,1634 @@
+//! Two GameServers in one process on different ports: cross-host handoff
+//! with a real WebSocket client, tier-up events across hosts, hibernation,
+//! fenced ownership and the world content barrier. Hibernation runs on
+//! celld (`CellZoneOwnership` + `CellZoneStateStore` against
+//! `tests/celld/fact-worker`; skipped unless the worker is built and celld
+//! starts, required with `CELLD_FACTS_REQUIRED=1`).
+
+#[path = "../support/celld.rs"]
+mod celld_support;
+#[path = "../support/realm.rs"]
+mod realm;
+
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use distributed::lease::InMemoryLeaseStore;
+use distributed_game::net::{
+    AbortNotes, GameServer, InternalHttpSecret, RemoteHost, RolloutError, ServerConfig, TicketKey,
+    WorldCoordinator, ZoneFactory,
+};
+use distributed_game::protocol::{error, kick, Hello, Notice};
+use distributed_game::world::{
+    FencedLeaseOwnership, HostAddr, LocalOwnership, StaticDirectory, ZoneDirectory, ZoneOwnership,
+    ZoneStateStore,
+};
+use distributed_game::*;
+use futures_util::{SinkExt, StreamExt};
+use realm::*;
+use tokio::net::TcpStream;
+use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
+
+type Ws = WebSocketStream<MaybeTlsStream<TcpStream>>;
+
+const SECRET: &str = "world-secret";
+const ADMIN: &str = "world-test-internal-secret-0123456789";
+
+fn admin() -> InternalHttpSecret {
+    InternalHttpSecret::new(ADMIN).unwrap()
+}
+
+fn ticket(principal: &str, zone: &str, nonce: &str) -> String {
+    TicketKey::new(SECRET).sign(&TicketClaims {
+        principal: principal.into(),
+        zone: zone.into(),
+        expires_at: 4_000_000_000,
+        nonce: nonce.into(),
+        role: Role::Player,
+        name: None,
+        extensions: Default::default(),
+        wake: false,
+    })
+}
+
+struct Node {
+    server: GameServer<Realm>,
+    addr: HostAddr,
+    sink: MemoryFactSink,
+}
+
+type Factory = Arc<dyn Fn(&str) -> Option<RealmConfig> + Send + Sync>;
+
+fn base_config() -> ServerConfig {
+    let mut config = ServerConfig::new(TicketKey::new(SECRET));
+    config.host.tick_rate = 30;
+    config.host.patch_rate = 10;
+    config.admin_secret = Some(admin());
+    config
+}
+
+async fn listen() -> (tokio::net::TcpListener, String) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    (listener, addr)
+}
+
+fn serve(server: &GameServer<Realm>, listener: tokio::net::TcpListener) {
+    let serving = server.clone();
+    tokio::spawn(async move {
+        serving
+            .serve(listener, std::future::pending())
+            .await
+            .unwrap();
+    });
+}
+
+/// Start two hosts "A" and "B" sharing a directory and ownership.
+async fn two_hosts(
+    config: impl Fn() -> ServerConfig,
+    assign: &[(&str, &str)],
+    factory: Factory,
+    ownership: Arc<dyn ZoneOwnership>,
+) -> (Node, Node, Arc<StaticDirectory>) {
+    let (la, a_addr) = listen().await;
+    let (lb, b_addr) = listen().await;
+    let a = HostAddr::new("A", &a_addr);
+    let b = HostAddr::new("B", &b_addr);
+    let dir = Arc::new(StaticDirectory::new());
+    dir.add_host(a.clone()).add_host(b.clone());
+    for (zone, host) in assign {
+        dir.assign(*zone, *host);
+    }
+    dir.fallback("A");
+    let mut nodes = Vec::new();
+    for (host, listener) in [(a, la), (b, lb)] {
+        let sink = MemoryFactSink::new();
+        let f = factory.clone();
+        let server = GameServer::<Realm>::new(config(), ZoneFactory::sync(move |a| f(&a.zone_id)))
+            .with_fact_sink(sink.clone(), 64, RetryPolicy::default())
+            .with_host_id(host.id.clone())
+            .with_directory(dir.clone())
+            .with_ownership(ownership.clone());
+        serve(&server, listener);
+        nodes.push(Node {
+            server,
+            addr: host,
+            sink,
+        });
+    }
+    let b = nodes.pop().unwrap();
+    let a = nodes.pop().unwrap();
+    (a, b, dir)
+}
+
+async fn send(ws: &mut Ws, msg: ClientMessage) {
+    ws.send(Message::Binary(msg.encode().into())).await.unwrap();
+}
+
+async fn hello(ws: &mut Ws, ticket: &str, token: &str, version: &str) {
+    send(
+        ws,
+        ClientMessage::Hello(Hello {
+            protocol_version: PROTOCOL_VERSION,
+            content_version: version.into(),
+            capabilities: 0,
+            ticket: ticket.into(),
+            reconnect_token: token.into(),
+            near: false,
+        }),
+    )
+    .await;
+}
+
+async fn next(ws: &mut Ws, mirror: &mut ClientMirror) -> Option<ServerMessage> {
+    loop {
+        let frame = tokio::time::timeout(Duration::from_secs(5), ws.next())
+            .await
+            .expect("server message within 5s")?;
+        match frame {
+            Ok(Message::Binary(bytes)) => return Some(mirror.apply(&bytes).unwrap()),
+            Ok(Message::Close(_)) | Err(_) => return None,
+            Ok(_) => continue,
+        }
+    }
+}
+
+/// Next message that is not a Delta.
+async fn next_control(ws: &mut Ws, mirror: &mut ClientMirror) -> Option<ServerMessage> {
+    loop {
+        match next(ws, mirror).await? {
+            ServerMessage::Delta(_) => continue,
+            other => return Some(other),
+        }
+    }
+}
+
+async fn connect(url: &str) -> Ws {
+    connect_async(url).await.unwrap().0
+}
+
+struct Client {
+    ws: Ws,
+    mirror: ClientMirror,
+    welcome: protocol::Welcome,
+}
+
+/// Connect to `url` (a zone URL), following Redirects, and expect Welcome.
+#[allow(clippy::result_large_err)]
+async fn join_url(url: &str, ticket: &str, version: &str) -> Result<Client, ServerMessage> {
+    let mut url = url.to_string();
+    for _ in 0..3 {
+        let mut ws = connect(&url).await;
+        hello(&mut ws, ticket, "", version).await;
+        let mut mirror = ClientMirror::new();
+        match next_control(&mut ws, &mut mirror).await.expect("reply") {
+            ServerMessage::Welcome(welcome) => {
+                return Ok(Client {
+                    ws,
+                    mirror,
+                    welcome,
+                })
+            }
+            ServerMessage::Redirect { url: to, .. } => url = to,
+            other => return Err(other),
+        }
+    }
+    panic!("redirect loop")
+}
+
+async fn control(client: &mut Client) -> Option<ServerMessage> {
+    next_control(&mut client.ws, &mut client.mirror).await
+}
+
+/// Next Freeze/Resume/Kick/Error (skips Deltas and game Events).
+async fn next_notice(client: &mut Client) -> Option<ServerMessage> {
+    loop {
+        match control(client).await? {
+            ServerMessage::Event { .. } => continue,
+            other => return Some(other),
+        }
+    }
+}
+
+async fn input(client: &mut Client, seq: u32, cmd: u8) {
+    send(
+        &mut client.ws,
+        ClientMessage::Input {
+            seq,
+            client_tick: 0,
+            payload: vec![cmd],
+        },
+    )
+    .await;
+}
+
+async fn eventually<F, Fut>(what: &str, mut check: F)
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    for _ in 0..200 {
+        if check().await {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    panic!("timed out waiting for {what}");
+}
+
+fn realm_factory(
+    neighbours: &[(&'static str, &'static str)],
+    rejecting: &'static [&'static str],
+) -> Factory {
+    let neighbours: Vec<(String, String)> = neighbours
+        .iter()
+        .map(|(a, b)| (a.to_string(), b.to_string()))
+        .collect();
+    Arc::new(move |zone: &str| {
+        if !zone.starts_with("realm") && !zone.starts_with('z') {
+            return None;
+        }
+        Some(RealmConfig {
+            neighbour: neighbours
+                .iter()
+                .find(|(from, _)| from == zone)
+                .map(|(_, to)| to.clone()),
+            reject_all: rejecting.contains(&zone),
+            gate: zone.ends_with(".inn"),
+            freeze_ready: !zone.ends_with(".stuck"),
+            move_facts: false,
+        })
+    })
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cross_host_handoff_follows_redirect_and_ticket_is_single_use() {
+    let (a, b, _dir) = two_hosts(
+        base_config,
+        &[("realm.east", "A"), ("realm.west", "B")],
+        realm_factory(&[("realm.east", "realm.west")], &[]),
+        Arc::new(LocalOwnership::new()),
+    )
+    .await;
+
+    // Asking B for an A zone redirects without consuming the ticket.
+    let t = ticket("ana", "realm.east", "n1");
+    let mut ana = join_url(&b.addr.zone_url("realm.east"), &t, "")
+        .await
+        .unwrap();
+    assert_eq!(ana.welcome.zone_id, "realm.east");
+    assert!(a.server.is_active("realm.east"));
+    assert!(!b.server.is_active("realm.east"));
+
+    for seq in 1..=2 {
+        input(&mut ana, seq, CMD_COUNT).await;
+    }
+    input(&mut ana, 3, CMD_HANDOFF).await;
+    let (target, transfer) = loop {
+        match control(&mut ana).await {
+            Some(ServerMessage::Handoff {
+                target_zone,
+                transfer_ticket,
+                ..
+            }) => break (target_zone, transfer_ticket),
+            Some(_) => continue,
+            None => panic!("closed before Handoff"),
+        }
+    };
+    assert_eq!(target, "realm.west");
+    // The source fenced the player out before the ticket was usable.
+    assert_eq!(
+        a.server.inspect("realm.east", |h| h.player_count()).await,
+        Some(0)
+    );
+
+    // Client follows: same host first (Redirect to B), then B admits.
+    let mut west = join_url(&a.addr.zone_url(&target), &transfer, "")
+        .await
+        .unwrap();
+    assert_eq!(west.welcome.zone_id, "realm.west");
+    let arrived = loop {
+        match control(&mut west).await.unwrap() {
+            ServerMessage::Event { type_id, payload } if type_id == EV_ARRIVED => break payload,
+            _ => continue,
+        }
+    };
+    assert_eq!(arrived, b"ana:gold=2|realm.east");
+    let arrivals = b
+        .server
+        .inspect("realm.west", |h| h.zone().arrivals.clone())
+        .await
+        .unwrap();
+    assert_eq!(arrivals[0].principal, "ana");
+
+    // Single use: neither the target nor the source accepts it again.
+    match join_url(&b.addr.zone_url("realm.west"), &transfer, "").await {
+        Err(ServerMessage::Error { code, .. }) => assert_eq!(code, error::UNAUTHORIZED),
+        other => panic!("replay admitted: {:?}", other.map(|c| c.welcome)),
+    }
+    match join_url(&a.addr.zone_url("realm.east"), &transfer, "").await {
+        Err(ServerMessage::Error { code, .. }) => assert_eq!(code, error::UNAUTHORIZED),
+        other => panic!(
+            "return after arrival admitted: {:?}",
+            other.map(|c| c.welcome)
+        ),
+    }
+    // A forged transfer (wrong key) is refused.
+    let forged = TicketKey::new("nope").sign(&TicketClaims {
+        principal: "mallory".into(),
+        zone: "realm.west".into(),
+        expires_at: 4_000_000_000,
+        nonce: "x".into(),
+        role: Role::Player,
+        name: None,
+        extensions: Default::default(),
+        wake: false,
+    });
+    assert!(join_url(&b.addr.zone_url("realm.west"), &forged, "")
+        .await
+        .is_err());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn redirects_use_the_configured_public_url() {
+    let (_a, b, _dir) = two_hosts(
+        || {
+            base_config().with_redirect_url(|host, zone| {
+                format!("wss://game.example/hosts/{}/zones/{zone}", host.id)
+            })
+        },
+        &[("realm.east", "A")],
+        realm_factory(&[], &[]),
+        Arc::new(LocalOwnership::new()),
+    )
+    .await;
+    let mut ws = connect(&b.addr.zone_url("realm.east")).await;
+    hello(&mut ws, &ticket("ana", "realm.east", "pub-1"), "", "").await;
+    let mut mirror = ClientMirror::new();
+    match next_control(&mut ws, &mut mirror).await {
+        Some(ServerMessage::Redirect { zone_id, url }) => {
+            assert_eq!(zone_id, "realm.east");
+            assert_eq!(url, "wss://game.example/hosts/A/zones/realm.east");
+        }
+        other => panic!("expected Redirect, got {other:?}"),
+    }
+    // Per-host advertised URL in the directory (no mapping configured).
+    let proxied = HostAddr::new("A", "10.0.0.2:2567").with_ws_url("wss://game.example/a/");
+    assert_eq!(proxied.zone_url("z"), "wss://game.example/a/zones/z");
+    assert_eq!(proxied.admin_url, "http://10.0.0.2:2567");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn refused_handoff_returns_to_source_with_carried_state() {
+    let (a, b, _dir) = two_hosts(
+        base_config,
+        &[("realm.east", "A"), ("realm.west", "B")],
+        realm_factory(&[("realm.east", "realm.west")], &["realm.west"]),
+        Arc::new(LocalOwnership::new()),
+    )
+    .await;
+    let mut ana = join_url(
+        &a.addr.zone_url("realm.east"),
+        &ticket("ana", "realm.east", "r1"),
+        "",
+    )
+    .await
+    .unwrap();
+    input(&mut ana, 1, CMD_COUNT).await;
+    input(&mut ana, 2, CMD_HANDOFF).await;
+    let transfer = loop {
+        if let Some(ServerMessage::Handoff {
+            transfer_ticket, ..
+        }) = control(&mut ana).await
+        {
+            break transfer_ticket;
+        }
+    };
+    // Target refuses (zone closed) -> policy: return to the source.
+    match join_url(&b.addr.zone_url("realm.west"), &transfer, "").await {
+        Err(ServerMessage::Error { code, .. }) => assert_eq!(code, error::REJECTED),
+        other => panic!("expected rejection: {:?}", other.map(|c| c.welcome)),
+    }
+    let mut back = join_url(&a.addr.zone_url("realm.east"), &transfer, "")
+        .await
+        .unwrap();
+    let arrived = loop {
+        match control(&mut back).await.unwrap() {
+            ServerMessage::Event { type_id, payload } if type_id == EV_ARRIVED => break payload,
+            _ => continue,
+        }
+    };
+    // Carried state comes back; `from` is the zone it never reached.
+    assert_eq!(arrived, b"ana:gold=1|realm.west");
+    // Once returned, the ticket is dead at the target too.
+    assert!(join_url(&b.addr.zone_url("realm.west"), &transfer, "")
+        .await
+        .is_err());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn refused_handoff_returns_to_a_source_on_the_same_host() {
+    // Source and target share a host (and its nonce replay cache): the
+    // target saw the ticket first, the return must still be admitted once.
+    let (a, _b, _dir) = two_hosts(
+        base_config,
+        &[("realm.east", "A"), ("realm.west", "A")],
+        realm_factory(&[("realm.east", "realm.west")], &["realm.west"]),
+        Arc::new(LocalOwnership::new()),
+    )
+    .await;
+    let mut ana = join_url(
+        &a.addr.zone_url("realm.east"),
+        &ticket("ana", "realm.east", "s1"),
+        "",
+    )
+    .await
+    .unwrap();
+    input(&mut ana, 1, CMD_HANDOFF).await;
+    let transfer = loop {
+        if let Some(ServerMessage::Handoff {
+            transfer_ticket, ..
+        }) = control(&mut ana).await
+        {
+            break transfer_ticket;
+        }
+    };
+    match join_url(&a.addr.zone_url("realm.west"), &transfer, "").await {
+        Err(ServerMessage::Error { code, .. }) => assert_eq!(code, error::REJECTED),
+        other => panic!("expected rejection: {:?}", other.map(|c| c.welcome)),
+    }
+    let back = join_url(&a.addr.zone_url("realm.east"), &transfer, "").await;
+    assert!(back.is_ok(), "return admitted: {:?}", back.err());
+    // The return is single use.
+    assert!(join_url(&a.addr.zone_url("realm.east"), &transfer, "")
+        .await
+        .is_err());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn boss_defeat_tiers_up_to_parent_and_grandparent_across_hosts() {
+    let (a, b, _dir) = two_hosts(
+        base_config,
+        &[
+            ("realm", "A"),
+            ("realm.east", "A"),
+            ("realm.east.keep", "B"),
+        ],
+        realm_factory(&[], &[]),
+        Arc::new(LocalOwnership::new()),
+    )
+    .await;
+    let mut ana = join_url(
+        &b.addr.zone_url("realm.east.keep"),
+        &ticket("ana", "realm.east.keep", "b1"),
+        "",
+    )
+    .await
+    .unwrap();
+    input(&mut ana, 1, CMD_BOSS).await;
+    for zone in ["realm.east", "realm"] {
+        let server = a.server.clone();
+        eventually(zone, || {
+            let server = server.clone();
+            async move {
+                server
+                    .inspect(zone, |h| {
+                        h.zone().child_events.iter().any(|e| {
+                            e.kind == "boss_defeated" && e.origin_zone == "realm.east.keep"
+                        })
+                    })
+                    .await
+                    .unwrap_or(false)
+            }
+        })
+        .await;
+    }
+    let grand = a
+        .server
+        .inspect("realm", |h| h.zone().child_events.clone())
+        .await
+        .unwrap();
+    assert_eq!(grand.len(), 1);
+    assert_eq!(grand[0].from_zone, "realm.east");
+    assert_eq!(grand[0].payload, b"realm.east.keep");
+    // Parents were activated on demand on their owning host only.
+    assert!(!b.server.is_active("realm.east"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn dormant_zone_hibernates_to_celld_and_restores() {
+    let Some(celld) = celld_support::Celld::start_new() else {
+        return;
+    };
+    let (ownership, store) = on_celld(&celld, "host-a");
+    let mut config = base_config();
+    config.host.idle_tick_rate = None;
+    config.host.dormant_after = Duration::from_millis(50);
+    config.hibernate_after = Some(Duration::from_millis(100));
+    let sink = MemoryFactSink::new();
+    let (listener, addr) = listen().await;
+    let factory = realm_factory(&[], &[]);
+    let server = GameServer::<Realm>::new(config, ZoneFactory::sync(move |a| factory(&a.zone_id)))
+        .with_fact_sink(sink.clone(), 64, RetryPolicy::default())
+        .with_ownership(ownership)
+        .with_state_store(store.clone());
+    serve(&server, listener);
+    let url = format!("ws://{addr}/zones/realm.vault");
+
+    let mut ana = join_url(&url, &ticket("ana", "realm.vault", "h1"), "")
+        .await
+        .unwrap();
+    for seq in 1..=3 {
+        input(&mut ana, seq, CMD_COUNT).await;
+    }
+    eventually("three counts", || {
+        let server = server.clone();
+        async move { server.inspect("realm.vault", |h| h.zone().counter).await == Some(3) }
+    })
+    .await;
+    send(&mut ana.ws, ClientMessage::Leave).await;
+    // The zone leaves the active set before its snapshot is written, so wait
+    // for the save itself.
+    eventually("hibernation save", || {
+        let server = server.clone();
+        async move { !server.is_active("realm.vault") && hibernation_outcomes(&server) >= 1 }
+    })
+    .await;
+    let saved = store
+        .load("realm.vault")
+        .await
+        .unwrap()
+        .expect("snapshot stored");
+    assert_eq!(saved.state, 3u32.to_le_bytes());
+    // Facts emitted while disposing were still committed.
+    eventually("dispose fact", || {
+        let sink = sink.clone();
+        async move {
+            sink.committed()
+                .iter()
+                .any(|f| f.key() == "dispose:realm.vault:3")
+        }
+    })
+    .await;
+    assert_eq!(
+        sink.committed()
+            .iter()
+            .filter(|f| f.command() == "realm.count")
+            .count(),
+        3
+    );
+
+    // Next activation restores it.
+    let mut again = join_url(&url, &ticket("ana", "realm.vault", "h2"), "")
+        .await
+        .unwrap();
+    let counter = loop {
+        match control(&mut again).await.unwrap() {
+            ServerMessage::Event { type_id, payload } if type_id == EV_JOINED => {
+                break u32::from_le_bytes(payload.try_into().unwrap())
+            }
+            _ => continue,
+        }
+    };
+    assert_eq!(counter, 3);
+}
+
+/// Zone ownership and hibernation snapshots in celld cells.
+fn on_celld(
+    celld: &celld_support::Celld,
+    host: &str,
+) -> (
+    Arc<distributed_game::celld::CellZoneOwnership>,
+    Arc<distributed_game::celld::CellZoneStateStore>,
+) {
+    let secret = || {
+        distributed::microsvc::cell_host::InternalHttpSecret::new(celld_support::SECRET).unwrap()
+    };
+    (
+        Arc::new(
+            distributed_game::celld::CellZoneOwnership::new(
+                celld.base(),
+                secret(),
+                "world-test",
+                host,
+            )
+            .unwrap(),
+        ),
+        Arc::new(
+            distributed_game::celld::CellZoneStateStore::new(
+                celld.base(),
+                secret(),
+                "world-test",
+                host,
+            )
+            .unwrap(),
+        ),
+    )
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn hibernation_saves_succeed_after_a_host_restart_on_the_same_store() {
+    let Some(celld) = celld_support::Celld::start_new() else {
+        return;
+    };
+    let url_of = |addr: &str| format!("ws://{addr}/zones/realm.keep");
+    let mut epochs = Vec::new();
+    let mut count = 0u32;
+    for run in 1..=2 {
+        // A fresh process: new store and ownership handles (the fencing
+        // tokens live in the celld lease cell, so they keep growing).
+        let (ownership, store) = on_celld(&celld, &format!("host-{run}"));
+        let mut config = base_config();
+        config.host.idle_tick_rate = None;
+        config.host.dormant_after = Duration::from_millis(50);
+        config.hibernate_after = Some(Duration::from_millis(100));
+        let (listener, addr) = listen().await;
+        let factory = realm_factory(&[], &[]);
+        let server =
+            GameServer::<Realm>::new(config, ZoneFactory::sync(move |a| factory(&a.zone_id)))
+                .with_ownership(ownership)
+                .with_state_store(store.clone());
+        serve(&server, listener);
+        // Two activations per run, so the first run's last token exceeds
+        // the restarted run's first token unless tokens survive restarts.
+        for cycle in 1..=2u64 {
+            let nonce = format!("r{run}-{cycle}");
+            let mut ana = join_url(&url_of(&addr), &ticket("ana", "realm.keep", &nonce), "")
+                .await
+                .unwrap();
+            input(&mut ana, 1, CMD_COUNT).await;
+            count += 1;
+            let expected = count;
+            eventually("count", || {
+                let server = server.clone();
+                async move {
+                    server.inspect("realm.keep", |h| h.zone().counter).await == Some(expected)
+                }
+            })
+            .await;
+            epochs.push(
+                server
+                    .inspect("realm.keep", |h| h.config().boot_epoch)
+                    .await
+                    .unwrap(),
+            );
+            send(&mut ana.ws, ClientMessage::Leave).await;
+            // Saved, stale or error: the assertions below say which.
+            eventually("hibernation save", || {
+                let server = server.clone();
+                async move { !server.is_active("realm.keep") && hibernation_outcomes(&server) >= cycle }
+            })
+            .await;
+            assert_eq!(server.metrics().hibernation_saves("stale"), 0, "run {run}");
+            assert_eq!(
+                server.metrics().hibernation_saves("saved"),
+                cycle,
+                "run {run}"
+            );
+            let saved = store.load("realm.keep").await.unwrap().expect("snapshot");
+            assert_eq!(saved.state, count.to_le_bytes(), "run {run} saved");
+        }
+        assert!(server
+            .metrics()
+            .render()
+            .contains("distributed_game_hibernation_saves_total{outcome=\"saved\"} 2"));
+        server.shutdown();
+    }
+    assert!(
+        epochs.windows(2).all(|w| w[1] > w[0]),
+        "epochs grow: {epochs:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn fenced_lease_keeps_zone_on_one_host_and_loss_stops_it() {
+    let clock = distributed::clock::ManualClock::starting_now();
+    let leases = InMemoryLeaseStore::with_clock(clock.clone());
+    let ownership: Arc<dyn ZoneOwnership> = Arc::new(FencedLeaseOwnership::new(leases));
+    let config = || {
+        let mut c = base_config();
+        c.ownership_ttl = Duration::from_secs(10);
+        c.ownership_renew_every = Duration::from_millis(50);
+        c.activation_timeout = Duration::from_millis(200);
+        c
+    };
+    // No directory: both hosts would happily serve any zone.
+    let mut nodes = Vec::new();
+    for id in ["A", "B"] {
+        let (listener, addr) = listen().await;
+        let f = realm_factory(&[], &[]);
+        let server = GameServer::<Realm>::new(config(), ZoneFactory::sync(move |a| f(&a.zone_id)))
+            .with_host_id(id)
+            .with_ownership(ownership.clone());
+        serve(&server, listener);
+        nodes.push((server, addr));
+    }
+    let url = |i: usize| format!("ws://{}/zones/zboss", nodes[i].1);
+
+    let mut ana = join_url(&url(0), &ticket("ana", "zboss", "l1"), "")
+        .await
+        .unwrap();
+    match join_url(&url(1), &ticket("bo", "zboss", "l2"), "").await {
+        Err(ServerMessage::Error { code, message }) => {
+            assert_eq!(code, error::ZONE_UNAVAILABLE);
+            assert!(message.contains("owned by A#"), "{message}");
+        }
+        other => panic!("second host ran the zone: {:?}", other.map(|c| c.welcome)),
+    }
+
+    // A stalls past its TTL (e.g. paused); its next renewal fails and the
+    // zone stops there.
+    clock.advance(Duration::from_secs(11));
+    let kicked = loop {
+        match control(&mut ana).await {
+            Some(ServerMessage::Kick { code, .. }) => break code,
+            Some(_) => continue,
+            None => panic!("closed without Kick"),
+        }
+    };
+    assert_eq!(kicked, kick::ZONE_DISPOSED);
+    let a = nodes[0].0.clone();
+    eventually("A stops", || {
+        let a = a.clone();
+        async move { !a.is_active("zboss") }
+    })
+    .await;
+    // Now B may own it.
+    let bo = join_url(&url(1), &ticket("bo", "zboss", "l3"), "")
+        .await
+        .unwrap();
+    assert_eq!(bo.welcome.zone_id, "zboss");
+}
+
+fn versioned(version: &'static str) -> impl Fn() -> ServerConfig {
+    move || {
+        let mut c = base_config();
+        c.host.content_version = version.into();
+        c
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rolling_commit_reloads_stale_clients_in_gates_and_apply_may_await() {
+    let safe_room = || {
+        let mut c = base_config();
+        c.host.content_version = "v1".into();
+        c.host.stale_policy = StalePolicy::SafeRoom { roam: false };
+        c
+    };
+    let (a, _b, _dir) = two_hosts(
+        safe_room,
+        &[("realm.inn", "A"), ("realm.field", "A")],
+        realm_factory(&[], &[]),
+        Arc::new(LocalOwnership::new()),
+    )
+    .await;
+    let mut inn = join_url(
+        &a.addr.zone_url("realm.inn"),
+        &ticket("ina", "realm.inn", "g1"),
+        "v1",
+    )
+    .await
+    .unwrap();
+    let mut field = join_url(
+        &a.addr.zone_url("realm.field"),
+        &ticket("fey", "realm.field", "g2"),
+        "v1",
+    )
+    .await
+    .unwrap();
+    let server = a.server.clone();
+    let coordinator = WorldCoordinator::new(Duration::from_secs(2))
+        .participant(Arc::new(a.server.clone()))
+        .with_abort_notes(AbortNotes {
+            not_acked: "the ritual held the world".into(),
+            apply_failed: "CDN said: {error}".into(),
+        });
+
+    // Async apply that fails: everyone resumes on v1 with the custom note.
+    let failed = coordinator
+        .rollout_async("v2", "", BarrierMode::Rolling, |_v| async {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            Err("pack missing".to_string())
+        })
+        .await;
+    assert_eq!(
+        failed,
+        Err(RolloutError::ApplyFailed("pack missing".into()))
+    );
+    for c in [&mut inn, &mut field] {
+        assert!(matches!(
+            next_notice(c).await,
+            Some(ServerMessage::Freeze(_))
+        ));
+        let resumed = next_notice(c).await;
+        assert!(
+            matches!(&resumed, Some(ServerMessage::Resume(n))
+                if n.version == "v1" && n.notes == "CDN said: pack missing"),
+            "{resumed:?}"
+        );
+    }
+
+    // Async apply observed while every zone is frozen, then a rolling commit.
+    let report = coordinator
+        .rollout_async("v2", "ice", BarrierMode::Rolling, |v| async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let frozen = server.inspect("realm.inn", |h| h.is_frozen()).await;
+            assert_eq!(frozen, Some(true), "zones stay frozen while applying {v}");
+            Ok(())
+        })
+        .await
+        .unwrap();
+    assert_eq!(report.version, "v2");
+    for c in [&mut inn, &mut field] {
+        assert!(matches!(
+            next_notice(c).await,
+            Some(ServerMessage::Freeze(_))
+        ));
+        assert!(matches!(
+            next_notice(c).await,
+            Some(ServerMessage::Resume(n)) if n.version == "v2"
+        ));
+    }
+    // The stale client already inside the gate reloads there ...
+    match next_notice(&mut inn).await {
+        Some(ServerMessage::Kick { code, .. }) => assert_eq!(code, kick::RELOAD),
+        other => panic!("expected Kick(RELOAD), got {other:?}"),
+    }
+    // ... the one in the field keeps playing its old version.
+    let field_connected = a
+        .server
+        .inspect("realm.field", |h| h.players().all(|p| p.connected))
+        .await;
+    assert_eq!(field_connected, Some(true));
+    // The reloaded client reconnects with its token on v2.
+    let mut back = connect(&a.addr.zone_url("realm.inn")).await;
+    hello(&mut back, "", &inn.welcome.reconnect_token, "v2").await;
+    let mut mirror = ClientMirror::new();
+    assert!(matches!(
+        next_control(&mut back, &mut mirror).await,
+        Some(ServerMessage::Welcome(w)) if w.content_version == "v2"
+    ));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn world_barrier_freezes_applies_and_resumes_across_hosts() {
+    let (a, b, _dir) = two_hosts(
+        versioned("v1"),
+        &[("realm.a1", "A"), ("realm.a2", "A"), ("realm.b1", "B")],
+        realm_factory(&[], &[]),
+        Arc::new(LocalOwnership::new()),
+    )
+    .await;
+    let mut clients = Vec::new();
+    for (i, zone) in ["realm.a1", "realm.a2", "realm.b1"].into_iter().enumerate() {
+        let host = if zone.ends_with("b1") { &b } else { &a };
+        let c = join_url(
+            &host.addr.zone_url(zone),
+            &ticket(&format!("p{i}"), zone, &format!("w{i}")),
+            "v1",
+        )
+        .await
+        .unwrap();
+        clients.push(c);
+    }
+
+    // Prepare only on A: frozen zones drop (and count) inputs.
+    let notice = Notice {
+        reason: "content_update".into(),
+        version: "v2".into(),
+        notes: String::new(),
+    };
+    a.server
+        .prepare_barrier(1, notice.clone(), Duration::from_secs(2))
+        .await
+        .unwrap();
+    assert!(matches!(
+        next_notice(&mut clients[0]).await,
+        Some(ServerMessage::Freeze(n)) if n.version == "v2"
+    ));
+    input(&mut clients[0], 1, CMD_COUNT).await;
+    let server = a.server.clone();
+    eventually("dropped input counted", || {
+        let server = server.clone();
+        async move {
+            server
+                .inspect("realm.a1", |h| h.inputs_dropped_frozen())
+                .await
+                .unwrap_or(0)
+                >= 1
+        }
+    })
+    .await;
+    // Per-zone metrics count frozen drops under their own outcome.
+    assert!(a
+        .server
+        .metrics()
+        .render()
+        .contains("distributed_game_zone_inputs_total{zone=\"realm.a1\",outcome=\"frozen\"} 1"));
+    // /metrics coexists with the admin routes on the same router.
+    let status = reqwest::Client::new()
+        .post(format!("{}/admin/barrier/nope", a.addr.admin_url))
+        .header("x-distributed-internal-secret", ADMIN)
+        .json(&serde_json::json!({}))
+        .send()
+        .await
+        .unwrap()
+        .status();
+    assert_eq!(status, 404);
+    assert!(a.server.abort_barrier(1, "test").await);
+    assert!(matches!(
+        next_notice(&mut clients[0]).await,
+        Some(ServerMessage::Resume(n)) if n.version == "v1"
+    ));
+    assert_eq!(
+        a.server.inspect("realm.a1", |h| h.zone().counter).await,
+        Some(0),
+        "input sent while frozen was not simulated"
+    );
+    // realm.a2 (also on A) went through the same aborted barrier.
+    assert!(matches!(
+        next_notice(&mut clients[1]).await,
+        Some(ServerMessage::Freeze(_))
+    ));
+    assert!(
+        matches!(next_notice(&mut clients[1]).await, Some(ServerMessage::Resume(n)) if n.version == "v1")
+    );
+
+    // Full rollout through the coordinator: A local, B over admin HTTP.
+    let applied = Arc::new(Mutex::new(Vec::new()));
+    let log = applied.clone();
+    let coordinator = WorldCoordinator::new(Duration::from_secs(2))
+        .participant(Arc::new(a.server.clone()))
+        .participant(Arc::new(RemoteHost::new(b.addr.clone(), admin())));
+    let report = coordinator
+        .rollout("v2", "new loot tables", BarrierMode::Rolling, |v| {
+            log.lock().unwrap().push(v.to_string());
+            Ok(())
+        })
+        .await
+        .unwrap();
+    assert_eq!(report.version, "v2");
+    assert_eq!(*applied.lock().unwrap(), vec!["v2".to_string()]);
+    for c in &mut clients {
+        assert!(matches!(
+            next_notice(c).await,
+            Some(ServerMessage::Freeze(n)) if n.version == "v2"
+        ));
+        let resumed = next_notice(c).await;
+        assert!(
+            matches!(
+                &resumed,
+                Some(ServerMessage::Resume(n)) if n.version == "v2" && n.notes == "new loot tables"
+            ),
+            "{resumed:?}"
+        );
+    }
+    assert_eq!(a.server.content_version(), "v2");
+    assert_eq!(b.server.content_version(), "v2");
+    // Rolling: v1 clients keep playing; facts now carry v2.
+    input(&mut clients[2], 2, CMD_COUNT).await;
+    let sink = b.sink.clone();
+    eventually("v2 fact", || {
+        let sink = sink.clone();
+        async move {
+            sink.committed()
+                .iter()
+                .any(|f| f.command() == "realm.count" && f.stamp().content_version == "v2")
+        }
+    })
+    .await;
+    // New zones activate on v2: a v1 fresh join is told to reload.
+    match join_url(
+        &a.addr.zone_url("realm.a3"),
+        &ticket("late", "realm.a3", "w9"),
+        "v1",
+    )
+    .await
+    {
+        Err(ServerMessage::Error { code, .. }) => assert_eq!(code, error::VERSION_MISMATCH),
+        other => panic!("stale join admitted: {:?}", other.map(|c| c.welcome)),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn barrier_aborts_and_resumes_old_version_when_a_zone_never_acks() {
+    let (a, b, _dir) = two_hosts(
+        versioned("v1"),
+        &[("realm.ok", "A"), ("realm.stuck", "B")],
+        realm_factory(&[], &[]),
+        Arc::new(LocalOwnership::new()),
+    )
+    .await;
+    let mut ok = join_url(
+        &a.addr.zone_url("realm.ok"),
+        &ticket("p1", "realm.ok", "s1"),
+        "v1",
+    )
+    .await
+    .unwrap();
+    let mut stuck = join_url(
+        &b.addr.zone_url("realm.stuck"),
+        &ticket("p2", "realm.stuck", "s2"),
+        "v1",
+    )
+    .await
+    .unwrap();
+    let coordinator = WorldCoordinator::new(Duration::from_millis(300))
+        .participant(Arc::new(a.server.clone()))
+        .participant(Arc::new(RemoteHost::new(b.addr.clone(), admin())));
+    let mut applied = false;
+    let err = coordinator
+        .rollout("v2", "", BarrierMode::Hard, |_| {
+            applied = true;
+            Ok(())
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(err, RolloutError::NotAcked(vec!["B/realm.stuck".into()]));
+    assert!(!applied);
+    assert!(matches!(
+        next_notice(&mut ok).await,
+        Some(ServerMessage::Freeze(n)) if n.version == "v2"
+    ));
+    assert!(matches!(
+        next_notice(&mut ok).await,
+        Some(ServerMessage::Resume(n)) if n.version == "v1"
+    ));
+    assert_eq!(a.server.content_version(), "v1");
+    assert_eq!(b.server.content_version(), "v1");
+    // The stuck zone never froze, so its client saw nothing; it keeps
+    // simulating on v1.
+    input(&mut stuck, 1, CMD_COUNT).await;
+    let server = b.server.clone();
+    eventually("stuck zone still runs", || {
+        let server = server.clone();
+        async move {
+            server
+                .inspect("realm.stuck", |h| (h.zone().counter, h.freeze_state()))
+                .await
+                == Some((1, FreezeState::Running))
+        }
+    })
+    .await;
+    // A wrong admin secret is refused.
+    let wrong =
+        WorldCoordinator::new(Duration::from_millis(300)).participant(Arc::new(RemoteHost::new(
+            b.addr.clone(),
+            InternalHttpSecret::new("not-the-world-test-internal-secret").unwrap(),
+        )));
+    assert!(matches!(
+        wrong
+            .rollout("v3", "", BarrierMode::Rolling, |_| Ok(()))
+            .await,
+        Err(RolloutError::NotAcked(_))
+    ));
+    assert_eq!(b.server.content_version(), "v1");
+}
+
+#[test]
+fn directory_types_are_object_safe() {
+    let dir: Arc<dyn ZoneDirectory> = Arc::new(StaticDirectory::new());
+    assert!(dir.locate("x").is_none());
+}
+
+/// Hibernation snapshot saves finished so far, whatever their outcome.
+fn hibernation_outcomes(server: &GameServer<Realm>) -> u64 {
+    let m = server.metrics();
+    m.hibernation_saves("saved") + m.hibernation_saves("stale") + m.hibernation_saves("error")
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, TicketExtension)]
+struct PartyClaims {
+    party: String,
+    team: u8,
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn transfer_tickets_carry_extension_claims_across_hosts() {
+    let (a, b, _dir) = two_hosts(
+        || {
+            let mut config = base_config();
+            config.admission = config.admission.with_ticket_extensions::<PartyClaims>();
+            config
+        },
+        &[("realm.east", "A"), ("realm.west", "B")],
+        realm_factory(&[("realm.east", "realm.west")], &[]),
+        Arc::new(LocalOwnership::new()),
+    )
+    .await;
+    let party = PartyClaims {
+        party: "p-9".into(),
+        team: 1,
+    };
+    let t = TicketKey::new(SECRET).sign(
+        &TicketClaims::new("ana", "realm.east", 4_000_000_000, "ext-1", Role::Player)
+            .with_extensions(TicketExtensions::from_typed(&party).unwrap()),
+    );
+    let mut ana = join_url(&a.addr.zone_url("realm.east"), &t, "")
+        .await
+        .unwrap();
+    input(&mut ana, 1, CMD_HANDOFF).await;
+    let transfer = loop {
+        match control(&mut ana).await {
+            Some(ServerMessage::Handoff {
+                transfer_ticket, ..
+            }) => break transfer_ticket,
+            Some(_) => continue,
+            None => panic!("closed before Handoff"),
+        }
+    };
+    // The server-minted transfer ticket signs the claims...
+    let distributed_game::net::VerifiedTicket::Transfer(verified) = TicketKey::new(SECRET)
+        .verify_ticket(&transfer, 1_700_000_000)
+        .unwrap()
+    else {
+        panic!("transfer ticket")
+    };
+    assert_eq!(
+        verified.claims.extensions.typed::<PartyClaims>().unwrap(),
+        party
+    );
+    // ...and the target zone on the other host sees them.
+    let _west = join_url(&a.addr.zone_url("realm.west"), &transfer, "")
+        .await
+        .unwrap();
+    let players = b
+        .server
+        .inspect("realm.west", |h| h.players().cloned().collect::<Vec<_>>())
+        .await
+        .unwrap();
+    assert_eq!(players[0].principal, "ana");
+    assert_eq!(players[0].extensions.typed::<PartyClaims>().unwrap(), party);
+}
+
+#[tokio::test]
+async fn fenced_lease_ownership_passes_the_conformance_suite() {
+    let ownership = FencedLeaseOwnership::new(InMemoryLeaseStore::new());
+    distributed_game::world::ownership_conformance(&ownership, "conformance").await;
+}
+
+/// How a [`Severable`] ownership answers renewals.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Renewals {
+    /// Passed through.
+    Pass,
+    /// A partition: every renewal fails with a backend error.
+    Fail,
+    /// A partition that never answers.
+    Hang,
+    /// The claim is gone (`Lost`).
+    Lose,
+}
+
+/// Ownership whose renewals can be cut (a partitioned or crashed host):
+/// once cut, nothing is released either.
+struct Severable {
+    inner: Arc<dyn ZoneOwnership>,
+    renewals: Mutex<Renewals>,
+    /// Acquisitions answered so far.
+    acquired: std::sync::atomic::AtomicUsize,
+    /// When a claim was last released (passed through or not).
+    released_at: Mutex<Option<tokio::time::Instant>>,
+}
+
+impl Severable {
+    fn new(inner: Arc<dyn ZoneOwnership>) -> Arc<Self> {
+        Arc::new(Self {
+            inner,
+            renewals: Mutex::new(Renewals::Pass),
+            acquired: Default::default(),
+            released_at: Mutex::new(None),
+        })
+    }
+
+    fn cut(&self, renewals: Renewals) {
+        *self.renewals.lock().unwrap() = renewals;
+    }
+}
+
+impl ZoneOwnership for Severable {
+    fn acquire<'a>(
+        &'a self,
+        zone_id: &'a str,
+        holder: &'a str,
+        ttl: Duration,
+    ) -> BoxFuture<'a, Result<world::ZoneClaim, world::OwnershipError>> {
+        Box::pin(async move {
+            let answer = self.inner.acquire(zone_id, holder, ttl).await;
+            self.acquired
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            answer
+        })
+    }
+
+    fn renew<'a>(
+        &'a self,
+        claim: &'a world::ZoneClaim,
+        ttl: Duration,
+    ) -> BoxFuture<'a, Result<world::ZoneClaim, world::OwnershipError>> {
+        match *self.renewals.lock().unwrap() {
+            Renewals::Pass => self.inner.renew(claim, ttl),
+            Renewals::Fail => {
+                Box::pin(async { Err(world::OwnershipError::Backend("partition".into())) })
+            }
+            Renewals::Hang => Box::pin(std::future::pending()),
+            Renewals::Lose => Box::pin(async { Err(world::OwnershipError::Lost) }),
+        }
+    }
+
+    fn release<'a>(&'a self, claim: &'a world::ZoneClaim) -> BoxFuture<'a, ()> {
+        *self.released_at.lock().unwrap() = Some(tokio::time::Instant::now());
+        if *self.renewals.lock().unwrap() == Renewals::Pass {
+            self.inner.release(claim)
+        } else {
+            Box::pin(async {})
+        }
+    }
+}
+
+/// A host that crashed holding a zone (its claim never released) and
+/// restarted inside the TTL with the same host id: its first activation
+/// must not get the dead incarnation's claim (and fencing token, which is
+/// the zone's `boot_epoch`) back, or its fact keys collide with the dead
+/// run's and are dropped as replays.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_restarted_host_outranks_its_previous_incarnation() {
+    let clock = distributed::clock::ManualClock::starting_now();
+    let store: Arc<dyn ZoneOwnership> = Arc::new(FencedLeaseOwnership::new(
+        InMemoryLeaseStore::with_clock(clock.clone()),
+    ));
+    let start = |ownership: Arc<dyn ZoneOwnership>| {
+        let mut config = base_config();
+        config.ownership_ttl = Duration::from_secs(15);
+        config.activation_timeout = Duration::from_secs(10);
+        let f = realm_factory(&[], &[]);
+        GameServer::<Realm>::new(config, ZoneFactory::sync(move |a| f(&a.zone_id)))
+            .with_host_id("H")
+            .with_ownership(ownership)
+    };
+    let crashed = Severable::new(store.clone());
+    let before = start(crashed.clone());
+    assert!(before.activate("zr").await);
+    let old = before
+        .inspect("zr", |h| h.config().boot_epoch)
+        .await
+        .unwrap();
+    // The process dies: no renewal, no release.
+    crashed.cut(Renewals::Fail);
+
+    let restarted = Severable::new(store.clone());
+    let after = start(restarted.clone());
+    assert!(after.begin_activation("zr"));
+    // The restarted host asks for the claim while the dead one lives ...
+    eventually("an acquisition attempt", || {
+        let restarted = restarted.clone();
+        async move { restarted.acquired.load(std::sync::atomic::Ordering::SeqCst) > 0 }
+    })
+    .await;
+    // ... and gets it once the dead claim lapses at the store's TTL.
+    clock.advance(Duration::from_secs(16));
+    let mut new = None;
+    for _ in 0..400 {
+        new = after.inspect("zr", |h| h.config().boot_epoch).await;
+        if new.is_some() {
+            break;
+        }
+        assert!(after.begin_activation("zr"));
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    let new = new.expect("the restarted host activates the zone");
+    assert!(new > old, "restarted epoch {new} <= dead epoch {old}");
+    before.shutdown();
+    after.shutdown();
+}
+
+#[tokio::test]
+async fn fenced_lease_ownership_passes_the_restart_conformance_suite() {
+    let clock = distributed::clock::ManualClock::starting_now();
+    let ownership = FencedLeaseOwnership::new(InMemoryLeaseStore::with_clock(clock.clone()));
+    let ttl = Duration::from_secs(10);
+    distributed_game::world::restart_conformance(&ownership, "restart", ttl, async {
+        clock.advance(ttl + Duration::from_secs(1));
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn sqlite_lease_ownership_passes_the_restart_conformance_suite() {
+    use distributed::lease::SqliteLeaseStore;
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .unwrap();
+    SqliteLeaseStore::migrate(&pool).await.unwrap();
+    let ownership = FencedLeaseOwnership::new(SqliteLeaseStore::new(pool));
+    distributed_game::world::ownership_conformance(&ownership, "conformance").await;
+    // The database clock decides expiry: wait it out.
+    let ttl = Duration::from_millis(200);
+    distributed_game::world::restart_conformance(&ownership, "restart", ttl, async {
+        tokio::time::sleep(ttl * 2).await;
+    })
+    .await;
+}
+
+/// A zone whose renewals stop succeeding stops by `ttl - renew_every`
+/// after its last successful renewal began (before another host may own
+/// it), and commits nothing from then on: neither queued facts nor the
+/// facts its disposal emits.
+#[tokio::test(start_paused = true)]
+async fn a_zone_that_cannot_renew_fences_itself() {
+    for renewals in [Renewals::Fail, Renewals::Hang, Renewals::Lose] {
+        let ownership = Severable::new(Arc::new(LocalOwnership::new()));
+        let sink = MemoryFactSink::new();
+        let mut config = base_config();
+        config.ownership_ttl = Duration::from_secs(3);
+        config.ownership_renew_every = Duration::from_secs(1);
+        let f = realm_factory(&[], &[]);
+        let server = GameServer::<Realm>::with_clock(
+            config,
+            Arc::new(distributed_game::ManualClock::new()),
+            ZoneFactory::sync(move |a| f(&a.zone_id)),
+        )
+        .with_fact_sink(sink.clone(), 64, RetryPolicy::default())
+        .with_ownership(ownership.clone());
+        assert!(server.activate("zf").await);
+        // Renewals at 1 s and 2 s succeed ...
+        tokio::time::sleep(Duration::from_millis(2_500)).await;
+        assert!(server.is_active("zf"), "{renewals:?}: healthy so far");
+        // ... the one at 3 s does not: the last success began at 2 s, so
+        // the zone fences at 2 s + (3 s - 1 s) = 4 s.
+        ownership.cut(renewals);
+        tokio::time::sleep(Duration::from_millis(1_400)).await;
+        if renewals != Renewals::Lose {
+            assert!(
+                server.is_active("zf"),
+                "{renewals:?}: still inside the TTL margin"
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(!server.is_active("zf"), "{renewals:?}: fenced at 4 s");
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        assert!(
+            sink.committed().is_empty(),
+            "{renewals:?}: committed after the fence: {:?}",
+            sink.committed()
+        );
+        server.shutdown();
+    }
+}
+
+/// Credits a [`Ledger`] zone is told to record.
+#[derive(Debug, Clone, PartialEq, GameEvent)]
+enum LedgerMessage {
+    #[game_event(id = 1)]
+    Credit { n: u32 },
+}
+
+/// Emits a fact per credit and one on disposal: drives the fact worker
+/// without clients.
+struct Ledger;
+
+impl Zone for Ledger {
+    type Config = ();
+    type Input = u8;
+    type Timer = ();
+    type Message = LedgerMessage;
+
+    fn schema() -> EntitySchema {
+        EntitySchema::new()
+    }
+
+    fn on_create(_ctx: &mut Ctx<'_, Self>, _: ()) -> Self {
+        Ledger
+    }
+
+    fn decode_input(&self, _player: PlayerId, _payload: &[u8]) -> Option<u8> {
+        None
+    }
+
+    fn on_tick(&mut self, _ctx: &mut Ctx<'_, Self>) {}
+
+    fn on_message(&mut self, ctx: &mut Ctx<'_, Self>, message: LedgerMessage) {
+        let LedgerMessage::Credit { n } = message;
+        let fact = Fact::new(
+            format!("credit:{n}"),
+            "ledger.credit",
+            serde_json::json!({}),
+        );
+        ctx.emit_fact(fact).expect("queued");
+    }
+
+    fn on_dispose(&mut self, ctx: &mut Ctx<'_, Self>) {
+        let _ = ctx.emit_fact(Fact::new(
+            "disposed",
+            "ledger.disposed",
+            serde_json::json!({}),
+        ));
+    }
+}
+
+/// A store taking `delay` per commit; records each commit's key and the
+/// instant it landed.
+#[derive(Clone)]
+struct SlowStore {
+    delay: Duration,
+    landed: Arc<Mutex<Vec<(String, tokio::time::Instant)>>>,
+}
+
+impl SlowStore {
+    fn new(delay: Duration) -> Self {
+        Self {
+            delay,
+            landed: Default::default(),
+        }
+    }
+
+    fn landed(&self) -> Vec<(String, tokio::time::Instant)> {
+        self.landed.lock().unwrap().clone()
+    }
+
+    fn keys(&self) -> Vec<String> {
+        self.landed().into_iter().map(|(key, _)| key).collect()
+    }
+}
+
+impl FactSink for SlowStore {
+    fn commit<'a>(&'a self, fact: &'a Fact) -> BoxFuture<'a, Result<FactReceipt, FactError>> {
+        Box::pin(async move {
+            tokio::time::sleep(self.delay).await;
+            self.landed
+                .lock()
+                .unwrap()
+                .push((fact.key().to_string(), tokio::time::Instant::now()));
+            Ok(FactReceipt {
+                payload: serde_json::Value::Null,
+                replayed: false,
+            })
+        })
+    }
+}
+
+/// A ledger zone on paused time: TTL 3 s, renewals every 1 s, so a zone
+/// fences 2 s after its last successful renewal began; commits take 1.5 s.
+async fn ledger(
+    ownership: Arc<Severable>,
+    settle_timeout: Duration,
+) -> (GameServer<Ledger>, SlowStore) {
+    let store = SlowStore::new(Duration::from_millis(1_500));
+    let mut config = base_config();
+    config.ownership_ttl = Duration::from_secs(3);
+    config.ownership_renew_every = Duration::from_secs(1);
+    config.settle_timeout = settle_timeout;
+    let server = GameServer::<Ledger>::with_clock(
+        config,
+        Arc::new(distributed_game::ManualClock::new()),
+        ZoneFactory::sync(|_| Some(())),
+    )
+    .with_fact_sink(store.clone(), 64, RetryPolicy::default())
+    .with_ownership(ownership);
+    assert!(server.activate("ledger").await);
+    (server, store)
+}
+
+async fn credit(server: &GameServer<Ledger>, credits: std::ops::RangeInclusive<u32>) {
+    for n in credits {
+        server
+            .send(
+                "ledger",
+                distributed_game::inbox::ZoneInbound::Message(LedgerMessage::Credit { n }),
+            )
+            .await
+            .unwrap();
+    }
+}
+
+/// Renewals that fail, hang or answer `Lost` from the start: the zone
+/// stops before its claim can expire, the commit already running when the
+/// fence passes is abandoned, and the facts queued behind it (and the
+/// disposal's) are never published.
+#[tokio::test(start_paused = true)]
+async fn a_fenced_zone_publishes_no_fact_it_can_no_longer_prove() {
+    for renewals in [Renewals::Fail, Renewals::Hang, Renewals::Lose] {
+        let ownership = Severable::new(Arc::new(LocalOwnership::new()));
+        let start = tokio::time::Instant::now();
+        let (server, store) = ledger(ownership.clone(), Duration::from_secs(2)).await;
+        ownership.cut(renewals);
+        credit(&server, 1..=3).await;
+        // The first renewal (1 s) fails: `Lost` fences at once, otherwise
+        // the fence stays at 0 s + (3 s - 1 s) = 2 s.
+        let fence = start
+            + match renewals {
+                Renewals::Lose => Duration::from_secs(1),
+                _ => Duration::from_secs(2),
+            };
+        tokio::time::sleep_until(fence - Duration::from_millis(100)).await;
+        assert!(server.is_active("ledger"), "{renewals:?}: before the fence");
+        tokio::time::sleep_until(fence + Duration::from_millis(100)).await;
+        assert!(!server.is_active("ledger"), "{renewals:?}: fenced");
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        let expected: &[&str] = match renewals {
+            // credit:1 lands at 1.5 s, inside the fence; credit:2 would at
+            // 3 s and is abandoned; credit:3 never starts.
+            Renewals::Fail | Renewals::Hang => &["credit:1"],
+            Renewals::Lose => &[],
+            Renewals::Pass => unreachable!(),
+        };
+        assert_eq!(store.keys(), expected, "{renewals:?}");
+        assert!(
+            store.landed().iter().all(|(_, at)| *at < fence),
+            "{renewals:?}: a fact landed after the fence: {:?}",
+            store.landed()
+        );
+        server.shutdown();
+    }
+}
+
+/// A shutdown settles the queued facts while the claim is renewed and
+/// releases the claim only after the last commit; under a partition the
+/// settling stops at the fence instead of running on past the claim.
+#[tokio::test(start_paused = true)]
+async fn a_shutdown_settles_facts_only_while_the_claim_holds() {
+    for renewals in [Renewals::Pass, Renewals::Fail] {
+        let ownership = Severable::new(Arc::new(LocalOwnership::new()));
+        let start = tokio::time::Instant::now();
+        let (server, store) = ledger(ownership.clone(), Duration::from_secs(30)).await;
+        ownership.cut(renewals);
+        credit(&server, 1..=4).await;
+        server.shutdown();
+        tokio::time::sleep(Duration::from_secs(40)).await;
+        let released = ownership.released_at.lock().unwrap().expect("released");
+        match renewals {
+            // 1.5 s per commit, renewed throughout: all four and the
+            // disposal's fact land by 7.5 s, then the claim goes.
+            Renewals::Pass => {
+                assert_eq!(
+                    store.keys(),
+                    ["credit:1", "credit:2", "credit:3", "credit:4", "disposed"]
+                );
+            }
+            // The fence (2 s) cuts the settling after credit:1.
+            _ => {
+                assert_eq!(store.keys(), ["credit:1"]);
+                assert!(store
+                    .landed()
+                    .iter()
+                    .all(|(_, at)| *at < start + Duration::from_secs(2)));
+            }
+        }
+        assert!(
+            store.landed().iter().all(|(_, at)| *at <= released),
+            "{renewals:?}: a fact landed after the claim was released"
+        );
+    }
+}
+
+/// A commit or abort for another barrier than the current one (a delayed
+/// message from an older rollout) changes nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_stale_barrier_commit_or_abort_is_ignored() {
+    let factory = realm_factory(&[], &[]);
+    let server = GameServer::<Realm>::new(
+        versioned("v1")(),
+        ZoneFactory::sync(move |a| factory(&a.zone_id)),
+    );
+    assert!(server.activate("realm.s1").await);
+    let notice = Notice {
+        reason: "content_update".into(),
+        version: "v2".into(),
+        notes: String::new(),
+    };
+    server
+        .prepare_barrier(2, notice, Duration::from_secs(2))
+        .await
+        .unwrap();
+    let state = |server: GameServer<Realm>| async move {
+        server
+            .inspect("realm.s1", |h| {
+                (h.is_frozen(), h.config().content_version.clone())
+            })
+            .await
+            .unwrap()
+    };
+    assert_eq!(state(server.clone()).await, (true, "v1".to_string()));
+    assert!(
+        !server
+            .commit_barrier(1, "v-old", "", BarrierMode::Rolling)
+            .await
+    );
+    assert!(!server.abort_barrier(1, "old").await);
+    assert_eq!(
+        state(server.clone()).await,
+        (true, "v1".to_string()),
+        "a stale commit/abort applied"
+    );
+    assert!(
+        server
+            .commit_barrier(2, "v2", "", BarrierMode::Rolling)
+            .await
+    );
+    assert_eq!(state(server.clone()).await, (false, "v2".to_string()));
+    server.shutdown();
+}

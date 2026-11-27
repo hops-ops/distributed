@@ -299,7 +299,7 @@ pub trait LockDialect: Send + Sync + 'static {
 }
 
 /// Executes a [`LockDialect`]'s SQL. Blanket-implemented for every dialect
-/// whose database supports the lease bind/decode surface (`&str` and `f64`
+/// whose database supports the lease bind/decode surface (`&str` and `i64`
 /// binds, one-`String` rows) — identical across our dialects, so the sqlx
 /// bounds live here exactly once and everything else asks for
 /// `D: LeaseQueries`.
@@ -309,7 +309,7 @@ pub trait LeaseQueries: LockDialect {
         pool: &Pool<Self::Db>,
         key: &str,
         token: &str,
-        ttl_secs: f64,
+        ttl_micros: i64,
     ) -> impl Future<Output = Result<bool, LockError>> + Send;
 
     /// Release the lease iff it still carries `token` (best-effort).
@@ -333,19 +333,19 @@ where
     <D::Db as Database>::Arguments: IntoArguments<D::Db>,
     str: Type<D::Db>,
     for<'q> &'q str: Encode<'q, D::Db>,
-    f64: Type<D::Db> + for<'q> Encode<'q, D::Db>,
+    i64: Type<D::Db> + for<'q> Encode<'q, D::Db>,
     for<'r> (String,): FromRow<'r, <D::Db as Database>::Row>,
 {
     async fn acquire(
         pool: &Pool<Self::Db>,
         key: &str,
         token: &str,
-        ttl_secs: f64,
+        ttl_micros: i64,
     ) -> Result<bool, LockError> {
         let outcome = sqlx::query_as::<_, (String,)>(D::ACQUIRE_SQL)
             .bind(key)
             .bind(token)
-            .bind(ttl_secs)
+            .bind(ttl_micros)
             .fetch_optional(pool)
             .await;
         match outcome {
@@ -525,7 +525,9 @@ impl<D: LeaseQueries> LeaseBackend for SqlxLock<D> {
             &self.pool,
             &self.key,
             token,
-            self.config.lease_ttl.as_secs_f64(),
+            // A TTL past any representable time never expires; clamping
+            // keeps `now + ttl` inside the integer range.
+            crate::repository::sql::duration_micros(self.config.lease_ttl).unwrap_or(i64::MAX / 2),
         )
         .await
     }
@@ -546,5 +548,21 @@ impl<D: LeaseQueries> Lock for SqlxLock<D> {
 
     fn unlock(&self) -> impl Future<Output = Result<(), LockError>> + Send + '_ {
         lease_unlock(self)
+    }
+
+    fn release_detached(self: Arc<Self>) {
+        match tokio::runtime::Handle::try_current() {
+            Ok(runtime) => {
+                runtime.spawn(async move {
+                    let _ = lease_unlock(&*self).await;
+                });
+            }
+            // No runtime to delete the lease row on: free this process's
+            // gate now and let the row expire by its TTL.
+            Err(_) => {
+                store_token(self.shared(), None);
+                let _ = self.shared().gate.unlock_core();
+            }
+        }
     }
 }

@@ -14,6 +14,7 @@ import { validateReplicaOperationBinding } from '../operation-binding.js';
 import { compareCodeUnits } from '../../lib/compare-code-units.js';
 import { freezeRecord } from '../../lib/freeze-record.js';
 import { isPlainRecord } from '../../lib/is-plain-record.js';
+import { oncePerIdentity } from '../../lib/once-per-identity.js';
 import { FILTER_OPERATORS, GRAPHQL_NAME, MAX_VARIABLE_CODEC_DEPTH } from './constants.js';
 
 export type VariableCodecRegistry = {
@@ -79,7 +80,16 @@ export function canonicalizeOperationVariables<
 	return freezeRecord(canonical) as TVariables;
 }
 
-export function validateVariableCodec(codec: ReplicaVariableCodecArtifact): VariableCodecRegistry {
+/** A variable codec is an immutable generated constant, validated once. */
+export function validateVariableCodec(
+	codec: ReplicaVariableCodecArtifact
+): VariableCodecRegistry {
+	return oncePerIdentity(validatedCodecs, codec, parseVariableCodec);
+}
+
+const validatedCodecs = new WeakMap<object, VariableCodecRegistry>();
+
+function parseVariableCodec(codec: ReplicaVariableCodecArtifact): VariableCodecRegistry {
 	const root = artifactRecord(
 		codec,
 		'artifact.variableCodec',
@@ -756,7 +766,7 @@ export function canonicalizeFilterComparison(
 				canonical.push([operator, operand]);
 				continue;
 			}
-			if (operator === '_like' || operator === '_ilike' || operator === '_has_key') {
+			if (operator === '_like' || operator === '_ilike' || operator === '_icontains' || operator === '_has_key') {
 				if (typeof operand !== 'string') {
 					variableValueInvalid(operatorPath, 'expected string or null');
 				}
@@ -972,7 +982,7 @@ export function validateFilterOperatorContract(
 	path: string
 ): void {
 	if (
-		(operator === '_like' || operator === '_ilike') &&
+		(operator === '_like' || operator === '_ilike' || operator === '_icontains') &&
 		scalar !== 'String'
 	) {
 		variableCodecInvalid(path);

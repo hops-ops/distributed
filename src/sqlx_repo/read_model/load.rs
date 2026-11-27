@@ -4,13 +4,12 @@ use std::sync::RwLock;
 use sqlx::{Database, Encode, Executor, IntoArguments, Type};
 
 use super::{
-    belongs_to_target_column, column_by_name, push_key_predicates, push_order_by_primary_key,
-    quote_identifier, relational_row_select, resolve_registered_read_model_schemas,
-    row_to_versioned_values, IncludeSpec, SqlxReadModelBackend,
+    column_by_name, push_key_predicates, push_order_by_primary_key, quote_identifier,
+    relational_row_select, resolve_registered_read_model_schemas, row_to_versioned_values,
+    IncludeSpec, SqlxReadModelBackend,
 };
 use crate::read_model::{
-    ReadModelIncludeRows, ReadModelLoadGraph, ReadModelLoadRequest, ReadModelQueryCapabilities,
-    Versioned,
+    ReadModelIncludeRows, ReadModelLoadGraph, ReadModelLoadRequest, Versioned,
 };
 use crate::sqlx_repo::read_model_storage_error;
 use crate::table::{
@@ -71,7 +70,6 @@ pub(crate) async fn load_read_model_graph<DB>(
     pool: &sqlx::Pool<DB>,
     schemas: &RwLock<TableSchemaRegistry>,
     request: ReadModelLoadRequest,
-    capabilities: ReadModelQueryCapabilities,
 ) -> Result<ReadModelLoadGraph, TableStoreError>
 where
     DB: SqlxReadModelBackend,
@@ -80,8 +78,6 @@ where
     for<'q> i64: Encode<'q, DB> + Type<DB> + sqlx::Decode<'q, DB>,
     for<'r> &'r str: sqlx::ColumnIndex<<DB as Database>::Row>,
 {
-    request.validate_for_query_capabilities(&capabilities)?;
-
     let (root_schema, include_specs) = resolve_registered_read_model_schemas(schemas, &request)?;
     validate_key(&root_schema, &request.key)?;
 
@@ -146,20 +142,11 @@ where
     for<'q> i64: Encode<'q, DB> + Type<DB> + sqlx::Decode<'q, DB>,
     for<'r> &'r str: sqlx::ColumnIndex<<DB as Database>::Row>,
 {
-    let foreign_key = spec.relationship.foreign_key.as_deref().ok_or_else(|| {
-        TableStoreError::Metadata(format!(
-            "relationship `{}` must declare a foreign key",
-            spec.relationship.field_name
-        ))
-    })?;
-    let source_column =
-        crate::table::column_name_for(root_schema, foreign_key).ok_or_else(|| {
-            TableStoreError::Metadata(format!(
-                "relationship `{}` foreign key `{}` is not a source column",
-                spec.relationship.field_name, foreign_key
-            ))
-        })?;
-    let target_column = belongs_to_target_column(&spec.target_schema, &source_column)?;
+    let (source_column, target_column) = crate::table::belongs_to_join_columns(
+        root_schema,
+        &spec.relationship,
+        &spec.target_schema,
+    )?;
     let source_value = root_row.get(&source_column).ok_or_else(|| {
         TableStoreError::Metadata(format!(
             "read model `{}` root row is missing relationship key `{}`",

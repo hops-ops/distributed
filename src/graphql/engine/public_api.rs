@@ -23,9 +23,6 @@ impl GraphqlEngine {
     }
 
     pub fn sdl_for_role(&self, role: &str) -> Option<String> {
-        if !self.inner.roles.contains(role) && role != self.inner.anonymous_role {
-            // Still allow any role that has a built schema.
-        }
         self.inner.schemas.get(role).map(|s| s.sdl())
     }
 
@@ -57,13 +54,18 @@ impl GraphqlEngine {
         self.inner.service_id.as_deref()
     }
 
+    /// The lifecycle gate taken from the bound service.
+    pub(crate) fn lifecycle(&self) -> &crate::microsvc::LifecycleGate {
+        &self.inner.lifecycle
+    }
+
     pub(crate) fn typed_command_binding(&self) -> Option<&TypedServiceCommandBinding> {
         self.inner.command_binding.as_ref()
     }
 
     pub(crate) fn typed_command_contracts_for_service(
         &self,
-    ) -> Result<Vec<crate::graphql::command_contract::TypedCommandContract>, String> {
+    ) -> Result<Vec<crate::command::TypedCommandContract>, String> {
         Ok(self.inner.typed_commands.contracts_for_binding())
     }
 
@@ -88,12 +90,7 @@ impl GraphqlEngine {
         DistributedClientSurfaceExport::from_selected_with_execution(
             service_id,
             surface,
-            ClientExecutionLimits::from_runtime(
-                self.inner.max_depth,
-                self.inner.max_complexity,
-                self.inner.max_bool_width,
-                self.inner.max_in_list,
-            )?,
+            self.inner.client_execution.clone(),
         )
     }
 
@@ -155,12 +152,7 @@ impl GraphqlEngine {
         DistributedClientSurfaceExport::from_selected_with_execution(
             service_id,
             surface,
-            ClientExecutionLimits::from_runtime(
-                self.inner.max_depth,
-                self.inner.max_complexity,
-                self.inner.max_bool_width,
-                self.inner.max_in_list,
-            )?,
+            self.inner.client_execution.clone(),
         )
     }
 
@@ -189,11 +181,16 @@ impl GraphqlEngine {
 
     /// Identity configuration used by GraphQL HTTP handlers.
     pub fn identity_config(&self) -> &IdentityConfig {
+        self.inner.identity.config()
+    }
+
+    pub(crate) fn identity(&self) -> &IdentityResolver {
         &self.inner.identity
     }
 
-    pub(crate) fn identity_validator(&self) -> Option<&OidcValidator> {
-        self.inner.identity_validator.as_ref()
+    /// Bounds applied to each origin WebSocket connection.
+    pub fn websocket_limits(&self) -> WebsocketLimits {
+        self.inner.websocket
     }
 
     /// Whether unknown/ungranted client `where` and `order_by` keys fail closed.
@@ -205,5 +202,17 @@ impl GraphqlEngine {
     /// Hub used by live subscriptions (tests may publish directly).
     pub fn change_hub(&self) -> &crate::graphql::subscribe::ChangeHub {
         &self.inner.change_hub
+    }
+
+    /// Active live producers: one per distinct shared live read, however
+    /// many subscribers follow it.
+    pub fn live_producer_count(&self) -> usize {
+        self.inner.change_hub.subscriber_count()
+    }
+
+    /// Active live subscription streams. Identical reads share one producer
+    /// ([`live_producer_count`](Self::live_producer_count)).
+    pub fn live_subscriber_count(&self) -> usize {
+        self.inner.live.subscriber_count()
     }
 }

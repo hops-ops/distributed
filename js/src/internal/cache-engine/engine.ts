@@ -3,6 +3,13 @@ import {
 	OptimisticLayerNotFoundError
 } from './errors.js';
 import {
+	Overlay,
+	graphReader,
+	isVisibleRecordLive,
+	sameVisibleIndex,
+	visibleRecord
+} from './graph.js';
+import {
 	assertName,
 	assertSynchronousResult,
 	assertWriterActive,
@@ -10,18 +17,15 @@ import {
 	cloneDerivedIndexOperations,
 	cloneFields,
 	cloneIndexMetadata,
-	cloneLink,
 	cloneLinks,
 	compareRecordTuple,
 	deepEqual,
-	dependenciesChanged,
 	derivedIndexKeys,
-	emptyVisibleRecord,
 	freezeRecord,
 	indexDependency,
+	indexKeysDependency,
 	indexMetadataWithoutStaleReason,
 	isOrderedSubsequence,
-	isVisibleRecordLive,
 	linkKeys,
 	operationDependencies,
 	parseSnapshot,
@@ -37,23 +41,21 @@ import {
 	validateIndexWrite,
 	validateRecordKey
 } from './helpers.js';
+import { compareCodeUnits } from '../../lib/compare-code-units.js';
 import type {
 	BaseCacheWriter,
 	CacheEngine,
 	CacheEngineOptions,
 	CacheEngineSnapshot,
-	CacheIndex,
+	CacheGraph,
 	CacheListener,
-	CachePresence,
 	CacheReader,
 	CacheSelector,
 	CacheValue,
 	DerivedIndexOperation,
 	DerivedIndexReconciler,
-	EngineBackup,
 	IndexKey,
 	IndexWrite,
-	MaterializedCacheGraph,
 	OptimisticCacheWriter,
 	OptimisticIndexWrite,
 	OptimisticLayer,
@@ -66,39 +68,63 @@ import type {
 	RecordLink,
 	RecordWrite,
 	Revision,
-	SparseRecord,
-	SparseRecordMeta,
+	StoredField,
 	StoredIndex,
 	StoredRecord,
-	VisibleIndex,
+	TransactionUndo,
 	VisibleRecord,
 	WatchOptions,
 	Watcher
 } from './types.js';
+import { TransactionalMap } from './transactional-map.js';
+import { cacheEngineWork } from './work.js';
+
+const byKey = <T>([left]: readonly [string, T], [right]: readonly [string, T]): number =>
+	compareCodeUnits(left, right);
 
 /**
  * Minimum purpose-built implementation selected by the executable spike.
  *
- * It stores authoritative sparse records and exact indexes, then materializes
+ * It stores authoritative sparse records and exact indexes, then replays
  * named optimistic operation layers above them. Confirmation advances a
  * per-dependency causal floor before removing the layer, so an older pending
  * layer cannot become visible again after a newer command confirms.
+ *
+ * Cost model: stored records, indexes and layers are immutable values, and a
+ * write replaces the value under its key. The committed state is a root that
+ * a transaction never writes: its writes go to a delta of the keys it touched
+ * (`TransactionalMap`), and every other key stays shared with the root. A
+ * transaction therefore costs what it writes: rollback drops the delta and
+ * keeps the old root, commit folds the delta in, the optimistic overlay holds
+ * only the keys its operations touch, and a commit re-selects only the
+ * watchers that read a changed key.
  */
 export class PurposeBuiltCacheEngine implements CacheEngine {
-	#records = new Map<RecordKey, StoredRecord>();
-	#indexes = new Map<IndexKey, StoredIndex>();
-	#layers: OptimisticLayer[] = [];
-	#derivedIndexOperations: DerivedIndexOperation[] = [];
+	readonly #records = new TransactionalMap<RecordKey, StoredRecord>();
+	readonly #indexes = new TransactionalMap<IndexKey, StoredIndex>();
+	/** Live base indexes holding each record as a member or as their parent. */
+	readonly #indexReferences = new TransactionalMap<RecordKey, ReadonlySet<IndexKey>>();
+	#layers: readonly OptimisticLayer[] = [];
+	#derivedIndexOperations: readonly DerivedIndexOperation[] = [];
 	#derivedIndexReconciler: DerivedIndexReconciler | undefined;
 	#reconcilingDerivedIndexes = false;
-	#confirmedFloors = new Map<string, number>();
+	#confirmedFloors: ReadonlyMap<string, number> = new Map();
 	#retained = new Map<RecordKey, number>();
 	#nextLayerSequence = 0;
 	#watchers = new Set<Watcher>();
-	#transactionDepth = 0;
+	#watchersByDependency = new Map<string, Set<Watcher>>();
+	#nextWatcherOrder = 0;
+	#undo: TransactionUndo | undefined;
 	#transactionLifecycleIndexes = new Set<IndexKey>();
 	#dirty = false;
 	#changedDependencies = new Set<string>();
+	/** The current overlay, kept until its layers or a key it read change. */
+	#overlay: Overlay | undefined;
+	readonly #base: CacheGraph = {
+		record: (key) => visibleRecord(this.#records.get(key)),
+		index: (key) => this.#indexes.get(key),
+		indexKeys: () => this.#indexes.keys()
+	};
 	readonly #reportWatcherError: (error: AggregateError) => void;
 
 	constructor(options: CacheEngineOptions = {}) {
@@ -107,12 +133,12 @@ export class PurposeBuiltCacheEngine implements CacheEngine {
 
 	read<T>(selector: CacheSelector<T>): T {
 		if (typeof selector !== 'function') throw new TypeError('cache selector must be a function');
-		return selector(this.#reader());
+		return selector(graphReader(this.#view()));
 	}
 
 	readConfirmed<T>(selector: CacheSelector<T>): T {
 		if (typeof selector !== 'function') throw new TypeError('cache selector must be a function');
-		return selector(this.#reader(undefined, false));
+		return selector(graphReader(this.#base));
 	}
 
 	confirmedIndexFences(
@@ -140,25 +166,32 @@ export class PurposeBuiltCacheEngine implements CacheEngine {
 	): () => void {
 		if (typeof listener !== 'function') throw new TypeError('cache listener must be a function');
 		const { value, dependencies } = this.#select(selector);
-		const watcher: Watcher<T> = { selector, listener, value, dependencies };
+		const watcher: Watcher<T> = {
+			selector,
+			listener,
+			order: ++this.#nextWatcherOrder,
+			value,
+			dependencies: new Set()
+		};
 		this.#watchers.add(watcher as Watcher);
+		this.#watchDependencies(watcher as Watcher, dependencies);
 		if (options.immediate) {
 			try {
 				listener(value, undefined);
 			} catch (error) {
-				this.#watchers.delete(watcher as Watcher);
+				this.#removeWatcher(watcher as Watcher);
 				reportSafely(
 					this.#reportWatcherError,
 					new AggregateError([error], 'initial cache watcher delivery failed')
 				);
 			}
 		}
-		return () => this.#watchers.delete(watcher as Watcher);
+		return () => this.#removeWatcher(watcher as Watcher);
 	}
 
 	batch<T>(update: (writer: BaseCacheWriter) => T): T {
 		if (typeof update !== 'function') throw new TypeError('cache update must be a function');
-		if (this.#transactionDepth !== 0) {
+		if (this.#undo !== undefined) {
 			throw new Error('nested cache batches are not supported');
 		}
 		return this.#transaction(() => {
@@ -186,15 +219,18 @@ export class PurposeBuiltCacheEngine implements CacheEngine {
 		const stableContext =
 			context === undefined ? undefined : cloneCacheValue(context);
 		this.#transaction(() => {
-			const before = this.#materialize();
-			this.#layers.push({
-				id,
-				sequence: ++this.#nextLayerSequence,
-				state: 'optimistic',
-				operations,
-				...(stableContext === undefined ? {} : { context: stableContext })
-			});
-			this.#markOverlayChanges(operations, before, this.#materialize());
+			const before = this.#view();
+			this.#layers = [
+				...this.#layers,
+				{
+					id,
+					sequence: ++this.#nextLayerSequence,
+					state: 'optimistic',
+					operations,
+					...(stableContext === undefined ? {} : { context: stableContext })
+				}
+			];
+			this.#markOverlayChanges(operations, before, this.#view());
 			this.#dirty = true;
 			this.#reconcileDerivedIndexes();
 		});
@@ -217,19 +253,18 @@ export class PurposeBuiltCacheEngine implements CacheEngine {
 				throw new OptimisticLayerNotFoundError(id);
 			}
 			const target = this.#layers[targetIndex]!;
-			const before = this.#materialize();
+			const before = this.#view();
 			const prefixLayers = this.#layers.slice(0, targetIndex);
-			const prefixDerivedIndexes =
-				this.#deriveIndexOperations(prefixLayers);
-			const prefix = this.#materialize(
-				true,
+			const prefix = new Overlay(
+				this.#base,
 				prefixLayers,
-				prefixDerivedIndexes
+				this.#deriveIndexOperations(prefixLayers),
+				this.#confirmedFloors
 			);
 			const operations: OverlayOperation[] = [];
 			this.#runOptimisticReplacement(
 				replacement,
-				this.#readerFromGraph(prefix),
+				graphReader(prefix),
 				operations
 			);
 			const stableContext =
@@ -239,18 +274,31 @@ export class PurposeBuiltCacheEngine implements CacheEngine {
 				deepEqual(stableContext, target.context)
 			) return false;
 
-			const previousOperations = target.operations;
-			target.operations = operations;
-			if (stableContext === undefined) delete target.context;
-			else target.context = stableContext;
+			const layers = [...this.#layers];
+			layers[targetIndex] = {
+				id: target.id,
+				sequence: target.sequence,
+				state: target.state,
+				operations,
+				...(stableContext === undefined ? {} : { context: stableContext })
+			};
+			this.#layers = layers;
 			this.#reconcileDerivedIndexes();
-			const after = this.#materialize();
+			const after = this.#view();
 			this.#markOverlayChanges(
-				[...previousOperations, ...operations],
+				[...target.operations, ...operations],
 				before,
 				after
 			);
-			this.#markIndexGraphChanges(before, after);
+			// The base is untouched here, so only overlaid indexes can differ.
+			for (const key of new Set([
+				...overlaidIndexKeys(before),
+				...overlaidIndexKeys(after)
+			])) {
+				if (!sameVisibleIndex(before.index(key), after.index(key))) {
+					this.#indexChanged(key);
+				}
+			}
 			this.#dirty = true;
 			return true;
 		});
@@ -275,10 +323,13 @@ export class PurposeBuiltCacheEngine implements CacheEngine {
 	}
 
 	markOptimisticLayerAccepted(id: string): boolean {
-		const layer = this.#layers.find((candidate) => candidate.id === id);
-		if (!layer) return false;
+		if (!this.#layers.some((candidate) => candidate.id === id)) return false;
 		this.#transaction(() => {
-			layer.state = 'accepted';
+			this.#layers = this.#layers.map((layer) =>
+				layer.id === id && layer.state !== 'accepted'
+					? { ...layer, state: 'accepted' }
+					: layer
+			);
 			this.#reconcileDerivedIndexes();
 		});
 		return true;
@@ -303,7 +354,14 @@ export class PurposeBuiltCacheEngine implements CacheEngine {
 		});
 
 		return this.#transaction(() => {
-			const before = this.#materialize();
+			const operations = layers.flatMap((layer) => layer.operations);
+			// The base update below changes what a later read of these keys sees.
+			const view = this.#view();
+			const before = new Map<RecordKey, VisibleRecord | undefined>();
+			for (const operation of operations) {
+				if (operation.kind !== 'write-record') continue;
+				before.set(operation.write.key, view.record(operation.write.key));
+			}
 			const layerDependencies = new Map<string, number>();
 			for (const layer of layers) {
 				for (const operation of layer.operations) {
@@ -320,16 +378,19 @@ export class PurposeBuiltCacheEngine implements CacheEngine {
 			// optimistic layer are confirmed. Advancing floors for every field in the
 			// server payload would incorrectly erase independent, older overlays.
 			const result = this.#runBaseUpdate(update);
-			for (const [dependency, sequence] of layerDependencies) {
-				const previous = this.#confirmedFloors.get(dependency) ?? 0;
-				if (sequence > previous) this.#confirmedFloors.set(dependency, sequence);
-			}
 			const removed = new Set(layers);
 			this.#layers = this.#layers.filter((candidate) => !removed.has(candidate));
-			for (const layer of layers) {
-				this.#markOverlayChanges(layer.operations, before, this.#materialize());
+			const floors = new Map(this.#confirmedFloors);
+			for (const [dependency, sequence] of layerDependencies) {
+				if (sequence > (floors.get(dependency) ?? 0)) floors.set(dependency, sequence);
 			}
-			if (this.#layers.length === 0) this.#confirmedFloors.clear();
+			this.#confirmedFloors = floors;
+			this.#markOverlayChanges(
+				operations,
+				{ record: (key) => before.get(key) },
+				this.#view()
+			);
+			if (this.#layers.length === 0) this.#confirmedFloors = new Map();
 			this.#dirty = true;
 			this.#reconcileDerivedIndexes();
 			return result;
@@ -340,10 +401,10 @@ export class PurposeBuiltCacheEngine implements CacheEngine {
 		const layer = this.#layers.find((candidate) => candidate.id === id);
 		if (!layer) return false;
 		this.#transaction(() => {
-			const before = this.#materialize();
+			const before = this.#view();
 			this.#layers = this.#layers.filter((candidate) => candidate !== layer);
-			this.#markOverlayChanges(layer.operations, before, this.#materialize());
-			if (this.#layers.length === 0) this.#confirmedFloors.clear();
+			this.#markOverlayChanges(layer.operations, before, this.#view());
+			if (this.#layers.length === 0) this.#confirmedFloors = new Map();
 			this.#dirty = true;
 			this.#reconcileDerivedIndexes();
 		});
@@ -354,63 +415,61 @@ export class PurposeBuiltCacheEngine implements CacheEngine {
 		return this.#layers.find((layer) => layer.id === id)?.state;
 	}
 
+	optimisticLayerProvisional(id: string): boolean {
+		const layer = this.#layers.find((candidate) => candidate.id === id);
+		if (layer === undefined) return false;
+		const view = this.#view();
+		return layer.operations.some(
+			(operation) =>
+				operation.kind === 'write-record' &&
+				view.provisional?.(operation.write.key) === true
+		);
+	}
+
+	get optimisticLayerCount(): number {
+		return this.#layers.length;
+	}
+
 	extract(): CacheEngineSnapshot {
+		cacheEngineWork.extracts += 1;
+		const stored = <T>([name, field]: readonly [string, StoredField<T>]) =>
+			[
+				name,
+				Object.freeze({
+					revision: revisionString(field.revision),
+					value: field.value
+				})
+			] as const;
 		return Object.freeze({
 			version: 1 as const,
 			records: Object.freeze(
-				[...this.#records]
-					.sort(([left], [right]) => left.localeCompare(right))
-					.map(([key, record]) =>
-						Object.freeze({
-							key,
-							revision: revisionString(record.revision),
-							incarnation: revisionString(record.incarnation),
-							...(record.tombstoneRevision === undefined
-								? {}
-								: { tombstoneRevision: revisionString(record.tombstoneRevision) }),
-							fields: freezeRecord(
-								[...record.fields]
-									.sort(([left], [right]) => left.localeCompare(right))
-									.map(([name, field]) => [
-										name,
-										Object.freeze({
-											revision: revisionString(field.revision),
-											value: cloneCacheValue(field.value)
-										})
-									])
-							),
-							links: freezeRecord(
-								[...record.links]
-									.sort(([left], [right]) => left.localeCompare(right))
-									.map(([name, link]) => [
-										name,
-										Object.freeze({
-											revision: revisionString(link.revision),
-											value: cloneLink(link.value)
-										})
-									])
-							)
-						})
-					)
+				[...this.#records].sort(byKey).map(([key, record]) =>
+					Object.freeze({
+						key,
+						revision: revisionString(record.revision),
+						incarnation: revisionString(record.incarnation),
+						...(record.tombstoneRevision === undefined
+							? {}
+							: { tombstoneRevision: revisionString(record.tombstoneRevision) }),
+						fields: freezeRecord([...record.fields].sort(byKey).map(stored)),
+						links: freezeRecord([...record.links].sort(byKey).map(stored))
+					})
+				)
 			),
 			indexes: Object.freeze(
-				[...this.#indexes]
-					.sort(([left], [right]) => left.localeCompare(right))
-					.map(([key, index]) =>
-						Object.freeze({
-							key,
-							revision: revisionString(index.revision),
-							...(index.staleRevision === undefined
-								? {}
-								: { staleRevision: revisionString(index.staleRevision) }),
-							records: Object.freeze([...index.records]),
-							complete: index.complete,
-							deleted: index.deleted,
-							...(index.metadata === undefined
-								? {}
-								: { metadata: cloneIndexMetadata(index.metadata) })
-						})
-					)
+				[...this.#indexes].sort(byKey).map(([key, index]) =>
+					Object.freeze({
+						key,
+						revision: revisionString(index.revision),
+						...(index.staleRevision === undefined
+							? {}
+							: { staleRevision: revisionString(index.staleRevision) }),
+						records: index.records,
+						complete: index.complete,
+						deleted: index.deleted,
+						...(index.metadata === undefined ? {} : { metadata: index.metadata })
+					})
+				)
 			)
 		});
 	}
@@ -418,11 +477,10 @@ export class PurposeBuiltCacheEngine implements CacheEngine {
 	restore(snapshot: CacheEngineSnapshot): void {
 		const restored = parseSnapshot(snapshot);
 		this.#transaction(() => {
-			this.#records = restored.records;
-			this.#indexes = restored.indexes;
+			this.#replaceBase(restored);
 			this.#layers = [];
 			this.#derivedIndexOperations = [];
-			this.#confirmedFloors.clear();
+			this.#confirmedFloors = new Map();
 			this.#nextLayerSequence = 0;
 			this.#changedDependencies.add('*');
 			this.#dirty = true;
@@ -432,8 +490,7 @@ export class PurposeBuiltCacheEngine implements CacheEngine {
 	restoreConfirmed(snapshot: CacheEngineSnapshot): void {
 		const restored = parseSnapshot(snapshot);
 		this.#transaction(() => {
-			this.#records = restored.records;
-			this.#indexes = restored.indexes;
+			this.#replaceBase(restored);
 			this.#derivedIndexOperations = [];
 			this.#changedDependencies.add('*');
 			this.#dirty = true;
@@ -446,13 +503,13 @@ export class PurposeBuiltCacheEngine implements CacheEngine {
 		this.#transaction(() => {
 			// Seed is authoritative for keys it contains; keys it omits stay.
 			for (const [key, record] of restored.records) {
-				this.#records.set(key, record);
+				this.#putRecord(key, record);
 				this.#changedDependencies.add(recordSeenDependency(key));
 				this.#changedDependencies.add(recordWildcardDependency(key));
 			}
 			for (const [key, index] of restored.indexes) {
-				this.#indexes.set(key, index);
-				this.#changedDependencies.add(indexDependency(key));
+				this.#putIndex(key, index);
+				this.#indexChanged(key);
 			}
 			this.#derivedIndexOperations = [];
 			this.#dirty = true;
@@ -470,8 +527,9 @@ export class PurposeBuiltCacheEngine implements CacheEngine {
 		this.#transaction(() => {
 			let changed = false;
 			for (const key of unique) {
-				if (!this.#indexes.delete(key)) continue;
-				this.#changedDependencies.add(indexDependency(key));
+				if (!this.#indexes.has(key)) continue;
+				this.#putIndex(key, undefined);
+				this.#indexChanged(key);
 				changed = true;
 			}
 			if (changed) this.#dirty = true;
@@ -498,134 +556,70 @@ export class PurposeBuiltCacheEngine implements CacheEngine {
 			// graph again. Conversely, an optimistic index/link may be the only
 			// current root for an authoritative record. Preserve the union.
 			const optimisticRoots = this.#optimisticRecordRoots();
-			const baseGraph = this.#materialize(false);
-			const visibleGraph = this.#materialize(true);
+			const visible = this.#view();
 			const reachable = new Set<RecordKey>([
-				...this.#reachableRecords(baseGraph, optimisticRoots),
-				...this.#reachableRecords(visibleGraph, optimisticRoots)
+				...this.#reachableRecords(this.#base, optimisticRoots),
+				...this.#reachableRecords(visible, optimisticRoots)
 			]);
 
+			// Decide everything from the graphs as they are, then remove.
 			const collected: RecordKey[] = [];
 			for (const [key, record] of this.#records) {
 				// Tombstones are revision fences and cannot be collected like data rows.
 				if (record.tombstoneRevision === undefined && !reachable.has(key)) {
-					this.#records.delete(key);
-					this.#changedDependencies.add(recordSeenDependency(key));
-					this.#changedDependencies.add(recordWildcardDependency(key));
 					collected.push(key);
 				}
 			}
-			let indexesCollected = false;
+			const collectedIndexes: IndexKey[] = [];
 			for (const [key, index] of this.#indexes) {
 				const parent = index.metadata?.parent;
 				if (parent === undefined) continue;
 				const parentIsLive =
-					isVisibleRecordLive(baseGraph.records.get(parent)) ||
-					isVisibleRecordLive(visibleGraph.records.get(parent));
+					isVisibleRecordLive(this.#base.record(parent)) ||
+					isVisibleRecordLive(visible.record(parent));
 				if (reachable.has(parent) && parentIsLive) continue;
-				this.#indexes.delete(key);
-				this.#changedDependencies.add(indexDependency(key));
-				indexesCollected = true;
+				collectedIndexes.push(key);
 			}
-			if (collected.length > 0 || indexesCollected) this.#dirty = true;
+			for (const key of collected) {
+				this.#putRecord(key, undefined);
+				this.#changedDependencies.add(recordSeenDependency(key));
+				this.#changedDependencies.add(recordWildcardDependency(key));
+			}
+			for (const key of collectedIndexes) {
+				this.#putIndex(key, undefined);
+				this.#indexChanged(key);
+			}
+			if (collected.length > 0 || collectedIndexes.length > 0) this.#dirty = true;
 			this.#reconcileDerivedIndexes();
 			return Object.freeze(collected.sort());
 		});
 	}
 
-	#reader(
-		dependencies?: Set<string>,
-		includeOptimistic = true
-	): CacheReader {
-		// V1 executable-spike tradeoff: materializing the visible graph is
-		// O(records + indexes + overlay operations) per selector. The private seam
-		// keeps this replaceable with an incrementally indexed graph without
-		// changing generated artifacts or the public replica API.
-		return this.#readerFromGraph(
-			this.#materialize(includeOptimistic),
-			dependencies
-		);
-	}
-
-	#readerFromGraph(
-		{ records, indexes }: MaterializedCacheGraph,
-		dependencies?: Set<string>
-	): CacheReader {
-		return Object.freeze({
-			recordMeta(key: RecordKey): SparseRecordMeta | undefined {
-				dependencies?.add(recordSeenDependency(key));
-				const record = records.get(key);
-				if (!record || record.tombstoned) return undefined;
-				return Object.freeze({
-					key,
-					incarnation: revisionString(record.incarnation)
-				});
-			},
-			field(key: RecordKey, name: string): CachePresence<CacheValue> {
-				assertName(name, 'record field');
-				dependencies?.add(recordSeenDependency(key));
-				dependencies?.add(recordFieldDependency(key, `field:${name}`));
-				const record = records.get(key);
-				if (!record || record.tombstoned || !record.fields.has(name)) {
-					return Object.freeze({ present: false });
-				}
-				return Object.freeze({
-					present: true,
-					value: cloneCacheValue(record.fields.get(name)!)
-				});
-			},
-			link(key: RecordKey, name: string): CachePresence<RecordLink> {
-				assertName(name, 'record link');
-				dependencies?.add(recordSeenDependency(key));
-				dependencies?.add(recordFieldDependency(key, `link:${name}`));
-				const record = records.get(key);
-				if (!record || record.tombstoned || !record.links.has(name)) {
-					return Object.freeze({ present: false });
-				}
-				return Object.freeze({
-					present: true,
-					value: cloneLink(record.links.get(name)!)
-				});
-			},
-			record(key: RecordKey): SparseRecord | undefined {
-				dependencies?.add(recordWildcardDependency(key));
-				const record = records.get(key);
-				if (!record || record.tombstoned) return undefined;
-				return Object.freeze({
-					key,
-					revision: revisionString(record.revision),
-					incarnation: revisionString(record.incarnation),
-					fields: freezeRecord(
-						[...record.fields].map(([name, value]) => [name, cloneCacheValue(value)])
-					),
-					links: freezeRecord(
-						[...record.links].map(([name, value]) => [name, cloneLink(value)])
-					)
-				});
-			},
-			index(key: IndexKey): CacheIndex | undefined {
-				dependencies?.add(indexDependency(key));
-				const index = indexes.get(key);
-				if (!index || index.deleted) return undefined;
-				return Object.freeze({
-					key,
-					revision: revisionString(index.revision),
-					...(index.staleRevision === undefined
-						? {}
-						: { staleRevision: revisionString(index.staleRevision) }),
-					records: Object.freeze([...index.records]),
-					complete: index.complete,
-					...(index.metadata === undefined
-						? {}
-						: { metadata: cloneIndexMetadata(index.metadata) })
-				});
-			}
-		});
+	/** The graph selectors see: the base, under the overlay when there is one. */
+	#view(): CacheGraph {
+		if (this.#layers.length === 0 && this.#derivedIndexOperations.length === 0) {
+			return this.#base;
+		}
+		const overlay = this.#overlay;
+		if (
+			overlay !== undefined &&
+			overlay.layers === this.#layers &&
+			overlay.derivedIndexOperations === this.#derivedIndexOperations &&
+			overlay.floors === this.#confirmedFloors
+		) {
+			return overlay;
+		}
+		return (this.#overlay = new Overlay(
+			this.#base,
+			this.#layers,
+			this.#derivedIndexOperations,
+			this.#confirmedFloors
+		));
 	}
 
 	#select<T>(selector: CacheSelector<T>): { value: T; dependencies: Set<string> } {
 		const dependencies = new Set<string>();
-		return { value: selector(this.#reader(dependencies)), dependencies };
+		return { value: selector(graphReader(this.#view(), dependencies)), dependencies };
 	}
 
 	#optimisticRecordRoots(): Set<RecordKey> {
@@ -652,17 +646,15 @@ export class PurposeBuiltCacheEngine implements CacheEngine {
 	}
 
 	#reachableRecords(
-		graph: {
-			records: Map<RecordKey, VisibleRecord>;
-			indexes: Map<IndexKey, VisibleIndex>;
-		},
+		graph: CacheGraph,
 		extraRoots: ReadonlySet<RecordKey>
 	): Set<RecordKey> {
 		const reachable = new Set<RecordKey>([...this.#retained.keys(), ...extraRoots]);
 		const pending = [...reachable];
-		const relationshipIndexes = new Map<RecordKey, VisibleIndex[]>();
-		for (const index of graph.indexes.values()) {
-			if (index.deleted) continue;
+		const relationshipIndexes = new Map<RecordKey, StoredIndex[]>();
+		for (const indexKey of graph.indexKeys()) {
+			const index = graph.index(indexKey);
+			if (index === undefined || index.deleted) continue;
 			const parent = index.metadata?.parent;
 			if (parent !== undefined) {
 				const indexes = relationshipIndexes.get(parent) ?? [];
@@ -678,13 +670,13 @@ export class PurposeBuiltCacheEngine implements CacheEngine {
 		}
 		while (pending.length > 0) {
 			const key = pending.pop()!;
-			const record = graph.records.get(key);
+			const record = graph.record(key);
 			if (!record || record.tombstoned) continue;
 			for (const link of record.links.values()) {
 				for (const key of linkKeys(link)) {
 					if (reachable.has(key)) continue;
 					reachable.add(key);
-				pending.push(key);
+					pending.push(key);
 				}
 			}
 			for (const index of relationshipIndexes.get(key) ?? []) {
@@ -698,53 +690,15 @@ export class PurposeBuiltCacheEngine implements CacheEngine {
 		return reachable;
 	}
 
-	#materialize(
-		includeOptimistic = true,
-		layers: readonly OptimisticLayer[] = this.#layers,
-		derivedIndexOperations: readonly DerivedIndexOperation[] =
-			this.#derivedIndexOperations
-	): MaterializedCacheGraph {
-		const records = new Map<RecordKey, VisibleRecord>();
-		const indexes = new Map<IndexKey, VisibleIndex>();
-
-		for (const [key, record] of this.#records) {
-			records.set(key, {
-				revision: record.revision,
-				incarnation: record.incarnation,
-				tombstoned: record.tombstoneRevision !== undefined,
-				fields: new Map([...record.fields].map(([name, field]) => [name, field.value])),
-				links: new Map([...record.links].map(([name, link]) => [name, link.value]))
-			});
-		}
-		for (const [key, index] of this.#indexes) {
-			indexes.set(key, {
-				revision: index.revision,
-				staleRevision: index.staleRevision,
-				records: [...index.records],
-				complete: index.complete,
-				deleted: index.deleted,
-				metadata: index.metadata
-			});
-		}
-
-		if (includeOptimistic) {
-			for (const layer of layers) {
-				for (const operation of layer.operations) {
-					this.#applyOverlay(records, indexes, layer.sequence, operation);
-				}
-			}
-			for (const operation of derivedIndexOperations) {
-				this.#applyDerivedIndexOperation(records, indexes, operation);
-			}
-		}
-
-		return { records, indexes };
+	#indexChanged(key: IndexKey): void {
+		this.#changedDependencies.add(indexDependency(key));
+		this.#changedDependencies.add(indexKeysDependency);
 	}
 
 	#markOverlayChanges(
 		operations: readonly OverlayOperation[],
-		before: MaterializedCacheGraph,
-		after: MaterializedCacheGraph
+		before: Pick<CacheGraph, 'record'>,
+		after: Pick<CacheGraph, 'record'>
 	): void {
 		for (const operation of operations) {
 			if (operation.kind === 'write-record') {
@@ -759,11 +713,10 @@ export class PurposeBuiltCacheEngine implements CacheEngine {
 				for (const name of Object.keys(operation.write.links ?? {})) {
 					this.#changedDependencies.add(recordFieldDependency(key, `link:${name}`));
 				}
-				const previous = before.records.get(key);
-				const next = after.records.get(key);
+				const previous = before.record(key);
+				const next = after.record(key);
 				if (
-					(previous !== undefined && !previous.tombstoned) !==
-						(next !== undefined && !next.tombstoned) ||
+					isVisibleRecordLive(previous) !== isVisibleRecordLive(next) ||
 					previous?.incarnation !== next?.incarnation
 				) {
 					this.#changedDependencies.add(recordSeenDependency(key));
@@ -775,211 +728,24 @@ export class PurposeBuiltCacheEngine implements CacheEngine {
 				this.#changedDependencies.add(recordWildcardDependency(operation.key));
 				continue;
 			}
-			this.#changedDependencies.add(
-				indexDependency(operation.kind === 'write-index' ? operation.write.key : operation.key)
+			this.#indexChanged(
+				operation.kind === 'write-index' ? operation.write.key : operation.key
 			);
 		}
 	}
 
-	#markIndexGraphChanges(
-		before: MaterializedCacheGraph,
-		after: MaterializedCacheGraph
-	): void {
-		for (const key of new Set([
-			...before.indexes.keys(),
-			...after.indexes.keys()
-		])) {
-			if (deepEqual(before.indexes.get(key), after.indexes.get(key))) {
-				continue;
-			}
-			this.#changedDependencies.add(indexDependency(key));
-		}
-	}
-
-	#applyOverlay(
-		records: Map<RecordKey, VisibleRecord>,
-		indexes: Map<IndexKey, VisibleIndex>,
-		sequence: number,
-		operation: OverlayOperation
-	): void {
-		if (operation.kind === 'write-record') {
-			const { key, fields = {}, links = {}, unset = [] } = operation.write;
-			let record = records.get(key);
-			if (operation.write.ifPresent === true && (!record || record.tombstoned)) {
-				return;
-			}
-			let wrote = false;
-			for (const [name, value] of Object.entries(fields)) {
-				if (sequence <= this.#recordFieldFloor(key, `field:${name}`)) continue;
-				if (!record) record = emptyVisibleRecord();
-				record.fields.set(name, value);
-				wrote = true;
-			}
-			for (const [name, value] of Object.entries(links)) {
-				if (sequence <= this.#recordFieldFloor(key, `link:${name}`)) continue;
-				if (!record) record = emptyVisibleRecord();
-				record.links.set(name, value);
-				wrote = true;
-			}
-			for (const name of unset) {
-				if (sequence <= this.#recordFieldFloor(key, `field:${name}`)) continue;
-				if (!record || !record.fields.has(name)) continue;
-				record.fields.delete(name);
-				wrote = true;
-			}
-			if (wrote && record) {
-				record.tombstoned = false;
-				records.set(key, record);
-			}
-			return;
-		}
-
-		if (operation.kind === 'tombstone-record') {
-			if (sequence <= (this.#confirmedFloors.get(recordSeenDependency(operation.key)) ?? 0)) {
-				return;
-			}
-			const record = records.get(operation.key) ?? emptyVisibleRecord();
-			record.tombstoned = true;
-			record.fields.clear();
-			record.links.clear();
-			records.set(operation.key, record);
-			return;
-		}
-
-		const key = operation.kind === 'write-index' ? operation.write.key : operation.key;
-		if (sequence <= (this.#confirmedFloors.get(indexDependency(key)) ?? 0)) return;
-		if (operation.kind === 'write-index') {
-			let metadata = operation.write.metadata;
-			if (metadata?.parent !== undefined) {
-				const parent = records.get(metadata.parent);
-				if (!parent || parent.tombstoned) return;
-				if (
-					metadata.parentRevision !== undefined &&
-					revisionToken(metadata.parentRevision) !== parent.revision
-				) {
-					return;
-				}
-				if (
-					metadata.parentIncarnation !== undefined &&
-					revisionToken(metadata.parentIncarnation) !== parent.incarnation
-				) {
-					return;
-				}
-				metadata = cloneIndexMetadata({
-					...metadata,
-					parentIncarnation: revisionString(parent.incarnation)
-				});
-			}
-			indexes.set(key, {
-				revision: indexes.get(key)?.revision ?? 0n,
-				staleRevision: indexes.get(key)?.staleRevision,
-				records: [...operation.write.records],
-				complete: operation.write.complete ?? false,
-				deleted: false,
-				metadata
-			});
-		} else {
-			const index = indexes.get(key) ?? {
-				revision: 0n,
-				staleRevision: undefined,
-				records: [],
-				complete: false,
-				deleted: true,
-				metadata: undefined
-			};
-			index.deleted = true;
-			index.records = [];
-			indexes.set(key, index);
-		}
-	}
-
-	#applyDerivedIndexOperation(
-		records: Map<RecordKey, VisibleRecord>,
-		indexes: Map<IndexKey, VisibleIndex>,
-		operation: DerivedIndexOperation
-	): void {
-		if (operation.kind === 'mark-index-stale') {
-			const index = indexes.get(operation.key);
-			if (!index || index.deleted) return;
-			/*
-			 * Staleness is a freshness claim, not structural data loss. Keep a
-			 * previously complete visible index renderable while the owner
-			 * revalidates it. Operations that actually remove membership or
-			 * records explicitly clear `complete` in their own lifecycle path.
-			 */
-			if (
-				index.staleRevision === undefined ||
-				index.staleRevision < index.revision
-			) {
-				index.staleRevision = index.revision;
-			}
-			if (index.metadata !== undefined) {
-				index.metadata = cloneIndexMetadata({
-					...index.metadata,
-					staleReason: operation.reason
-				});
-			}
-			return;
-		}
-
-		const key =
-			operation.kind === 'write-index' ? operation.write.key : operation.key;
-		if (operation.kind === 'delete-index') {
-			const index = indexes.get(key) ?? {
-				revision: 0n,
-				staleRevision: undefined,
-				records: [],
-				complete: false,
-				deleted: true,
-				metadata: undefined
-			};
-			index.deleted = true;
-			index.records = [];
-			indexes.set(key, index);
-			return;
-		}
-
-		let metadata = operation.write.metadata;
-		if (metadata?.parent !== undefined) {
-			const parent = records.get(metadata.parent);
-			if (!parent || parent.tombstoned) return;
-			if (
-				metadata.parentRevision !== undefined &&
-				revisionToken(metadata.parentRevision) !== parent.revision
-			) {
-				return;
-			}
-			if (
-				metadata.parentIncarnation !== undefined &&
-				revisionToken(metadata.parentIncarnation) !== parent.incarnation
-			) {
-				return;
-			}
-			metadata = cloneIndexMetadata({
-				...metadata,
-				parentIncarnation: revisionString(parent.incarnation)
-			});
-		}
-		indexes.set(key, {
-			revision: indexes.get(key)?.revision ?? 0n,
-			staleRevision: indexes.get(key)?.staleRevision,
-			records: [...operation.write.records],
-			complete: operation.write.complete ?? false,
-			deleted: false,
-			metadata
-		});
-	}
-
 	#reconcileDerivedIndexes(): void {
 		const next = this.#deriveIndexOperations(this.#layers);
-		const before = this.#materialize();
 		const previous = this.#derivedIndexOperations;
-		this.#derivedIndexOperations = [...next];
-		const after = this.#materialize();
+		// The same operations over the same base show the same indexes.
+		if (deepEqual(previous, next)) return;
+		const before = this.#view();
+		this.#derivedIndexOperations = next;
+		const after = this.#view();
 		let changed = false;
 		for (const key of derivedIndexKeys([...previous, ...next])) {
-			if (deepEqual(before.indexes.get(key), after.indexes.get(key))) continue;
-			this.#changedDependencies.add(indexDependency(key));
+			if (sameVisibleIndex(before.index(key), after.index(key))) continue;
+			this.#indexChanged(key);
 			changed = true;
 		}
 		if (changed) this.#dirty = true;
@@ -992,39 +758,28 @@ export class PurposeBuiltCacheEngine implements CacheEngine {
 			throw new Error('derived index reconciliation cannot be re-entered');
 		}
 		const reconciler = this.#derivedIndexReconciler;
-		let next: readonly DerivedIndexOperation[];
+		if (reconciler === undefined) return [];
 		this.#reconcilingDerivedIndexes = true;
 		try {
-			next =
-				reconciler === undefined
-					? []
-					: cloneDerivedIndexOperations(
-							runDerivedIndexReconciler(
-								reconciler,
-								this.extract(),
-								layers.map((layer) =>
-									Object.freeze({
-										id: layer.id,
-										sequence: layer.sequence,
-										state: layer.state,
-										...(layer.context === undefined
-											? {}
-											: { context: layer.context })
-									})
-								)
-							)
-						);
+			return cloneDerivedIndexOperations(
+				runDerivedIndexReconciler(
+					reconciler,
+					graphReader(this.#base),
+					layers.map((layer) =>
+						Object.freeze({
+							id: layer.id,
+							sequence: layer.sequence,
+							state: layer.state,
+							...(layer.context === undefined
+								? {}
+								: { context: layer.context })
+						})
+					)
+				)
+			);
 		} finally {
 			this.#reconcilingDerivedIndexes = false;
 		}
-		return next;
-	}
-
-	#recordFieldFloor(key: RecordKey, field: string): number {
-		return Math.max(
-			this.#confirmedFloors.get(recordWildcardDependency(key)) ?? 0,
-			this.#confirmedFloors.get(recordFieldDependency(key, field)) ?? 0
-		);
 	}
 
 	#baseWriter(touched?: Set<string>, isActive: () => boolean = () => true): BaseCacheWriter {
@@ -1177,6 +932,79 @@ export class PurposeBuiltCacheEngine implements CacheEngine {
 		}
 	}
 
+	#putRecord(key: RecordKey, record: StoredRecord | undefined): void {
+		if (record === undefined) this.#records.delete(key);
+		else this.#records.set(key, record);
+		if (this.#overlay?.records.has(key)) this.#overlay = undefined;
+		cacheEngineWork.recordsWritten += 1;
+	}
+
+	#putIndex(key: IndexKey, index: StoredIndex | undefined): void {
+		this.#moveIndexReferences(key, this.#indexes.get(key), index);
+		if (index === undefined) this.#indexes.delete(key);
+		else this.#indexes.set(key, index);
+		if (this.#overlay?.indexes.has(key)) this.#overlay = undefined;
+		cacheEngineWork.indexesWritten += 1;
+	}
+
+	#replaceBase(base: {
+		records: Map<RecordKey, StoredRecord>;
+		indexes: Map<IndexKey, StoredIndex>;
+	}): void {
+		this.#records.replace(base.records);
+		this.#indexes.replace(base.indexes);
+		this.#overlay = undefined;
+		const references = new Map<RecordKey, Set<IndexKey>>();
+		for (const [key, index] of base.indexes) {
+			if (index.deleted) continue;
+			for (const record of indexReferences(index)) {
+				let keys = references.get(record);
+				if (keys === undefined) references.set(record, (keys = new Set()));
+				keys.add(key);
+			}
+		}
+		this.#indexReferences.replace(references);
+	}
+
+	#moveIndexReferences(
+		key: IndexKey,
+		previous: StoredIndex | undefined,
+		next: StoredIndex | undefined
+	): void {
+		const before = previous?.deleted === false ? previous : undefined;
+		const after = next?.deleted === false ? next : undefined;
+		if (
+			before !== undefined &&
+			after !== undefined &&
+			before.records === after.records &&
+			before.metadata?.parent === after.metadata?.parent
+		) {
+			return;
+		}
+		const references = this.#indexReferences;
+		// A set this transaction already wrote is its own; any other is shared
+		// with the committed root and is copied before it changes.
+		const own = (record: RecordKey): Set<IndexKey> => {
+			const keys = references.get(record);
+			if (keys !== undefined && references.written(record)) {
+				return keys as Set<IndexKey>;
+			}
+			const copy = new Set(keys);
+			references.set(record, copy);
+			return copy;
+		};
+		for (const record of indexReferences(before)) {
+			if (!references.get(record)?.has(key)) continue;
+			const keys = own(record);
+			keys.delete(key);
+			if (keys.size === 0) references.delete(record);
+		}
+		for (const record of indexReferences(after)) {
+			if (references.get(record)?.has(key)) continue;
+			own(record).add(key);
+		}
+	}
+
 	#writeBaseRecord(write: RecordWrite, touched?: Set<string>): boolean {
 		validateRecordKey(write.key);
 		const revision = revisionToken(write.revision);
@@ -1194,7 +1022,7 @@ export class PurposeBuiltCacheEngine implements CacheEngine {
 			touched?.add(recordSeenDependency(write.key));
 		}
 
-		let record = this.#records.get(write.key);
+		const record = this.#records.get(write.key);
 		if (
 			requestedIncarnation === undefined &&
 			record?.tombstoneRevision !== undefined
@@ -1240,32 +1068,19 @@ export class PurposeBuiltCacheEngine implements CacheEngine {
 			}
 		}
 
-		let changed = false;
-		let presenceChanged = false;
-		if (!record) {
-			this.#invalidateIndexesForRecordLifecycle(write.key, touched);
-			record = {
-				revision,
-				incarnation,
-				fields: new Map(),
-				links: new Map()
-			};
-			this.#records.set(write.key, record);
-			changed = true;
-			presenceChanged = true;
-		} else if (incarnation > record.incarnation) {
-			this.#invalidateIndexesForRecordLifecycle(write.key, touched);
-			record.fields.clear();
-			record.links.clear();
-			record.tombstoneRevision = undefined;
-			record.incarnation = incarnation;
-			record.revision = revision;
-			changed = true;
-			presenceChanged = true;
-		}
-
+		// A new record or a new incarnation starts empty; otherwise the write
+		// lands on a copy, taken only once a field or link actually changes.
+		const fresh = record === undefined || incarnation > record.incarnation;
+		let changed = fresh;
+		let nextRevision = fresh ? revision : record.revision;
+		let nextFields: Map<string, StoredField<CacheValue>> | undefined = fresh
+			? new Map()
+			: undefined;
+		let nextLinks: Map<string, StoredField<RecordLink>> | undefined = fresh
+			? new Map()
+			: undefined;
 		for (const [name, value] of Object.entries(fields)) {
-			const current = record.fields.get(name);
+			const current = (nextFields ?? record!.fields).get(name);
 			if (current && revision < current.revision) continue;
 			if (current && revision === current.revision) {
 				if (deepEqual(current.value, value)) continue;
@@ -1274,11 +1089,11 @@ export class PurposeBuiltCacheEngine implements CacheEngine {
 					revision
 				);
 			}
-			record.fields.set(name, { revision, value });
+			(nextFields ??= new Map(record!.fields)).set(name, { revision, value });
 			changed = true;
 		}
 		for (const [name, value] of Object.entries(links)) {
-			const current = record.links.get(name);
+			const current = (nextLinks ?? record!.links).get(name);
 			if (current && revision < current.revision) continue;
 			if (current && revision === current.revision) {
 				if (deepEqual(current.value, value)) continue;
@@ -1287,29 +1102,37 @@ export class PurposeBuiltCacheEngine implements CacheEngine {
 					revision
 				);
 			}
-			record.links.set(name, { revision, value });
+			(nextLinks ??= new Map(record!.links)).set(name, { revision, value });
 			changed = true;
 		}
-		if (incarnation === record.incarnation && revision > record.revision) {
-			record.revision = revision;
+		if (!fresh && revision > record.revision) {
+			nextRevision = revision;
 			changed = true;
 		}
-		if (changed) {
-			this.#changedDependencies.add(recordWildcardDependency(write.key));
-			if (presenceChanged) this.#changedDependencies.add(recordSeenDependency(write.key));
-			for (const name of Object.keys(fields)) {
-				this.#changedDependencies.add(
-					recordFieldDependency(write.key, `field:${name}`)
-				);
-			}
-			for (const name of Object.keys(links)) {
-				this.#changedDependencies.add(
-					recordFieldDependency(write.key, `link:${name}`)
-				);
-			}
-			this.#dirty = true;
+		if (!changed) return false;
+
+		if (fresh) this.#invalidateIndexesForRecordLifecycle(write.key, touched);
+		this.#putRecord(write.key, {
+			revision: nextRevision,
+			incarnation,
+			tombstoneRevision: fresh ? undefined : record.tombstoneRevision,
+			fields: nextFields ?? record!.fields,
+			links: nextLinks ?? record!.links
+		});
+		this.#changedDependencies.add(recordWildcardDependency(write.key));
+		if (fresh) this.#changedDependencies.add(recordSeenDependency(write.key));
+		for (const name of Object.keys(fields)) {
+			this.#changedDependencies.add(
+				recordFieldDependency(write.key, `field:${name}`)
+			);
 		}
-		return changed;
+		for (const name of Object.keys(links)) {
+			this.#changedDependencies.add(
+				recordFieldDependency(write.key, `link:${name}`)
+			);
+		}
+		this.#dirty = true;
+		return true;
 	}
 
 	#tombstoneBaseRecord(
@@ -1339,20 +1162,14 @@ export class PurposeBuiltCacheEngine implements CacheEngine {
 				if (record.tombstoneRevision !== undefined) return false;
 				throw new CacheRevisionConflictError(recordSeenDependency(key), revision);
 			}
-			record.incarnation = incarnation;
-			record.revision = revision;
-			record.tombstoneRevision = revision;
-			record.fields.clear();
-			record.links.clear();
-		} else {
-			this.#records.set(key, {
-				revision,
-				incarnation,
-				tombstoneRevision: revision,
-				fields: new Map(),
-				links: new Map()
-			});
 		}
+		this.#putRecord(key, {
+			revision,
+			incarnation,
+			tombstoneRevision: revision,
+			fields: new Map(),
+			links: new Map()
+		});
 		this.#invalidateIndexesForRecordLifecycle(key, touched);
 		this.#changedDependencies.add(recordSeenDependency(key));
 		this.#changedDependencies.add(recordWildcardDependency(key));
@@ -1363,13 +1180,8 @@ export class PurposeBuiltCacheEngine implements CacheEngine {
 	#discardBaseRecord(key: RecordKey, touched?: Set<string>): boolean {
 		validateRecordKey(key);
 		const hadRecord = this.#records.has(key);
-		const hasIndexReference = [...this.#indexes.values()].some(
-			(index) =>
-				!index.deleted &&
-				(index.metadata?.parent === key || index.records.includes(key))
-		);
-		if (!hadRecord && !hasIndexReference) return false;
-		this.#records.delete(key);
+		if (!hadRecord && !this.#indexReferences.has(key)) return false;
+		if (hadRecord) this.#putRecord(key, undefined);
 		touched?.add(recordSeenDependency(key));
 		touched?.add(recordWildcardDependency(key));
 		this.#invalidateIndexesForRecordLifecycle(key, touched);
@@ -1383,28 +1195,33 @@ export class PurposeBuiltCacheEngine implements CacheEngine {
 		recordKey: RecordKey,
 		touched?: Set<string>
 	): void {
-		for (const [key, index] of this.#indexes) {
-			if (index.deleted) continue;
+		for (const key of [...(this.#indexReferences.get(recordKey) ?? [])]) {
+			const index = this.#indexes.get(key)!;
 			const ownedByRecord = index.metadata?.parent === recordKey;
-			const referencesRecord = index.records.includes(recordKey);
-			if (!ownedByRecord && !referencesRecord) continue;
 			this.#transactionLifecycleIndexes.add(key);
-			index.deleted = ownedByRecord;
-			index.records = ownedByRecord
-				? []
-				: index.records.filter((candidate) => candidate !== recordKey);
-			index.complete = false;
-			if (index.metadata !== undefined) {
-				index.metadata = cloneIndexMetadata({
-					...index.metadata,
-					staleReason: 'record-lifecycle-changed'
-				});
-			}
-			if (index.staleRevision === undefined || index.staleRevision < index.revision) {
-				index.staleRevision = index.revision;
-			}
+			this.#putIndex(key, {
+				revision: index.revision,
+				staleRevision:
+					index.staleRevision === undefined || index.staleRevision < index.revision
+						? index.revision
+						: index.staleRevision,
+				records: ownedByRecord
+					? EMPTY_KEYS
+					: Object.freeze(
+							index.records.filter((candidate) => candidate !== recordKey)
+						),
+				complete: false,
+				deleted: ownedByRecord,
+				metadata:
+					index.metadata === undefined
+						? undefined
+						: cloneIndexMetadata({
+								...index.metadata,
+								staleReason: 'record-lifecycle-changed'
+							})
+			});
 			touched?.add(indexDependency(key));
-			this.#changedDependencies.add(indexDependency(key));
+			this.#indexChanged(key);
 			this.#dirty = true;
 		}
 	}
@@ -1418,7 +1235,7 @@ export class PurposeBuiltCacheEngine implements CacheEngine {
 			return false;
 		}
 		if (current && revision < current.revision) return false;
-		const records = [...write.records];
+		const records = Object.freeze([...write.records]);
 		const complete = write.complete ?? false;
 		let metadata =
 			write.metadata === undefined ? undefined : cloneIndexMetadata(write.metadata);
@@ -1449,6 +1266,12 @@ export class PurposeBuiltCacheEngine implements CacheEngine {
 			});
 		}
 		const staleRevision = metadata?.staleReason === undefined ? undefined : revision;
+		const put = (index: StoredIndex): true => {
+			this.#putIndex(write.key, index);
+			this.#indexChanged(write.key);
+			this.#dirty = true;
+			return true;
+		};
 		if (current && revision === current.revision) {
 			if (
 				current.deleted &&
@@ -1459,14 +1282,14 @@ export class PurposeBuiltCacheEngine implements CacheEngine {
 				// A hidden fence uses an empty deleted index so it materializes no
 				// membership. Revision zero is valid, so an equal-checkpoint success
 				// must be able to replace that sentinel state.
-				current.records = records;
-				current.complete = complete;
-				current.deleted = false;
-				current.metadata = metadata;
-				current.staleRevision = staleRevision;
-				this.#changedDependencies.add(indexDependency(write.key));
-				this.#dirty = true;
-				return true;
+				return put({
+					revision,
+					staleRevision,
+					records,
+					complete,
+					deleted: false,
+					metadata
+				});
 			}
 			if (
 				complete &&
@@ -1482,14 +1305,14 @@ export class PurposeBuiltCacheEngine implements CacheEngine {
 				// model advancing. Permit only the monotonic incomplete -> complete
 				// refinement; an already-authoritative membership still conflicts on
 				// any same-revision disagreement.
-				current.records = records;
-				current.complete = true;
-				current.deleted = false;
-				current.metadata = metadata;
-				current.staleRevision = undefined;
-				this.#changedDependencies.add(indexDependency(write.key));
-				this.#dirty = true;
-				return true;
+				return put({
+					revision,
+					staleRevision: undefined,
+					records,
+					complete: true,
+					deleted: false,
+					metadata
+				});
 			}
 			const currentComparable = indexMetadataWithoutStaleReason(current.metadata);
 			const nextComparable = indexMetadataWithoutStaleReason(metadata);
@@ -1505,25 +1328,18 @@ export class PurposeBuiltCacheEngine implements CacheEngine {
 				) {
 					return false;
 				}
-				current.metadata = metadata;
-				current.staleRevision = staleRevision;
-				this.#changedDependencies.add(indexDependency(write.key));
-				this.#dirty = true;
-				return true;
+				return put({ ...current, staleRevision, metadata });
 			}
 			throw new CacheRevisionConflictError(indexDependency(write.key), revision);
 		}
-		this.#indexes.set(write.key, {
+		return put({
 			revision,
+			staleRevision,
 			records,
 			complete,
 			deleted: false,
-			metadata,
-			staleRevision
+			metadata
 		});
-		this.#changedDependencies.add(indexDependency(write.key));
-		this.#dirty = true;
-		return true;
 	}
 
 	#markBaseIndexStale(
@@ -1534,20 +1350,19 @@ export class PurposeBuiltCacheEngine implements CacheEngine {
 	): boolean {
 		assertName(key, 'index key');
 		assertName(reason, 'index stale reason');
-		let current = this.#indexes.get(key);
+		const current = this.#indexes.get(key);
 		if (!current) {
 			if (revisionValue === undefined) return false;
-			const revision = revisionToken(revisionValue);
-			this.#indexes.set(key, {
+			this.#putIndex(key, {
 				revision: 0n,
-				staleRevision: revision,
-				records: [],
+				staleRevision: revisionToken(revisionValue),
+				records: EMPTY_KEYS,
 				complete: false,
 				deleted: true,
 				metadata: undefined
 			});
 			touched?.add(indexDependency(key));
-			this.#changedDependencies.add(indexDependency(key));
+			this.#indexChanged(key);
 			this.#dirty = true;
 			return true;
 		}
@@ -1566,11 +1381,15 @@ export class PurposeBuiltCacheEngine implements CacheEngine {
 			return false;
 		}
 		touched?.add(indexDependency(key));
-		if (current.metadata !== undefined) {
-			current.metadata = cloneIndexMetadata({ ...current.metadata, staleReason: reason });
-		}
-		current.staleRevision = revision;
-		this.#changedDependencies.add(indexDependency(key));
+		this.#putIndex(key, {
+			...current,
+			staleRevision: revision,
+			metadata:
+				current.metadata === undefined
+					? undefined
+					: cloneIndexMetadata({ ...current.metadata, staleReason: reason })
+		});
+		this.#indexChanged(key);
 		this.#dirty = true;
 		return true;
 	}
@@ -1588,55 +1407,118 @@ export class PurposeBuiltCacheEngine implements CacheEngine {
 			if (current.deleted) return false;
 			throw new CacheRevisionConflictError(indexDependency(key), revision);
 		}
-		this.#indexes.set(key, {
+		this.#putIndex(key, {
 			revision,
-			records: [],
+			staleRevision: undefined,
+			records: EMPTY_KEYS,
 			complete: false,
 			deleted: true,
-			metadata: current?.metadata,
-			staleRevision: undefined
+			metadata: current?.metadata
 		});
-		this.#changedDependencies.add(indexDependency(key));
+		this.#indexChanged(key);
 		this.#dirty = true;
 		return true;
 	}
 
+	/**
+	 * Run one all-or-nothing update. The outermost call opens the stored maps'
+	 * transaction and keeps the previous layer state; a failure drops every
+	 * write and restores that state before it propagates, and success commits.
+	 */
 	#transaction<T>(update: () => T): T {
-		const outermost = this.#transactionDepth === 0;
-		const backup = outermost ? this.#backup() : undefined;
-		if (outermost) this.#transactionLifecycleIndexes = new Set();
-		this.#transactionDepth += 1;
+		if (this.#undo !== undefined) return update();
+		const undo: TransactionUndo = (this.#undo = {
+			layers: this.#layers,
+			derivedIndexOperations: this.#derivedIndexOperations,
+			confirmedFloors: this.#confirmedFloors,
+			nextLayerSequence: this.#nextLayerSequence
+		});
+		this.#transactionLifecycleIndexes = new Set();
+		this.#records.begin();
+		this.#indexes.begin();
+		this.#indexReferences.begin();
 		let result: T;
 		try {
 			result = update();
 		} catch (error) {
-			this.#transactionDepth -= 1;
-			if (outermost && backup) {
-				this.#restoreBackup(backup);
-				this.#dirty = false;
-				this.#transactionLifecycleIndexes = new Set();
-			}
+			this.#rollback(undo);
 			throw error;
+		} finally {
+			this.#undo = undefined;
 		}
-		this.#transactionDepth -= 1;
-		if (outermost) {
-			const shouldFlush = this.#dirty;
-			const changedDependencies = this.#changedDependencies;
-			this.#dirty = false;
-			this.#changedDependencies = new Set();
-			this.#transactionLifecycleIndexes = new Set();
-			if (shouldFlush) this.#flushWatchers(changedDependencies);
-		}
+		this.#records.commit();
+		this.#indexes.commit();
+		this.#indexReferences.commit();
+		const shouldFlush = this.#dirty;
+		const changedDependencies = this.#changedDependencies;
+		this.#dirty = false;
+		this.#changedDependencies = new Set();
+		this.#transactionLifecycleIndexes = new Set();
+		if (shouldFlush) this.#flushWatchers(changedDependencies);
 		return result;
 	}
 
+	#rollback(undo: TransactionUndo): void {
+		this.#records.rollback();
+		this.#indexes.rollback();
+		this.#indexReferences.rollback();
+		this.#layers = undo.layers;
+		this.#derivedIndexOperations = undo.derivedIndexOperations;
+		this.#confirmedFloors = undo.confirmedFloors;
+		this.#nextLayerSequence = undo.nextLayerSequence;
+		this.#overlay = undefined;
+		this.#dirty = false;
+		this.#changedDependencies = new Set();
+		this.#transactionLifecycleIndexes = new Set();
+	}
+
+	#watchDependencies(watcher: Watcher, dependencies: Set<string>): void {
+		for (const dependency of watcher.dependencies) {
+			if (dependencies.has(dependency)) continue;
+			const watchers = this.#watchersByDependency.get(dependency);
+			if (watchers?.delete(watcher) && watchers.size === 0) {
+				this.#watchersByDependency.delete(dependency);
+			}
+		}
+		for (const dependency of dependencies) {
+			if (watcher.dependencies.has(dependency)) continue;
+			let watchers = this.#watchersByDependency.get(dependency);
+			if (watchers === undefined) {
+				this.#watchersByDependency.set(dependency, (watchers = new Set()));
+			}
+			watchers.add(watcher);
+		}
+		watcher.dependencies = dependencies;
+	}
+
+	#removeWatcher(watcher: Watcher): boolean {
+		if (!this.#watchers.delete(watcher)) return false;
+		this.#watchDependencies(watcher, new Set());
+		return true;
+	}
+
+	/** Re-select the watchers that read a changed dependency, in watch order. */
 	#flushWatchers(changedDependencies: ReadonlySet<string>): void {
+		let affected: Watcher[];
+		if (changedDependencies.size === 0 || changedDependencies.has('*')) {
+			affected = [...this.#watchers];
+		} else {
+			const readers = new Set<Watcher>();
+			for (const dependency of changedDependencies) {
+				for (const watcher of this.#watchersByDependency.get(dependency) ?? []) {
+					readers.add(watcher);
+				}
+			}
+			affected = [...readers].sort((left, right) => left.order - right.order);
+		}
 		const errors: unknown[] = [];
-		for (const watcher of this.#watchers) {
-			if (!dependenciesChanged(watcher.dependencies, changedDependencies)) continue;
+		for (const watcher of affected) {
+			// An earlier listener may have removed this watcher.
+			if (!this.#watchers.has(watcher)) continue;
 			try {
+				cacheEngineWork.reselections += 1;
 				const { value: next, dependencies } = this.#select(watcher.selector);
-				watcher.dependencies = dependencies;
+				this.#watchDependencies(watcher, dependencies);
 				if (deepEqual(next, watcher.value)) continue;
 				const previous = watcher.value;
 				watcher.value = next;
@@ -1655,30 +1537,16 @@ export class PurposeBuiltCacheEngine implements CacheEngine {
 			);
 		}
 	}
+}
 
-	#backup(): EngineBackup {
-		const backup = structuredClone({
-			records: this.#records,
-			indexes: this.#indexes,
-			layers: this.#layers,
-			derivedIndexOperations: this.#derivedIndexOperations,
-			confirmedFloors: this.#confirmedFloors,
-			retained: this.#retained,
-			nextLayerSequence: this.#nextLayerSequence,
-			changedDependencies: new Set<string>()
-		});
-		backup.changedDependencies = new Set(this.#changedDependencies);
-		return backup;
-	}
+const EMPTY_KEYS: readonly RecordKey[] = Object.freeze([]);
 
-	#restoreBackup(backup: EngineBackup): void {
-		this.#records = backup.records;
-		this.#indexes = backup.indexes;
-		this.#layers = backup.layers;
-		this.#derivedIndexOperations = backup.derivedIndexOperations;
-		this.#confirmedFloors = backup.confirmedFloors;
-		this.#retained = backup.retained;
-		this.#nextLayerSequence = backup.nextLayerSequence;
-		this.#changedDependencies = new Set(backup.changedDependencies);
-	}
+function* indexReferences(index: StoredIndex | undefined): Iterable<RecordKey> {
+	if (index === undefined) return;
+	yield* index.records;
+	if (index.metadata?.parent !== undefined) yield index.metadata.parent;
+}
+
+function overlaidIndexKeys(graph: CacheGraph): Iterable<IndexKey> {
+	return graph instanceof Overlay ? graph.indexes.keys() : [];
 }

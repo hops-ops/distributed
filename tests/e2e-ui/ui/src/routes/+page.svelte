@@ -78,8 +78,8 @@ pub struct Todos {
     pub status: String,
 }
 
-impl Todos {
-    pub fn permissions() -> ModelPermissions<Self> {
+impl AuthorizedReadModel for Todos {
+    fn permissions() -> ModelPermissions<Self> {
         ModelPermissions::new()
             .grant(
                 "user",
@@ -96,7 +96,6 @@ distributed::projection! {
     pub const TODOS: ProjectionDescriptor<EventualOnly> = {
         name: "project_todos",
         version: 1,
-        epoch: "e2e-ui-todos-v2",
         model: Todos,
         on {
             events: [
@@ -162,23 +161,28 @@ await commands.todo.create({ title: text });
 await commands.todo.complete({ todo_id });
 // Replica applies SaveTodo (upsert_todos) to the cache. Page does not.`;
 
-	const codeWasm = `// Advanced optimism: same domain pure, shipped as WASM
-.preview_reduce_known_record(CommandProjectionPureReduce::wasm(
-    "blob.simulate_move",
-    "blob/pkg/blob_wasm",   // wasm-pack under $lib
-    "blobSimulateMove",     // (recordJson, argsJson) → assignJson
-    "BlobGames",
-))
+	const codeWasm = `// Advanced optimism: the same domain pure, shipped as WASM.
+// blob-domain: typed row, arguments and output.
+pub fn preview_move(row: MoveRow, args: MoveArgs) -> Option<MovePreview> {
+    simulate_move(&row.map, row.score, args.direction).ok()
+}
+distributed::wasm_pure! {
+    pub const PREVIEW_MOVE = preview_move(MoveRow, MoveArgs) -> MovePreview;
+}
 
-// Generated client hosts the module. No TypeScript board rules.`;
+// The command: key, argument and patched columns come from the types.
+preview_reduce_known_record:
+    CommandProjectionPureReduce::known_record::<BlobGames>(PREVIEW_MOVE),
+
+// distributed build compiles it; the generated client hosts it.
+// No TypeScript board rules.`;
 
 	const codeLive = `# The nested layout retains one live window across child pages.
-query ChatMessages($limit: Int!, $offset: Int!) @load @live {
+query ChatMessages($limit: Int! = 25) @load @live @window {
   chat_messages(
     where: { room_id: { _eq: "lobby" } }
     limit: $limit
-    offset: $offset
-    order_by: [{ created_at: desc }]
+    order_by: [{ created_at: desc }, { message_id: desc }]
   ) {
     message_id
     body
@@ -195,17 +199,18 @@ query Todos @load {
   todos { todo_id title status }
 }`;
 
-	const codeService = `// compose.rs (trimmed). Each routes(...) takes repo, locks,
-// read models, and the projection owner for that module.
-pub const MODULE_IDS: &[&str] = &[
-  todo::MODULE_ID, chat::MODULE_ID, blob::MODULE_ID, "identity",
-];
-
-Service::new()
-  .named("e2e-ui")
-  .routes(todo::routes(repo.clone(), locks.clone(), read_models.clone(), projections.todo))
-  .routes(chat::routes(repo.clone(), locks.clone(), read_models.clone(), projections.chat))
-  .routes(blob::routes(repo, locks, read_models, projections.blob))
+	const codeService = `// compose.rs (trimmed). Each module takes the stores and the
+// projections mounted from their descriptors.
+pub fn build_service<St: ServiceStores>(stores: &St) -> Service {
+  let projections = projections();
+  Service::new()
+    .named("e2e-ui")
+    .routes(todo::routes(stores, &projections))
+    .routes(chat::routes(stores, &projections))
+    .routes(blob::routes(stores))
+    .routes(identity::routes(stores, &projections))
+}
+// The application manifest's modules are derived from this Service.
 
 // Another crate can list the same modules, or only Eventual projectors.
 // You write that Service. You do not flip a Runtime::role flag.`;
@@ -711,7 +716,7 @@ Service::new()
 						<code>run</code>. You do not set a runtime role flag.
 					</p>
 					<p class="wf-why">
-						Todo commands are <code>portable_command!</code> declarations in
+						Todo commands are <code>command!</code> declarations in
 						<code>todo-domain</code>. This playground mounts them on a local Service. The sibling
 						example <code>tests/e2e-celld</code> mounts the same declarations and wait-dispatches
 						create, complete, and <code>chat.post</code> to a <strong>cell</strong> (one private

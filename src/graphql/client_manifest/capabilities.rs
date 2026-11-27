@@ -91,7 +91,6 @@ pub(super) fn query_footprint_supports_live_resume(surface: &Surface) -> bool {
         };
         owners.next().is_none()
             && owner.partition.preserves_source_sequence()
-            && owner.change_epoch.is_some()
             && projector_partition_matches_authorization(surface, owner)
     })
 }

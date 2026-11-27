@@ -10,10 +10,14 @@ existing unbounded-tech quality provider plus the integration/* jobs below —
 | Workflow | `workflow_call` | Audience |
 |----------|-----------------|----------|
 | [`quality.yaml`](./quality.yaml) | yes | **Consumers:** fmt → clippy → build → test + coverage (sticky PR comment) |
-| [`test-all-features.yaml`](./test-all-features.yaml) | yes | **This repo:** workspace `--all-features` |
-| [`integration-*.yaml`](./) | yes | **This repo:** broker / DB / CLI / observability / GraphQL identity+OIDC |
+| [`test-all-features.yaml`](./test-all-features.yaml) | yes | **This repo:** `cargo hack --each-feature` compile check |
+| [`integration-services.yaml`](./integration-services.yaml) | yes | **This repo:** whole workspace, all features, against `compose.yaml` services via `make test-local`; a test that cannot reach its service fails (`DISTRIBUTED_REQUIRE_SERVICES`) |
+| [`integration-gateway.yaml`](./integration-gateway.yaml) | yes | **This repo:** application gateway contracts, native and Worker adapters |
+| [`integration-game-demos.yaml`](./integration-game-demos.yaml) | yes | **This repo:** `examples/game` smoke |
+| [`integration-*.yaml`](./) | yes | **This repo:** CLI / observability / GraphQL identity+OIDC |
 | [`integration-e2e-ui.yaml`](./integration-e2e-ui.yaml) | yes | **This repo:** `tests/e2e-ui` offline suite, compose Playwright e2e, and kind local-GitOps Playwright e2e |
-| [`integration-celld.yaml`](./integration-celld.yaml) | yes | **This repo:** `tests/e2e-celld` workspace tests + live Azurite+celld+NATS |
+| [`integration-celld.yaml`](./integration-celld.yaml) | yes | **This repo:** `tests/e2e-celld` workspace tests, celld storage and cell-alarm proofs (`celld dev`), live celld+NATS |
+| [`integration-wasm32-domains.yaml`](./integration-wasm32-domains.yaml) | yes | **This repo:** every domain crate builds for `wasm32-unknown-unknown` (`scripts/check-wasm32-domains.sh`), and a native-only fixture must fail |
 | [`integration-js.yaml`](./integration-js.yaml) | yes | **This repo:** install, typecheck, test, build, and packed-consumer smoke test for `js/` |
 | [`on-pr-quality.yaml`](./on-pr-quality.yaml) | entry | **This repo** PR gate (not the consumer quality contract) |
 | [`on-push-main-version-and-tag.yaml`](./on-push-main-version-and-tag.yaml) | entry | **This repo** main → **vnext** tag |
@@ -126,6 +130,36 @@ npm releases authenticate through GitHub Actions OIDC. The workflow
 intentionally has job-scoped `id-token: write`, uses npm 11.5.1 or newer, and
 does **not** require or accept a long-lived `NPM_TOKEN` repository secret.
 
+## Speed rules for this repo's pipeline
+
+The organization is on GitHub's free plan: 20 hosted jobs run at once, across
+every pull request. A run that starts more jobs than that waits on itself, so
+the pipeline is shaped by runner slots and by compile time.
+
+- **Caches are written by the base branch and read by pull requests.** A cache
+  saved on a pull request's merge ref is readable by that pull request alone,
+  and the repository holds 10 GB in total. Every `Swatinem/rust-cache` step
+  therefore sets `save-if: ${{ github.event_name != 'pull_request' }}` (or
+  `false` when a sibling job with the same `shared-key` builds the superset and
+  writes it). `on-pr-quality` also runs on push to `v5`; that run writes the
+  caches. A pull request that changes `Cargo.lock` compiles its changed
+  dependencies once per run until it merges.
+- **Jobs that build the same thing share a `shared-key`**, with the same
+  `workspaces` list. One job per key writes it.
+- **A new Rust job needs a `rust-cache` step and a `timeout-minutes`.** The
+  timeout is the job's budget: set it from the job's measured p95 on a cold
+  cache, and lower it when the job gets faster. Do not raise one to get a run
+  green.
+- **No `needs:` between test jobs.** A job that waits on another job also
+  waits on that job's queue time.
+- **Small checks share a runner** (`integration-observability`, the gateway
+  `fixtures` job). Each check step carries `if: ${{ !cancelled() }}` so one
+  run lists every failure.
+- **Tools come prebuilt** (`taiki-e/install-action`) or from the cache
+  (`cargo install` is a no-op when `~/.cargo/bin` was restored).
+- `CARGO_PROFILE_DEV_DEBUG=line-tables-only` in every reusable workflow:
+  backtraces keep file and line; link time and cache size drop.
+
 ## Why this monorepo doesn’t call `quality.yaml`
 
 The framework workspace needs a different gate: default-features tests via
@@ -137,4 +171,4 @@ quality contract.
 ## Out of scope (for now)
 
 - crates.io publish reusable (framework still uses `unbounded-tech` publish helpers in `on-v-tag-publish.yaml`)
-- image / GitOps promote (service scaffolds via `distributed`)
+- image build and GitOps promotion

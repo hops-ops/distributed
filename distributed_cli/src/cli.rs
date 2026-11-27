@@ -1,14 +1,10 @@
-//! The `distributed` command surface: clap types plus the [`run_distributed`]
-//! dispatcher. Generation lives in the crate's `generate`/`atlas` modules and
-//! the `describe`/`schema` harness in `manifest_harness`; this module maps
-//! flags onto those types and owns filesystem / process side effects.
-//!
-//! Host CLIs (for example `hops`) may mount [`ServiceArgs`] under a nested
-//! service command and dispatch with [`run`], re-exporting rather than
-//! reimplementing service-related commands.
+//! The `distributed` command surface: clap types plus the [`run`] dispatcher.
+//! Generation lives in the crate's `generate`/`atlas` modules and the
+//! `describe`/`schema` harness in `manifest_harness`; this module maps flags
+//! onto those types and owns filesystem / process side effects.
 
 use clap::{ArgGroup, Args, Subcommand, ValueEnum};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::error::Error;
 use std::ffi::OsString;
 use std::fs;
@@ -19,35 +15,25 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::client_compiler::{
-    compile_client, ClientCompileInput, ClientDocument, ClientSurfaceSelector,
-    GeneratedClientFile, GeneratedClientProject,
-};
-use crate::contracts::{
-    contracts_accept, contracts_check, unknown_scope_diagnostic, ContractAcceptScope,
-    ContractCatalog,
+    check_client_project, compile_client, write_client_project, ClientCompileInput, ClientDocument,
+    ClientSurfaceIdentity,
 };
 use crate::js_framework::watch_local_javascript;
 use crate::lifecycle::{
-    activate_lifecycle_project_generation, discover_lifecycle_project, run_lifecycle_build,
-    run_lifecycle_dev, run_lifecycle_project_build, run_lifecycle_project_dev,
-    DiscoveredLifecycleProject, LifecycleActivation, LifecycleBuildOptions, LifecycleBuildRequest,
-    LifecycleCheckBaseline, LifecycleDevOptions, LifecycleProjectDevOptions,
+    activate_lifecycle_project_generation, discover_lifecycle_project, run_lifecycle_project_build,
+    run_lifecycle_project_dev, DiscoveredLifecycleProject, LifecycleActivation,
+    LifecycleBuildRequest, LifecycleProjectDevOptions, UiAdapter,
 };
 use crate::manifest_harness::{
     resolve_target_manifest_path, run_manifest_harness, HarnessMode, HarnessOptions,
 };
 use crate::skills::{embedded_skills, generate_skills, SkillsInitSpec, AGENTS_MD_FILE};
 use crate::wasm_pures::build_declared_wasm_pures;
-use crate::{
-    generate_service_scaffold, package_name, render_atlas_schema, AtlasDatabaseUrl,
-    AtlasSchemaSpec, BusTarget, FileMode, GeneratedFile, GithubRepo, GitopsPromoteTarget,
-    MetricsTarget, PostCreateAction, ServiceScaffoldSpec, ServiceTransport, StoreTarget,
-};
+use crate::{render_atlas_schema, AtlasDatabaseUrl, AtlasSchemaSpec, FileMode, GeneratedFile};
 
-const DISTRIBUTED_MANIFEST_SCHEMA_VERSION: u64 = 1;
-const DISTRIBUTED_CLIENT_MANIFEST_VERSION: u64 = 2;
+const DISTRIBUTED_MANIFEST_SCHEMA_VERSION: u64 = 3;
 
-/// Top-level standalone CLI arguments for the `distributed` binary.
+/// The `distributed` command tree.
 #[derive(Args, Debug)]
 pub struct DistributedArgs {
     #[command(subcommand)]
@@ -60,22 +46,23 @@ pub enum DistributedCommands {
     Build(BuildArgs),
     /// Run one coherent local application supervisor
     Dev(DevArgs),
-    /// Aggregate contract lifecycle check and accept
-    Contracts(ContractsArgs),
-    /// Scaffold a new Distributed microservice crate
-    #[command(alias = "create")]
-    Scaffold(ScaffoldArgs),
     /// Print a service's explicit ApplicationManifest as JSON
     Describe(DescribeArgs),
     /// Compile role/application-scoped GraphQL operations into client artifacts
     Client(ClientArgs),
     /// Compile the service's authorized client Surface manifest as JSON
     ClientManifest(ClientManifestArgs),
+    /// Print a distributed_game zone's GameSurface (kinds, input, events) as JSON
+    GameManifest(GameManifestArgs),
+    /// Generate typed TypeScript for a distributed_game zone from its GameSurface
+    GameClient(GameClientArgs),
+    /// Compile a distributed_game zone's `#[predict]` step and `#[game_pure]` functions to WebAssembly for its generated client
+    GameWasm(GameWasmArgs),
     /// Render schema artifacts (SQL or an Atlas Operator resource) from a read-model catalog
     Schema(SchemaArgs),
     /// Extract the embedded Distributed agent skills into a project
     Skills(SkillsArgs),
-    /// Internal bounded readiness probe used by `distributed dev`.
+    /// Internal bounded readiness probe used by `dev`.
     #[command(name = "__probe", hide = true)]
     Probe(ProbeArgs),
     /// Internal local Distributed JavaScript source watcher.
@@ -100,54 +87,11 @@ pub struct JavascriptWatchArgs {
     pub project_root: PathBuf,
 }
 
-/// Library adapter for embedding service-related commands under another CLI.
-#[derive(Args, Debug)]
-pub struct ServiceArgs {
-    #[command(subcommand)]
-    pub command: ServiceCommands,
-}
-
-#[derive(Subcommand, Debug)]
-pub enum ServiceCommands {
-    /// Build one coherent application generation
-    Build(BuildArgs),
-    /// Run one coherent local application supervisor
-    Dev(DevArgs),
-    /// Scaffold a new Distributed microservice crate
-    #[command(alias = "create")]
-    Scaffold(ScaffoldArgs),
-    /// Print a service's explicit ApplicationManifest as JSON
-    Describe(DescribeArgs),
-    /// Compile role/application-scoped GraphQL operations into client artifacts
-    Client(ClientArgs),
-    /// Compile the service's authorized client Surface manifest as JSON
-    ClientManifest(ClientManifestArgs),
-    /// Render schema artifacts (SQL or an Atlas Operator resource) from a read-model catalog
-    Schema(SchemaArgs),
-    /// Extract the embedded Distributed agent skills into a project
-    Skills(SkillsArgs),
-    /// Internal bounded readiness probe used by `hops service dev`.
-    #[command(name = "__probe", hide = true)]
-    Probe(ProbeArgs),
-    /// Internal local Distributed JavaScript source watcher.
-    #[command(name = "__js-watch", hide = true)]
-    JavascriptWatch(JavascriptWatchArgs),
-}
-
 #[derive(Args, Debug)]
 pub struct BuildArgs {
     /// Project to build; defaults to the current directory
     #[arg(value_name = "PROJECT")]
     pub project: Option<PathBuf>,
-    /// Deprecated alias for the project directory
-    #[arg(long, hide = true, conflicts_with = "project")]
-    pub root: Option<PathBuf>,
-    /// Advanced contract-catalog override, relative to the project
-    #[arg(long, hide = true)]
-    pub catalog: Option<PathBuf>,
-    /// Advanced lifecycle-config override, relative to the project
-    #[arg(long, hide = true)]
-    pub config: Option<PathBuf>,
     /// Advanced generation-store override, relative to the project
     #[arg(long)]
     pub out: Option<PathBuf>,
@@ -173,70 +117,12 @@ pub struct DevArgs {
     /// Project to run; defaults to the current directory
     #[arg(value_name = "PROJECT")]
     pub project: Option<PathBuf>,
-    /// Deprecated alias for the project directory
-    #[arg(long, hide = true, conflicts_with = "project")]
-    pub root: Option<PathBuf>,
-    /// Advanced contract-catalog override, relative to the project
-    #[arg(long, hide = true)]
-    pub catalog: Option<PathBuf>,
-    /// Advanced lifecycle-config override, relative to the project
-    #[arg(long, hide = true)]
-    pub config: Option<PathBuf>,
     /// Advanced generation-store override, relative to the project
     #[arg(long)]
     pub out: Option<PathBuf>,
     /// Maximum wait for another lifecycle build process
     #[arg(long, default_value_t = 10_000)]
     pub lock_timeout_ms: u64,
-}
-
-#[derive(Args, Debug)]
-pub struct ContractsArgs {
-    #[command(subcommand)]
-    pub command: ContractsCommands,
-}
-
-#[derive(Subcommand, Debug)]
-pub enum ContractsCommands {
-    /// Read-only aggregate contract check (never writes tracked files)
-    Check(ContractsCheckArgs),
-    /// Exact-scope accept with staging, atomic replace, and rollback
-    Accept(ContractsAcceptArgs),
-}
-
-#[derive(Args, Debug)]
-pub struct ContractsCheckArgs {
-    /// Catalog root directory
-    #[arg(long, default_value = ".")]
-    pub root: PathBuf,
-    /// Path to the contract catalog JSON (relative to root or absolute)
-    #[arg(long, default_value = "contracts/catalog.json")]
-    pub catalog: PathBuf,
-    /// Output format
-    #[arg(long, value_enum, default_value = "human")]
-    pub output: ContractsOutput,
-}
-
-#[derive(Args, Debug)]
-pub struct ContractsAcceptArgs {
-    /// Catalog root directory
-    #[arg(long, default_value = ".")]
-    pub root: PathBuf,
-    /// Exact accept scope (no broad wildcards)
-    #[arg(long)]
-    pub scope: String,
-    /// Staged payload file: JSON object mapping portable relative paths to UTF-8 contents
-    #[arg(long)]
-    pub staged: PathBuf,
-    /// Output format
-    #[arg(long, value_enum, default_value = "human")]
-    pub output: ContractsOutput,
-}
-
-#[derive(Clone, Copy, Debug, ValueEnum)]
-pub enum ContractsOutput {
-    Human,
-    Json,
 }
 
 #[derive(Args, Debug)]
@@ -292,86 +178,6 @@ pub enum AgentHarness {
 }
 
 #[derive(Args, Debug)]
-pub struct ScaffoldArgs {
-    /// Service/package name to scaffold
-    pub name: String,
-    /// Output directory. Defaults to ./<name>.
-    #[arg(long)]
-    pub path: Option<PathBuf>,
-    /// Service framework to scaffold
-    #[arg(long, value_enum, default_value = "distributed")]
-    pub framework: Framework,
-    /// Compatibility alias for scaffold kind, e.g. distributed-microsvc.
-    #[arg(long)]
-    pub kind: Option<String>,
-    /// Runtime transport to scaffold
-    #[arg(long, value_enum, default_value = "http")]
-    pub transport: Transport,
-    /// Compatibility shortcut for --transport http.
-    #[arg(long)]
-    pub http: bool,
-    /// Compatibility shortcut for --transport knative.
-    #[arg(long)]
-    pub knative: bool,
-    /// Model aggregate to scaffold. May be repeated.
-    #[arg(long)]
-    pub model: Vec<String>,
-    /// Generate placeholder read-model modules and register them in read_model_catalog().
-    #[arg(long)]
-    pub read_models: bool,
-    /// Generate src/query/ GraphQL skeleton, enable the graphql feature, and wire with_graphql.
-    #[arg(long)]
-    pub query_api: bool,
-    /// Enable Distributed tracing spans and GitOps OTLP environment values.
-    #[arg(long, visible_alias = "otel")]
-    pub tracing: bool,
-    /// Command handler to scaffold. May be repeated.
-    #[arg(long)]
-    pub command: Vec<String>,
-    /// Event handler to scaffold. May be repeated.
-    #[arg(long)]
-    pub event: Vec<String>,
-    /// Message bus backend to scaffold.
-    #[arg(long, value_enum)]
-    pub bus: Option<Bus>,
-    /// Metrics integration to scaffold.
-    #[arg(long, value_enum)]
-    pub metrics: Option<Metrics>,
-    /// Generate independent local and cloud workload charts under
-    /// .gitops/local and .gitops/deploy.
-    #[arg(long)]
-    pub gitops: bool,
-    /// Generate a GitOps promotion chart for Argo CD or Flux.
-    #[arg(long, value_enum)]
-    pub gitops_promote: Option<GitopsPromote>,
-    /// GitHub repository to create and configure with release workflows.
-    #[arg(long, value_name = "OWNER/REPO")]
-    pub github: Option<String>,
-    /// GitOps preview environment repository to promote pull-request previews into.
-    #[arg(long, value_name = "OWNER/REPO")]
-    pub github_preview: Option<String>,
-    /// GitOps permanent environment repository to promote version tags into.
-    #[arg(long, value_name = "OWNER/REPO")]
-    pub github_promote: Option<String>,
-    /// Read-model/schema storage target
-    #[arg(
-        long,
-        alias = "storage",
-        visible_alias = "storage",
-        visible_alias = "read-model",
-        value_enum,
-        default_value = "postgres"
-    )]
-    pub store: Store,
-    /// Path to the local Distributed crate.
-    #[arg(long)]
-    pub distributed_path: Option<PathBuf>,
-    /// Overwrite generated files in an existing directory.
-    #[arg(long)]
-    pub force: bool,
-}
-
-#[derive(Args, Debug)]
 pub struct DescribeArgs {
     /// Service project directory. Defaults to the current directory.
     #[arg(long, default_value = ".")]
@@ -397,7 +203,7 @@ pub struct DescribeArgs {
     /// Path to the local Distributed crate.
     #[arg(long)]
     pub distributed_path: Option<PathBuf>,
-    /// Exact wasm-pack JavaScript launcher owned by the resolved framework package.
+    /// Exact wasm-pack JavaScript launcher installed beside the resolved framework package.
     #[arg(long, hide = true)]
     pub wasm_pack_launcher: Option<PathBuf>,
 }
@@ -426,6 +232,77 @@ pub struct ClientManifestArgs {
     /// Path to the local Distributed crate.
     #[arg(long)]
     pub distributed_path: Option<PathBuf>,
+}
+
+#[derive(Args, Debug)]
+pub struct GameManifestArgs {
+    /// Game crate directory. Defaults to the current directory.
+    #[arg(long, default_value = ".")]
+    pub path: PathBuf,
+    /// Cargo.toml of the game crate. Overrides --path.
+    #[arg(long)]
+    pub manifest_path: Option<PathBuf>,
+    /// Cargo package to inspect when the manifest belongs to a workspace.
+    #[arg(long)]
+    pub package: Option<String>,
+    /// Comma-delimited feature list for the game crate.
+    #[arg(long, value_delimiter = ',')]
+    pub features: Vec<String>,
+    /// Disable default features on the game crate dependency.
+    #[arg(long)]
+    pub no_default_features: bool,
+    /// Surface export function returning `distributed_game::GameSurface`.
+    /// Defaults to `<crate>::game_surface`; e.g. `game_demos::arena::game_surface`.
+    #[arg(long)]
+    pub entrypoint: Option<String>,
+    /// Write the JSON here instead of stdout.
+    #[arg(long)]
+    pub out: Option<PathBuf>,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+pub enum GameImportExtension {
+    /// `./schema.ts` (Vite, Node type stripping, `allowImportingTsExtensions`)
+    Ts,
+    /// `./schema.js` (tsc NodeNext emit)
+    Js,
+    /// `./schema` (bundler resolution)
+    None,
+}
+
+#[derive(Args, Debug)]
+pub struct GameClientArgs {
+    /// GameSurface JSON (from `distributed game-manifest`).
+    #[arg(long)]
+    pub manifest: PathBuf,
+    /// Generated TypeScript directory (owned by the generator).
+    #[arg(long)]
+    pub out: PathBuf,
+    /// Verify the generated files are current without writing anything.
+    #[arg(long)]
+    pub check: bool,
+    /// Import specifier extension between generated files.
+    #[arg(long, value_enum, default_value = "ts")]
+    pub import_extension: GameImportExtension,
+}
+
+#[derive(Args, Debug)]
+pub struct GameWasmArgs {
+    /// GameSurface JSON (from `distributed game-manifest`) with a predicted step or pure functions.
+    #[arg(long)]
+    pub manifest: PathBuf,
+    /// Generated client directory; the module is written to `<out>/wasm/<surface>.wasm`.
+    #[arg(long)]
+    pub out: PathBuf,
+    /// Cargo project containing the package that declares the step.
+    #[arg(long, default_value = ".")]
+    pub path: PathBuf,
+    /// Cargo.toml of that project. Overrides --path.
+    #[arg(long)]
+    pub manifest_path: Option<PathBuf>,
+    /// Verify the module is current without compiling.
+    #[arg(long)]
+    pub check: bool,
 }
 
 #[derive(Args, Debug)]
@@ -515,51 +392,6 @@ pub struct SchemaArgs {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
-pub enum Framework {
-    Distributed,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
-pub enum Transport {
-    Http,
-    Knative,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
-pub enum GitopsPromote {
-    Argo,
-    Flux,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
-pub enum Bus {
-    Rabbitmq,
-    Kafka,
-    Psql,
-    Nats,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
-pub enum Metrics {
-    Prometheus,
-}
-
-impl From<Metrics> for MetricsTarget {
-    fn from(value: Metrics) -> Self {
-        match value {
-            Metrics::Prometheus => MetricsTarget::Prometheus,
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
-pub enum Store {
-    Postgres,
-    Sqlite,
-    InMemory,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 pub enum ManifestFormat {
     Json,
 }
@@ -581,58 +413,17 @@ pub enum SchemaFormat {
     Graphql,
 }
 
-// Map the CLI's clap enums onto the generation spec enums. These exist so
-// `--help` / value parsing stay in the command surface while generation stays in
-// the `generate`/`atlas` modules.
-impl From<Transport> for ServiceTransport {
-    fn from(transport: Transport) -> Self {
-        match transport {
-            Transport::Http => ServiceTransport::Http,
-            Transport::Knative => ServiceTransport::Knative,
-        }
-    }
-}
-
-impl From<Store> for StoreTarget {
-    fn from(store: Store) -> Self {
-        match store {
-            Store::Postgres => StoreTarget::Postgres,
-            Store::Sqlite => StoreTarget::Sqlite,
-            Store::InMemory => StoreTarget::InMemory,
-        }
-    }
-}
-
-impl From<Bus> for BusTarget {
-    fn from(bus: Bus) -> Self {
-        match bus {
-            Bus::Rabbitmq => BusTarget::Rabbitmq,
-            Bus::Kafka => BusTarget::Kafka,
-            Bus::Psql => BusTarget::Psql,
-            Bus::Nats => BusTarget::Nats,
-        }
-    }
-}
-
-impl From<GitopsPromote> for GitopsPromoteTarget {
-    fn from(promote: GitopsPromote) -> Self {
-        match promote {
-            GitopsPromote::Argo => GitopsPromoteTarget::Argo,
-            GitopsPromote::Flux => GitopsPromoteTarget::Flux,
-        }
-    }
-}
-
-/// Dispatch the standalone `distributed` binary command tree.
-pub fn run_distributed(args: &DistributedArgs) -> Result<(), Box<dyn Error>> {
+/// Dispatch a parsed command.
+pub fn run(args: &DistributedArgs) -> Result<(), Box<dyn Error>> {
     match &args.command {
-        DistributedCommands::Build(build) => run_build(build, &[]),
-        DistributedCommands::Dev(dev) => run_dev(dev, &[]),
-        DistributedCommands::Contracts(contracts) => run_contracts(contracts),
-        DistributedCommands::Scaffold(scaffold) => run_scaffold(scaffold),
+        DistributedCommands::Build(build) => run_build(build),
+        DistributedCommands::Dev(dev) => run_dev(dev),
         DistributedCommands::Describe(describe) => run_describe(describe),
         DistributedCommands::Client(client) => run_client(client),
         DistributedCommands::ClientManifest(client) => run_client_manifest(client),
+        DistributedCommands::GameManifest(game) => run_game_manifest(game),
+        DistributedCommands::GameClient(game) => run_game_client(game),
+        DistributedCommands::GameWasm(game) => run_game_wasm(game),
         DistributedCommands::Schema(schema) => run_schema(schema),
         DistributedCommands::Skills(skills) => match &skills.command {
             SkillsCommands::Init(init) => run_skills_init(init),
@@ -670,50 +461,14 @@ fn run_probe(args: &ProbeArgs) -> Result<(), Box<dyn Error>> {
     .into())
 }
 
-/// Dispatch a parsed service command. Host CLIs (for example `hops service`)
-/// call this without mounting the aggregate contracts surface.
-pub fn run(args: &ServiceArgs) -> Result<(), Box<dyn Error>> {
-    match &args.command {
-        ServiceCommands::Build(build) => run_build(build, &["service"]),
-        ServiceCommands::Dev(dev) => run_dev(dev, &["service"]),
-        ServiceCommands::Scaffold(scaffold) => run_scaffold(scaffold),
-        ServiceCommands::Describe(describe) => run_describe(describe),
-        ServiceCommands::Client(client) => run_client(client),
-        ServiceCommands::ClientManifest(client) => run_client_manifest(client),
-        ServiceCommands::Schema(schema) => run_schema(schema),
-        ServiceCommands::Skills(skills) => match &skills.command {
-            SkillsCommands::Init(init) => run_skills_init(init),
-            SkillsCommands::List => run_skills_list(),
-        },
-        ServiceCommands::Probe(probe) => run_probe(probe),
-        ServiceCommands::JavascriptWatch(watch) => run_javascript_watch(watch),
-    }
-}
-
-#[derive(Debug)]
-enum ResolvedLifecycleProject {
-    Discovered(Box<DiscoveredLifecycleProject>),
-    Files {
-        project: PathBuf,
-        workspace: PathBuf,
-        catalog: PathBuf,
-        config: PathBuf,
-        out: PathBuf,
-    },
-}
-
+/// The project a `build` or `dev` invocation names, discovered from its Cargo
+/// workspace. The project's `.env` files are loaded first: discovery reads the
+/// addresses they may set.
 fn resolve_lifecycle_project(
     project: Option<&Path>,
-    legacy_root: Option<&Path>,
-    catalog: Option<&Path>,
-    config: Option<&Path>,
     out: Option<&Path>,
-    command_prefix: &[&str],
-) -> Result<ResolvedLifecycleProject, Box<dyn Error>> {
-    if project.is_some() && legacy_root.is_some() {
-        return Err("pass a project path or --root, not both".into());
-    }
-    let requested = project.or(legacy_root).unwrap_or_else(|| Path::new("."));
+) -> Result<DiscoveredLifecycleProject, Box<dyn Error>> {
+    let requested = project.unwrap_or_else(|| Path::new("."));
     let project = requested.canonicalize().map_err(|error| {
         format!(
             "failed to resolve lifecycle project `{}`: {error}",
@@ -727,85 +482,9 @@ fn resolve_lifecycle_project(
         )
         .into());
     }
-
-    let uses_file_adapter = legacy_root.is_some() || catalog.is_some() || config.is_some();
-    if !uses_file_adapter {
-        load_project_environment(&project)?;
-        let executable = std::env::current_exe()?;
-        return discover_lifecycle_project(&project, executable, command_prefix, out)
-            .map(Box::new)
-            .map(ResolvedLifecycleProject::Discovered)
-            .map_err(Into::into);
-    }
-    if catalog.is_some() != config.is_some() && legacy_root.is_none() {
-        return Err("advanced lifecycle overrides require both --catalog and --config".into());
-    }
-
-    let resolve_input = |provided: Option<&Path>, default: &str, label: &str| {
-        let requested = provided.unwrap_or_else(|| Path::new(default));
-        let candidate = if requested.is_absolute() {
-            requested.to_path_buf()
-        } else {
-            project.join(requested)
-        };
-        candidate.canonicalize().map_err(|error| {
-            let guidance = if provided.is_none() {
-                format!(
-                    "; expected this project to contain `{default}` (run from the project directory or pass the project path)"
-                )
-            } else {
-                String::new()
-            };
-            format!(
-                "failed to resolve lifecycle {label} `{}`: {error}{guidance}",
-                candidate.display()
-            )
-        })
-    };
-    let catalog = resolve_input(catalog, "distributed.contracts.json", "contract catalog")?;
-    let config = resolve_input(config, "distributed.lifecycle.json", "config")?;
-    let requested_out = out.unwrap_or_else(|| Path::new("dist/distributed"));
-    let out = if requested_out.is_absolute() {
-        requested_out.to_path_buf()
-    } else {
-        project.join(requested_out)
-    };
-
-    let mut failures = Vec::new();
-    let mut workspace = None;
-    for candidate in project.ancestors() {
-        if !catalog.starts_with(candidate)
-            || !config.starts_with(candidate)
-            || !out.starts_with(candidate)
-        {
-            continue;
-        }
-        match ContractCatalog::from_path_at_root(&catalog, candidate) {
-            Ok(_) => {
-                workspace = Some(candidate.to_path_buf());
-                break;
-            }
-            Err(error) => failures.push(format!("{}: {error}", candidate.display())),
-        }
-    }
-    let workspace = workspace.ok_or_else(|| {
-        let detail = failures
-            .last()
-            .map(|failure| format!(" Last attempted root: {failure}"))
-            .unwrap_or_default();
-        format!(
-            "unable to discover the workspace for lifecycle project `{}`; no project ancestor resolves every catalog source.{detail}",
-            project.display()
-        )
-    })?;
-
-    Ok(ResolvedLifecycleProject::Files {
-        project,
-        workspace,
-        catalog,
-        config,
-        out,
-    })
+    load_project_environment(&project)?;
+    let executable = std::env::current_exe()?;
+    Ok(discover_lifecycle_project(&project, executable, out)?)
 }
 
 fn load_project_environment(project: &Path) -> Result<(), Box<dyn Error>> {
@@ -829,104 +508,84 @@ fn load_project_environment(project: &Path) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-fn run_build(args: &BuildArgs, command_prefix: &[&str]) -> Result<(), Box<dyn Error>> {
-    let resolved = resolve_lifecycle_project(
-        args.project.as_deref(),
-        args.root.as_deref(),
-        args.catalog.as_deref(),
-        args.config.as_deref(),
-        args.out.as_deref(),
-        command_prefix,
-    )?;
-    let (report, detail) = match &resolved {
-        ResolvedLifecycleProject::Discovered(project) => {
-            if args.check {
-                prepare_project_javascript(project, true)?;
-            } else {
-                build_project_runtime(project)?;
-                prepare_project_javascript(project, false)?;
-                if let Some(ui) = &project.ui {
-                    prepare_ui_dependencies(project, ui)?;
-                }
-                prepare_project_wasm_pures(project).map_err(|error| {
-                    contextualize_project_generation_error(
-                        project,
-                        ProjectGenerationPhase::ApplicationPreflight,
-                        error,
-                    )
-                })?;
-            }
-            eprintln!(
-                "distributed build: introspecting typed application {} (the first run may compile its harness)",
-                project.application_package
-            );
-            let report = run_lifecycle_project_build(
-                &project.plan,
-                &LifecycleBuildRequest {
-                    check: args.check,
-                    check_baseline: LifecycleCheckBaseline::ActiveGeneration,
-                    lock_timeout: Duration::from_millis(args.lock_timeout_ms),
-                    nodes: None,
-                    activation_inputs: None,
-                    cancel: None,
-                    activation: LifecycleActivation::Deferred,
-                },
-            )
-            .map_err(|error| {
-                contextualize_project_generation_error(
-                    project,
-                    ProjectGenerationPhase::LifecycleBuild,
-                    error,
-                )
-            })?;
-            if !args.check {
-                build_project_ui(project, &report)?;
-                activate_lifecycle_project_generation(
-                    &project.plan,
-                    &report,
-                    Duration::from_millis(args.lock_timeout_ms),
-                )?;
-            }
-            (report, Some(project))
+/// The flag a `build` or `dev` session polls to stop.
+///
+/// SIGINT, SIGTERM and SIGHUP all set it (on Windows: Ctrl-C, Ctrl-Break and
+/// the console closing), so the session ends the same way for each: it stops
+/// its process groups and returns. The session's children do not share its
+/// process group, so this handler is the only thing that stops them.
+fn stop_on_signals() -> Result<Arc<AtomicBool>, Box<dyn Error>> {
+    let stop = Arc::new(AtomicBool::new(false));
+    let signaled = Arc::clone(&stop);
+    ctrlc::set_handler(move || signaled.store(true, Ordering::SeqCst))?;
+    Ok(stop)
+}
+
+fn run_build(args: &BuildArgs) -> Result<(), Box<dyn Error>> {
+    let project = resolve_lifecycle_project(args.project.as_deref(), args.out.as_deref())?;
+    let project = &project;
+    let stop = stop_on_signals()?;
+    if args.check {
+        prepare_project_javascript(project, true, &stop)?;
+    } else {
+        build_project_runtime(project, &stop)?;
+        prepare_project_javascript(project, false, &stop)?;
+        if let Some(ui) = &project.ui {
+            prepare_ui_dependencies(project, ui, &stop)?;
         }
-        ResolvedLifecycleProject::Files {
-            workspace,
-            catalog,
-            config,
-            out,
-            ..
-        } => (
-            run_lifecycle_build(&LifecycleBuildOptions {
-                root: workspace.clone(),
-                catalog: catalog.clone(),
-                config: config.clone(),
-                out: out.clone(),
-                check: args.check,
-                lock_timeout: Duration::from_millis(args.lock_timeout_ms),
-                nodes: None,
-                activation_inputs: None,
-                cancel: None,
-            })?,
-            None,
-        ),
-    };
+        prepare_project_wasm_pures(project, &stop).map_err(|error| {
+            contextualize_project_generation_error(
+                project,
+                ProjectGenerationPhase::ApplicationPreflight,
+                error,
+            )
+        })?;
+    }
+    eprintln!(
+        "distributed build: introspecting typed application {} (the first run may compile its harness)",
+        project.application_package
+    );
+    let report = run_lifecycle_project_build(
+        &project.plan,
+        &LifecycleBuildRequest {
+            check: args.check,
+            lock_timeout: Duration::from_millis(args.lock_timeout_ms),
+            nodes: None,
+            activation_inputs: None,
+            cancel: Some(Arc::clone(&stop)),
+            activation: LifecycleActivation::Deferred,
+        },
+    )
+    .map_err(|error| {
+        contextualize_project_generation_error(
+            project,
+            ProjectGenerationPhase::LifecycleBuild,
+            error,
+        )
+    })?;
+    if !args.check {
+        build_project_ui(project, &report, &stop)?;
+        activate_lifecycle_project_generation(
+            &project.plan,
+            &report,
+            Duration::from_millis(args.lock_timeout_ms),
+        )?;
+    }
     match args.output {
         LifecycleOutput::Json => println!("{}", serde_json::to_string(&report)?),
         LifecycleOutput::Human => {
             let mode = if report.check { "check" } else { "build" };
-            if let Some(project) = detail {
-                println!(
-                    "distributed {mode}: project={} application={} runtime={}{}",
-                    project.name,
-                    project.application_package,
-                    project.runtime_binary,
-                    project
-                        .ui
-                        .as_ref()
-                        .map(|ui| format!(" ui={}", ui.display()))
-                        .unwrap_or_default()
-                );
-            }
+            println!(
+                "distributed {mode}: project={} application={} runtime={}{}",
+                project.name,
+                project.application_package,
+                project.runtime_binary,
+                project
+                    .ui
+                    .as_ref()
+                    .map(|ui| format!(" ui={}", ui.root.display()))
+                    .unwrap_or_default()
+            );
             println!(
                 "lifecycle graph: {} generation={} release={} nodes={}",
                 if report.ok { "ok" } else { "drift" },
@@ -951,7 +610,10 @@ fn run_build(args: &BuildArgs, command_prefix: &[&str]) -> Result<(), Box<dyn Er
     Ok(())
 }
 
-fn build_project_runtime(project: &DiscoveredLifecycleProject) -> Result<(), Box<dyn Error>> {
+fn build_project_runtime(
+    project: &DiscoveredLifecycleProject,
+    stop: &AtomicBool,
+) -> Result<(), Box<dyn Error>> {
     eprintln!(
         "distributed build: compiling Rust runtime {} ({})",
         project.runtime_binary, project.runtime_package
@@ -967,6 +629,7 @@ fn build_project_runtime(project: &DiscoveredLifecycleProject) -> Result<(), Box
             OsString::from(&project.runtime_binary),
         ],
         "Rust runtime build",
+        stop,
     )
 }
 
@@ -984,7 +647,7 @@ fn contextualize_project_generation_error(
     let error = error.to_string();
     if is_application_introspection_failure(phase, &error) {
         return format!(
-            "typed application `{}` could not be introspected through `{}`; the selected application crate must publicly export a zero-argument function returning `distributed::ApplicationManifest` (or select another export with `[package.metadata.distributed.application] entrypoint = \"...\"`):\n{error}",
+            "typed application `{}` could not be introspected through `{}`; the selected application crate must publicly export a zero-argument function returning `distributed::application::ApplicationManifest` (or select another export with `[package.metadata.distributed.application] entrypoint = \"...\"`):\n{error}",
             project.application_package, project.application_entrypoint
         )
         .into();
@@ -1005,7 +668,10 @@ fn is_application_introspection_failure(phase: ProjectGenerationPhase, error: &s
     }
 }
 
-fn prepare_project_wasm_pures(project: &DiscoveredLifecycleProject) -> Result<(), Box<dyn Error>> {
+fn prepare_project_wasm_pures(
+    project: &DiscoveredLifecycleProject,
+    stop: &AtomicBool,
+) -> Result<(), Box<dyn Error>> {
     if project.ui.is_none() {
         return Ok(());
     }
@@ -1020,6 +686,7 @@ fn prepare_project_wasm_pures(project: &DiscoveredLifecycleProject) -> Result<()
             distributed_path: Some(project.distributed_root.clone()),
         },
         HarnessMode::DescribeJson,
+        Some(stop),
     )?;
     let manifest: serde_json::Value = serde_json::from_str(&json)?;
     validate_manifest_json(&manifest)?;
@@ -1027,11 +694,12 @@ fn prepare_project_wasm_pures(project: &DiscoveredLifecycleProject) -> Result<()
         .javascript
         .as_ref()
         .zip(project.ui.as_ref())
-        .map(|(javascript, ui)| javascript.wasm_pack_launcher(ui));
+        .map(|(javascript, ui)| javascript.wasm_pack_launcher(&ui.root));
     build_declared_wasm_pures(
         &manifest,
         &project.cargo_root.join("Cargo.toml"),
         wasm_pack_launcher.as_deref(),
+        Some(stop),
     )?;
     Ok(())
 }
@@ -1039,43 +707,38 @@ fn prepare_project_wasm_pures(project: &DiscoveredLifecycleProject) -> Result<()
 fn build_project_ui(
     project: &DiscoveredLifecycleProject,
     generation: &crate::lifecycle::LifecycleBuildReport,
+    stop: &AtomicBool,
 ) -> Result<(), Box<dyn Error>> {
     if let Some(ui) = &project.ui {
-        let ui_root = ui;
-        prepare_ui_dependencies(project, &ui_root)?;
-        eprintln!(
-            "distributed build: checking SvelteKit UI {}",
-            ui_root.display()
-        );
-        run_project_ui_script(project, generation, ui_root, "check", true)?;
-        eprintln!(
-            "distributed build: compiling SvelteKit UI {}",
-            ui_root.display()
-        );
-        run_project_ui_script(project, generation, ui_root, "build", false)?;
+        prepare_ui_dependencies(project, ui, stop)?;
+        for (step, args) in [("check", &ui.check), ("build", &ui.build)] {
+            if args.is_empty() {
+                continue;
+            }
+            eprintln!("distributed build: UI {step} in {}", ui.root.display());
+            run_project_ui_command(project, generation, ui, step, args, stop)?;
+        }
     }
     Ok(())
 }
 
-fn run_project_ui_script(
+fn run_project_ui_command(
     project: &DiscoveredLifecycleProject,
     generation: &crate::lifecycle::LifecycleBuildReport,
-    ui_root: &Path,
-    script: &str,
-    if_present: bool,
+    ui: &UiAdapter,
+    step: &str,
+    args: &[String],
+    stop: &AtomicBool,
 ) -> Result<(), Box<dyn Error>> {
     let lifecycle_dir = if project.plan.out.is_absolute() {
         project.plan.out.clone()
     } else {
         project.plan.root.join(&project.plan.out)
     };
-    let mut command = Command::new("npm");
-    command.args(["run", script]);
-    if if_present {
-        command.arg("--if-present");
-    }
-    let status = command
-        .current_dir(ui_root)
+    let mut command = Command::new(&ui.package_manager);
+    command
+        .args(args)
+        .current_dir(&ui.root)
         .env("DISTRIBUTED_LIFECYCLE_OWNS_CLIENT_COMPILE", "1")
         .env("DISTRIBUTED_LIFECYCLE_PROJECT_ROOT", &project.plan.root)
         .env("DISTRIBUTED_LIFECYCLE_DIR", lifecycle_dir)
@@ -1083,25 +746,31 @@ fn run_project_ui_script(
             "DISTRIBUTED_LIFECYCLE_GENERATION_ID",
             &generation.generation_id,
         )
-        .status()?;
-    if !status.success() {
-        return Err(format!("SvelteKit UI `{script}` failed with {status}").into());
-    }
-    Ok(())
+        .env(
+            crate::lifecycle::LIFECYCLE_CLI_EXECUTABLE_ENV,
+            &project.plan.cli_executable,
+        );
+    finish_project_command(
+        crate::process::run(&mut command, Some(stop))?,
+        &format!("UI {step}"),
+    )
 }
 
 fn prepare_ui_dependencies(
     project: &DiscoveredLifecycleProject,
-    ui_root: &Path,
+    ui: &UiAdapter,
+    stop: &AtomicBool,
 ) -> Result<(), Box<dyn Error>> {
-    ensure_ui_dependencies(ui_root)?;
+    if !ui.root.join("node_modules").is_dir() {
+        install_ui_dependencies(ui, stop)?;
+    }
     let Some(javascript) = &project.javascript else {
         return Ok(());
     };
-    if let Err(error) = javascript.verify_installed(ui_root) {
-        eprintln!("distributed: refreshing SvelteKit dependencies because {error}");
-        install_ui_dependencies(ui_root)?;
-        javascript.verify_installed(ui_root)?;
+    if let Err(error) = javascript.verify_installed(&ui.root) {
+        eprintln!("distributed: refreshing UI dependencies because {error}");
+        install_ui_dependencies(ui, stop)?;
+        javascript.verify_installed(&ui.root)?;
     }
     Ok(())
 }
@@ -1109,129 +778,95 @@ fn prepare_ui_dependencies(
 fn prepare_project_javascript(
     project: &DiscoveredLifecycleProject,
     check: bool,
+    stop: &AtomicBool,
 ) -> Result<(), Box<dyn Error>> {
     if let Some(javascript) = &project.javascript {
-        javascript.prepare(&project.cargo_root, check)?;
+        javascript.prepare(&project.cargo_root, check, Some(stop))?;
         if check {
             let ui = project
                 .ui
                 .as_ref()
                 .ok_or("Distributed JavaScript package resolved without a UI root")?;
-            javascript.verify_installed(ui)?;
+            javascript.verify_installed(&ui.root)?;
         }
     }
     Ok(())
 }
 
-fn ensure_ui_dependencies(ui_root: &Path) -> Result<(), Box<dyn Error>> {
-    if ui_root.join("node_modules").is_dir() {
-        return Ok(());
-    }
-    install_ui_dependencies(ui_root)
-}
-
-fn install_ui_dependencies(ui_root: &Path) -> Result<(), Box<dyn Error>> {
-    let install = if ui_root.join("package-lock.json").is_file() {
-        "ci"
-    } else {
-        "install"
-    };
+fn install_ui_dependencies(ui: &UiAdapter, stop: &AtomicBool) -> Result<(), Box<dyn Error>> {
+    let install = ui.install.clone().unwrap_or_else(|| {
+        let locked = ui.root.join("package-lock.json").is_file();
+        vec![if locked { "ci" } else { "install" }.to_string()]
+    });
     eprintln!(
-        "distributed: installing SvelteKit dependencies with `npm {install}` in {}",
-        ui_root.display()
+        "distributed: installing UI dependencies with `{} {}` in {}",
+        ui.package_manager,
+        install.join(" "),
+        ui.root.display()
     );
-    run_project_command(
-        ui_root,
-        "npm",
-        &[OsString::from(install)],
-        "SvelteKit dependency install",
+    let mut command = Command::new(&ui.package_manager);
+    command.args(install).current_dir(&ui.root);
+    finish_project_command(
+        crate::process::run(&mut command, Some(stop))?,
+        "UI dependency install",
     )
 }
 
+/// Run a build step of the session: in its own process group, until it exits
+/// or the session is stopped.
 fn run_project_command(
     cwd: &Path,
     program: &str,
     args: &[OsString],
     label: &str,
+    stop: &AtomicBool,
 ) -> Result<(), Box<dyn Error>> {
-    let status = Command::new(program).args(args).current_dir(cwd).status()?;
-    if !status.success() {
-        return Err(format!("{label} failed with {status}").into());
-    }
-    Ok(())
+    let mut command = Command::new(program);
+    command.args(args).current_dir(cwd);
+    finish_project_command(crate::process::run(&mut command, Some(stop))?, label)
 }
 
-fn run_dev(args: &DevArgs, command_prefix: &[&str]) -> Result<(), Box<dyn Error>> {
-    let resolved = resolve_lifecycle_project(
-        args.project.as_deref(),
-        args.root.as_deref(),
-        args.catalog.as_deref(),
-        args.config.as_deref(),
-        args.out.as_deref(),
-        command_prefix,
-    )?;
-    let stop = Arc::new(AtomicBool::new(false));
-    let signal_stop = Arc::clone(&stop);
-    ctrlc::set_handler(move || signal_stop.store(true, Ordering::SeqCst))?;
-    let report = match resolved {
-        ResolvedLifecycleProject::Discovered(project) => {
-            prepare_project_javascript(&project, false)?;
-            if let Some(ui) = &project.ui {
-                prepare_ui_dependencies(&project, ui)?;
-            }
-            eprintln!(
-                "distributed dev: project={} api={} ui={} (Ctrl-C to stop)",
-                project.name,
-                project.runtime_binary,
-                project
-                    .ui
-                    .as_ref()
-                    .map(|ui| ui.display().to_string())
-                    .unwrap_or_else(|| "none".to_string())
-            );
-            run_lifecycle_project_dev(&LifecycleProjectDevOptions {
-                project: project.plan,
-                build: LifecycleBuildRequest {
-                    check: false,
-                    check_baseline: LifecycleCheckBaseline::Workspace,
-                    lock_timeout: Duration::from_millis(args.lock_timeout_ms),
-                    nodes: None,
-                    activation_inputs: None,
-                    cancel: Some(Arc::clone(&stop)),
-                    activation: LifecycleActivation::Immediate,
-                },
-                stop: Arc::clone(&stop),
-                progress: true,
-            })?
-        }
-        ResolvedLifecycleProject::Files {
-            project,
-            workspace,
-            catalog,
-            config,
-            out,
-        } => {
-            eprintln!(
-                "lifecycle dev: starting project={} and waiting for the initial generation (Ctrl-C to stop)",
-                project.display()
-            );
-            run_lifecycle_dev(&LifecycleDevOptions {
-                build: LifecycleBuildOptions {
-                    root: workspace,
-                    catalog,
-                    config,
-                    out,
-                    check: false,
-                    lock_timeout: Duration::from_millis(args.lock_timeout_ms),
-                    nodes: None,
-                    activation_inputs: None,
-                    cancel: Some(Arc::clone(&stop)),
-                },
-                stop: Arc::clone(&stop),
-                progress: true,
-            })?
-        }
-    };
+fn finish_project_command(
+    status: Option<std::process::ExitStatus>,
+    label: &str,
+) -> Result<(), Box<dyn Error>> {
+    match status {
+        Some(status) if status.success() => Ok(()),
+        Some(status) => Err(format!("{label} failed with {status}").into()),
+        None => Err(format!("{label} was stopped").into()),
+    }
+}
+
+fn run_dev(args: &DevArgs) -> Result<(), Box<dyn Error>> {
+    let project = resolve_lifecycle_project(args.project.as_deref(), args.out.as_deref())?;
+    let stop = stop_on_signals()?;
+    prepare_project_javascript(&project, false, &stop)?;
+    if let Some(ui) = &project.ui {
+        prepare_ui_dependencies(&project, ui, &stop)?;
+    }
+    eprintln!(
+        "distributed dev: project={} api={} ui={} (Ctrl-C to stop)",
+        project.name,
+        project.runtime_binary,
+        project
+            .ui
+            .as_ref()
+            .map(|ui| ui.root.display().to_string())
+            .unwrap_or_else(|| "none".to_string())
+    );
+    let report = run_lifecycle_project_dev(&LifecycleProjectDevOptions {
+        project: project.plan,
+        build: LifecycleBuildRequest {
+            check: false,
+            lock_timeout: Duration::from_millis(args.lock_timeout_ms),
+            nodes: None,
+            activation_inputs: None,
+            cancel: Some(Arc::clone(&stop)),
+            activation: LifecycleActivation::Immediate,
+        },
+        stop: Arc::clone(&stop),
+        progress: true,
+    })?;
     println!(
         "lifecycle dev: stopped initial={} final={} rebuilds={}",
         report.initial_generation, report.final_generation, report.rebuilds
@@ -1240,86 +875,6 @@ fn run_dev(args: &DevArgs, command_prefix: &[&str]) -> Result<(), Box<dyn Error>
         println!("process={process} restarts={count}");
     }
     Ok(())
-}
-
-fn run_contracts(args: &ContractsArgs) -> Result<(), Box<dyn Error>> {
-    match &args.command {
-        ContractsCommands::Check(check) => run_contracts_check(check),
-        ContractsCommands::Accept(accept) => run_contracts_accept(accept),
-    }
-}
-
-fn run_contracts_check(args: &ContractsCheckArgs) -> Result<(), Box<dyn Error>> {
-    let root = absolute_path(&args.root)?;
-    let catalog_path = if args.catalog.is_absolute() {
-        args.catalog.clone()
-    } else {
-        root.join(&args.catalog)
-    };
-    let catalog = ContractCatalog::from_path(&catalog_path)?;
-    let report = contracts_check(&catalog, &root, std::iter::empty());
-    match args.output {
-        ContractsOutput::Human => {
-            if report.human.is_empty() {
-                println!("contracts check: ok");
-            } else {
-                println!("{}", report.human);
-            }
-        }
-        ContractsOutput::Json => {
-            println!("{}", serde_json::to_string_pretty(&report.result)?);
-        }
-    }
-    if report.ok {
-        Ok(())
-    } else {
-        Err("contracts check failed".into())
-    }
-}
-
-fn run_contracts_accept(args: &ContractsAcceptArgs) -> Result<(), Box<dyn Error>> {
-    let Some(scope) = ContractAcceptScope::parse(&args.scope) else {
-        let diagnostic = unknown_scope_diagnostic(&args.scope);
-        return Err(diagnostic.human().into());
-    };
-    let root = absolute_path(&args.root)?;
-    let staged_source = fs::read_to_string(&args.staged)?;
-    let staged_json: serde_json::Value = serde_json::from_str(&staged_source)?;
-    let object = staged_json
-        .as_object()
-        .ok_or("staged payload must be a JSON object of path -> string contents")?;
-    let mut staged = BTreeMap::new();
-    for (path, value) in object {
-        let contents = value
-            .as_str()
-            .ok_or_else(|| format!("staged path `{path}` must map to a UTF-8 string"))?;
-        staged.insert(path.clone(), contents.as_bytes().to_vec());
-    }
-    let report = contracts_accept(&root, scope, &staged)?;
-    match args.output {
-        ContractsOutput::Human => {
-            if report.noop {
-                println!("contracts accept: no-op ({})", report.scope);
-            } else {
-                println!(
-                    "contracts accept: updated {} path(s) for scope {}",
-                    report.changed_paths.len(),
-                    report.scope
-                );
-                for path in &report.changed_paths {
-                    println!("  {path}");
-                }
-            }
-        }
-        ContractsOutput::Json => {
-            println!("{}", serde_json::to_string_pretty(&report)?);
-        }
-    }
-    if report.ok {
-        Ok(())
-    } else {
-        Err("contracts accept failed".into())
-    }
 }
 
 fn run_skills_list() -> Result<(), Box<dyn Error>> {
@@ -1554,87 +1109,6 @@ fn display_path(path: &Path) -> String {
         .to_string()
 }
 
-fn run_scaffold(args: &ScaffoldArgs) -> Result<(), Box<dyn Error>> {
-    validate_scaffold_kind(args.framework, args.kind.as_deref())?;
-    let transport = if args.http && args.knative {
-        return Err("--http and --knative cannot be used together".into());
-    } else if args.http {
-        Transport::Http
-    } else if args.knative {
-        Transport::Knative
-    } else {
-        args.transport
-    };
-
-    let github = parse_optional_github_repo(args.github.as_deref(), "--github")?;
-    let github_preview =
-        parse_optional_github_repo(args.github_preview.as_deref(), "--github-preview")?;
-    let github_promote =
-        parse_optional_github_repo(args.github_promote.as_deref(), "--github-promote")?;
-
-    // The default output directory uses the normalized package name, so derive it
-    // (and fail fast on an invalid name) before creating any directory.
-    let package_name = package_name(&args.name)?;
-    let output_dir = args
-        .path
-        .clone()
-        .unwrap_or_else(|| PathBuf::from(&package_name));
-    let output_dir = absolute_path(&output_dir)?;
-    ensure_output_dir(&output_dir, args.force)?;
-
-    let distributed_path = resolve_distributed_path(args.distributed_path.as_deref(), &output_dir)?;
-    let distributed_dependency_path = path_for_toml(&relative_path(&output_dir, &distributed_path));
-
-    // GraphQL execution needs a SQL store feature; promote in-memory → sqlite.
-    let store = {
-        let store = args.store.into();
-        if args.query_api && matches!(store, crate::StoreTarget::InMemory) {
-            eprintln!(
-                "warning: --query-api requires a SQL store; promoting --store in-memory to sqlite"
-            );
-            crate::StoreTarget::Sqlite
-        } else {
-            store
-        }
-    };
-
-    let spec = ServiceScaffoldSpec {
-        name: args.name.clone(),
-        transport: transport.into(),
-        store,
-        bus: args.bus.map(Into::into),
-        metrics: args.metrics.map(Into::into),
-        models: args.model.clone(),
-        read_models: args.read_models || args.query_api,
-        query_api: args.query_api,
-        tracing: args.tracing,
-        commands: args.command.clone(),
-        events: args.event.clone(),
-        distributed_dependency_path,
-        gitops: args.gitops,
-        gitops_promote: args.gitops_promote.map(Into::into),
-        github,
-        github_preview,
-        github_promote,
-    };
-
-    let project = generate_service_scaffold(spec)?;
-    for file in &project.files {
-        write_generated_file(&output_dir, file)?;
-    }
-    for warning in &project.warnings {
-        eprintln!("warning: {warning}");
-    }
-    for action in &project.post_create_actions {
-        match action {
-            PostCreateAction::EnsureGithubRepository { repo } => ensure_github_repo(repo)?,
-        }
-    }
-
-    println!("Scaffolded Distributed service at {}", output_dir.display());
-    Ok(())
-}
-
 fn run_describe(args: &DescribeArgs) -> Result<(), Box<dyn Error>> {
     match args.format {
         ManifestFormat::Json => {
@@ -1649,6 +1123,7 @@ fn run_describe(args: &DescribeArgs) -> Result<(), Box<dyn Error>> {
                     distributed_path: args.distributed_path.clone(),
                 },
                 HarnessMode::DescribeJson,
+                None,
             )?;
             let envelope: serde_json::Value = serde_json::from_str(&json)?;
             validate_manifest_json(&envelope)?;
@@ -1662,6 +1137,7 @@ fn run_describe(args: &DescribeArgs) -> Result<(), Box<dyn Error>> {
                     &envelope,
                     &cargo_manifest,
                     args.wasm_pack_launcher.as_deref(),
+                    None,
                 )?;
             }
             println!("{}", serde_json::to_string_pretty(&envelope)?);
@@ -1672,8 +1148,6 @@ fn run_describe(args: &DescribeArgs) -> Result<(), Box<dyn Error>> {
 
 const MAX_CLIENT_MANIFEST_BYTES: usize = 16 * 1024 * 1024;
 const MAX_CLIENT_DOCUMENT_BYTES: usize = 1024 * 1024;
-const MAX_GENERATED_CLIENT_ARTIFACT_BYTES: usize = 8 * 1024 * 1024;
-const MAX_GENERATED_CLIENT_FILES: usize = 8_192;
 
 fn run_client(args: &ClientArgs) -> Result<(), Box<dyn Error>> {
     let manifest_source =
@@ -1683,7 +1157,7 @@ fn run_client(args: &ClientArgs) -> Result<(), Box<dyn Error>> {
             format!("parse client manifest {}: {error}", args.manifest.display()).into()
         })?;
     let selector = match (&args.role, &args.surface) {
-        (Some(role), None) => ClientSurfaceSelector::role(role.clone()),
+        (Some(role), None) => ClientSurfaceIdentity::role(role.clone()),
         (None, Some(surface)) => {
             // Prefer explicit CLI roles when both lists are provided; otherwise
             // take eligible/schema roles from the application surface in the
@@ -1700,14 +1174,16 @@ fn run_client(args: &ClientArgs) -> Result<(), Box<dyn Error>> {
             } else {
                 application_roles_from_manifest(&manifest, surface)?
             };
-            ClientSurfaceSelector::application(surface.clone(), eligible_roles, schema_roles)
+            ClientSurfaceIdentity::application(surface.clone(), eligible_roles, schema_roles)
         }
         _ => {
             return Err("pass exactly one of --role <name> or --surface <application-name>".into());
         }
     };
     let documents = collect_client_documents(&args.documents)?;
-    let project = compile_client(ClientCompileInput::new(manifest, selector, documents))?;
+    let project = compile_client(ClientCompileInput::from_manifest_json(
+        manifest, selector, documents,
+    )?)?;
 
     if args.check {
         check_client_project(&args.out, &project)?;
@@ -1873,405 +1349,6 @@ fn portable_relative_path(path: &Path) -> Result<String, Box<dyn Error>> {
     Ok(parts.join("/"))
 }
 
-fn generated_client_path(
-    root: &Path,
-    file: &GeneratedClientFile,
-) -> Result<PathBuf, Box<dyn Error>> {
-    let relative = Path::new(&file.path);
-    if relative.is_absolute()
-        || relative
-            .components()
-            .any(|component| !matches!(component, Component::Normal(_)))
-    {
-        return Err(format!("compiler produced unsafe generated path `{}`", file.path).into());
-    }
-    Ok(root.join(relative))
-}
-
-fn write_client_project(
-    root: &Path,
-    project: &GeneratedClientProject,
-) -> Result<(), Box<dyn Error>> {
-    validate_generated_client_files(&project.files)?;
-    validate_client_write_targets(root, &project.files)?;
-    let stale_files = stale_generated_client_files(root, project)?;
-    validate_client_output_convergence(root, project, &stale_files)?;
-    fs::create_dir_all(root)?;
-
-    for path in stale_files {
-        fs::remove_file(&path).map_err(|error| {
-            format!(
-                "remove stale generated client artifact {}: {error}",
-                path.display()
-            )
-        })?;
-    }
-
-    // Provenance is written last so an interrupted run never advertises a new
-    // complete generation before its operation modules exist.
-    let mut files = project.files.iter().collect::<Vec<_>>();
-    files.sort_by_key(|file| (file.path == "manifest.json", file.path.as_str()));
-    for file in files {
-        let path = generated_client_path(root, file)?;
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        fs::write(&path, &file.contents)
-            .map_err(|error| format!("write generated artifact {}: {error}", path.display()))?;
-    }
-    Ok(())
-}
-
-fn validate_client_output_convergence(
-    root: &Path,
-    project: &GeneratedClientProject,
-    stale_files: &[PathBuf],
-) -> Result<(), Box<dyn Error>> {
-    let expected = project
-        .files
-        .iter()
-        .map(|file| file.path.clone())
-        .collect::<BTreeSet<_>>();
-    let stale = stale_files
-        .iter()
-        .map(|path| {
-            path.strip_prefix(root)
-                .map_err(|_| {
-                    format!(
-                        "stale generated client path {} escaped output {}",
-                        path.display(),
-                        root.display()
-                    )
-                })
-                .and_then(|relative| {
-                    portable_relative_path(relative).map_err(|error| error.to_string())
-                })
-        })
-        .collect::<Result<BTreeSet<_>, _>>()?;
-    let unexpected = collect_generated_client_paths(root)?
-        .into_iter()
-        .filter(|path| !expected.contains(path) && !stale.contains(path))
-        .collect::<Vec<_>>();
-    if unexpected.is_empty() {
-        return Ok(());
-    }
-    Err(format!(
-        "generated output contains files without current or previous compiler ownership:\n  {}; refusing to write until they are moved or removed",
-        unexpected.join("\n  ")
-    )
-    .into())
-}
-
-fn validate_client_write_targets(
-    root: &Path,
-    files: &[GeneratedClientFile],
-) -> Result<(), Box<dyn Error>> {
-    match fs::symlink_metadata(root) {
-        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
-            return Err(format!(
-                "generated output {} must be a real directory, not a symlink or other entry",
-                root.display()
-            )
-            .into())
-        }
-        Ok(_) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => {
-            return Err(format!("inspect generated output {}: {error}", root.display()).into())
-        }
-    }
-
-    for file in files {
-        let relative = Path::new(&file.path);
-        let mut current = root.to_path_buf();
-        let component_count = relative.components().count();
-        for (index, component) in relative.components().enumerate() {
-            let Component::Normal(component) = component else {
-                unreachable!("generated paths were validated before write-target inspection")
-            };
-            current.push(component);
-            let metadata = match fs::symlink_metadata(&current) {
-                Ok(metadata) => metadata,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
-                Err(error) => {
-                    return Err(format!(
-                        "inspect generated client path {}: {error}",
-                        current.display()
-                    )
-                    .into())
-                }
-            };
-            let is_target = index + 1 == component_count;
-            let valid = if is_target {
-                metadata.is_file() && !metadata.file_type().is_symlink()
-            } else {
-                metadata.is_dir() && !metadata.file_type().is_symlink()
-            };
-            if !valid {
-                return Err(format!(
-                    "generated client path {} contains a symlink or incompatible entry",
-                    current.display()
-                )
-                .into());
-            }
-        }
-    }
-    Ok(())
-}
-
-fn stale_generated_client_files(
-    root: &Path,
-    project: &GeneratedClientProject,
-) -> Result<Vec<PathBuf>, Box<dyn Error>> {
-    let provenance_path = root.join("manifest.json");
-    let metadata = match fs::symlink_metadata(&provenance_path) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(error) => {
-            return Err(format!(
-                "inspect previous generated client manifest {}: {error}",
-                provenance_path.display()
-            )
-            .into())
-        }
-    };
-    if metadata.file_type().is_symlink() || !metadata.is_file() {
-        return Err(format!(
-            "previous generated client manifest {} must be a regular file",
-            provenance_path.display()
-        )
-        .into());
-    }
-
-    let source = read_utf8_bounded(
-        &provenance_path,
-        MAX_CLIENT_MANIFEST_BYTES,
-        "previous generated client manifest",
-    )?;
-    let provenance: serde_json::Value = serde_json::from_str(&source).map_err(|error| {
-        format!(
-            "parse previous generated client manifest {}: {error}; refusing to guess stale-file ownership",
-            provenance_path.display()
-        )
-    })?;
-    let compiler_manifest_version = provenance
-        .get("compiler_manifest_version")
-        .and_then(serde_json::Value::as_u64);
-    if !matches!(compiler_manifest_version, Some(1 | 2)) {
-        return Err(format!(
-            "previous generated client manifest {} has an unsupported compiler_manifest_version; refusing to guess stale-file ownership",
-            provenance_path.display()
-        )
-        .into());
-    }
-    let operations = provenance
-        .get("operations")
-        .and_then(serde_json::Value::as_array)
-        .ok_or_else(|| {
-            format!(
-                "previous generated client manifest {} is missing operations; refusing to guess stale-file ownership",
-                provenance_path.display()
-            )
-        })?;
-    let expected = project
-        .files
-        .iter()
-        .map(|file| file.path.as_str())
-        .collect::<BTreeSet<_>>();
-    let mut stale = BTreeSet::new();
-    for (index, operation) in operations.iter().enumerate() {
-        let module_path = operation
-            .get("module_path")
-            .and_then(serde_json::Value::as_str)
-            .ok_or_else(|| {
-                format!(
-                    "previous generated client manifest {} operations[{index}] is missing module_path; refusing to guess stale-file ownership",
-                    provenance_path.display()
-                )
-            })?;
-        validate_previous_client_module_path(module_path)?;
-        if !expected.contains(module_path) {
-            stale.insert(module_path.to_string());
-        }
-    }
-
-    if compiler_manifest_version == Some(1) && !expected.contains("routes.ts") {
-        stale.insert("routes.ts".to_string());
-    }
-
-    let mut paths = Vec::with_capacity(stale.len());
-    for relative in stale {
-        let path = root.join(&relative);
-        let metadata = match fs::symlink_metadata(&path) {
-            Ok(metadata) => metadata,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(error) => {
-                return Err(format!(
-                    "inspect stale generated client artifact {}: {error}",
-                    path.display()
-                )
-                .into())
-            }
-        };
-        if metadata.file_type().is_symlink() || !metadata.is_file() {
-            return Err(format!(
-                "stale generated client artifact {} must be a regular file",
-                path.display()
-            )
-            .into());
-        }
-        let contents = read_utf8_bounded(
-            &path,
-            MAX_GENERATED_CLIENT_ARTIFACT_BYTES,
-            "stale generated client artifact",
-        )?;
-        let has_compatible_marker = contents
-            .starts_with("/** GENERATED by distributed client. Do not edit. */")
-            || (compiler_manifest_version == Some(1)
-                && relative == "routes.ts"
-                && contents.starts_with(
-                    "/** GENERATED framework-neutral `@load` ownership plan. */",
-                ));
-        if !has_compatible_marker {
-            return Err(format!(
-                "refusing to remove {} because its compiler ownership marker is missing",
-                path.display()
-            )
-            .into());
-        }
-        paths.push(path);
-    }
-    Ok(paths)
-}
-
-fn validate_previous_client_module_path(path: &str) -> Result<(), Box<dyn Error>> {
-    let mut components = Path::new(path).components();
-    let valid = matches!(components.next(), Some(Component::Normal(value)) if value == "operations")
-        && matches!(components.next(), Some(Component::Normal(value)) if Path::new(value).extension().is_some_and(|extension| extension == "ts"))
-        && components.next().is_none();
-    if !valid {
-        return Err(format!(
-            "previous compiler provenance contains unsafe operation module path `{path}`; refusing to remove it"
-        )
-        .into());
-    }
-    Ok(())
-}
-
-fn check_client_project(
-    root: &Path,
-    project: &GeneratedClientProject,
-) -> Result<(), Box<dyn Error>> {
-    validate_generated_client_files(&project.files)?;
-    let expected = project
-        .files
-        .iter()
-        .map(|file| (file.path.clone(), file.contents.as_str()))
-        .collect::<BTreeMap<_, _>>();
-    let actual_paths = collect_generated_client_paths(root)?;
-    let mut drift = Vec::new();
-
-    for (path, contents) in &expected {
-        let full_path = root.join(path);
-        match fs::read_to_string(&full_path) {
-            Ok(actual) if actual == *contents => {}
-            Ok(_) => drift.push(format!("changed {path}")),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                drift.push(format!("missing {path}"));
-            }
-            Err(error) => {
-                return Err(
-                    format!("read generated artifact {}: {error}", full_path.display()).into(),
-                )
-            }
-        }
-    }
-    for path in actual_paths {
-        if !expected.contains_key(&path) {
-            drift.push(format!("unexpected {path}"));
-        }
-    }
-    if drift.is_empty() {
-        return Ok(());
-    }
-    drift.sort();
-    Err(format!(
-        "generated Distributed client artifacts are stale:\n  {}\nrun `distributed client` without --check to regenerate",
-        drift.join("\n  ")
-    )
-    .into())
-}
-
-fn validate_generated_client_files(files: &[GeneratedClientFile]) -> Result<(), Box<dyn Error>> {
-    if files.is_empty() || files.len() > MAX_GENERATED_CLIENT_FILES {
-        return Err(format!(
-            "compiler produced {} files; expected 1..={MAX_GENERATED_CLIENT_FILES}",
-            files.len()
-        )
-        .into());
-    }
-    let mut paths = BTreeSet::new();
-    for file in files {
-        let _ = generated_client_path(Path::new("."), file)?;
-        if !paths.insert(file.path.as_str()) {
-            return Err(format!("compiler produced duplicate path `{}`", file.path).into());
-        }
-    }
-    Ok(())
-}
-
-fn collect_generated_client_paths(root: &Path) -> Result<BTreeSet<String>, Box<dyn Error>> {
-    let mut files = BTreeSet::new();
-    match fs::symlink_metadata(root) {
-        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
-            return Err(format!(
-                "generated output {} must be a real directory, not a symlink or other entry",
-                root.display()
-            )
-            .into())
-        }
-        Ok(_) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(files),
-        Err(error) => {
-            return Err(format!("inspect generated output {}: {error}", root.display()).into())
-        }
-    }
-    let mut pending = vec![(root.to_path_buf(), PathBuf::new())];
-    while let Some((directory, relative)) = pending.pop() {
-        for entry in fs::read_dir(&directory)? {
-            let entry = entry?;
-            let file_type = entry.file_type()?;
-            let next_relative = relative.join(entry.file_name());
-            if file_type.is_symlink() {
-                return Err(format!(
-                    "generated output contains unsupported symlink {}",
-                    entry.path().display()
-                )
-                .into());
-            }
-            if file_type.is_dir() {
-                pending.push((entry.path(), next_relative));
-            } else if file_type.is_file() {
-                files.insert(portable_relative_path(&next_relative)?);
-                if files.len() > MAX_GENERATED_CLIENT_FILES {
-                    return Err(format!(
-                        "generated output {} exceeds {MAX_GENERATED_CLIENT_FILES} files",
-                        root.display()
-                    )
-                    .into());
-                }
-            } else {
-                return Err(format!(
-                    "generated output contains unsupported entry {}",
-                    entry.path().display()
-                )
-                .into());
-            }
-        }
-    }
-    Ok(files)
-}
-
 fn run_client_manifest(args: &ClientManifestArgs) -> Result<(), Box<dyn Error>> {
     let json = run_manifest_harness(
         &HarnessOptions {
@@ -2284,10 +1361,92 @@ fn run_client_manifest(args: &ClientManifestArgs) -> Result<(), Box<dyn Error>> 
             distributed_path: args.distributed_path.clone(),
         },
         HarnessMode::ClientManifest,
+        None,
     )?;
     let manifest: serde_json::Value = serde_json::from_str(&json)?;
     validate_client_manifest_json(&manifest)?;
     println!("{}", serde_json::to_string_pretty(&manifest)?);
+    Ok(())
+}
+
+fn run_game_manifest(args: &GameManifestArgs) -> Result<(), Box<dyn Error>> {
+    let json = run_manifest_harness(
+        &HarnessOptions {
+            path: args.path.clone(),
+            manifest_path: args.manifest_path.clone(),
+            package: args.package.clone(),
+            features: args.features.clone(),
+            no_default_features: args.no_default_features,
+            entrypoint: args.entrypoint.clone(),
+            distributed_path: None,
+        },
+        HarnessMode::GameManifest,
+        None,
+    )?;
+    crate::game_client::validate_game_surface(&json)?;
+    let value: serde_json::Value = serde_json::from_str(&json)?;
+    let pretty = serde_json::to_string_pretty(&value)? + "\n";
+    match &args.out {
+        Some(path) => {
+            if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+                fs::create_dir_all(parent)?;
+            }
+            fs::write(path, pretty)
+                .map_err(|error| format!("write game surface {}: {error}", path.display()))?;
+        }
+        None => print!("{pretty}"),
+    }
+    Ok(())
+}
+
+fn run_game_client(args: &GameClientArgs) -> Result<(), Box<dyn Error>> {
+    let source = read_utf8_bounded(&args.manifest, MAX_CLIENT_MANIFEST_BYTES, "game surface")?;
+    let ext = match args.import_extension {
+        GameImportExtension::Ts => crate::game_client::ImportExtension::Ts,
+        GameImportExtension::Js => crate::game_client::ImportExtension::Js,
+        GameImportExtension::None => crate::game_client::ImportExtension::None,
+    };
+    let files = crate::game_client::generate_game_client(&source, ext)
+        .map_err(|error| format!("{}: {error}", args.manifest.display()))?;
+    if args.check {
+        crate::game_client::check_game_client(&args.out, &files)?;
+        println!(
+            "Game client for {} is current ({} files)",
+            args.manifest.display(),
+            files.len()
+        );
+    } else {
+        crate::game_client::write_game_client(&args.out, &files)?;
+        println!(
+            "Generated {} game client files at {}",
+            files.len(),
+            args.out.display()
+        );
+    }
+    Ok(())
+}
+
+fn run_game_wasm(args: &GameWasmArgs) -> Result<(), Box<dyn Error>> {
+    let source = read_utf8_bounded(&args.manifest, MAX_CLIENT_MANIFEST_BYTES, "game surface")?;
+    let cargo_manifest = args
+        .manifest_path
+        .clone()
+        .unwrap_or_else(|| args.path.join("Cargo.toml"));
+    let outcome = crate::game_wasm::run_game_wasm(&crate::game_wasm::GameWasmOptions {
+        surface: &source,
+        cargo_manifest: &cargo_manifest,
+        out: &args.out,
+        check: args.check,
+    })
+    .map_err(|error| format!("{}: {error}", args.manifest.display()))?;
+    match outcome {
+        crate::game_wasm::GameWasmOutcome::Current(path) => {
+            println!("Compiled game module {} is current", path.display())
+        }
+        crate::game_wasm::GameWasmOutcome::Built(path) => {
+            println!("Compiled game module to {}", path.display())
+        }
+    }
     Ok(())
 }
 
@@ -2307,6 +1466,7 @@ fn run_schema(args: &SchemaArgs) -> Result<(), Box<dyn Error>> {
             distributed_path: args.distributed_path.clone(),
         },
         mode,
+        None,
     ).map_err(|err| -> Box<dyn Error> {
         let msg = err.to_string();
         if msg.contains("graphql_sdl") || msg.contains("no method named `graphql_sdl`") {
@@ -2373,46 +1533,9 @@ fn atlas_spec_from_flags(
     })
 }
 
-fn validate_scaffold_kind(framework: Framework, kind: Option<&str>) -> Result<(), Box<dyn Error>> {
-    if framework != Framework::Distributed {
-        return Err("only --framework distributed is supported".into());
-    }
-
-    if let Some(kind) = kind {
-        match kind {
-            "distributed-microsvc" | "distributed" => {}
-            _ => {
-                return Err(format!(
-                    "unsupported service kind `{kind}`; expected distributed-microsvc"
-                )
-                .into());
-            }
-        }
-    }
-
-    Ok(())
-}
-
-fn ensure_output_dir(path: &Path, force: bool) -> Result<(), Box<dyn Error>> {
-    if path.exists() {
-        if !path.is_dir() {
-            return Err(format!("{} exists and is not a directory", path.display()).into());
-        }
-        if !force && fs::read_dir(path)?.next().is_some() {
-            return Err(format!(
-                "{} already exists and is not empty; pass --force to overwrite generated files",
-                path.display()
-            )
-            .into());
-        }
-    }
-    fs::create_dir_all(path)?;
-    Ok(())
-}
-
 /// Write one generated file under `output_dir`, creating parent directories and
-/// honoring the optional mode hint (executable bit, or a symlink whose
-/// `contents` is the relative target).
+/// honoring the optional mode hint (a symlink whose `contents` is the
+/// relative target).
 fn write_generated_file(output_dir: &Path, file: &GeneratedFile) -> Result<(), Box<dyn Error>> {
     let path = output_dir.join(&file.path);
     if let Some(parent) = path.parent() {
@@ -2422,9 +1545,6 @@ fn write_generated_file(output_dir: &Path, file: &GeneratedFile) -> Result<(), B
         return replace_with_symlink(&path, Path::new(&file.contents));
     }
     fs::write(&path, &file.contents)?;
-    if file.mode == Some(FileMode::Executable) {
-        set_executable(&path)?;
-    }
     Ok(())
 }
 
@@ -2454,104 +1574,36 @@ fn replace_with_symlink(path: &Path, _target: &Path) -> Result<(), Box<dyn Error
     .into())
 }
 
-#[cfg(unix)]
-fn set_executable(path: &Path) -> Result<(), Box<dyn Error>> {
-    use std::os::unix::fs::PermissionsExt;
-    let mut perms = fs::metadata(path)?.permissions();
-    perms.set_mode(perms.mode() | 0o111);
-    fs::set_permissions(path, perms)?;
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn set_executable(_path: &Path) -> Result<(), Box<dyn Error>> {
-    Ok(())
-}
-
-fn parse_optional_github_repo(
-    raw: Option<&str>,
-    flag: &str,
-) -> Result<Option<GithubRepo>, Box<dyn Error>> {
-    raw.map(|value| {
-        GithubRepo::parse(value)
-            .map_err(|err| -> Box<dyn Error> { format!("{flag}: {err}").into() })
-    })
-    .transpose()
-}
-
-fn ensure_github_repo(repo: &GithubRepo) -> Result<(), Box<dyn Error>> {
-    let slug = repo.slug();
-    let view_output = Command::new("gh")
-        .args(["repo", "view", &slug, "--json", "nameWithOwner"])
-        .output();
-
-    match view_output {
-        Ok(output) if output.status.success() => {
-            println!("GitHub repository {slug} already exists");
-            return Ok(());
-        }
-        Ok(_) => {}
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            return Err(
-                "GitHub CLI (`gh`) is not installed or not in PATH. Install it before using --github."
-                    .into(),
-            );
-        }
-        Err(err) => return Err(Box::new(err)),
-    }
-
-    let output = Command::new("gh")
-        .args(github_repo_create_args(&slug))
-        .output()?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("gh repo create failed: {stderr}").into());
-    }
-    println!("Created GitHub repository {slug}");
-    Ok(())
-}
-
-fn github_repo_create_args(slug: &str) -> Vec<&str> {
-    vec!["repo", "create", slug, "--private"]
-}
-
 fn validate_manifest_json(envelope: &serde_json::Value) -> Result<(), Box<dyn Error>> {
-    let Some(schema_version) = envelope
+    let schema_version = envelope
         .get("schema_version")
         .and_then(serde_json::Value::as_u64)
-    else {
-        return Err("manifest JSON is missing numeric schema_version".into());
-    };
+        .ok_or("manifest JSON is missing numeric schema_version")?;
     if schema_version != DISTRIBUTED_MANIFEST_SCHEMA_VERSION {
-        return Err(format!(
-            "unsupported Distributed manifest schema version {schema_version}; expected {DISTRIBUTED_MANIFEST_SCHEMA_VERSION}"
-        )
-        .into());
+        return Err(format!("unsupported Distributed manifest schema version {schema_version}; expected {DISTRIBUTED_MANIFEST_SCHEMA_VERSION}").into());
     }
-    // `describe` emits ApplicationManifest JSON (logical composition artifact),
-    // not the retired DistributedManifestEnvelope { project: ... } shape.
     if envelope
         .get("name")
         .and_then(serde_json::Value::as_str)
-        .map(str::is_empty)
-        .unwrap_or(true)
+        .filter(|name| !name.is_empty())
+        .is_none()
     {
         return Err("application manifest JSON is missing non-empty string name".into());
     }
-    for field in [
-        "modules",
-        "commands",
-        "events",
-        "projections",
-        "models",
-        "surfaces",
-    ] {
+    for field in ["modules", "surfaces"] {
         if envelope
             .get(field)
             .and_then(serde_json::Value::as_array)
             .is_none()
         {
             return Err(format!("application manifest JSON is missing array {field}").into());
+        }
+    }
+    for field in ["commands", "events", "models", "projections"] {
+        if envelope.get(field).is_some() {
+            return Err(
+                format!("application manifest JSON contains redundant inventory {field}").into(),
+            );
         }
     }
     let framework = envelope
@@ -2583,54 +1635,11 @@ fn validate_manifest_json(envelope: &serde_json::Value) -> Result<(), Box<dyn Er
     Ok(())
 }
 
+/// The harness printed exactly the client manifest this CLI was built with.
 fn validate_client_manifest_json(manifest: &serde_json::Value) -> Result<(), Box<dyn Error>> {
-    let Some(version) = manifest
-        .get("manifest_version")
-        .and_then(serde_json::Value::as_u64)
-    else {
-        return Err("client manifest JSON is missing numeric manifest_version".into());
-    };
-    if version != DISTRIBUTED_CLIENT_MANIFEST_VERSION {
-        return Err(format!(
-            "unsupported Distributed client manifest version {version}; expected {DISTRIBUTED_CLIENT_MANIFEST_VERSION}"
-        )
-        .into());
-    }
-    if manifest
-        .get("protocol_version")
-        .and_then(serde_json::Value::as_u64)
-        .is_none()
-    {
-        return Err("client manifest JSON is missing numeric protocol_version".into());
-    }
-    for field in ["service_id", "schema_fingerprint", "protocol_fingerprint"] {
-        if manifest
-            .get(field)
-            .and_then(serde_json::Value::as_str)
-            .is_none()
-        {
-            return Err(format!("client manifest JSON is missing string {field}").into());
-        }
-    }
-    for field in ["surface", "capabilities"] {
-        if manifest
-            .get(field)
-            .and_then(serde_json::Value::as_object)
-            .is_none()
-        {
-            return Err(format!("client manifest JSON is missing object {field}").into());
-        }
-    }
-    for field in ["scalar_codecs", "models", "roots", "commands", "projectors"] {
-        if manifest
-            .get(field)
-            .and_then(serde_json::Value::as_array)
-            .is_none()
-        {
-            return Err(format!("client manifest JSON is missing array {field}").into());
-        }
-    }
-    Ok(())
+    serde_json::from_value::<crate::DistributedClientManifest>(manifest.clone())
+        .map(drop)
+        .map_err(|error| format!("invalid Distributed client manifest: {error}").into())
 }
 
 pub(crate) fn resolve_distributed_path(
@@ -2704,37 +1713,6 @@ fn absolute_path(path: &Path) -> Result<PathBuf, Box<dyn Error>> {
     } else {
         Ok(std::env::current_dir()?.join(path))
     }
-}
-
-fn relative_path(from_dir: &Path, to: &Path) -> PathBuf {
-    let from = path_components(from_dir);
-    let to = path_components(to);
-    let common = from
-        .iter()
-        .zip(to.iter())
-        .take_while(|(left, right)| left == right)
-        .count();
-    let mut relative = PathBuf::new();
-    for _ in common..from.len() {
-        relative.push("..");
-    }
-    for component in &to[common..] {
-        relative.push(component);
-    }
-    if relative.as_os_str().is_empty() {
-        PathBuf::from(".")
-    } else {
-        relative
-    }
-}
-
-fn path_components(path: &Path) -> Vec<OsString> {
-    path.components()
-        .filter_map(|component| match component {
-            Component::Normal(value) => Some(value.to_os_string()),
-            _ => None,
-        })
-        .collect()
 }
 
 pub(crate) fn path_for_toml(path: &Path) -> String {
@@ -2828,40 +1806,13 @@ mod tests {
     }
 
     #[test]
-    fn github_repo_create_args_are_private() {
-        assert_eq!(
-            github_repo_create_args("hops-ops/test-domain"),
-            vec!["repo", "create", "hops-ops/test-domain", "--private"]
-        );
-    }
-
-    #[test]
-    fn client_manifest_validator_accepts_only_current_version() {
-        let manifest = serde_json::json!({
-            "manifest_version": DISTRIBUTED_CLIENT_MANIFEST_VERSION,
-            "protocol_version": 1,
-            "service_id": "orders",
-            "schema_fingerprint": "sha256:schema",
-            "protocol_fingerprint": "sha256:protocol",
-            "surface": {},
-            "capabilities": {},
-            "scalar_codecs": [],
-            "models": [],
-            "roots": [],
-            "commands": [],
-            "projectors": [],
-            "projection_programs": [],
-            "projection_bindings": []
-        });
-        validate_client_manifest_json(&manifest).expect("current manifest version");
-
-        let mut stale = manifest;
-        stale["manifest_version"] = serde_json::json!(3);
-        let error = validate_client_manifest_json(&stale)
+    fn client_manifest_validator_rejects_other_versions() {
+        let error = validate_client_manifest_json(&serde_json::json!({"manifest_version": 3}))
             .expect_err("pre-release v3 manifests must be rejected");
-        assert!(error.to_string().contains(&format!(
-            "version 3; expected {DISTRIBUTED_CLIENT_MANIFEST_VERSION}"
-        )));
+        assert!(
+            error.to_string().contains("version 3; expected 2"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -2879,67 +1830,6 @@ mod tests {
             ProjectGenerationPhase::LifecycleBuild,
             "lifecycle node `application` executor failed"
         ));
-    }
-
-    #[test]
-    fn client_generation_removes_owned_version_one_routes_artifact() {
-        let fixture = tempfile::tempdir().expect("create generated client fixture");
-        let root = fixture.path();
-        fs::write(
-            root.join("manifest.json"),
-            r#"{"compiler_manifest_version":1,"operations":[]}"#,
-        )
-        .expect("write legacy manifest");
-        fs::write(
-            root.join("routes.ts"),
-            "/** GENERATED framework-neutral `@load` ownership plan. */\nexport const DISTRIBUTED_ROUTES = [];\n",
-        )
-        .expect("write legacy routes");
-        let current_manifest =
-            "{\"compiler_manifest_version\":2,\"operations\":[]}\n".to_string();
-        let project = GeneratedClientProject {
-            files: vec![GeneratedClientFile {
-                path: "manifest.json".to_string(),
-                contents: current_manifest.clone(),
-            }],
-            operations: Vec::new(),
-            islands: Vec::new(),
-            schema_fingerprint: "sha256:schema".to_string(),
-            protocol_fingerprint: "sha256:protocol".to_string(),
-        };
-
-        write_client_project(root, &project).expect("upgrade legacy generated client");
-
-        assert!(!root.join("routes.ts").exists());
-        assert_eq!(
-            fs::read_to_string(root.join("manifest.json")).expect("read current manifest"),
-            current_manifest
-        );
-    }
-
-    #[test]
-    fn optional_github_repo_reports_the_flag_on_error() {
-        let err = parse_optional_github_repo(Some("missing-repo"), "--github")
-            .expect_err("invalid repo should error");
-        assert!(err.to_string().contains("--github"));
-        assert!(parse_optional_github_repo(None, "--github")
-            .unwrap()
-            .is_none());
-        let ok = parse_optional_github_repo(Some("hops-ops/test-domain"), "--github")
-            .unwrap()
-            .unwrap();
-        assert_eq!(ok.slug(), "hops-ops/test-domain");
-    }
-
-    #[test]
-    fn scaffold_help_lists_otel_alias() {
-        let mut command = ScaffoldArgs::augment_args(clap::Command::new("scaffold"));
-        let mut help = Vec::new();
-        command.write_help(&mut help).unwrap();
-        let help = String::from_utf8(help).unwrap();
-
-        assert!(help.contains("--tracing"));
-        assert!(help.contains("--otel"));
     }
 
     #[test]

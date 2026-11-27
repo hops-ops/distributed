@@ -486,7 +486,6 @@ mod tests {
             provenance: ArtifactProvenance {
                 sources: sources.iter().map(|source| (*source).into()).collect(),
                 generator: format!("generator.{id}"),
-                source_revision: None,
                 glob_limit: sources
                     .iter()
                     .any(|source| source.contains('*'))
@@ -498,7 +497,6 @@ mod tests {
             }),
             outputs: BTreeMap::from([(format!("{id}-artifact"), output.into())]),
             lifecycle: ["build".into(), "dev".into()].into_iter().collect(),
-            environment_policy: None,
         }
     }
 

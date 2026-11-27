@@ -6,12 +6,18 @@ name: distributed_cli Integration Tests
 on:
   workflow_call:
 
+env:
+  CARGO_TERM_COLOR: always
+  # File and line in backtraces, without the full debug info that makes up
+  # most of a dev build's link time and cache size.
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
+  CARGO_INCREMENTAL: "0"
+
 jobs:
   distributed-cli:
     name: distributed_cli Integration Tests
     runs-on: ubuntu-latest
-    env:
-      CARGO_TERM_COLOR: always
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
         with:
@@ -19,6 +25,12 @@ jobs:
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8
         with:
           toolchain: stable
+          # game-wasm tests compile prediction steps to WebAssembly.
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: cli
+          save-if: ${{ github.event_name != 'pull_request' }}
       - uses: actions/setup-node@v7
         with:
           node-version: "24"

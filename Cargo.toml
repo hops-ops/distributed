@@ -1,6 +1,6 @@
 [workspace]
-members = ["distributed_macros", "distributed_cli"]
-exclude = ["tests/e2e-ui", "tests/celld/worker", "tests/celld/relay-worker"]
+members = ["tests/common", "examples/quickstart", "distributed_macros", "distributed_cli", "distributed_game", "distributed_leaderboard", "distributed_game_macros", "tests/fixtures/renamed-dependency"]
+exclude = ["tests/e2e-ui", "tests/celld/worker", "tests/celld/relay-worker", "tests/celld/alarm-worker", "tests/celld/fact-worker", "tests/celld/zone-worker", "tests/fixtures/wasm32-native-domain", "examples/game/server"]
 resolver = "2"
 
 [workspace.package]
@@ -34,37 +34,62 @@ required-features = ["graphql", "sqlite"]
 
 [features]
 default = []
-application-runtime = []
-runtime = ["application-runtime"]
-emitter = ["dep:event-emitter-rs"]
+# Internal: a Tokio runtime is linked. Every Tokio-using feature implies it and
+# the crate gates its Tokio-only code (outbox and consumer workers) on this one
+# name. Not a public switch: enable the transport or store you need instead.
+runtime-tokio = ["dep:tokio"]
+# Portable gateway declarations, dispatch, whole-operation GraphQL selection
+# and the delivery identity/freshness contracts; runtime adapters are separate.
+gateway = ["dep:url", "dep:async-graphql-parser"]
+# Native HTTP adapter remains independent of GraphQL and SQL.
+gateway-native = ["gateway", "http", "reqwest/stream", "dep:hyper", "dep:hyper-util", "dep:tower", "tokio/io-util"]
+# workers-rs ingress and delivery contracts, without native executors.
+gateway-worker = ["gateway", "dep:worker", "dep:futures-channel"]
+# Native GraphQL execution behind the gateway, including native delivery
+# (snapshots, coalescing, live sharing; each still opt-in at runtime).
+gateway-graphql-native = ["gateway-native", "graphql", "dep:tokio-tungstenite"]
 metrics = []
-http = ["dep:axum", "dep:reqwest", "dep:tokio"]
-grpc = ["dep:tonic", "dep:tonic-prost", "dep:prost", "dep:tokio"]
-postgres = ["dep:sqlx", "dep:tokio", "sqlx/postgres", "sqlx/migrate", "sqlx/runtime-tokio", "sqlx/json"]
-sqlite = ["dep:sqlx", "dep:tokio", "sqlx/migrate", "sqlx/runtime-tokio", "sqlx/sqlite", "sqlx/json"]
-nats = ["dep:async-nats", "dep:futures", "dep:tokio"]
-rabbitmq = ["dep:lapin", "dep:futures", "dep:tokio"]
-kafka = ["dep:rdkafka", "dep:tokio"]
-workers-rs = ["dep:worker"]
-otel = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:tracing", "dep:tracing-opentelemetry"]
-graphql = ["dep:async-graphql", "dep:async-graphql-axum", "dep:hmac", "dep:jsonwebtoken", "http", "axum?/ws"]
+http = ["dep:axum", "dep:reqwest", "runtime-tokio"]
+# Knative: `bus::KnativeBus`, `bus::knative_triggers` and the CloudEvents
+# ingress `microsvc::cloud_events_router`.
+knative = ["http"]
+grpc = ["dep:tonic", "dep:tonic-prost", "dep:prost", "runtime-tokio"]
+postgres = ["dep:sqlx", "runtime-tokio", "sqlx/postgres", "sqlx/migrate", "sqlx/runtime-tokio", "sqlx/json", "common/postgres"]
+sqlite = ["dep:sqlx", "runtime-tokio", "sqlx/migrate", "sqlx/runtime-tokio", "sqlx/sqlite", "sqlx/json", "common/sqlite"]
+nats = ["dep:async-nats", "dep:futures", "runtime-tokio"]
+rabbitmq = ["dep:lapin", "dep:futures", "runtime-tokio"]
+kafka = ["dep:rdkafka", "runtime-tokio"]
+# `bus::RedisStreamPublisher`: the Redis Streams `MessagePublisher`.
+redis-streams = ["dep:redis", "runtime-tokio"]
+# Code that runs inside a celld Worker (wasm32 Durable Objects): the cell
+# host's Durable Object storage and outbox, and the celld Queue publisher.
+cloudflare-workers = ["dep:worker"]
+otel = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:tracing-opentelemetry"]
+graphql = ["common/graphql", "dep:async-graphql", "dep:async-graphql-axum", "dep:futures-channel", "dep:hmac", "dep:jsonwebtoken", "dep:subtle", "futures-util/sink", "http", "axum?/ws"]
 
 [dependencies]
 async-nats = { version = "0.50", optional = true }
 async-trait = "0.1"
 async-graphql = { version = "7", optional = true }
+async-graphql-parser = { version = "7", optional = true }
+tokio-tungstenite = { version = "0.30", optional = true }
 async-graphql-axum = { version = "7", optional = true }
 axum = { version = "0.8", optional = true }
+hyper = { version = "1", features = ["http1", "server"], optional = true }
+hyper-util = { version = "0.1", features = ["tokio"], optional = true }
+tower = { version = "0.5", features = ["util"], optional = true }
 base64 = "0.23.0"
 futures = { version = "0.3", optional = true }
 lapin = { version = "4", optional = true }
 rdkafka = { version = "0.39", features = ["cmake-build", "tokio"], optional = true }
+redis = { version = "1.7.1", default-features = false, features = ["script", "streams", "tokio-comp", "connection-manager"], optional = true }
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"], optional = true }
 jsonwebtoken = { version = "9", optional = true }
 bitcode = { version = "0.6.9", features = ["serde"] }
-event-emitter-rs = { version = "0.1.4", optional = true }
+futures-channel = { version = "0.3", features = ["sink"], optional = true }
 futures-util = { version = "0.3", default-features = false, features = ["alloc"] }
 hmac = { version = "0.12", optional = true }
+subtle = { version = "2", optional = true }
 opentelemetry = { version = "0.32", default-features = false, features = ["trace"], optional = true }
 opentelemetry_sdk = { version = "0.32", default-features = false, features = ["trace"], optional = true }
 serde = { version = "1.0.210", features = ["derive"] }
@@ -76,9 +101,10 @@ tonic = { version = "0.14", default-features = false, features = ["router", "tra
 tonic-prost = { version = "0.14", optional = true }
 prost = { version = "0.14", optional = true }
 tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "time", "sync"], optional = true }
-tracing = { version = "0.1", optional = true }
+tracing = "0.1"
 tracing-opentelemetry = { version = "0.33", default-features = false, optional = true }
 uuid = { version = "1", features = ["v7"] }
+url = { version = "2", optional = true }
 worker = { version = "0.8", features = ["queue"], optional = true }
 
 [target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
@@ -92,11 +118,16 @@ sha2 = "0.10"
 tonic-build = { version = "0.14", default-features = false, features = ["transport"] }
 
 [dev-dependencies]
-axum = "0.8"
+# Shared integration-test fixtures and conformance suites; `sqlite`,
+# `postgres` and `graphql` forward to it.
+common = { path = "tests/common" }
+axum = { version = "0.8", features = ["ws"] }
 distributed_cli = { path = "distributed_cli" }
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
-# OTLP export e2e (tests/otel_export): a real SDK pipeline pointed at a
+# Names the level SQLx logs statements at (src/sqlx_repo/statement_count_tests.rs).
+log = "0.4"
+# OTLP export e2e (tests/observability/otel_export): a real SDK pipeline pointed at a
 # collector container, exercising the `otel` feature the way a service binary
 # would. Keep versions in lockstep with the optional `otel` feature deps.
 opentelemetry-otlp = { version = "0.32", default-features = false, features = ["trace", "http-proto", "reqwest-blocking-client"] }

@@ -5,9 +5,7 @@ mod blob;
 mod chat;
 mod todos;
 
-pub use auth_users::{
-    map_zitadel_user_status, map_zitadel_user_upsert, ZitadelEmail, ZitadelUserPayload,
-};
-pub use blob::{SaveBlobGame, BlobDirectEligibilityGuards, BLOB_GAMES};
+pub use auth_users::{SaveAuthUser, ZitadelUserProfile, AUTH_USERS};
+pub use blob::{SaveBlobGame, BLOB_GAMES};
 pub use chat::{SaveChatMessage, CHAT_MESSAGES};
 pub use todos::{DeleteTodo, SaveTodo, TODOS};

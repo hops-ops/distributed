@@ -4,28 +4,27 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 
 use super::*;
-use crate::graphql::command_contract::CommandProjectionPreviewSource;
+use crate::command::CommandProjectionPreviewSource;
 use crate::graphql::surface::{
     SurfaceProjectionArm, SurfaceProjectionOperation, SurfaceSelectedProjectionProgram,
 };
-use crate::projection::placement::{
-    ProjectionBindingState, ProjectionExecutionClass, ProjectionPlacement,
-};
 use crate::projection::{
-    ProjectionAssignmentRef, ProjectionEnvelopeField, ProjectionExpression,
-    ProjectionExpressionRef, ProjectionInvalidation, ProjectionMutationKind, ProjectionPartition,
-    ProjectionRelationshipEffectKind, ProjectionScalarTransform, ProjectionValue,
+    MutationKind, ProjectionAssignmentRef, ProjectionEnvelopeField, ProjectionExpression,
+    ProjectionExpressionRef, ProjectionInvalidation, ProjectionPartition, ProjectionValue,
     ProjectionValueRef, ProjectionValueType,
 };
 
-pub(super) const CLIENT_PROJECTION_PROGRAM_VERSION: u32 = 2;
-pub(super) const CLIENT_PROJECTION_BINDING_VERSION: u32 = 1;
+/// Version of the client projection-program shape in the manifest.
+pub const CLIENT_PROJECTION_PROGRAM_VERSION: u32 = 2;
+/// Version of the client projection-binding shape in the manifest.
+pub const CLIENT_PROJECTION_BINDING_VERSION: u32 = 1;
 pub(super) const CLIENT_PROJECTION_OPERATION_SEMANTICS_VERSION: u32 = 1;
-pub(super) const COMMAND_PROJECTION_EXTENSION_VERSION: u32 = 2;
+/// Version of a command's `projection` extension slot.
+pub const COMMAND_PROJECTION_EXTENSION_VERSION: u32 = 2;
 
 #[derive(Clone)]
 struct SlotOrigin {
-    event: crate::ProjectionEventSelector,
+    event: crate::projection::ProjectionEventSelector,
     slot: String,
     target: SlotTarget,
     value_type: ProjectionValueType,
@@ -49,21 +48,9 @@ pub(super) fn projection_manifest(
                 version: CLIENT_PROJECTION_BINDING_VERSION,
                 binding_id: modeled.binding_id().to_string(),
                 program_id: modeled.program_id().to_string(),
-                epoch: modeled.epoch().as_str().to_owned(),
-                state: match modeled.state() {
-                    ProjectionBindingState::Active => ClientProjectionBindingState::Active,
-                    ProjectionBindingState::Draining => ClientProjectionBindingState::Draining,
-                },
-                placement: match modeled.placement() {
-                    ProjectionPlacement::Eventual => ClientProjectionPlacement::Eventual,
-                    ProjectionPlacement::Direct => ClientProjectionPlacement::Direct,
-                },
-                execution_class: match modeled.execution_class() {
-                    ProjectionExecutionClass::Causal => ClientProjectionExecutionClass::Causal,
-                    ProjectionExecutionClass::Background => {
-                        ClientProjectionExecutionClass::Background
-                    }
-                },
+                state: modeled.state(),
+                placement: modeled.placement(),
+                execution_class: modeled.execution_class(),
             });
             let Some(selected) = modeled.selected_program() else {
                 continue;
@@ -88,7 +75,6 @@ pub(super) fn projection_manifest(
         left.program_id
             .cmp(&right.program_id)
             .then_with(|| left.binding_id.cmp(&right.binding_id))
-            .then_with(|| left.epoch.cmp(&right.epoch))
     });
     Ok((programs.into_values().collect(), bindings))
 }
@@ -301,8 +287,8 @@ pub(super) fn command_projection_extension(
         .pure_reduces
         .iter()
         .map(|reduce| {
+            use crate::command::CommandProjectionPreviewSource as ServerSource;
             use crate::graphql::client_manifest::ClientProjectionPreviewSource as ClientSource;
-            use crate::graphql::command_contract::CommandProjectionPreviewSource as ServerSource;
             let map_source = |source: &ServerSource| -> Result<ClientSource, ClientManifestError> {
                 Ok(match source {
                     ServerSource::InputPath { path } => ClientSource::Input { path: path.clone() },
@@ -582,7 +568,7 @@ fn auto_aggregate_id_path(
 }
 
 fn lower_program(
-    program_id: crate::ProjectionProgramId,
+    program_id: crate::projection::ProjectionProgramId,
     program: &SurfaceSelectedProjectionProgram,
     surface: &Surface,
     slots: &mut Vec<SlotOrigin>,
@@ -617,7 +603,7 @@ fn lower_program(
 
 #[cfg(test)]
 pub(super) fn lower_program_for_test(
-    program_id: crate::ProjectionProgramId,
+    program_id: crate::projection::ProjectionProgramId,
     program: &SurfaceSelectedProjectionProgram,
     surface: &Surface,
 ) -> Result<ClientProjectionProgram, ClientManifestError> {
@@ -625,7 +611,7 @@ pub(super) fn lower_program_for_test(
 }
 
 fn lower_arm(
-    program_id: crate::ProjectionProgramId,
+    program_id: crate::projection::ProjectionProgramId,
     arm: &SurfaceProjectionArm,
     partition: &ProjectionPartition,
     surface: &Surface,
@@ -652,7 +638,7 @@ fn lower_arm(
 }
 
 fn lower_operation(
-    program_id: crate::ProjectionProgramId,
+    program_id: crate::projection::ProjectionProgramId,
     arm: &SurfaceProjectionArm,
     arm_ref: &str,
     operation: &SurfaceProjectionOperation,
@@ -792,17 +778,7 @@ fn lower_operation(
                 .collect::<Result<Vec<_>, ClientManifestError>>()?;
             Ok(ClientProjectionRelationshipEffect {
                 ordinal: effect.ordinal(),
-                kind: match effect.kind() {
-                    ProjectionRelationshipEffectKind::Link => {
-                        ClientProjectionRelationshipEffectKind::Link
-                    }
-                    ProjectionRelationshipEffectKind::Unlink => {
-                        ClientProjectionRelationshipEffectKind::Unlink
-                    }
-                    ProjectionRelationshipEffectKind::Invalidate => {
-                        ClientProjectionRelationshipEffectKind::Invalidate
-                    }
-                },
+                kind: effect.kind(),
                 source_model: relationship.source_model().to_owned(),
                 relationship: relationship.relationship().to_owned(),
                 target_model: relationship.target_model().to_owned(),
@@ -846,7 +822,7 @@ fn lower_operation(
 }
 
 fn lower_expression(
-    program_id: crate::ProjectionProgramId,
+    program_id: crate::projection::ProjectionProgramId,
     arm: &SurfaceProjectionArm,
     arm_ref: &str,
     position: &str,
@@ -857,7 +833,7 @@ fn lower_expression(
 }
 
 fn lower_expression_at(
-    program_id: crate::ProjectionProgramId,
+    program_id: crate::projection::ProjectionProgramId,
     arm: &SurfaceProjectionArm,
     arm_ref: &str,
     position: &str,
@@ -878,13 +854,11 @@ fn lower_expression_at(
             });
             ClientProjectionExpression::Slot {
                 slot,
-                value_type: client_value_type(value_type),
+                value_type: value_type.clone(),
             }
         }
-        ProjectionExpressionRef::Envelope { field } if intrinsic_envelope(field) => {
-            ClientProjectionExpression::Envelope {
-                field: client_envelope(field),
-            }
+        ProjectionExpressionRef::Envelope { field } if field.is_client_intrinsic() => {
+            ClientProjectionExpression::Envelope { field }
         }
         ProjectionExpressionRef::Envelope { field } => {
             let value_type = envelope_value_type(field);
@@ -896,13 +870,10 @@ fn lower_expression_at(
                 target,
                 value_type: value_type.clone(),
             });
-            ClientProjectionExpression::Slot {
-                slot,
-                value_type: client_value_type(&value_type),
-            }
+            ClientProjectionExpression::Slot { slot, value_type }
         }
         ProjectionExpressionRef::Constant { value } => ClientProjectionExpression::Constant {
-            value: client_value(value),
+            value: value.clone(),
         },
         ProjectionExpressionRef::Enum { enum_type, variant } => ClientProjectionExpression::Enum {
             enum_type: enum_type.to_owned(),
@@ -946,14 +917,7 @@ fn lower_expression_at(
             transform,
             arguments,
         } => ClientProjectionExpression::Transform {
-            transform: match transform {
-                ProjectionScalarTransform::StringConcat => {
-                    ClientProjectionScalarTransform::StringConcat
-                }
-                ProjectionScalarTransform::FirstPresent => {
-                    ClientProjectionScalarTransform::FirstPresent
-                }
-            },
+            transform,
             arguments: arguments
                 .iter()
                 .enumerate()
@@ -973,7 +937,7 @@ fn lower_expression_at(
 }
 
 fn slot_id(
-    program_id: crate::ProjectionProgramId,
+    program_id: crate::projection::ProjectionProgramId,
     arm: &SurfaceProjectionArm,
     arm_ref: &str,
     position: &str,
@@ -994,7 +958,10 @@ fn slot_id(
     )
 }
 
-fn arm_ref(program_id: crate::ProjectionProgramId, arm: &SurfaceProjectionArm) -> String {
+fn arm_ref(
+    program_id: crate::projection::ProjectionProgramId,
+    arm: &SurfaceProjectionArm,
+) -> String {
     opaque_ref(
         b"distributed.client-projection-arm.v1",
         &(
@@ -1007,7 +974,7 @@ fn arm_ref(program_id: crate::ProjectionProgramId, arm: &SurfaceProjectionArm) -
     .expect("canonical projection arm identity serialization cannot fail")
 }
 
-fn event_ref(selector: &crate::ProjectionEventSelector) -> ClientProjectionEventRef {
+fn event_ref(selector: &crate::projection::ProjectionEventSelector) -> ClientProjectionEventRef {
     ClientProjectionEventRef {
         id: opaque_ref(b"distributed.client-projection-event.v1", selector, "pe1")
             .expect("canonical event selector serialization cannot fail"),
@@ -1138,7 +1105,7 @@ fn client_preview_source(
         CommandProjectionPreviewSource::Constant { value } => {
             if constant_compatible(value, expected) {
                 ClientProjectionPreviewSource::Constant {
-                    value: client_value(value),
+                    value: value.clone(),
                 }
             } else {
                 ClientProjectionPreviewSource::Unknown
@@ -1189,9 +1156,10 @@ fn input_field_compatible(
 ) -> bool {
     match expected {
         ProjectionValueType::Boolean => field.type_name == "Boolean",
-        ProjectionValueType::I64 | ProjectionValueType::U64 => {
-            matches!(field.type_name.as_str(), "BigInt" | "Int")
+        ProjectionValueType::I64 => {
+            matches!(field.type_name.as_str(), "BigInt" | "Int") && field.unsigned_integer.is_none()
         }
+        ProjectionValueType::U64 => field.type_name == "BigInt" && field.unsigned_integer.is_some(),
         ProjectionValueType::F64 => field.type_name == "Float",
         ProjectionValueType::String => {
             matches!(field.type_name.as_str(), "ID" | "String" | "Timestamptz")
@@ -1211,8 +1179,11 @@ fn input_field_compatible(
 fn codec_compatible(codec: &str, expected: &ProjectionValueType) -> bool {
     match expected {
         ProjectionValueType::Boolean => codec == "boolean",
-        ProjectionValueType::I64 | ProjectionValueType::U64 => {
-            codec == "json_number_precision_limited"
+        ProjectionValueType::I64 => {
+            matches!(codec, "int32" | "json_number_precision_limited")
+        }
+        ProjectionValueType::U64 => {
+            crate::command::CommandUnsignedInteger::from_client_codec(codec).is_some()
         }
         ProjectionValueType::F64 => codec == "float64",
         ProjectionValueType::String | ProjectionValueType::Enum(_) => codec == "string",
@@ -1235,15 +1206,6 @@ fn constant_compatible(value: &ProjectionValue, expected: &ProjectionValueType) 
     }
 }
 
-fn intrinsic_envelope(field: ProjectionEnvelopeField) -> bool {
-    matches!(
-        field,
-        ProjectionEnvelopeField::OccurrenceVersion
-            | ProjectionEnvelopeField::EventName
-            | ProjectionEnvelopeField::EventVersion
-    )
-}
-
 fn envelope_value_type(field: ProjectionEnvelopeField) -> ProjectionValueType {
     match field {
         ProjectionEnvelopeField::AggregateSequence
@@ -1262,106 +1224,43 @@ fn envelope_value_type(field: ProjectionEnvelopeField) -> ProjectionValueType {
     }
 }
 
-fn client_value(value: &ProjectionValue) -> ClientProjectionValue {
-    match value.as_ref() {
-        ProjectionValueRef::Null => ClientProjectionValue::Null,
-        ProjectionValueRef::Boolean(value) => ClientProjectionValue::Boolean(value),
-        ProjectionValueRef::I64(value) => ClientProjectionValue::I64(value.to_owned()),
-        ProjectionValueRef::U64(value) => ClientProjectionValue::U64(value.to_owned()),
-        ProjectionValueRef::F64(value) => ClientProjectionValue::F64(value.to_owned()),
-        ProjectionValueRef::String(value) => ClientProjectionValue::String(value.to_owned()),
-        ProjectionValueRef::Enum { enum_type, variant } => ClientProjectionValue::Enum {
-            enum_type: enum_type.to_owned(),
-            variant: variant.to_owned(),
-        },
-        ProjectionValueRef::List(values) => {
-            ClientProjectionValue::List(values.iter().map(client_value).collect())
-        }
-        ProjectionValueRef::Object(fields) => ClientProjectionValue::Object(
-            fields
-                .iter()
-                .map(|field| ClientProjectionValueField {
-                    name: field.name().to_owned(),
-                    value: client_value(field.value()),
-                })
-                .collect(),
-        ),
-    }
-}
-
-fn client_value_type(value_type: &ProjectionValueType) -> ClientProjectionValueType {
-    match value_type {
-        ProjectionValueType::Boolean => ClientProjectionValueType::Boolean,
-        ProjectionValueType::I64 => ClientProjectionValueType::I64,
-        ProjectionValueType::U64 => ClientProjectionValueType::U64,
-        ProjectionValueType::F64 => ClientProjectionValueType::F64,
-        ProjectionValueType::String => ClientProjectionValueType::String,
-        ProjectionValueType::Enum(name) => ClientProjectionValueType::Enum(name.clone()),
-        ProjectionValueType::Json => ClientProjectionValueType::Json,
-    }
-}
-
-fn client_envelope(field: ProjectionEnvelopeField) -> ClientProjectionEnvelopeField {
-    match field {
-        ProjectionEnvelopeField::OccurrenceVersion => {
-            ClientProjectionEnvelopeField::OccurrenceVersion
-        }
-        ProjectionEnvelopeField::OccurrenceId
-        | ProjectionEnvelopeField::AggregateType
-        | ProjectionEnvelopeField::AggregateId
-        | ProjectionEnvelopeField::AggregateSequence
-        | ProjectionEnvelopeField::PublicationOrdinal
-        | ProjectionEnvelopeField::BodyFingerprint
-        | ProjectionEnvelopeField::BodyKind
-        | ProjectionEnvelopeField::BodyTypeName
-        | ProjectionEnvelopeField::BodyVersion
-        | ProjectionEnvelopeField::BodySchema
-        | ProjectionEnvelopeField::BodyCodec
-        | ProjectionEnvelopeField::BodyCodecVersion => {
-            unreachable!("non-intrinsic envelope fields are lowered to slots")
-        }
-        ProjectionEnvelopeField::EventName => ClientProjectionEnvelopeField::EventName,
-        ProjectionEnvelopeField::EventVersion => ClientProjectionEnvelopeField::EventVersion,
-    }
-}
-
-fn mutation_kind(kind: ProjectionMutationKind) -> ClientProjectionMutationKind {
+fn mutation_kind(kind: MutationKind) -> ClientProjectionMutationKind {
     match kind {
-        ProjectionMutationKind::Insert => ClientProjectionMutationKind::Insert,
-        ProjectionMutationKind::Upsert => ClientProjectionMutationKind::Upsert,
-        ProjectionMutationKind::Patch => ClientProjectionMutationKind::Patch,
-        ProjectionMutationKind::UpsertPatch => ClientProjectionMutationKind::UpsertPatch,
-        ProjectionMutationKind::Delete => ClientProjectionMutationKind::Delete,
-        ProjectionMutationKind::Recreate => ClientProjectionMutationKind::Recreate,
-        ProjectionMutationKind::InsertRelated => ClientProjectionMutationKind::InsertRelated,
-        ProjectionMutationKind::UpsertRelated => ClientProjectionMutationKind::UpsertRelated,
+        MutationKind::Insert => ClientProjectionMutationKind::Insert,
+        MutationKind::Upsert => ClientProjectionMutationKind::Upsert,
+        MutationKind::Patch => ClientProjectionMutationKind::Patch,
+        MutationKind::UpsertPatch => ClientProjectionMutationKind::UpsertPatch,
+        MutationKind::Delete => ClientProjectionMutationKind::Delete,
+        MutationKind::Recreate => ClientProjectionMutationKind::Recreate,
+        MutationKind::InsertRelated => ClientProjectionMutationKind::InsertRelated,
+        MutationKind::UpsertRelated => ClientProjectionMutationKind::UpsertRelated,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::command::{CommandProjectionPreview, CommandProjectionPreviewSource};
+    use crate::domain_event::{DomainEvent, DomainEventBodyKind};
     use crate::graphql::{
-        build_surface, CommandProjectionPreview, CommandProjectionPreviewSource, SurfaceOptions,
-        SurfaceProjector, SurfaceTypeDef, SurfaceTypeField,
+        build_surface, SurfaceOptions, SurfaceProjector, SurfaceTypeDef, SurfaceTypeField,
     };
     use crate::projection::lower::ProjectionPortableType;
     use crate::projection::placement::{
         ProjectionBindingId, ProjectionBindingState, ProjectionExecutionClass, ProjectionPlacement,
     };
-    use crate::table::{ColumnType, PrimaryKey, TableColumn, TableKind, TableSchema};
-    use crate::{
-        DomainEvent, DomainEventBodyKind, ProjectionEnvelopeField, ProjectionExpression,
-        ProjectionKeyField, ProjectionValue,
+    use crate::projection::{
+        ProjectionEnvelopeField, ProjectionExpression, ProjectionKeyField, ProjectionValue,
     };
+    use crate::table::{ColumnType, PrimaryKey, TableColumn, TableKind, TableSchema};
 
-    #[derive(Serialize, crate::DomainEvent)]
+    #[derive(Serialize, crate::domain_event::DomainEvent)]
     #[domain_event(name = "todo.preview-a", version = 1)]
     struct PreviewA {
         value: String,
     }
 
-    #[derive(Serialize, crate::DomainEvent)]
+    #[derive(Serialize, crate::domain_event::DomainEvent)]
     #[domain_event(name = "todo.preview-b", version = 1)]
     struct PreviewB {
         value: String,
@@ -1382,7 +1281,6 @@ mod tests {
                 ],
                 primary_key: PrimaryKey::new(["todo_pk"]),
                 version_column: None,
-                foreign_keys: Vec::new(),
                 indexes: Vec::new(),
                 relationships: Vec::new(),
                 kind: TableKind::ReadModel,
@@ -1392,9 +1290,9 @@ mod tests {
         .unwrap()
     }
 
-    fn selector() -> crate::ProjectionEventSelector {
-        crate::ProjectionEventSelector::try_new(
-            crate::DOMAIN_EVENT_OCCURRENCE_VERSION,
+    fn selector() -> crate::projection::ProjectionEventSelector {
+        crate::projection::ProjectionEventSelector::try_new(
+            crate::domain_event::DOMAIN_EVENT_OCCURRENCE_VERSION,
             "todo.purged",
             1,
             DomainEventBodyKind::Deletion,
@@ -1402,8 +1300,8 @@ mod tests {
             1,
             "private-delete-schema",
             "sha256:1111111111111111111111111111111111111111111111111111111111111111",
-            crate::DOMAIN_EVENT_BODY_CODEC,
-            crate::DOMAIN_EVENT_BODY_CODEC_VERSION,
+            crate::domain_event::DOMAIN_EVENT_BODY_CODEC,
+            crate::domain_event::DOMAIN_EVENT_BODY_CODEC_VERSION,
         )
         .unwrap()
     }
@@ -1416,6 +1314,7 @@ mod tests {
             input: SurfaceCommandShape::Typed(SurfaceTypeDef {
                 name: "TodoPreviewInput".into(),
                 fields: vec![SurfaceTypeField {
+                    unsigned_integer: None,
                     name: "value".into(),
                     type_name: input_type.into(),
                     nullable: false,
@@ -1430,36 +1329,33 @@ mod tests {
             }),
             consistency: CommandConsistency::Succeeded,
             input_defaults: Vec::new(),
-            effects: None,
-            confirmations: Vec::new(),
             projected_model: None,
             direct_projection: None,
             projections: Default::default(),
-            confirmation_unavailable: false,
         }
     }
 
-    fn typed_selector<E: DomainEvent>() -> crate::ProjectionEventSelector {
-        crate::ProjectionEventSelector::try_from_descriptor(&E::DESCRIPTOR).unwrap()
+    fn typed_selector<E: DomainEvent>() -> crate::projection::ProjectionEventSelector {
+        crate::projection::ProjectionEventSelector::try_from_descriptor(&E::DESCRIPTOR).unwrap()
     }
 
     fn selected_program(
         name: &str,
-        selectors: impl IntoIterator<Item = crate::ProjectionEventSelector>,
+        selectors: impl IntoIterator<Item = crate::projection::ProjectionEventSelector>,
     ) -> SurfaceSelectedProjectionProgram {
         selected_program_with_partition(name, selectors, ProjectionPartition::Unit)
     }
 
     fn selected_program_with_partition(
         name: &str,
-        selectors: impl IntoIterator<Item = crate::ProjectionEventSelector>,
+        selectors: impl IntoIterator<Item = crate::projection::ProjectionEventSelector>,
         partition: ProjectionPartition,
     ) -> SurfaceSelectedProjectionProgram {
         let operations = |ordinal| {
             vec![SurfaceProjectionOperation {
                 operation_id: format!("{name}-delete-{ordinal}"),
                 staging_ordinal: ordinal,
-                kind: ProjectionMutationKind::Delete,
+                kind: MutationKind::Delete,
                 model: "TodoView".into(),
                 storage: "todos".into(),
                 key: vec![ProjectionKeyField::try_new(
@@ -1494,7 +1390,7 @@ mod tests {
 
     fn selected_constant_program(
         name: &str,
-        selector: crate::ProjectionEventSelector,
+        selector: crate::projection::ProjectionEventSelector,
     ) -> SurfaceSelectedProjectionProgram {
         SurfaceSelectedProjectionProgram {
             name: name.into(),
@@ -1508,7 +1404,7 @@ mod tests {
                 operations: vec![SurfaceProjectionOperation {
                     operation_id: format!("{name}-delete"),
                     staging_ordinal: 0,
-                    kind: ProjectionMutationKind::Delete,
+                    kind: MutationKind::Delete,
                     model: "TodoView".into(),
                     storage: "todos".into(),
                     key: vec![ProjectionKeyField::try_new(
@@ -1528,7 +1424,7 @@ mod tests {
 
     fn selected_value_patch_program(
         name: &str,
-        selector: crate::ProjectionEventSelector,
+        selector: crate::projection::ProjectionEventSelector,
     ) -> SurfaceSelectedProjectionProgram {
         SurfaceSelectedProjectionProgram {
             name: name.into(),
@@ -1542,7 +1438,7 @@ mod tests {
                 operations: vec![SurfaceProjectionOperation {
                     operation_id: format!("{name}-patch"),
                     staging_ordinal: 0,
-                    kind: ProjectionMutationKind::Patch,
+                    kind: MutationKind::Patch,
                     model: "TodoView".into(),
                     storage: "todos".into(),
                     key: vec![ProjectionKeyField::try_new(
@@ -1586,7 +1482,7 @@ mod tests {
         selected: Option<SurfaceSelectedProjectionProgram>,
     ) -> crate::graphql::SurfaceModeledProjection {
         crate::graphql::SurfaceModeledProjection::selected_for_client_manifest_test(
-            crate::ProjectionProgramId::parse(&format!(
+            crate::projection::ProjectionProgramId::parse(&format!(
                 "pp1:sha256:{}",
                 format!("{seed:02x}").repeat(32)
             ))
@@ -1656,7 +1552,8 @@ mod tests {
 
     #[test]
     fn auto_optimism_maps_input_defaults_and_row_policy_claims() {
-        use crate::graphql::command_contract::{CommandInputDefault, InputDefaultGenerator};
+        use crate::command::{CommandInputDefault, InputDefaultGenerator};
+
         use crate::graphql::{claim, col};
 
         let selector = typed_selector::<PreviewA>();
@@ -1672,7 +1569,7 @@ mod tests {
                 operations: vec![SurfaceProjectionOperation {
                     operation_id: "auto-upsert".into(),
                     staging_ordinal: 0,
-                    kind: ProjectionMutationKind::Upsert,
+                    kind: MutationKind::Upsert,
                     model: "TodoView".into(),
                     storage: "todos".into(),
                     key: vec![ProjectionKeyField::try_new(
@@ -1729,6 +1626,7 @@ mod tests {
                 name: "TodoCreateInput".into(),
                 fields: vec![
                     SurfaceTypeField {
+                        unsigned_integer: None,
                         name: "todo_id".into(),
                         type_name: "ID".into(),
                         nullable: false,
@@ -1737,6 +1635,7 @@ mod tests {
                         nested: None,
                     },
                     SurfaceTypeField {
+                        unsigned_integer: None,
                         name: "title".into(),
                         type_name: "String".into(),
                         nullable: false,
@@ -1752,12 +1651,9 @@ mod tests {
                 path: vec!["todo_id".into()],
                 generator: InputDefaultGenerator::UuidV7,
             }],
-            effects: None,
-            confirmations: Vec::new(),
             projected_model: None,
             direct_projection: None,
             projections: Default::default(),
-            confirmation_unavailable: false,
         };
         command.projections.add_event_set(crate::events![PreviewA]);
 
@@ -1842,7 +1738,7 @@ mod tests {
             command.consistency = consistency;
             command.projections.add_event_set(crate::events![PreviewA]);
             command.projections.add_inferred_values(
-                crate::graphql::__command_projection_event_preview::<PreviewA, PreviewA>(vec![(
+                crate::command::__command_projection_event_preview::<PreviewA, PreviewA>(vec![(
                     "value",
                     CommandProjectionPreviewSource::constant(ProjectionValue::string(
                         "transition-value",
@@ -1860,9 +1756,8 @@ mod tests {
                 .iter()
                 .any(|value| matches!(
                     &value.source,
-                    ClientProjectionPreviewSource::Constant {
-                        value: ClientProjectionValue::String(value),
-                    } if value == "transition-value"
+                    ClientProjectionPreviewSource::Constant { value }
+                        if value == &ProjectionValue::string("transition-value")
                 )));
         }
     }
@@ -2024,8 +1919,11 @@ mod tests {
                 ProjectionValue::string("tenant-a"),
             )),
         );
-        let program_id =
-            crate::ProjectionProgramId::parse(&format!("pp1:sha256:{}", "22".repeat(32))).unwrap();
+        let program_id = crate::projection::ProjectionProgramId::parse(&format!(
+            "pp1:sha256:{}",
+            "22".repeat(32)
+        ))
+        .unwrap();
         let mut unit_slots = Vec::new();
         let unit = lower_program(program_id, &unit, &todo_surface(), &mut unit_slots).unwrap();
         let mut expression_slots = Vec::new();
@@ -2191,7 +2089,7 @@ mod tests {
         let (programs, bindings) = projection_manifest(&surface).unwrap();
         assert_eq!(programs.len(), 1);
         assert_eq!(bindings.len(), 1);
-        assert_eq!(bindings[0].placement, ClientProjectionPlacement::Direct);
+        assert_eq!(bindings[0].placement, ProjectionPlacement::Direct);
 
         let mut command = command("String");
         command.projections.add_event_set(crate::events![PreviewA]);
@@ -2217,7 +2115,7 @@ mod tests {
         let (programs, bindings) = projection_manifest(&surface).unwrap();
         assert!(programs.is_empty());
         assert_eq!(bindings.len(), 1);
-        assert_eq!(bindings[0].placement, ClientProjectionPlacement::Direct);
+        assert_eq!(bindings[0].placement, ProjectionPlacement::Direct);
     }
 
     #[test]
@@ -2228,7 +2126,7 @@ mod tests {
             operations: vec![SurfaceProjectionOperation {
                 operation_id: "delete-todo".into(),
                 staging_ordinal: 0,
-                kind: ProjectionMutationKind::Delete,
+                kind: MutationKind::Delete,
                 model: "TodoView".into(),
                 storage: "todos".into(),
                 key: vec![
@@ -2265,29 +2163,32 @@ mod tests {
             partition: ProjectionPartition::Unit,
             arms: vec![arm],
         };
-        let program_id =
-            crate::ProjectionProgramId::parse(&format!("pp1:sha256:{}", "11".repeat(32))).unwrap();
+        let program_id = crate::projection::ProjectionProgramId::parse(&format!(
+            "pp1:sha256:{}",
+            "11".repeat(32)
+        ))
+        .unwrap();
         let mut slots = Vec::new();
         let lowered = lower_program(program_id, &selected, &todo_surface(), &mut slots).unwrap();
         let key = &lowered.arms[0].operations[0].key;
         assert!(matches!(
             key[0].expression,
             ClientProjectionExpression::Slot {
-                value_type: ClientProjectionValueType::String,
+                value_type: ProjectionValueType::String,
                 ..
             }
         ));
         assert!(matches!(
             key[1].expression,
             ClientProjectionExpression::Slot {
-                value_type: ClientProjectionValueType::String,
+                value_type: ProjectionValueType::String,
                 ..
             }
         ));
         assert!(matches!(
             key[2].expression,
             ClientProjectionExpression::Envelope {
-                field: ClientProjectionEnvelopeField::EventName
+                field: ProjectionEnvelopeField::EventName
             }
         ));
         assert_eq!(slots.len(), 2);
@@ -2301,6 +2202,43 @@ mod tests {
     fn preview_sources_require_exact_typed_and_presence_proof() {
         let string_command = command("String");
         let input = CommandProjectionPreviewSource::input(["value"]);
+
+        let mut unsigned_command = command("BigInt");
+        let signed_command = unsigned_command.clone();
+        let SurfaceCommandShape::Typed(definition) = &mut unsigned_command.input else {
+            unreachable!()
+        };
+        definition.fields[0].unsigned_integer = Some(crate::command::CommandUnsignedInteger::U64);
+        for (command, allowed) in [(&unsigned_command, true), (&signed_command, false)] {
+            let source = client_preview_source(
+                &input,
+                true,
+                None,
+                Some(ProjectionPortableType::U64),
+                Some("u64"),
+                Some(false),
+                Some(true),
+                &ProjectionValueType::U64,
+                command,
+            )
+            .unwrap();
+            assert_eq!(
+                matches!(source, ClientProjectionPreviewSource::Input { .. }),
+                allowed
+            );
+        }
+        assert!(codec_compatible(
+            "uint64_safe_integer",
+            &ProjectionValueType::U64
+        ));
+        assert!(!codec_compatible(
+            "json_number_precision_limited",
+            &ProjectionValueType::U64
+        ));
+        assert!(codec_compatible(
+            "json_number_precision_limited",
+            &ProjectionValueType::I64
+        ));
 
         assert_eq!(
             client_preview_source(

@@ -1,3 +1,4 @@
+import { oncePerIdentity } from '../lib/once-per-identity.js';
 import { isDistributedTrustedPresetCodec } from '../protocol.js';
 import type { GraphqlVariables } from '../types.js';
 import type {
@@ -17,12 +18,25 @@ export type ValidatedReplicaOperationBinding = {
 /**
  * Validate the exact compiler-owned protocol identity before an operation may
  * acquire a cache key, register a maintenance plan, or reach a transport.
+ * An artifact is an immutable generated constant, validated once.
  */
 export function validateReplicaOperationBinding<
 	TData,
 	TVariables extends GraphqlVariables
 >(
 	artifact: ReplicaOperationArtifact<TData, TVariables>
+): ValidatedReplicaOperationBinding {
+	return oncePerIdentity(
+		validatedBindings,
+		artifact as ReplicaOperationArtifact<unknown, GraphqlVariables>,
+		validateBinding
+	);
+}
+
+const validatedBindings = new WeakMap<object, ValidatedReplicaOperationBinding>();
+
+function validateBinding(
+	artifact: ReplicaOperationArtifact<unknown, GraphqlVariables>
 ): ValidatedReplicaOperationBinding {
 	if (typeof artifact.id !== 'string' || artifact.id.length === 0) {
 		throw new TypeError('replica artifact id must be a non-empty string');

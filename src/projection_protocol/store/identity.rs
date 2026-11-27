@@ -9,7 +9,6 @@ pub(super) const MAX_FAILURE_CODE_BYTES: usize = 255;
 pub(super) const MAX_FAILURE_DETAIL_BYTES: usize = 1024 * 1024;
 pub(crate) const MAX_PROJECTION_QUERY_CHECKPOINT_PROBES: usize = 128;
 pub(crate) const MAX_PROJECTION_QUERY_BATCH_ROWS: usize = 4_096;
-pub(crate) const MAX_PROJECTION_QUERY_BATCH_CHECKPOINT_PROBES: usize = 4_096;
 pub(crate) const MAX_PROJECTION_EVIDENCE_BATCH_ITEMS: usize = 128;
 
 /// Default maximum number of durable changes retained per projector partition.
@@ -110,6 +109,7 @@ impl ProjectionInputFingerprint {
         Self(domain_separated_digest(INPUT_FINGERPRINT_DOMAIN, bytes))
     }
 
+    #[cfg(any(feature = "sqlite", feature = "postgres"))]
     pub(crate) fn from_digest(digest: [u8; 32]) -> Self {
         Self(digest)
     }
@@ -182,6 +182,8 @@ impl TrustedProjectionInput {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum ProjectionInputDisposition {
     Pending,
+    /// Identical logical input at a new adapter-authenticated broker position.
+    Redelivery,
     Duplicate(ProjectionCheckpoint),
     Stale(ProjectionCheckpoint),
 }
@@ -191,6 +193,13 @@ pub(crate) enum ProjectionInputDisposition {
 pub(crate) struct ProjectionModelOwnership {
     pub(crate) model: String,
     pub(crate) table: String,
+    /// Semantic author identity for a commit carrying this ownership.
+    ///
+    /// Bootstrap declarations leave this unset. A modeled projector attaches
+    /// its immutable program identity when sealing a commit; the adapter
+    /// persists that identity on each change/observation rather than changing
+    /// an existing ownership row retroactively.
+    pub(crate) program_id: Option<ProjectionProgramId>,
 }
 
 impl ProjectionModelOwnership {
@@ -201,7 +210,13 @@ impl ProjectionModelOwnership {
         Ok(Self {
             model: bounded_name("projection model", model, 255)?,
             table: bounded_name("projection table", table, 255)?,
+            program_id: None,
         })
+    }
+
+    pub(crate) fn with_program_id(mut self, program_id: ProjectionProgramId) -> Self {
+        self.program_id = Some(program_id);
+        self
     }
 }
 
@@ -218,7 +233,7 @@ pub(crate) enum ProjectionRecordExpectation {
 
 /// Protocol meaning of a staged table mutation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum ProjectionMutationKind {
+pub(crate) enum RecordTransition {
     Upsert,
     Delete,
     Recreate,
@@ -230,7 +245,8 @@ pub(crate) struct ProjectionRecordMutation {
     pub(crate) scope: ProjectionRecordScope,
     pub(crate) mutation: TableMutation,
     pub(crate) expectation: ProjectionRecordExpectation,
-    pub(crate) kind: ProjectionMutationKind,
+    pub(crate) kind: RecordTransition,
+    pub(crate) source_snapshot: Option<super::super::SourceSnapshotVersion>,
 }
 
 impl ProjectionRecordMutation {
@@ -238,7 +254,17 @@ impl ProjectionRecordMutation {
         scope: ProjectionRecordScope,
         mutation: TableMutation,
         expectation: ProjectionRecordExpectation,
-        kind: ProjectionMutationKind,
+        kind: RecordTransition,
+    ) -> Result<Self, ProjectionProtocolError> {
+        Self::with_source_snapshot(scope, mutation, expectation, kind, None)
+    }
+
+    pub(crate) fn with_source_snapshot(
+        scope: ProjectionRecordScope,
+        mutation: TableMutation,
+        expectation: ProjectionRecordExpectation,
+        kind: RecordTransition,
+        source_snapshot: Option<super::super::SourceSnapshotVersion>,
     ) -> Result<Self, ProjectionProtocolError> {
         if let ProjectionRecordExpectation::Exact(revision) = &expectation {
             if revision.scope() != &scope {
@@ -248,15 +274,14 @@ impl ProjectionRecordMutation {
             }
         }
         let is_delete = matches!(mutation, TableMutation::DeleteRow(_));
-        if is_delete != matches!(kind, ProjectionMutationKind::Delete) {
+        if is_delete != matches!(kind, RecordTransition::Delete) {
             return Err(ProjectionProtocolError::InvalidBatch(
                 "projection delete kind and table mutation disagree".into(),
             ));
         }
-        if matches!(
-            kind,
-            ProjectionMutationKind::Delete | ProjectionMutationKind::Recreate
-        ) && !matches!(expectation, ProjectionRecordExpectation::Exact(_))
+        if (kind == RecordTransition::Recreate
+            || (kind == RecordTransition::Delete && source_snapshot.is_none()))
+            && !matches!(expectation, ProjectionRecordExpectation::Exact(_))
         {
             return Err(ProjectionProtocolError::InvalidBatch(
                 "projection delete/recreate requires an exact record revision".into(),
@@ -267,6 +292,7 @@ impl ProjectionRecordMutation {
             mutation,
             expectation,
             kind,
+            source_snapshot,
         })
     }
 }

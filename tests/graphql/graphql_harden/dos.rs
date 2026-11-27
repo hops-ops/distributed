@@ -1,0 +1,551 @@
+//! D* Resource-exhaustion red-team suite.
+
+use distributed::graphql::IdentityConfig;
+use std::sync::Arc;
+use std::time::Duration;
+
+use async_graphql::Request;
+use distributed::graphql::{read, GraphqlEngine, ModelPermissions};
+
+use common::graphql::{
+    assert_no_sql_leak, child, engine_all_columns, error_messages, order, parent, seed_orders,
+    session, Db, OrderView,
+};
+
+pub async fn where_max_depth_rejected(db: Db) {
+    let pool = seed_orders(&db).await;
+    let engine = GraphqlEngine::builder(pool)
+        .identity(IdentityConfig::dev_headers())
+        .roles(&["user"])
+        .model::<OrderView>(ModelPermissions::new().grant("user", read().all_columns()))
+        .max_depth(2)
+        .build()
+        .unwrap();
+    let s = session("user", "tenant-a");
+    let q = r#"{
+      orders(where: { _and: [{ _and: [{ _and: [{ status: { _eq: "open" } }] }] }] }) {
+        order_id
+      }
+    }"#;
+    let resp = engine.execute(&s, Request::new(q)).await;
+    assert!(!resp.errors.is_empty(), "expected max depth error");
+    let msgs = error_messages(&resp);
+    assert!(
+        msgs.contains("depth") || msgs.contains("bad request"),
+        "expected depth-related client error, got {msgs}"
+    );
+    assert_no_sql_leak(&resp);
+}
+
+pub async fn graphql_depth_counts_root_and_leaf_fields(db: Db) {
+    let pool = seed_orders(&db).await;
+    let too_shallow = GraphqlEngine::builder(pool.clone())
+        .identity(IdentityConfig::dev_headers())
+        .roles(&["user"])
+        .model::<OrderView>(ModelPermissions::new().grant("user", read().all_columns()))
+        .max_depth(1)
+        .build()
+        .unwrap();
+    let exact = GraphqlEngine::builder(pool)
+        .identity(IdentityConfig::dev_headers())
+        .roles(&["user"])
+        .model::<OrderView>(ModelPermissions::new().grant("user", read().all_columns()))
+        .max_depth(2)
+        .build()
+        .unwrap();
+    let s = session("user", "tenant-a");
+    let rejected = too_shallow
+        .execute(&s, Request::new("{ orders { order_id } }"))
+        .await;
+    assert!(!rejected.errors.is_empty(), "root plus leaf has depth two");
+    assert_no_sql_leak(&rejected);
+
+    let accepted = exact
+        .execute(&s, Request::new("{ orders { order_id } }"))
+        .await;
+    assert!(accepted.errors.is_empty(), "{accepted:?}");
+}
+
+pub async fn max_in_list_rejected(db: Db) {
+    let pool = seed_orders(&db).await;
+    let engine = GraphqlEngine::builder(pool)
+        .identity(IdentityConfig::dev_headers())
+        .roles(&["user"])
+        .model::<OrderView>(ModelPermissions::new().grant("user", read().all_columns()))
+        .max_in_list(3)
+        .build()
+        .unwrap();
+    let s = session("user", "x");
+    let q = r#"{ orders(where: { order_id: { _in: ["a","b","c","d"] } }) { order_id } }"#;
+    let resp = engine.execute(&s, Request::new(q)).await;
+    assert!(
+        !resp.errors.is_empty(),
+        "expected list-too-long style error"
+    );
+    assert_no_sql_leak(&resp);
+}
+
+pub async fn limit_clamped_by_max_limit(db: Db) {
+    let pool = seed_orders(&db).await;
+    let engine = GraphqlEngine::builder(pool)
+        .identity(IdentityConfig::dev_headers())
+        .roles(&["user"])
+        .model::<OrderView>(ModelPermissions::new().grant("user", read().all_columns()))
+        .max_limit(1)
+        .default_limit(1)
+        .build()
+        .unwrap();
+    let s = session("user", "x");
+    let resp = engine
+        .execute(&s, Request::new("{ orders(limit: 100) { order_id } }"))
+        .await;
+    assert!(resp.errors.is_empty(), "{:?}", resp.errors);
+    let data = serde_json::to_value(&resp.data).unwrap();
+    assert_eq!(data["orders"].as_array().unwrap().len(), 1);
+}
+
+/// D5: wide `_or` list rejected by `max_bool_width`.
+pub async fn d5_wide_or_list_rejected_by_max_bool_width(db: Db) {
+    let pool = seed_orders(&db).await;
+    let engine = GraphqlEngine::builder(pool)
+        .identity(IdentityConfig::dev_headers())
+        .roles(&["user"])
+        .model::<OrderView>(ModelPermissions::new().grant("user", read().all_columns()))
+        .max_bool_width(3)
+        .build()
+        .unwrap();
+    let s = session("user", "x");
+    // 4 disjuncts > max_bool_width 3
+    let q = r#"{
+      orders(where: { _or: [
+        { status: { _eq: "open" } },
+        { status: { _eq: "shipped" } },
+        { status: { _eq: "closed" } },
+        { status: { _eq: "x" } }
+      ] }) { order_id }
+    }"#;
+    let resp = engine.execute(&s, Request::new(q)).await;
+    assert!(
+        !resp.errors.is_empty(),
+        "expected breadth limit error for wide _or"
+    );
+    let msgs = error_messages(&resp);
+    assert!(
+        msgs.contains("list too long") || msgs.contains("bad request"),
+        "expected list-too-long style message, got {msgs}"
+    );
+    assert_no_sql_leak(&resp);
+}
+
+/// D5 complementary: `_and` width bound.
+pub async fn d5_wide_and_list_rejected_by_max_bool_width(db: Db) {
+    let pool = seed_orders(&db).await;
+    let engine = GraphqlEngine::builder(pool)
+        .identity(IdentityConfig::dev_headers())
+        .roles(&["user"])
+        .model::<OrderView>(ModelPermissions::new().grant("user", read().all_columns()))
+        .max_bool_width(2)
+        .build()
+        .unwrap();
+    let s = session("user", "x");
+    let q = r#"{
+      orders(where: { _and: [
+        { status: { _eq: "open" } },
+        { total_cents: { _gt: 0 } },
+        { order_id: { _neq: "" } }
+      ] }) { order_id }
+    }"#;
+    let resp = engine.execute(&s, Request::new(q)).await;
+    assert!(!resp.errors.is_empty(), "expected _and breadth error");
+    assert_no_sql_leak(&resp);
+}
+
+/// D7: concurrent executes complete without hang; short timeouts map cleanly.
+pub async fn d7_concurrent_queries_complete(db: Db) {
+    let pool = seed_orders(&db).await;
+    let engine = Arc::new(engine_all_columns(pool));
+    let mut handles = Vec::new();
+    for i in 0..8 {
+        let engine = Arc::clone(&engine);
+        handles.push(tokio::spawn(async move {
+            let s = session("user", "x");
+            let q = if i % 2 == 0 {
+                "{ orders { order_id } }"
+            } else {
+                r#"{ orders(where: { status: { _eq: "open" } }) { order_id status } }"#
+            };
+            let resp = engine.execute(&s, Request::new(q)).await;
+            assert_no_sql_leak(&resp);
+            resp.errors.is_empty()
+        }));
+    }
+    for h in handles {
+        assert!(h.await.expect("join"), "concurrent query should succeed");
+    }
+}
+
+/// D7b: concurrent queries under tight statement_timeout still terminate.
+pub async fn d7_concurrent_with_timeout_bound_terminates(db: Db) {
+    db.seed([order("o1", "t", "open", 1, "n")]).await;
+    let pool = db.pool();
+
+    let engine = Arc::new(
+        GraphqlEngine::builder(pool)
+            .identity(IdentityConfig::dev_headers())
+            .roles(&["user"])
+            .model::<OrderView>(ModelPermissions::new().grant("user", read().all_columns()))
+            .statement_timeout(Duration::from_secs(2))
+            .build()
+            .unwrap(),
+    );
+
+    let mut handles = Vec::new();
+    for _ in 0..6 {
+        let engine = Arc::clone(&engine);
+        handles.push(tokio::spawn(async move {
+            let s = session("user", "x");
+            let resp = engine
+                .execute(&s, Request::new("{ orders { order_id } }"))
+                .await;
+            assert_no_sql_leak(&resp);
+            // Success or timeout — both terminate.
+            true
+        }));
+    }
+    let result = tokio::time::timeout(Duration::from_secs(10), async {
+        for h in handles {
+            assert!(h.await.expect("join"));
+        }
+    })
+    .await;
+    assert!(result.is_ok(), "concurrent suite must not hang");
+}
+
+/// Nested has_many fan-out exceeds relationship-aware complexity budget while
+/// staying under max_depth (proves weights, not only depth).
+pub async fn d8_two_level_default_nest_exceeds_row_budget(db: Db) {
+    use distributed::graphql::{read, GraphqlEngine};
+    use distributed::read_model::ReadModel;
+    use distributed::read_model::RelationalReadModel;
+    use distributed::table::{ReadModelCatalog, RelationshipDef, RelationshipKind};
+    use serde::{Deserialize, Serialize};
+
+    #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, ReadModel)]
+    #[table("parents")]
+    struct ParentView {
+        #[id("parent_id")]
+        parent_id: String,
+        name: String,
+    }
+    #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, ReadModel)]
+    #[table("children")]
+    struct ChildView {
+        #[id("child_id")]
+        child_id: String,
+        parent_id: String,
+        name: String,
+    }
+    #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, ReadModel)]
+    #[table("grandchildren")]
+    struct GrandView {
+        #[id("grand_id")]
+        grand_id: String,
+        child_id: String,
+        name: String,
+    }
+
+    db.seed([parent("p1", "P")]).await;
+    db.seed([child("c1", "p1", "C")]).await;
+    db.seed([GrandView {
+        grand_id: "g1".into(),
+        child_id: "c1".into(),
+        name: "G".into(),
+    }])
+    .await;
+    let pool = db.pool();
+
+    let mut parent = ParentView::schema().clone();
+    parent.relationships = vec![RelationshipDef {
+        references: None,
+        field_name: "children".into(),
+        kind: RelationshipKind::HasMany,
+        target_model: "ChildView".into(),
+        foreign_key: Some("parent_id".into()),
+        through: None,
+        target_foreign_key: None,
+    }];
+    let mut child = ChildView::schema().clone();
+    child.relationships = vec![RelationshipDef {
+        references: None,
+        field_name: "grandchildren".into(),
+        kind: RelationshipKind::HasMany,
+        target_model: "GrandView".into(),
+        foreign_key: Some("child_id".into()),
+        through: None,
+        target_foreign_key: None,
+    }];
+    let grand = GrandView::schema().clone();
+    let manifest = ReadModelCatalog::new("cx")
+        .table_schema(parent)
+        .table_schema(child)
+        .table_schema(grand);
+
+    // Default max_rows (200,000) + max_depth high enough that depth is not the limit.
+    let engine = GraphqlEngine::from_schema_catalog(&manifest, pool)
+        .unwrap()
+        .identity(IdentityConfig::dev_headers())
+        .roles(&["user"])
+        .max_depth(8)
+        .permission::<ParentView>("user", read().all_columns())
+        .permission::<ChildView>("user", read().all_columns())
+        .permission::<GrandView>("user", read().all_columns())
+        .build()
+        .expect("build");
+
+    let s = session("user", "u");
+    // Three default pages nested: 100 × (1 + 100 × (1 + 100)) = 1,010,100 rows.
+    let q = r#"{
+      parents {
+        parent_id
+        children {
+          child_id
+          name
+          grandchildren {
+            grand_id
+            name
+          }
+        }
+      }
+    }"#;
+    let resp = engine.execute(&s, Request::new(q)).await;
+    assert!(
+        !resp.errors.is_empty(),
+        "3-level nested has_many must exceed the row budget"
+    );
+    assert_no_sql_leak(&resp);
+    let msgs = error_messages(&resp);
+    assert!(
+        msgs.contains("row budget exceeded"),
+        "expected row budget client error, got {msgs}"
+    );
+}
+
+/// One default nest stays under the default row budget (100 × 101 = 10,100).
+pub async fn d8_shallow_nested_has_many_within_budget(db: Db) {
+    use distributed::graphql::{read, GraphqlEngine};
+    use distributed::read_model::ReadModel;
+    use distributed::read_model::RelationalReadModel;
+    use distributed::table::{ReadModelCatalog, RelationshipDef, RelationshipKind};
+    use serde::{Deserialize, Serialize};
+
+    #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, ReadModel)]
+    #[table("parents")]
+    struct ParentView {
+        #[id("parent_id")]
+        parent_id: String,
+        name: String,
+    }
+    #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, ReadModel)]
+    #[table("children")]
+    struct ChildView {
+        #[id("child_id")]
+        child_id: String,
+        parent_id: String,
+        name: String,
+    }
+
+    db.seed([parent("p1", "P")]).await;
+    db.seed([child("c1", "p1", "C")]).await;
+    let pool = db.pool();
+
+    let mut parent = ParentView::schema().clone();
+    parent.relationships = vec![RelationshipDef {
+        references: None,
+        field_name: "children".into(),
+        kind: RelationshipKind::HasMany,
+        target_model: "ChildView".into(),
+        foreign_key: Some("parent_id".into()),
+        through: None,
+        target_foreign_key: None,
+    }];
+    let child = ChildView::schema().clone();
+    let manifest = ReadModelCatalog::new("cx2")
+        .table_schema(parent)
+        .table_schema(child);
+    let engine = GraphqlEngine::from_schema_catalog(&manifest, pool)
+        .unwrap()
+        .identity(IdentityConfig::dev_headers())
+        .roles(&["user"])
+        .permission::<ParentView>("user", read().all_columns())
+        .permission::<ChildView>("user", read().all_columns())
+        .build()
+        .expect("build");
+
+    let s = session("user", "u");
+    let resp = engine
+        .execute(
+            &s,
+            Request::new("{ parents { parent_id children { child_id name } } }"),
+        )
+        .await;
+    assert!(
+        resp.errors.is_empty(),
+        "1-level nest must succeed under default budget: {:?}",
+        resp.errors
+    );
+}
+
+/// Explicit low max_rows rejects modest nests (budget knob works).
+pub async fn d8_low_max_rows_rejects_single_nest(db: Db) {
+    use distributed::graphql::{read, GraphqlEngine};
+    use distributed::read_model::ReadModel;
+    use distributed::read_model::RelationalReadModel;
+    use distributed::table::{ReadModelCatalog, RelationshipDef, RelationshipKind};
+    use serde::{Deserialize, Serialize};
+
+    #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, ReadModel)]
+    #[table("parents")]
+    struct ParentView {
+        #[id("parent_id")]
+        parent_id: String,
+        name: String,
+    }
+    #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, ReadModel)]
+    #[table("children")]
+    struct ChildView {
+        #[id("child_id")]
+        child_id: String,
+        parent_id: String,
+        name: String,
+    }
+
+    db.seed([parent("p1", "P")]).await;
+    db.seed([child("c1", "p1", "C")]).await;
+    let pool = db.pool();
+
+    let mut parent = ParentView::schema().clone();
+    parent.relationships = vec![RelationshipDef {
+        references: None,
+        field_name: "children".into(),
+        kind: RelationshipKind::HasMany,
+        target_model: "ChildView".into(),
+        foreign_key: Some("parent_id".into()),
+        through: None,
+        target_foreign_key: None,
+    }];
+    let child = ChildView::schema().clone();
+    let manifest = ReadModelCatalog::new("cx3")
+        .table_schema(parent)
+        .table_schema(child);
+    let engine = GraphqlEngine::from_schema_catalog(&manifest, pool)
+        .unwrap()
+        .identity(IdentityConfig::dev_headers())
+        .roles(&["user"])
+        .max_rows(10_099)
+        .max_depth(8)
+        .permission::<ParentView>("user", read().all_columns())
+        .permission::<ChildView>("user", read().all_columns())
+        .build()
+        .expect("build");
+
+    let s = session("user", "u");
+    let resp = engine
+        .execute(
+            &s,
+            Request::new("{ parents { parent_id children { child_id name } } }"),
+        )
+        .await;
+    assert!(
+        !resp.errors.is_empty(),
+        "low budget must reject 1-level nest"
+    );
+    assert_no_sql_leak(&resp);
+    let msgs = error_messages(&resp);
+    assert!(msgs.contains("row budget exceeded"), "{msgs}");
+}
+
+/// Regression: the row budget counts each list's resolved `limit`.
+///
+/// The old weighted complexity estimate ignored `limit` entirely, so this
+/// request (a shape `d8_shallow_nested_has_many_within_budget` shows the
+/// defaults admit) was accepted although it can return 1000 × (1 + 1000) =
+/// 1,001,000 rows, five times the default `max_rows`. Lowering the limits
+/// to a product within budget is accepted.
+pub async fn d8_explicit_limits_multiply_into_the_row_budget(db: Db) {
+    use distributed::graphql::{read, GraphqlEngine};
+    use distributed::read_model::ReadModel;
+    use distributed::read_model::RelationalReadModel;
+    use distributed::table::{ReadModelCatalog, RelationshipDef, RelationshipKind};
+    use serde::{Deserialize, Serialize};
+
+    #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, ReadModel)]
+    #[table("parents")]
+    struct ParentView {
+        #[id("parent_id")]
+        parent_id: String,
+        name: String,
+    }
+    #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, ReadModel)]
+    #[table("children")]
+    struct ChildView {
+        #[id("child_id")]
+        child_id: String,
+        parent_id: String,
+        name: String,
+    }
+
+    db.seed([parent("p1", "P")]).await;
+    db.seed([child("c1", "p1", "C")]).await;
+    let pool = db.pool();
+
+    let mut parent = ParentView::schema().clone();
+    parent.relationships = vec![RelationshipDef {
+        references: None,
+        field_name: "children".into(),
+        kind: RelationshipKind::HasMany,
+        target_model: "ChildView".into(),
+        foreign_key: Some("parent_id".into()),
+        through: None,
+        target_foreign_key: None,
+    }];
+    let manifest = ReadModelCatalog::new("cx4")
+        .table_schema(parent)
+        .table_schema(ChildView::schema().clone());
+    let engine = GraphqlEngine::from_schema_catalog(&manifest, pool)
+        .unwrap()
+        .identity(IdentityConfig::dev_headers())
+        .roles(&["user"])
+        .permission::<ParentView>("user", read().all_columns())
+        .permission::<ChildView>("user", read().all_columns())
+        .build()
+        .expect("build");
+
+    let s = session("user", "u");
+    let resp = engine
+        .execute(
+            &s,
+            Request::new(
+                "{ parents(limit: 1000) { parent_id children(limit: 1000) { child_id } } }",
+            ),
+        )
+        .await;
+    assert_no_sql_leak(&resp);
+    assert!(
+        error_messages(&resp).contains("row budget exceeded"),
+        "1,001,000 rows must exceed the default row budget: {:?}",
+        resp.errors
+    );
+
+    // 1000 × (1 + 199) = 200,000: exactly the default budget.
+    let resp = engine
+        .execute(
+            &s,
+            Request::new(
+                "{ parents(limit: 1000) { parent_id children(limit: 199) { child_id } } }",
+            ),
+        )
+        .await;
+    assert!(resp.errors.is_empty(), "{:?}", resp.errors);
+    let data = resp.data.into_json().unwrap();
+    assert_eq!(data["parents"][0]["children"][0]["child_id"], "c1");
+}

@@ -11,12 +11,12 @@ use serde::Serialize;
 use serde_json::{Map as JsonMap, Value as JsonValue};
 
 use super::manifest::{
-    hash_bytes, ClientManifest, ManifestAggregateSemantics, ManifestArgument, ManifestArgumentKind,
-    ManifestComplexityWeights, ManifestExecutionLimits, ManifestField, ManifestFilterExpr,
-    ManifestFilterField, ManifestFilterInput, ManifestFilterSemantics, ManifestModel,
-    ManifestOrderSemantics, ManifestPagination, ManifestRelationship,
-    ManifestRelationshipKeyMapping, ManifestRelationshipKind, ManifestRelationshipMaintenance,
-    ManifestRoot, ManifestRowPolicy, RootKind, RootOperation,
+    hash_bytes, row_cost, ClientAggregateSemantics, ClientArgument, ClientArgumentKind,
+    ClientExecutionLimits, ClientField, ClientFilterField, ClientFilterInput,
+    ClientFilterSemantics, ClientManifest, ClientModel, ClientOrderSemantics,
+    ClientPaginationSemantics, ClientRelationship, ClientRelationshipKind,
+    ClientRelationshipMaintenance, ClientRoot, ClientRootKind, ClientRootOperation,
+    ClientRowPolicy, FilterExpr, RelationshipKeyMapping,
 };
 use super::{ClientCompileError, ClientDocument};
 
@@ -28,9 +28,11 @@ mod query_plan;
 mod types;
 mod validation;
 mod variables;
+mod window;
 
 pub(crate) use operation::{compile_document, typescript_scalar};
 pub(crate) use types::*;
+pub(crate) use window::CompiledWindow;
 
 use arguments::*;
 use fragments::*;
@@ -39,3 +41,4 @@ use operation::*;
 use query_plan::*;
 use validation::*;
 use variables::*;
+use window::*;

@@ -8,11 +8,11 @@ import type {
 import type {
 	DistributedDecimalString,
 	DistributedLiveCursor,
+	DistributedObservedRecord,
 	DistributedOpaqueString,
 	DistributedTrustedPreset
 } from '../../protocol.js';
-import type { ReplicaTrustedPresetDescriptor } from '../commands.js';
-import type { ValidatedReplicaOperationBinding } from '../operation-binding.js';
+import type { ReplicaTrustedPresetDescriptor } from '../commands/types.js';
 import type {
 	ReplicaLiveState,
 	ReplicaOperationArtifact,
@@ -30,7 +30,18 @@ export type LiveEntry = {
 	unsubscribe: () => void;
 	active: boolean;
 	protocolGeneration: number;
+	/** Local fence for taking over query snapshots that preceded this stream. */
+	startRevision: string;
 	operationGeneration?: number;
+	/** Consecutive failed live executions; drives the reopen backoff. */
+	failures?: number;
+	/** Pending reopen of this inactive entry after a failed stream. */
+	retry?: unknown;
+	/**
+	 * Shared indexes whose independent owner disagreed with this stream's last
+	 * frame. Another operation rewriting one of them reopens this stream.
+	 */
+	fencedIndexKeys?: ReadonlySet<string>;
 };
 
 export type ProtocolGeneration = {
@@ -45,6 +56,18 @@ export type RenderedOperation = {
 	readonly variables: GraphqlVariables;
 };
 
+/** An operation without a watch or retained handle, awaiting collection. */
+export type RetiredOperation = RenderedOperation & {
+	/** Scheduler time at which its grace period ends. */
+	due: number;
+	/** The result held when it retired; a later write restarts the period. */
+	written: {
+		readonly group: OperationProtocolGroup | undefined;
+		readonly query: string | undefined;
+		readonly live: string | undefined;
+	};
+};
+
 export type SerializedOperationProtocolState = {
 	readonly operation: string;
 	readonly snapshotScope?: string;
@@ -53,6 +76,8 @@ export type SerializedOperationProtocolState = {
 		Readonly<{ scopeToken: string; position: string }>
 	])[];
 	readonly indexRevision?: string;
+	/** Local boundary after which a disposed live owner may be handed off. */
+	readonly retiredAtRevision?: string;
 	readonly indexKeys: readonly string[];
 	readonly pathRecords: readonly (readonly [string, string])[];
 	readonly cursors: readonly DistributedLiveCursor[];
@@ -108,8 +133,6 @@ export type ReplicaArtifactBinding = {
 	trustedPresets?: readonly ReplicaTrustedPresetDescriptor[];
 };
 
-export type ValidatedArtifactBinding = ValidatedReplicaOperationBinding;
-
 export type RecordProtocolClock = {
 	scopeToken: DistributedOpaqueString;
 	incarnation: DistributedDecimalString;
@@ -138,6 +161,8 @@ export type OperationProtocolState = {
 	snapshotScope?: DistributedOpaqueString;
 	indexClocks: Map<string, IndexProtocolClock>;
 	indexRevision?: string;
+	/** Local boundary after which a disposed live owner may be handed off. */
+	retiredAtRevision?: string;
 	indexKeys: Set<string>;
 	pathRecords: Map<string, string>;
 	cursors: readonly DistributedLiveCursor[];
@@ -155,6 +180,12 @@ export type OptimisticReceiptState = {
 	causationId: DistributedOpaqueString;
 	expectations: ReadonlyMap<string, true>;
 	observed: Set<string>;
+	/**
+	 * Per observed expectation, the row revision the projector wrote for this
+	 * causation. Once the base holds every one at or past it, the layer is
+	 * proven and retires.
+	 */
+	revisions: Map<string, DistributedObservedRecord>;
 };
 
 export type IndexDisposition = 'fresh' | 'equal' | 'higher' | 'lower' | 'incomparable';
@@ -163,6 +194,13 @@ export type SharedIndexDisposition = {
 	readonly compared: boolean;
 	readonly disposition?: 'equal' | 'higher' | 'lower';
 	readonly indexRevision?: string;
+	readonly restartAfterRetirement?: boolean;
+	/**
+	 * Incoming indexes owned by an independent live stream or later query
+	 * owner. A snapshot frame may be admitted without writing them when its
+	 * membership for each is identical to the owner's.
+	 */
+	readonly fencedIndexKeys?: ReadonlySet<string>;
 };
 
 export type CapturedReplicaOptimisticOperation =

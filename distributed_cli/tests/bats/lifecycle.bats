@@ -12,7 +12,7 @@ setup() {
   ROOT="$(cd "$ROOT" && pwd -P)"
   DEV_LOG="$ROOT/dev.log"
   SUPERVISOR_PID=""
-  write_fixture
+  PROJECT=""
 }
 
 teardown() {
@@ -21,21 +21,26 @@ teardown() {
     wait_for_exit "$SUPERVISOR_PID" 100 || kill -TERM "$SUPERVISOR_PID" 2>/dev/null || true
     wait "$SUPERVISOR_PID" 2>/dev/null || true
   fi
-  if [ -f "$ROOT/dev-descendants.log" ]; then
-    while IFS= read -r pid; do
-      kill -TERM "$pid" 2>/dev/null || true
-    done < "$ROOT/dev-descendants.log"
-  fi
+  # The test project's processes start descendants that ignore SIGTERM.
+  for log in "$PROJECT/dev-family.log" "$PROJECT/build-family.log"; do
+    if [ -n "$PROJECT" ] && [ -f "$log" ]; then
+      for pid in $(cat "$log"); do
+        kill -KILL "$pid" 2>/dev/null || true
+      done
+    fi
+  done
+}
+
+# A GraphQL service with no lifecycle configuration, linked to this checkout.
+copy_zero_config_app() {
+  PROJECT="$ROOT/zero-config-app"
+  cp -R "$BATS_TEST_DIRNAME/../fixtures/zero-config-app" "$PROJECT"
+  sed "s|__DISTRIBUTED_ROOT__|$DISTRIBUTED_ROOT|" "$PROJECT/Cargo.toml" > "$PROJECT/Cargo.toml.next"
+  mv "$PROJECT/Cargo.toml.next" "$PROJECT/Cargo.toml"
 }
 
 @test "project build and dev are zero-config and invalid typed exports fail before UI" {
-  PROJECT="$ROOT/zero-config-app"
-  run "$DISTRIBUTED_BIN" scaffold zero-config-app \
-    --path "$PROJECT" \
-    --distributed-path "$DISTRIBUTED_ROOT" \
-    --query-api \
-    --store sqlite
-  [ "$status" -eq 0 ]
+  copy_zero_config_app
 
   mkdir -p "$PROJECT/ui" "$ROOT/bin"
   printf '{"name":"zero-config-ui","private":true,"scripts":{"build":"vite build"},"dependencies":{"@hops-ops/distributed":"file:%s/js"}}\n' \
@@ -72,7 +77,6 @@ SCRIPT
   grep -F "$PROJECT/ui:run build" "$ROOT/npm.log"
   [ -f "$DISTRIBUTED_ROOT/js/dist/index.js" ]
   [ "$(find "$PROJECT/.distributed/javascript" -name '*.json' -type f | wc -l | tr -d ' ')" -eq 1 ]
-  [ ! -e "$PROJECT/distributed.contracts.json" ]
   [ ! -e "$PROJECT/distributed.lifecycle.json" ]
   manifest_count="$(find "$PROJECT/.distributed/lifecycle/generations" \
     -path '*/artifacts/application-manifest.json' -type f | wc -l | tr -d ' ')"
@@ -117,23 +121,17 @@ SCRIPT
     ZERO_CONFIG_REAL_NPM="$ZERO_CONFIG_REAL_NPM" \
     "$DISTRIBUTED_BIN" build "$PROJECT"
   [ "$status" -ne 0 ]
-  if [[ "$output" != *'must publicly export a zero-argument function returning `distributed::ApplicationManifest`'* ]]; then
+  if [[ "$output" != *'must publicly export a zero-argument function returning `distributed::application::ApplicationManifest`'* ]]; then
     printf 'unexpected invalid-export diagnostic:\n%s\n' "$output" >&2
     false
   fi
-  [[ "$output" != *'compiling SvelteKit UI'* ]]
+  [[ "$output" != *'distributed build: UI '* ]]
   [ "$(cat "$ROOT/npm.log")" = 'npm-must-not-run' ]
   [ "$(cat "$PROJECT/.distributed/lifecycle/active.json")" = "$active_before" ]
 }
 
 @test "linked checkout skew is structured and fails before build or dev startup" {
-  PROJECT="$ROOT/skewed-app"
-  run "$DISTRIBUTED_BIN" scaffold skewed-app \
-    --path "$PROJECT" \
-    --distributed-path "$DISTRIBUTED_ROOT" \
-    --query-api \
-    --store sqlite
-  [ "$status" -eq 0 ]
+  copy_zero_config_app
 
   OTHER_JS="$ROOT/other-distributed/js"
   mkdir -p "$PROJECT/ui" "$OTHER_JS"
@@ -149,62 +147,66 @@ SCRIPT
   [[ "$output" == *'"affected_components":["rust","cli","javascript"]'* ]]
   [[ "$output" == *'"expected"'* ]]
   [[ "$output" == *'"repair"'* ]]
-  [ ! -e "$PROJECT/target/debug/skewed-app" ]
+  [ ! -e "$PROJECT/target/debug/zero-config-app" ]
   [ ! -e "$PROJECT/ui/node_modules" ]
   [ ! -e "$PROJECT/.distributed/lifecycle/active.json" ]
 
   run "$DISTRIBUTED_BIN" dev "$PROJECT"
   [ "$status" -eq 1 ]
   [[ "$output" == *'incompatible Distributed framework members'* ]]
-  [ ! -e "$PROJECT/target/debug/skewed-app" ]
+  [ ! -e "$PROJECT/target/debug/zero-config-app" ]
   [ ! -e "$PROJECT/ui/node_modules" ]
   [ ! -e "$PROJECT/.distributed/lifecycle/active.json" ]
 }
 
 @test "build activates atomically and check reports drift without replacing active" {
-  run "$DISTRIBUTED_BIN" build --root "$ROOT" --output json
+  write_project
+  ACTIVE="$PROJECT/.distributed/lifecycle/active.json"
+
+  run project build --output json
   [ "$status" -eq 0 ]
   [[ "$output" == *'"ok":true'* ]]
-  [[ "$output" == *'"executed":["application","plan"]'* ]]
-  [ -f "$ROOT/dist/distributed/active.json" ]
-  active_before="$(cat "$ROOT/dist/distributed/active.json")"
+  [[ "$output" == *'"executed":["application"]'* ]]
+  [ -f "$ACTIVE" ]
+  active_before="$(cat "$ACTIVE")"
 
-  run "$DISTRIBUTED_BIN" build --root "$ROOT" --check --output json
+  run project build --check --output json
   [ "$status" -eq 0 ]
   [[ "$output" == *'"drift":[]'* ]]
-  [ "$(cat "$ROOT/dist/distributed/active.json")" = "$active_before" ]
+  [ "$(cat "$ACTIVE")" = "$active_before" ]
 
-  printf 'second\n' > "$ROOT/src/input.txt"
-  run "$DISTRIBUTED_BIN" build --root "$ROOT" --check --output json
+  printf 'renamed\n' > "$PROJECT/service/src/name.txt"
+  run project build --check --output json
   [ "$status" -eq 1 ]
   [[ "$output" == *'"ok":false'* ]]
   [[ "$output" == *'"node_id":"application"'* ]]
-  [ "$(cat "$ROOT/dist/distributed/active.json")" = "$active_before" ]
+  [ "$(cat "$ACTIVE")" = "$active_before" ]
 
-  : > "$ROOT/fail-plan"
-  run "$DISTRIBUTED_BIN" build --root "$ROOT" --output json
+  : > "$PROJECT/fail-manifest"
+  run project build --output json
   [ "$status" -ne 0 ]
-  [[ "$output" == *'injected plan failure'* ]]
-  [ "$(cat "$ROOT/dist/distributed/active.json")" = "$active_before" ]
+  [[ "$output" == *'injected manifest failure'* ]]
+  [ "$(cat "$ACTIVE")" = "$active_before" ]
 }
 
 @test "dev reports process readiness, rebuilds selectively, and cleans descendants" {
-  "$DISTRIBUTED_BIN" dev --root "$ROOT" > "$DEV_LOG" 2>&1 &
+  write_project
+  project dev > "$DEV_LOG" 2>&1 &
   SUPERVISOR_PID=$!
 
-  wait_for_log 'lifecycle dev: ready generation=' 300
-  grep -F 'lifecycle dev: process api ready http://127.0.0.1:18081/health' "$DEV_LOG"
-  grep -F 'lifecycle dev: process ui ready http://127.0.0.1:15181' "$DEV_LOG"
-  grep -F "api:api:$ROOT/src" "$ROOT/dev-environment.log"
-  grep -F "ui:ui:$ROOT/src" "$ROOT/dev-environment.log"
+  wait_for_log 'lifecycle dev: ready generation=' 6000
+  grep -F "lifecycle dev: process api ready http://127.0.0.1:$API_PORT" "$DEV_LOG"
+  grep -F "lifecycle dev: process ui ready http://127.0.0.1:$UI_PORT_VALUE" "$DEV_LOG"
+  grep -Fx "api:$PROJECT" "$PROJECT/dev-environment.log"
+  grep -Fx "ui:$PROJECT/ui" "$PROJECT/dev-environment.log"
 
-  printf 'second\n' > "$ROOT/src/input.txt"
-  wait_for_log 'invalidated=application,plan restarted=api' 300
-  [ "$(grep -c '^api:' "$ROOT/dev-process.log")" -eq 2 ]
-  [ "$(grep -c '^ui:' "$ROOT/dev-process.log")" -eq 1 ]
+  printf 'renamed\n' > "$PROJECT/service/src/name.txt"
+  wait_for_log 'invalidated=application restarted=api' 6000
+  [ "$(grep -c '^api:' "$PROJECT/dev-process.log")" -eq 2 ]
+  [ "$(grep -c '^ui:' "$PROJECT/dev-process.log")" -eq 1 ]
 
   kill -INT "$SUPERVISOR_PID"
-  wait_for_exit "$SUPERVISOR_PID" 200
+  wait_for_exit "$SUPERVISOR_PID" 600
   wait "$SUPERVISOR_PID"
   dev_status=$?
   SUPERVISOR_PID=""
@@ -212,26 +214,34 @@ SCRIPT
   grep -F 'process=api restarts=1' "$DEV_LOG"
   grep -F 'process=ui restarts=0' "$DEV_LOG"
 
-  while IFS= read -r pid; do
+  # Three processes ran, each with a descendant.
+  [ "$(wc -w < "$PROJECT/dev-family.log" | tr -d ' ')" -eq 6 ]
+  for pid in $(cat "$PROJECT/dev-family.log"); do
     ! kill -0 "$pid" 2>/dev/null
-  done < "$ROOT/dev-descendants.log"
+  done
 }
 
 @test "Ctrl-C cancels the initial build before any process starts" {
-  : > "$ROOT/slow-plan"
-  "$DISTRIBUTED_BIN" dev --root "$ROOT" > "$DEV_LOG" 2>&1 &
+  write_project
+  : > "$PROJECT/slow-manifest"
+  project dev > "$DEV_LOG" 2>&1 &
   SUPERVISOR_PID=$!
-  wait_for_file "$ROOT/build-plan-starts.log" 300
+  wait_for_file "$PROJECT/build-family.log" 6000
+  # The file exists before the harness has written its record.
+  while [ ! -s "$PROJECT/build-family.log" ]; do sleep 0.05; done
 
   kill -INT "$SUPERVISOR_PID"
-  wait_for_exit "$SUPERVISOR_PID" 200
+  wait_for_exit "$SUPERVISOR_PID" 600
   wait "$SUPERVISOR_PID" || dev_status=$?
   dev_status="${dev_status:-0}"
   SUPERVISOR_PID=""
 
   [ "$dev_status" -ne 0 ]
   grep -F 'lifecycle build was canceled' "$DEV_LOG"
-  [ ! -e "$ROOT/dev-process.log" ]
+  [ ! -e "$PROJECT/dev-process.log" ]
+  for pid in $(cat "$PROJECT/build-family.log"); do
+    ! kill -0 "$pid" 2>/dev/null
+  done
 }
 
 free_port() {
@@ -291,142 +301,35 @@ wait_for_exit() {
   return 1
 }
 
-write_fixture() {
-  mkdir -p "$ROOT/src" "$ROOT/plan" "$ROOT/generated"
-  printf 'first\n' > "$ROOT/src/input.txt"
-  printf 'local\n' > "$ROOT/plan/input.txt"
-  printf 'application:first\n' > "$ROOT/generated/application.json"
-  printf 'plan:local:application:first\n' > "$ROOT/generated/plan.json"
-
-  cat > "$ROOT/build-app.sh" <<'SCRIPT'
-#!/bin/sh
-set -eu
-root=$1
-sed 's/^/application:/' "$root/src/input.txt"
-SCRIPT
-
-  cat > "$ROOT/build-plan.sh" <<'SCRIPT'
-#!/bin/sh
-set -eu
-root=$1
-stage=$2
-if [ -f "$root/fail-plan" ]; then
-  printf 'injected plan failure\n' >&2
-  exit 17
-fi
-if [ -f "$root/slow-plan" ]; then
-  printf 'started\n' >> "$root/build-plan-starts.log"
-  while [ -f "$root/slow-plan" ]; do sleep 0.05; done
-fi
-printf 'plan:' > "$stage/generated/plan.json"
-tr -d '\n' < "$root/plan/input.txt" >> "$stage/generated/plan.json"
-printf ':' >> "$stage/generated/plan.json"
-cat "$stage/generated/application.json" >> "$stage/generated/plan.json"
-SCRIPT
-
-  cat > "$ROOT/dev-child.sh" <<'SCRIPT'
-#!/bin/sh
-set -eu
-root=$1
-name=$2
-printf '%s:%s:%s\n' "$name" "$DISTRIBUTED_GENERATION_ID" "$DISTRIBUTED_RELEASE_ID" >> "$root/dev-process.log"
-printf '%s:%s:%s\n' "$name" "$DEV_FIXTURE_NAME" "$PWD" >> "$root/dev-environment.log"
-trap 'exit 0' TERM
-/bin/sh -c 'trap "" TERM; while :; do sleep 1; done' &
-descendant=$!
-printf '%s\n' "$descendant" >> "$root/dev-descendants.log"
-wait "$descendant"
-SCRIPT
-  chmod +x "$ROOT/build-app.sh" "$ROOT/build-plan.sh" "$ROOT/dev-child.sh"
-
-  cat > "$ROOT/distributed.contracts.json" <<'JSON'
-{
-  "schema_version": 1,
-  "entries": {
-    "application": {
-      "id": "application",
-      "kind": "application_manifest",
-      "scope": { "id": "application/bats" },
-      "owner": "application/bats",
-      "identity": { "kind": "application_manifest", "value": "ref:application" },
-      "provenance": { "sources": ["src/input.txt"], "generator": "bats.application" },
-      "outputs": { "manifest": "generated/application.json" },
-      "lifecycle": ["build", "check", "dev"]
-    },
-    "plan": {
-      "id": "plan",
-      "kind": "deployment_plan",
-      "scope": { "id": "deployment/bats" },
-      "owner": "deployment/bats",
-      "identity": { "kind": "deployment_plan", "value": "ref:plan" },
-      "provenance": {
-        "sources": ["generated/application.json", "plan/input.txt"],
-        "generator": "bats.plan"
-      },
-      "predecessor": {
-        "entry_id": "application",
-        "identity": { "kind": "application_manifest", "value": "ref:application" }
-      },
-      "outputs": { "plan": "generated/plan.json" },
-      "lifecycle": ["build", "check", "dev"]
-    }
-  }
+# The lifecycle test project (tests/fixtures/lifecycle-project) as $PROJECT:
+# a Cargo workspace whose API and UI listen on ports of their own.
+write_project() {
+  PROJECT="$ROOT/project"
+  API_PORT="$(free_port)"
+  UI_PORT_VALUE="$(free_port)"
+  while [ "$UI_PORT_VALUE" = "$API_PORT" ]; do
+    UI_PORT_VALUE="$(free_port)"
+  done
+  cp -R "$DISTRIBUTED_ROOT/distributed_cli/tests/fixtures/lifecycle-project" "$PROJECT"
+  for manifest in "$PROJECT/Cargo.toml" "$PROJECT/service/Cargo.toml"; do
+    sed -e "s|@DISTRIBUTED@|$DISTRIBUTED_ROOT|" \
+      -e "s|@API_PORT@|$API_PORT|" \
+      -e "s|@UI_PORT@|$UI_PORT_VALUE|" \
+      "$manifest" > "$manifest.next"
+    mv "$manifest.next" "$manifest"
+  done
+  # The framework's lock file resolves the project without the network.
+  cp "$DISTRIBUTED_ROOT/Cargo.lock" "$PROJECT/Cargo.lock"
 }
-JSON
 
-  cat > "$ROOT/distributed.lifecycle.json" <<'JSON'
-{
-  "schema_version": 1,
-  "application": "bats",
-  "source": {
-    "rust": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-    "cli": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-    "javascript": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-  },
-  "roots": ["plan"],
-  "executors": {
-    "bats.application": {
-      "identity": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
-      "program": "/bin/sh",
-      "args": ["{root}/build-app.sh", "{root}"],
-      "stdout": "generated/application.json"
-    },
-    "bats.plan": {
-      "identity": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
-      "program": "/bin/sh",
-      "args": ["{root}/build-plan.sh", "{root}", "{stage}"]
-    }
-  },
-  "dev": {
-    "poll_ms": 20,
-    "debounce_ms": 30,
-    "shutdown_ms": 100,
-    "processes": {
-      "api": {
-        "program": "/bin/sh",
-        "args": ["{root}/dev-child.sh", "{root}", "{process}"],
-        "cwd": "src",
-        "env": { "DEV_FIXTURE_NAME": "{process}" },
-        "url": "http://127.0.0.1:18081/health",
-        "restart_on": ["application"],
-        "ready": {
-          "program": "/bin/test",
-          "args": ["-f", "{root}/dist/distributed/active.json"],
-          "interval_ms": 10,
-          "timeout_ms": 2000
-        }
-      },
-      "ui": {
-        "program": "/bin/sh",
-        "args": ["{root}/dev-child.sh", "{root}", "{process}"],
-        "cwd": "src",
-        "env": { "DEV_FIXTURE_NAME": "{process}" },
-        "url": "http://127.0.0.1:15181",
-        "restart_on": [],
-        "ready_after_ms": 20
-      }
-    }
-  }
-}
-JSON
+# `distributed <command> $PROJECT ...`, replacing the subshell that `run` or
+# `&` started, so that `$!` is the CLI itself. The test projects of this file
+# share one Cargo target directory, and their own metadata decides where they
+# listen.
+project() {
+  command=$1
+  shift
+  exec env -u BIND -u UI_HOST -u UI_BIND -u UI_PORT -u UI_URL -u PUBLIC_ORIGIN \
+    CARGO_TARGET_DIR="$BATS_FILE_TMPDIR/lifecycle-project-target" \
+    "$DISTRIBUTED_BIN" "$command" "$PROJECT" "$@"
 }

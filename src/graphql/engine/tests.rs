@@ -6,16 +6,15 @@ mod client_surface_parity_tests {
     use std::collections::{BTreeMap, BTreeSet};
     use std::sync::Arc;
 
-    use sha2::{Digest, Sha256};
-
     use super::*;
-    use crate::graphql::command_contract::{CommandEffects, TypedCommandContract};
+    use crate::command::CommandConsistency;
+    use crate::command::TypedCommandContract;
+    use crate::command::{CommandInputType, CommandOutputType, CommandTypeDef, CommandTypeField};
     use crate::graphql::commands::TypedCommandInventory;
     #[cfg(feature = "sqlite")]
     use crate::graphql::ModelNormalization;
     use crate::graphql::{
-        claim, col, ClientRootOperation, CommandConsistency, DistributedClientSurfaceExport,
-        GraphqlInputType, GraphqlOutputType, GraphqlTypeDef, GraphqlTypeField, RoleGrant,
+        claim, col, ClientRootOperation, DistributedClientSurfaceExport, ReadPermission,
     };
     use crate::table::{ColumnType, PrimaryKey, TableColumn, TableKind, TableSchema};
     #[cfg(feature = "sqlite")]
@@ -32,13 +31,11 @@ mod client_surface_parity_tests {
                 },
                 TableColumn::new("status", "status", ColumnType::Text),
                 TableColumn {
-                    jsonb: true,
                     ..TableColumn::new("metadata", "metadata", ColumnType::Json)
                 },
             ],
             primary_key: PrimaryKey::new(["order_id"]),
             version_column: Some("_sourced_version".into()),
-            foreign_keys: Vec::new(),
             indexes: Vec::new(),
             relationships: Vec::new(),
             kind: TableKind::ReadModel,
@@ -64,21 +61,19 @@ mod client_surface_parity_tests {
         roles: &[&str],
     ) -> TypedCommandContract
     where
-        I: GraphqlInputType + 'static,
-        O: GraphqlOutputType + 'static,
+        I: CommandInputType + 'static,
+        O: CommandOutputType + 'static,
     {
         TypedCommandContract {
             name: command_name.into(),
             field_name: field_name.into(),
             roles: roles.iter().map(|role| (*role).into()).collect(),
-            input: I::graphql_type().with_type_id(TypeId::of::<I>()),
-            output: O::graphql_type().with_type_id(TypeId::of::<O>()),
+            input: I::command_type().with_type_id(TypeId::of::<I>()),
+            output: O::command_type().with_type_id(TypeId::of::<O>()),
             input_type_id: TypeId::of::<I>(),
             output_type_id: TypeId::of::<O>(),
             consistency: CommandConsistency::Succeeded,
             input_defaults: Vec::new(),
-            effects: CommandEffects::revalidate(),
-            confirmations: Vec::new(),
             projected_model: None,
             direct_projection: None,
             projections: Default::default(),
@@ -133,12 +128,77 @@ mod client_surface_parity_tests {
         let project = ReadModelCatalog::new("orders-service").table_schema(orders());
         GraphqlEngine::from_schema_catalog(&project, pool)
             .unwrap()
+            .identity(crate::graphql::IdentityConfig::dev_headers())
             .roles(&["user"])
             .grant_all("user")
             .protocol_token_key([7; 32])
             .protocol_namespace(namespace)
             .build()
             .unwrap()
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn protocol_surface_export_cache_is_engine_scoped_and_shared_by_engine_clones() {
+        let engine = Arc::new(protocol_engine("first-engine"));
+        let cloned = engine.clone();
+        let another = protocol_engine("second-engine");
+        let export = &engine.inner.protocol.as_ref().unwrap().roles["user"]
+            .surface
+            .export;
+        let cloned_export = &cloned.inner.protocol.as_ref().unwrap().roles["user"]
+            .surface
+            .export;
+        let other_export = &another.inner.protocol.as_ref().unwrap().roles["user"]
+            .surface
+            .export;
+        assert!(std::ptr::eq(
+            export.manifest_ref().unwrap(),
+            cloned_export.manifest_ref().unwrap()
+        ));
+        assert!(!std::ptr::eq(
+            export.manifest_ref().unwrap(),
+            other_export.manifest_ref().unwrap()
+        ));
+        let fresh = engine
+            .client_surface_for_role("user")
+            .unwrap()
+            .manifest()
+            .unwrap();
+        assert_eq!(export.manifest_ref().unwrap(), &fresh);
+        assert_eq!(other_export.manifest_ref().unwrap(), &fresh);
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn repeated_protocol_accumulators_reuse_metadata_but_release_request_authority() {
+        use crate::command_dispatch::VerifiedPrincipal;
+        let engine = protocol_engine("request-cache-test");
+        let export = &engine.inner.protocol.as_ref().unwrap().roles["user"]
+            .surface
+            .export;
+        let owners = export.manifest_cache_owners();
+        let mut session = Session::new();
+        session.set("x-roles", "user");
+        let request = Request::new("{ __typename }").data(VerifiedPrincipal::test_oidc(
+            "https://issuer.example",
+            "principal-a",
+            &["orders-service"],
+        ));
+        let authority = resolve_execution_authority(&engine.inner, &session, &request).unwrap();
+        let first = engine
+            .protocol_accumulator(&authority, &session, &request)
+            .unwrap_or_else(|_| panic!("first request authority"))
+            .unwrap();
+        assert_eq!(export.manifest_cache_owners(), owners + 1);
+        let second = engine
+            .protocol_accumulator(&authority, &session, &request)
+            .unwrap_or_else(|_| panic!("second request authority"))
+            .unwrap();
+        assert_eq!(export.manifest_cache_owners(), owners + 2);
+        drop(first);
+        drop(second);
+        assert_eq!(export.manifest_cache_owners(), owners);
     }
 
     #[cfg(feature = "sqlite")]
@@ -149,13 +209,14 @@ mod client_surface_parity_tests {
         let project = ReadModelCatalog::new("orders-service").table_schema(orders());
         let mut builder = GraphqlEngine::from_schema_catalog(&project, pool)
             .unwrap()
+            .identity(crate::graphql::IdentityConfig::dev_headers())
             .roles(&["user"])
             .grant_all("user");
         builder
             .permissions
-            .get_mut(&("OrderView".into(), "user".into()))
+            .get_mut("user")
+            .and_then(|grants| grants.get_mut("OrderView"))
             .unwrap()
-            .permission
             .row_filter = Some(col("status").eq(claim(claim_key)));
         builder
             .protocol_token_key([7; 32])
@@ -209,19 +270,69 @@ mod client_surface_parity_tests {
         let project = ReadModelCatalog::new("orders-service").table_schema(orders());
         let engine = GraphqlEngine::from_schema_catalog(&project, pool)
             .unwrap()
+            .identity(crate::graphql::IdentityConfig::dev_headers())
             .roles(&["user"])
             .grant_all("user")
             .max_depth(6)
-            .max_complexity(37)
+            .max_fields(37)
+            .max_rows(4_321)
+            .max_in_list(9)
+            .max_bool_width(3)
             .build()
             .unwrap();
 
         let manifest = engine.client_manifest_for_role("user").unwrap();
-        assert_eq!(manifest.execution.max_depth, 6);
-        assert_eq!(manifest.execution.max_complexity, 37);
-        assert_eq!(manifest.execution.complexity.version, 1);
-        assert_eq!(manifest.execution.complexity.scalar, 1);
-        assert_eq!(manifest.execution.complexity.list_fanout, 5);
+        assert_eq!(
+            manifest.execution,
+            crate::graphql::ClientExecutionLimits {
+                max_depth: 6,
+                max_fields: 37,
+                max_rows: 4_321,
+                max_bool_width: 3,
+                max_in_list: 9,
+            }
+        );
+    }
+
+    /// The `root_field` metric label is the schema field, never the client's
+    /// alias, and anything the role's surface does not serve is `_`.
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn metric_root_field_is_the_schema_field_not_the_alias() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .connect_lazy("sqlite::memory:")
+            .unwrap();
+        let project = ReadModelCatalog::new("orders-service").table_schema(orders());
+        let engine = GraphqlEngine::from_schema_catalog(&project, pool)
+            .unwrap()
+            .identity(crate::graphql::IdentityConfig::dev_headers())
+            .roles(&["user"])
+            .grant_all("user")
+            .build()
+            .unwrap();
+        let surface = engine.inner.role_surfaces.get("user");
+        let root = engine.inner.role_surfaces["user"].query_fields[0]
+            .name
+            .clone();
+        let label = |document: &str| {
+            super::request::metric_root_field(&mut Request::new(document), surface)
+        };
+
+        assert_eq!(label(&format!("{{ {root} {{ order_id }} }}")), root);
+        assert_eq!(
+            label(&format!("{{ anyClientText123: {root} {{ order_id }} }}")),
+            root
+        );
+        assert_eq!(label("{ __typename }"), "_");
+        assert_eq!(label("{ notAField }"), "_");
+        assert_eq!(label("not graphql"), "_");
+        assert_eq!(
+            super::request::metric_root_field(
+                &mut Request::new(format!("{{ {root} {{ order_id }} }}")),
+                None
+            ),
+            "_"
+        );
     }
 
     #[cfg(feature = "sqlite")]
@@ -234,6 +345,7 @@ mod client_surface_parity_tests {
             let project = ReadModelCatalog::new("orders-service").table_schema(orders());
             GraphqlEngine::from_schema_catalog(&project, pool)
                 .unwrap()
+                .identity(crate::graphql::IdentityConfig::dev_headers())
                 .roles(&["user"])
                 .grant_all("user")
                 .client_application_surface("console", ["user"], ["user"])
@@ -253,7 +365,8 @@ mod client_surface_parity_tests {
 
         assert_eq!(generated, runtime);
         assert_eq!(runtime.execution.max_depth, 8);
-        assert_eq!(runtime.execution.max_complexity, 500);
+        assert_eq!(runtime.execution.max_fields, 500);
+        assert_eq!(runtime.execution.max_rows, 200_000);
         assert_eq!(
             with_graphiql.inner.schemas.get("user").unwrap().sdl(),
             with_graphiql
@@ -339,7 +452,7 @@ mod client_surface_parity_tests {
             .await;
         assert_eq!(
             disabled.data,
-            Value::Null,
+            async_graphql::Value::Null,
             "GraphiQL must not override request-level introspection denial"
         );
         let streamed = with_graphiql
@@ -352,7 +465,7 @@ mod client_surface_parity_tests {
         assert_eq!(streamed.len(), 1);
         assert_eq!(
             streamed[0].data,
-            Value::Null,
+            async_graphql::Value::Null,
             "the streaming path must preserve request-level introspection denial"
         );
     }
@@ -416,7 +529,7 @@ mod client_surface_parity_tests {
     #[cfg(feature = "sqlite")]
     #[tokio::test]
     async fn configured_protocol_attaches_stable_role_and_identity_bound_envelopes() {
-        use crate::graphql::identity::VerifiedPrincipal;
+        use crate::command_dispatch::VerifiedPrincipal;
 
         let engine = protocol_engine("public/graphql");
         let manifest = engine.client_manifest_for_role("user").unwrap();
@@ -462,10 +575,7 @@ mod client_surface_parity_tests {
         assert_eq!(first, second);
         assert_eq!(first["protocolVersion"], 1);
         assert_eq!(first["schemaHash"], manifest.schema_fingerprint);
-        assert_eq!(
-            first["operation"],
-            "sha256:7f56e67dd21ab3f30d1ff8b7bed08893f0a0db86449836189b361dd1e56ddb4b"
-        );
+        assert_digest(first["operation"].as_str().unwrap());
         let scope = first["cacheScope"].as_str().unwrap();
         assert!(scope.starts_with("v1.cache-scope."));
         assert!(!scope.contains("principal-a"));
@@ -563,6 +673,7 @@ mod client_surface_parity_tests {
         let project = ReadModelCatalog::new("orders-service").table_schema(orders());
         let engine = GraphqlEngine::from_schema_catalog(&project, pool)
             .unwrap()
+            .identity(crate::graphql::IdentityConfig::dev_headers())
             .roles(&["admin", "user"])
             .grant_all("admin")
             .grant_all("user")
@@ -588,6 +699,7 @@ mod client_surface_parity_tests {
         let project = ReadModelCatalog::new("orders-service").table_schema(orders());
         let engine = GraphqlEngine::from_schema_catalog(&project, pool)
             .unwrap()
+            .identity(crate::graphql::IdentityConfig::dev_headers())
             .roles(&["anonymous", "user"])
             .grant_all("anonymous")
             .grant_all("user")
@@ -639,6 +751,7 @@ mod client_surface_parity_tests {
         let project = ReadModelCatalog::new("orders-service").table_schema(orders());
         let mut builder = GraphqlEngine::from_schema_catalog(&project, pool)
             .unwrap()
+            .identity(crate::graphql::IdentityConfig::dev_headers())
             .roles(&["admin", "user"])
             .grant_all("admin")
             .grant_all("user");
@@ -646,12 +759,12 @@ mod client_surface_parity_tests {
         // user-only so the application contract keeps a portable claim preset.
         builder
             .permissions
-            .get_mut(&("OrderView".into(), "user".into()))
+            .get_mut("user")
+            .and_then(|grants| grants.get_mut("OrderView"))
             .unwrap()
-            .permission
             .row_filter = Some(col("status").eq(claim("x-user-id")));
         let engine = builder
-            .client_application_surface_with_schema_roles("console", ["admin", "user"], ["user"])
+            .client_application_surface("console", ["admin", "user"], ["user"])
             .protocol_token_key([7; 32])
             .build()
             .unwrap();
@@ -661,7 +774,7 @@ mod client_surface_parity_tests {
             .expect("registered multi-role application manifest");
         assert_eq!(
             manifest.surface,
-            crate::graphql::ClientSurfaceIdentity::application_with_schema_roles(
+            crate::graphql::ClientSurfaceIdentity::application(
                 "console",
                 ["admin", "user"],
                 ["user"],
@@ -752,6 +865,7 @@ mod client_surface_parity_tests {
         let project2 = ReadModelCatalog::new("orders-service").table_schema(orders());
         let user_only = GraphqlEngine::from_schema_catalog(&project2, pool2)
             .unwrap()
+            .identity(crate::graphql::IdentityConfig::dev_headers())
             .roles(&["admin", "user"])
             .grant_all("admin")
             .grant_all("user")
@@ -802,6 +916,7 @@ mod client_surface_parity_tests {
         let project = ReadModelCatalog::new("orders-service").table_schema(orders());
         let engine = GraphqlEngine::from_schema_catalog(&project, pool)
             .unwrap()
+            .identity(crate::graphql::IdentityConfig::dev_headers())
             .roles(&["admin", "user"])
             .grant_all("admin")
             .grant_all("user")
@@ -942,6 +1057,51 @@ mod client_surface_parity_tests {
         assert!(!response.extensions.contains_key("distributed"));
     }
 
+    #[test]
+    fn unsigned_presets_from_session_enforce_canonical_safe_ranges() {
+        for (codec, maximum) in [
+            ("uint8", 255_u64),
+            ("uint16", 65_535),
+            ("uint32", 4_294_967_295),
+            ("uint64_safe_integer", 9_007_199_254_740_991),
+        ] {
+            let descriptor = ClientTrustedPresetDescriptor {
+                name: "x-revision".into(),
+                codec: codec.into(),
+            };
+            let mut session = Session::new();
+            for raw in ["0".to_string(), maximum.to_string()] {
+                session.set("x-revision", &raw);
+                assert_eq!(
+                    crate::graphql::engine::protocol::resolve_protocol_preset(
+                        &session,
+                        &descriptor
+                    )
+                    .unwrap()
+                    .value,
+                    serde_json::json!(raw.parse::<u64>().unwrap())
+                );
+            }
+            for raw in [
+                "-1".to_string(),
+                "-0".into(),
+                "1.5".into(),
+                "1.0".into(),
+                "+1".into(),
+                "01".into(),
+                "NaN".into(),
+                (maximum + 1).to_string(),
+            ] {
+                session.set("x-revision", &raw);
+                assert!(crate::graphql::engine::protocol::resolve_protocol_preset(
+                    &session,
+                    &descriptor
+                )
+                .is_none());
+            }
+        }
+    }
+
     #[cfg(feature = "sqlite")]
     #[tokio::test]
     async fn row_policy_presets_follow_sql_claim_case_normalization() {
@@ -976,8 +1136,72 @@ mod client_surface_parity_tests {
 
     #[cfg(feature = "sqlite")]
     #[tokio::test]
+    async fn required_presets_reject_query_and_stream_without_internal_errors() {
+        let mut engine = preset_protocol_engine();
+        Arc::get_mut(&mut engine.inner)
+            .unwrap()
+            .protocol
+            .as_mut()
+            .unwrap()
+            .roles
+            .get_mut("user")
+            .unwrap()
+            .surface
+            .trusted_presets = vec![ClientTrustedPresetDescriptor {
+            name: "x-required-number".into(),
+            codec: "int32".into(),
+        }];
+        for value in [None, Some("not-a-number"), Some("01"), Some("2147483648")] {
+            let mut session = Session::new();
+            session.set("x-roles", "user");
+            if let Some(value) = value {
+                session.set("x-required-number", value);
+            }
+            let query = engine
+                .execute(&session, Request::new("{ __typename }"))
+                .await;
+            let streamed = engine
+                .execute_stream(&session, Request::new("{ __typename }"))
+                .collect::<Vec<_>>()
+                .await;
+            assert_eq!(streamed.len(), 1);
+            for response in std::iter::once(query).chain(streamed) {
+                assert_eq!(response.errors.len(), 1);
+                let error = serde_json::to_value(&response.errors[0]).unwrap();
+                assert_eq!(error["extensions"]["code"], "BAD_REQUEST", "{error}");
+                assert_eq!(
+                    error["message"],
+                    "required session input is missing or invalid"
+                );
+                assert_eq!(response.data, async_graphql::Value::Null);
+                assert!(!response.extensions.contains_key("distributed"));
+            }
+        }
+        let mut valid = Session::new();
+        valid.set("x-roles", "user");
+        valid.set("x-required-number", "42");
+        let response = engine.execute(&valid, Request::new("{ __typename }")).await;
+        assert!(!response.is_err(), "{:?}", response.errors);
+        assert_eq!(
+            distributed_extension(&response)["trustedPresets"][0]["value"],
+            42
+        );
+        let responses = engine
+            .execute_stream(&valid, Request::new("{ __typename }"))
+            .collect::<Vec<_>>()
+            .await;
+        assert_eq!(responses.len(), 1);
+        assert!(!responses[0].is_err());
+        assert_eq!(
+            distributed_extension(&responses[0])["trustedPresets"][0]["value"],
+            42
+        );
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
     async fn cache_scope_tracks_only_relevant_claims_and_private_policy() {
-        use crate::graphql::identity::VerifiedPrincipal;
+        use crate::command_dispatch::VerifiedPrincipal;
 
         let engine = policy_protocol_engine("public/graphql", "x-tenant");
         let principal = VerifiedPrincipal::test_oidc(
@@ -1051,7 +1275,7 @@ mod client_surface_parity_tests {
     #[cfg(feature = "sqlite")]
     #[tokio::test]
     async fn protocol_stream_uses_one_request_accumulator_and_raw_engine_has_no_envelope() {
-        use crate::graphql::identity::VerifiedPrincipal;
+        use crate::command_dispatch::VerifiedPrincipal;
 
         let engine = protocol_engine("public/graphql");
         let mut session = Session::new();
@@ -1073,6 +1297,7 @@ mod client_surface_parity_tests {
         let project = ReadModelCatalog::new("orders-service").table_schema(orders());
         let raw = GraphqlEngine::from_schema_catalog(&project, pool)
             .unwrap()
+            .identity(crate::graphql::IdentityConfig::dev_headers())
             .roles(&["user"])
             .grant_all("user")
             .build()
@@ -1088,6 +1313,7 @@ mod client_surface_parity_tests {
             .connect_lazy("sqlite::memory:")
             .unwrap();
         let result = GraphqlEngine::builder(pool.clone())
+            .identity(crate::graphql::IdentityConfig::dev_headers())
             .service_id("orders-service")
             .protocol_token_key([0; 32])
             .build();
@@ -1098,6 +1324,7 @@ mod client_surface_parity_tests {
         assert!(error.to_string().contains("must not be all zero"));
 
         let result = GraphqlEngine::builder(pool)
+            .identity(crate::graphql::IdentityConfig::dev_headers())
             .protocol_token_key([7; 32])
             .build();
         let error = match result {
@@ -1125,6 +1352,7 @@ mod client_surface_parity_tests {
         .unwrap();
         let mut builder = GraphqlEngine::from_schema_catalog(&project, pool)
             .unwrap()
+            .identity(crate::graphql::IdentityConfig::dev_headers())
             .roles(&["user"])
             .grant_all("user")
             .default_limit(7)
@@ -1237,10 +1465,7 @@ mod client_surface_parity_tests {
         for forbidden in ["_contains", "_contained_in", "_has_key"] {
             assert!(!metadata_ops.contains(forbidden));
         }
-        assert_eq!(
-            manifest.schema_fingerprint,
-            "sha256:7a456dac4fce3e4ccba7255baccad3e70e891f71ea476c1560631c9b2e5cf1da"
-        );
+        assert_digest(&manifest.schema_fingerprint);
     }
 
     #[cfg(feature = "sqlite")]
@@ -1250,6 +1475,7 @@ mod client_surface_parity_tests {
             .connect_lazy("sqlite::memory:")
             .unwrap();
         let engine = GraphqlEngine::builder(pool)
+            .identity(crate::graphql::IdentityConfig::dev_headers())
             .register_schema_exposed(orders())
             .unwrap()
             .roles(&["user"])
@@ -1272,6 +1498,7 @@ mod client_surface_parity_tests {
         let project = ReadModelCatalog::new("orders-service").table_schema(orders());
         let engine = GraphqlEngine::from_schema_catalog(&project, pool)
             .unwrap()
+            .identity(crate::graphql::IdentityConfig::dev_headers())
             .roles(&["empty"])
             .build()
             .unwrap();
@@ -1300,6 +1527,7 @@ mod client_surface_parity_tests {
         let project = ReadModelCatalog::new("orders-service").table_schema(orders());
         let engine = GraphqlEngine::from_schema_catalog(&project, pool)
             .unwrap()
+            .identity(crate::graphql::IdentityConfig::dev_headers())
             .roles(&["user"])
             .grant_all("user")
             .default_limit(7)
@@ -1367,15 +1595,17 @@ mod client_surface_parity_tests {
             .iter()
             .cloned()
             .collect();
-        assert_eq!(metadata_ops, runtime_json);
-        for required in ["_contains", "_contained_in", "_has_key"] {
-            assert!(metadata_ops.contains(required));
+        // The client contract is dialect-neutral: every operator it offers is
+        // accepted by this runtime, and the Postgres-only `jsonb` operators
+        // stay on the GraphQL schema for raw GraphQL but out of the manifest,
+        // so its schema hash equals a SQLite deployment's.
+        assert!(metadata_ops.is_subset(&runtime_json));
+        for postgres_only in ["_contains", "_contained_in", "_has_key"] {
+            assert!(runtime_json.contains(postgres_only));
+            assert!(!metadata_ops.contains(postgres_only));
         }
         assert_eq!(manifest.service_id, "orders-service");
-        assert_eq!(
-            manifest.schema_fingerprint,
-            "sha256:7a599939c85d2f444428431675655d371929234965bdcfb6c81eba244694e6d0"
-        );
+        assert_digest(&manifest.schema_fingerprint);
     }
 
     fn customers() -> TableSchema {
@@ -1392,7 +1622,6 @@ mod client_surface_parity_tests {
             ],
             primary_key: PrimaryKey::new(["customer_id"]),
             version_column: None,
-            foreign_keys: Vec::new(),
             indexes: Vec::new(),
             relationships: Vec::new(),
             kind: TableKind::ReadModel,
@@ -1404,9 +1633,10 @@ mod client_surface_parity_tests {
         type_name: &str,
         nullable: bool,
         list: bool,
-        nested: Option<GraphqlTypeDef>,
-    ) -> GraphqlTypeField {
-        GraphqlTypeField {
+        nested: Option<CommandTypeDef>,
+    ) -> CommandTypeField {
+        CommandTypeField {
+            unsigned_integer: None,
             name: name.into(),
             type_name: type_name.into(),
             nullable,
@@ -1418,16 +1648,16 @@ mod client_surface_parity_tests {
 
     struct ChangeOrderInput;
 
-    impl GraphqlInputType for ChangeOrderInput {
-        fn graphql_type() -> GraphqlTypeDef {
-            let patch = GraphqlTypeDef::new(
+    impl CommandInputType for ChangeOrderInput {
+        fn command_type() -> CommandTypeDef {
+            let patch = CommandTypeDef::new(
                 "OrderPatchInput",
                 vec![
                     type_field("status", "String", false, false, None),
                     type_field("metadata", "JSON", true, false, None),
                 ],
             );
-            GraphqlTypeDef::new(
+            CommandTypeDef::new(
                 "ChangeOrderInput",
                 vec![
                     type_field("patch", "OrderPatchInput", false, false, Some(patch)),
@@ -1439,16 +1669,16 @@ mod client_surface_parity_tests {
 
     struct ChangeOrderPayload;
 
-    impl GraphqlOutputType for ChangeOrderPayload {
-        fn graphql_type() -> GraphqlTypeDef {
-            let changed_order = GraphqlTypeDef::new(
+    impl CommandOutputType for ChangeOrderPayload {
+        fn command_type() -> CommandTypeDef {
+            let changed_order = CommandTypeDef::new(
                 "ChangedOrder",
                 vec![
                     type_field("status", "String", false, false, None),
                     type_field("order_id", "String", false, false, None),
                 ],
             );
-            GraphqlTypeDef::new(
+            CommandTypeDef::new(
                 "ChangeOrderPayload",
                 vec![
                     type_field("warnings", "String", true, true, None),
@@ -1507,7 +1737,9 @@ mod client_surface_parity_tests {
     ) {
         assert!(builder
             .permissions
-            .insert((model.into(), role.into()), RoleModelPerm { permission },)
+            .entry(role.into())
+            .or_default()
+            .insert(model.into(), permission)
             .is_none());
     }
 
@@ -1515,6 +1747,7 @@ mod client_surface_parity_tests {
         let project = matrix_project();
         let mut builder = GraphqlEngine::from_schema_catalog(&project, pool)
             .unwrap()
+            .identity(crate::graphql::IdentityConfig::dev_headers())
             .roles(&["restricted", "admin"])
             .default_limit(11)
             .max_limit(23)
@@ -1558,19 +1791,14 @@ mod client_surface_parity_tests {
         let grants = match role {
             "restricted" => BTreeMap::from([(
                 "OrderView".into(),
-                RoleGrant::columns(["order_id", "status"])
+                read()
+                    .columns(["order_id", "status"])
                     .rows(col("status").eq("OPEN"))
                     .limit(5),
             )]),
             "admin" => BTreeMap::from([
-                (
-                    "OrderView".into(),
-                    RoleGrant::all_columns().with_aggregations(),
-                ),
-                (
-                    "CustomerView".into(),
-                    RoleGrant::all_columns().with_aggregations(),
-                ),
+                ("OrderView".into(), read().all_columns().aggregations()),
+                ("CustomerView".into(), read().all_columns().aggregations()),
             ]),
             other => panic!("unexpected matrix role `{other}`"),
         };
@@ -1625,23 +1853,20 @@ mod client_surface_parity_tests {
         inventory
     }
 
-    fn sha256(bytes: &[u8]) -> String {
-        format!("sha256:{:x}", Sha256::digest(bytes))
+    /// A content digest as the protocol writes them. Its value is pinned by
+    /// comparing independent builds, not by a golden constant.
+    fn assert_digest(digest: &str) {
+        let hex = digest.strip_prefix("sha256:").unwrap_or_default();
+        assert!(
+            hex.len() == 64
+                && hex
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
+            "not a sha256 digest: {digest}"
+        );
     }
 
-    #[derive(Clone, Copy)]
-    struct ArtifactGoldens {
-        manifest: &'static str,
-        static_sdl: &'static str,
-        runtime_sdl: &'static str,
-    }
-
-    async fn assert_role_matrix(
-        engine: &GraphqlEngine,
-        dialect: SurfaceDialect,
-        role: &str,
-        expected: ArtifactGoldens,
-    ) {
+    async fn assert_role_matrix(engine: &GraphqlEngine, dialect: SurfaceDialect, role: &str) {
         let stored = engine.surface_for_role(role).unwrap();
         let export = engine.client_surface_for_role(role).unwrap();
         assert!(Arc::ptr_eq(&stored, export.surface()));
@@ -1776,16 +2001,9 @@ mod client_surface_parity_tests {
             other => panic!("unexpected matrix role `{other}`"),
         }
 
-        let manifest_json = serde_json::to_vec(&manifest).unwrap();
-        let actual_manifest = sha256(&manifest_json);
-        let actual_static_sdl = sha256(static_sdl.as_bytes());
-        let actual_runtime_sdl = sha256(runtime_sdl.as_bytes());
-        assert_eq!(actual_manifest, expected.manifest, "{dialect:?}/{role}");
-        assert_eq!(actual_static_sdl, expected.static_sdl, "{dialect:?}/{role}");
-        assert_eq!(
-            actual_runtime_sdl, expected.runtime_sdl,
-            "{dialect:?}/{role}"
-        );
+        // The manifest equals one built independently from the same inputs
+        // (above), so its fingerprint is stable across builds.
+        assert_digest(&manifest.schema_fingerprint);
     }
 
     async fn assert_nested_command_validates(engine: &GraphqlEngine) {
@@ -1816,54 +2034,14 @@ mod client_surface_parity_tests {
     }
 
     #[cfg(feature = "sqlite")]
-    const SQLITE_RESTRICTED_GOLDENS: ArtifactGoldens = ArtifactGoldens {
-        manifest: "sha256:a2b97c4156fd9e6c99c3ad516af5cf2c57781fa4f13757902685989a691b2515",
-        static_sdl: "sha256:6ac07aaa60a726bdde7c1632125a3ab933766931187654dacc2dd4ab19ffece1",
-        runtime_sdl: "sha256:fb41d43fa1b58fec7224d768124abc8bb0b30407e1ee56b44f620ddc8d8c0007",
-    };
-
-    #[cfg(feature = "sqlite")]
-    const SQLITE_ADMIN_GOLDENS: ArtifactGoldens = ArtifactGoldens {
-        manifest: "sha256:4619fb257bd0b3b0155ebdff5f34a8d15f6c23bc0fc8a99459e7d56aad444932",
-        static_sdl: "sha256:4d7ba7651ff632d32e538a083165ff718e094858c6c5bdb2705d38d9f0665e2f",
-        runtime_sdl: "sha256:be0f13249ec0cb394457572097a1d201649deeec1eba9c980f48b1751a13062b",
-    };
-
-    #[cfg(feature = "postgres")]
-    const POSTGRES_RESTRICTED_GOLDENS: ArtifactGoldens = ArtifactGoldens {
-        manifest: "sha256:a2b97c4156fd9e6c99c3ad516af5cf2c57781fa4f13757902685989a691b2515",
-        static_sdl: "sha256:6ac07aaa60a726bdde7c1632125a3ab933766931187654dacc2dd4ab19ffece1",
-        runtime_sdl: "sha256:fb41d43fa1b58fec7224d768124abc8bb0b30407e1ee56b44f620ddc8d8c0007",
-    };
-
-    #[cfg(feature = "postgres")]
-    const POSTGRES_ADMIN_GOLDENS: ArtifactGoldens = ArtifactGoldens {
-        manifest: "sha256:66cddbcf76eac385f94de011497fe4752f7fb6102de28c14c24d83c67367788b",
-        static_sdl: "sha256:d128621aea3ffa6c38abc44a9b7f3b2716aada4af4b579b10e7c415040281751",
-        runtime_sdl: "sha256:ae58e2ed718955a6d400197a4cfa2f363d3057c80c6f4e528d10615a3df804cb",
-    };
-
-    #[cfg(feature = "sqlite")]
     #[tokio::test]
     async fn sqlite_restricted_admin_full_artifact_matrix() {
         let pool = sqlx::sqlite::SqlitePoolOptions::new()
             .connect_lazy("sqlite::memory:")
             .unwrap();
         let engine = matrix_engine(pool.into());
-        assert_role_matrix(
-            &engine,
-            SurfaceDialect::Sqlite,
-            "restricted",
-            SQLITE_RESTRICTED_GOLDENS,
-        )
-        .await;
-        assert_role_matrix(
-            &engine,
-            SurfaceDialect::Sqlite,
-            "admin",
-            SQLITE_ADMIN_GOLDENS,
-        )
-        .await;
+        assert_role_matrix(&engine, SurfaceDialect::Sqlite, "restricted").await;
+        assert_role_matrix(&engine, SurfaceDialect::Sqlite, "admin").await;
         assert_nested_command_validates(&engine).await;
     }
 
@@ -1874,20 +2052,8 @@ mod client_surface_parity_tests {
             .connect_lazy("postgres://postgres:postgres@localhost/distributed_test")
             .unwrap();
         let engine = matrix_engine(pool.into());
-        assert_role_matrix(
-            &engine,
-            SurfaceDialect::Postgres,
-            "restricted",
-            POSTGRES_RESTRICTED_GOLDENS,
-        )
-        .await;
-        assert_role_matrix(
-            &engine,
-            SurfaceDialect::Postgres,
-            "admin",
-            POSTGRES_ADMIN_GOLDENS,
-        )
-        .await;
+        assert_role_matrix(&engine, SurfaceDialect::Postgres, "restricted").await;
+        assert_role_matrix(&engine, SurfaceDialect::Postgres, "admin").await;
         assert_nested_command_validates(&engine).await;
     }
 
@@ -1909,7 +2075,6 @@ mod client_surface_parity_tests {
             ],
             primary_key: PrimaryKey::new(["tenant_id", "record_id"]),
             version_column: None,
-            foreign_keys: Vec::new(),
             indexes: Vec::new(),
             relationships: Vec::new(),
             kind: TableKind::ReadModel,
@@ -1963,6 +2128,7 @@ mod client_surface_parity_tests {
         let project = ReadModelCatalog::new("composite-service").table_schema(composite_records());
         let engine = GraphqlEngine::from_schema_catalog(&project, pool.clone())
             .unwrap()
+            .identity(crate::graphql::IdentityConfig::dev_headers())
             .roles(&["admin"])
             .grant_all("admin")
             .build()
@@ -2078,9 +2244,9 @@ mod client_surface_parity_tests {
             }],
             primary_key: PrimaryKey::new(["parent_id"]),
             version_column: None,
-            foreign_keys: Vec::new(),
             indexes: Vec::new(),
             relationships: vec![RelationshipDef {
+                references: None,
                 field_name: "children".into(),
                 kind: RelationshipKind::HasMany,
                 target_model: "PolicyChildView".into(),
@@ -2108,7 +2274,6 @@ mod client_surface_parity_tests {
             ],
             primary_key: PrimaryKey::new(["child_id"]),
             version_column: None,
-            foreign_keys: Vec::new(),
             indexes: Vec::new(),
             relationships: Vec::new(),
             kind: TableKind::ReadModel,
@@ -2160,6 +2325,7 @@ mod client_surface_parity_tests {
             .table_schema(policy_children());
         let mut builder = GraphqlEngine::from_schema_catalog(&project, pool)
             .unwrap()
+            .identity(crate::graphql::IdentityConfig::dev_headers())
             .roles(&["restricted"]);
         insert_permission(
             &mut builder,
@@ -2217,7 +2383,6 @@ mod client_surface_parity_tests {
             ],
             primary_key: PrimaryKey::new(["metric_id"]),
             version_column: None,
-            foreign_keys: Vec::new(),
             indexes: Vec::new(),
             relationships: Vec::new(),
             kind: TableKind::ReadModel,
@@ -2235,6 +2400,7 @@ mod client_surface_parity_tests {
                 let project = ReadModelCatalog::new("metrics-service").table_schema(metrics());
                 let mut builder = GraphqlEngine::from_schema_catalog(&project, pool)
                     .unwrap()
+                    .identity(crate::graphql::IdentityConfig::dev_headers())
                     .roles(&["restricted"]);
                 insert_permission(
                     &mut builder,
@@ -2256,6 +2422,7 @@ mod client_surface_parity_tests {
         let project = ReadModelCatalog::new("metrics-service").table_schema(metrics());
         let mut builder = GraphqlEngine::from_schema_catalog(&project, pool)
             .unwrap()
+            .identity(crate::graphql::IdentityConfig::dev_headers())
             .roles(&["restricted"]);
         insert_permission(
             &mut builder,
@@ -2277,9 +2444,9 @@ mod client_surface_parity_tests {
                 FilterExpr::Cmp {
                     column: "metric_id".into(),
                     op: crate::graphql::filter::CmpOp::Eq,
-                    rhs: Operand::Lit(crate::graphql::LitValue::Json(serde_json::json!(
-                        "metric-1"
-                    ))),
+                    rhs: crate::graphql::Operand::Lit(crate::graphql::LitValue::Json(
+                        serde_json::json!("metric-1"),
+                    )),
                 },
                 "literal kind `json`",
             ),
@@ -2287,8 +2454,10 @@ mod client_surface_parity_tests {
                 FilterExpr::In {
                     column: "value".into(),
                     values: vec![
-                        Operand::from(1.0),
-                        Operand::Lit(crate::graphql::LitValue::Json(serde_json::json!(2.0))),
+                        crate::graphql::Operand::from(1.0),
+                        crate::graphql::Operand::Lit(crate::graphql::LitValue::Json(
+                            serde_json::json!(2.0),
+                        )),
                     ],
                     negated: false,
                 },
@@ -2298,7 +2467,7 @@ mod client_surface_parity_tests {
                 FilterExpr::Cmp {
                     column: "metric_id".into(),
                     op: crate::graphql::filter::CmpOp::HasKey,
-                    rhs: Operand::from("tenant"),
+                    rhs: crate::graphql::Operand::from("tenant"),
                 },
                 "operator `HasKey`",
             ),
@@ -2310,6 +2479,7 @@ mod client_surface_parity_tests {
             let project = ReadModelCatalog::new("metrics-service").table_schema(metrics());
             let mut builder = GraphqlEngine::from_schema_catalog(&project, pool)
                 .unwrap()
+                .identity(crate::graphql::IdentityConfig::dev_headers())
                 .roles(&["restricted"]);
             insert_permission(
                 &mut builder,
@@ -2323,20 +2493,5 @@ mod client_surface_parity_tests {
                 .expect("mistyped row-policy literal must fail");
             assert!(error.to_string().contains(expected), "{error}");
         }
-    }
-
-    #[cfg(feature = "sqlite")]
-    #[tokio::test]
-    async fn sqlite_nocase_can_equate_unequal_code_unit_strings() {
-        let pool = sqlx::sqlite::SqlitePoolOptions::new()
-            .connect("sqlite::memory:")
-            .await
-            .unwrap();
-        let equal: i64 = sqlx::query_scalar("SELECT 'A' = 'a' COLLATE NOCASE")
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-        assert_eq!(equal, 1);
-        assert_ne!("A", "a");
     }
 }

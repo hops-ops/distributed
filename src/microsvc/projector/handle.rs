@@ -12,7 +12,7 @@ const DETERMINISTIC_FAILURE_ID_BYTES: usize = 64;
 /// unique deterministic failure ID. It never serializes a canonical projection
 /// partition, which may contain tenant identifiers. During repair, the owning
 /// store resolves and validates the exact durable topology/partition scope and
-/// the [`Service`](super::Service) verifies that topology is registered.
+/// the [`Service`](crate::microsvc::Service) verifies that topology is registered.
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub struct ProjectionRepairHandle {
     version: u8,
@@ -35,6 +35,18 @@ impl ProjectionRepairHandle {
     pub fn failure_id(&self) -> &str {
         &self.failure_id
     }
+}
+
+/// A projection that a durable failure has stopped, as
+/// [`Service::stopped_projections`](crate::microsvc::Service::stopped_projections)
+/// reports it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StoppedProjection {
+    /// The stopped projector's topology name.
+    pub projection: String,
+    /// What [`Service::repair_projection`](crate::microsvc::Service::repair_projection)
+    /// takes to let it resume from its failed input.
+    pub repair: ProjectionRepairHandle,
 }
 
 impl fmt::Debug for ProjectionRepairHandle {

@@ -1,65 +1,58 @@
 #[cfg(feature = "graphql")]
 use super::causal::collapse_projection_evidence;
+#[cfg(feature = "runtime-tokio")]
+use super::routes::LedgerCompaction;
 use super::*;
-#[cfg(feature = "graphql")]
 use crate::aggregate::Aggregate;
-#[cfg(feature = "graphql")]
 use crate::bus::RunOptions;
 use crate::bus::{Message, MessageKind, SubscriptionPlan};
+use crate::command::Eventual;
+use crate::command::{typed_command, PreparedCommand, Succeeded};
 #[cfg(feature = "graphql")]
+use crate::command::{Atomic, CommandConsistency};
+use crate::command::{CommandInputType, CommandOutputType, CommandTypeDef, CommandTypeField};
+#[cfg(feature = "graphql")]
+use crate::command_dispatch::SharedCommandHost;
+use crate::command_dispatch::VerifiedPrincipal;
+#[cfg(feature = "runtime-tokio")]
+use crate::command_ledger::CommandLedgerState;
 use crate::command_ledger::{
     AttemptFence, CausalCommitBatch, CausalGetStream, CausalRepositoryIdentity,
-    CausalTransactionalCommit, CommandLedgerError, CommandLedgerKey, CommandLedgerState,
-    CommandLedgerStore, CommandLookup, CommandLookupScope, CommandReservation, ReservationOutcome,
+    CausalTransactionalCommit, CommandLedgerError, CommandLedgerKey, CommandLedgerStore,
+    CommandLookup, CommandLookupScope, CommandReservation, ExternalCommandCompletion,
+    ReservationOutcome,
 };
 #[cfg(feature = "graphql")]
-use crate::graphql::command_contract::CommandConsistency;
+use crate::graphql::{SurfaceDirectProjection, SurfaceProjector};
 #[cfg(feature = "graphql")]
-use crate::graphql::identity::VerifiedPrincipal;
-#[cfg(all(feature = "graphql", feature = "sqlite"))]
-use crate::graphql::Eventual;
-use crate::graphql::{
-    typed_command, GraphqlInputType, GraphqlOutputType, GraphqlTypeDef, GraphqlTypeField,
-    PreparedCommand, Succeeded,
-};
-#[cfg(feature = "graphql")]
-use crate::graphql::{Atomic, SurfaceDirectProjection, SurfaceProjector};
-#[cfg(feature = "graphql")]
+use crate::microsvc::cell_host::{CelldCommandHost, InternalHttpSecret};
 use crate::microsvc::HasOutboxStore;
-use crate::microsvc::{
-    CommandRequest, Context, HandlerError, RepoReadModelDependencies, Routes, Service, Session,
-};
-#[cfg(feature = "graphql")]
+use crate::microsvc::{Context, HandlerError, RepoReadModelDependencies, Routes, Service, Session};
 use crate::outbox::OutboxMessage;
-#[cfg(feature = "graphql")]
+use crate::outbox_worker::OutboxStore;
 use crate::projection_protocol::{
+    PartitionId, ProjectionCausationEvidenceBatch, ProjectionCausationEvidenceRequest,
     ProjectionChangeCursor, ProjectionChangeRead, ProjectionCheckpoint, ProjectionCommitBatch,
-    ProjectionCommitResult, ProjectionFailure, ProjectionFailureBatch, ProjectionFailureLocation,
-    ProjectionGeneration, ProjectionInputCursor, ProjectionInputDisposition,
-    ProjectionLiveRecordBatch, ProjectionLiveRecordBatchRequest, ProjectionModelOwnership,
-    ProjectionObligationEvidenceBatch, ProjectionObligationEvidenceBatchRequest,
-    ProjectionObservation, ProjectionObservationKind, ProjectionPartition,
-    ProjectionPartitionRuntimeState, ProjectionProtocolError, ProjectionProtocolStore,
-    ProjectionQuerySnapshot, ProjectionQuerySnapshotBatch, ProjectionQuerySnapshotBatchRequest,
-    ProjectionQuerySnapshotRequest, ProjectionRecordMetadata, ProjectionRecordScope,
-    ProjectorTopologyId, TrustedProjectionInput,
+    ProjectionCommitResult, ProjectionExecutionSnapshotBatch,
+    ProjectionExecutionSnapshotBatchRequest, ProjectionFailure, ProjectionFailureBatch,
+    ProjectionFailureLocation, ProjectionGeneration, ProjectionInputCursor,
+    ProjectionInputDisposition, ProjectionModelOwnership, ProjectionObservation,
+    ProjectionObservationKind, ProjectionPartitionRuntimeState, ProjectionProtocolError,
+    ProjectionProtocolStore, ProjectionQuerySnapshot, ProjectionQuerySnapshotRequest,
+    ProjectionRecordMetadata, ProjectionRecordScope, ProjectorTopologyId, TrustedProjectionInput,
 };
+use crate::GetStream;
 use crate::{
     sourced, AggregateBuilder, AggregateRepository, Entity, InMemoryRepository, Queueable,
     QueuedRepository,
 };
-#[cfg(feature = "graphql")]
-use crate::{GetStream, OutboxStore};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use serde_json::Value;
 use std::collections::HashMap;
-#[cfg(feature = "graphql")]
 use std::future::Future;
-#[cfg(feature = "graphql")]
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicBool, Ordering};
-#[cfg(feature = "graphql")]
 use std::sync::{Arc, Mutex};
 
 #[cfg(feature = "graphql")]
@@ -75,10 +68,11 @@ struct TypedOutput {
     id: String,
 }
 
-fn one_string_field(name: &str, field: &str) -> GraphqlTypeDef {
-    GraphqlTypeDef::new(
+fn one_string_field(name: &str, field: &str) -> CommandTypeDef {
+    CommandTypeDef::new(
         name,
-        vec![GraphqlTypeField {
+        vec![CommandTypeField {
+            unsigned_integer: None,
             name: field.into(),
             type_name: "String".into(),
             nullable: false,
@@ -89,32 +83,31 @@ fn one_string_field(name: &str, field: &str) -> GraphqlTypeDef {
     )
 }
 
-impl GraphqlInputType for TypedInput {
-    fn graphql_type() -> GraphqlTypeDef {
+impl CommandInputType for TypedInput {
+    fn command_type() -> CommandTypeDef {
         one_string_field("TypedInput", "id").with_type_id(std::any::TypeId::of::<Self>())
     }
 }
 
-impl GraphqlOutputType for TypedOutput {
-    fn graphql_type() -> GraphqlTypeDef {
+impl CommandOutputType for TypedOutput {
+    fn command_type() -> CommandTypeDef {
         one_string_field("TypedOutput", "id").with_type_id(std::any::TypeId::of::<Self>())
     }
 }
 
-#[cfg(feature = "graphql")]
 #[derive(Deserialize)]
 struct CausalTestInput {
     id: String,
     label: String,
 }
 
-#[cfg(feature = "graphql")]
-impl GraphqlInputType for CausalTestInput {
-    fn graphql_type() -> GraphqlTypeDef {
-        GraphqlTypeDef::new(
+impl CommandInputType for CausalTestInput {
+    fn command_type() -> CommandTypeDef {
+        CommandTypeDef::new(
             "CausalTestInput",
             vec![
-                GraphqlTypeField {
+                CommandTypeField {
+                    unsigned_integer: None,
                     name: "id".into(),
                     type_name: "String".into(),
                     nullable: false,
@@ -122,7 +115,8 @@ impl GraphqlInputType for CausalTestInput {
                     item_nullable: false,
                     nested: None,
                 },
-                GraphqlTypeField {
+                CommandTypeField {
+                    unsigned_integer: None,
                     name: "label".into(),
                     type_name: "String".into(),
                     nullable: false,
@@ -137,7 +131,7 @@ impl GraphqlInputType for CausalTestInput {
 }
 
 #[cfg(feature = "graphql")]
-#[derive(Clone, Deserialize, crate::GraphqlInput)]
+#[derive(Clone, Deserialize, crate::command::CommandInput)]
 struct CausalProjectionInput {
     #[serde(rename = "todoId")]
     id: String,
@@ -145,8 +139,7 @@ struct CausalProjectionInput {
     partition: String,
 }
 
-#[cfg(feature = "graphql")]
-#[derive(Clone, Serialize, Deserialize, crate::ReadModel)]
+#[derive(Clone, Serialize, Deserialize, crate::read_model::ReadModel)]
 #[readmodel(
         table = "causal_projection_obligation_views",
         primary_key = ["id"]
@@ -155,23 +148,20 @@ struct CausalProjectionObligationView {
     id: String,
 }
 
-#[cfg(feature = "graphql")]
-#[derive(Clone, Serialize, Deserialize, crate::ReadModel)]
+#[derive(Clone, Serialize, Deserialize, crate::read_model::ReadModel)]
 #[readmodel(table = "causal_projection_sibling_views", primary_key = ["id"])]
 struct CausalProjectionSiblingView {
     id: String,
 }
 
-#[cfg(feature = "graphql")]
-#[derive(Clone, Serialize, crate::DomainEvent)]
+#[derive(Clone, Serialize, crate::domain_event::DomainEvent)]
 #[domain_event(name = "causal.lifecycle-recorded", version = 1)]
 struct CausalLifecycleRecorded {
     id: String,
     label: String,
 }
 
-#[cfg(feature = "graphql")]
-#[derive(Clone, Serialize, Deserialize, crate::ReadModel)]
+#[derive(Clone, Serialize, Deserialize, crate::read_model::ReadModel)]
 #[readmodel(table = "causal_lifecycle_views", primary_key = ["id"])]
 struct CausalLifecycleView {
     id: String,
@@ -179,7 +169,7 @@ struct CausalLifecycleView {
 }
 
 #[cfg(feature = "graphql")]
-#[derive(Clone, Serialize, Deserialize, crate::DomainState)]
+#[derive(Clone, Serialize, Deserialize, crate::domain_event::DomainState)]
 #[domain_state(version = 1)]
 struct CausalDirectState {
     id: String,
@@ -190,9 +180,9 @@ fn causal_direct_program(
     name: &'static str,
     version: u64,
     event_name: &'static str,
-) -> Result<crate::ProjectionProgram, crate::ProjectionProgramError> {
+) -> Result<crate::projection::ProjectionProgram, crate::projection::ProjectionProgramError> {
     use crate::mutation::{
-        bind_state_body_to_mutation, compile_projection, state_upsert_program_for_model,
+        bind_event_apply_mutation, compile_projection, state_upsert_program_for_model,
     };
 
     let program = state_upsert_program_for_model::<CausalProjectionObligationView>(
@@ -200,116 +190,60 @@ fn causal_direct_program(
         1,
         "upsert-view",
         "view",
+    )?;
+    let descriptor =
+        crate::domain_event::DomainEventDescriptor::state::<CausalDirectState>(event_name, 1);
+    let handler = bind_event_apply_mutation(
+        &descriptor,
+        program,
+        "view",
+        crate::mutation::ProjectionInputSource::Body,
+    )?;
+    compile_projection(
+        name,
+        version,
+        crate::projection::ProjectionPartition::Unit,
+        [handler],
     )
-    .map_err(|e| crate::ProjectionProgramError::InvalidOperation {
-        operation: name.into(),
-        reason: e.to_string(),
-    })?;
-    let descriptor = crate::DomainEventDescriptor::state::<CausalDirectState>(event_name, 1);
-    let handler =
-        bind_state_body_to_mutation::<CausalProjectionObligationView>(&descriptor, program, "view")
-            .map_err(|e| crate::ProjectionProgramError::InvalidOperation {
-                operation: name.into(),
-                reason: e.to_string(),
-            })?;
-    compile_projection(name, version, crate::ProjectionPartition::Unit, [handler]).map_err(|e| {
-        crate::ProjectionProgramError::InvalidOperation {
-            operation: name.into(),
-            reason: e.to_string(),
-        }
-    })
 }
 
 #[cfg(feature = "graphql")]
-fn causal_direct_v1_program() -> Result<crate::ProjectionProgram, crate::ProjectionProgramError> {
+fn causal_direct_v1_program(
+) -> Result<crate::projection::ProjectionProgram, crate::projection::ProjectionProgramError> {
     causal_direct_program("project_causal_direct", 1, "causal.direct-recorded")
 }
 
 #[cfg(feature = "graphql")]
-fn causal_direct_v1_resolve(
-    occurrence: &crate::DomainEventOccurrence,
-) -> Result<crate::ResolvedProjectionPlan, crate::ProjectionProgramError> {
-    crate::mutation::resolve_mutation_program(&causal_direct_v1_program()?, occurrence)
+crate::projection! {
+    const CAUSAL_DIRECT_PROJECTION: crate::projection::lower::ProjectionDescriptor< crate::projection::lower::DirectCandidate, > = {
+        name: "project_causal_direct",
+        version: 1,
+        model: CausalProjectionObligationView,
+        program: causal_direct_v1_program,
+    };
 }
 
 #[cfg(feature = "graphql")]
-fn causal_direct_v1_lower(
-    plan: &crate::ResolvedProjectionPlan,
-) -> Result<
-    crate::projection::lower::LoweredProjectionPlan,
-    crate::projection::lower::ProjectionLoweringError,
-> {
-    crate::mutation::lower_single_model::<CausalProjectionObligationView>(plan)
-}
-
-#[cfg(feature = "graphql")]
-fn causal_direct_v1_inventory() -> Result<
-    crate::projection::lower::ProjectionOutputInventory,
-    crate::projection::lower::ProjectionLoweringError,
-> {
-    crate::mutation::inventory_single_model::<CausalProjectionObligationView>()
-}
-
-#[cfg(feature = "graphql")]
-const CAUSAL_DIRECT_PROJECTION: crate::projection::lower::ProjectionDescriptor<
-    crate::projection::lower::DirectCandidate,
-> = crate::mutation::descriptor_from_factories(
-    "project_causal_direct",
-    1,
-    "causal-direct-v1",
-    causal_direct_v1_program,
-    causal_direct_v1_resolve,
-    causal_direct_v1_lower,
-    causal_direct_v1_inventory,
-);
-
-#[cfg(feature = "graphql")]
-fn causal_direct_v2_program() -> Result<crate::ProjectionProgram, crate::ProjectionProgramError> {
+fn causal_direct_v2_program(
+) -> Result<crate::projection::ProjectionProgram, crate::projection::ProjectionProgramError> {
     causal_direct_program("project_causal_direct", 2, "causal.direct-recorded")
 }
 
 #[cfg(feature = "graphql")]
-fn causal_direct_v2_resolve(
-    occurrence: &crate::DomainEventOccurrence,
-) -> Result<crate::ResolvedProjectionPlan, crate::ProjectionProgramError> {
-    crate::mutation::resolve_mutation_program(&causal_direct_v2_program()?, occurrence)
+crate::projection! {
+    const CAUSAL_ROGUE_DIRECT_PROJECTION: crate::projection::lower::ProjectionDescriptor< crate::projection::lower::DirectCandidate, > = {
+        name: "project_causal_direct",
+        version: 2,
+        model: CausalProjectionObligationView,
+        program: causal_direct_v2_program,
+    };
 }
 
 #[cfg(feature = "graphql")]
-fn causal_direct_v2_lower(
-    plan: &crate::ResolvedProjectionPlan,
-) -> Result<
-    crate::projection::lower::LoweredProjectionPlan,
-    crate::projection::lower::ProjectionLoweringError,
-> {
-    crate::mutation::lower_single_model::<CausalProjectionObligationView>(plan)
-}
-
-#[cfg(feature = "graphql")]
-fn causal_direct_v2_inventory() -> Result<
-    crate::projection::lower::ProjectionOutputInventory,
-    crate::projection::lower::ProjectionLoweringError,
-> {
-    crate::mutation::inventory_single_model::<CausalProjectionObligationView>()
-}
-
-#[cfg(feature = "graphql")]
-const CAUSAL_ROGUE_DIRECT_PROJECTION: crate::projection::lower::ProjectionDescriptor<
-    crate::projection::lower::DirectCandidate,
-> = crate::mutation::descriptor_from_factories(
-    "project_causal_direct",
-    2,
-    "causal-direct-v1",
-    causal_direct_v2_program,
-    causal_direct_v2_resolve,
-    causal_direct_v2_lower,
-    causal_direct_v2_inventory,
-);
-
-#[cfg(feature = "graphql")]
-fn causal_sibling_program() -> Result<crate::ProjectionProgram, crate::ProjectionProgramError> {
+fn causal_sibling_program(
+) -> Result<crate::projection::ProjectionProgram, crate::projection::ProjectionProgramError> {
     use crate::mutation::{
-        bind_state_body_to_mutation, compile_projection, state_upsert_program_for_model,
+        bind_event_apply_mutation, compile_projection, state_upsert_program_for_model,
     };
 
     let program = state_upsert_program_for_model::<CausalProjectionSiblingView>(
@@ -317,76 +251,41 @@ fn causal_sibling_program() -> Result<crate::ProjectionProgram, crate::Projectio
         1,
         "upsert-view",
         "view",
-    )
-    .map_err(|e| crate::ProjectionProgramError::InvalidOperation {
-        operation: "project_causal_direct_sibling".into(),
-        reason: e.to_string(),
-    })?;
-    let descriptor = crate::DomainEventDescriptor::state::<CausalDirectState>(
+    )?;
+    let descriptor = crate::domain_event::DomainEventDescriptor::state::<CausalDirectState>(
         "causal.direct-sibling-recorded",
         1,
     );
-    let handler =
-        bind_state_body_to_mutation::<CausalProjectionSiblingView>(&descriptor, program, "view")
-            .map_err(|e| crate::ProjectionProgramError::InvalidOperation {
-                operation: "project_causal_direct_sibling".into(),
-                reason: e.to_string(),
-            })?;
+    let handler = bind_event_apply_mutation(
+        &descriptor,
+        program,
+        "view",
+        crate::mutation::ProjectionInputSource::Body,
+    )?;
     compile_projection(
         "project_causal_direct_sibling",
         1,
-        crate::ProjectionPartition::Unit,
+        crate::projection::ProjectionPartition::Unit,
         [handler],
     )
-    .map_err(|e| crate::ProjectionProgramError::InvalidOperation {
-        operation: "project_causal_direct_sibling".into(),
-        reason: e.to_string(),
-    })
 }
 
 #[cfg(feature = "graphql")]
-fn causal_sibling_resolve(
-    occurrence: &crate::DomainEventOccurrence,
-) -> Result<crate::ResolvedProjectionPlan, crate::ProjectionProgramError> {
-    crate::mutation::resolve_mutation_program(&causal_sibling_program()?, occurrence)
+crate::projection! {
+    const CAUSAL_SIBLING_DIRECT_PROJECTION: crate::projection::lower::ProjectionDescriptor< crate::projection::lower::DirectCandidate, > = {
+        name: "project_causal_direct_sibling",
+        version: 1,
+        model: CausalProjectionSiblingView,
+        program: causal_sibling_program,
+    };
 }
 
 #[cfg(feature = "graphql")]
-fn causal_sibling_lower(
-    plan: &crate::ResolvedProjectionPlan,
-) -> Result<
-    crate::projection::lower::LoweredProjectionPlan,
-    crate::projection::lower::ProjectionLoweringError,
-> {
-    crate::mutation::lower_single_model::<CausalProjectionSiblingView>(plan)
-}
-
-#[cfg(feature = "graphql")]
-fn causal_sibling_inventory() -> Result<
-    crate::projection::lower::ProjectionOutputInventory,
-    crate::projection::lower::ProjectionLoweringError,
-> {
-    crate::mutation::inventory_single_model::<CausalProjectionSiblingView>()
-}
-
-#[cfg(feature = "graphql")]
-const CAUSAL_SIBLING_DIRECT_PROJECTION: crate::projection::lower::ProjectionDescriptor<
-    crate::projection::lower::DirectCandidate,
-> = crate::mutation::descriptor_from_factories(
-    "project_causal_direct_sibling",
-    1,
-    "causal-direct-v1",
-    causal_sibling_program,
-    causal_sibling_resolve,
-    causal_sibling_lower,
-    causal_sibling_inventory,
-);
-
-#[cfg(feature = "graphql")]
-fn causal_lifecycle_program() -> Result<crate::ProjectionProgram, crate::ProjectionProgramError> {
+fn causal_lifecycle_program(
+) -> Result<crate::projection::ProjectionProgram, crate::projection::ProjectionProgramError> {
     use crate::domain_event::DomainEventContract;
     use crate::mutation::{
-        bind_state_body_to_mutation, compile_projection, state_upsert_program_for_model,
+        bind_event_apply_mutation, compile_projection, state_upsert_program_for_model,
     };
 
     let program = state_upsert_program_for_model::<CausalLifecycleView>(
@@ -394,69 +293,30 @@ fn causal_lifecycle_program() -> Result<crate::ProjectionProgram, crate::Project
         1,
         "upsert-view",
         "view",
-    )
-    .map_err(|e| crate::ProjectionProgramError::InvalidOperation {
-        operation: "project_causal_lifecycle".into(),
-        reason: e.to_string(),
-    })?;
-    let handler = bind_state_body_to_mutation::<CausalLifecycleView>(
+    )?;
+    let handler = bind_event_apply_mutation(
         &CausalLifecycleRecorded::descriptor(),
         program,
         "view",
-    )
-    .map_err(|e| crate::ProjectionProgramError::InvalidOperation {
-        operation: "project_causal_lifecycle".into(),
-        reason: e.to_string(),
-    })?;
+        crate::mutation::ProjectionInputSource::Body,
+    )?;
     compile_projection(
         "project_causal_lifecycle",
         1,
-        crate::ProjectionPartition::Unit,
+        crate::projection::ProjectionPartition::Unit,
         [handler],
     )
-    .map_err(|e| crate::ProjectionProgramError::InvalidOperation {
-        operation: "project_causal_lifecycle".into(),
-        reason: e.to_string(),
-    })
 }
 
 #[cfg(feature = "graphql")]
-fn causal_lifecycle_resolve(
-    occurrence: &crate::DomainEventOccurrence,
-) -> Result<crate::ResolvedProjectionPlan, crate::ProjectionProgramError> {
-    crate::mutation::resolve_mutation_program(&causal_lifecycle_program()?, occurrence)
+crate::projection! {
+    const CAUSAL_LIFECYCLE_PROJECTION: crate::projection::lower::ProjectionDescriptor< crate::projection::lower::EventualOnly, > = {
+        name: "project_causal_lifecycle",
+        version: 1,
+        model: CausalLifecycleView,
+        program: causal_lifecycle_program,
+    };
 }
-
-#[cfg(feature = "graphql")]
-fn causal_lifecycle_lower(
-    plan: &crate::ResolvedProjectionPlan,
-) -> Result<
-    crate::projection::lower::LoweredProjectionPlan,
-    crate::projection::lower::ProjectionLoweringError,
-> {
-    crate::mutation::lower_single_model::<CausalLifecycleView>(plan)
-}
-
-#[cfg(feature = "graphql")]
-fn causal_lifecycle_inventory() -> Result<
-    crate::projection::lower::ProjectionOutputInventory,
-    crate::projection::lower::ProjectionLoweringError,
-> {
-    crate::mutation::inventory_single_model::<CausalLifecycleView>()
-}
-
-#[cfg(feature = "graphql")]
-const CAUSAL_LIFECYCLE_PROJECTION: crate::projection::lower::ProjectionDescriptor<
-    crate::projection::lower::EventualOnly,
-> = crate::mutation::descriptor_from_factories(
-    "project_causal_lifecycle",
-    1,
-    "causal-lifecycle-v1",
-    causal_lifecycle_program,
-    causal_lifecycle_resolve,
-    causal_lifecycle_lower,
-    causal_lifecycle_inventory,
-);
 
 #[cfg(feature = "graphql")]
 fn modeled_direct_registration(
@@ -464,7 +324,6 @@ fn modeled_direct_registration(
         crate::projection::lower::DirectCandidate,
     >,
     owner: &str,
-    epoch: &str,
     topology_name: &str,
     topology_digest: u8,
     schema: crate::table::TableSchema,
@@ -497,23 +356,17 @@ fn modeled_direct_registration(
     let catalog =
         crate::projection::catalog::ProjectionCatalog::try_new(vec![binding.clone()]).unwrap();
     let active = catalog
-        .activate(
-            vec![
-                crate::projection::catalog::ProjectionBindingActivation::new(
-                    binding.id(),
-                    binding.program_id(),
-                    crate::projection_protocol::ProjectionEpoch::new(epoch).unwrap(),
-                    crate::projection::placement::ProjectionBindingState::Active,
-                    Some(
-                        crate::projection::placement::ProjectionExecutorRoute::local(
-                            "causal-direct",
-                        )
+        .activate(vec![
+            crate::projection::catalog::ProjectionBindingActivation::new(
+                binding.id(),
+                binding.program_id(),
+                crate::projection::placement::ProjectionBindingState::Active,
+                Some(
+                    crate::projection::placement::ProjectionExecutorRoute::local("causal-direct")
                         .unwrap(),
-                    ),
                 ),
-            ],
-            None,
-        )
+            ),
+        ])
         .unwrap();
     crate::graphql::SurfaceModeledProjection::try_from_descriptor(
         descriptor,
@@ -560,22 +413,14 @@ fn modeled_lifecycle_projector(
     let catalog =
         crate::projection::catalog::ProjectionCatalog::try_new(vec![binding.clone()]).unwrap();
     let active = catalog
-        .activate(
-            vec![
-                crate::projection::catalog::ProjectionBindingActivation::new(
-                    binding.id(),
-                    binding.program_id(),
-                    crate::projection_protocol::ProjectionEpoch::new("causal-lifecycle-v1")
-                        .unwrap(),
-                    state,
-                    Some(
-                        crate::projection::placement::ProjectionExecutorRoute::local(route)
-                            .unwrap(),
-                    ),
-                ),
-            ],
-            None,
-        )
+        .activate(vec![
+            crate::projection::catalog::ProjectionBindingActivation::new(
+                binding.id(),
+                binding.program_id(),
+                state,
+                Some(crate::projection::placement::ProjectionExecutorRoute::local(route).unwrap()),
+            ),
+        ])
         .unwrap();
     SurfaceProjector::new("project_causal_lifecycle").modeled(
         crate::graphql::SurfaceModeledProjection::try_from_descriptor(
@@ -588,29 +433,27 @@ fn modeled_lifecycle_projector(
     )
 }
 
-#[cfg(feature = "graphql")]
-impl GraphqlOutputType for CausalProjectionObligationView {
-    fn graphql_type() -> GraphqlTypeDef {
+impl CommandOutputType for CausalProjectionObligationView {
+    fn command_type() -> CommandTypeDef {
         one_string_field("CausalProjectionObligationView", "id")
             .with_type_id(std::any::TypeId::of::<Self>())
     }
 }
 
-#[cfg(feature = "graphql")]
-impl GraphqlOutputType for CausalProjectionSiblingView {
-    fn graphql_type() -> GraphqlTypeDef {
+impl CommandOutputType for CausalProjectionSiblingView {
+    fn command_type() -> CommandTypeDef {
         one_string_field("CausalProjectionSiblingView", "id")
             .with_type_id(std::any::TypeId::of::<Self>())
     }
 }
 
-#[cfg(feature = "graphql")]
-impl GraphqlOutputType for CausalLifecycleView {
-    fn graphql_type() -> GraphqlTypeDef {
-        GraphqlTypeDef::new(
+impl CommandOutputType for CausalLifecycleView {
+    fn command_type() -> CommandTypeDef {
+        CommandTypeDef::new(
             "CausalLifecycleView",
             vec![
-                GraphqlTypeField {
+                CommandTypeField {
+                    unsigned_integer: None,
                     name: "id".into(),
                     type_name: "String".into(),
                     nullable: false,
@@ -618,7 +461,8 @@ impl GraphqlOutputType for CausalLifecycleView {
                     item_nullable: false,
                     nested: None,
                 },
-                GraphqlTypeField {
+                CommandTypeField {
+                    unsigned_integer: None,
                     name: "label".into(),
                     type_name: "String".into(),
                     nullable: false,
@@ -632,32 +476,10 @@ impl GraphqlOutputType for CausalLifecycleView {
     }
 }
 
-static TYPED_HANDLER_INVOKED: AtomicBool = AtomicBool::new(false);
-static TYPED_GUARD_INVOKED: AtomicBool = AtomicBool::new(false);
-
 async fn typed_handler(
     _context: &CausalCommandContext<'_, RouteComboAggregate>,
     input: TypedInput,
 ) -> Result<PreparedCommand<Succeeded<TypedOutput>>, HandlerError> {
-    TYPED_HANDLER_INVOKED.store(true, Ordering::SeqCst);
-    Ok(PreparedCommand::prepare(TypedOutput { id: input.id }).unwrap())
-}
-
-#[cfg(all(feature = "graphql", feature = "application-runtime"))]
-static GENERATED_MOUNT_HANDLER_INVOKED: AtomicUsize = AtomicUsize::new(0);
-
-#[cfg(all(feature = "graphql", feature = "application-runtime"))]
-#[distributed::command(
-    id = "causal.generated_mount",
-    roles(user),
-    input = CausalTestInput,
-    outcome = Succeeded<TypedOutput>
-)]
-async fn generated_mount_handler(
-    _context: &CausalCommandContext<'_, CausalDispatcherAggregate>,
-    input: CausalTestInput,
-) -> Result<PreparedCommand<Succeeded<TypedOutput>>, HandlerError> {
-    GENERATED_MOUNT_HANDLER_INVOKED.fetch_add(1, Ordering::SeqCst);
     Ok(PreparedCommand::prepare(TypedOutput { id: input.id }).unwrap())
 }
 
@@ -666,7 +488,7 @@ struct RouteComboAggregate {
     entity: Entity,
 }
 
-#[sourced(entity)]
+#[sourced(entity, aggregate_type = "route_combo_aggregate")]
 impl RouteComboAggregate {
     #[event("created")]
     fn create(&mut self) {
@@ -674,19 +496,18 @@ impl RouteComboAggregate {
     }
 }
 
-#[cfg(feature = "graphql")]
 #[derive(Default, crate::Snapshot)]
 struct CausalDispatcherAggregate {
     entity: Entity,
 }
 
-#[cfg(feature = "graphql")]
 impl CausalDispatcherAggregate {
     fn record(&mut self, id: String) -> crate::SourcedResult {
         self.entity.set_id(id);
         self.entity.digest_empty("causal.recorded")
     }
 
+    #[cfg(feature = "graphql")]
     fn record_direct(&mut self, id: String) -> Result<(), HandlerError> {
         self.entity.set_id(id.clone());
         self.entity
@@ -695,7 +516,7 @@ impl CausalDispatcherAggregate {
         self.entity
             .capture_domain_state(
                 Self::aggregate_type(),
-                crate::DomainEventDescriptor::state::<CausalDirectState>(
+                crate::domain_event::DomainEventDescriptor::state::<CausalDirectState>(
                     "causal.direct-recorded",
                     1,
                 ),
@@ -720,7 +541,6 @@ impl CausalDispatcherAggregate {
     }
 }
 
-#[cfg(feature = "graphql")]
 impl Aggregate for CausalDispatcherAggregate {
     type ReplayError = std::convert::Infallible;
 
@@ -741,7 +561,6 @@ impl Aggregate for CausalDispatcherAggregate {
     }
 }
 
-#[cfg(feature = "graphql")]
 fn causal_test_principal() -> VerifiedPrincipal {
     VerifiedPrincipal::test_oidc(
         "https://issuer.example/",
@@ -750,17 +569,14 @@ fn causal_test_principal() -> VerifiedPrincipal {
     )
 }
 
-#[cfg(feature = "graphql")]
 fn causal_test_command_id() -> String {
     uuid::Uuid::now_v7().hyphenated().to_string()
 }
 
-#[cfg(feature = "graphql")]
 fn causal_test_input(id: &str, label: &str) -> Value {
     json!({ "id": id, "label": label })
 }
 
-#[cfg(feature = "graphql")]
 fn session_with_role(role: &str) -> Session {
     let mut session = Session::new();
     session.set(crate::microsvc::ROLE_KEY, role);
@@ -770,12 +586,22 @@ fn session_with_role(role: &str) -> Session {
 
 #[cfg(feature = "graphql")]
 fn command_host(service: &Arc<Service>) -> crate::command_dispatch::SharedCommandHost {
-    Arc::new(crate::command_dispatch::LocalCommandHost::new(Arc::clone(
-        service,
-    )))
+    Arc::clone(service) as crate::command_dispatch::SharedCommandHost
 }
 
 #[cfg(feature = "graphql")]
+fn celld_status_host(service: &Arc<Service>) -> SharedCommandHost {
+    Arc::new(
+        CelldCommandHost::new(
+            "http://127.0.0.1:1",
+            Arc::clone(service),
+            InternalHttpSecret::new("test-only-internal-secret-32-bytes")
+                .expect("test internal secret should be valid"),
+        )
+        .expect("status-only celld host should accept a local URL"),
+    )
+}
+
 #[derive(Clone, Copy)]
 enum InjectedCommitBehavior {
     CommitThenErrorOnce,
@@ -783,14 +609,12 @@ enum InjectedCommitBehavior {
     Delegate,
 }
 
-#[cfg(feature = "graphql")]
 #[derive(Clone)]
 struct AmbiguousCommitRepository {
     inner: InMemoryRepository,
     behavior: Arc<Mutex<InjectedCommitBehavior>>,
 }
 
-#[cfg(feature = "graphql")]
 impl AmbiguousCommitRepository {
     fn new(inner: InMemoryRepository, behavior: InjectedCommitBehavior) -> Self {
         Self {
@@ -810,8 +634,14 @@ impl AmbiguousCommitRepository {
     }
 }
 
-#[cfg(feature = "graphql")]
 impl CausalGetStream for AmbiguousCommitRepository {
+    fn get_causal_stream_tail<'a>(
+        &'a self,
+        identity: &'a crate::StreamIdentity,
+        after_version: u64,
+    ) -> impl Future<Output = Result<Option<Entity>, crate::RepositoryError>> + Send + 'a {
+        self.inner.get_causal_stream_tail(identity, after_version)
+    }
     fn get_causal_stream<'a>(
         &'a self,
         identity: &'a crate::StreamIdentity,
@@ -820,15 +650,31 @@ impl CausalGetStream for AmbiguousCommitRepository {
     }
 }
 
-#[cfg(feature = "graphql")]
 impl CausalRepositoryIdentity for AmbiguousCommitRepository {
     fn causal_storage_identity(&self) -> crate::command_ledger::CausalStorageIdentity {
         CausalRepositoryIdentity::causal_storage_identity(&self.inner)
     }
 }
 
-#[cfg(feature = "graphql")]
+impl crate::microsvc::dependencies::CausalHostProjections for AmbiguousCommitRepository {
+    crate::microsvc::dependencies::direct_causal_projection_methods!();
+}
+
 impl ProjectionProtocolStore for AmbiguousCommitRepository {
+    async fn projection_rebuild_records(
+        &self,
+        context: &crate::projection::rebuild::RebuildContext,
+    ) -> Result<Vec<ProjectionRecordMetadata>, ProjectionProtocolError> {
+        self.inner.projection_rebuild_records(context).await
+    }
+
+    async fn commit_projection_rebuild(
+        &self,
+        plan: crate::projection::rebuild::SnapshotProjectionRebuildPlan,
+    ) -> Result<usize, ProjectionProtocolError> {
+        self.inner.commit_projection_rebuild(plan).await
+    }
+
     fn register_projection_models<'a>(
         &'a self,
         topology: &'a ProjectorTopologyId,
@@ -886,35 +732,28 @@ impl ProjectionProtocolStore for AmbiguousCommitRepository {
         self.inner.projection_query_snapshot(request)
     }
 
-    fn projection_query_snapshot_batch<'a>(
+    fn projection_execution_snapshot_batch<'a>(
         &'a self,
-        request: &'a ProjectionQuerySnapshotBatchRequest,
-    ) -> impl Future<Output = Result<ProjectionQuerySnapshotBatch, ProjectionProtocolError>> + Send + 'a
-    {
-        self.inner.projection_query_snapshot_batch(request)
-    }
-
-    fn projection_obligation_evidence_batch<'a>(
-        &'a self,
-        request: &'a ProjectionObligationEvidenceBatchRequest,
-    ) -> impl Future<Output = Result<ProjectionObligationEvidenceBatch, ProjectionProtocolError>>
+        request: &'a ProjectionExecutionSnapshotBatchRequest,
+    ) -> impl Future<Output = Result<ProjectionExecutionSnapshotBatch, ProjectionProtocolError>>
            + Send
            + 'a {
-        self.inner.projection_obligation_evidence_batch(request)
+        self.inner.projection_execution_snapshot_batch(request)
     }
 
-    fn projection_live_record_batch<'a>(
+    fn projection_causation_evidence<'a>(
         &'a self,
-        request: &'a ProjectionLiveRecordBatchRequest,
-    ) -> impl Future<Output = Result<ProjectionLiveRecordBatch, ProjectionProtocolError>> + Send + 'a
-    {
-        self.inner.projection_live_record_batch(request)
+        request: &'a ProjectionCausationEvidenceRequest,
+    ) -> impl Future<Output = Result<ProjectionCausationEvidenceBatch, ProjectionProtocolError>>
+           + Send
+           + 'a {
+        self.inner.projection_causation_evidence(request)
     }
 
     fn projection_partition_runtime_state<'a>(
         &'a self,
         topology: &'a ProjectorTopologyId,
-        partition: &'a ProjectionPartition,
+        partition: &'a PartitionId,
     ) -> impl Future<Output = Result<Option<ProjectionPartitionRuntimeState>, ProjectionProtocolError>>
            + Send
            + 'a {
@@ -935,7 +774,7 @@ impl ProjectionProtocolStore for AmbiguousCommitRepository {
     fn projection_changes<'a>(
         &'a self,
         topology: &'a ProjectorTopologyId,
-        partition: &'a ProjectionPartition,
+        partition: &'a PartitionId,
         after: Option<&'a ProjectionChangeCursor>,
         limit: usize,
     ) -> impl Future<Output = Result<ProjectionChangeRead, ProjectionProtocolError>> + Send + 'a
@@ -947,7 +786,7 @@ impl ProjectionProtocolStore for AmbiguousCommitRepository {
     fn repair_projection<'a>(
         &'a self,
         topology: &'a ProjectorTopologyId,
-        partition: &'a ProjectionPartition,
+        partition: &'a PartitionId,
         failure_id: &'a str,
     ) -> impl Future<Output = Result<ProjectionGeneration, ProjectionProtocolError>> + Send + 'a
     {
@@ -965,7 +804,7 @@ impl ProjectionProtocolStore for AmbiguousCommitRepository {
     fn projection_failure<'a>(
         &'a self,
         topology: &'a ProjectorTopologyId,
-        partition: &'a ProjectionPartition,
+        partition: &'a PartitionId,
         failure_id: &'a str,
     ) -> impl Future<Output = Result<Option<ProjectionFailure>, ProjectionProtocolError>> + Send + 'a
     {
@@ -981,9 +820,15 @@ impl ProjectionProtocolStore for AmbiguousCommitRepository {
            + 'a {
         self.inner.projection_failure_location(failure_id)
     }
+
+    fn stopped_projection_failures<'a>(
+        &'a self,
+        topology: &'a ProjectorTopologyId,
+    ) -> impl Future<Output = Result<Vec<String>, ProjectionProtocolError>> + Send + 'a {
+        self.inner.stopped_projection_failures(topology)
+    }
 }
 
-#[cfg(feature = "graphql")]
 impl CommandLedgerStore for AmbiguousCommitRepository {
     fn reserve_command(
         &self,
@@ -1007,6 +852,13 @@ impl CommandLedgerStore for AmbiguousCommitRepository {
         CommandLedgerStore::mark_retryable_unknown(&self.inner, attempt)
     }
 
+    fn complete_external_command(
+        &self,
+        completion: ExternalCommandCompletion,
+    ) -> impl Future<Output = Result<(), CommandLedgerError>> + Send + '_ {
+        CommandLedgerStore::complete_external_command(&self.inner, completion)
+    }
+
     fn compact_expired_commands(
         &self,
         limit: usize,
@@ -1015,7 +867,20 @@ impl CommandLedgerStore for AmbiguousCommitRepository {
     }
 }
 
-#[cfg(feature = "graphql")]
+impl crate::schedule::BackendHost for AmbiguousCommitRepository {
+    fn capabilities(&self) -> crate::schedule::Capabilities {
+        self.inner.capabilities()
+    }
+
+    fn host_now(
+        &self,
+    ) -> impl std::future::Future<Output = Result<std::time::SystemTime, crate::RepositoryError>>
+           + Send
+           + '_ {
+        self.inner.host_now()
+    }
+}
+
 impl crate::repository::TransactionalCommit for AmbiguousCommitRepository {
     fn commit_batch<'a>(
         &'a self,
@@ -1025,12 +890,11 @@ impl crate::repository::TransactionalCommit for AmbiguousCommitRepository {
     }
 }
 
-#[cfg(feature = "graphql")]
 impl CausalTransactionalCommit for AmbiguousCommitRepository {
     async fn commit_causal_batch<'a>(
         &'a self,
         batch: CausalCommitBatch<'a>,
-    ) -> Result<(), CommandLedgerError> {
+    ) -> Result<crate::command_ledger::CommandCompletion<'a>, CommandLedgerError> {
         let behavior = {
             let mut behavior = self.behavior.lock().map_err(|_| {
                 CommandLedgerError::Storage(crate::RepositoryError::LockPoisoned(
@@ -1052,7 +916,6 @@ impl CausalTransactionalCommit for AmbiguousCommitRepository {
     }
 }
 
-#[cfg(feature = "graphql")]
 impl HasOutboxStore for AmbiguousCommitRepository {
     type OutboxStore = crate::InMemoryOutboxStore;
 
@@ -1073,6 +936,56 @@ fn test_service(routes: Routes<()>) -> Service {
     Service::new().routes(routes)
 }
 
+/// Dependencies of a route bundle whose commands touch no aggregate.
+type StoreDeps =
+    RepoReadModelDependencies<AggregateRepository<InMemoryRepository, ()>, InMemoryRepository>;
+
+fn command_routes() -> Routes<StoreDeps> {
+    let repository = InMemoryRepository::new();
+    Routes::for_stores(repository.clone(), repository)
+}
+
+fn command_service(routes: Routes<StoreDeps>) -> Service {
+    Service::new().named("tests").routes(routes)
+}
+
+#[derive(Deserialize, crate::command::CommandInput)]
+struct NoInput {}
+
+#[derive(Serialize, crate::command::CommandOutput)]
+struct Pong {
+    pong: bool,
+}
+
+fn pong_command(name: &'static str) -> crate::command::TypedCommand<NoInput, Succeeded<Pong>> {
+    typed_command::<NoInput, Succeeded<Pong>>(name)
+}
+
+async fn pong(
+    _context: &CausalCommandContext<'_, ()>,
+    _input: NoInput,
+) -> Result<PreparedCommand<Succeeded<Pong>>, HandlerError> {
+    Ok(PreparedCommand::prepare(Pong { pong: true }).unwrap())
+}
+
+/// Dispatch one new command as the test principal.
+async fn dispatch_command(
+    service: &Service,
+    command: &str,
+    input: Value,
+    session: Session,
+) -> Result<Value, CausalDispatchError> {
+    service
+        .dispatch_causal(
+            command,
+            &causal_test_command_id(),
+            input,
+            session,
+            causal_test_principal(),
+        )
+        .await
+}
+
 #[test]
 fn named_service_preserves_identity_with_route_bundles() {
     let routes = Routes::new().with_read_model_store(crate::InMemoryRepository::new());
@@ -1085,76 +998,74 @@ fn named_service_preserves_identity_with_route_bundles() {
     );
 }
 
-#[tokio::test]
-async fn typed_direct_dispatch_fails_before_invoking_handler() {
-    TYPED_HANDLER_INVOKED.store(false, Ordering::SeqCst);
-    let service = Service::new().named("todos").routes(
+#[test]
+fn service_compiles_exact_application_modules_from_command_namespaces() {
+    let repository = InMemoryRepository::new();
+    let service = Service::new().named("catalog").routes(
         Routes::new()
-            .with_repo(
-                InMemoryRepository::new()
-                    .queued()
-                    .aggregate::<RouteComboAggregate>(),
+            .with_repo(repository.queued().aggregate::<RouteComboAggregate>())
+            .typed_command(
+                typed_command::<TypedInput, Succeeded<TypedOutput>>("access.grant").roles(["user"]),
             )
-            .typed_command(typed_command::<TypedInput, Succeeded<TypedOutput>>(
-                "todo.create",
-            ))
+            .handle(typed_handler)
+            .typed_command(
+                typed_command::<TypedInput, Succeeded<TypedOutput>>("repository.create")
+                    .roles(["user"]),
+            )
             .handle(typed_handler),
     );
+    let surface = crate::graphql::build_surface(&[], &crate::graphql::SurfaceOptions::sqlite())
+        .expect("empty read-model Surface should build")
+        .with_service(&service)
+        .expect("typed Service should bind to the Surface");
+    let surface = crate::application::SurfaceSpec::from_surface("catalog", &surface)
+        .expect("Surface should become a portable application contract");
 
-    let error = service
-        .dispatch("todo.create", json!({ "id": "todo-1" }), Session::new())
-        .await
-        .expect_err("typed causal commands must reject direct dispatch");
+    let application = service
+        .application("catalog", surface.clone())
+        .expect("Service and Surface should compile into one application");
 
-    assert!(error.to_string().contains("verified GraphQL bearer"));
-    assert!(!TYPED_HANDLER_INVOKED.load(Ordering::SeqCst));
-}
-
-#[tokio::test]
-async fn typed_direct_dispatch_fails_before_invoking_guard_or_handler() {
-    TYPED_GUARD_INVOKED.store(false, Ordering::SeqCst);
-    TYPED_HANDLER_INVOKED.store(false, Ordering::SeqCst);
-    let service = Service::new().named("todos").routes(
-        Routes::new()
-            .with_repo(
-                InMemoryRepository::new()
-                    .queued()
-                    .aggregate::<RouteComboAggregate>(),
-            )
-            .typed_command(typed_command::<TypedInput, Succeeded<TypedOutput>>(
-                "todo.guarded_create",
-            ))
-            .guarded(
-                |_| {
-                    TYPED_GUARD_INVOKED.store(true, Ordering::SeqCst);
-                    true
-                },
-                typed_handler,
-            ),
+    assert_eq!(
+        application
+            .modules()
+            .iter()
+            .map(crate::application::Module::id)
+            .collect::<Vec<_>>(),
+        ["access", "repository"]
+    );
+    assert_eq!(
+        application
+            .manifest()
+            .commands
+            .iter()
+            .map(|command| command.id.as_str())
+            .collect::<Vec<_>>(),
+        ["access.grant", "repository.create"]
     );
 
-    let error = service
-        .dispatch(
-            "todo.guarded_create",
-            json!({ "id": "todo-1" }),
-            Session::new(),
-        )
-        .await
-        .expect_err("typed causal commands must reject before application guards");
-
-    assert!(error.to_string().contains("verified GraphQL bearer"));
-    assert!(!TYPED_GUARD_INVOKED.load(Ordering::SeqCst));
-    assert!(!TYPED_HANDLER_INVOKED.load(Ordering::SeqCst));
+    let mut missing = surface.clone();
+    missing
+        .contract
+        .commands
+        .retain(|command| command.id != "access.grant");
+    assert!(matches!(
+        service.application("catalog", missing),
+        Err(crate::application::ApplicationError::Missing { kind: "surface command", identity })
+            if identity == "access.grant"
+    ));
+    assert!(
+        Service::new().application("catalog", surface).is_err(),
+        "a Surface cannot expose commands absent from the owning Service"
+    );
 }
 
-#[cfg(feature = "graphql")]
 #[tokio::test]
 async fn thin_complete_registers_without_a_handler_context_body() {
     let repository = InMemoryRepository::new();
     let routes = Routes::new()
         .with_repo(repository.aggregate::<CausalDispatcherAggregate>())
         .typed_command(
-            typed_command::<CausalTestInput, crate::graphql::Succeeded<TypedOutput>>("todo.create")
+            typed_command::<CausalTestInput, crate::command::Succeeded<TypedOutput>>("todo.create")
                 .roles(["user"]),
         )
         .create()
@@ -1162,11 +1073,11 @@ async fn thin_complete_registers_without_a_handler_context_body() {
             aggregate.record(input.id.clone())?;
             Ok::<_, crate::EventRecordError>(())
         })
-        .succeeded(|aggregate| TypedOutput {
+        .succeeded(|aggregate, _principal| TypedOutput {
             id: aggregate.entity().id().to_string(),
         })
         .typed_command(
-            typed_command::<CausalTestInput, crate::graphql::Succeeded<TypedOutput>>(
+            typed_command::<CausalTestInput, crate::command::Succeeded<TypedOutput>>(
                 "todo.complete",
             )
             .roles(["user"]),
@@ -1176,7 +1087,7 @@ async fn thin_complete_registers_without_a_handler_context_body() {
             aggregate.record(input.id.clone())?;
             Ok::<_, crate::EventRecordError>(())
         })
-        .succeeded(|aggregate| TypedOutput {
+        .succeeded(|aggregate, _principal| TypedOutput {
             id: aggregate.entity().id().to_string(),
         });
     let specs = routes.command_specs().expect("thin commands compile");
@@ -1213,49 +1124,97 @@ async fn thin_complete_registers_without_a_handler_context_body() {
     assert_eq!(completed, json!({ "id": "todo-1" }));
 }
 
-#[cfg(all(feature = "graphql", feature = "application-runtime"))]
-#[tokio::test]
-async fn generated_mount_registers_and_executes_original_handler_through_causal_protocol() {
-    GENERATED_MOUNT_HANDLER_INVOKED.store(0, Ordering::SeqCst);
-    let repository = InMemoryRepository::new();
-    let routes = generated_mount_handler_register(
-        Routes::new().with_repo(repository.aggregate::<CausalDispatcherAggregate>()),
-    );
-    let service = Service::new().named("generated-mounts").routes(routes);
-
-    assert_eq!(service.registered_command_mounts().len(), 1);
-    assert_eq!(
-        service.registered_command_mounts()[0].spec().id,
-        GENERATED_MOUNT_HANDLER_MOUNT.spec().id
-    );
-
-    let request = CommandRequest {
-        command: "causal.generated_mount".into(),
-        input: json!({"id": "generated-1", "label": "mounted"}),
-        session_variables: HashMap::new(),
-    };
-    let result = service.registered_command_mounts()[0]
-        .invoke_with(
-            &service,
-            &request,
-            crate::application::CommandMountInvocation::Authenticated {
-                command_id: causal_test_command_id(),
-                session: session_with_role("user"),
-                principal: causal_test_principal(),
-            },
-        )
-        .await;
-    let crate::application::CommandMountExecutionResult::Causal(result) =
-        result.expect("authenticated causal mount dispatch should commit")
-    else {
-        panic!("typed mount must use the causal execution result");
-    };
-    assert_eq!(result.payload, json!({"id": "generated-1"}));
-    assert_eq!(result.receipt.command_name, "causal.generated_mount");
-    assert_eq!(GENERATED_MOUNT_HANDLER_INVOKED.load(Ordering::SeqCst), 1);
+fn thin_route<D>(
+    routes: Routes<D>,
+    name: &'static str,
+) -> crate::microsvc::TypedRouteBuilder<D, CausalTestInput, Succeeded<TypedOutput>>
+where
+    D: crate::microsvc::CausalRouteDependencies<Aggregate = CausalDispatcherAggregate>
+        + Send
+        + Sync
+        + 'static,
+{
+    routes.typed_command(
+        typed_command::<CausalTestInput, Succeeded<TypedOutput>>(name).roles(["user"]),
+    )
 }
 
-#[cfg(feature = "graphql")]
+#[tokio::test]
+async fn thin_commands_share_one_load_rule_guard_and_principal() {
+    fn record(
+        aggregate: &mut crate::microsvc::AggregateCheckout<CausalDispatcherAggregate>,
+        input: &CausalTestInput,
+        _principal: &str,
+    ) -> Result<(), crate::EventRecordError> {
+        aggregate.record(input.id.clone())
+    }
+    let id = |input: &CausalTestInput| input.id.clone();
+    // The payload reports the principal, so the test can see what it was given.
+    let who = |_: &crate::microsvc::AggregateCheckout<CausalDispatcherAggregate>,
+               principal: &str| TypedOutput {
+        id: principal.to_string(),
+    };
+
+    let routes =
+        Routes::new().with_repo(InMemoryRepository::new().aggregate::<CausalDispatcherAggregate>());
+    let routes = thin_route(routes, "todo.create")
+        .create_by(id)
+        .invoke(record)
+        .succeeded(who);
+    let routes = thin_route(routes, "todo.touch")
+        .load_or_create_by(id)
+        .invoke(record)
+        .succeeded(who);
+    let routes = thin_route(routes, "todo.complete")
+        .load_by(id)
+        .invoke(record)
+        .succeeded(who);
+    let routes = thin_route(routes, "todo.locked")
+        .load_by(id)
+        .guard(|_| false)
+        .invoke(record)
+        .succeeded(who);
+    let service = Service::new().named("thin-load").routes(routes);
+    let dispatch = |command: &'static str, id: &'static str| {
+        let service = &service;
+        async move {
+            service
+                .dispatch_causal(
+                    command,
+                    &causal_test_command_id(),
+                    causal_test_input(id, "x"),
+                    session_with_role("user"),
+                    causal_test_principal(),
+                )
+                .await
+        }
+    };
+
+    let principal = json!({ "id": "causal-test-subject" });
+    assert_eq!(dispatch("todo.create", "todo-1").await.unwrap(), principal);
+    let duplicate = dispatch("todo.create", "todo-1").await.unwrap_err();
+    assert!(
+        duplicate.to_string().contains("todo-1 already exists"),
+        "create over an existing stream must reject: {duplicate}"
+    );
+    assert_eq!(dispatch("todo.touch", "todo-1").await.unwrap(), principal);
+    assert_eq!(dispatch("todo.touch", "todo-2").await.unwrap(), principal);
+    assert_eq!(
+        dispatch("todo.complete", "todo-2").await.unwrap(),
+        principal
+    );
+    let missing = dispatch("todo.complete", "todo-3").await.unwrap_err();
+    assert!(
+        missing.to_string() == "not found: todo-3",
+        "a required load of a missing stream is NotFound: {missing}"
+    );
+    let refused = dispatch("todo.locked", "todo-1").await.unwrap_err();
+    assert!(
+        refused.to_string().contains("guard"),
+        "a thin command's guard must refuse: {refused:?}"
+    );
+}
+
 #[tokio::test]
 async fn causal_dispatch_replays_canonical_equivalent_input_without_reinvoking_handler() {
     let handler_calls = Arc::new(AtomicUsize::new(0));
@@ -1315,6 +1274,61 @@ async fn causal_dispatch_replays_canonical_equivalent_input_without_reinvoking_h
     assert_eq!(handler_calls.load(Ordering::SeqCst), 1);
 }
 
+/// The command host is core: it runs and replays a typed command in every
+/// build, the GraphQL transport included or not.
+#[tokio::test]
+async fn service_command_host_runs_typed_commands_through_the_ledger() {
+    use crate::command_dispatch::CommandHost;
+
+    let service = Arc::new(
+        Service::new().named("causal-tests").routes(
+            Routes::new()
+                .with_repo(InMemoryRepository::new().aggregate::<CausalDispatcherAggregate>())
+                .typed_command(typed_command::<CausalTestInput, Succeeded<TypedOutput>>(
+                    "causal.host",
+                ))
+                .handle(
+                    |_context: &CausalCommandContext<'_, CausalDispatcherAggregate>,
+                     input: CausalTestInput| async move {
+                        Ok(
+                            PreparedCommand::<Succeeded<TypedOutput>>::prepare(TypedOutput {
+                                id: input.id,
+                            })
+                            .unwrap(),
+                        )
+                    },
+                ),
+        ),
+    );
+    let host = Arc::clone(&service);
+    assert!(host
+        .ledger()
+        .is_some_and(|ledger| std::ptr::eq(ledger, service.as_ref())));
+
+    let mut session = Session::new();
+    session.set(crate::microsvc::USER_ID_KEY, "causal-test-subject");
+    let command_id = causal_test_command_id();
+    let invoke = || {
+        host.invoke(
+            "causal.host",
+            &command_id,
+            causal_test_input("todo-host", "label"),
+            session.clone(),
+            causal_test_principal(),
+            None,
+        )
+    };
+
+    let first = invoke().await.expect("the host runs the command");
+    assert_eq!(first.payload(), &json!({ "id": "todo-host" }));
+    assert_eq!(first.state(), "succeeded");
+    assert!(!first.replayed());
+
+    let replay = invoke().await.expect("the ledger replays the command ID");
+    assert!(replay.replayed());
+    assert_eq!(replay.causation_id(), first.causation_id());
+}
+
 #[cfg(feature = "graphql")]
 #[tokio::test]
 async fn causal_dispatch_receipt_and_status_use_the_exact_durable_replay() {
@@ -1366,17 +1380,18 @@ async fn causal_dispatch_receipt_and_status_use_the_exact_durable_replay() {
         .await
         .expect("response-loss retry should recover the same receipt source");
 
-    assert_eq!(first, replay);
+    assert!(!first.replayed(), "the first dispatch ran the handler");
+    assert!(replay.replayed(), "the retry replays the durable receipt");
+    assert_eq!(first, replay.clone().fresh());
     assert_eq!(first.payload, json!({ "id": "todo-receipt" }));
     assert_eq!(first.receipt.command_id, command_id);
     assert_eq!(first.receipt.state, CommandLedgerState::Succeeded);
     assert_eq!(first.receipt.consistency, CommandConsistency::Succeeded);
-    assert!(first.receipt.obligations.is_empty());
     assert!(first.receipt.direct_projection.is_none());
     assert_eq!(handler_calls.load(Ordering::SeqCst), 1);
 
     let status = service
-        .causal_command_status(&command_id, &Session::new(), principal)
+        .causal_command_status(&command_id, &Session::new(), principal, None)
         .await
         .expect("same principal and current grant should resolve status");
     assert_eq!(status.state, CausalCommandPublicState::Succeeded);
@@ -1387,9 +1402,71 @@ async fn causal_dispatch_receipt_and_status_use_the_exact_durable_replay() {
     );
     assert_eq!(status.consistency, Some(CommandConsistency::Succeeded));
     assert_eq!(status.outcome, Some(first.payload));
-    assert!(status.obligations.is_empty());
     assert!(status.evidence.is_empty());
     assert!(status.direct_projection.is_none());
+}
+
+/// An eventual command needs modeled projection metadata for its terminal
+/// receipt. Dispatched without a GraphQL request authority there is none, so
+/// the attempt's completion is refused after the reservation was acquired.
+/// That exit must release the attempt: the retry runs the handler again
+/// instead of answering `InProgress` until the attempt lease expires.
+#[tokio::test]
+async fn a_failure_after_the_reservation_releases_the_attempt_for_an_immediate_retry() {
+    let handler_calls = Arc::new(AtomicUsize::new(0));
+    let route_calls = Arc::clone(&handler_calls);
+    let service = Service::new().named("causal-tests").routes(
+        Routes::new()
+            .with_repo(InMemoryRepository::new().aggregate::<CausalDispatcherAggregate>())
+            .typed_command(
+                typed_command::<CausalTestInput, Eventual<TypedOutput>>("causal.unsealed")
+                    .emits(crate::events![CausalLifecycleRecorded]),
+            )
+            .handle(
+                move |context: &CausalCommandContext<'_, CausalDispatcherAggregate>,
+                      input: CausalTestInput| {
+                    let calls = Arc::clone(&route_calls);
+                    let result = (|| {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        let mut checkout = context.create();
+                        checkout.record_lifecycle(input.id.clone(), input.label)?;
+                        context
+                            .publish_events()
+                            .commit(checkout)?
+                            .eventual(TypedOutput { id: input.id })
+                    })();
+                    async move { result }
+                },
+            ),
+    );
+    let command_id = causal_test_command_id();
+    let dispatch = || {
+        service.dispatch_causal(
+            "causal.unsealed",
+            &command_id,
+            causal_test_input("todo-unsealed", "first"),
+            Session::new(),
+            causal_test_principal(),
+        )
+    };
+
+    let first = dispatch()
+        .await
+        .expect_err("the receipt cannot be completed");
+    assert!(
+        matches!(&first, CausalDispatchError::Internal(detail)
+            if detail.contains("requires modeled projection metadata")),
+        "unexpected first failure: {first:?}"
+    );
+    assert_eq!(handler_calls.load(Ordering::SeqCst), 1);
+
+    let retry = dispatch().await.expect_err("the retry fails the same way");
+    assert!(
+        matches!(&retry, CausalDispatchError::Internal(detail)
+            if detail.contains("requires modeled projection metadata")),
+        "the retry must run again, not find the first attempt in progress: {retry:?}"
+    );
+    assert_eq!(handler_calls.load(Ordering::SeqCst), 2);
 }
 
 #[cfg(feature = "graphql")]
@@ -1398,8 +1475,7 @@ fn causal_status_projection_failure_precedes_observed_and_pending_evidence() {
     let item = |obligation_index, state| CausalCommandProjectionEvidence {
         obligation_index,
         state,
-        incarnation: (state == CausalProjectionEvidenceState::Observed).then_some(1),
-        revision: (state == CausalProjectionEvidenceState::Observed).then_some(2),
+        record: None,
     };
 
     assert_eq!(
@@ -1430,7 +1506,6 @@ fn causal_status_projection_failure_precedes_observed_and_pending_evidence() {
     );
 }
 
-#[cfg(feature = "graphql")]
 #[tokio::test]
 async fn causal_dispatch_rejects_same_command_id_with_different_input() {
     let handler_calls = Arc::new(AtomicUsize::new(0));
@@ -1488,7 +1563,6 @@ async fn causal_dispatch_rejects_same_command_id_with_different_input() {
     assert_eq!(handler_calls.load(Ordering::SeqCst), 1);
 }
 
-#[cfg(feature = "graphql")]
 #[tokio::test]
 async fn causal_guard_rejection_is_replayed_without_guard_or_handler_callback() {
     let guard_calls = Arc::new(AtomicUsize::new(0));
@@ -1555,7 +1629,6 @@ async fn causal_guard_rejection_is_replayed_without_guard_or_handler_callback() 
     assert_eq!(handler_calls.load(Ordering::SeqCst), 0);
 }
 
-#[cfg(feature = "graphql")]
 #[tokio::test]
 async fn causal_handler_rejection_is_replayed_without_reinvoking_handler() {
     let handler_calls = Arc::new(AtomicUsize::new(0));
@@ -1613,7 +1686,6 @@ async fn causal_handler_rejection_is_replayed_without_reinvoking_handler() {
     assert_eq!(handler_calls.load(Ordering::SeqCst), 1);
 }
 
-#[cfg(feature = "graphql")]
 #[tokio::test]
 async fn causal_dispatch_checks_current_role_before_reservation_guard_and_handler() {
     let guard_calls = Arc::new(AtomicUsize::new(0));
@@ -1778,14 +1850,24 @@ async fn causal_status_lookup_does_not_disclose_another_routes_command() {
     assert_eq!(cross_route, CommandLookup::Unknown);
 
     let authorized = service
-        .causal_command_status(&command_id, &session_with_role("admin"), principal.clone())
+        .causal_command_status(
+            &command_id,
+            &session_with_role("admin"),
+            principal.clone(),
+            None,
+        )
         .await
         .expect("current admin grant should recover the command without its route name");
     assert_eq!(authorized.state, CausalCommandPublicState::Succeeded);
     assert_eq!(authorized.command_id, command_id);
 
     let revoked = service
-        .causal_command_status(&command_id, &session_with_role("user"), principal.clone())
+        .causal_command_status(
+            &command_id,
+            &session_with_role("user"),
+            principal.clone(),
+            None,
+        )
         .await
         .expect("revoked routes must collapse to a non-enumerating status");
     assert_eq!(revoked.state, CausalCommandPublicState::Unknown);
@@ -1796,7 +1878,12 @@ async fn causal_status_lookup_does_not_disclose_another_routes_command() {
         &["distributed-tests"],
     );
     let wrong_principal = service
-        .causal_command_status(&command_id, &session_with_role("admin"), other_principal)
+        .causal_command_status(
+            &command_id,
+            &session_with_role("admin"),
+            other_principal,
+            None,
+        )
         .await
         .expect("another principal must not learn whether the command exists");
     assert_eq!(wrong_principal.state, CausalCommandPublicState::Unknown);
@@ -1806,6 +1893,7 @@ async fn causal_status_lookup_does_not_disclose_another_routes_command() {
             "not-a-command-id",
             &session_with_role("admin"),
             principal.clone(),
+            None,
         )
         .await
         .expect("malformed IDs are non-enumerating, not validation or storage errors");
@@ -1814,13 +1902,12 @@ async fn causal_status_lookup_does_not_disclose_another_routes_command() {
 
     let missing_id = causal_test_command_id();
     let missing = service
-        .causal_command_status(&missing_id, &session_with_role("admin"), principal)
+        .causal_command_status(&missing_id, &session_with_role("admin"), principal, None)
         .await
         .expect("absent IDs are non-enumerating");
     assert_eq!(missing.state, CausalCommandPublicState::Unknown);
 }
 
-#[cfg(feature = "graphql")]
 #[tokio::test]
 async fn causal_dispatch_overwrites_event_and_outbox_causation_with_ledger_identity() {
     let observed_causation = Arc::new(Mutex::new(None::<String>));
@@ -1943,12 +2030,12 @@ async fn causal_dispatch_overwrites_event_and_outbox_causation_with_ledger_ident
     );
 }
 
-#[cfg(feature = "graphql")]
 #[tokio::test]
 async fn causal_dispatch_uses_the_configured_immediate_outbox_publisher() {
     let repository = InMemoryRepository::new();
-    let observed_broker_metadata = Arc::new(Mutex::new(None::<[String; 4]>));
+    let observed_broker_metadata = Arc::new(Mutex::new(None::<[String; 6]>));
     let route_observed_broker_metadata = Arc::clone(&observed_broker_metadata);
+    let bus = crate::bus::InMemoryBus::new();
     let service = Service::new()
         .named("causal-tests")
         .routes(
@@ -1986,17 +2073,19 @@ async fn causal_dispatch_uses_the_configured_immediate_outbox_publisher() {
                     >| {
                         let message = context.message();
                         let metadata = [
+                            message.id().expect("published message ID").to_string(),
+                            message.name().to_string(),
                             message.causation_id().unwrap_or_default().to_string(),
                             message
-                                .metadata("x-sourced-source-aggregate-type")
+                                .metadata("x-distributed-source-aggregate-type")
                                 .unwrap_or_default()
                                 .to_string(),
                             message
-                                .metadata("x-sourced-source-aggregate-id")
+                                .metadata("x-distributed-source-aggregate-id")
                                 .unwrap_or_default()
                                 .to_string(),
                             message
-                                .metadata("x-sourced-source-sequence")
+                                .metadata("x-distributed-source-sequence")
                                 .unwrap_or_default()
                                 .to_string(),
                         ];
@@ -2008,7 +2097,7 @@ async fn causal_dispatch_uses_the_configured_immediate_outbox_publisher() {
                     },
                 ),
         )
-        .with_bus(crate::bus::InMemoryBus::new());
+        .with_bus(bus.clone());
 
     service
         .dispatch_causal(
@@ -2028,11 +2117,14 @@ async fn causal_dispatch_uses_the_configured_immediate_outbox_publisher() {
                 tokio::task::yield_now().await;
                 continue;
             }
-            if !outbox
-                .messages_by_status(crate::outbox::OutboxMessageStatus::Published, usize::MAX)
+            if outbox
+                .messages_by_status(crate::outbox::OutboxMessageStatus::InFlight, usize::MAX)
                 .await
                 .unwrap()
                 .is_empty()
+                && bus
+                    .published_ids()
+                    .contains(&"todo-immediate:immediate-fact".to_string())
             {
                 break;
             }
@@ -2041,35 +2133,35 @@ async fn causal_dispatch_uses_the_configured_immediate_outbox_publisher() {
     })
     .await
     .expect("immediate publish should settle the causal outbox row");
-    assert!(outbox.pending(usize::MAX).await.unwrap().is_empty());
-    let published = outbox
-        .messages_by_status(crate::outbox::OutboxMessageStatus::Published, usize::MAX)
+    assert!(
+        outbox.pending(usize::MAX).await.unwrap().is_empty(),
+        "delivered messages are deleted, not retained as evidence"
+    );
+    let stream = repository
+        .get_stream(
+            &crate::StreamIdentity::new(
+                CausalDispatcherAggregate::aggregate_type(),
+                "todo-immediate",
+            )
+            .unwrap(),
+        )
         .await
+        .unwrap()
         .unwrap();
-    assert_eq!(published.len(), 1);
-    assert_eq!(published[0].id(), "todo-immediate:immediate-fact");
-    assert_eq!(published[0].event_type, "causal.immediate_fact");
-    let causation = published[0]
+    let causation = stream.events()[0]
         .causation_id()
-        .expect("persisted outbox row should retain ledger causation")
+        .expect("committed event carries ledger causation")
         .to_string();
-    assert_eq!(
-        published[0].source_aggregate_type.as_deref(),
-        Some(CausalDispatcherAggregate::aggregate_type())
-    );
-    assert_eq!(
-        published[0].source_aggregate_id.as_deref(),
-        Some("todo-immediate")
-    );
-    assert_eq!(published[0].source_sequence, Some(1));
 
     service
-        .run(RunOptions::idempotent())
+        .run(RunOptions::until_idle())
         .await
         .expect("attached bus should deliver the immediately published fact");
     assert_eq!(
         observed_broker_metadata.lock().unwrap().as_ref(),
         Some(&[
+            "todo-immediate:immediate-fact".to_string(),
+            "causal.immediate_fact".to_string(),
             causation,
             CausalDispatcherAggregate::aggregate_type().to_string(),
             "todo-immediate".to_string(),
@@ -2079,19 +2171,25 @@ async fn causal_dispatch_uses_the_configured_immediate_outbox_publisher() {
     );
 }
 
-#[cfg(feature = "graphql")]
 #[tokio::test]
 async fn causal_prepared_batch_failure_rolls_back_every_atomic_participant() {
-    use crate::{ReadModelWorkspaceExt, RowKey, RowPatch, RowValue, SnapshotStore};
+    use crate::{CommitBatch, SnapshotStore, TransactionalCommit};
 
+    let aggregate_id = "atomic-rollback-aggregate";
     let repository = InMemoryRepository::new();
+    // An outbox row already holds the id the command stages, so its batch
+    // fails after the stream, snapshot and outbox legs are staged.
     repository
-        .model_store()
-        .register_schema::<CausalProjectionObligationView>()
-        .unwrap();
-    repository
-        .model_store()
-        .register_schema::<CausalProjectionSiblingView>()
+        .commit_batch(CommitBatch {
+            outbox_messages: vec![OutboxMessage::create(
+                format!("{aggregate_id}:atomic-fact"),
+                "causal.atomic_fact",
+                b"earlier".to_vec(),
+            )
+            .unwrap()],
+            ..CommitBatch::empty()
+        })
+        .await
         .unwrap();
     let service = Service::new().named("causal-atomic-rollback").routes(
         Routes::new()
@@ -2113,31 +2211,6 @@ async fn causal_prepared_batch_failure_rolls_back_every_atomic_participant() {
                             .record(input.id.clone())
                             .map_err(|error| HandlerError::Other(Box::new(error)))?;
 
-                        let committed_row_id = format!("{}:committed-row", input.id);
-                        let mut read_models = crate::read_model::ReadModelWritePlanBuilder::new();
-                        read_models
-                            .upsert(&CausalProjectionObligationView {
-                                id: committed_row_id,
-                            })
-                            .map_err(|error| HandlerError::Other(Box::new(error)))?;
-                        read_models
-                            .upsert(&CausalProjectionSiblingView {
-                                id: format!("{}:sibling-row", input.id),
-                            })
-                            .map_err(|error| HandlerError::Other(Box::new(error)))?;
-                        read_models
-                            .patch::<CausalProjectionObligationView>(
-                                RowKey::new([(
-                                    "id",
-                                    RowValue::String(format!("{}:missing-row", input.id)),
-                                )]),
-                                RowPatch::new().set(
-                                    "id",
-                                    RowValue::String(format!("{}:still-missing", input.id)),
-                                ),
-                            )
-                            .map_err(|error| HandlerError::Other(Box::new(error)))?;
-
                         let outbox = OutboxMessage::create(
                             format!("{}:atomic-fact", input.id),
                             "causal.atomic_fact",
@@ -2147,7 +2220,6 @@ async fn causal_prepared_batch_failure_rolls_back_every_atomic_participant() {
 
                         context
                             .outbox(outbox)
-                            .read_models(read_models)
                             .commit(checkout)?
                             .succeeded(TypedOutput { id: input.id })
                     })();
@@ -2157,7 +2229,6 @@ async fn causal_prepared_batch_failure_rolls_back_every_atomic_participant() {
     );
     let command_id = causal_test_command_id();
     let principal = causal_test_principal();
-    let aggregate_id = "atomic-rollback-aggregate";
 
     let error = service
         .dispatch_causal(
@@ -2168,7 +2239,7 @@ async fn causal_prepared_batch_failure_rolls_back_every_atomic_participant() {
             principal.clone(),
         )
         .await
-        .expect_err("the update-existing patch against a missing row must fail the batch");
+        .expect_err("the duplicate outbox id must fail the batch");
     assert_eq!(error.code(), "INTERNAL");
 
     let identity =
@@ -2178,46 +2249,12 @@ async fn causal_prepared_batch_failure_rolls_back_every_atomic_participant() {
         repository.get_stream(&identity).await.unwrap().is_none(),
         "aggregate stream must roll back"
     );
-    assert!(
-        repository
-            .outbox_store()
-            .pending(usize::MAX)
-            .await
-            .unwrap()
-            .is_empty(),
-        "outbox row must roll back"
-    );
+    let pending = repository.outbox_store().pending(usize::MAX).await.unwrap();
+    assert_eq!(pending.len(), 1, "the command's outbox row must roll back");
+    assert_eq!(pending[0].payload, b"earlier");
     assert!(
         repository.get_snapshot(&identity).await.unwrap().is_none(),
         "snapshot must roll back"
-    );
-    let projected = repository
-        .model_store()
-        .workspace()
-        .load::<CausalProjectionObligationView>(RowKey::new([(
-            "id",
-            RowValue::String(format!("{aggregate_id}:committed-row")),
-        )]))
-        .one()
-        .await
-        .unwrap();
-    assert!(
-        projected.is_none(),
-        "earlier read-model writes must roll back"
-    );
-    let sibling = repository
-        .model_store()
-        .workspace()
-        .load::<CausalProjectionSiblingView>(RowKey::new([(
-            "id",
-            RowValue::String(format!("{aggregate_id}:sibling-row")),
-        )]))
-        .one()
-        .await
-        .unwrap();
-    assert!(
-        sibling.is_none(),
-        "multi-table writes must roll back together"
     );
     assert!(matches!(
         service
@@ -2235,10 +2272,7 @@ async fn causal_prepared_batch_failure_rolls_back_every_atomic_participant() {
 
 #[cfg(all(feature = "graphql", feature = "sqlite"))]
 #[tokio::test]
-async fn causal_dispatch_replay_contains_resolved_projection_obligation() {
-    // Separately authored command_confirmations! is removed. Succeeded commands
-    // without modeled `.emits` finish without finite projection obligations; the
-    // outbox fact still stages for downstream projectors.
+async fn succeeded_causal_dispatch_replays_and_stages_its_outbox_fact() {
     let repository = crate::SqliteRepository::connect_and_migrate("sqlite::memory:")
         .await
         .expect("framework migrations should apply");
@@ -2277,6 +2311,7 @@ async fn causal_dispatch_replay_contains_resolved_projection_obligation() {
             ),
     );
     let engine = crate::graphql::GraphqlEngine::builder(&repository)
+        .identity(crate::graphql::IdentityConfig::dev_headers())
         .protocol_token_key(TEST_PROTOCOL_TOKEN_KEY)
         .model::<CausalProjectionObligationView>(
             crate::graphql::ModelPermissions::new()
@@ -2307,11 +2342,10 @@ async fn causal_dispatch_replay_contains_resolved_projection_obligation() {
     assert_eq!(result, json!({ "id": "todo-obligation" }));
 
     let status = service
-        .causal_command_status(&command_id, &Session::new(), principal.clone())
+        .causal_command_status(&command_id, &Session::new(), principal.clone(), None)
         .await
         .expect("status should load");
     assert_eq!(status.consistency, Some(CommandConsistency::Succeeded));
-    assert!(status.obligations.is_empty());
 
     let lookup = service
         .lookup_causal_command(
@@ -2322,10 +2356,10 @@ async fn causal_dispatch_replay_contains_resolved_projection_obligation() {
         )
         .await
         .expect("same principal should be able to recover its command");
-    let CommandLookup::Replay(replay) = lookup else {
-        panic!("completed command should be replayable");
-    };
-    assert!(replay.projection_obligations.is_empty());
+    assert!(
+        matches!(lookup, CommandLookup::Replay(_)),
+        "completed command should be replayable"
+    );
 
     let pending = repository.outbox_store().pending(10).await.unwrap();
     assert_eq!(pending.len(), 1);
@@ -2374,6 +2408,7 @@ async fn graphql_terminal_replay_revalidates_after_active_projection_starts_drai
             .facts(["causal.lifecycle-recorded"])
             .models(["CausalProjectionSiblingView"]);
         let engine = crate::graphql::GraphqlEngine::builder(&repository)
+            .identity(crate::graphql::IdentityConfig::dev_headers())
             .protocol_token_key(TEST_PROTOCOL_TOKEN_KEY)
             .model::<CausalLifecycleView>(
                 crate::graphql::ModelPermissions::new()
@@ -2600,6 +2635,304 @@ async fn graphql_terminal_replay_revalidates_after_active_projection_starts_drai
 
 #[cfg(all(feature = "graphql", feature = "sqlite"))]
 #[tokio::test]
+async fn graphql_succeeded_status_evaluates_retained_projection_evidence() {
+    let repository = crate::SqliteRepository::connect_and_migrate("sqlite::memory:")
+        .await
+        .expect("framework migrations should apply");
+    let mut table_registry = crate::table::TableSchemaRegistry::new();
+    table_registry
+        .register_schema(
+            <CausalLifecycleView as crate::read_model::RelationalReadModel>::schema().clone(),
+        )
+        .unwrap();
+    repository
+        .bootstrap_table_schema_for_dev(&table_registry)
+        .await
+        .unwrap();
+    let projector = modeled_lifecycle_projector(
+        crate::projection::placement::ProjectionBindingState::Active,
+        "causal-succeeded-status",
+        "causal-succeeded-status-topology",
+        0x7a,
+    );
+    let service = Service::new().named("causal-succeeded-status").routes(
+        Routes::new()
+            .with_repo(repository.clone().aggregate::<CausalDispatcherAggregate>())
+            .with_read_model_store(repository.clone())
+            .typed_command(
+                typed_command::<CausalTestInput, Eventual<TypedOutput>>("causal.lifecycle")
+                    .roles(["user"])
+                    .emits(crate::events![CausalLifecycleRecorded]),
+            )
+            .handle(
+                |context: &CausalCommandContext<'_, CausalDispatcherAggregate>,
+                 input: CausalTestInput| {
+                    let result = (|| {
+                        let mut checkout = context.create();
+                        checkout.record_lifecycle(input.id.clone(), input.label)?;
+                        context
+                            .publish_events()
+                            .commit(checkout)?
+                            .eventual(TypedOutput { id: input.id })
+                    })();
+                    async move { result }
+                },
+            )
+            .consume_projection(projector.clone()),
+    );
+    let engine = crate::graphql::GraphqlEngine::builder(&repository)
+        .identity(crate::graphql::IdentityConfig::dev_headers())
+        .protocol_token_key(TEST_PROTOCOL_TOKEN_KEY)
+        .model::<CausalLifecycleView>(
+            crate::graphql::ModelPermissions::new()
+                .grant("user", crate::graphql::read().all_columns()),
+        )
+        .service(&service)
+        .client_projectors([projector])
+        .build()
+        .expect("active modeled projection should compile");
+    let service = Arc::new(
+        service
+            .try_with_graphql(engine)
+            .expect("compiled service should bind"),
+    );
+    let command_id = causal_test_command_id();
+    let mutation = format!(
+        "mutation {{ causal_lifecycle(commandId: \"{command_id}\", input: {{ id: \"todo-succeeded-status\", label: \"active\" }}) {{ id }} }}"
+    );
+    let session = session_with_role("user");
+    let principal = causal_test_principal();
+    let response = service
+        .graphql_engine()
+        .unwrap()
+        .execute(
+            &session,
+            async_graphql::Request::new(&mutation)
+                .data(command_host(&service))
+                .data(principal.clone()),
+        )
+        .await;
+    assert!(response.errors.is_empty(), "{response:?}");
+    let envelope = serde_json::to_value(
+        response
+            .extensions
+            .get("distributed")
+            .expect("modeled command should carry the protocol envelope"),
+    )
+    .unwrap();
+    assert_eq!(envelope["command"]["state"], "succeeded_pending_projection");
+    assert_eq!(envelope["command"]["expects"].as_array().unwrap().len(), 1);
+    let causation_id = envelope["command"]["causationId"]
+        .as_str()
+        .expect("command envelope should carry its causation")
+        .to_string();
+
+    // The wait-path cell commits a terminal succeeded receipt while retaining
+    // modeled obligations. Before the projector writes proof, status remains
+    // publicly succeeded but cannot claim an observation.
+    let changed = sqlx::query(
+        "UPDATE command_ledger SET state = 'succeeded' \
+         WHERE service_id = ? AND command_id = ?",
+    )
+    .bind("causal-succeeded-status")
+    .bind(&command_id)
+    .execute(repository.pool())
+    .await
+    .unwrap();
+    assert_eq!(changed.rows_affected(), 1);
+
+    let status_query =
+        format!("query {{ commandStatus(commandId: \"{command_id}\") {{ state }} }}");
+    let before_projection = service
+        .graphql_engine()
+        .unwrap()
+        .execute(
+            &session,
+            async_graphql::Request::new(&status_query)
+                .data(command_host(&service))
+                .data(principal.clone()),
+        )
+        .await;
+    assert!(before_projection.errors.is_empty(), "{before_projection:?}");
+    assert_eq!(
+        before_projection.data.into_json().unwrap(),
+        json!({"commandStatus": {"state": "succeeded"}})
+    );
+    let before_envelope = serde_json::to_value(
+        before_projection
+            .extensions
+            .get("distributed")
+            .expect("status should carry its protocol envelope"),
+    )
+    .unwrap();
+    assert_eq!(before_envelope["command"]["state"], "succeeded");
+    assert_eq!(
+        before_envelope["command"]["expects"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(before_envelope["command"].get("observations").is_none());
+
+    // The celld host must use the same durable status evaluator. In
+    // particular, a terminal cell receipt cannot make the gateway claim a
+    // projection observation before the modeled projector has supplied proof.
+    let before_celld = service
+        .graphql_engine()
+        .unwrap()
+        .execute(
+            &session,
+            async_graphql::Request::new(&status_query)
+                .data(celld_status_host(&service))
+                .data(principal.clone()),
+        )
+        .await;
+    assert!(before_celld.errors.is_empty(), "{before_celld:?}");
+    let before_celld_envelope = serde_json::to_value(
+        before_celld
+            .extensions
+            .get("distributed")
+            .expect("celld status should carry its protocol envelope"),
+    )
+    .unwrap();
+    assert_eq!(before_celld_envelope["command"]["state"], "succeeded");
+    assert_eq!(
+        before_celld_envelope["command"]["expects"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(before_celld_envelope["command"]
+        .get("observations")
+        .is_none());
+
+    let pending = repository
+        .outbox_store()
+        .pending(10)
+        .await
+        .expect("the committed domain event should be pending");
+    assert_eq!(pending.len(), 1);
+    let ordered = crate::bus::OrderedDelivery::new(
+        crate::projection_protocol::ProjectionSource::new(
+            "test-ordered-events",
+            b"causal-succeeded-status".to_vec(),
+        )
+        .unwrap(),
+        crate::projection_protocol::ProjectionEpoch::new("test-ordered-events-v1").unwrap(),
+        1,
+        true,
+    )
+    .unwrap();
+    service
+        .dispatch_projector(0, &Message::from(pending[0].clone()), Some(&ordered))
+        .await
+        .expect("the real modeled projector should commit its evidence");
+
+    let after_projection = service
+        .graphql_engine()
+        .unwrap()
+        .execute(
+            &session,
+            async_graphql::Request::new(&status_query)
+                .data(command_host(&service))
+                .data(principal.clone()),
+        )
+        .await;
+    assert!(after_projection.errors.is_empty(), "{after_projection:?}");
+    let after_envelope = serde_json::to_value(
+        after_projection
+            .extensions
+            .get("distributed")
+            .expect("status should carry its protocol envelope"),
+    )
+    .unwrap();
+    assert_eq!(after_envelope["command"]["state"], "succeeded");
+    assert_eq!(
+        after_envelope["command"]["observations"]
+            .as_array()
+            .expect("matching durable proof should be exposed")
+            .len(),
+        1
+    );
+    assert_eq!(
+        after_envelope["command"]["observations"][0]["causationId"],
+        causation_id
+    );
+
+    let after_celld = service
+        .graphql_engine()
+        .unwrap()
+        .execute(
+            &session,
+            async_graphql::Request::new(&status_query)
+                .data(celld_status_host(&service))
+                .data(principal.clone()),
+        )
+        .await;
+    assert!(after_celld.errors.is_empty(), "{after_celld:?}");
+    let after_celld_envelope = serde_json::to_value(
+        after_celld
+            .extensions
+            .get("distributed")
+            .expect("celld status should carry its protocol envelope"),
+    )
+    .unwrap();
+    assert_eq!(after_celld_envelope["command"]["state"], "succeeded");
+    assert_eq!(
+        after_celld_envelope["command"]["observations"]
+            .as_array()
+            .expect("celld status should expose matching durable proof")
+            .len(),
+        1
+    );
+
+    // A proof authored by a different semantic program is not an observation
+    // for this command, even when its physical topology and scope are equal.
+    let wrong_program =
+        "pp1:sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    let changed =
+        sqlx::query("UPDATE projection_observations SET program_id = ? WHERE causation_id = ?")
+            .bind(wrong_program)
+            .bind(&causation_id)
+            .execute(repository.pool())
+            .await
+            .unwrap();
+    assert_eq!(changed.rows_affected(), 1);
+
+    let wrong_projection = service
+        .graphql_engine()
+        .unwrap()
+        .execute(
+            &session,
+            async_graphql::Request::new(&status_query)
+                .data(command_host(&service))
+                .data(principal),
+        )
+        .await;
+    assert!(wrong_projection.errors.is_empty(), "{wrong_projection:?}");
+    let wrong_envelope = serde_json::to_value(
+        wrong_projection
+            .extensions
+            .get("distributed")
+            .expect("status should carry its protocol envelope"),
+    )
+    .unwrap();
+    assert_eq!(wrong_envelope["command"]["state"], "succeeded");
+    assert!(wrong_envelope["command"].get("observations").is_none());
+    assert_eq!(
+        wrong_envelope["command"]["expects"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1,
+        "mismatched proof must leave the exact obligation pending"
+    );
+}
+
+#[cfg(all(feature = "graphql", feature = "sqlite"))]
+#[tokio::test]
 async fn engine_rejects_incompatible_direct_owner_before_typed_command_binding() {
     let repository = crate::SqliteRepository::connect_and_migrate("sqlite::memory:")
         .await
@@ -2630,7 +2963,6 @@ async fn engine_rejects_incompatible_direct_owner_before_typed_command_binding()
     let first = modeled_direct_registration(
         CAUSAL_DIRECT_PROJECTION,
         "project_causal_direct",
-        "causal-direct-v1",
         "first-direct-topology",
         1,
         <CausalProjectionObligationView as crate::read_model::RelationalReadModel>::schema()
@@ -2639,7 +2971,6 @@ async fn engine_rejects_incompatible_direct_owner_before_typed_command_binding()
     let second = modeled_direct_registration(
         CAUSAL_SIBLING_DIRECT_PROJECTION,
         "project_causal_direct",
-        "causal-direct-v1",
         "second-direct-topology",
         2,
         <CausalProjectionSiblingView as crate::read_model::RelationalReadModel>::schema().clone(),
@@ -2651,6 +2982,7 @@ async fn engine_rejects_incompatible_direct_owner_before_typed_command_binding()
         // command partition would produce a different error.
         .partition_by(["must-not-bind"]);
     let result = crate::graphql::GraphqlEngine::builder(&repository)
+        .identity(crate::graphql::IdentityConfig::dev_headers())
         .model::<CausalProjectionObligationView>(
             crate::graphql::ModelPermissions::new()
                 .grant("anonymous", crate::graphql::read().all_columns()),
@@ -2682,7 +3014,7 @@ async fn projected_command_auto_binds_bootstraps_and_replays_exact_direct_eviden
     let repository = crate::SqliteRepository::connect_and_migrate("sqlite::memory:")
         .await
         .expect("framework migrations should apply");
-    let mut registry = crate::TableSchemaRegistry::new();
+    let mut registry = crate::table::TableSchemaRegistry::new();
     registry
         .register::<CausalProjectionObligationView>()
         .unwrap()
@@ -2758,23 +3090,17 @@ async fn projected_command_auto_binds_bootstraps_and_replays_exact_direct_eviden
     let catalog =
         crate::projection::catalog::ProjectionCatalog::try_new(vec![binding.clone()]).unwrap();
     let active = catalog
-        .activate(
-            vec![
-                crate::projection::catalog::ProjectionBindingActivation::new(
-                    binding.id(),
-                    binding.program_id(),
-                    crate::projection_protocol::ProjectionEpoch::new("causal-direct-v1").unwrap(),
-                    crate::projection::placement::ProjectionBindingState::Active,
-                    Some(
-                        crate::projection::placement::ProjectionExecutorRoute::local(
-                            "causal-direct",
-                        )
+        .activate(vec![
+            crate::projection::catalog::ProjectionBindingActivation::new(
+                binding.id(),
+                binding.program_id(),
+                crate::projection::placement::ProjectionBindingState::Active,
+                Some(
+                    crate::projection::placement::ProjectionExecutorRoute::local("causal-direct")
                         .unwrap(),
-                    ),
                 ),
-            ],
-            None,
-        )
+            ),
+        ])
         .unwrap();
     let modeled = crate::graphql::SurfaceModeledProjection::try_from_descriptor(
         CAUSAL_DIRECT_PROJECTION,
@@ -2785,6 +3111,7 @@ async fn projected_command_auto_binds_bootstraps_and_replays_exact_direct_eviden
     .unwrap();
     let projection = SurfaceDirectProjection::new("project_causal_direct").modeled(modeled);
     let engine = crate::graphql::GraphqlEngine::builder(&repository)
+        .identity(crate::graphql::IdentityConfig::dev_headers())
         .protocol_token_key(TEST_PROTOCOL_TOKEN_KEY)
         .model::<CausalProjectionObligationView>(
             crate::graphql::ModelPermissions::new()
@@ -2813,21 +3140,13 @@ async fn projected_command_auto_binds_bootstraps_and_replays_exact_direct_eviden
     target
         .resolve(&json!({}), Some(&Session::new()))
         .unwrap()
-        .validate_modeled_owner(
-            legitimate_executor.name,
-            legitimate_executor.epoch,
-            legitimate_executor.program_id,
-        )
+        .validate_modeled_owner(legitimate_executor.name, legitimate_executor.program_id)
         .unwrap();
     let rogue_executor = CAUSAL_ROGUE_DIRECT_PROJECTION.server_executor().unwrap();
     let rogue_error = target
         .resolve(&json!({}), Some(&Session::new()))
         .unwrap()
-        .validate_modeled_owner(
-            rogue_executor.name,
-            rogue_executor.epoch,
-            rogue_executor.program_id,
-        )
+        .validate_modeled_owner(rogue_executor.name, rogue_executor.program_id)
         .unwrap_err();
     assert!(
         rogue_error.to_string().contains("program"),
@@ -2853,12 +3172,11 @@ async fn projected_command_auto_binds_bootstraps_and_replays_exact_direct_eviden
     assert_eq!(handler_calls.load(Ordering::SeqCst), 1);
 
     let direct_status = service
-        .causal_command_status(&command_id, &Session::new(), causal_test_principal())
+        .causal_command_status(&command_id, &Session::new(), causal_test_principal(), None)
         .await
         .expect("direct projected status should use ledger replay evidence");
     assert_eq!(direct_status.state, CausalCommandPublicState::Atomic);
     assert_eq!(direct_status.consistency, Some(CommandConsistency::Atomic));
-    assert!(direct_status.obligations.is_empty());
     assert!(direct_status.evidence.is_empty());
     let direct_status_evidence = direct_status
         .direct_projection
@@ -2961,7 +3279,6 @@ async fn projected_command_auto_binds_bootstraps_and_replays_exact_direct_eviden
     assert_eq!(second_replay.direct_projection, Some(evidence));
 }
 
-#[cfg(feature = "graphql")]
 #[tokio::test]
 async fn causal_dispatch_recovers_committed_replay_after_commit_acknowledgement_loss() {
     let handler_calls = Arc::new(AtomicUsize::new(0));
@@ -3034,7 +3351,6 @@ async fn causal_dispatch_recovers_committed_replay_after_commit_acknowledgement_
     assert_eq!(handler_calls.load(Ordering::SeqCst), 1);
 }
 
-#[cfg(feature = "graphql")]
 #[tokio::test]
 async fn causal_dispatch_reclaims_retryable_attempt_after_precommit_failure() {
     let handler_calls = Arc::new(AtomicUsize::new(0));
@@ -3121,13 +3437,231 @@ async fn causal_dispatch_reclaims_retryable_attempt_after_precommit_failure() {
     assert_eq!(handler_calls.load(Ordering::SeqCst), 2);
 }
 
+/// What a contended command's handler does between loading its aggregate and
+/// staging its commit. Keyed by aggregate ID, so tests share nothing.
+struct Contention {
+    runs: AtomicUsize,
+    after_load:
+        Box<dyn Fn(usize) -> std::pin::Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>,
+}
+
+static CONTENTION: std::sync::LazyLock<Mutex<HashMap<String, Arc<Contention>>>> =
+    std::sync::LazyLock::new(Default::default);
+
+fn contend(
+    id: &str,
+    after_load: impl Fn(usize) -> std::pin::Pin<Box<dyn Future<Output = ()> + Send>>
+        + Send
+        + Sync
+        + 'static,
+) -> Arc<Contention> {
+    let contention = Arc::new(Contention {
+        runs: AtomicUsize::new(0),
+        after_load: Box::new(after_load),
+    });
+    CONTENTION
+        .lock()
+        .unwrap()
+        .insert(id.to_string(), Arc::clone(&contention));
+    contention
+}
+
+/// Appends one event to the aggregate it loaded (or creates it).
+async fn contended_handler(
+    context: &CausalCommandContext<'_, CausalDispatcherAggregate>,
+    input: CausalTestInput,
+) -> Result<PreparedCommand<Succeeded<TypedOutput>>, HandlerError> {
+    let contention = Arc::clone(&CONTENTION.lock().unwrap()[&input.id]);
+    let mut checkout = match context.get(&input.id).await? {
+        Some(checkout) => checkout,
+        None => context.create(),
+    };
+    (contention.after_load)(contention.runs.fetch_add(1, Ordering::SeqCst)).await;
+    checkout
+        .record(input.id.clone())
+        .map_err(|error| HandlerError::Other(Box::new(error)))?;
+    context
+        .commit(checkout)?
+        .succeeded(TypedOutput { id: input.id })
+}
+
+fn contended_route<D>(routes: Routes<D>) -> Routes<D>
+where
+    D: crate::microsvc::CausalRouteDependencies<Aggregate = CausalDispatcherAggregate>
+        + Send
+        + Sync
+        + 'static,
+{
+    routes
+        .typed_command(typed_command::<CausalTestInput, Succeeded<TypedOutput>>(
+            "causal.contended",
+        ))
+        .handle(contended_handler)
+}
+
+/// Typed commands hold no lock across the handler: two of them on one
+/// aggregate race on its stream version, and the loser must be re-run on the
+/// winner's state rather than failed.
+macro_rules! concurrent_write_tests {
+    ($backend:ident, $repository:expr) => {
+        mod $backend {
+            use super::*;
+
+            #[tokio::test]
+            async fn concurrent_commands_on_one_aggregate_both_commit() {
+                let repository = $repository;
+                let id = concat!(stringify!($backend), "-raced");
+                // Both first runs hold the same loaded version before either
+                // commits. The loser's rerun does not wait.
+                let loaded = Arc::new(tokio::sync::Barrier::new(2));
+                let contention = contend(id, move |run| {
+                    let loaded = Arc::clone(&loaded);
+                    Box::pin(async move {
+                        if run < 2 {
+                            loaded.wait().await;
+                        }
+                    })
+                });
+                let service = Service::new()
+                    .named("causal-tests")
+                    .routes(contended_route(Routes::new().with_repo(
+                        repository.clone().aggregate::<CausalDispatcherAggregate>(),
+                    )));
+                let (first_id, second_id) = (causal_test_command_id(), causal_test_command_id());
+                let dispatch = |command_id| {
+                    service.dispatch_causal_with_receipt(
+                        "causal.contended",
+                        command_id,
+                        causal_test_input(id, "raced"),
+                        Session::new(),
+                        causal_test_principal(),
+                    )
+                };
+
+                let (first, second) = tokio::join!(dispatch(&first_id), dispatch(&second_id));
+
+                let first = first.expect("one command wins the stream version");
+                let second = second.expect("the other is run again and commits");
+                assert!(!first.replayed() && !second.replayed());
+                assert_eq!(
+                    contention.runs.load(Ordering::SeqCst),
+                    3,
+                    "exactly the loser ran again"
+                );
+                let committed = repository
+                    .aggregate::<CausalDispatcherAggregate>()
+                    .get(id)
+                    .await
+                    .unwrap()
+                    .expect("both commands committed to one stream");
+                assert_eq!(committed.entity().version(), 2);
+            }
+
+            #[tokio::test]
+            async fn a_command_that_keeps_losing_is_released_as_concurrent_write() {
+                let repository = $repository;
+                let id = concat!(stringify!($backend), "-starved");
+                // Another writer commits behind every run's loaded version.
+                let interfering = Arc::new(AtomicBool::new(true));
+                let contention = contend(id, {
+                    let (repository, interfering) = (repository.clone(), Arc::clone(&interfering));
+                    move |_run| {
+                        let (repository, interfering) =
+                            (repository.clone(), Arc::clone(&interfering));
+                        Box::pin(async move {
+                            if !interfering.load(Ordering::SeqCst) {
+                                return;
+                            }
+                            let writer = repository.aggregate::<CausalDispatcherAggregate>();
+                            let mut other = writer.get(id).await.unwrap().unwrap_or_default();
+                            other.record(id.to_string()).unwrap();
+                            writer.commit(&mut other).await.unwrap();
+                        })
+                    }
+                });
+                let service = Service::new()
+                    .named("causal-tests")
+                    .routes(contended_route(Routes::new().with_repo(
+                        repository.clone().aggregate::<CausalDispatcherAggregate>(),
+                    )));
+                let command_id = causal_test_command_id();
+                let dispatch = || {
+                    service.dispatch_causal_with_receipt(
+                        "causal.contended",
+                        &command_id,
+                        causal_test_input(id, "starved"),
+                        Session::new(),
+                        causal_test_principal(),
+                    )
+                };
+                let runs = crate::repository::CONCURRENT_WRITE_RETRIES;
+
+                let starved = dispatch().await.expect_err("every run lost the race");
+                assert!(
+                    matches!(starved, CausalDispatchError::ConcurrentWrite),
+                    "unexpected failure: {starved:?}"
+                );
+                assert_eq!(starved.code(), "CONCURRENT_WRITE");
+                assert_eq!(starved.status_code(), 503);
+                assert_eq!(contention.runs.load(Ordering::SeqCst), runs);
+                assert!(matches!(
+                    service
+                        .lookup_causal_command(
+                            "causal.contended",
+                            &command_id,
+                            &Session::new(),
+                            causal_test_principal(),
+                        )
+                        .await
+                        .unwrap(),
+                    CommandLookup::RetryableUnknown { .. }
+                ));
+
+                interfering.store(false, Ordering::SeqCst);
+                let retried = dispatch()
+                    .await
+                    .expect("the same command ID runs again at once");
+                assert!(!retried.replayed());
+                assert_eq!(contention.runs.load(Ordering::SeqCst), runs + 1);
+                let committed = repository
+                    .aggregate::<CausalDispatcherAggregate>()
+                    .get(id)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(
+                    committed.entity().version(),
+                    runs as u64 + 1,
+                    "the other writer's events and this command's one"
+                );
+            }
+        }
+    };
+}
+
+concurrent_write_tests!(in_memory, InMemoryRepository::new());
+
+#[cfg(feature = "sqlite")]
+concurrent_write_tests!(
+    sqlite,
+    crate::SqliteRepository::connect_and_migrate("sqlite::memory:")
+        .await
+        .expect("framework migrations should apply")
+);
+
 #[tokio::test]
 async fn service_collects_route_bundles_with_different_dependencies() {
     let service = Service::new()
+        .named("tests")
+        .routes(
+            command_routes()
+                .typed_command(pong_command("stores.dep"))
+                .handle(pong),
+        )
         .routes(
             Routes::new()
                 .with_dependencies(String::from("orders"))
-                .command("string.dep")
+                .event("string.dep")
                 .handle(|ctx: &Context<String>| {
                     let dep = ctx.dependencies().clone();
                     async move { Ok(json!({ "dependency": dep })) }
@@ -3143,39 +3677,42 @@ async fn service_collects_route_bundles_with_different_dependencies() {
                 }),
         );
 
-    let command = service
-        .dispatch("string.dep", json!({}), Session::new())
+    let command = dispatch_command(&service, "stores.dep", json!({}), Session::new())
         .await
         .unwrap();
-    let event = service
-        .dispatch_message(&Message::new(
-            "number.dep",
-            MessageKind::Event,
-            br#"{}"#.to_vec(),
-        ))
-        .await
-        .unwrap();
+    let event = |name: &'static str| {
+        let service = &service;
+        async move {
+            service
+                .dispatch_message(&Message::new(name, MessageKind::Event, br#"{}"#.to_vec()))
+                .await
+                .unwrap()
+        }
+    };
 
-    assert_eq!(command, json!({ "dependency": "orders" }));
-    assert_eq!(event, json!({ "dependency": 7 }));
+    assert_eq!(command, json!({ "pong": true }));
+    assert_eq!(event("string.dep").await, json!({ "dependency": "orders" }));
+    assert_eq!(event("number.dep").await, json!({ "dependency": 7 }));
     assert_eq!(
         service.subscription_plan(),
         SubscriptionPlan {
-            commands: vec!["string.dep".to_string()],
-            events: vec!["number.dep".to_string()],
+            commands: vec!["stores.dep".to_string()],
+            events: vec!["string.dep".to_string(), "number.dep".to_string()],
         }
     );
 }
 
 #[tokio::test]
 async fn service_dispatches_all_route_dependency_builder_combinations() {
-    let repo_only = InMemoryRepository::new().queued().aggregate();
-    let combo_repo = InMemoryRepository::new().queued().aggregate();
+    let repo_only: RouteComboRepo = InMemoryRepository::new().queued().aggregate();
+    let combo_repo: RouteComboRepo = InMemoryRepository::new().queued().aggregate();
+    let typed = |name| typed_command::<TypedInput, Succeeded<TypedOutput>>(name);
     let service = Service::new()
+        .named("tests")
         .routes(
             Routes::new()
                 .with_dependencies(String::from("custom"))
-                .command("custom.route")
+                .event("custom.route")
                 .handle(|ctx: &Context<String>| {
                     let dependency = ctx.dependencies().clone();
                     async move { Ok(json!({ "route": dependency })) }
@@ -3184,11 +3721,8 @@ async fn service_dispatches_all_route_dependency_builder_combinations() {
         .routes(
             Routes::new()
                 .with_repo(repo_only)
-                .command("repo.route")
-                .handle(|ctx: &Context<RouteComboRepo>| {
-                    let _ = ctx.repo();
-                    async move { Ok(json!({ "route": "repo" })) }
-                }),
+                .typed_command(typed("repo.route"))
+                .handle(typed_handler),
         )
         .routes(
             Routes::new()
@@ -3203,78 +3737,96 @@ async fn service_dispatches_all_route_dependency_builder_combinations() {
             Routes::new()
                 .with_repo(combo_repo)
                 .with_read_model_store(InMemoryRepository::new())
-                .command("repo-read.route")
+                .typed_command(typed("repo-read.route"))
+                .handle(typed_handler)
+                .event("repo-read.event")
                 .handle(|ctx: &Context<RouteComboDeps>| {
                     let _ = ctx.repo();
                     let _ = ctx.read_model_store();
                     async move { Ok(json!({ "route": "repo-read" })) }
                 }),
         );
+    let event = |name: &'static str| {
+        let service = &service;
+        async move {
+            service
+                .dispatch_message(&Message::new(name, MessageKind::Event, br#"{}"#.to_vec()))
+                .await
+                .unwrap()
+        }
+    };
 
-    let custom = service
-        .dispatch("custom.route", json!({}), Session::new())
-        .await
-        .unwrap();
-    let repo = service
-        .dispatch("repo.route", json!({}), Session::new())
-        .await
-        .unwrap();
-    let read = service
-        .dispatch_message(&Message::new(
-            "read.route",
-            MessageKind::Event,
-            br#"{}"#.to_vec(),
-        ))
-        .await
-        .unwrap();
-    let repo_read = service
-        .dispatch("repo-read.route", json!({}), Session::new())
-        .await
-        .unwrap();
+    let repo = dispatch_command(
+        &service,
+        "repo.route",
+        json!({ "id": "repo" }),
+        Session::new(),
+    )
+    .await
+    .unwrap();
+    let repo_read = dispatch_command(
+        &service,
+        "repo-read.route",
+        json!({ "id": "repo-read" }),
+        Session::new(),
+    )
+    .await
+    .unwrap();
 
-    assert_eq!(custom, json!({ "route": "custom" }));
-    assert_eq!(repo, json!({ "route": "repo" }));
-    assert_eq!(read, json!({ "route": "read" }));
-    assert_eq!(repo_read, json!({ "route": "repo-read" }));
+    assert_eq!(event("custom.route").await, json!({ "route": "custom" }));
+    assert_eq!(repo, json!({ "id": "repo" }));
+    assert_eq!(event("read.route").await, json!({ "route": "read" }));
+    assert_eq!(repo_read, json!({ "id": "repo-read" }));
+    assert_eq!(
+        event("repo-read.event").await,
+        json!({ "route": "repo-read" })
+    );
     assert_eq!(
         service.subscription_plan(),
         SubscriptionPlan {
-            commands: vec![
+            commands: vec!["repo.route".to_string(), "repo-read.route".to_string()],
+            events: vec![
                 "custom.route".to_string(),
-                "repo.route".to_string(),
-                "repo-read.route".to_string(),
+                "read.route".to_string(),
+                "repo-read.event".to_string(),
             ],
-            events: vec!["read.route".to_string()],
         }
     );
 }
 
 #[test]
 fn duplicate_route_names_within_bundle_are_rejected() {
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+    let commands = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _routes = command_routes()
+            .typed_command(pong_command("same"))
+            .handle(pong)
+            .typed_command(pong_command("same"))
+            .handle(pong);
+    }));
+    let events = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let _routes = test_routes()
-            .command("same")
+            .event("same")
             .handle(|_: &Context<()>| async move { Ok(json!({})) })
-            .command("same")
+            .event("same")
             .handle(|_: &Context<()>| async move { Ok(json!({})) });
     }));
 
-    assert!(result.is_err());
+    assert!(commands.is_err());
+    assert!(events.is_err());
 }
 
 #[test]
 fn duplicate_route_bundle_add_is_rejected_atomically() {
-    let mut service = Service::new().routes(
-        test_routes()
-            .command("same")
-            .handle(|_: &Context<()>| async move { Ok(json!({})) }),
+    let mut service = command_service(
+        command_routes()
+            .typed_command(pong_command("same"))
+            .handle(pong),
     );
-    let conflicting = Routes::new()
-        .with_dependencies(7_u32)
-        .command("same")
-        .handle(|_: &Context<u32>| async move { Ok(json!({})) })
-        .command("new")
-        .handle(|_: &Context<u32>| async move { Ok(json!({})) });
+    let conflicting = command_routes()
+        .typed_command(pong_command("same"))
+        .handle(pong)
+        .typed_command(pong_command("new"))
+        .handle(pong);
 
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         service.add_routes(conflicting);
@@ -3289,13 +3841,12 @@ fn duplicate_route_bundle_add_is_rejected_atomically() {
 
 #[tokio::test]
 async fn dispatch_returns_handler_result() {
-    let service = test_service(
-        test_routes()
-            .command("ping")
-            .handle(|_ctx: &Context<()>| async move { Ok(json!({ "pong": true })) }),
+    let service = command_service(
+        command_routes()
+            .typed_command(pong_command("ping"))
+            .handle(pong),
     );
-    let result = service
-        .dispatch("ping", json!({}), Session::new())
+    let result = dispatch_command(&service, "ping", json!({}), Session::new())
         .await
         .unwrap();
     assert_eq!(result, json!({ "pong": true }));
@@ -3303,20 +3854,22 @@ async fn dispatch_returns_handler_result() {
 
 #[tokio::test]
 async fn unknown_command() {
-    // This dispatch records the same {unnamed, unknown, unknown_command}
-    // series into the process-global registry that
-    // `metrics_bucket_unknown_command_under_fixed_message_label` asserts
-    // an exact count on — serialize against it.
+    // This dispatch records an {unknown, unknown_command} series into the
+    // process-global registry that
+    // `metrics_bucket_unknown_command_under_fixed_message_label` resets and
+    // asserts an exact count on — serialize against it.
     #[cfg(feature = "metrics")]
     let _guard = crate::metrics::async_lock_for_tests().await;
 
-    let service = test_service(
-        test_routes()
-            .command("ping")
-            .handle(|_ctx: &Context<()>| async move { Ok(json!({})) }),
+    let service = command_service(
+        command_routes()
+            .typed_command(pong_command("ping"))
+            .handle(pong),
     );
-    let result = service.dispatch("unknown", json!({}), Session::new()).await;
-    assert!(matches!(result, Err(HandlerError::UnknownCommand(ref s)) if s == "unknown"));
+    let result = dispatch_command(&service, "unknown", json!({}), Session::new()).await;
+    assert!(
+        matches!(result, Err(CausalDispatchError::BadRequest(ref s)) if s == "unknown typed command")
+    );
 }
 
 #[cfg(feature = "metrics")]
@@ -3325,21 +3878,25 @@ async fn metrics_bucket_unknown_command_under_fixed_message_label() {
     let _guard = crate::metrics::async_lock_for_tests().await;
     crate::metrics::reset_for_tests();
 
-    let service = test_service(
-        test_routes()
-            .command("ping")
-            .handle(|_ctx: &Context<()>| async move { Ok(json!({})) }),
+    let service = command_service(
+        command_routes()
+            .typed_command(pong_command("ping"))
+            .handle(pong),
     );
 
-    let result = service
-        .dispatch("attacker-controlled-path", json!({}), Session::new())
-        .await;
-    assert!(matches!(result, Err(HandlerError::UnknownCommand(_))));
+    let result = dispatch_command(
+        &service,
+        "attacker-controlled-path",
+        json!({}),
+        Session::new(),
+    )
+    .await;
+    assert!(matches!(result, Err(CausalDispatchError::BadRequest(_))));
 
     let text = crate::metrics::prometheus_text();
     assert!(
             text.contains(
-                "distributed_microsvc_dispatch_total{service=\"unnamed\",message_kind=\"command\",message=\"unknown\",status=\"unknown_command\"} 1"
+                "distributed_microsvc_dispatch_total{service=\"tests\",message_kind=\"command\",message=\"unknown\",status=\"unknown_command\"} 1"
             ),
             "unknown commands should use a bounded message label:\n{text}"
         );
@@ -3349,45 +3906,88 @@ async fn metrics_bucket_unknown_command_under_fixed_message_label() {
     );
 }
 
+#[cfg(feature = "metrics")]
+#[tokio::test]
+async fn metrics_count_each_typed_dispatch_once_by_outcome() {
+    let _guard = crate::metrics::async_lock_for_tests().await;
+    crate::metrics::reset_for_tests();
+
+    let service = command_service(
+        command_routes()
+            .typed_command(pong_command("ping"))
+            .handle(pong)
+            .typed_command(pong_command("fail"))
+            .handle(|_: &CausalCommandContext<'_, ()>, _: NoInput| async move {
+                Err::<PreparedCommand<Succeeded<Pong>>, _>(HandlerError::Rejected("nope".into()))
+            })
+            .typed_command(pong_command("bus.ping").roles([crate::microsvc::TRANSPORT_ROLE]))
+            .handle(pong),
+    );
+    dispatch_command(&service, "ping", json!({}), Session::new())
+        .await
+        .unwrap();
+    dispatch_command(&service, "fail", json!({}), Session::new())
+        .await
+        .unwrap_err();
+    service
+        .dispatch_message(
+            &Message::new("bus.ping", MessageKind::Command, b"{}".to_vec()).with_id("msg-1"),
+        )
+        .await
+        .unwrap();
+
+    let text = crate::metrics::prometheus_text();
+    for (message, status) in [
+        ("ping", "success"),
+        ("fail", "rejected"),
+        ("bus.ping", "success"),
+    ] {
+        let series = format!(
+            "distributed_microsvc_dispatch_total{{service=\"tests\",message_kind=\"command\",message=\"{message}\",status=\"{status}\"}} 1"
+        );
+        assert!(text.contains(&series), "missing `{series}`:\n{text}");
+    }
+}
+
 #[tokio::test]
 async fn handler_error_propagates() {
-    let service = test_service(
-        test_routes()
-            .command("fail")
-            .handle(|_ctx: &Context<()>| async move { Err(HandlerError::Rejected("nope".into())) }),
-    );
-    let result = service.dispatch("fail", json!({}), Session::new()).await;
-    assert!(matches!(result, Err(HandlerError::Rejected(ref s)) if s == "nope"));
+    let service = command_service(command_routes().typed_command(pong_command("fail")).handle(
+        |_: &CausalCommandContext<'_, ()>, _: NoInput| async move {
+            Err::<PreparedCommand<Succeeded<Pong>>, _>(HandlerError::Rejected("nope".into()))
+        },
+    ));
+    let result = dispatch_command(&service, "fail", json!({}), Session::new()).await;
+    assert!(matches!(
+        result,
+        Err(CausalDispatchError::Rejected { code: "REJECTED", status: 422, ref message })
+            if message.contains("nope")
+    ));
 }
 
 #[tokio::test]
 async fn decode_error_from_bad_payload() {
-    #[derive(serde::Deserialize)]
-    struct Input {
-        _name: String,
-    }
-
-    let service = test_service(test_routes().command("typed").handle(|ctx: &Context<()>| {
-        let input = ctx.input::<Input>();
-        async move {
-            let _input = input?;
-            Ok(json!({}))
-        }
-    }));
-    let result = service
-        .dispatch("typed", json!({ "wrong": 1 }), Session::new())
-        .await;
-    assert!(matches!(result, Err(HandlerError::DecodeFailed(_))));
+    let service = Service::new().named("tests").routes(
+        Routes::new()
+            .with_repo(
+                InMemoryRepository::new()
+                    .queued()
+                    .aggregate::<RouteComboAggregate>(),
+            )
+            .typed_command(typed_command::<TypedInput, Succeeded<TypedOutput>>("typed"))
+            .handle(typed_handler),
+    );
+    let result = dispatch_command(&service, "typed", json!({ "wrong": 1 }), Session::new()).await;
+    assert!(matches!(result, Err(CausalDispatchError::BadRequest(_))));
 }
 
 #[test]
 fn command_names_list() {
-    let service = test_service(
-        test_routes()
-            .command("a")
-            .handle(|_: &Context<()>| async move { Ok(json!({})) })
-            .command("b")
-            .handle(|_: &Context<()>| async move { Ok(json!({})) }),
+    let service = command_service(
+        command_routes()
+            .typed_command(pong_command("a"))
+            .handle(pong)
+            .typed_command(pong_command("b"))
+            .handle(pong),
     );
     let mut cmds = service.command_names();
     cmds.sort();
@@ -3398,12 +3998,15 @@ fn command_names_list() {
 fn subscription_plan_separates_commands_and_events() {
     const EVENTS: &[&str] = &["checkout.started", "seat.reserved"];
 
-    let service = test_service(
-        test_routes()
-            .command("checkout.start")
-            .handle(|_: &Context<()>| async move { Ok(json!({})) })
+    let service = command_service(
+        command_routes()
+            .typed_command(pong_command("checkout.start"))
+            .handle(pong)
             .events(EVENTS)
-            .guarded(|_| true, |_: &Context<()>| async move { Ok(json!({})) }),
+            .guarded(
+                |_| true,
+                |_: &Context<StoreDeps>| async move { Ok(json!({})) },
+            ),
     );
 
     assert_eq!(
@@ -3437,15 +4040,12 @@ fn event_conveniences_record_event_names() {
 
 #[tokio::test]
 async fn command_and_event_handlers_can_share_a_name() {
-    let service = test_service(
-        test_routes()
-            .command("shared")
-            .handle(|ctx: &Context<()>| {
-                let kind = format!("{:?}", ctx.message().kind);
-                async move { Ok(json!({ "kind": kind })) }
-            })
+    let service = command_service(
+        command_routes()
+            .typed_command(pong_command("shared"))
+            .handle(pong)
             .event("shared")
-            .handle(|ctx: &Context<()>| {
+            .handle(|ctx: &Context<StoreDeps>| {
                 let event_id = ctx.message().id().map(|s| s.to_string());
                 async move { Ok(json!({ "event_id": event_id })) }
             }),
@@ -3453,13 +4053,12 @@ async fn command_and_event_handlers_can_share_a_name() {
     let event_message =
         Message::new("shared", MessageKind::Event, br#"{}"#.to_vec()).with_id("evt-1");
 
-    let command_result = service
-        .dispatch("shared", json!({}), Session::new())
+    let command_result = dispatch_command(&service, "shared", json!({}), Session::new())
         .await
         .unwrap();
     let event_result = service.dispatch_message(&event_message).await.unwrap();
 
-    assert_eq!(command_result, json!({ "kind": "Command" }));
+    assert_eq!(command_result, json!({ "pong": true }));
     assert_eq!(event_result, json!({ "event_id": "evt-1" }));
     assert!(service.handles_message(MessageKind::Command, "shared"));
     assert!(service.handles_message(MessageKind::Event, "shared"));
@@ -3593,25 +4192,33 @@ async fn dispatch_message_always_exposes_message_metadata() {
 
 #[tokio::test]
 async fn dispatch_exposes_trace_context_from_session_metadata() {
+    #[derive(Serialize, crate::command::CommandOutput)]
+    struct Trace {
+        traceparent: Option<String>,
+        tracestate: Option<String>,
+    }
+
     let traceparent = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
-    let service = test_service(test_routes().command("checkout.start").handle(
-        |ctx: &Context<()>| {
-            let trace_context = ctx.message().trace_context();
-            async move {
-                Ok(json!({
-                    "traceparent": trace_context.traceparent,
-                    "tracestate": trace_context.tracestate,
-                }))
-            }
-        },
-    ));
+    let service = command_service(
+        command_routes()
+            .typed_command(typed_command::<NoInput, Succeeded<Trace>>("checkout.start"))
+            .handle(|ctx: &CausalCommandContext<'_, ()>, _: NoInput| {
+                let trace_context = ctx.trace_context();
+                async move {
+                    Ok(PreparedCommand::prepare(Trace {
+                        traceparent: trace_context.traceparent,
+                        tracestate: trace_context.tracestate,
+                    })
+                    .unwrap())
+                }
+            }),
+    );
     let session = Session::from_map(HashMap::from([
         ("traceparent".to_string(), traceparent.to_string()),
         ("tracestate".to_string(), "vendor=value".to_string()),
     ]));
 
-    let result = service
-        .dispatch("checkout.start", json!({}), session)
+    let result = dispatch_command(&service, "checkout.start", json!({}), session)
         .await
         .unwrap();
 
@@ -3623,143 +4230,591 @@ async fn dispatch_exposes_trace_context_from_session_metadata() {
 
 #[tokio::test]
 async fn guard_passes() {
-    let service = test_service(test_routes().command("greet").guarded(
-        |ctx| ctx.has_fields(&["name"]),
-        |ctx: &Context<()>| {
-            let name = ctx.raw_input()["name"].as_str().map(|s| s.to_string());
-            async move { Ok(json!({ "hello": name.unwrap() })) }
-        },
-    ));
-    let result = service
-        .dispatch("greet", json!({ "name": "Pat" }), Session::new())
+    let service = command_service(
+        command_routes()
+            .typed_command(pong_command("greet"))
+            .guarded(|ctx| ctx.command_name() == "greet", pong),
+    );
+    let result = dispatch_command(&service, "greet", json!({}), Session::new())
         .await
         .unwrap();
-    assert_eq!(result, json!({ "hello": "Pat" }));
+    assert_eq!(result, json!({ "pong": true }));
 }
 
 #[tokio::test]
 async fn guard_rejects() {
-    let service = test_service(test_routes().command("greet").guarded(
-        |ctx| ctx.has_fields(&["name"]),
-        |_ctx: &Context<()>| async move {
-            panic!("handler should not run");
-            #[allow(unreachable_code)]
-            Ok(json!({}))
-        },
+    let service = command_service(
+        command_routes()
+            .typed_command(pong_command("greet"))
+            .guarded(
+                |_| false,
+                |_: &CausalCommandContext<'_, ()>, _: NoInput| async move {
+                    panic!("handler should not run");
+                    #[allow(unreachable_code)]
+                    Ok(PreparedCommand::<Succeeded<Pong>>::prepare(Pong { pong: true }).unwrap())
+                },
+            ),
+    );
+    let result = dispatch_command(&service, "greet", json!({}), Session::new()).await;
+    assert!(matches!(
+        result,
+        Err(CausalDispatchError::Rejected {
+            code: "REJECTED",
+            status: 422,
+            ..
+        })
     ));
-    let result = service
-        .dispatch("greet", json!({ "wrong": 1 }), Session::new())
-        .await;
-    assert!(matches!(result, Err(HandlerError::GuardRejected(ref s)) if s == "greet"));
 }
 
 #[tokio::test]
 async fn guard_checks_session() {
-    let service = test_service(test_routes().command("admin").guarded(
-        |ctx| ctx.role() == Some("admin"),
-        |_ctx: &Context<()>| async move { Ok(json!({ "ok": true })) },
-    ));
+    let service = command_service(
+        command_routes()
+            .typed_command(pong_command("admin"))
+            .guarded(|ctx| ctx.role() == Some("admin"), pong),
+    );
 
     // No role
-    assert!(service
-        .dispatch("admin", json!({}), Session::new())
-        .await
-        .is_err());
+    assert!(
+        dispatch_command(&service, "admin", json!({}), Session::new())
+            .await
+            .is_err()
+    );
 
     // Admin role
     let mut session = Session::new();
     session.set(crate::microsvc::ROLE_KEY, "admin");
-    assert!(service.dispatch("admin", json!({}), session).await.is_ok());
+    assert!(dispatch_command(&service, "admin", json!({}), session)
+        .await
+        .is_ok());
+}
+
+type LaneLog = std::sync::Arc<std::sync::Mutex<Vec<String>>>;
+
+fn lane_log() -> LaneLog {
+    std::sync::Arc::new(std::sync::Mutex::new(Vec::new()))
+}
+
+fn lane_recorder(log: &LaneLog, label: &'static str) -> Routes<()> {
+    let log = log.clone();
+    test_routes()
+        .events(&["fact.recorded", "fact.other"])
+        .handle(move |ctx: &Context<()>| {
+            log.lock()
+                .unwrap()
+                .push(format!("{label}:{}", ctx.message().name()));
+            async move { Ok(json!({})) }
+        })
 }
 
 #[tokio::test]
-async fn dispatch_request_success() {
-    let service = test_service(
-        test_routes()
-            .command("ping")
-            .handle(|_ctx: &Context<()>| async move { Ok(json!({ "pong": true })) }),
+async fn named_lanes_partition_routes_and_default_dispatch_runs_all_in_order() {
+    use crate::bus::{LaneSet, MessageRouter};
+    let log = lane_log();
+    let service = Service::new()
+        .routes(lane_recorder(&log, "projection-a"))
+        .lane("process", lane_recorder(&log, "policy"))
+        .routes(lane_recorder(&log, "projection-b"))
+        .lane(
+            "process",
+            test_routes()
+                .event("fact.process_only")
+                .handle(|_: &Context<()>| async move { Ok(json!({})) }),
+        );
+
+    assert_eq!(
+        service.delivery_lane_names(),
+        &[DEFAULT_DELIVERY_LANE, "process"]
     );
-    let request = CommandRequest {
-        command: "ping".to_string(),
-        input: json!({}),
-        session_variables: HashMap::new(),
-    };
-    let response = service.dispatch_request(&request).await;
-    assert_eq!(response.status, 200);
-    assert_eq!(response.body, json!({ "pong": true }));
-}
-
-#[tokio::test]
-async fn dispatch_request_error_codes() {
-    let service = test_service(
-        test_routes()
-            .command("reject")
-            .handle(|_: &Context<()>| async move { Err(HandlerError::Rejected("no".into())) })
-            .command("unauth")
-            .handle(|ctx: &Context<()>| {
-                let user_id = ctx.user_id().map(|s| s.to_string());
-                async move {
-                    let _ = user_id?;
-                    Ok(json!({}))
-                }
-            }),
+    assert_eq!(MessageRouter::delivery_lanes(&service), 2);
+    assert_eq!(
+        MessageRouter::lanes_for(&service, MessageKind::Event, "fact.recorded"),
+        LaneSet::single(0).with(1)
     );
-
-    let resp = service
-        .dispatch_request(&CommandRequest {
-            command: "unknown".to_string(),
-            input: json!({}),
-            session_variables: HashMap::new(),
-        })
-        .await;
-    assert_eq!(resp.status, 404);
-
-    let resp = service
-        .dispatch_request(&CommandRequest {
-            command: "reject".to_string(),
-            input: json!({}),
-            session_variables: HashMap::new(),
-        })
-        .await;
-    assert_eq!(resp.status, 422);
-
-    let resp = service
-        .dispatch_request(&CommandRequest {
-            command: "unauth".to_string(),
-            input: json!({}),
-            session_variables: HashMap::new(),
-        })
-        .await;
-    assert_eq!(resp.status, 401);
-}
-
-#[tokio::test]
-async fn dispatch_request_passes_session() {
-    let service = test_service(test_routes().command("whoami").handle(|ctx: &Context<()>| {
-        let user_id = ctx.user_id().map(|s| s.to_string());
-        async move {
-            let user_id = user_id?;
-            Ok(json!({ "user_id": user_id }))
-        }
-    }));
-    let mut vars = HashMap::new();
-    vars.insert(
-        crate::microsvc::USER_ID_KEY.to_string(),
-        "user-99".to_string(),
+    assert_eq!(
+        MessageRouter::lanes_for(&service, MessageKind::Event, "fact.process_only"),
+        LaneSet::single(1)
     );
-    let request = CommandRequest {
-        command: "whoami".to_string(),
-        input: json!({}),
-        session_variables: vars,
-    };
-    let response = service.dispatch_request(&request).await;
-    assert_eq!(response.status, 200);
-    assert_eq!(response.body, json!({ "user_id": "user-99" }));
+    assert!(MessageRouter::lanes_for(&service, MessageKind::Event, "fact.unknown").is_empty());
+
+    let message = Message::new("fact.recorded", MessageKind::Event, b"{}".to_vec()).with_id("e1");
+    MessageRouter::dispatch_lane(&service, &message, None, 1)
+        .await
+        .unwrap();
+    assert_eq!(*log.lock().unwrap(), ["policy:fact.recorded"]);
+    log.lock().unwrap().clear();
+    MessageRouter::dispatch_lane(&service, &message, None, 0)
+        .await
+        .unwrap();
+    assert_eq!(
+        *log.lock().unwrap(),
+        ["projection-a:fact.recorded", "projection-b:fact.recorded"]
+    );
+    // Without lanes (sequential transports), every route runs in
+    // registration order exactly as before lanes existed.
+    log.lock().unwrap().clear();
+    service.dispatch_message(&message).await.unwrap();
+    assert_eq!(
+        *log.lock().unwrap(),
+        [
+            "projection-a:fact.recorded",
+            "policy:fact.recorded",
+            "projection-b:fact.recorded"
+        ]
+    );
+    // A lane with no route for the message is an unknown-route error, never a
+    // silent success.
+    let only = Message::new("fact.process_only", MessageKind::Event, b"{}".to_vec());
+    assert!(MessageRouter::dispatch_lane(&service, &only, None, 0)
+        .await
+        .is_err());
 }
 
 #[test]
-fn command_request_requires_session_variables_field() {
-    let json = r#"{"command":"ping","input":{}}"#;
-    let result: Result<CommandRequest, _> = serde_json::from_str(json);
-    assert!(result.is_err());
+fn service_without_named_lanes_reports_one_lane() {
+    use crate::bus::MessageRouter;
+    let log = lane_log();
+    let service = Service::new().routes(lane_recorder(&log, "only"));
+    assert_eq!(MessageRouter::delivery_lanes(&service), 1);
+}
+
+#[test]
+#[should_panic(expected = "named delivery lane")]
+fn default_lane_name_cannot_be_used_as_a_named_lane() {
+    let log = lane_log();
+    let _ = Service::new().lane(DEFAULT_DELIVERY_LANE, lane_recorder(&log, "x"));
+}
+
+#[cfg(any(feature = "graphql", feature = "runtime-tokio"))]
+macro_rules! ledger_compaction_routes {
+    ($repository:expr, $command:literal) => {
+        Routes::new()
+            .with_repo($repository.clone().aggregate::<CausalDispatcherAggregate>())
+            .typed_command(typed_command::<CausalTestInput, Succeeded<TypedOutput>>(
+                $command,
+            ))
+            .handle(
+                |_context: &CausalCommandContext<'_, CausalDispatcherAggregate>,
+                 input: CausalTestInput| async move {
+                    Ok(
+                        PreparedCommand::<Succeeded<TypedOutput>>::prepare(TypedOutput {
+                            id: input.id,
+                        })
+                        .unwrap(),
+                    )
+                },
+            )
+    };
+}
+
+#[cfg(feature = "runtime-tokio")]
+macro_rules! ledger_compaction_service {
+    ($repository:expr) => {
+        Service::new()
+            .named("ledger-compaction")
+            .routes(ledger_compaction_routes!($repository, "ledger.compact"))
+    };
+}
+
+#[cfg(feature = "runtime-tokio")]
+async fn reserve_for_compaction<R: CommandLedgerStore>(
+    repository: &R,
+) -> (CommandLedgerKey, crate::command_ledger::CommandAttempt) {
+    use crate::command_ledger::{
+        CanonicalInputHash, CommandContractFingerprint, CommandId, PrincipalPartitionId,
+    };
+    let key = CommandLedgerKey::new(
+        "ledger-compaction",
+        PrincipalPartitionId::new("v1:sha256:principal").unwrap(),
+        CommandId::parse(&causal_test_command_id()).unwrap(),
+    )
+    .unwrap();
+    let reservation = CommandReservation::new(
+        key.clone(),
+        "ledger.compact",
+        CommandContractFingerprint::new([1; 32]),
+        CanonicalInputHash::new([2; 32]),
+        std::time::Duration::from_secs(30),
+        std::time::Duration::from_secs(300),
+    )
+    .unwrap();
+    match repository.reserve_command(reservation).await.unwrap() {
+        ReservationOutcome::Acquired(attempt) => (key, attempt),
+        other => panic!("expected an acquired attempt, got {other:?}"),
+    }
+}
+
+#[cfg(feature = "runtime-tokio")]
+/// Writes a terminal row whose retention lapses 50 ms after commit, a
+/// terminal row retained for 300 s and an in-progress row, then runs the
+/// worker's pass until the first one is due. The ledger has no injectable
+/// clock (the stores use their own), so the pass is polled instead of the
+/// test sleeping for a fixed time.
+async fn worker_pass_compacts_only_expired_rows<R>(service: &Service, repository: &R)
+where
+    R: CommandLedgerStore + CausalTransactionalCommit,
+{
+    use crate::command_ledger::TerminalCommandState;
+    use std::time::{Duration, Instant};
+
+    let scope = CommandLookupScope::CommandName("ledger.compact");
+    let complete = |attempt: crate::command_ledger::CommandAttempt, retention: Duration| async move {
+        let completion = attempt
+            .complete(
+                TerminalCommandState::Succeeded,
+                json!({"id": "todo-1"}),
+                retention,
+            )
+            .unwrap();
+        repository
+            .commit_causal_batch(CausalCommitBatch::new(
+                crate::CommitBatch::empty(),
+                completion,
+            ))
+            .await
+            .unwrap();
+    };
+    let (expired, attempt) = reserve_for_compaction(repository).await;
+    complete(attempt, Duration::from_millis(50)).await;
+    let (retained, attempt) = reserve_for_compaction(repository).await;
+    complete(attempt, Duration::from_secs(300)).await;
+    let (in_progress, _attempt) = reserve_for_compaction(repository).await;
+
+    let ledgers = service.command_ledgers();
+    assert_eq!(ledgers.len(), 1);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut compacted = 0;
+    while compacted == 0 {
+        assert!(
+            Instant::now() < deadline,
+            "the expired row was never compacted"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        compacted = crate::microsvc::workers::compact_command_ledgers(&ledgers, 8).await;
+    }
+
+    assert_eq!(compacted, 1, "only the expired row is compacted");
+    assert_eq!(
+        crate::microsvc::workers::compact_command_ledgers(&ledgers, 8).await,
+        0
+    );
+    assert_eq!(
+        repository.lookup_command(&expired, scope).await.unwrap(),
+        CommandLookup::Expired
+    );
+    assert!(matches!(
+        repository.lookup_command(&retained, scope).await.unwrap(),
+        CommandLookup::Replay(_)
+    ));
+    assert!(matches!(
+        repository
+            .lookup_command(&in_progress, scope)
+            .await
+            .unwrap(),
+        CommandLookup::InProgress { .. }
+    ));
+}
+
+#[cfg(feature = "runtime-tokio")]
+#[tokio::test]
+async fn ledger_worker_pass_compacts_only_expired_rows_in_memory() {
+    let repository = InMemoryRepository::new();
+    let service = ledger_compaction_service!(repository);
+    worker_pass_compacts_only_expired_rows(&service, &repository).await;
+}
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn ledger_worker_pass_compacts_only_expired_rows_in_sqlite() {
+    let repository = crate::SqliteRepository::connect_and_migrate("sqlite::memory:")
+        .await
+        .expect("framework migrations should apply");
+    let service = ledger_compaction_service!(repository);
+    worker_pass_compacts_only_expired_rows(&service, &repository).await;
+}
+
+#[cfg(any(feature = "graphql", feature = "runtime-tokio"))]
+#[tokio::test]
+async fn service_compacts_each_command_repository_once() {
+    let shared = InMemoryRepository::new();
+    let other = InMemoryRepository::new();
+    let service = Service::new()
+        .named("ledger-compaction")
+        .routes(ledger_compaction_routes!(shared, "ledger.first"))
+        .routes(ledger_compaction_routes!(shared, "ledger.second"))
+        .routes(ledger_compaction_routes!(other, "ledger.third"))
+        .routes(test_routes());
+
+    assert_eq!(service.command_ledgers().len(), 2);
+}
+
+#[cfg(feature = "runtime-tokio")]
+/// `with_bus` starts the worker: with no explicit pass, the expired row is
+/// compacted. Tokio time is paused, so the worker's interval elapses as soon
+/// as the runtime is idle; the row's retention is wall-clock time.
+#[tokio::test(start_paused = true)]
+async fn with_bus_runs_ledger_compaction() {
+    use crate::command_ledger::TerminalCommandState;
+    use std::time::{Duration, Instant};
+
+    let repository = InMemoryRepository::new();
+    let service = ledger_compaction_service!(repository).with_bus(crate::bus::InMemoryBus::new());
+    let (key, attempt) = reserve_for_compaction(&repository).await;
+    let completion = attempt
+        .complete(
+            TerminalCommandState::Succeeded,
+            json!({"id": "todo-1"}),
+            Duration::from_millis(50),
+        )
+        .unwrap();
+    repository
+        .commit_causal_batch(CausalCommitBatch::new(
+            crate::CommitBatch::empty(),
+            completion,
+        ))
+        .await
+        .unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while repository.command_ledger_state(&key) != Some(CommandLedgerState::Expired) {
+        assert!(
+            Instant::now() < deadline,
+            "the worker never compacted the row"
+        );
+        tokio::time::sleep(crate::microsvc::workers::LEDGER_COMPACTION_INTERVAL).await;
+    }
+    drop(service);
+}
+
+#[cfg(feature = "runtime-tokio")]
+#[tokio::test]
+async fn dropping_the_ledger_compaction_worker_stops_it() {
+    let ledger: LedgerCompaction = Arc::new(|_| Box::pin(async { Ok(0) }));
+    let worker = crate::microsvc::workers::LedgerCompactionWorker::spawn(vec![ledger.clone()]);
+    drop(worker);
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while Arc::strong_count(&ledger) > 1 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the aborted worker releases its ledgers");
+}
+
+/// One closed gate, every way in: the service refuses the write, and each
+/// transport answers the way it did when it checked the gate itself.
+#[cfg(all(feature = "graphql", feature = "sqlite"))]
+#[tokio::test]
+async fn a_closed_lifecycle_gate_refuses_writes_on_every_transport() {
+    let gated_service =
+        |repository: &crate::SqliteRepository| {
+            Service::new()
+                .named("lifecycle-gate")
+                .with_http_command_routes()
+                .routes(
+                    Routes::new()
+                        .with_repo(repository.clone().aggregate::<CausalDispatcherAggregate>())
+                        .typed_command(typed_command::<CausalTestInput, Succeeded<TypedOutput>>(
+                            "gate.write",
+                        ))
+                        .handle(
+                            |_context: &CausalCommandContext<'_, CausalDispatcherAggregate>,
+                             input: CausalTestInput| async move {
+                                Ok(PreparedCommand::<Succeeded<TypedOutput>>::prepare(
+                                    TypedOutput { id: input.id },
+                                )
+                                .unwrap())
+                            },
+                        ),
+                )
+        };
+    let engine_for = |repository: &crate::SqliteRepository, service: &Service| {
+        crate::graphql::GraphqlEngine::builder(repository)
+            .identity(crate::graphql::IdentityConfig::dev_headers())
+            .protocol_token_key(TEST_PROTOCOL_TOKEN_KEY)
+            .service(service)
+            .build()
+            .expect("the gated service's commands should compile")
+    };
+    let repository = crate::SqliteRepository::connect_and_migrate("sqlite::memory:")
+        .await
+        .expect("framework migrations should apply");
+
+    let service =
+        gated_service(&repository).with_lifecycle(crate::microsvc::LifecycleGate::closed());
+    let engine = engine_for(&repository, &service);
+    let service = Arc::new(service.try_with_graphql(engine).unwrap());
+    let mut session = Session::new();
+    session.set(crate::microsvc::USER_ID_KEY, "alice");
+    let mutation = format!(
+        "mutation {{ gate_write(commandId: \"{}\", input: {{ id: \"todo-1\", label: \"x\" }}) {{ id }} }}",
+        causal_test_command_id()
+    );
+
+    // The service itself.
+    let refused = service
+        .dispatch_causal(
+            "gate.write",
+            &causal_test_command_id(),
+            causal_test_input("todo-1", "x"),
+            session.clone(),
+            causal_test_principal(),
+        )
+        .await;
+    assert!(matches!(
+        refused,
+        Err(CausalDispatchError::Handler(
+            HandlerError::ApplicationReloading
+        ))
+    ));
+
+    // The engine, as a WebSocket or an embedding caller reaches it.
+    let engine = service.graphql_engine().unwrap();
+    let response = engine
+        .execute(&session, async_graphql::Request::new(mutation.clone()))
+        .await;
+    assert_eq!(response.errors.len(), 1);
+    assert_eq!(
+        response.errors[0].message,
+        "application generation is reloading; mutation dispatch is unavailable"
+    );
+    assert!(response.errors[0].extensions.is_none());
+    let read = engine
+        .execute(&session, async_graphql::Request::new("{ __typename }"))
+        .await;
+    assert!(read.errors.is_empty(), "reads stay open: {read:?}");
+
+    // HTTP.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let app = crate::microsvc::router(Arc::clone(&service));
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let client = reqwest::Client::new();
+    let post = |path: &str, body: Value| {
+        let request = client
+            .post(format!("{base}/{path}"))
+            .header(crate::microsvc::USER_ID_KEY, "alice")
+            .json(&body);
+        async move {
+            let response = request.send().await.unwrap();
+            (
+                response.status().as_u16(),
+                response.json::<Value>().await.unwrap(),
+            )
+        }
+    };
+
+    assert_eq!(
+        post("graphql", json!({ "query": mutation })).await,
+        (
+            503,
+            json!({"errors": [{
+                "message": "application generation is reloading",
+                "extensions": { "code": "APPLICATION_RELOADING" }
+            }]})
+        )
+    );
+    assert_eq!(
+        post("graphql", json!({ "query": "{ __typename }" }))
+            .await
+            .0,
+        200
+    );
+    let reloading = json!({
+        "code": "APPLICATION_RELOADING",
+        "error": "application generation is not active"
+    });
+    // A body that is not a command envelope is refused as one, gate or not.
+    let (status, body) = post("gate.write", json!({ "id": "todo-1", "label": "x" })).await;
+    assert_eq!((status, &body["code"]), (400, &json!("BAD_REQUEST")));
+    assert_eq!(
+        post(
+            "gate.write",
+            json!({
+                "commandId": causal_test_command_id(),
+                "input": { "id": "todo-1", "label": "x" }
+            })
+        )
+        .await,
+        (503, reloading)
+    );
+
+    // An engine built before the service was given its gate has the wrong one.
+    let ungated = gated_service(&repository);
+    let engine = engine_for(&repository, &ungated);
+    let mismatch = ungated
+        .with_lifecycle(crate::microsvc::LifecycleGate::closed())
+        .try_with_graphql(engine)
+        .err()
+        .expect("the engine does not share the service's gate");
+    assert_eq!(
+        mismatch,
+        crate::microsvc::GraphqlServiceBindError::LifecycleMismatch
+    );
+}
+
+#[derive(Debug, Deserialize, crate::command::CommandInput)]
+struct StampedInput {
+    id: String,
+    at: String,
+}
+
+#[derive(Serialize, crate::command::CommandOutput)]
+struct StampedOutput {
+    id: String,
+    at: String,
+}
+
+#[tokio::test]
+async fn now_input_default_is_the_host_clock_never_the_callers_value() {
+    use std::time::{Duration, UNIX_EPOCH};
+
+    let clock =
+        crate::clock::ManualClock::new(UNIX_EPOCH + Duration::from_millis(1_700_000_000_123));
+    let repository = InMemoryRepository::new().with_clock(clock.clone());
+    let routes = Routes::for_stores(repository.clone(), repository)
+        .typed_command(
+            typed_command::<StampedInput, Succeeded<StampedOutput>>("stamp.now").input_defaults(
+                crate::command::__command_input_defaults(vec![
+                    crate::command::__input_default_now::<
+                        StampedInput,
+                        __DistributedStampedInputEffectInputField_at,
+                    >(),
+                ]),
+            ),
+        )
+        .handle(
+            |_context: &CausalCommandContext<'_, ()>, input: StampedInput| async move {
+                Ok(PreparedCommand::prepare(StampedOutput {
+                    id: input.id,
+                    at: input.at,
+                })
+                .unwrap())
+            },
+        );
+    let service = command_service(routes);
+    let command_id = causal_test_command_id();
+    let dispatch = |at: &'static str| {
+        service.dispatch_causal(
+            "stamp.now",
+            &command_id,
+            json!({ "id": "a", "at": at }),
+            Session::new(),
+            causal_test_principal(),
+        )
+    };
+
+    let first = dispatch("1").await.unwrap();
+    assert_eq!(first, json!({ "id": "a", "at": "1700000000123" }));
+
+    // A retry of the same command carries the same preview value: it replays
+    // the stored outcome even though the clock moved, never a new stamp or a
+    // command-id conflict.
+    clock.advance(Duration::from_secs(60));
+    assert_eq!(dispatch("1").await.unwrap(), first);
+    // A different submitted input under the same id is still a conflict.
+    assert!(matches!(
+        dispatch("2").await,
+        Err(CausalDispatchError::CommandIdReuse)
+    ));
 }

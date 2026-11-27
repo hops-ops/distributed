@@ -18,7 +18,10 @@ identity:
   humansNamespace: default
   mrNamespace: ""
   demoUsers: true
-  instanceLoginV2: true
+  # Instance Features are global on one AuthStack. Leave this false so each
+  # worktree keeps its own app-level Login V2 baseUri. One primary lane may
+  # set it true; a second true clobbers the first.
+  instanceLoginV2: false
   seedLocalOidcSecret: false
   localOidcSeed: {}
   seedLocalHumanPasswords: true

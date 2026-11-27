@@ -5,7 +5,9 @@
 //!
 //! ## RPCs
 //!
-//! - `Dispatch` — dispatch a command. Input = `GrpcRequest`, output = `GrpcResponse`.
+//! - `Dispatch` — dispatch a typed command. Input = `GrpcRequest` whose `input`
+//!   is the JSON `{ "commandId", "input" }`, output = `GrpcResponse`. An input
+//!   without a `commandId` is a 400.
 //! - `Health` — health check returning available commands.
 //!
 //! ## Example
@@ -15,19 +17,19 @@
 //! use distributed::{microsvc, InMemoryRepository};
 //!
 //! let service = Arc::new(
-//!     microsvc::Service::new().routes(
+//!     microsvc::Service::new().named("counters").routes(
 //!         microsvc::Routes::new()
 //!             .with_repo(InMemoryRepository::new().queued().aggregate::<Counter>())
-//!             .command("counter.create")
-//!             .handle(|ctx| { /* ... */ })
+//!             .typed_command(counter_create::command())
+//!             .handle(counter_create::handle)
 //!     )
 //! );
 //!
 //! // Get the server to compose with other tonic routes
-//! let grpc_svc = microsvc::grpc_server(service.clone());
+//! let grpc_svc = microsvc::grpc::grpc_server(service.clone());
 //!
 //! // Or serve directly
-//! microsvc::serve_grpc(service, "[::1]:50051").await?;
+//! microsvc::grpc::serve_grpc(service, "[::1]:50051").await?;
 //! ```
 
 use std::collections::HashMap;
@@ -84,8 +86,7 @@ include!(concat!(
     "/sourced.microsvc.CommandService.rs"
 ));
 
-pub use command_service_client::CommandServiceClient;
-pub use command_service_server::{CommandService, CommandServiceServer};
+use command_service_server::{CommandService, CommandServiceServer};
 
 /// Error returned when serving the gRPC transport fails.
 #[derive(Debug)]
@@ -169,8 +170,7 @@ impl CommandService for GrpcHandler {
         // [`build_session`] and the `Session` trust-boundary docs.
         let session = build_session(&metadata, req.session_variables);
 
-        #[cfg(feature = "graphql")]
-        let wait_path = match super::wait_path::parse_wait_path_body(&input) {
+        let (command_id, input) = match super::wait_path::parse_wait_path_body(&input) {
             Ok(wait_path) => wait_path,
             Err(error) => {
                 return Ok(Response::new(GrpcResponse {
@@ -179,50 +179,29 @@ impl CommandService for GrpcHandler {
                 }));
             }
         };
-        #[cfg(feature = "graphql")]
-        if let Some((command_id, wait_input)) = wait_path {
-            return match super::wait_path::dispatch_wait_path(
-                self.service.as_ref(),
-                &req.command,
-                &command_id,
-                wait_input,
-                session,
-            )
-            .await
-            {
-                Ok(result) => Ok(Response::new(GrpcResponse {
-                    status: 200,
-                    body: super::wait_path::wait_path_response(&result).to_string(),
-                })),
-                Err(e) => {
-                    let status = e.status_code();
-                    if status >= 500 {
-                        eprintln!("microsvc command `{}` failed: {e}", req.command);
-                    }
-                    Ok(Response::new(GrpcResponse {
-                        status: status as u32,
-                        body: json!({ "error": e.client_message() }).to_string(),
-                    }))
-                }
-            };
-        }
-
-        match self.service.dispatch(&req.command, input, session).await {
-            Ok(value) => Ok(Response::new(GrpcResponse {
+        match super::wait_path::dispatch_wait_path(
+            self.service.as_ref(),
+            &req.command,
+            &command_id,
+            input,
+            session,
+        )
+        .await
+        {
+            Ok(result) => Ok(Response::new(GrpcResponse {
                 status: 200,
-                body: value.to_string(),
+                body: super::wait_path::wait_path_response(&result).to_string(),
             })),
             Err(e) => {
-                // Mirror the HTTP transport: never leak internal error detail
-                // (SQL/driver text) to clients. Server-internal failures are
-                // masked; client-fault errors keep their descriptive message.
+                // Mirror the HTTP transport: the error body never carries
+                // internal error detail (SQL/driver text).
                 let status = e.status_code();
                 if status >= 500 {
-                    eprintln!("microsvc command `{}` failed: {e}", req.command);
+                    tracing::error!(command = %req.command, error = %e, "microsvc command failed");
                 }
                 Ok(Response::new(GrpcResponse {
                     status: status as u32,
-                    body: json!({ "error": e.client_facing_message() }).to_string(),
+                    body: super::wait_path::wait_path_error_response(&e).to_string(),
                 }))
             }
         }

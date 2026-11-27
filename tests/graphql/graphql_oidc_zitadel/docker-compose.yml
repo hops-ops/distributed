@@ -1,0 +1,53 @@
+# Minimal Zitadel stack for GraphQL OIDC e2e (CI + local).
+# No login UI / Caddy — machine-user JWT-bearer mint only.
+#
+# Prefer the helper (handles machinekey perms + wait + bootstrap):
+#   ./scripts/oidc-zitadel-up.sh
+#   set -a && source graphql-oidc.env && set +a
+#   cargo test --test graphql --features graphql,sqlite,metrics graphql_oidc_zitadel::
+#
+# Or manually:
+#   mkdir -p tests/graphql/graphql_oidc_zitadel/machinekey && chmod 777 tests/graphql/graphql_oidc_zitadel/machinekey
+#   docker compose -f tests/graphql/graphql_oidc_zitadel/docker-compose.yml up -d --wait
+#   ./scripts/ci-bootstrap-graphql-oidc.sh
+services:
+  zitadel-db:
+    image: docker.io/library/postgres:16-alpine
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: zitadel
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 15
+      start_period: 10s
+    networks: [zitadel]
+
+  zitadel:
+    image: ghcr.io/zitadel/zitadel:v4.6.1
+    user: "0:0"
+    command: >-
+      start-from-init
+      --masterkey "MasterkeyNeedsToHave32Characters"
+      --tlsMode disabled
+      --config /init/zitadel.yaml
+      --steps /init/steps.yaml
+    depends_on:
+      zitadel-db:
+        condition: service_healthy
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./init:/init:ro
+      # Bind mount must be world-writable on host (chmod 777) so FirstInstance
+      # can write zitadel-admin-sa.json. CI/local helper scripts enforce this.
+      # Service also runs as root (user 0:0) for GHA bind-mount reliability.
+      - ./machinekey:/machinekey
+    # No in-container healthcheck: image may lack curl/bash. Host-side wait on
+    # http://localhost:8080/debug/ready is in scripts/oidc-zitadel-up.sh.
+    networks: [zitadel]
+
+networks:
+  zitadel:

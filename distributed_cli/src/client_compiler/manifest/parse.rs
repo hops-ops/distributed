@@ -1,79 +1,59 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use serde::{Deserialize, Serialize};
-use serde_json::Value as JsonValue;
-
 use super::*;
 
-// The compiler treats one manifest version as an exact executable contract.
-// Same-version extensions must bump the pre-release version instead of being
-// silently ignored by an older client compiler.
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ManifestWire {
-    manifest_version: u64,
-    protocol_version: u64,
-    service_id: String,
-    surface: ManifestSurface,
-    schema_fingerprint: String,
-    protocol_fingerprint: String,
-    execution: ManifestExecutionLimits,
-    capabilities: ManifestCapabilities,
-    scalar_codecs: Vec<ManifestScalarCodec>,
-    models: Vec<ManifestModel>,
-    roots: Vec<ManifestRoot>,
-    commands: Vec<ManifestCommand>,
-    protocol_operations: ManifestProtocolOperations,
-    projectors: Vec<ManifestProjector>,
-    projection_programs: Vec<ManifestProjectionProgram>,
-    projection_bindings: Vec<ManifestProjectionBinding>,
-}
-
-#[derive(Serialize)]
-struct ManifestSchemaMaterial<'a> {
-    manifest_version: u64,
-    protocol_version: u64,
-    service_id: &'a str,
-    surface: &'a ManifestSurface,
-    execution: &'a ManifestExecutionLimits,
-    capabilities: &'a ManifestCapabilities,
-    scalar_codecs: &'a [ManifestScalarCodec],
-    models: &'a [ManifestModel],
-    roots: &'a [ManifestRoot],
-    commands: &'a [ManifestCommand],
-    protocol_operations: &'a ManifestProtocolOperations,
-    projectors: &'a [ManifestProjector],
-    projection_programs: &'a [ManifestProjectionProgram],
-    projection_bindings: &'a [ManifestProjectionBinding],
+/// The validated, indexed form of one [`DistributedClientManifest`].
+#[derive(Clone, Debug)]
+pub(crate) struct ClientManifest {
+    pub(crate) service_id: String,
+    pub(crate) surface: ClientSurfaceIdentity,
+    pub(crate) schema_fingerprint: String,
+    pub(crate) protocol_fingerprint: String,
+    pub(crate) execution: ClientExecutionLimits,
+    pub(crate) capabilities: ClientCapabilities,
+    pub(crate) scalar_codecs: BTreeMap<String, String>,
+    pub(crate) models: BTreeMap<String, ClientModel>,
+    pub(crate) roots: BTreeMap<(ClientRootOperation, String), ClientRoot>,
+    pub(crate) commands: Vec<ClientCommand>,
+    /// Exact scope-wide descriptor inventory derived from command-local
+    /// presets plus every client-visible row-policy claim/column codec.
+    pub(crate) trusted_presets: Vec<ClientTrustedPresetDescriptor>,
+    pub(crate) commands_requiring_revalidation: BTreeSet<String>,
+    pub(crate) protocol_operations: ClientProtocolOperations,
+    pub(crate) projectors: Vec<ClientProjector>,
+    pub(crate) projection_programs: Vec<ClientProjectionProgram>,
+    pub(crate) projection_bindings: Vec<ClientProjectionBinding>,
+    pub(crate) leaderboards: Vec<ClientLeaderboard>,
 }
 
 impl ClientManifest {
+    /// Validate one manifest as an exact executable contract: the versions
+    /// and protocol family this compiler was built with, the surface the
+    /// caller selected, and content matching its declared fingerprint.
     pub(crate) fn parse(
-        value: JsonValue,
-        selector: &ClientSurfaceSelector,
+        mut wire: DistributedClientManifest,
+        selector: &ClientSurfaceIdentity,
     ) -> Result<Self, ClientCompileError> {
-        validate_input_default_generators_in_json(&value)?;
-        let mut wire: ManifestWire = serde_json::from_value(value).map_err(|error| {
+        let computed_schema_fingerprint = wire.computed_schema_fingerprint().map_err(|error| {
             ClientCompileError::manifest(
-                "client.manifest.invalid",
-                format!("invalid Distributed client manifest: {error}"),
+                "client.manifest.schema_fingerprint",
+                format!("could not recompute manifest schema fingerprint: {error}"),
             )
         })?;
-        let computed_schema_fingerprint = schema_fingerprint(&wire)?;
-        if wire.manifest_version != MANIFEST_VERSION {
+        if wire.manifest_version != DISTRIBUTED_CLIENT_MANIFEST_VERSION {
             return Err(ClientCompileError::manifest(
                 "client.manifest.version",
                 format!(
-                    "client compiler requires manifest_version {MANIFEST_VERSION}, received {}",
+                    "client compiler requires manifest_version {DISTRIBUTED_CLIENT_MANIFEST_VERSION}, received {}",
                     wire.manifest_version
                 ),
             ));
         }
-        if wire.protocol_version != PROTOCOL_VERSION {
+        if wire.protocol_version != DISTRIBUTED_CLIENT_PROTOCOL_VERSION {
             return Err(ClientCompileError::manifest(
                 "client.manifest.protocol_version",
                 format!(
-                    "client compiler requires protocol_version {PROTOCOL_VERSION}, received {}",
+                    "client compiler requires protocol_version {DISTRIBUTED_CLIENT_PROTOCOL_VERSION}, received {}",
                     wire.protocol_version
                 ),
             ));
@@ -82,11 +62,14 @@ impl ClientManifest {
         validate_hash(&wire.schema_fingerprint, "manifest.schema_fingerprint")?;
         validate_hash(&wire.protocol_fingerprint, "manifest.protocol_fingerprint")?;
         validate_execution_limits(&wire.execution)?;
-        if wire.protocol_fingerprint != PROTOCOL_FINGERPRINT {
+        let protocol_fingerprint = client_protocol_fingerprint().map_err(|error| {
+            ClientCompileError::manifest("client.manifest.protocol_fingerprint", error.to_string())
+        })?;
+        if wire.protocol_fingerprint != protocol_fingerprint {
             return Err(ClientCompileError::manifest(
                 "client.manifest.protocol_fingerprint",
                 format!(
-                    "client compiler protocol contract is `{PROTOCOL_FINGERPRINT}`, received `{}`; regenerate the manifest and use a matching distributed version",
+                    "client compiler protocol contract is `{protocol_fingerprint}`, received `{}`; regenerate the manifest and use a matching distributed version",
                     wire.protocol_fingerprint
                 ),
             ));
@@ -204,8 +187,19 @@ impl ClientManifest {
                 &models,
                 &projectors,
             )?);
-        let trusted_presets = derive_trusted_preset_descriptors(&models, &commands)?;
-        validate_derived_capabilities(&wire.capabilities, &roots, &commands)?;
+        let trusted_presets =
+            trusted_preset_descriptors(models.values(), &commands).map_err(|error| {
+                ClientCompileError::manifest(
+                    "client.manifest.trusted_preset_inventory",
+                    error.to_string(),
+                )
+            })?;
+        let leaderboards = external_leaderboards(&wire.external)?;
+        validate_leaderboards(&leaderboards, &roots, &typenames)?;
+        let live_leaderboards = leaderboards
+            .iter()
+            .any(|leaderboard| leaderboard.roots.iter().any(|root| root.live));
+        validate_derived_capabilities(&wire.capabilities, &roots, &commands, live_leaderboards)?;
         if wire.schema_fingerprint != computed_schema_fingerprint {
             return Err(ClientCompileError::manifest(
                 "client.manifest.schema_fingerprint",
@@ -233,45 +227,11 @@ impl ClientManifest {
             projectors,
             projection_programs,
             projection_bindings,
+            leaderboards,
         })
     }
 
-    pub(crate) fn root(&self, operation: RootOperation, name: &str) -> Option<&ManifestRoot> {
+    pub(crate) fn root(&self, operation: ClientRootOperation, name: &str) -> Option<&ClientRoot> {
         self.roots.get(&(operation, name.to_string()))
     }
-}
-
-fn schema_fingerprint(wire: &ManifestWire) -> Result<String, ClientCompileError> {
-    let material = ManifestSchemaMaterial {
-        manifest_version: wire.manifest_version,
-        protocol_version: wire.protocol_version,
-        service_id: &wire.service_id,
-        surface: &wire.surface,
-        execution: &wire.execution,
-        capabilities: &wire.capabilities,
-        scalar_codecs: &wire.scalar_codecs,
-        models: &wire.models,
-        roots: &wire.roots,
-        commands: &wire.commands,
-        protocol_operations: &wire.protocol_operations,
-        projectors: &wire.projectors,
-        projection_programs: &wire.projection_programs,
-        projection_bindings: &wire.projection_bindings,
-    };
-    serde_json::to_vec(&material)
-        .map(|bytes| hash_bytes(&bytes))
-        .map_err(|error| {
-            ClientCompileError::manifest(
-                "client.manifest.schema_fingerprint",
-                format!("could not recompute manifest schema fingerprint: {error}"),
-            )
-        })
-}
-
-#[cfg(test)]
-pub(crate) fn refresh_schema_fingerprint(value: &mut JsonValue) {
-    let wire: ManifestWire =
-        serde_json::from_value(value.clone()).expect("test manifest must match the v2 wire shape");
-    value["schema_fingerprint"] =
-        JsonValue::String(schema_fingerprint(&wire).expect("test manifest must be serializable"));
 }

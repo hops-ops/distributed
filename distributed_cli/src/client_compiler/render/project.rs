@@ -4,11 +4,11 @@ use serde::Serialize;
 
 use super::super::graphql::CompiledOperation;
 use super::super::islands::{island_plan, GeneratedIslandInventory, ISLAND_PLAN_VERSION};
-use super::super::manifest::{canonical_json_value, ClientManifest, ManifestSurface};
+use super::super::manifest::{canonical_json_value, ClientManifest, ClientSurfaceIdentity};
 use super::super::{
     ClientCompileError, GeneratedClientFile, GeneratedClientProject, GeneratedOperationSummary,
 };
-use super::commands::render_commands;
+use super::commands::{render_commands, render_lazy_commands};
 use super::common::json_string;
 use super::operation::render_operation_module;
 
@@ -40,12 +40,26 @@ pub(crate) fn render_project(
         path: "commands.ts".into(),
         contents: render_commands(manifest)?,
     });
+    if !manifest.commands.is_empty() {
+        files.push(GeneratedClientFile {
+            path: "lazy-commands.ts".into(),
+            contents: render_lazy_commands(manifest)?,
+        });
+    }
     let pures = super::commands::render_pures(manifest)?;
     let has_pures = pures.is_some();
     if let Some(pures) = pures {
         files.push(GeneratedClientFile {
             path: "pures.ts".into(),
             contents: pures,
+        });
+    }
+    let leaderboards = super::leaderboards::render_leaderboards(manifest)?;
+    let has_leaderboards = leaderboards.is_some();
+    if let Some(leaderboards) = leaderboards {
+        files.push(GeneratedClientFile {
+            path: "leaderboards.ts".into(),
+            contents: leaderboards,
         });
     }
     files.push(GeneratedClientFile {
@@ -66,7 +80,7 @@ pub(crate) fn render_project(
     });
     files.push(GeneratedClientFile {
         path: "index.ts".into(),
-        contents: render_index(&operations, has_pures),
+        contents: render_index(&operations, has_pures, has_leaderboards),
     });
     files.push(GeneratedClientFile {
         path: "manifest.json".into(),
@@ -161,7 +175,7 @@ struct CompilerManifest<'a> {
     distributed_manifest_version: u32,
     protocol_version: u32,
     service_id: &'a str,
-    surface: &'a super::super::manifest::ManifestSurface,
+    surface: &'a super::super::manifest::ClientSurfaceIdentity,
     schema_fingerprint: &'a str,
     protocol_fingerprint: &'a str,
     scalar_codecs: &'a BTreeMap<String, String>,
@@ -279,7 +293,11 @@ fn render_islands(
     ))
 }
 
-fn render_index(operations: &[CompiledOperation], has_pures: bool) -> String {
+fn render_index(
+    operations: &[CompiledOperation],
+    has_pures: bool,
+    has_leaderboards: bool,
+) -> String {
     let mut lines = vec![
         "/** GENERATED public entrypoint. */".to_string(),
         "export * from './commands.js';".into(),
@@ -288,6 +306,9 @@ fn render_index(operations: &[CompiledOperation], has_pures: bool) -> String {
     ];
     if has_pures {
         lines.push("export * from './pures.js';".into());
+    }
+    if has_leaderboards {
+        lines.push("export * from './leaderboards.js';".into());
     }
     for operation in operations {
         let module = operation
@@ -308,8 +329,8 @@ fn render_sveltekit(
     // schema fingerprints, and protocol hashes belong to compatibility, not
     // identity.
     let (kind, name) = match &manifest.surface {
-        ManifestSurface::Role { name } => ("role", name),
-        ManifestSurface::Application { name, .. } => ("application", name),
+        ClientSurfaceIdentity::Role { name } => ("role", name),
+        ClientSurfaceIdentity::Application { name, .. } => ("application", name),
     };
     let reload_key = serde_json::to_string(&format!("surface:{kind}:{name}")).map_err(|error| {
         ClientCompileError::manifest(
@@ -345,6 +366,8 @@ fn render_sveltekit(
     ]);
     if !manifest.commands.is_empty() {
         value_exports.insert("createCommands".into());
+        value_exports.insert("createLazyCommands".into());
+        value_exports.insert("provideDistributedLazy".into());
     }
     for command in &manifest.commands {
         value_exports.insert(format!("Command_{}", command.mutation_field));
@@ -405,6 +428,8 @@ fn render_sveltekit(
                 "} from './commands.js';",
                 "",
                 "export type { GeneratedCommands } from './commands.js';",
+                "import { createLazyCommands } from './lazy-commands.js';",
+                "export { createLazyCommands } from './lazy-commands.js';",
             ]
             .join("\n"),
         );
@@ -483,6 +508,18 @@ fn render_sveltekit(
         .map(str::to_string),
     );
     sections.push(bindings.join("\n"));
+    if !manifest.commands.is_empty() {
+        sections.push(format!(r#"/** Opt-in deferred commands; query, SSR and boundary loading stay unchanged. */
+export function provideDistributedLazy(
+  options: Omit<CreateDistributedSvelteKitOptions<GeneratedCommands>, 'createCommands' | 'reload'> & {{ reload?: Omit<DistributedReloadOptions, 'key'> }}
+): DistributedSvelteKitClient<GeneratedCommands> {{
+  return provideDistributedSvelteKitClient(createDistributedSvelteKit<GeneratedCommands>({{
+    ...options,
+    createCommands: createLazyCommands,
+    reload: {{ ...options.reload, key: {reload_key} }}
+  }}));
+}}"#));
+    }
 
     Ok(format!("{}\n", sections.join("\n\n")))
 }

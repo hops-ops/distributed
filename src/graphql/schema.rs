@@ -9,9 +9,9 @@ use async_graphql::dynamic::{
 };
 use async_graphql::Value;
 
-use super::compile::{self, QueryPlan, RootKind};
+use super::compile::{self, CompileError, QueryPlan, RootKind};
 use super::engine::{EngineInner, ExecutionAuthority};
-use super::identity::VerifiedPrincipal;
+use super::execute::{execute_plan, ProtocolRead};
 use super::naming::{
     bool_exp_name, causal_protocol_type_names, comparison_exp_name, order_by_name,
     COMMAND_STATUS_ROOT_FIELD, CUSTOM_SCALARS, DISTRIBUTED_COMMAND_STATE_TYPE,
@@ -22,12 +22,13 @@ use super::surface::{
     RootKind as SurfaceRootKind, Surface, SurfaceArgument, SurfaceCommandShape, SurfaceModel,
     SurfaceTypeDef, SurfaceTypeField,
 };
+use crate::command_dispatch::VerifiedPrincipal;
 use crate::microsvc::Session;
 
 pub fn build_role_schema(
     role_surface: &Surface,
     max_depth: usize,
-    max_complexity: usize,
+    max_fields: usize,
     disable_introspection: bool,
 ) -> Result<Schema, String> {
     let has_causal_commands = !role_surface.commands.is_empty();
@@ -143,6 +144,14 @@ pub fn build_role_schema(
         }
     }
 
+    // External roots granted to this role (run by their executors).
+    let (with_external, external_roots) =
+        super::external_roots::add_query_roots(query, role_surface);
+    query = with_external;
+    for object in super::external_roots::objects(role_surface) {
+        registered_objects.insert(object.type_name().to_string(), object);
+    }
+
     // Comparison input types come from this exact role Surface instance.
     // Only register when IR lists ops — never emit empty input objects.
     for scalar in &scalars_needed {
@@ -178,7 +187,7 @@ pub fn build_role_schema(
 
     // Empty-role Query must still define ≥1 field (async-graphql requirement).
     // Spec: empty role → FORBIDDEN with extensions.code (no query surface).
-    if role_surface.query_fields.is_empty() && !has_causal_commands {
+    if role_surface.query_fields.is_empty() && external_roots == 0 && !has_causal_commands {
         query = query.field(Field::new(
             "_empty",
             TypeRef::named_nn(TypeRef::BOOLEAN),
@@ -270,22 +279,30 @@ pub fn build_role_schema(
                         .unwrap_or_else(Session::new);
                     let authority = ctx.data_opt::<ExecutionAuthority>().cloned();
                     let protocol = ctx.data_opt::<ProtocolResponseAccumulator>().cloned();
+                    #[cfg(feature = "gateway")]
+                    let recorder = ctx.data_opt::<super::delivery::PlanRecorder>().cloned();
                     let selection = compile::selection_from_field(ctx.field());
                     SubscriptionFieldFuture::new(async move {
                         let inner = inner.ok_or_else(|| {
                             async_graphql::Error::new("GraphqlEngine not in request data")
                         })?;
-                        let role = privilege_role_for_request(
-                            authority.as_ref(),
+                        let role = execution_privilege(authority.as_ref())?;
+                        let plan = compile::compile_query(
+                            &inner,
                             &session,
-                            &inner.anonymous_role,
-                        );
-                        let stream = super::subscribe::live_query_stream(
-                            inner, session, role, model, selection, protocol,
+                            &role,
+                            &model,
+                            compile::RootKind::List,
+                            &selection,
                         )
-                        .await
-                        .map_err(async_graphql::Error::new)?;
-                        Ok(stream)
+                        .map_err(|error| compile_client_error(&error))?;
+                        #[cfg(feature = "gateway")]
+                        if let Some(recorder) = recorder {
+                            return Err::<super::subscribe::LiveQueryStream, _>(
+                                recorder.record(plan),
+                            );
+                        }
+                        super::subscribe::live_query_stream(&inner, role, plan, protocol)
                     })
                 },
             ),
@@ -293,6 +310,13 @@ pub fn build_role_schema(
         );
         subscription = subscription.field(field);
         has_subscription = true;
+    }
+
+    if role_surface.subscriptions {
+        let (with_external, added) =
+            super::external_roots::add_subscription_roots(subscription, role_surface);
+        subscription = with_external;
+        has_subscription |= added > 0;
     }
 
     let mut builder = if let Some(m) = mutation {
@@ -334,7 +358,9 @@ pub fn build_role_schema(
 
     let mut builder = builder
         .limit_depth(max_depth)
-        .limit_complexity(max_complexity);
+        // Every field costs 1 by default, so async-graphql's "complexity" is
+        // the document's field count.
+        .limit_complexity(max_fields);
     if disable_introspection {
         builder = builder.disable_introspection();
     }
@@ -666,14 +692,6 @@ fn passthrough_key(
     let Some(value) = ctx.parent_value.as_value() else {
         return Ok(None);
     };
-    // Nested JSON may arrive as a string (SQLite json_group_array quirk).
-    if let Value::String(s) = value {
-        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(s) {
-            if let Ok(v) = Value::from_json(parsed) {
-                return Ok(lookup_key(&v, key));
-            }
-        }
-    }
     Ok(lookup_key(value, key))
 }
 
@@ -725,14 +743,10 @@ async fn execute_cell_by_key(
 
 fn lookup_key(value: &Value, key: &str) -> Option<Value> {
     match value {
-        Value::Object(map) => {
-            for (k, v) in map {
-                if k.as_str() == key {
-                    return (!matches!(v, Value::Null)).then(|| v.clone());
-                }
-            }
-            None
-        }
+        Value::Object(map) => map
+            .get(key)
+            .filter(|value| !matches!(value, Value::Null))
+            .cloned(),
         _ => None,
     }
 }
@@ -751,11 +765,15 @@ async fn resolve_root(
         .cloned()
         .unwrap_or_else(Session::new);
     let authority = ctx.data_opt::<ExecutionAuthority>();
-    let role = privilege_role_for_request(authority, &session, &inner.anonymous_role);
+    let role = execution_privilege(authority)?;
 
     let selection = compile::selection_from_field(ctx.field());
     let plan = compile::compile_query(&inner, &session, &role, model, kind, &selection)
-        .map_err(|e| client_error("BAD_REQUEST", sanitize_compile_error(&e)))?;
+        .map_err(|e| compile_client_error(&e))?;
+    #[cfg(feature = "gateway")]
+    if let Some(recorder) = ctx.data_opt::<super::delivery::PlanRecorder>() {
+        return Err(recorder.record(plan));
+    }
     let value = match plan {
         QueryPlan::CellByKey {
             model,
@@ -765,28 +783,31 @@ async fn resolve_root(
             .await
             .map_err(|_| client_error("INTERNAL", "cell read dependency failed"))?,
         QueryPlan::Sql(plan) => {
-            if let Some(protocol) = ctx.data_opt::<ProtocolResponseAccumulator>().cloned() {
-                let role_surface = inner.role_surfaces.get(&role).cloned().ok_or_else(|| {
-                    client_error("INTERNAL", "authorized GraphQL role surface is unavailable")
-                })?;
-                let executed = super::query_protocol::execute_query_with_protocol(
-                    &inner,
-                    role_surface,
-                    protocol.clone(),
-                    &plan,
-                    None,
-                )
+            let (pool, primary) = (&inner.pool, true);
+            #[cfg(feature = "gateway")]
+            let (pool, primary) = ctx
+                .data_opt::<super::engine::read_routing::ReadRequest>()
+                .map_or((pool, primary), |read| read.pool(&inner, &plan));
+            let protocol = ctx.data_opt::<ProtocolResponseAccumulator>();
+            let read = match protocol {
+                None => None,
+                Some(accumulator) => Some(ProtocolRead {
+                    role_surface: inner.role_surfaces.get(&role).cloned().ok_or_else(|| {
+                        client_error("INTERNAL", "authorized GraphQL role surface is unavailable")
+                    })?,
+                    accumulator: accumulator.clone(),
+                    live_resume: None,
+                }),
+            };
+            let executed = execute_plan(&inner, pool, primary, &plan, read)
                 .await
-                .map_err(|e| client_error_for_execute_err(&e))?;
-                protocol
-                    .record_query_metadata(executed.snapshot, None)
+                .map_err(|error| error.client_error())?;
+            if let (Some(accumulator), Some(evidence)) = (protocol, executed.protocol) {
+                accumulator
+                    .record_query_metadata(evidence.snapshot, None)
                     .map_err(|_| client_error("INTERNAL", "query evidence encoding failed"))?;
-                executed.value
-            } else {
-                super::engine::execute_plan(&inner, &plan)
-                    .await
-                    .map_err(|e| client_error_for_execute_err(&e))?
             }
+            executed.value
         }
     };
     // `None` (not `Some(Null)`) so nullable by_pk roots do not try to resolve
@@ -798,21 +819,16 @@ async fn resolve_root(
     }
 }
 
-/// Privilege pack for SQL grants: surface execution authority, else anonymous.
-fn privilege_role_for_request(
+/// The privilege pack the engine authorized this request to execute under.
+///
+/// `GraphqlEngine` injects it on every entry point. A request without one was
+/// never authorized, so it does not run under a guessed role.
+pub(crate) fn execution_privilege(
     authority: Option<&ExecutionAuthority>,
-    session: &Session,
-    anonymous_role: &str,
-) -> String {
-    if let Some(authority) = authority {
-        return authority.privilege_role.clone();
-    }
-    // Fallback for schema unit tests that execute without engine request data.
-    session
-        .roles()
-        .first()
-        .map(|role| (*role).to_string())
-        .unwrap_or_else(|| anonymous_role.to_string())
+) -> Result<String, async_graphql::Error> {
+    authority
+        .map(|authority| authority.privilege_role.clone())
+        .ok_or_else(|| client_error("INTERNAL", "request has no execution authority"))
 }
 
 /// Closed set of engine-authored GraphQL `extensions.code` values (v1 freeze).
@@ -829,48 +845,16 @@ pub const ENGINE_ERROR_CODES: &[&str] = &[
     "COMMAND_ID_REUSE",
     "COMMAND_IN_PROGRESS",
     "COMMAND_EXPIRED",
+    "CONCURRENT_WRITE", // command mutations; nothing committed, retry
 ];
 
-/// Map executor error strings to stable client errors (`extensions.code`).
-pub(crate) fn client_error_for_execute_err(e: &str) -> async_graphql::Error {
-    if e.contains("timeout") {
-        client_error("TIMEOUT", "statement timeout")
-    } else {
-        client_error("INTERNAL", "internal error")
-    }
+/// A compile failure as the client sees it: a fixed code and message per
+/// [`CompileError`] variant, never the detail (which may name SQL or limits).
+pub(crate) fn compile_client_error(error: &CompileError) -> async_graphql::Error {
+    client_error(error.client_code(), error.client_message())
 }
 
-fn sanitize_compile_error(e: &str) -> String {
-    // Stable short messages; never return raw SQL.
-    if e.contains("max depth") {
-        "max depth exceeded".into()
-    } else if e.contains("too complex") || e.contains("query too complex") {
-        "query too complex".into()
-    } else if e.contains("max_in_list")
-        || e.contains("_in list")
-        || e.contains("max_bool_width")
-        || e.contains("_and list")
-        || e.contains("_or list")
-    {
-        "list too long".into()
-    } else if e.contains("invalid GraphQL response key") {
-        "invalid response key".into()
-    } else if e.contains("unknown comparison")
-        || e.contains("unknown where field")
-        || e.contains("ungranted where")
-        || e.contains("unknown order_by")
-        || e.contains("ungranted order_by")
-        || e.contains("ambiguous order_by")
-    {
-        "invalid filter".into()
-    } else if e.contains("cell-by-key") {
-        "unsupported on cell store".into()
-    } else {
-        "bad request".into()
-    }
-}
-
-fn client_error(code: &str, message: impl Into<String>) -> async_graphql::Error {
+pub(crate) fn client_error(code: &str, message: impl Into<String>) -> async_graphql::Error {
     use async_graphql::ErrorExtensions;
     let code = code.to_string();
     async_graphql::Error::new(message.into()).extend_with(move |_, ext| {
@@ -879,7 +863,7 @@ fn client_error(code: &str, message: impl Into<String>) -> async_graphql::Error 
 }
 
 /// Command-mutation errors also carry numeric HTTP `extensions.status`.
-fn client_error_with_status(
+pub(crate) fn client_error_with_status(
     code: &str,
     status: u16,
     message: impl Into<String>,
@@ -894,7 +878,15 @@ fn client_error_with_status(
 
 #[cfg(test)]
 mod execute_err_mapping_tests {
-    use super::{client_error_for_execute_err, sanitize_compile_error, ENGINE_ERROR_CODES};
+    use super::{compile_client_error, CompileError, ENGINE_ERROR_CODES};
+    use crate::graphql::execute::ExecuteError;
+
+    fn code(err: &async_graphql::Error) -> String {
+        match err.extensions.as_ref().and_then(|ext| ext.get("code")) {
+            Some(async_graphql::Value::String(code)) => code.clone(),
+            other => panic!("expected a string code, got {other:?}"),
+        }
+    }
 
     #[test]
     fn engine_error_codes_closed_set_v1() {
@@ -912,90 +904,75 @@ mod execute_err_mapping_tests {
                 "COMMAND_ID_REUSE",
                 "COMMAND_IN_PROGRESS",
                 "COMMAND_EXPIRED",
+                "CONCURRENT_WRITE",
             ]
         );
     }
 
     #[test]
     fn statement_timeout_maps_to_timeout_code() {
-        let err = client_error_for_execute_err("statement timeout");
+        let err = ExecuteError::Timeout.client_error();
         assert_eq!(err.message, "statement timeout");
-        let code = err
-            .extensions
-            .as_ref()
-            .and_then(|ext| ext.get("code"))
-            .map(|v| format!("{v:?}"));
-        assert!(
-            code.as_deref()
-                .map(|c| c.contains("TIMEOUT"))
-                .unwrap_or(false),
-            "expected TIMEOUT extension, got {code:?}"
-        );
+        assert_eq!(code(&err), "TIMEOUT");
     }
 
     #[test]
-    fn other_errors_map_to_internal() {
-        let err = client_error_for_execute_err("sqlite execute: boom");
+    fn other_execute_errors_map_to_internal_without_detail() {
+        // The word "timeout" in a detail no longer decides the code.
+        let err = ExecuteError::Failed("pool timeout: secret dsn".into()).client_error();
         assert_eq!(err.message, "internal error");
-        let code = err
-            .extensions
-            .as_ref()
-            .and_then(|ext| ext.get("code"))
-            .map(|v| format!("{v:?}"));
-        assert!(
-            code.as_deref()
-                .map(|c| c.contains("INTERNAL"))
-                .unwrap_or(false),
-            "expected INTERNAL extension, got {code:?}"
-        );
+        assert_eq!(code(&err), "INTERNAL");
     }
 
     #[test]
-    fn sanitize_compile_error_table() {
-        assert_eq!(
-            sanitize_compile_error("max depth exceeded"),
-            "max depth exceeded"
-        );
-        assert_eq!(
-            sanitize_compile_error("_and list length 999 exceeds max_bool_width 256"),
-            "list too long"
-        );
-        assert_eq!(
-            sanitize_compile_error("_in list length 500 exceeds max_in_list 100"),
-            "list too long"
-        );
-        assert_eq!(
-            sanitize_compile_error("invalid GraphQL response key `x y`"),
-            "invalid response key"
-        );
-        assert_eq!(
-            sanitize_compile_error("unknown comparison op `_wat`"),
-            "invalid filter"
-        );
-        assert_eq!(
-            sanitize_compile_error("unknown where field `nope`"),
-            "invalid filter"
-        );
-        assert_eq!(
-            sanitize_compile_error("ungranted order_by column `secret`"),
-            "invalid filter"
-        );
-        assert_eq!(
-            sanitize_compile_error(
-                "ambiguous order_by entry: use one field per list entry to declare priority"
+    fn compile_errors_map_by_variant_never_by_detail() {
+        let cases = [
+            (CompileError::TooDeep, "BAD_REQUEST", "max depth exceeded"),
+            (
+                CompileError::TooManyRows {
+                    rows: 1_001_000,
+                    max_rows: 20_000,
+                },
+                "BAD_REQUEST",
+                "row budget exceeded",
             ),
-            "invalid filter"
-        );
-        assert_eq!(
-            sanitize_compile_error("SELECT * FROM secret"),
-            "bad request"
-        );
-        assert_eq!(
-            sanitize_compile_error(
-                "cell-by-key store does not support list queries (would fan out to N cells); declare a SQL index read model"
+            (
+                CompileError::ListTooLong("_in list length 500 exceeds max_in_list 100".into()),
+                "BAD_REQUEST",
+                "list too long",
             ),
-            "unsupported on cell store"
-        );
+            (
+                CompileError::InvalidResponseKey("x y".into()),
+                "BAD_REQUEST",
+                "invalid response key",
+            ),
+            (
+                CompileError::InvalidFilter("unknown where field `nope`".into()),
+                "BAD_REQUEST",
+                "invalid filter",
+            ),
+            (
+                CompileError::UnsupportedOnCellStore("list on cell store".into()),
+                "BAD_REQUEST",
+                "unsupported on cell store",
+            ),
+            (
+                // A detail that names a limit does not leak or reclassify.
+                CompileError::BadRequest("SELECT * FROM secret max depth".into()),
+                "BAD_REQUEST",
+                "bad request",
+            ),
+            (
+                CompileError::internal("no join key for `secret`"),
+                "INTERNAL",
+                "internal error",
+            ),
+        ];
+        for (error, expected_code, expected_message) in cases {
+            let err = compile_client_error(&error);
+            assert_eq!(code(&err), expected_code, "{error:?}");
+            assert_eq!(err.message, expected_message, "{error:?}");
+        }
     }
 }
 
@@ -1060,7 +1037,9 @@ async fn resolve_command(
             input,
             session,
             principal,
-            Some(protocol.clone()),
+            Some(crate::command_dispatch::ProtocolAuthority::new(
+                protocol.clone(),
+            )),
         )
         .await
         .map_err(|error| {
@@ -1109,6 +1088,14 @@ async fn resolve_command_status(
             "command host not configured (use graphql_router_with_host or graphql_router_with_service)",
         )
     })?;
+    // Status is read from the command ledger, which only an in-process host
+    // holds; a remote writer answers status through its own GraphQL.
+    let ledger = host.ledger().ok_or_else(|| {
+        client_error(
+            "INTERNAL",
+            "command status needs the service that owns the command ledger; this endpoint dispatches to a remote writer",
+        )
+    })?;
     let command_id = ctx
         .args
         .get("commandId")
@@ -1116,8 +1103,11 @@ async fn resolve_command_status(
         .deserialize::<String>()
         .map_err(|_| client_error("BAD_REQUEST", "invalid commandId"))?;
 
-    let status = host
-        .status(&command_id, &session, principal, Some(protocol.clone()))
+    crate::command_dispatch::validate_principal_session_if_present(&session, &principal).map_err(
+        |error| client_error_with_status(error.code(), error.status_code(), error.client_message()),
+    )?;
+    let status = ledger
+        .causal_command_status(&command_id, &session, principal, Some(protocol.clone()))
         .await
         .map_err(|error| {
             client_error_with_status(error.code(), error.status_code(), error.client_message())
@@ -1139,8 +1129,8 @@ mod causal_command_schema_tests {
     use std::sync::Arc;
 
     use super::*;
-    use crate::command_dispatch::{LocalCommandHost, SharedCommandHost};
-    use crate::graphql::command_contract::{CommandConsistency, CommandEffects};
+    use crate::command::CommandConsistency;
+    use crate::command_dispatch::SharedCommandHost;
     use crate::graphql::protocol::{
         DistributedEnvelopeV1, ProtocolResponseAccumulator, ProtocolTokenCodec,
         ProtocolTokenPurpose,
@@ -1173,6 +1163,7 @@ mod causal_command_schema_tests {
                 input: SurfaceCommandShape::Typed(SurfaceTypeDef {
                     name: "CompleteTodoInput".into(),
                     fields: vec![SurfaceTypeField {
+                        unsigned_integer: None,
                         name: "id".into(),
                         type_name: "String".into(),
                         nullable: false,
@@ -1184,6 +1175,7 @@ mod causal_command_schema_tests {
                 output: SurfaceCommandShape::Typed(SurfaceTypeDef {
                     name: "CompleteTodoPayload".into(),
                     fields: vec![SurfaceTypeField {
+                        unsigned_integer: None,
                         name: "id".into(),
                         type_name: "String".into(),
                         nullable: false,
@@ -1194,17 +1186,15 @@ mod causal_command_schema_tests {
                 }),
                 consistency: CommandConsistency::Succeeded,
                 input_defaults: Vec::new(),
-                effects: Some(CommandEffects::revalidate()),
-                confirmations: Vec::new(),
                 projected_model: None,
                 direct_projection: None,
                 projections: Default::default(),
-                confirmation_unavailable: false,
             }],
             commands_attached: true,
             projectors: Vec::new(),
             projectors_attached: false,
             service_binding: None,
+            external: Vec::new(),
         }
     }
 
@@ -1334,9 +1324,7 @@ mod causal_command_schema_tests {
             "{{ {COMMAND_STATUS_ROOT_FIELD}(commandId: \"{}\") {{ s: state }} }}",
             uuid::Uuid::now_v7()
         ))
-        .data(Arc::new(LocalCommandHost::new(Arc::new(
-            Service::new().named("status-test"),
-        ))) as SharedCommandHost)
+        .data(Arc::new(Service::new().named("status-test")) as SharedCommandHost)
         .data(VerifiedPrincipal::test_oidc(
             "https://issuer.example/",
             "status-test-subject",

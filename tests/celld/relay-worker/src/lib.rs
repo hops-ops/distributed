@@ -2,7 +2,7 @@
 //! native Distributed bus provides command routing and event fanout.
 
 use distributed::bus::{CelldQueueEnvelope, CelldQueueHttpPublisher, CelldQueueRelay};
-use distributed::cell_host::CELL_INTERNAL_SECRET_HEADER;
+use distributed::microsvc::cell_host::CELL_INTERNAL_SECRET_HEADER;
 use worker::{event, Context, Env, Error, MessageBatch, MessageExt, Result};
 
 #[event(queue)]

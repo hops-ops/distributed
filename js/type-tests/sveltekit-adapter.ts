@@ -3,7 +3,9 @@ import {
 	createDistributedSvelteKit,
 	createDistributedSvelteKitServer,
 	defineDistributedBoundaryBinding,
-	defineDistributedBoundaryOperation
+	defineDistributedBoundaryOperation,
+	defineGraphqlIslandBindings,
+	searchParam
 } from '@hops-ops/distributed/sveltekit';
 import { distributedSvelteKit } from '@hops-ops/distributed/sveltekit/vite';
 import type {
@@ -20,6 +22,26 @@ type Todo = {
 };
 type TodosResult = { todos: readonly Todo[] };
 type TodoResult = { todo: Todo | null };
+
+defineGraphqlIslandBindings<{ limit?: number; enabled: boolean; ids: readonly string[] }>({
+	limit: searchParam('limit', 'Int'),
+	enabled: searchParam('enabled', 'Boolean'),
+	ids: searchParam('id', 'ID', 'all')
+});
+defineGraphqlIslandBindings<{ limit: number }>({
+	// @ts-expect-error URL text must explicitly decode to the generated number type.
+	limit: searchParam('limit', 'String')
+});
+defineGraphqlIslandBindings<{ ids: readonly string[] }>({
+	// @ts-expect-error A generated list requires all mode.
+	ids: searchParam('id', 'ID')
+});
+defineGraphqlIslandBindings<{ limit: number }>({
+	// @ts-expect-error A scalar variable cannot use all mode.
+	limit: searchParam('limit', 'Int', 'all')
+});
+// @ts-expect-error Untyped search parameters were removed in binding v2.
+searchParam('limit');
 
 declare const replica: DistributedReplica;
 declare const Todos: ReplicaOperationArtifact<
@@ -57,7 +79,12 @@ const client = createDistributedSvelteKit({
 const todos = client.operation(Todos).use({}, { live: true });
 const selected = client.operation(TodoById).use({ id: 'todo-1' });
 selected.data.todo?.status;
-todos.pending.map((receipt) => receipt.status());
+const pendingTodo: boolean = todos.pending.has(todos.data.todos?.[0]);
+const pendingCount: number = todos.pending.size;
+void pendingTodo;
+void pendingCount;
+// @ts-expect-error Pending rows are a membership set, not a receipt list.
+todos.pending.map((receipt) => receipt);
 client.retainLocation(
 	{ id: 'active-page', pathname: '/todos/todo-1', kind: 'page' },
 	{ search: new URLSearchParams(), session: null, props: {} }

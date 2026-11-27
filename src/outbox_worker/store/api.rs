@@ -1,8 +1,14 @@
 use std::future::Future;
 use std::time::{Duration, SystemTime};
 
+use crate::bus::RetryBackoff;
 use crate::outbox::{OutboxMessage, OutboxMessageStatus};
 use crate::repository::RepositoryError;
+
+/// How long a released row waits before its next publish attempt: 250 ms
+/// after the first failure, doubling to one minute.
+pub const OUTBOX_RETRY: RetryBackoff =
+    RetryBackoff::new(Duration::from_millis(250), Duration::from_secs(60));
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OutboxPublishFailureAction {
@@ -131,7 +137,7 @@ pub trait OutboxStore: Send + Sync {
     /// override this with `COUNT`/`MIN(created_at)` or equivalent (both
     /// in-tree stores do).
     ///
-    /// The default pages up to [`BACKLOG_STATS_SCAN_LIMIT`] pending rows —
+    /// The default pages up to `BACKLOG_STATS_SCAN_LIMIT` pending rows —
     /// never the whole outbox, per the bound contract on
     /// [`messages_by_status`]. The count saturates at that limit; the oldest
     /// creation time stays exact because pending listings are in claim
@@ -156,6 +162,8 @@ pub trait OutboxStore: Send + Sync {
         request: ClaimOutboxMessages,
     ) -> impl Future<Output = Result<Vec<OutboxMessage>, RepositoryError>> + Send + 'a;
 
+    /// Delete a delivered row while holding its active claim. The outbox is
+    /// pending delivery work, not a publication-history or replay store.
     fn complete<'a>(
         &'a self,
         claim: &'a OutboxClaimRef,
@@ -183,10 +191,13 @@ pub trait OutboxStore: Send + Sync {
         }
     }
 
+    /// Hand a claimed row back for another attempt. It becomes claimable
+    /// again `retry_after` from now.
     fn release<'a>(
         &'a self,
         claim: &'a OutboxClaimRef,
         error: &'a str,
+        retry_after: Duration,
     ) -> impl Future<Output = Result<(), RepositoryError>> + Send + 'a;
 
     fn fail<'a>(
@@ -195,18 +206,37 @@ pub trait OutboxStore: Send + Sync {
         error: &'a str,
     ) -> impl Future<Output = Result<(), RepositoryError>> + Send + 'a;
 
+    /// Put a failed row back in the queue with a fresh attempt count. This
+    /// is the operator's action once the cause of the failure is repaired.
+    /// `NotFound` when there is no such row, `InvalidState` when it is not
+    /// failed.
+    fn requeue_failed<'a>(
+        &'a self,
+        message_id: &'a str,
+    ) -> impl Future<Output = Result<(), RepositoryError>> + Send + 'a;
+
+    /// Settle a publish that did not succeed.
+    ///
+    /// A `retryable` failure (the broker is down, the outcome is unknown) is
+    /// always released, however many attempts it has had: an outage must not
+    /// turn pending work into failed rows. A permanent failure is released
+    /// until the row has been attempted `max_attempts` times and then failed.
+    /// Every release waits [`OUTBOX_RETRY`]`.delay(attempt)` before the row is
+    /// claimable again.
     fn record_failure<'a>(
         &'a self,
         claim: &'a OutboxClaimRef,
         error: &'a str,
+        retryable: bool,
         max_attempts: u32,
     ) -> impl Future<Output = Result<OutboxPublishFailureAction, RepositoryError>> + Send + 'a {
         async move {
-            if claim.attempt >= max_attempts {
+            if !retryable && claim.attempt >= max_attempts {
                 self.fail(claim, error).await?;
                 Ok(OutboxPublishFailureAction::Failed)
             } else {
-                self.release(claim, error).await?;
+                self.release(claim, error, OUTBOX_RETRY.delay(claim.attempt))
+                    .await?;
                 Ok(OutboxPublishFailureAction::Released)
             }
         }

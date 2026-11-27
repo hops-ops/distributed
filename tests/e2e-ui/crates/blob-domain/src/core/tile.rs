@@ -1,8 +1,17 @@
-//! Canonical tile values (client board + domain parity).
+//! Board tiles. Serialized as snake_case strings (`"player"`, `"hole"`, …), so
+//! the client renders `tile-${cell}` with no tile table of its own.
 
-pub const HOLE: u8 = 0;
-pub const UNVISITED: u8 = 1;
-pub const VISITED: u8 = 2;
-pub const DEAD_BY_SUICIDE: u8 = 3;
-pub const DEAD_BY_HOLE: u8 = 4;
-pub const PLAYER: u8 = 9;
+use serde::{Deserialize, Serialize};
+
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, distributed::table::JsonType,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum Tile {
+    Hole,
+    Unvisited,
+    Visited,
+    DeadBySuicide,
+    DeadByHole,
+    Player,
+}

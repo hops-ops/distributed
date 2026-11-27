@@ -1,0 +1,5 @@
+error[E0080]: evaluation panicked: #[command("hero.equip")]: the input has a field named `actor`, the #[principal] parameter; the principal comes from the verified session only, so it can never be an input field
+  --> tests/compile_fail/aggregate_command_principal_input_field.rs:25:22
+   |
+25 |         #[principal] actor: &str,
+   |                      ^^^^^ evaluation of `_` failed here

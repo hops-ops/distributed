@@ -1,5 +1,6 @@
-use distributed::graphql::{claim, col, read, ModelPermissions};
-use distributed::ReadModel;
+use blob_domain::{Direction, Tile};
+use distributed::graphql::{claim, col, read, AuthorizedReadModel, ModelPermissions};
+use distributed::read_model::ReadModel;
 use serde::{Deserialize, Serialize};
 
 use super::AuthUsers;
@@ -15,16 +16,19 @@ pub struct BlobGames {
     pub player_dead: bool,
     pub current_level: i64,
     pub current_level_completed: bool,
-    pub map_json: String,
+    /// The board: a JSON column typed from [`Tile`] in generated clients.
+    pub map: Vec<Vec<Tile>>,
+    /// Directions the player can take without leaving the board.
+    pub moves: Vec<Direction>,
     /// `active` | `dead` | `level_complete`
     pub status: String,
     #[readmodel(belongs_to = "AuthUsers", foreign_key = "owner_id")]
     pub owner: Option<AuthUsers>,
 }
 
-impl BlobGames {
+impl AuthorizedReadModel for BlobGames {
     /// Read authorization attached to the Blob game query model.
-    pub fn permissions() -> ModelPermissions<Self> {
+    fn permissions() -> ModelPermissions<Self> {
         ModelPermissions::new()
             .grant(
                 "user",

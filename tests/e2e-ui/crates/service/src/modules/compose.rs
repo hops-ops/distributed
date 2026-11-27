@@ -1,63 +1,29 @@
 //! Compose bounded-context modules into one e2e-ui Service.
 
-use blob_domain::BlobGame;
-use chat_domain::ChatMessage;
-use distributed::microsvc::{
-    ConfigurableOutboxPublisher, HasOutboxStore, HasRepo, Service,
-};
-use distributed::{AggregateBuilder, AggregateRepository, QueuedRepository};
-use todo_domain::Todo;
+use distributed::microsvc::{Service, ServiceStores};
 
-use crate::bounds::{EventStore, Locks, ReadStore};
-use crate::modules::{blob, chat, projections, todo};
+use crate::handlers::ingestors::{zitadel, zitadel_scrape};
+use crate::modules::projections::projections;
+use crate::modules::{blob, chat, identity, todo};
+use crate::E2E_UI_APPLICATION;
 
-/// Explicit module inventory for the e2e-ui application.
-pub const MODULE_IDS: &[&str] = &[todo::MODULE_ID, chat::MODULE_ID, blob::MODULE_ID, "identity"];
-
-/// Compose todo + chat (+ identity ingestors) + blob modules into one Service.
+/// Compose todo + chat + blob + identity modules into one Service.
 ///
 /// This is the review-visible application wiring: list modules, do not invent
-/// infrastructure. Dialect runners and workers live in `host`.
-pub fn build_service<R, L, S>(repo: R, locks: L, read_models: S) -> Service
-where
-    R: EventStore,
-    L: Locks,
-    S: ReadStore,
-    QueuedRepository<R, L>: Clone
-        + AggregateBuilder
-        + HasOutboxStore
-        + distributed::TransactionalCommit
-        + Send
-        + Sync
-        + 'static,
-    AggregateRepository<QueuedRepository<R, L>, Todo>:
-        HasRepo + HasOutboxStore + ConfigurableOutboxPublisher + Send + Sync + 'static,
-    AggregateRepository<QueuedRepository<R, L>, ChatMessage>:
-        HasRepo + HasOutboxStore + ConfigurableOutboxPublisher + Send + Sync + 'static,
-    AggregateRepository<QueuedRepository<R, L>, BlobGame>:
-        HasRepo + HasOutboxStore + ConfigurableOutboxPublisher + Send + Sync + 'static,
-{
-    let projections = projections::projection_owners();
-    let todos = todo::routes(
-        repo.clone(),
-        locks.clone(),
-        read_models.clone(),
-        projections.todo,
-    );
-    let chat = chat::routes(
-        repo.clone(),
-        locks.clone(),
-        read_models.clone(),
-        projections.chat,
-    );
-    let blob = blob::routes(repo, locks, read_models, projections.blob);
+/// infrastructure. The application's modules are the command namespaces
+/// (`todo.*`, `chat.*`, `blob.*`, `zitadel.*`); the host lives in `host`.
+pub fn build_service<St: ServiceStores>(stores: &St) -> Service {
+    let projections = projections();
 
     // GraphQL-only public write surface. POST /todo.* stays 404 (suite T0).
-    // Zitadel Action ingress still needs HTTP: those commands are registered in
-    // the chat module and re-mounted in `http::serve`.
+    // Zitadel Action ingress still needs HTTP: its two commands are exposed
+    // through edges that check the shared secret and run as the ingestor.
     Service::new()
-        .named("e2e-ui")
-        .routes(todos)
-        .routes(chat)
-        .routes(blob)
+        .named(E2E_UI_APPLICATION)
+        .routes(todo::routes(stores, &projections))
+        .routes(chat::routes(stores, &projections))
+        .routes(blob::routes(stores))
+        .routes(identity::routes(stores, &projections))
+        .with_http_command(zitadel::COMMAND, zitadel::http_edge)
+        .with_http_command(zitadel_scrape::COMMAND, zitadel_scrape::http_edge)
 }

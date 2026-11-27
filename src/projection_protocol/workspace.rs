@@ -8,15 +8,17 @@
 use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 
+#[cfg(any(feature = "graphql", test))]
+use super::ProjectionExecutionSnapshotBatchRequest;
 use super::{
-    ProjectionCommitBatch, ProjectionEpoch, ProjectionExecutionSnapshotBatchRequest,
-    ProjectionGraphSnapshotRequest, ProjectionModelOwnership, ProjectionMutationKind,
-    ProjectionObservationKind, ProjectionObservationRequest, ProjectionObservationTarget,
-    ProjectionProtocolError, ProjectionQuerySnapshotRequest, ProjectionRecordExpectation,
-    ProjectionRecordMutation, ProjectionRecordScope, ProjectionScopeCodec, RecordRevision,
+    ProjectionCommitBatch, ProjectionModelOwnership, ProjectionObservationKind,
+    ProjectionObservationRequest, ProjectionObservationTarget, ProjectionProtocolError,
+    ProjectionQuerySnapshotRequest, ProjectionRecordExpectation, ProjectionRecordMutation,
+    ProjectionRecordScope, ProjectionScopeCodec, RecordRevision, RecordTransition,
     TrustedProjectionInput,
 };
-use crate::read_model::{RelationalReadModel, RelationalReadModelIncludes};
+use crate::projection::ProjectionProgramId;
+use crate::read_model::RelationalReadModel;
 use crate::table::{
     DeleteTableRowMutation, ExpectedVersion, PatchMode, PatchTableRowMutation, RowKey, RowPatch,
     RowWriteMode, TableMutation, TableRowMutation, TableSchema,
@@ -32,7 +34,7 @@ pub struct ProjectionWorkspace {
     codec: Arc<ProjectionScopeCodec>,
     partition_value: Option<serde_json::Value>,
     input: TrustedProjectionInput,
-    change_epoch: ProjectionEpoch,
+    program_id: Option<ProjectionProgramId>,
     ownership: BTreeMap<String, String>,
     mutations: Vec<ProjectionRecordMutation>,
     observations: Vec<ProjectionObservationRequest>,
@@ -44,7 +46,15 @@ impl ProjectionWorkspace {
         codec: Arc<ProjectionScopeCodec>,
         partition_value: Option<serde_json::Value>,
         input: TrustedProjectionInput,
-        change_epoch: ProjectionEpoch,
+    ) -> Result<Self, ProjectionProtocolError> {
+        Self::new_with_program_id(codec, partition_value, input, None)
+    }
+
+    pub(crate) fn new_with_program_id(
+        codec: Arc<ProjectionScopeCodec>,
+        partition_value: Option<serde_json::Value>,
+        input: TrustedProjectionInput,
+        program_id: Option<ProjectionProgramId>,
     ) -> Result<Self, ProjectionProtocolError> {
         if codec.topology() != input.cursor.topology() {
             return Err(ProjectionProtocolError::ScopeMismatch {
@@ -63,7 +73,7 @@ impl ProjectionWorkspace {
             codec,
             partition_value,
             input,
-            change_epoch,
+            program_id,
             ownership: BTreeMap::new(),
             mutations: Vec::new(),
             observations: Vec::new(),
@@ -92,7 +102,7 @@ impl ProjectionWorkspace {
             scope,
             mutation,
             ProjectionRecordExpectation::Missing,
-            ProjectionMutationKind::Upsert,
+            RecordTransition::Upsert,
         )
     }
 
@@ -124,7 +134,7 @@ impl ProjectionWorkspace {
             scope,
             mutation,
             ProjectionRecordExpectation::Exact(expected.clone()),
-            ProjectionMutationKind::Upsert,
+            RecordTransition::Upsert,
         )
     }
 
@@ -153,7 +163,7 @@ impl ProjectionWorkspace {
             scope,
             mutation,
             ProjectionRecordExpectation::Exact(expected.clone()),
-            ProjectionMutationKind::Upsert,
+            RecordTransition::Upsert,
         )
     }
 
@@ -179,7 +189,7 @@ impl ProjectionWorkspace {
             scope,
             mutation,
             ProjectionRecordExpectation::Exact(expected.clone()),
-            ProjectionMutationKind::Delete,
+            RecordTransition::Delete,
         )
     }
 
@@ -210,7 +220,7 @@ impl ProjectionWorkspace {
             scope,
             mutation,
             ProjectionRecordExpectation::Exact(expected_tombstone.clone()),
-            ProjectionMutationKind::Recreate,
+            RecordTransition::Recreate,
         )
     }
 
@@ -239,13 +249,13 @@ impl ProjectionWorkspace {
         )
     }
 
+    #[cfg(any(feature = "graphql", test))]
     pub(crate) fn execution_snapshot_request(
         &self,
-        mutations: &[TableMutation],
+        records: &[(&'static TableSchema, &RowKey)],
     ) -> Result<ProjectionExecutionSnapshotBatchRequest, ProjectionProtocolError> {
-        let mut requests = Vec::with_capacity(mutations.len());
-        for mutation in mutations {
-            let (schema, key) = mutation_schema_key(mutation);
+        let mut requests = Vec::with_capacity(records.len());
+        for &(schema, key) in records {
             self.ensure_registered_schema(schema)?;
             requests.push(ProjectionQuerySnapshotRequest::new(
                 &self.codec,
@@ -258,40 +268,7 @@ impl ProjectionWorkspace {
         ProjectionExecutionSnapshotBatchRequest::new(requests)
     }
 
-    /// Graph include snapshot builder (protocol store API). Retained for
-    /// adapter conformance; portable projectors use single-scope loads.
-    #[allow(dead_code)]
-    pub(crate) fn graph_snapshot_request<M>(
-        &self,
-        key: RowKey,
-        includes: Vec<String>,
-        max_unique_record_scopes: usize,
-    ) -> Result<ProjectionGraphSnapshotRequest, ProjectionProtocolError>
-    where
-        M: RelationalReadModel + RelationalReadModelIncludes,
-    {
-        let includes = includes
-            .into_iter()
-            .map(|include| {
-                let schema = M::include_target_schema(&include)?;
-                self.ensure_registered_schema(schema)?;
-                Ok((
-                    include,
-                    self.codec
-                        .registered_schema_owned(&schema.model_name)
-                        .map_err(|error| {
-                            ProjectionProtocolError::InvalidBatch(error.to_string())
-                        })?,
-                ))
-            })
-            .collect::<Result<Vec<_>, ProjectionProtocolError>>()?;
-        ProjectionGraphSnapshotRequest::new(
-            self.query_snapshot_request::<M>(key)?,
-            includes,
-            max_unique_record_scopes,
-        )
-    }
-
+    #[cfg(any(feature = "graphql", test))]
     pub(crate) fn record_scope(
         &self,
         schema: &'static TableSchema,
@@ -308,20 +285,32 @@ impl ProjectionWorkspace {
             .map_err(|error| ProjectionProtocolError::InvalidBatch(error.to_string()))
     }
 
+    #[cfg(any(feature = "graphql", test))]
     pub(crate) fn partition_value(&self) -> Option<&serde_json::Value> {
         self.partition_value.as_ref()
     }
 
+    #[cfg(any(feature = "graphql", test))]
     pub(crate) fn stage_execution_mutation(
         &mut self,
         mutation: TableMutation,
         expectation: ProjectionRecordExpectation,
-        kind: ProjectionMutationKind,
+        kind: RecordTransition,
+        source: Option<super::SourceSnapshotVersion>,
     ) -> Result<&mut Self, ProjectionProtocolError> {
         validate_execution_mutation_shape(&mutation, &expectation, kind)?;
         let (schema, key) = mutation_schema_key(&mutation);
         let scope = self.record_scope(schema, key)?;
-        self.stage(schema, scope, mutation, expectation, kind)
+        self.push_staged(
+            schema,
+            ProjectionRecordMutation::with_source_snapshot(
+                scope,
+                mutation,
+                expectation,
+                kind,
+                source,
+            )?,
+        )
     }
 
     #[allow(dead_code)]
@@ -357,7 +346,13 @@ impl ProjectionWorkspace {
     ) -> Result<Vec<ProjectionModelOwnership>, ProjectionProtocolError> {
         self.ownership
             .iter()
-            .map(|(model, table)| ProjectionModelOwnership::new(model.clone(), table.clone()))
+            .map(|(model, table)| {
+                let ownership = ProjectionModelOwnership::new(model.clone(), table.clone())?;
+                Ok(self
+                    .program_id
+                    .map(|program_id| ownership.clone().with_program_id(program_id))
+                    .unwrap_or(ownership))
+            })
             .collect()
     }
 
@@ -365,7 +360,6 @@ impl ProjectionWorkspace {
         let ownership = self.ownership()?;
         let batch = ProjectionCommitBatch {
             input: self.input,
-            change_epoch: self.change_epoch,
             ownership,
             mutations: self.mutations,
             observations: self.observations,
@@ -432,8 +426,20 @@ impl ProjectionWorkspace {
         scope: ProjectionRecordScope,
         mutation: TableMutation,
         expectation: ProjectionRecordExpectation,
-        kind: ProjectionMutationKind,
+        kind: RecordTransition,
     ) -> Result<&mut Self, ProjectionProtocolError> {
+        self.push_staged(
+            schema,
+            ProjectionRecordMutation::new(scope, mutation, expectation, kind)?,
+        )
+    }
+
+    fn push_staged(
+        &mut self,
+        schema: &'static TableSchema,
+        mutation: ProjectionRecordMutation,
+    ) -> Result<&mut Self, ProjectionProtocolError> {
+        let scope = mutation.scope.clone();
         if !self.staged_scopes.insert(scope.clone()) {
             return Err(ProjectionProtocolError::InvalidBatch(format!(
                 "projection workspace repeats model `{}` record scope",
@@ -441,12 +447,7 @@ impl ProjectionWorkspace {
             )));
         }
         self.register_ownership(schema)?;
-        self.mutations.push(ProjectionRecordMutation::new(
-            scope.clone(),
-            mutation,
-            expectation,
-            kind,
-        )?);
+        self.mutations.push(mutation);
         self.observations.push(ProjectionObservationRequest {
             kind: ProjectionObservationKind::Record,
             target: ProjectionObservationTarget::StagedRecord(scope),
@@ -455,6 +456,7 @@ impl ProjectionWorkspace {
     }
 }
 
+#[cfg(any(feature = "graphql", test))]
 fn mutation_schema_key(mutation: &TableMutation) -> (&'static TableSchema, &RowKey) {
     match mutation {
         TableMutation::UpsertRow(mutation) => (mutation.schema, &mutation.key),
@@ -463,36 +465,37 @@ fn mutation_schema_key(mutation: &TableMutation) -> (&'static TableSchema, &RowK
     }
 }
 
+#[cfg(any(feature = "graphql", test))]
 fn validate_execution_mutation_shape(
     mutation: &TableMutation,
     expectation: &ProjectionRecordExpectation,
-    kind: ProjectionMutationKind,
+    kind: RecordTransition,
 ) -> Result<(), ProjectionProtocolError> {
     let valid = match (mutation, expectation, kind) {
         (
             TableMutation::UpsertRow(row),
             ProjectionRecordExpectation::Missing,
-            ProjectionMutationKind::Upsert,
+            RecordTransition::Upsert,
         ) => row.mode == RowWriteMode::Insert && row.expected_version == ExpectedVersion::NotExists,
         (
             TableMutation::UpsertRow(row),
             ProjectionRecordExpectation::Exact(_),
-            ProjectionMutationKind::Upsert,
+            RecordTransition::Upsert,
         ) => row.mode == RowWriteMode::Upsert && row.expected_version == ExpectedVersion::Any,
         (
             TableMutation::PatchRow(row),
             ProjectionRecordExpectation::Exact(_),
-            ProjectionMutationKind::Upsert,
+            RecordTransition::Upsert,
         ) => row.mode == PatchMode::UpdateExisting && row.expected_version == ExpectedVersion::Any,
         (
             TableMutation::DeleteRow(row),
-            ProjectionRecordExpectation::Exact(_),
-            ProjectionMutationKind::Delete,
+            ProjectionRecordExpectation::Exact(_) | ProjectionRecordExpectation::Missing,
+            RecordTransition::Delete,
         ) => row.expected_version == ExpectedVersion::Any,
         (
             TableMutation::UpsertRow(row),
             ProjectionRecordExpectation::Exact(_),
-            ProjectionMutationKind::Recreate,
+            RecordTransition::Recreate,
         ) => row.mode == RowWriteMode::Insert && row.expected_version == ExpectedVersion::NotExists,
         _ => false,
     };
@@ -509,8 +512,8 @@ fn validate_execution_mutation_shape(
 mod tests {
     use super::*;
     use crate::projection_protocol::{
-        ProjectionGeneration, ProjectionInputCursor, ProjectionInputFingerprint, ProjectionSource,
-        ProjectorTopologyId,
+        ProjectionEpoch, ProjectionGeneration, ProjectionInputCursor, ProjectionInputFingerprint,
+        ProjectionSource, ProjectorTopologyId,
     };
     use crate::table::{ColumnType, PrimaryKey, RowValue, RowValues, TableColumn, TableKind};
 
@@ -535,7 +538,6 @@ mod tests {
                 ],
                 primary_key: PrimaryKey::new(["todo_id"]),
                 version_column: Some("_sourced_version".into()),
-                foreign_keys: Vec::new(),
                 indexes: Vec::new(),
                 relationships: Vec::new(),
                 kind: TableKind::ReadModel,
@@ -583,13 +585,7 @@ mod tests {
             true,
         )
         .unwrap();
-        ProjectionWorkspace::new(
-            Arc::new(codec),
-            partition_value,
-            input,
-            ProjectionEpoch::new("changes-v1").unwrap(),
-        )
-        .unwrap()
+        ProjectionWorkspace::new(Arc::new(codec), partition_value, input).unwrap()
     }
 
     #[test]

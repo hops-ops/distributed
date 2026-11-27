@@ -3,29 +3,29 @@ use serde::{Deserialize, Serialize};
 
 use crate::levels::generate_level;
 
-use super::tile;
-use super::{BlobError, BlobGameState, Direction};
+use super::{BlobError, BlobGameState};
+use crate::core::{legal_moves, simulate_move, status_of, Direction, SimulateError, Tile};
 
 /// Tiny 3×3 map for unit tests (player top-left, no holes).
-pub fn test_map_no_holes() -> Vec<Vec<u8>> {
-    use tile::*;
+pub fn test_map_no_holes() -> Vec<Vec<Tile>> {
+    use Tile::*;
     vec![
-        vec![PLAYER, UNVISITED, UNVISITED],
-        vec![UNVISITED, UNVISITED, UNVISITED],
-        vec![UNVISITED, UNVISITED, UNVISITED],
+        vec![Player, Unvisited, Unvisited],
+        vec![Unvisited, Unvisited, Unvisited],
+        vec![Unvisited, Unvisited, Unvisited],
     ]
 }
 
-pub fn test_map_with_hole() -> Vec<Vec<u8>> {
-    use tile::*;
+pub fn test_map_with_hole() -> Vec<Vec<Tile>> {
+    use Tile::*;
     vec![
-        vec![PLAYER, HOLE, UNVISITED],
-        vec![UNVISITED, UNVISITED, UNVISITED],
-        vec![UNVISITED, UNVISITED, UNVISITED],
+        vec![Player, Hole, Unvisited],
+        vec![Unvisited, Unvisited, Unvisited],
+        vec![Unvisited, Unvisited, Unvisited],
     ]
 }
 
-fn validate_map(map: &[Vec<u8>]) -> Result<(), BlobError> {
+fn validate_map(map: &[Vec<Tile>]) -> Result<(), BlobError> {
     if map.is_empty() || map[0].is_empty() {
         return Err(BlobError::InvalidMap("empty map".into()));
     }
@@ -36,7 +36,7 @@ fn validate_map(map: &[Vec<u8>]) -> Result<(), BlobError> {
             return Err(BlobError::InvalidMap(format!("ragged row {r}")));
         }
         for &t in row {
-            if t == tile::PLAYER {
+            if t == Tile::Player {
                 players += 1;
             }
         }
@@ -49,35 +49,18 @@ fn validate_map(map: &[Vec<u8>]) -> Result<(), BlobError> {
     Ok(())
 }
 
-fn map_to_json(map: &[Vec<u8>]) -> String {
-    serde_json::to_string(map).unwrap_or_else(|_| "[]".into())
-}
-
-fn status_of(player_dead: bool, level_complete: bool) -> String {
-    if player_dead {
-        "dead".into()
-    } else if level_complete {
-        "level_complete".into()
-    } else {
-        "active".into()
-    }
-}
-
-// Pure post-move board snapshot — defined in `crate::core`, re-exported here.
-pub use crate::core::{simulate_move, MovePreview};
-
-fn map_simulate_err(err: crate::core::SimulateError) -> BlobError {
+fn map_simulate_err(err: SimulateError) -> BlobError {
     match err {
-        crate::core::SimulateError::NoActiveLevel => BlobError::NoActiveLevel,
-        crate::core::SimulateError::CannotMove(msg) => BlobError::CannotMove(msg.into()),
+        SimulateError::NoActiveLevel => BlobError::NoActiveLevel,
+        SimulateError::CannotMove(msg) => BlobError::CannotMove(msg.into()),
     }
 }
 
 #[cfg(test)]
-fn player_pos_in(map: &[Vec<u8>]) -> Result<(usize, usize), BlobError> {
+fn player_pos_in(map: &[Vec<Tile>]) -> Result<(usize, usize), BlobError> {
     for (r, row) in map.iter().enumerate() {
         for (c, &t) in row.iter().enumerate() {
-            if t == tile::PLAYER {
+            if t == Tile::Player {
                 return Ok((r, c));
             }
         }
@@ -97,7 +80,7 @@ pub struct BlobGame {
     pub current_level: i64,
     pub current_level_completed: bool,
     /// Current level map only (demo keeps one active map in state).
-    pub map: Vec<Vec<u8>>,
+    pub map: Vec<Vec<Tile>>,
 }
 
 impl BlobGame {
@@ -124,7 +107,8 @@ impl BlobGame {
             player_dead: self.player_dead,
             current_level: self.current_level,
             current_level_completed: self.current_level_completed,
-            map_json: map_to_json(&self.map),
+            map: self.map.clone(),
+            moves: legal_moves(&self.map),
             status: status_of(self.player_dead, self.current_level_completed),
         }
     }
@@ -163,7 +147,7 @@ impl BlobGame {
         Ok(())
     }
 
-    #[event("blob.initialized", version = 1, domain)]
+    #[event("blob.initialized", version = 1, domain, known(player_dead: false, current_level_completed: true))]
     fn record_initialized(&mut self, game_id: String, owner_id: String) {
         self.entity.set_id(&game_id);
         self.game_id = game_id;
@@ -176,7 +160,7 @@ impl BlobGame {
     }
 
     /// Append/start a level map. Requires current level complete and player alive.
-    pub fn start_level(&mut self, owner_id: &str, map: Vec<Vec<u8>>) -> Result<(), BlobError> {
+    pub fn start_level(&mut self, owner_id: &str, map: Vec<Vec<Tile>>) -> Result<(), BlobError> {
         self.ensure_owner(owner_id)?;
         if self.player_dead {
             return Err(BlobError::PlayerDead);
@@ -190,8 +174,8 @@ impl BlobGame {
         Ok(())
     }
 
-    #[event("blob.level_started", version = 1, domain)]
-    fn record_level_started(&mut self, current_level: i64, map: Vec<Vec<u8>>) {
+    #[event("blob.level_started", version = 1, domain, known(current_level_completed: false, player_dead: false))]
+    fn record_level_started(&mut self, current_level: i64, map: Vec<Vec<Tile>>) {
         self.current_level = current_level;
         self.map = map;
         self.current_level_completed = false;
@@ -212,7 +196,7 @@ impl BlobGame {
         &mut self,
         game_id: impl Into<String>,
         owner_id: impl Into<String>,
-        map: Vec<Vec<u8>>,
+        map: Vec<Vec<Tile>>,
     ) -> Result<(), BlobError> {
         if self.is_created() {
             return Err(BlobError::AlreadyExists);
@@ -237,13 +221,13 @@ impl BlobGame {
         self.start_level(owner_id, map)
     }
 
-    #[event("blob.started", version = 1, domain)]
+    #[event("blob.started", version = 1, domain, known(player_dead: false, current_level_completed: false))]
     fn record_started(
         &mut self,
         game_id: String,
         owner_id: String,
         current_level: i64,
-        map: Vec<Vec<u8>>,
+        map: Vec<Vec<Tile>>,
     ) {
         self.entity.set_id(&game_id);
         self.game_id = game_id;
@@ -267,7 +251,7 @@ impl BlobGame {
         self.record_moved(
             preview.score,
             preview.player_dead,
-            preview.level_complete,
+            preview.current_level_completed,
             preview.map,
             direction.as_str().to_string(),
         )?;
@@ -280,7 +264,7 @@ impl BlobGame {
         score: i64,
         player_dead: bool,
         current_level_completed: bool,
-        map: Vec<Vec<u8>>,
+        map: Vec<Vec<Tile>>,
         _direction: String,
     ) {
         self.score = score;
@@ -295,7 +279,7 @@ mod tests {
     use super::*;
     use crate::levels::{demo_map, is_hamiltonian_passable};
 
-    fn game_with_map(map: Vec<Vec<u8>>) -> BlobGame {
+    fn game_with_map(map: Vec<Vec<Tile>>) -> BlobGame {
         let mut g = BlobGame::default();
         g.initialize("g1", "alice").unwrap();
         g.start_level("alice", map).unwrap();
@@ -317,13 +301,16 @@ mod tests {
     #[test]
     fn simulate_move_matches_move_dir() {
         let mut g = BlobGame::default();
-        g.start_with_map("g1", "alice", test_map_no_holes()).unwrap();
+        g.start_with_map("g1", "alice", test_map_no_holes())
+            .unwrap();
         let preview = simulate_move(&g.map, g.score, Direction::Right).unwrap();
         g.move_dir("alice", Direction::Right).unwrap();
         assert_eq!(g.map, preview.map);
         assert_eq!(g.score, preview.score);
         assert_eq!(g.player_dead, preview.player_dead);
-        assert_eq!(g.current_level_completed, preview.level_complete);
+        assert_eq!(g.current_level_completed, preview.current_level_completed);
+        assert_eq!(g.state().moves, preview.moves);
+        assert_eq!(g.state().status, preview.status);
     }
 
     #[test]
@@ -339,7 +326,7 @@ mod tests {
         g.move_dir("alice", Direction::Right).unwrap();
         assert_eq!(g.score, 1);
         assert_eq!(g.player_pos().unwrap(), (0, 1));
-        assert_eq!(g.map[0][0], tile::VISITED);
+        assert_eq!(g.map[0][0], Tile::Visited);
     }
 
     #[test]
@@ -347,7 +334,7 @@ mod tests {
         let mut g = game_with_map(test_map_with_hole());
         g.move_dir("alice", Direction::Right).unwrap();
         assert!(g.player_dead);
-        assert_eq!(g.map[0][1], tile::DEAD_BY_HOLE);
+        assert_eq!(g.map[0][1], Tile::DeadByHole);
         assert_eq!(g.score, 0);
     }
 
@@ -357,7 +344,7 @@ mod tests {
         g.move_dir("alice", Direction::Right).unwrap();
         g.move_dir("alice", Direction::Left).unwrap();
         assert!(g.player_dead);
-        assert_eq!(g.map[0][0], tile::DEAD_BY_SUICIDE);
+        assert_eq!(g.map[0][0], Tile::DeadBySuicide);
     }
 
     #[test]
@@ -372,8 +359,8 @@ mod tests {
     #[test]
     fn complete_level_when_no_unvisited() {
         // 2×2: player + 3 unvisited
-        use tile::*;
-        let map = vec![vec![PLAYER, UNVISITED], vec![UNVISITED, UNVISITED]];
+        use Tile::*;
+        let map = vec![vec![Player, Unvisited], vec![Unvisited, Unvisited]];
         let mut g = game_with_map(map);
         g.move_dir("alice", Direction::Right).unwrap();
         g.move_dir("alice", Direction::Down).unwrap();
@@ -395,8 +382,8 @@ mod tests {
 
     #[test]
     fn complete_then_start_next_level() {
-        use tile::*;
-        let map = vec![vec![PLAYER, UNVISITED], vec![UNVISITED, UNVISITED]];
+        use Tile::*;
+        let map = vec![vec![Player, Unvisited], vec![Unvisited, Unvisited]];
         let mut g = BlobGame::default();
         g.initialize("g1", "alice").unwrap();
         g.start_level("alice", map).unwrap();
@@ -417,8 +404,8 @@ mod tests {
 
     #[test]
     fn hydrate_preserves_level_complete_before_next() {
-        use tile::*;
-        let map = vec![vec![PLAYER, UNVISITED], vec![UNVISITED, UNVISITED]];
+        use Tile::*;
+        let map = vec![vec![Player, Unvisited], vec![Unvisited, Unvisited]];
         let mut g = BlobGame::default();
         g.initialize("g1", "alice").unwrap();
         g.start_level("alice", map).unwrap();
@@ -457,7 +444,7 @@ mod tests {
     fn start_with_demo_uses_generated_passable_map() {
         let mut g = BlobGame::default();
         g.start_with_demo("g-rand", "alice").unwrap();
-        assert_eq!(g.map[0][0], tile::PLAYER);
+        assert_eq!(g.map[0][0], Tile::Player);
         assert!(is_hamiltonian_passable(&g.map));
         assert!(g.map.len() >= 5);
     }

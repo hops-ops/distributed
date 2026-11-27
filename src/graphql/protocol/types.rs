@@ -56,8 +56,7 @@ pub(crate) struct DistributedCommandMetadata {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) projection_disposition: Option<DistributedProjectionDisposition>,
     pub(crate) expects: Vec<DistributedProjectionExpectation>,
-    /// Exact role-safe actual delta and opaque modeled obligations. Legacy
-    /// compiler confirmations remain in `expects` during the migration.
+    /// Exact role-safe actual delta and opaque modeled obligations.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) projection: Option<super::CommandProjectionMetadataV1>,
     /// Exact finite obligations already observed for this authorized command.
@@ -65,8 +64,11 @@ pub(crate) struct DistributedCommandMetadata {
     /// can retire optimism without reconstructing any hidden scope material.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) observations: Vec<DistributedProjectionObservation>,
-    /// Exact same-transaction revision evidence retained in the durable replay
-    /// envelope. Async commands leave this empty and confirm through expects.
+    /// Revisions of the read-model rows an atomic command wrote in its own
+    /// transaction, retained in the durable replay envelope. An eventual
+    /// command's write side cannot know a row revision without reading the
+    /// read model, so it leaves this empty: its token is `causationId`, and
+    /// each observation names the row revision the projector produced.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) records: Vec<DistributedRecordRevision>,
 }
@@ -97,6 +99,23 @@ pub(crate) struct DistributedProjectionObservation {
     pub(crate) projection: String,
     pub(crate) model: String,
     pub(crate) scope_token: OpaqueProtocolToken,
+    /// The row revision the projector wrote for this causation, from its own
+    /// observation log. A client holding that row at or past this clock has
+    /// the command's effect. Absent for dependency observations, which name
+    /// no row, and where the server did not read the revision.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) record: Option<DistributedObservedRecord>,
+}
+
+/// One row clock, comparable with a [`DistributedRecordRevision`] carrying the
+/// same `scopeToken`. It omits the tombstone flag: "at or past" compares only
+/// `(incarnation, revision)`, and a deletion's observation does not record it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct DistributedObservedRecord {
+    pub(crate) scope_token: OpaqueProtocolToken,
+    pub(crate) incarnation: String,
+    pub(crate) revision: String,
 }
 
 /// Client-returned live cursor. `projection` selects one finite, role-visible
@@ -170,11 +189,19 @@ impl DistributedQuerySnapshot {
     }
 }
 
-/// Per-frame resumability decision for a live operation.
+/// Authorized snapshot delivery does not imply partition-wide resumability.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum DistributedLiveMode {
+    Snapshot,
+    Resumable,
+}
+
+/// Per-frame delivery mode for a live operation.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct DistributedLiveMetadata {
-    pub(crate) supported: bool,
+    pub(crate) mode: DistributedLiveMode,
     pub(crate) reset: bool,
     pub(crate) cursors: Vec<DistributedLiveCursor>,
 }
@@ -259,6 +286,17 @@ pub(crate) struct DistributedGenerationEnvelope {
 
 impl DistributedGenerationEnvelope {
     fn from_environment() -> Option<Self> {
+        if let Some(member) = crate::microsvc::lifecycle::membership_from_environment() {
+            let active = member.generation;
+            return Some(Self {
+                version: 1,
+                generation_id: active.generation_id,
+                release_id: active.release_id,
+                topology_id: Some(active.topology_id),
+                compatibility_id: Some(active.compatibility_id),
+                member_id: optional_environment_identity("DISTRIBUTED_MEMBER_ID"),
+            });
+        }
         let generation_id = std::env::var("DISTRIBUTED_GENERATION_ID").ok()?;
         let release_id = std::env::var("DISTRIBUTED_RELEASE_ID").ok()?;
         if !bounded_identity(&generation_id) || !bounded_identity(&release_id) {

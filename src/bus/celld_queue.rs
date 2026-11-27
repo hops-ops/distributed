@@ -13,7 +13,7 @@
 //! possible if Queue accepts a message and the outbox settlement is interrupted;
 //! the stable message id is therefore required end to end.
 
-use crate::bus::{validate_stable_message_id, Message, MessagePublisher, TransportError};
+use crate::bus::{Message, MessagePublisher, TransportError, WireEnvelope};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -21,7 +21,7 @@ use std::sync::Arc;
 /// Version of the JSON body stored in celld Queue.
 pub const CELLD_QUEUE_ENVELOPE_VERSION: u16 = 1;
 
-/// celld 0.4 Queue's maximum serialized message body.
+/// celld Queue's maximum serialized message body.
 pub const CELLD_QUEUE_MAX_BODY_BYTES: usize = 128 * 1024;
 
 /// Conventional authenticated native relay endpoint used by Queue consumers.
@@ -38,15 +38,14 @@ pub struct CelldQueueEnvelope {
 impl CelldQueueEnvelope {
     /// Validate and wrap a canonical message for celld Queue.
     pub fn new(message: Message) -> Result<Self, TransportError> {
-        message.validate_name().map_err(|error| {
-            TransportError::permanent(format!("invalid celld Queue message name: {error}"))
+        WireEnvelope::validate(&message).map_err(|error| {
+            TransportError::permanent(format!("invalid celld Queue message: {error}"))
         })?;
-        let id = message.id().ok_or_else(|| {
-            TransportError::permanent("celld Queue messages require a stable message id")
-        })?;
-        validate_stable_message_id(Some(id)).map_err(|error| {
-            TransportError::permanent(format!("invalid celld Queue message id: {error}"))
-        })?;
+        if message.id().is_none() {
+            return Err(TransportError::permanent(
+                "celld Queue messages require a stable message id",
+            ));
+        }
 
         let envelope = Self {
             version: CELLD_QUEUE_ENVELOPE_VERSION,
@@ -84,7 +83,7 @@ impl CelldQueueEnvelope {
 
 /// Relays Queue bodies through any Distributed publisher.
 ///
-/// Wrap a [`crate::BusPublisher`] to recover the bus topology split: commands
+/// Wrap a [`crate::outbox_worker::BusPublisher`] to recover the bus topology split: commands
 /// go to `send_message`, while events go to `publish_message` for fanout.
 #[derive(Clone)]
 pub struct CelldQueueRelay<P> {
@@ -136,7 +135,7 @@ where
 }
 
 /// workers-rs adapter that durably accepts messages into a celld Queue.
-#[cfg(feature = "workers-rs")]
+#[cfg(feature = "cloudflare-workers")]
 #[derive(Clone)]
 pub struct CelldQueuePublisher {
     queue: worker::Queue,
@@ -148,21 +147,22 @@ pub struct CelldQueuePublisher {
 /// NATS, Kafka, or RabbitMQ clients). A successful 2xx response is the publish
 /// threshold; Queue acknowledges only after the native bus has accepted the
 /// canonical message.
-#[cfg(all(feature = "workers-rs", target_arch = "wasm32"))]
+#[cfg(all(feature = "cloudflare-workers", target_arch = "wasm32"))]
 #[derive(Clone)]
 pub struct CelldQueueHttpPublisher {
     endpoint: String,
     headers: Vec<(String, String)>,
 }
 
-#[cfg(all(feature = "workers-rs", any(target_arch = "wasm32", test)))]
+#[cfg(all(feature = "cloudflare-workers", any(target_arch = "wasm32", test)))]
 #[derive(Clone, Copy)]
 enum CelldQueueHttpEndpointPolicy {
     HttpsOnly,
     LocalTestHttp,
+    MeshHttp,
 }
 
-#[cfg(all(feature = "workers-rs", any(target_arch = "wasm32", test)))]
+#[cfg(all(feature = "cloudflare-workers", any(target_arch = "wasm32", test)))]
 fn validate_celld_queue_http_endpoint(
     endpoint: &str,
     policy: CelldQueueHttpEndpointPolicy,
@@ -197,17 +197,28 @@ fn validate_celld_queue_http_endpoint(
             }
             Ok(())
         }
+        CelldQueueHttpEndpointPolicy::MeshHttp if url.scheme() == "https" => Ok(()),
+        CelldQueueHttpEndpointPolicy::MeshHttp => {
+            let host = url.host_str().unwrap_or_default();
+            let cluster_service = host.ends_with(".svc.cluster.local") || host.ends_with(".svc");
+            if url.scheme() != "http" || !cluster_service {
+                return Err(TransportError::permanent(
+                    "mesh Queue relay URL must use HTTPS or HTTP to a cluster Service (*.svc)",
+                ));
+            }
+            Ok(())
+        }
     }
 }
 
-#[cfg(all(feature = "workers-rs", any(target_arch = "wasm32", test)))]
+#[cfg(all(feature = "cloudflare-workers", any(target_arch = "wasm32", test)))]
 fn celld_queue_http_redirect_policy() -> worker::RequestRedirect {
     // Credential-bearing relay requests never follow redirects. A redirect is
     // a transport failure; operators must configure the final HTTPS endpoint.
     worker::RequestRedirect::Error
 }
 
-#[cfg(all(feature = "workers-rs", target_arch = "wasm32"))]
+#[cfg(all(feature = "cloudflare-workers", target_arch = "wasm32"))]
 impl CelldQueueHttpPublisher {
     /// Build a relay publisher that sends credentials only over HTTPS.
     pub fn new(endpoint: impl Into<String>) -> Result<Self, TransportError> {
@@ -243,13 +254,33 @@ impl CelldQueueHttpPublisher {
         })
     }
 
+    /// Build a publisher for a relay inside a service mesh that encrypts
+    /// pod-to-pod traffic (for example Istio sidecar or ambient mTLS).
+    ///
+    /// Cleartext is allowed only to a cluster Service host
+    /// (`*.svc.cluster.local` or `*.svc`); anything else must be HTTPS. The
+    /// worker cannot see the mesh: choosing this asserts that the celld pod
+    /// and the relay's pods are both enrolled in it.
+    pub fn new_mesh(endpoint: impl Into<String>) -> Result<Self, TransportError> {
+        let endpoint = endpoint.into();
+        validate_celld_queue_http_endpoint(
+            &endpoint,
+            CelldQueueHttpEndpointPolicy::MeshHttp,
+            None,
+        )?;
+        Ok(Self {
+            endpoint,
+            headers: Vec::new(),
+        })
+    }
+
     pub fn with_header(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
         self.headers.push((name.into(), value.into()));
         self
     }
 }
 
-#[cfg(all(feature = "workers-rs", target_arch = "wasm32"))]
+#[cfg(all(feature = "cloudflare-workers", target_arch = "wasm32"))]
 impl MessagePublisher for CelldQueueHttpPublisher {
     fn publish(
         &self,
@@ -302,7 +333,7 @@ impl MessagePublisher for CelldQueueHttpPublisher {
     }
 }
 
-#[cfg(feature = "workers-rs")]
+#[cfg(feature = "cloudflare-workers")]
 impl CelldQueuePublisher {
     pub fn new(queue: worker::Queue) -> Self {
         Self { queue }
@@ -342,7 +373,7 @@ impl CelldQueuePublisher {
     }
 }
 
-#[cfg(feature = "workers-rs")]
+#[cfg(feature = "cloudflare-workers")]
 impl MessagePublisher for CelldQueuePublisher {
     fn publish(
         &self,
@@ -363,10 +394,10 @@ mod tests {
     use super::*;
     use crate::bus::{Bus, MessageKind};
     use crate::outbox_worker::testing::block_on;
-    use crate::BusPublisher;
+    use crate::outbox_worker::BusPublisher;
     use std::sync::{Arc, Mutex};
 
-    #[cfg(feature = "workers-rs")]
+    #[cfg(feature = "cloudflare-workers")]
     #[test]
     fn relay_http_endpoint_requires_https_or_explicit_local_test_mode() {
         assert!(validate_celld_queue_http_endpoint(
@@ -399,6 +430,25 @@ mod tests {
             Some("production-secret"),
         )
         .is_err());
+    }
+
+    #[cfg(feature = "cloudflare-workers")]
+    #[test]
+    fn mesh_relay_allows_http_only_to_cluster_services() {
+        let mesh = |endpoint| {
+            validate_celld_queue_http_endpoint(
+                endpoint,
+                CelldQueueHttpEndpointPolicy::MeshHttp,
+                None,
+            )
+        };
+        assert!(mesh("http://relay.ns.svc.cluster.local:2567/internal/celld-queue/relay").is_ok());
+        assert!(mesh("http://relay.ns.svc:2567/internal/celld-queue/relay").is_ok());
+        assert!(mesh("https://relay.example.test/internal/celld-queue/relay").is_ok());
+        assert!(mesh("http://relay.example.test/internal/celld-queue/relay").is_err());
+        assert!(mesh("http://127.0.0.1:2567/internal/celld-queue/relay").is_err());
+        assert!(mesh("http://svc.cluster.local.example.test/relay").is_err());
+        assert!(mesh("http://user:pw@relay.ns.svc/relay").is_err());
     }
 
     #[derive(Clone, Default)]
@@ -509,7 +559,7 @@ mod tests {
         assert!(block_on(relay.relay(envelope)).is_err());
     }
 
-    #[cfg(feature = "workers-rs")]
+    #[cfg(feature = "cloudflare-workers")]
     #[test]
     fn relay_http_requests_never_follow_redirects() {
         assert!(matches!(

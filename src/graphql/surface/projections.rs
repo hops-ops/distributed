@@ -1,14 +1,13 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::projection::catalog::{ActiveProjectionBindings, ProjectionCatalog, ProjectionEpoch};
+use crate::projection::catalog::{ActiveProjectionBindings, ProjectionCatalog};
 use crate::projection::placement::{
     ProjectionBinding, ProjectionBindingId, ProjectionBindingState, ProjectionExecutionClass,
     ProjectionExecutorRoute, ProjectionPlacement,
 };
-use crate::{
-    ProjectionField, ProjectionInvalidation, ProjectionKeyField, ProjectionMutationKind,
-    ProjectionOperation, ProjectionPartition, ProjectionProgram, ProjectionProgramId,
-    ProjectionRelationshipEffect,
+use crate::projection::{
+    MutationKind, ProjectionField, ProjectionInvalidation, ProjectionKeyField, ProjectionOperation,
+    ProjectionPartition, ProjectionProgram, ProjectionProgramId, ProjectionRelationshipEffect,
 };
 
 use super::types::{SurfaceProjectionOwner, SurfaceProjectionOwnerKind};
@@ -19,7 +18,7 @@ use super::{SurfaceModel, SurfaceRelationshipKeys};
 pub(crate) struct SurfaceProjectionOperation {
     pub operation_id: String,
     pub staging_ordinal: u32,
-    pub kind: ProjectionMutationKind,
+    pub kind: MutationKind,
     pub model: String,
     pub storage: String,
     pub key: Vec<ProjectionKeyField>,
@@ -34,7 +33,7 @@ pub(crate) struct SurfaceProjectionOperation {
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 pub(crate) struct SurfaceProjectionArm {
     pub arm_id: String,
-    pub selector: crate::ProjectionEventSelector,
+    pub selector: crate::projection::ProjectionEventSelector,
     pub operations: Vec<SurfaceProjectionOperation>,
 }
 
@@ -64,7 +63,6 @@ pub struct SurfaceModeledProjection {
     placement: ProjectionPlacement,
     execution_class: ProjectionExecutionClass,
     state: ProjectionBindingState,
-    epoch: ProjectionEpoch,
     route: ProjectionExecutorRoute,
     output_models: Vec<String>,
     raw_program: Option<ProjectionProgram>,
@@ -81,7 +79,6 @@ impl PartialEq for SurfaceModeledProjection {
             && self.placement == other.placement
             && self.execution_class == other.execution_class
             && self.state == other.state
-            && self.epoch == other.epoch
             && self.route == other.route
             && self.output_models == other.output_models
             && self.raw_program == other.raw_program
@@ -105,7 +102,6 @@ impl std::fmt::Debug for SurfaceModeledProjection {
             .field("placement", &self.placement)
             .field("execution_class", &self.execution_class)
             .field("state", &self.state)
-            .field("epoch", &self.epoch.as_str())
             .field("output_models", &self.output_models)
             .finish_non_exhaustive()
     }
@@ -124,6 +120,8 @@ impl SurfaceModeledProjection {
         } else {
             return Err("modeled projection has no canonical program material".to_owned());
         };
+        let program = crate::application::compact_projection_program_contract(program)
+            .map_err(|error| error.to_string())?;
         let binding = self.raw_binding.as_ref().map(|binding| {
             serde_json::json!({
                 "identity_version": binding.identity_version(),
@@ -147,7 +145,6 @@ impl SurfaceModeledProjection {
             "placement": self.placement,
             "execution_class": self.execution_class,
             "state": self.state,
-            "epoch": self.epoch.as_str(),
             "output_models": self.output_models,
             "program": program,
             "binding": binding,
@@ -171,8 +168,6 @@ impl SurfaceModeledProjection {
             placement,
             execution_class,
             state,
-            epoch: ProjectionEpoch::new("client-manifest-test-v1")
-                .expect("test epoch is canonical"),
             route: ProjectionExecutorRoute::local("client-manifest-test")
                 .expect("test route is canonical"),
             output_models,
@@ -188,7 +183,7 @@ impl SurfaceModeledProjection {
     ///
     /// This is the only public authority path. Arbitrary
     /// `ProjectionBindingActivation::new(...)` values cannot bypass catalog
-    /// writer-conflict, route, placement, or epoch-takeover validation.
+    /// writer-conflict, route, or placement validation.
     pub fn try_from_catalog(
         program: ProjectionProgram,
         catalog: &ProjectionCatalog,
@@ -213,7 +208,7 @@ impl SurfaceModeledProjection {
             .route()
             .cloned()
             .ok_or_else(|| format!("modeled projection binding `{binding_id}` has no route"))?;
-        let program_id = program.id().map_err(|error| error.to_string())?;
+        let program_id = program.id();
         if binding.program_id() != program_id || activation.program_id() != program_id {
             return Err("modeled projection binding does not match its program digest".into());
         }
@@ -229,7 +224,6 @@ impl SurfaceModeledProjection {
             placement: binding.placement(),
             execution_class: binding.execution_class(),
             state: activation.state(),
-            epoch: activation.epoch().clone(),
             route,
             output_models,
             raw_program: Some(program),
@@ -243,7 +237,7 @@ impl SurfaceModeledProjection {
     /// binding that will host it.
     ///
     /// This is the mountable form used by the projection service runtime.
-    /// Program digest, output schemas, route, and epoch are all validated
+    /// Program digest, output schemas and route are all validated
     /// before a transport subscription can be planned.
     pub fn try_from_descriptor<D>(
         descriptor: crate::projection::lower::ProjectionDescriptor<D>,
@@ -255,12 +249,11 @@ impl SurfaceModeledProjection {
         let executor = descriptor
             .server_executor()
             .map_err(|error| error.to_string())?;
-        let mut modeled = Self::try_from_catalog(program, catalog, active, binding_id)?;
+        let mut modeled = Self::try_from_catalog(program.clone(), catalog, active, binding_id)?;
         let (_, binding) = modeled
             .raw()
             .ok_or_else(|| "mountable modeled projection lost its raw binding".to_owned())?;
         if executor.program_id != modeled.program_id
-            || executor.epoch != modeled.epoch.as_str()
             || executor.outputs.models.len() != binding.outputs().len()
             || executor.outputs.models.iter().any(|output| {
                 !binding.outputs().iter().any(|bound| {
@@ -271,7 +264,7 @@ impl SurfaceModeledProjection {
             })
         {
             return Err(
-                "generated projection executor differs from its exact binding digest, epoch, or outputs"
+                "generated projection executor differs from its exact binding digest or outputs"
                     .into(),
             );
         }
@@ -292,11 +285,6 @@ impl SurfaceModeledProjection {
     /// Return active or draining state.
     pub fn state(&self) -> ProjectionBindingState {
         self.state
-    }
-
-    /// Return the exact physical incarnation.
-    pub fn epoch(&self) -> &ProjectionEpoch {
-        &self.epoch
     }
 
     /// Return the exact validated executor route.
@@ -504,7 +492,6 @@ impl SurfaceModeledProjection {
         Some((self.raw_program.as_ref()?, self.raw_binding.as_ref()?))
     }
 
-    #[cfg(feature = "graphql")]
     pub(crate) fn server_executor(
         &self,
     ) -> Option<&crate::projection::lower::ProjectionServerExecutorDescriptor> {
@@ -529,21 +516,6 @@ pub(crate) fn validate_direct_modeled_owner_compatibility(
             .iter()
             .filter(|modeled| modeled.state() == ProjectionBindingState::Active)
             .collect::<Vec<_>>();
-        let active_epochs = active
-            .iter()
-            .map(|modeled| modeled.epoch().as_str())
-            .collect::<BTreeSet<_>>();
-        if active_epochs.len() > 1 {
-            return Err(format!(
-                "direct modeled projection owner `{}` has mixed active change epochs: {}",
-                owner.name,
-                active_epochs
-                    .into_iter()
-                    .map(|epoch| format!("`{epoch}`"))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ));
-        }
         let Some(first) = active.first() else {
             continue;
         };
@@ -770,7 +742,6 @@ fn server_executor_eq(
         (Some(left), Some(right)) => {
             left.name == right.name
                 && left.version == right.version
-                && left.epoch == right.epoch
                 && left.program_id == right.program_id
                 && left.outputs == right.outputs
         }
@@ -847,8 +818,8 @@ fn select_operation(
     invalidations.extend(relationship_recovery);
     invalidations.sort();
     invalidations.dedup();
-    let row_consequence = operation.kind() == ProjectionMutationKind::Delete || !fields.is_empty();
-    let hidden_only_row_change = operation.kind() != ProjectionMutationKind::Delete
+    let row_consequence = operation.kind() == MutationKind::Delete || !fields.is_empty();
+    let hidden_only_row_change = operation.kind() != MutationKind::Delete
         && !operation.fields().is_empty()
         && fields.is_empty();
     let force_revalidate = (row_consequence && !key_visible) || hidden_only_row_change;
@@ -1016,7 +987,7 @@ fn validate_direct_program(
             .iter()
             .map(|field| field.name())
             .collect::<BTreeSet<_>>();
-        if operation.kind() != ProjectionMutationKind::Upsert
+        if operation.kind() != MutationKind::Upsert
             || operation.target().model() != output.model()
             || operation.target().storage() != output.storage()
             || operation_fields != complete_fields
@@ -1034,13 +1005,13 @@ fn validate_direct_program(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::graphql::{build_surface, surface_for_role, RoleGrant, SurfaceOptions};
+    use crate::graphql::{build_surface, read, surface_for_role, ReadPermission, SurfaceOptions};
+    use crate::projection::{
+        ProjectionAssignment, ProjectionExpression, ProjectionRelationship, ProjectionValue,
+    };
     use crate::table::{
         ColumnType, PrimaryKey, RelationshipDef, RelationshipKind, TableColumn, TableKind,
         TableSchema,
-    };
-    use crate::{
-        ProjectionAssignment, ProjectionExpression, ProjectionRelationship, ProjectionValue,
     };
 
     fn schema(
@@ -1062,19 +1033,19 @@ mod tests {
                 .collect(),
             primary_key: PrimaryKey::new([fields[0]]),
             version_column: None,
-            foreign_keys: Vec::new(),
             indexes: Vec::new(),
             relationships,
             kind: TableKind::ReadModel,
         }
     }
 
-    fn models(grants: BTreeMap<String, RoleGrant>) -> BTreeMap<String, SurfaceModel> {
+    fn models(grants: BTreeMap<String, ReadPermission>) -> BTreeMap<String, SurfaceModel> {
         let todo = schema(
             "TodoView",
             "todos",
             &["todo_id", "owner_id", "title"],
             vec![RelationshipDef {
+                references: None,
                 field_name: "owner".into(),
                 kind: RelationshipKind::BelongsTo,
                 target_model: "UserView".into(),
@@ -1109,8 +1080,8 @@ mod tests {
         ProjectionOperation::try_new(
             "patch-and-link",
             0,
-            ProjectionMutationKind::Patch,
-            crate::ProjectionTarget::try_new("TodoView", "todos").unwrap(),
+            MutationKind::Patch,
+            crate::projection::ProjectionTarget::try_new("TodoView", "todos").unwrap(),
             vec![key(0, "todo_id")],
             vec![ProjectionField::try_new(
                 0,
@@ -1141,11 +1112,8 @@ mod tests {
         let selected = select_operation(
             &operation("title", vec![owner_link("todo_id", "user_id")]),
             &models(BTreeMap::from([
-                (
-                    "TodoView".into(),
-                    RoleGrant::columns(["todo_id", "owner_id"]),
-                ),
-                ("UserView".into(), RoleGrant::columns(["user_id"])),
+                ("TodoView".into(), read().columns(["todo_id", "owner_id"])),
+                ("UserView".into(), read().columns(["user_id"])),
             ])),
         )
         .unwrap();
@@ -1162,10 +1130,7 @@ mod tests {
     fn denied_relationship_consequence_is_omitted_without_broad_recovery() {
         let selected = select_operation(
             &operation("title", vec![owner_link("todo_id", "user_id")]),
-            &models(BTreeMap::from([(
-                "TodoView".into(),
-                RoleGrant::all_columns(),
-            )])),
+            &models(BTreeMap::from([("TodoView".into(), read().all_columns())])),
         )
         .unwrap();
 
@@ -1180,14 +1145,14 @@ mod tests {
         let narrow = select_operation(
             &operation("title", vec![owner_link("todo_id", "user_id")]),
             &models(BTreeMap::from([
-                ("TodoView".into(), RoleGrant::all_columns()),
-                ("UserView".into(), RoleGrant::columns(["name"])),
+                ("TodoView".into(), read().all_columns()),
+                ("UserView".into(), read().columns(["name"])),
             ])),
         )
         .unwrap();
         assert_eq!(
             narrow.relationship_effects[0].kind(),
-            crate::ProjectionRelationshipEffectKind::Invalidate
+            crate::projection::ProjectionRelationshipEffectKind::Invalidate
         );
         assert!(narrow.invalidations.contains(
             &ProjectionInvalidation::relationship("TodoView", "owner", "UserView",).unwrap()
@@ -1197,11 +1162,8 @@ mod tests {
         let source_recovery = select_operation(
             &operation("owner_id", vec![owner_link("title", "user_id")]),
             &models(BTreeMap::from([
-                (
-                    "TodoView".into(),
-                    RoleGrant::columns(["todo_id", "owner_id"]),
-                ),
-                ("UserView".into(), RoleGrant::columns(["user_id"])),
+                ("TodoView".into(), read().columns(["todo_id", "owner_id"])),
+                ("UserView".into(), read().columns(["user_id"])),
             ])),
         )
         .unwrap();
@@ -1215,16 +1177,13 @@ mod tests {
 
     #[test]
     fn partial_multi_model_selection_keeps_authorized_operations_only() {
-        let selected_models = models(BTreeMap::from([(
-            "TodoView".into(),
-            RoleGrant::all_columns(),
-        )]));
+        let selected_models = models(BTreeMap::from([("TodoView".into(), read().all_columns())]));
         let todo = operation("title", Vec::new());
         let user = ProjectionOperation::try_new(
             "patch-user",
             1,
-            ProjectionMutationKind::Patch,
-            crate::ProjectionTarget::try_new("UserView", "users").unwrap(),
+            MutationKind::Patch,
+            crate::projection::ProjectionTarget::try_new("UserView", "users").unwrap(),
             vec![key(0, "user_id")],
             vec![ProjectionField::try_new(
                 0,

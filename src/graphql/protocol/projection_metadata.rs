@@ -5,8 +5,8 @@ use serde::de::{Error as _, IgnoredAny, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
 
 use super::OpaqueProtocolToken;
+use crate::domain_event::MAX_DOMAIN_EVENT_BODY_BYTES;
 use crate::graphql::projection_delta::{ProjectionDelta, ProjectionDeltaError};
-use crate::MAX_DOMAIN_EVENT_BODY_BYTES;
 
 /// Version of the command response/status projection metadata envelope.
 pub(crate) const COMMAND_PROJECTION_METADATA_WIRE_VERSION: u16 = 1;
@@ -439,7 +439,6 @@ mod tests {
         PROJECTION_DELTA_WIRE_VERSION,
     };
     use crate::graphql::protocol::{ProtocolTokenCodec, ProtocolTokenPurpose};
-    use sha2::{Digest, Sha256};
 
     fn delta() -> ProjectionDelta {
         ProjectionDelta {
@@ -464,7 +463,6 @@ mod tests {
                 binding_id:
                     "pb1:sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
                         .into(),
-                epoch: "todos-v1".into(),
                 program_ir_version: crate::projection::PROJECTION_PROGRAM_IR_VERSION,
                 operation_semantics_version:
                     crate::projection::PROJECTION_OPERATION_SEMANTICS_VERSION,
@@ -583,10 +581,6 @@ mod tests {
         let fixture = include_bytes!("../../../tests/fixtures/command-projection-metadata-v1.json");
         let fixture = fixture.strip_suffix(b"\n").unwrap_or(fixture);
         assert_eq!(fixture, expected);
-        assert_eq!(
-            format!("sha256:{:x}", Sha256::digest(fixture)),
-            "sha256:40417ca1897322e636dc196388f68c331c322c142f624d3741e4e7a24b8e9f81"
-        );
         assert_eq!(
             CommandProjectionMetadataV1::from_json(fixture).unwrap(),
             metadata

@@ -8,17 +8,17 @@ use serde::Serialize;
 use super::{
     DistributedCommandConsistency, DistributedCommandMetadata, DistributedCommandState,
     DistributedEnvelopeV1, DistributedLiveCursor, DistributedLiveMetadata,
-    DistributedProjectionDisposition, DistributedProjectionExpectation,
+    DistributedObservedRecord, DistributedProjectionDisposition, DistributedProjectionExpectation,
     DistributedProjectionObservation, DistributedQuerySnapshot, DistributedRecordRevision,
     OpaqueProtocolToken, ProtocolTokenCodec, ProtocolTokenError, ProtocolTokenPurpose,
     RequestedLiveResume,
 };
+use crate::command::CommandConsistency;
 use crate::command_ledger::CommandLedgerState;
-use crate::graphql::command_contract::CommandConsistency;
 use crate::graphql::projection_delta::runtime::ModeledProjectionStatusDisposition;
 use crate::microsvc::{
-    CausalCommandProjectionObligation, CausalCommandPublicState, CausalCommandPublicStatus,
-    CausalCommandReceiptSource, CausalProjectionEvidenceState,
+    CausalCommandPublicState, CausalCommandPublicStatus, CausalCommandReceiptSource,
+    CausalProjectionEvidenceState,
 };
 
 #[derive(Serialize)]
@@ -73,8 +73,8 @@ struct LiveResumeTokenMaterial<'a> {
     snapshot_scope: &'a str,
     projection: &'a str,
     topology: &'a crate::projection_protocol::ProjectorTopologyId,
-    partition: &'a crate::projection_protocol::ProjectionPartition,
-    epoch: &'a str,
+    partition: &'a crate::projection_protocol::PartitionId,
+    epoch: Option<&'a str>,
     position: String,
 }
 
@@ -95,6 +95,8 @@ struct ProtocolResponseState {
     stream_frames: Mutex<Option<VecDeque<DistributedEnvelopeV1>>>,
     dispatch_claimed: Mutex<bool>,
     codec: ProtocolTokenCodec,
+    #[cfg(feature = "gateway")]
+    gateway: Mutex<Option<crate::graphql::delivery::GatewayCapture>>,
 }
 
 impl ProtocolResponseAccumulator {
@@ -108,8 +110,31 @@ impl ProtocolResponseAccumulator {
                 stream_frames: Mutex::new(None),
                 dispatch_claimed: Mutex::new(false),
                 codec,
+                #[cfg(feature = "gateway")]
+                gateway: Mutex::new(None),
             }),
         }
+    }
+
+    /// What every token this accumulator issues is bound to besides its own
+    /// material: the cache scope (itself a MAC over every authorization input
+    /// of the request) and the schema hash. Two accumulators with the same
+    /// scope and codec issue identical query and live tokens.
+    pub(crate) fn token_scope(&self) -> Result<(String, String), ProtocolAccumulatorError> {
+        self.with_envelope(|envelope| {
+            (
+                envelope.cache_scope.as_str().to_owned(),
+                envelope.schema_hash.clone(),
+            )
+        })
+    }
+
+    /// A fresh accumulator that issues exactly this one's tokens and shares
+    /// none of its response state: what a shared live execution evidences
+    /// with, so no subscriber's accumulator is touched by another's frame.
+    pub(crate) fn issuer(&self) -> Result<Self, ProtocolAccumulatorError> {
+        let envelope = self.with_envelope(Clone::clone)?;
+        Ok(Self::new(envelope, self.inner.codec.clone()))
     }
 
     pub(crate) fn bind_projection_request(
@@ -132,8 +157,8 @@ impl ProtocolResponseAccumulator {
         &self,
         causation_id: crate::command_ledger::CausationId,
         replay_retention: std::time::Duration,
-        occurrences: &[crate::DomainEventOccurrence],
-        sealed_events: &[crate::ProjectionEventSelector],
+        occurrences: &[crate::domain_event::DomainEventOccurrence],
+        sealed_events: &[crate::projection::ProjectionEventSelector],
     ) -> Result<super::CommandProjectionMetadataV1, ProtocolAccumulatorError> {
         let request = self
             .inner
@@ -401,7 +426,10 @@ impl ProtocolResponseAccumulator {
 
     /// Stable exact-index scope. The current head is excluded so later
     /// positions within the same projector/partition/query window compare.
-    #[allow(dead_code)]
+    /// The change epoch is excluded as well: a partition has none until its
+    /// first write, and position zero before that write must compare as
+    /// before every position after it.
+    #[cfg(test)]
     pub(crate) fn issue_index_scope(
         &self,
         snapshot_scope: &OpaqueProtocolToken,
@@ -411,7 +439,6 @@ impl ProtocolResponseAccumulator {
             snapshot_scope,
             cursor.topology(),
             cursor.projection_partition(),
-            cursor.epoch(),
         )
     }
 
@@ -419,8 +446,7 @@ impl ProtocolResponseAccumulator {
         &self,
         snapshot_scope: &OpaqueProtocolToken,
         topology: &crate::projection_protocol::ProjectorTopologyId,
-        partition: &crate::projection_protocol::ProjectionPartition,
-        epoch: &crate::projection_protocol::ProjectionEpoch,
+        partition: &crate::projection_protocol::PartitionId,
     ) -> Result<OpaqueProtocolToken, ProtocolAccumulatorError> {
         #[derive(Serialize)]
         struct Material<'a> {
@@ -430,8 +456,7 @@ impl ProtocolResponseAccumulator {
             schema_hash: &'a str,
             snapshot_scope: &'a str,
             topology: &'a crate::projection_protocol::ProjectorTopologyId,
-            partition: &'a crate::projection_protocol::ProjectionPartition,
-            epoch: &'a str,
+            partition: &'a crate::projection_protocol::PartitionId,
         }
 
         self.with_envelope(|envelope| {
@@ -447,14 +472,13 @@ impl ProtocolResponseAccumulator {
                         snapshot_scope: snapshot_scope.as_str(),
                         topology,
                         partition,
-                        epoch: epoch.as_str(),
                     },
                 )
                 .map_err(|_| ProtocolAccumulatorError::Encoding)
         })?
     }
 
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(crate) fn issue_live_resume(
         &self,
         projection: &str,
@@ -466,7 +490,7 @@ impl ProtocolResponseAccumulator {
             snapshot_scope,
             cursor.topology(),
             cursor.projection_partition(),
-            cursor.epoch(),
+            Some(cursor.epoch()),
             cursor.position(),
         )
     }
@@ -476,8 +500,8 @@ impl ProtocolResponseAccumulator {
         projection: &str,
         snapshot_scope: &OpaqueProtocolToken,
         topology: &crate::projection_protocol::ProjectorTopologyId,
-        partition: &crate::projection_protocol::ProjectionPartition,
-        epoch: &crate::projection_protocol::ProjectionEpoch,
+        partition: &crate::projection_protocol::PartitionId,
+        epoch: Option<&crate::projection_protocol::ProjectionEpoch>,
         position: u64,
     ) -> Result<DistributedLiveCursor, ProtocolAccumulatorError> {
         let token = self.live_resume_token(
@@ -498,7 +522,7 @@ impl ProtocolResponseAccumulator {
     /// Verify a client-returned cursor against one server-derived static
     /// projector scope. The public projection/position fields select the
     /// finite candidate; hidden topology/partition/epoch remain MAC-bound.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(crate) fn verify_live_resume(
         &self,
         supplied: &DistributedLiveCursor,
@@ -514,7 +538,7 @@ impl ProtocolResponseAccumulator {
             &supplied.projection,
             expected.topology(),
             expected.projection_partition(),
-            expected.epoch(),
+            Some(expected.epoch()),
             expected.position(),
         )
     }
@@ -526,32 +550,42 @@ impl ProtocolResponseAccumulator {
         snapshot_scope: &OpaqueProtocolToken,
         projection: &str,
         topology: &crate::projection_protocol::ProjectorTopologyId,
-        partition: &crate::projection_protocol::ProjectionPartition,
-        epoch: &crate::projection_protocol::ProjectionEpoch,
+        partition: &crate::projection_protocol::PartitionId,
+        epoch: Option<&crate::projection_protocol::ProjectionEpoch>,
         position: u64,
     ) -> Result<(), ProtocolTokenError> {
         if supplied.projection != projection || supplied.position != position.to_string() {
             return Err(ProtocolTokenError::Mismatch);
         }
-        self.with_envelope(|envelope| {
-            self.inner.codec.verify(
-                &supplied.token,
-                ProtocolTokenPurpose::LiveResume,
-                &LiveResumeTokenMaterial {
-                    domain: "distributed.graphql.live-resume",
-                    version: 1,
-                    cache_scope: envelope.cache_scope.as_str(),
-                    schema_hash: &envelope.schema_hash,
-                    snapshot_scope: snapshot_scope.as_str(),
-                    projection,
-                    topology,
-                    partition,
-                    epoch: epoch.as_str(),
-                    position: position.to_string(),
-                },
-            )
-        })
-        .map_err(|_| ProtocolTokenError::InvalidMaterial)?
+        let verify = |epoch: Option<&crate::projection_protocol::ProjectionEpoch>| {
+            self.with_envelope(|envelope| {
+                self.inner.codec.verify(
+                    &supplied.token,
+                    ProtocolTokenPurpose::LiveResume,
+                    &LiveResumeTokenMaterial {
+                        domain: "distributed.graphql.live-resume",
+                        version: 1,
+                        cache_scope: envelope.cache_scope.as_str(),
+                        schema_hash: &envelope.schema_hash,
+                        snapshot_scope: snapshot_scope.as_str(),
+                        projection,
+                        topology,
+                        partition,
+                        epoch: epoch.map(crate::projection_protocol::ProjectionEpoch::as_str),
+                        position: position.to_string(),
+                    },
+                )
+            })
+            .map_err(|_| ProtocolTokenError::InvalidMaterial)?
+        };
+        // A cursor issued before the partition existed names no epoch and
+        // sits at position zero. It is the position before the first write of
+        // the epoch the partition is born with, so it stays valid after that
+        // write. A cursor that names an epoch is valid in that epoch only.
+        match verify(epoch) {
+            Err(_) if epoch.is_some() && position == 0 => verify(None),
+            verified => verified,
+        }
     }
 
     fn live_resume_token(
@@ -559,8 +593,8 @@ impl ProtocolResponseAccumulator {
         projection: &str,
         snapshot_scope: &OpaqueProtocolToken,
         topology: &crate::projection_protocol::ProjectorTopologyId,
-        partition: &crate::projection_protocol::ProjectionPartition,
-        epoch: &crate::projection_protocol::ProjectionEpoch,
+        partition: &crate::projection_protocol::PartitionId,
+        epoch: Option<&crate::projection_protocol::ProjectionEpoch>,
         position: u64,
     ) -> Result<OpaqueProtocolToken, ProtocolAccumulatorError> {
         self.with_envelope(|envelope| {
@@ -577,7 +611,7 @@ impl ProtocolResponseAccumulator {
                         projection,
                         topology,
                         partition,
-                        epoch: epoch.as_str(),
+                        epoch: epoch.map(crate::projection_protocol::ProjectionEpoch::as_str),
                         position: position.to_string(),
                     },
                 )
@@ -669,11 +703,11 @@ impl ProtocolResponseAccumulator {
         let obligation_count = receipt
             .projection_metadata
             .as_ref()
-            .map_or(receipt.obligations.len(), |metadata| {
-                metadata.obligations.len()
-            });
+            .map_or(0, |metadata| metadata.obligations.len());
+        // A receipt comes from the write side, which never reads the read
+        // model: it names no projected row revision for an observation.
         let observed = if receipt.state == CommandLedgerState::Atomic {
-            (0..obligation_count).collect::<Vec<_>>()
+            (0..obligation_count).map(|index| (index, None)).collect()
         } else {
             Vec::new()
         };
@@ -683,7 +717,6 @@ impl ProtocolResponseAccumulator {
             &receipt.causation_id,
             command_state(receipt.state),
             receipt.consistency,
-            &receipt.obligations,
             receipt.projection_metadata.as_ref(),
             receipt.direct_projection.as_ref(),
             &observed,
@@ -710,7 +743,7 @@ impl ProtocolResponseAccumulator {
             .evidence
             .iter()
             .filter(|evidence| evidence.state == CausalProjectionEvidenceState::Observed)
-            .map(|evidence| evidence.obligation_index)
+            .map(|evidence| (evidence.obligation_index, evidence.record.as_ref()))
             .collect::<Vec<_>>();
         self.record_command(
             self.metadata(
@@ -719,7 +752,6 @@ impl ProtocolResponseAccumulator {
                 causation_id,
                 public_command_state(status.state),
                 consistency,
-                &status.obligations,
                 status.projection_metadata.as_ref(),
                 status.direct_projection.as_ref(),
                 &observed,
@@ -741,15 +773,11 @@ impl ProtocolResponseAccumulator {
         causation_id: &str,
         state: DistributedCommandState,
         consistency: CommandConsistency,
-        obligations: &[CausalCommandProjectionObligation],
         projection_metadata: Option<&super::CommandProjectionMetadataV1>,
         direct_projection: Option<&crate::projection_protocol::SameTransactionProjectionEvidence>,
-        observed_obligation_indices: &[usize],
+        observed_obligations: &[(usize, Option<&crate::projection_protocol::RecordRevision>)],
         projection_disposition: Option<DistributedProjectionDisposition>,
     ) -> Result<DistributedCommandMetadata, ProtocolAccumulatorError> {
-        if projection_metadata.is_some() && !obligations.is_empty() {
-            return Err(ProtocolAccumulatorError::Encoding);
-        }
         if let Some(metadata) = projection_metadata {
             // Modeled metadata is a request-authorized capability even when it
             // carries no finite obligations and the ledger state is already
@@ -776,9 +804,7 @@ impl ProtocolResponseAccumulator {
         if projection_disposition.is_some() && projection_metadata.is_none() {
             return Err(ProtocolAccumulatorError::Encoding);
         }
-        if projection_disposition.is_some()
-            && (!obligations.is_empty() || direct_projection.is_some())
-        {
+        if projection_disposition.is_some() && direct_projection.is_some() {
             return Err(ProtocolAccumulatorError::Encoding);
         }
         if projection_disposition.is_some() {
@@ -794,25 +820,8 @@ impl ProtocolResponseAccumulator {
                 records: Vec::new(),
             });
         }
-        let mut expects = obligations
-            .iter()
-            .map(|obligation| {
-                self.issue_projection_obligation_scope(
-                    causation_id,
-                    &obligation.projector,
-                    &obligation.model,
-                    obligation.observation_kind,
-                    &obligation.scope,
-                )
-                .map(|scope_token| DistributedProjectionExpectation {
-                    projection: obligation.projector.clone(),
-                    model: obligation.model.clone(),
-                    scope_token,
-                })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        if let Some(metadata) = projection_metadata {
-            expects.extend(
+        let expects = projection_metadata
+            .map(|metadata| {
                 metadata
                     .obligations
                     .iter()
@@ -825,48 +834,42 @@ impl ProtocolResponseAccumulator {
                             }
                         })
                     })
-                    .collect::<Result<Vec<_>, _>>()?,
-            );
-        }
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .transpose()?
+            .unwrap_or_default();
         let mut seen_observations = std::collections::BTreeSet::new();
-        let observations = observed_obligation_indices
+        let observations = observed_obligations
             .iter()
-            .map(|index| {
+            .map(|(index, record)| {
                 if !seen_observations.insert(*index) {
                     return Err(ProtocolAccumulatorError::Encoding);
                 }
-                match projection_metadata {
-                    Some(metadata) => {
-                        let obligation = metadata
-                            .obligations
-                            .get(*index)
-                            .ok_or(ProtocolAccumulatorError::Encoding)?;
-                        let (projection, model) = modeled_obligation_label(metadata, obligation)?;
-                        Ok(DistributedProjectionObservation {
-                            causation_id: causation_id.to_string(),
-                            projection,
-                            model,
-                            scope_token: obligation.scope_token.clone(),
+                let metadata = projection_metadata.ok_or(ProtocolAccumulatorError::Encoding)?;
+                let obligation = metadata
+                    .obligations
+                    .get(*index)
+                    .ok_or(ProtocolAccumulatorError::Encoding)?;
+                let (projection, model) = modeled_obligation_label(metadata, obligation)?;
+                let record = record
+                    .map(|record| {
+                        if record.scope().model() != obligation.model {
+                            return Err(ProtocolAccumulatorError::Encoding);
+                        }
+                        Ok(DistributedObservedRecord {
+                            scope_token: self.issue_record_scope(record.scope())?,
+                            incarnation: record.incarnation().to_string(),
+                            revision: record.revision().to_string(),
                         })
-                    }
-                    None => {
-                        let obligation = obligations
-                            .get(*index)
-                            .ok_or(ProtocolAccumulatorError::Encoding)?;
-                        Ok(DistributedProjectionObservation {
-                            causation_id: causation_id.to_string(),
-                            projection: obligation.projector.clone(),
-                            model: obligation.model.clone(),
-                            scope_token: self.issue_projection_obligation_scope(
-                                causation_id,
-                                &obligation.projector,
-                                &obligation.model,
-                                obligation.observation_kind,
-                                &obligation.scope,
-                            )?,
-                        })
-                    }
-                }
+                    })
+                    .transpose()?;
+                Ok(DistributedProjectionObservation {
+                    causation_id: causation_id.to_string(),
+                    projection,
+                    model,
+                    scope_token: obligation.scope_token.clone(),
+                    record,
+                })
             })
             .collect::<Result<Vec<_>, ProtocolAccumulatorError>>()?;
         let records = direct_projection
@@ -965,13 +968,50 @@ impl ProtocolResponseAccumulator {
         Ok(())
     }
 
-    #[allow(dead_code)]
+    #[cfg(any(test, feature = "gateway"))]
     pub(crate) fn snapshot(&self) -> Result<DistributedEnvelopeV1, ProtocolAccumulatorError> {
         self.inner
             .envelope
             .lock()
             .map(|envelope| envelope.clone())
             .map_err(|_| ProtocolAccumulatorError::Poisoned)
+    }
+
+    #[cfg(feature = "gateway")]
+    pub(crate) fn enable_gateway(
+        &self,
+        capture: crate::graphql::delivery::GatewayCapture,
+    ) -> Result<(), ProtocolAccumulatorError> {
+        *self
+            .inner
+            .gateway
+            .lock()
+            .map_err(|_| ProtocolAccumulatorError::Poisoned)? = Some(capture);
+        Ok(())
+    }
+    #[cfg(feature = "gateway")]
+    pub(crate) fn gateway_enabled(&self) -> bool {
+        self.inner.gateway.lock().is_ok_and(|state| state.is_some())
+    }
+    #[cfg(feature = "gateway")]
+    pub(crate) fn record_gateway_versions(
+        &self,
+        versions: &crate::graphql::delivery::VersionVector,
+    ) -> Result<(), String> {
+        let mut state = self
+            .inner
+            .gateway
+            .lock()
+            .map_err(|_| "gateway capture unavailable")?;
+        if let Some(state) = state.as_mut() {
+            state.validator = Some(crate::graphql::delivery::validator(
+                &self.inner.codec,
+                &state.identity,
+                &state.key,
+                versions,
+            )?);
+        }
+        Ok(())
     }
 
     pub(crate) fn attach(&self, response: &mut Response) -> Result<(), ProtocolAccumulatorError> {
@@ -998,6 +1038,21 @@ impl ProtocolResponseAccumulator {
             serde_json::to_value(envelope).map_err(|_| ProtocolAccumulatorError::Encoding)?;
         let value = Value::from_json(json).map_err(|_| ProtocolAccumulatorError::Encoding)?;
         response.extensions.insert("distributed".into(), value);
+        #[cfg(feature = "gateway")]
+        if response.errors.is_empty() {
+            let state = self
+                .inner
+                .gateway
+                .lock()
+                .map_err(|_| ProtocolAccumulatorError::Poisoned)?;
+            if let Some(validator) = state.as_ref().and_then(|state| state.validator.as_ref()) {
+                response.extensions.insert(
+                    "gatewayDelivery".into(),
+                    Value::from_json(serde_json::json!({"validator":validator}))
+                        .map_err(|_| ProtocolAccumulatorError::Encoding)?,
+                );
+            }
+        }
         Ok(())
     }
 }

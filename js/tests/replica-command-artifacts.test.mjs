@@ -32,6 +32,55 @@ const GENERATED_DRAINING_COMMAND = JSON.parse(
 	)
 );
 
+const GENERATED_UNSIGNED_COMMAND = JSON.parse(readFileSync(new URL(
+	'../../distributed_cli/tests/fixtures/generated-unsigned-command.json', import.meta.url
+), 'utf8'));
+
+test('generated unsigned command preserves exact optimistic and transport values', () => {
+	for (const priority of [0, 1, Number.MAX_SAFE_INTEGER]) {
+		const prepared = prepareReplicaCommand(GENERATED_UNSIGNED_COMMAND, {
+			id: GENERATED_UUID, tenantId: 'tenant-1', title: 'Update', priority
+		}, { commandId: COMMAND_ID });
+		assert.equal(prepared.transport.variables.input.priority, priority);
+		assert.equal(prepared.optimistic.operations[0].fields.priority, priority);
+		assert.equal(prepared.optimistic.operations[0].kind, 'upsert');
+	}
+});
+
+test('unsigned command preparation rejects invalid values before producing optimism', () => {
+	for (const [codec, maximum] of [['uint8', 255], ['uint16', 65_535],
+		['uint32', 4_294_967_295], ['uint64_safe_integer', Number.MAX_SAFE_INTEGER]]) {
+		const artifact = structuredClone(GENERATED_UNSIGNED_COMMAND);
+		artifact.input.definition.fields.find(field => field.name === 'priority').codec = codec;
+		const prepare = priority => prepareReplicaCommand(artifact, {
+			id: GENERATED_UUID, tenantId: 'tenant-1', title: 'Update', priority
+		}, { commandId: COMMAND_ID });
+		assert.equal(prepare(maximum).optimistic.operations[0].fields.priority, maximum);
+		for (const invalid of [-1, -0, 0.5, NaN, Infinity, -Infinity, maximum + 1,
+			2 ** 64, '1', 1n, null, undefined]) {
+			assert.throws(() => prepare(invalid), error =>
+				error instanceof ReplicaCommandContractError && /input.priority/.test(error.message));
+		}
+	}
+});
+
+test('compiled recovery-only command drops unused presets without weakening validation', () => {
+	const artifact = JSON.parse(readFileSync(new URL(
+		'../../distributed_cli/tests/fixtures/generated-recovery-preset-command.json', import.meta.url
+	), 'utf8'));
+	assert.deepEqual(artifact.protocol.trustedPresets, [{ name: 'priority', codec: 'int32' }]);
+	assert.equal(artifact.trustedPresets, undefined);
+	assert.deepEqual(artifact.projection.preview.operations, []);
+	assert.ok(artifact.projection.preview.recoveries.length > 0);
+	const input = { id: GENERATED_UUID, tenantId: 'tenant-1', title: 'Prepare' };
+	assert.doesNotThrow(() => prepareReplicaCommand(artifact, input, { commandId: COMMAND_ID }));
+	const invalid = { ...artifact, trustedPresets: artifact.protocol.trustedPresets };
+	assert.throws(
+		() => prepareReplicaCommand(invalid, input, { commandId: COMMAND_ID }),
+		/artifact.trustedPresets\[0\]/
+	);
+});
+
 const scalarField = (
 	name,
 	typeName = 'String',
@@ -147,7 +196,6 @@ function projectionArtifact(operations, capabilities, recoveries = []) {
 			Object.freeze({
 				programId: PROGRAM,
 				bindingId: BINDING,
-				epoch: 'todos-v1',
 				programIrVersion: 1,
 				operationSemanticsVersion: 1
 			})
@@ -275,7 +323,6 @@ function projectedArtifact(directOverrides = {}) {
 			model: 'Todo',
 			identityFields: ['id'],
 			partition: inputValue(['meta', 'count']),
-			changeEpoch: 'todos-v1',
 			...directOverrides
 		}
 	});
@@ -467,6 +514,44 @@ test('real default generators produce canonical values', () => {
 
 	assert.match(prepared.input.id, /^[0-9a-f]{8}-[0-9a-f]{4}-7/);
 	assert.match(prepared.input.code, /^[0-7][0-9A-HJKMNP-TV-Z]{25}$/);
+});
+
+test('now() previews unix milliseconds as a canonical decimal string', () => {
+	const artifact = baseArtifact({
+		inputDefaults: {
+			version: 1,
+			defaults: [
+				{ path: ['code'], generator: 'now' },
+				{ path: ['id'], generator: 'uuid_v7' }
+			]
+		}
+	});
+	const prepared = prepareReplicaCommand(
+		artifact,
+		{ meta: { count: 1 }, title: 'Stamped' },
+		{ commandId: COMMAND_ID, generators: { now: () => 1700000000123 } }
+	);
+	assert.equal(prepared.input.code, '1700000000123');
+	const real = prepareReplicaCommand(
+		artifact,
+		{ meta: { count: 1 }, title: 'Stamped' },
+		{ commandId: COMMAND_ID }
+	);
+	assert.match(real.input.code, /^[1-9][0-9]{12,}$/);
+	for (const bad of [-1, 1.5, Number.NaN, 2 ** 53]) {
+		assert.throws(
+			() =>
+				prepareReplicaCommand(
+					artifact,
+					{ meta: { count: 1 }, title: 'Bad clock' },
+					{ commandId: COMMAND_ID, generators: { now: () => bad } }
+				),
+			(error) =>
+				error instanceof ReplicaCommandContractError &&
+				error.code === 'REPLICA_COMMAND_INPUT_INVALID' &&
+				error.path === 'input.code'
+		);
+	}
 });
 
 test('public UUIDv7 generation supports caller-correlated optimistic record ids', () => {

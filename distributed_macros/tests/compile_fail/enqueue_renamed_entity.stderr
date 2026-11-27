@@ -1,7 +1,0 @@
-error[E0609]: no field `entity` on type `&mut Order`
-  --> tests/compile_fail/enqueue_renamed_entity.rs:22:5
-   |
-22 |     #[enqueue("order.initialized")]
-   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ unknown field
-   |
-   = note: this error originates in the attribute macro `enqueue` (in Nightly builds, run with -Z macro-backtrace for more info)

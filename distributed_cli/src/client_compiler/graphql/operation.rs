@@ -12,7 +12,7 @@ pub(crate) fn compile_document(
             Pos::default(),
         ));
     }
-    let parsed = parse_query(&document.source).map_err(|error| {
+    let mut parsed = parse_query(&document.source).map_err(|error| {
         let pos = error.positions().next().unwrap_or_default();
         source_error(
             "client.graphql.parse",
@@ -21,7 +21,7 @@ pub(crate) fn compile_document(
             pos,
         )
     })?;
-    let (name, operation) = match &parsed.operations {
+    let (name, operation) = match &mut parsed.operations {
         DocumentOperations::Single(operation) => {
             return Err(source_error(
                 "client.operation.named_required",
@@ -31,7 +31,7 @@ pub(crate) fn compile_document(
             ));
         }
         DocumentOperations::Multiple(operations) if operations.len() == 1 => {
-            let (name, operation) = operations.iter().next().expect("length checked");
+            let (name, operation) = operations.iter_mut().next().expect("length checked");
             (name.as_str().to_string(), operation)
         }
         DocumentOperations::Multiple(operations) => {
@@ -60,6 +60,17 @@ pub(crate) fn compile_document(
         ));
     }
     let compiler_directives = compiler_directives(&operation.node, document)?;
+    let mut window = if compiler_directives.window {
+        Some(apply_window(
+            &mut operation.node,
+            manifest,
+            document,
+            operation.pos,
+        )?)
+    } else {
+        None
+    };
+    let operation = &*operation;
     let variables = compile_variables(&operation.node, document)?;
     let mut expander = FragmentExpander::new(&parsed.fragments, document);
     let root_fields =
@@ -68,7 +79,7 @@ pub(crate) fn compile_document(
 
     let root_name = root_field.first.node.name.node.as_str();
     let root_manifest = manifest
-        .root(RootOperation::Query, root_name)
+        .root(ClientRootOperation::Query, root_name)
         .ok_or_else(|| {
             source_error(
                 "client.root.denied_or_unknown",
@@ -99,7 +110,7 @@ pub(crate) fn compile_document(
         document,
     )?;
     let mut selection = match root_manifest.kind {
-        RootKind::List | RootKind::ByPk => compile_model_object(
+        ClientRootKind::List | ClientRootKind::ByPk => compile_model_object(
             &root_field,
             model,
             &ModelCompileContext::new(manifest, &variables, document),
@@ -107,7 +118,7 @@ pub(crate) fn compile_document(
             &mut expander,
             2,
         )?,
-        RootKind::Aggregate => {
+        ClientRootKind::Aggregate => {
             let semantics = root_manifest.aggregate.as_ref().ok_or_else(|| {
                 ClientCompileError::manifest(
                     "client.manifest.aggregate_semantics",
@@ -132,7 +143,7 @@ pub(crate) fn compile_document(
             )?
         }
     };
-    if root_manifest.kind == RootKind::List {
+    if root_manifest.kind == ClientRootKind::List {
         let dependencies = query_plan_field_dependencies(
             model,
             root_manifest.filter.as_ref(),
@@ -148,17 +159,20 @@ pub(crate) fn compile_document(
             root_field.first.pos,
         )?;
     }
+    if let Some(window) = &mut window {
+        bind_window_keys(window, &selection, document, operation.pos)?;
+    }
     validate_used_variables(&variables, &used_variables, document, operation.pos)?;
     expander.reject_unused_fragments()?;
 
     let cardinality = match root_manifest.kind {
-        RootKind::List => Cardinality::Many,
-        RootKind::ByPk => Cardinality::One,
-        RootKind::Aggregate => Cardinality::One,
+        ClientRootKind::List => Cardinality::Many,
+        ClientRootKind::ByPk => Cardinality::One,
+        ClientRootKind::Aggregate => Cardinality::One,
     };
     let coverage = match root_manifest.kind {
-        RootKind::Aggregate => Some(complete_coverage()),
-        RootKind::List | RootKind::ByPk => compile_coverage(
+        ClientRootKind::Aggregate => Some(complete_coverage()),
+        ClientRootKind::List | ClientRootKind::ByPk => compile_coverage(
             root_manifest.pagination.as_ref(),
             &root_manifest.arguments,
             &root_manifest.name,
@@ -178,13 +192,16 @@ pub(crate) fn compile_document(
         &root_field.first.node,
         coverage.as_ref(),
         0,
-        root_manifest.kind == RootKind::List,
+        root_manifest.kind == ClientRootKind::List,
     )?;
     let root = CompiledRoot {
         response_key: root_field.first.node.response_key().node.to_string(),
         field: root_name.to_string(),
         cardinality,
-        nullable: matches!(root_manifest.kind, RootKind::ByPk | RootKind::Aggregate),
+        nullable: matches!(
+            root_manifest.kind,
+            ClientRootKind::ByPk | ClientRootKind::Aggregate
+        ),
         arguments: compiled_arguments,
         dependencies: root_manifest.dependencies.clone(),
         coverage,
@@ -233,6 +250,7 @@ pub(crate) fn compile_document(
         variables,
         variable_codec,
         root,
+        window,
     })
 }
 
@@ -240,6 +258,7 @@ pub(crate) fn compile_document(
 pub(super) struct CompilerDirectives {
     load: bool,
     live: bool,
+    window: bool,
 }
 
 pub(super) fn compiler_directives(
@@ -269,6 +288,7 @@ pub(super) fn compiler_directives(
         match name {
             "load" => result.load = true,
             "live" => result.live = true,
+            "window" => result.window = true,
             "skip" | "include" => {
                 return Err(source_error(
                     "client.directive.conditional_unsupported",
@@ -296,7 +316,7 @@ pub(super) fn compile_live(
     query_name: &str,
     variables: &[CompiledVariable],
     root: &CompiledRoot,
-    query_manifest: &ManifestRoot,
+    query_manifest: &ClientRoot,
     manifest: &ClientManifest,
     document: &ClientDocument,
     position: Pos,
@@ -313,7 +333,7 @@ pub(super) fn compile_live(
         ));
     }
     let subscription = manifest
-        .root(RootOperation::Subscription, &query_manifest.name)
+        .root(ClientRootOperation::Subscription, &query_manifest.name)
         .ok_or_else(|| {
             source_error(
                 "client.live.root_missing",
@@ -350,8 +370,8 @@ pub(super) fn compile_live(
     })
 }
 
-pub(super) fn arguments_compatible(left: &[ManifestArgument], right: &[ManifestArgument]) -> bool {
-    let canonical = |arguments: &[ManifestArgument]| {
+pub(super) fn arguments_compatible(left: &[ClientArgument], right: &[ClientArgument]) -> bool {
+    let canonical = |arguments: &[ClientArgument]| {
         arguments
             .iter()
             .map(|argument| {
@@ -537,14 +557,15 @@ pub(super) fn variable_type_compatible(variable: &Type, argument: &Type) -> bool
     }
 }
 
-pub(crate) fn typescript_scalar(
-    field: &CompiledScalar,
-) -> Result<&'static str, ClientCompileError> {
+pub(crate) fn typescript_scalar(field: &CompiledScalar) -> Result<String, ClientCompileError> {
     match field.codec.as_str() {
-        "boolean" => Ok("boolean"),
-        "float64" | "int32" | "json_number_precision_limited" => Ok("number"),
-        "string" | "base64" | "string_unvalidated_timestamp" => Ok("string"),
-        "json" => Ok("unknown"),
+        "boolean" => Ok("boolean".into()),
+        "float64" | "int32" | "json_number_precision_limited" => Ok("number".into()),
+        "string" | "base64" | "string_unvalidated_timestamp" => Ok("string".into()),
+        "json" => Ok(field
+            .json_type
+            .as_ref()
+            .map_or_else(|| "unknown".into(), typescript_json)),
         codec => Err(ClientCompileError::manifest(
             "client.scalar.codec_unsupported",
             format!(
@@ -552,6 +573,60 @@ pub(crate) fn typescript_scalar(
                 field.field
             ),
         )),
+    }
+}
+
+/// The TypeScript type of a JSON value of this shape (read-only, like every
+/// generated data type).
+pub(crate) fn typescript_json(shape: &distributed::table::JsonShape) -> String {
+    use distributed::table::JsonShape;
+    let quote = |value: &str| serde_json::to_string(value).expect("a string serializes");
+    let element = |shape: &JsonShape| {
+        let item = typescript_json(shape);
+        // A union or a readonly array needs parentheses before `[]`.
+        if item.contains(' ') && !item.starts_with('{') {
+            format!("({item})")
+        } else {
+            item
+        }
+    };
+    match shape {
+        JsonShape::Boolean => "boolean".into(),
+        JsonShape::Number => "number".into(),
+        JsonShape::String => "string".into(),
+        JsonShape::Enum { values } if values.is_empty() => "never".into(),
+        JsonShape::Enum { values } => values
+            .iter()
+            .map(|value| quote(value))
+            .collect::<Vec<_>>()
+            .join(" | "),
+        JsonShape::Array { items } => format!("readonly {}[]", element(items)),
+        JsonShape::Tuple { items } => format!(
+            "readonly [{}]",
+            items
+                .iter()
+                .map(typescript_json)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        JsonShape::Nullable { value } => format!("{} | null", typescript_json(value)),
+        JsonShape::Map { values } => {
+            format!("{{ readonly [key: string]: {} }}", typescript_json(values))
+        }
+        JsonShape::Object { fields } if fields.is_empty() => "{}".into(),
+        JsonShape::Object { fields } => format!(
+            "{{ {} }}",
+            fields
+                .iter()
+                .map(|field| format!(
+                    "readonly {}: {};",
+                    quote(&field.name),
+                    typescript_json(&field.shape)
+                ))
+                .collect::<Vec<_>>()
+                .join(" ")
+        ),
+        JsonShape::Unknown => "unknown".into(),
     }
 }
 
@@ -592,6 +667,45 @@ pub(super) fn source_error(
 #[cfg(test)]
 mod local_tests {
     use super::module_stem;
+
+    #[test]
+    fn json_shapes_render_exact_readonly_types() {
+        use distributed::table::{JsonField, JsonShape};
+        let tile = JsonShape::Enum {
+            values: vec!["hole".into(), "player".into()],
+        };
+        let board = JsonShape::Array {
+            items: Box::new(JsonShape::Array {
+                items: Box::new(tile),
+            }),
+        };
+        assert_eq!(
+            super::typescript_json(&board),
+            r#"readonly (readonly ("hole" | "player")[])[]"#
+        );
+        let object = JsonShape::Object {
+            fields: vec![
+                JsonField {
+                    name: "at".into(),
+                    shape: JsonShape::Tuple {
+                        items: vec![JsonShape::Number, JsonShape::Number],
+                    },
+                },
+                JsonField {
+                    name: "tags".into(),
+                    shape: JsonShape::Map {
+                        values: Box::new(JsonShape::Nullable {
+                            value: Box::new(JsonShape::String),
+                        }),
+                    },
+                },
+            ],
+        };
+        assert_eq!(
+            super::typescript_json(&object),
+            r#"{ readonly "at": readonly [number, number]; readonly "tags": { readonly [key: string]: string | null }; }"#
+        );
+    }
 
     #[test]
     fn module_names_are_portable() {

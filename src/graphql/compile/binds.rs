@@ -18,13 +18,70 @@ pub enum BindValue {
     Json(JsonValue),
 }
 
+/// Two binds are equal exactly when the driver receives the same value: an
+/// `F64` by its bits, a `Json` by the text it is bound as. Live sharing keys
+/// on this, so equal binds must never be told apart by SQL.
+impl PartialEq for BindValue {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Null, Self::Null) => true,
+            (Self::Bool(a), Self::Bool(b)) => a == b,
+            (Self::I64(a), Self::I64(b)) => a == b,
+            (Self::F64(a), Self::F64(b)) => a.to_bits() == b.to_bits(),
+            (Self::Text(a), Self::Text(b)) => a == b,
+            (Self::Bytes(a), Self::Bytes(b)) => a == b,
+            (Self::Json(a), Self::Json(b)) => bound_text(a) == bound_text(b),
+            _ => false,
+        }
+    }
+}
+
+impl Eq for BindValue {}
+
+/// The text a `Json` bind is sent as (see `apply_binds!`).
+fn bound_text(value: &JsonValue) -> String {
+    value.to_string()
+}
+
+impl std::hash::Hash for BindValue {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        std::mem::discriminant(self).hash(state);
+        match self {
+            Self::Null => {}
+            Self::Bool(value) => value.hash(state),
+            Self::I64(value) => value.hash(state),
+            Self::F64(value) => value.to_bits().hash(state),
+            Self::Text(value) => value.hash(state),
+            Self::Bytes(value) => value.hash(state),
+            Self::Json(value) => bound_text(value).hash(state),
+        }
+    }
+}
+
+/// Give a numeric column one bind type.
+///
+/// The Postgres driver prepares a statement once per connection and reuses
+/// its parameter types for every later bind of the same SQL. Bound as an
+/// integer where the statement was first prepared with a float (or the other
+/// way round), a value's bytes are read as the other type and the comparison
+/// silently goes wrong: `2.0 <> 2` comes back true.
+fn for_column(bind: BindValue, column_type: &ColumnType) -> Result<BindValue, String> {
+    match (column_type, bind) {
+        (ColumnType::Float, BindValue::I64(value)) => Ok(BindValue::F64(value as f64)),
+        (ColumnType::Integer | ColumnType::UnsignedInteger, BindValue::F64(value)) => {
+            Err(format!("expected integer, got `{value}`"))
+        }
+        (_, bind) => Ok(bind),
+    }
+}
+
 pub(super) fn operand_to_bind(
     op: &Operand,
     session: &Session,
     column_type: &ColumnType,
 ) -> Result<BindValue, String> {
     match op {
-        Operand::Lit(lit) => lit_to_bind(lit),
+        Operand::Lit(lit) => for_column(lit_to_bind(lit)?, column_type),
         Operand::Claim(c) => {
             let raw = session
                 .get(&c.header)
@@ -71,13 +128,14 @@ pub(super) fn value_to_bind(v: &Value, column_type: &ColumnType) -> Result<BindV
         Value::Null => Ok(BindValue::Null),
         Value::Boolean(b) => Ok(BindValue::Bool(*b)),
         Value::Number(n) => {
-            if let Some(i) = n.as_i64() {
-                Ok(BindValue::I64(i))
+            let bind = if let Some(i) = n.as_i64() {
+                BindValue::I64(i)
             } else if let Some(f) = n.as_f64() {
-                Ok(BindValue::F64(f))
+                BindValue::F64(f)
             } else {
-                Err("number out of range".into())
-            }
+                return Err("number out of range".into());
+            };
+            for_column(bind, column_type)
         }
         Value::String(s) => match column_type {
             ColumnType::Bytes => {
@@ -108,6 +166,28 @@ fn value_to_json(v: &Value) -> Result<JsonValue, String> {
 #[cfg(test)]
 mod parse_claim_tests {
     use super::*;
+
+    #[test]
+    fn a_numeric_column_always_binds_one_type() {
+        let session = Session::new();
+        let literal = |value: LitValue, column: ColumnType| {
+            operand_to_bind(&Operand::Lit(value), &session, &column)
+        };
+        assert!(matches!(
+            literal(LitValue::I64(2), ColumnType::Float),
+            Ok(BindValue::F64(value)) if value == 2.0
+        ));
+        assert!(matches!(
+            value_to_bind(&Value::from(2), &ColumnType::Float),
+            Ok(BindValue::F64(value)) if value == 2.0
+        ));
+        assert!(matches!(
+            value_to_bind(&Value::from(2), &ColumnType::Integer),
+            Ok(BindValue::I64(2))
+        ));
+        assert!(literal(LitValue::F64(2.5), ColumnType::Integer).is_err());
+        assert!(value_to_bind(&Value::from(2.5), &ColumnType::UnsignedInteger).is_err());
+    }
 
     #[test]
     fn integer_claim_ok_and_fail() {

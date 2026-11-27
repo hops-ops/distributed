@@ -68,7 +68,6 @@ pub(crate) mod transport_outcome {
     pub(crate) const ACK: &str = "ack";
     pub(crate) const NACK: &str = "nack";
     pub(crate) const DEAD_LETTER: &str = "dead_letter";
-    pub(crate) const PARK: &str = "park";
     pub(crate) const IGNORED: &str = "ignored";
     pub(crate) const LOG_AND_ACK: &str = "log_and_ack";
 }
@@ -82,14 +81,12 @@ pub(crate) mod failure_class {
 pub(crate) mod failure_action {
     pub(crate) const NACK: &str = "nack";
     pub(crate) const DEAD_LETTER: &str = "dead_letter";
-    pub(crate) const PARK: &str = "park";
     pub(crate) const LOG_AND_ACK: &str = "log_and_ack";
     pub(crate) const STOP: &str = "stop";
     pub(crate) const RECV_ERROR: &str = "recv_error";
     pub(crate) const SETTLE_ACK: &str = "settle_ack";
     pub(crate) const SETTLE_NACK: &str = "settle_nack";
     pub(crate) const SETTLE_DEAD_LETTER: &str = "settle_dead_letter";
-    pub(crate) const SETTLE_PARK: &str = "settle_park";
     pub(crate) const SETTLE_ERROR: &str = "settle_error";
 }
 
@@ -162,7 +159,29 @@ pub(crate) fn handler_error_status(error: &HandlerError) -> &'static str {
         | HandlerError::ProjectionTerminalRecorded { .. }
         | HandlerError::ProjectionDeliveryHalted { .. } => dispatch_status::REPOSITORY_ERROR,
         HandlerError::GuardRejected(_) => dispatch_status::GUARD_REJECTED,
-        HandlerError::Other(_) => dispatch_status::OTHER_ERROR,
+        HandlerError::ApplicationReloading | HandlerError::Other(_) => dispatch_status::OTHER_ERROR,
+    }
+}
+
+/// The dispatch status of a typed command that did not succeed, in the
+/// vocabulary [`handler_error_status`] already uses.
+#[cfg(feature = "metrics")]
+pub(crate) fn causal_error_status(error: &crate::microsvc::CausalDispatchError) -> &'static str {
+    use crate::microsvc::CausalDispatchError as Error;
+    match error {
+        Error::BadRequest(_) => dispatch_status::DECODE_FAILED,
+        Error::Unauthorized | Error::Forbidden => dispatch_status::UNAUTHORIZED,
+        Error::Rejected { status: 404, .. } => dispatch_status::NOT_FOUND,
+        Error::Rejected {
+            status: 401 | 403, ..
+        } => dispatch_status::UNAUTHORIZED,
+        Error::Rejected { status, .. } if *status < 500 => dispatch_status::REJECTED,
+        Error::CommandIdReuse | Error::Expired => dispatch_status::REJECTED,
+        Error::Handler(error) => handler_error_status(error),
+        Error::InProgress
+        | Error::ConcurrentWrite
+        | Error::Internal(_)
+        | Error::Rejected { .. } => dispatch_status::OTHER_ERROR,
     }
 }
 
@@ -187,7 +206,6 @@ pub(crate) fn failure_action_label(action: FailureAction) -> &'static str {
     match action {
         FailureAction::Nack => failure_action::NACK,
         FailureAction::DeadLetter => failure_action::DEAD_LETTER,
-        FailureAction::Park => failure_action::PARK,
         FailureAction::LogAndAck => failure_action::LOG_AND_ACK,
         FailureAction::Stop => failure_action::STOP,
     }
@@ -198,7 +216,6 @@ pub(crate) fn settle_failure_action(settle_action: &'static str) -> &'static str
         transport_outcome::ACK => failure_action::SETTLE_ACK,
         transport_outcome::NACK => failure_action::SETTLE_NACK,
         transport_outcome::DEAD_LETTER => failure_action::SETTLE_DEAD_LETTER,
-        transport_outcome::PARK => failure_action::SETTLE_PARK,
         _ => failure_action::SETTLE_ERROR,
     }
 }

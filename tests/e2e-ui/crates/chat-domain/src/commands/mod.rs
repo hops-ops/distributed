@@ -5,6 +5,4 @@
 
 mod post;
 
-pub use post::{
-    canonical_near_unix_millis, handle_post, post, ChatPostInput, ChatPostPayload, Post,
-};
+pub use post::{handle_post, post, ChatPostInput, ChatPostPayload, Post};

@@ -1,35 +1,97 @@
 use super::*;
 
+/// A live record's key may belong to one partition only. `staged` holds the
+/// records a write is about to store over `stored`.
+pub(super) fn ensure_live_record_identity_available(
+    stored: &HashMap<ProjectionRecordScope, ProjectionRecordMetadata>,
+    staged: &HashMap<ProjectionRecordScope, ProjectionRecordMetadata>,
+    metadata: &ProjectionRecordMetadata,
+) -> Result<(), ProjectionProtocolError> {
+    if metadata.tombstone {
+        return Ok(());
+    }
+    let candidate = metadata.revision.scope();
+    let records = staged.iter().chain(
+        stored
+            .iter()
+            .filter(|(scope, _)| !staged.contains_key(*scope)),
+    );
+    for (scope, stored) in records {
+        if stored.tombstone
+            || scope == candidate
+            || scope.topology() != candidate.topology()
+            || scope.model() != candidate.model()
+            || scope.key_digest() != candidate.key_digest()
+        {
+            continue;
+        }
+        if scope.canonical_key_bytes() != candidate.canonical_key_bytes() {
+            return Err(corrupt_storage(format!(
+                "projection live-record key digest collision for model `{}`",
+                candidate.model()
+            )));
+        }
+        return Err(corrupt_storage(format!(
+            "projection live record for model `{}` is already owned by another partition",
+            candidate.model()
+        )));
+    }
+    Ok(())
+}
+
+/// The compaction point that keeps `retention` once a partition's log has
+/// grown to `head`, proven against the stored log. Changes above the stored
+/// head are the caller's own contiguous appends and need no proof.
+pub(super) fn retained_through(
+    partition: Option<&PartitionState>,
+    head: u64,
+    retention: ProjectionChangeRetention,
+) -> Result<u64, ProjectionProtocolError> {
+    let through = head.saturating_sub(retention.max_retained_changes());
+    if let Some(partition) = partition {
+        partition.check_compaction(through.min(partition.change_head))?;
+    }
+    Ok(through)
+}
+
+/// The change that follows `head` in a partition's log. Advances `head`;
+/// storing the change is the caller's.
+pub(super) fn next_change(
+    partition_key: &PartitionKey,
+    change_epoch: &ProjectionEpoch,
+    head: &mut u64,
+    pending: PendingChange,
+) -> Result<ProjectionChange, ProjectionProtocolError> {
+    let position = head
+        .checked_add(1)
+        .ok_or(ProjectionProtocolError::PositionOverflow {
+            domain: "projection change",
+        })?;
+    let cursor = ProjectionChangeCursor::new(
+        partition_key.topology.clone(),
+        partition_key.partition.clone(),
+        change_epoch.clone(),
+        position,
+    )?;
+    *head = position;
+    Ok(ProjectionChange {
+        cursor,
+        kind: pending.kind,
+        causation_id: pending.causation_id,
+        observation_kind: pending.observation_kind,
+        scope: pending.scope,
+        revision: pending.revision,
+        failure_id: pending.failure_id,
+        program_id: pending.program_id,
+    })
+}
+
 impl InMemoryProjectionProtocolState {
     pub(super) fn ensure_live_record_identity_available(
         &self,
         metadata: &ProjectionRecordMetadata,
     ) -> Result<(), ProjectionProtocolError> {
-        if metadata.tombstone {
-            return Ok(());
-        }
-        let candidate = metadata.revision.scope();
-        for (scope, stored) in &self.records {
-            if stored.tombstone
-                || scope == candidate
-                || scope.topology() != candidate.topology()
-                || scope.model() != candidate.model()
-                || scope.key_digest() != candidate.key_digest()
-            {
-                continue;
-            }
-            if scope.canonical_key_bytes() != candidate.canonical_key_bytes() {
-                return Err(ProjectionProtocolError::InvalidBatch(format!(
-                    "projection live-record key digest collision for model `{}`",
-                    candidate.model()
-                )));
-            }
-            return Err(ProjectionProtocolError::InvalidBatch(format!(
-                "projection live record for model `{}` is already owned by another partition",
-                candidate.model()
-            )));
-        }
-        Ok(())
+        ensure_live_record_identity_available(&self.records, &HashMap::new(), metadata)
     }
 
     pub(super) fn require_registered_topology(
@@ -45,315 +107,149 @@ impl InMemoryProjectionProtocolState {
         }
     }
 
-    pub(super) fn ensure_partition(
+    /// The partition's stored change epoch, or a newly minted one for a
+    /// partition that does not exist yet. Pass it to
+    /// [`partition_mut`](Self::partition_mut) to keep it.
+    pub(super) fn change_epoch(&self, key: &PartitionKey) -> ProjectionEpoch {
+        self.partitions
+            .get(key)
+            .map_or_else(ProjectionEpoch::mint, |partition| {
+                partition.change_epoch.clone()
+            })
+    }
+
+    /// The partition's state, created at the initial generation with
+    /// `change_epoch` on first use. An existing partition keeps its epoch.
+    pub(super) fn partition_mut(
         &mut self,
         key: &PartitionKey,
         change_epoch: &ProjectionEpoch,
-    ) -> Result<(), ProjectionProtocolError> {
-        match self.partitions.get(key) {
-            Some(partition) if &partition.change_epoch != change_epoch => {
-                return Err(ProjectionProtocolError::ScopeMismatch {
-                    field: "projection change epoch",
-                });
-            }
-            Some(_) => {}
-            None => {
-                self.partitions
-                    .insert(key.clone(), PartitionState::new(change_epoch.clone()));
-                self.generations.insert(
-                    GenerationKey {
-                        partition: key.clone(),
-                        generation: ProjectionGeneration::initial(),
-                    },
-                    GenerationLineage::initial(),
-                );
-            }
+    ) -> &mut PartitionState {
+        if !self.partitions.contains_key(key) {
+            self.generations.insert(
+                GenerationKey {
+                    partition: key.clone(),
+                    generation: ProjectionGeneration::initial(),
+                },
+                GenerationLineage::initial(),
+            );
         }
-        Ok(())
+        self.partitions
+            .entry(key.clone())
+            .or_insert_with(|| PartitionState::new(change_epoch.clone()))
     }
 
-    pub(super) fn validate_partition(
+    /// Check an input's durable identities and partition fences, then
+    /// classify it.
+    pub(super) fn input_disposition(
         &self,
-        key: &PartitionKey,
         input: &TrustedProjectionInput,
-        change_epoch: &ProjectionEpoch,
-    ) -> Result<(), ProjectionProtocolError> {
+    ) -> Result<ProjectionInputDisposition, ProjectionProtocolError> {
         self.require_registered_topology(input.cursor.topology())?;
-        self.validate_known_input_identity(input)?;
-        let Some(partition) = self.partitions.get(key) else {
-            if input.generation != ProjectionGeneration::initial() {
-                return Err(ProjectionProtocolError::GenerationFenced {
-                    expected: ProjectionGeneration::initial().get(),
-                    actual: input.generation.get(),
-                });
-            }
-            self.validate_gap_free(&input.cursor, input.gap_free)?;
-            self.validate_input_identity(input)?;
-            return Ok(());
-        };
-        if &partition.change_epoch != change_epoch {
-            return Err(ProjectionProtocolError::ScopeMismatch {
-                field: "projection change epoch",
-            });
-        }
-        if input.generation != partition.active_generation {
-            return Err(ProjectionProtocolError::GenerationFenced {
-                expected: partition.active_generation.get(),
-                actual: input.generation.get(),
-            });
-        }
-        if !self.generations.contains_key(&GenerationKey {
-            partition: key.clone(),
-            generation: input.generation,
-        }) {
-            return Err(ProjectionProtocolError::InvalidBatch(format!(
-                "active projection generation {} has no durable lineage",
-                input.generation.get()
-            )));
-        }
-        self.validate_gap_free(&input.cursor, input.gap_free)?;
+        let key = PartitionKey::from_input(&input.cursor);
+        let partition = self.partitions.get(&key);
         self.validate_input_identity(input)?;
-        if let Some(failure_id) = &partition.stopped_failure_id {
-            return Err(ProjectionProtocolError::PartitionStopped {
-                failure_id: failure_id.clone(),
-            });
-        }
-        Ok(())
+        ensure_active_input(
+            input,
+            self.active_generation(&key),
+            partition.and_then(|partition| partition.stopped_failure_id.as_deref()),
+        )?;
+        self.classify_input(input)
     }
 
-    pub(super) fn validate_known_input_identity(
-        &self,
-        input: &TrustedProjectionInput,
-    ) -> Result<(), ProjectionProtocolError> {
-        let cursor_known = self
-            .input_identities
-            .contains_key(&CursorIdentityKey::new(&input.cursor));
-        let message_known = self.messages.contains_key(&MessageKey {
-            topology: input.cursor.topology().clone(),
-            message_id: input.message_id.clone(),
-        });
-        let source_capability_known = self
-            .gap_free_capabilities
-            .contains_key(&SourceCapabilityKey::new(&input.cursor));
-        if cursor_known || message_known || source_capability_known {
-            // Exact cursor corruption wins over message reuse; both are durable
-            // generation-independent identities. The source's fixed gap-free
-            // capability has the same precedence. An entirely unknown
-            // old-generation input is still rejected as GenerationFenced below.
-            self.validate_input_identity(input)?;
-            self.validate_gap_free(&input.cursor, input.gap_free)?;
-        }
-        Ok(())
-    }
-
-    pub(super) fn validate_pending_retry(
-        &self,
-        key: &PartitionKey,
-        input: &TrustedProjectionInput,
-    ) -> Result<(), ProjectionProtocolError> {
-        let Some(partition) = self.partitions.get(key) else {
-            return Ok(());
-        };
-        if let Some(failure_id) = &partition.pending_retry_failure_id {
-            let Some(fence) = self.failure_inputs.get(failure_id) else {
-                return Err(ProjectionProtocolError::InvalidBatch(format!(
-                    "pending projection retry `{failure_id}` has no exact input fence"
-                )));
-            };
-            if fence.cursor != input.cursor {
-                return Err(ProjectionProtocolError::IncomparableInput);
-            }
-            if !fence.matches_retry(input) {
-                return Err(ProjectionProtocolError::InputCorruption);
-            }
-        }
-        Ok(())
+    pub(super) fn active_generation(&self, key: &PartitionKey) -> ProjectionGeneration {
+        self.partitions
+            .get(key)
+            .map_or(ProjectionGeneration::initial(), |partition| {
+                partition.active_generation
+            })
     }
 
     pub(super) fn validate_input_identity(
         &self,
         input: &TrustedProjectionInput,
     ) -> Result<(), ProjectionProtocolError> {
-        if self
-            .input_identities
-            .get(&CursorIdentityKey::new(&input.cursor))
-            .is_some_and(|identity| {
-                identity.fingerprint != input.fingerprint
-                    || identity.message_id != input.message_id
-                    || identity.causation_id != input.causation_id
-                    || identity.gap_free != input.gap_free
+        validate_input_identity(
+            input,
+            self.gap_free_capabilities
+                .get(&SourceCapabilityKey::new(&input.cursor))
+                .copied(),
+            self.input_identities
+                .get(&CursorIdentityKey::new(&input.cursor)),
+            self.messages.get(&MessageKey {
+                topology: input.cursor.topology().clone(),
+                message_id: input.message_id.clone(),
+            }),
+        )
+    }
+
+    /// Classify an input that passed its identity and partition fences. An
+    /// unapplied input must also be the one a pending repair retries.
+    pub(super) fn classify_input(
+        &self,
+        input: &TrustedProjectionInput,
+    ) -> Result<ProjectionInputDisposition, ProjectionProtocolError> {
+        let key = PartitionKey::from_input(&input.cursor);
+        if self.partitions.contains_key(&key)
+            && !self.generations.contains_key(&GenerationKey {
+                partition: key.clone(),
+                generation: input.generation,
             })
         {
-            return Err(ProjectionProtocolError::InputCorruption);
+            return Err(corrupt_storage(format!(
+                "active projection generation {} has no durable lineage",
+                input.generation.get()
+            )));
         }
-        self.reject_reused_message(
-            &input.cursor,
-            input.fingerprint,
-            &input.message_id,
-            &input.causation_id,
-            input.gap_free,
-        )
+        let disposition = classify_input(
+            input,
+            self.applied_receipts
+                .get(&CursorReceiptKey::new(&input.cursor, input.generation))
+                .map(|(input, change)| (input, change)),
+            self.applied_receipts.iter().any(|(receipt, (applied, _))| {
+                receipt.generation == input.generation
+                    && receipt.partition == key
+                    && applied.message_id == input.message_id
+            }),
+            self.inputs
+                .get(&InputKey::new(&input.cursor, input.generation))
+                .map(|(input, change)| (input, change)),
+        )?;
+        let pending_retry = self
+            .partitions
+            .get(&key)
+            .and_then(|partition| partition.pending_retry_failure_id.as_ref());
+        if let (
+            ProjectionInputDisposition::Pending | ProjectionInputDisposition::Redelivery,
+            Some(failure_id),
+        ) = (&disposition, pending_retry)
+        {
+            let failure = self.failures.get(failure_id).ok_or_else(|| {
+                corrupt_storage(format!(
+                    "pending projection retry failure `{failure_id}` is missing"
+                ))
+            })?;
+            validate_pending_retry(input, self.active_generation(&key), failure)?;
+        }
+        Ok(disposition)
     }
 
     pub(super) fn persist_input_identity(&mut self, input: &TrustedProjectionInput) {
         self.input_identities
             .entry(CursorIdentityKey::new(&input.cursor))
-            .or_insert_with(|| InputIdentity {
-                fingerprint: input.fingerprint,
-                message_id: input.message_id.clone(),
-                causation_id: input.causation_id.clone(),
-                gap_free: input.gap_free,
-            });
+            .or_insert_with(|| input.clone());
         self.messages
             .entry(MessageKey {
                 topology: input.cursor.topology().clone(),
                 message_id: input.message_id.clone(),
             })
-            .or_insert_with(|| MessageIdentity {
-                cursor: input.cursor.clone(),
-                fingerprint: input.fingerprint,
-                causation_id: input.causation_id.clone(),
-                gap_free: input.gap_free,
-            });
+            .or_insert_with(|| input.clone());
     }
 
-    pub(super) fn classify_input(
+    /// Validate a commit's ownership declarations and targets. The caller
+    /// stores the declarations once the whole commit is known to apply.
+    pub(super) fn check_ownership(
         &self,
-        cursor: &ProjectionInputCursor,
-        fingerprint: ProjectionInputFingerprint,
-        message_id: &str,
-        causation_id: &str,
-        generation: ProjectionGeneration,
-        gap_free: bool,
-    ) -> Result<InputDisposition, ProjectionProtocolError> {
-        self.validate_gap_free(cursor, gap_free)?;
-        let candidate = TrustedProjectionInput {
-            cursor: cursor.clone(),
-            fingerprint,
-            message_id: message_id.to_string(),
-            causation_id: causation_id.to_string(),
-            generation,
-            gap_free,
-        };
-        self.validate_input_identity(&candidate)?;
-        if let Some(receipt) = self
-            .applied_receipts
-            .get(&CursorReceiptKey::new(cursor, generation))
-        {
-            if receipt.fingerprint == fingerprint
-                && receipt.message_id == message_id
-                && receipt.causation_id == causation_id
-                && receipt.gap_free == gap_free
-            {
-                return Ok(InputDisposition::Duplicate(receipt.checkpoint.clone()));
-            }
-            return Err(ProjectionProtocolError::InputCorruption);
-        }
-        let input_key = InputKey::new(cursor, generation);
-        let Some(previous) = self.inputs.get(&input_key) else {
-            self.reject_reused_message(cursor, fingerprint, message_id, causation_id, gap_free)?;
-            return Ok(InputDisposition::New);
-        };
-
-        match cursor.compare_position(&previous.cursor) {
-            RevisionComparison::Equal
-                if fingerprint != previous.fingerprint
-                    || message_id != previous.message_id
-                    || causation_id != previous.causation_id
-                    || gap_free != previous.gap_free =>
-            {
-                Err(ProjectionProtocolError::InputCorruption)
-            }
-            RevisionComparison::Equal => {
-                Ok(InputDisposition::Duplicate(previous.checkpoint.clone()))
-            }
-            RevisionComparison::Older => {
-                self.reject_reused_message(
-                    cursor,
-                    fingerprint,
-                    message_id,
-                    causation_id,
-                    gap_free,
-                )?;
-                Ok(InputDisposition::Stale(previous.checkpoint.clone()))
-            }
-            RevisionComparison::Incomparable => Err(ProjectionProtocolError::IncomparableInput),
-            RevisionComparison::Newer => {
-                self.reject_reused_message(
-                    cursor,
-                    fingerprint,
-                    message_id,
-                    causation_id,
-                    gap_free,
-                )?;
-                if gap_free
-                    && cursor.position()
-                        != checked_next(previous.cursor.position(), "gap-free projection input")?
-                {
-                    return Err(ProjectionProtocolError::IncomparableInput);
-                }
-                Ok(InputDisposition::New)
-            }
-        }
-    }
-
-    pub(super) fn reject_reused_message(
-        &self,
-        cursor: &ProjectionInputCursor,
-        fingerprint: ProjectionInputFingerprint,
-        message_id: &str,
-        causation_id: &str,
-        gap_free: bool,
-    ) -> Result<(), ProjectionProtocolError> {
-        let key = MessageKey {
-            topology: cursor.topology().clone(),
-            message_id: message_id.to_string(),
-        };
-        if let Some(previous) = self.messages.get(&key) {
-            if previous.cursor != *cursor
-                || previous.fingerprint != fingerprint
-                || previous.causation_id != causation_id
-                || previous.gap_free != gap_free
-            {
-                return Err(ProjectionProtocolError::MessageIdReuse {
-                    message_id: message_id.to_string(),
-                });
-            }
-        }
-        Ok(())
-    }
-
-    pub(super) fn validate_gap_free(
-        &self,
-        cursor: &ProjectionInputCursor,
-        gap_free: bool,
-    ) -> Result<(), ProjectionProtocolError> {
-        if self
-            .gap_free_capabilities
-            .get(&SourceCapabilityKey::new(cursor))
-            .is_some_and(|registered| *registered != gap_free)
-        {
-            return Err(ProjectionProtocolError::InputCorruption);
-        }
-        Ok(())
-    }
-
-    pub(super) fn has_exact_message_identity(&self, input: &TrustedProjectionInput) -> bool {
-        self.messages
-            .get(&MessageKey {
-                topology: input.cursor.topology().clone(),
-                message_id: input.message_id.clone(),
-            })
-            .is_some_and(|identity| {
-                identity.cursor == input.cursor
-                    && identity.fingerprint == input.fingerprint
-                    && identity.causation_id == input.causation_id
-                    && identity.gap_free == input.gap_free
-            })
-    }
-
-    pub(super) fn register_ownership(
-        &mut self,
         partition: &PartitionKey,
         batch: &ProjectionCommitBatch,
     ) -> Result<(), ProjectionProtocolError> {
@@ -410,11 +306,18 @@ impl InMemoryProjectionProtocolState {
                     declaration.table, other.model
                 )));
             }
-            self.ownership.insert(key, declaration.table.clone());
         }
+        let owned_table = |scope: &ProjectionRecordScope| match batch
+            .ownership
+            .iter()
+            .find(|declaration| declaration.model == scope.model())
+        {
+            Some(declaration) => Ok(declaration.table.as_str()),
+            None => self.owned_table(partition, scope),
+        };
 
         for mutation in &batch.mutations {
-            let table = self.owned_table(partition, &mutation.scope)?;
+            let table = owned_table(&mutation.scope)?;
             if table != mutation.mutation.table_name() {
                 return Err(ProjectionProtocolError::InvalidBatch(format!(
                     "projection model `{}` owns table `{table}`, but its mutation targets `{}`",
@@ -431,7 +334,7 @@ impl InMemoryProjectionProtocolState {
             }
         }
         for observation in &batch.observations {
-            self.owned_table(partition, observation.scope())?;
+            owned_table(observation.scope())?;
         }
         Ok(())
     }
@@ -532,123 +435,6 @@ impl InMemoryProjectionProtocolState {
             })
     }
 
-    pub(super) fn next_record(
-        &self,
-        scope: &ProjectionRecordScope,
-        expectation: &ProjectionRecordExpectation,
-        kind: ProjectionMutationKind,
-    ) -> Result<(RecordRevision, bool), ProjectionProtocolError> {
-        let current = self.records.get(scope);
-        match (expectation, current, kind) {
-            (ProjectionRecordExpectation::Missing, None, ProjectionMutationKind::Upsert) => {
-                Ok((RecordRevision::new(scope.clone(), 1, 1)?, false))
-            }
-            (ProjectionRecordExpectation::Missing, Some(metadata), _) if metadata.tombstone => {
-                Err(ProjectionProtocolError::RecordTombstoned {
-                    model: scope.model().to_string(),
-                })
-            }
-            (ProjectionRecordExpectation::Missing, Some(_), _) => {
-                Err(ProjectionProtocolError::RecordAlreadyExists {
-                    model: scope.model().to_string(),
-                })
-            }
-            (ProjectionRecordExpectation::Exact(_), None, _) => {
-                Err(ProjectionProtocolError::RecordMissing {
-                    model: scope.model().to_string(),
-                })
-            }
-            (ProjectionRecordExpectation::Exact(expected), Some(metadata), _) => {
-                if expected != &metadata.revision {
-                    return Err(ProjectionProtocolError::RecordRevisionConflict {
-                        model: scope.model().to_string(),
-                        expected_incarnation: expected.incarnation(),
-                        expected_revision: expected.revision(),
-                        actual_incarnation: metadata.revision.incarnation(),
-                        actual_revision: metadata.revision.revision(),
-                    });
-                }
-                match kind {
-                    ProjectionMutationKind::Upsert if metadata.tombstone => {
-                        Err(ProjectionProtocolError::RecordTombstoned {
-                            model: scope.model().to_string(),
-                        })
-                    }
-                    ProjectionMutationKind::Upsert => Ok((
-                        RecordRevision::new(
-                            scope.clone(),
-                            metadata.revision.incarnation(),
-                            checked_next(metadata.revision.revision(), "record revision")?,
-                        )?,
-                        false,
-                    )),
-                    ProjectionMutationKind::Delete if metadata.tombstone => {
-                        Err(ProjectionProtocolError::RecordTombstoned {
-                            model: scope.model().to_string(),
-                        })
-                    }
-                    ProjectionMutationKind::Delete => Ok((
-                        RecordRevision::new(
-                            scope.clone(),
-                            metadata.revision.incarnation(),
-                            checked_next(metadata.revision.revision(), "record revision")?,
-                        )?,
-                        true,
-                    )),
-                    ProjectionMutationKind::Recreate if !metadata.tombstone => {
-                        Err(ProjectionProtocolError::RecreateRequiresTombstone {
-                            model: scope.model().to_string(),
-                        })
-                    }
-                    ProjectionMutationKind::Recreate => Ok((
-                        RecordRevision::new(
-                            scope.clone(),
-                            checked_next(metadata.revision.incarnation(), "record incarnation")?,
-                            1,
-                        )?,
-                        false,
-                    )),
-                }
-            }
-            (_, _, ProjectionMutationKind::Delete | ProjectionMutationKind::Recreate) => {
-                Err(ProjectionProtocolError::InvalidBatch(
-                    "delete/recreate requires an exact record expectation".into(),
-                ))
-            }
-        }
-    }
-
-    pub(super) fn validate_physical_record(
-        &self,
-        scope: &ProjectionRecordScope,
-        expectation: &ProjectionRecordExpectation,
-        kind: ProjectionMutationKind,
-        row_exists: bool,
-    ) -> Result<(), ProjectionProtocolError> {
-        let should_exist = match (expectation, kind) {
-            (ProjectionRecordExpectation::Missing, ProjectionMutationKind::Upsert) => false,
-            (ProjectionRecordExpectation::Exact(_), ProjectionMutationKind::Recreate) => false,
-            (
-                ProjectionRecordExpectation::Exact(_),
-                ProjectionMutationKind::Upsert | ProjectionMutationKind::Delete,
-            ) => true,
-            _ => {
-                return Err(ProjectionProtocolError::InvalidBatch(
-                    "projection mutation has no valid physical-row expectation".into(),
-                ));
-            }
-        };
-        if row_exists == should_exist {
-            return Ok(());
-        }
-        let expected = if should_exist { "present" } else { "absent" };
-        let actual = if row_exists { "present" } else { "absent" };
-        Err(ProjectionProtocolError::InvalidBatch(format!(
-            "projection record `{}` metadata requires its physical row to be {expected}, but it is {actual}",
-            scope.model()
-        )))
-    }
-
     pub(super) fn append_change(
         &mut self,
         partition_key: &PartitionKey,
@@ -658,28 +444,9 @@ impl InMemoryProjectionProtocolState {
             .partitions
             .get_mut(partition_key)
             .expect("partition is initialized before appending changes");
-        let position = partition.change_head.checked_add(1).ok_or(
-            ProjectionProtocolError::PositionOverflow {
-                domain: "projection change",
-            },
-        )?;
-        let cursor = ProjectionChangeCursor::new(
-            partition_key.topology.clone(),
-            partition_key.partition.clone(),
-            partition.change_epoch.clone(),
-            position,
-        )?;
-        let change = ProjectionChange {
-            cursor,
-            kind: pending.kind,
-            causation_id: pending.causation_id,
-            observation_kind: pending.observation_kind,
-            scope: pending.scope,
-            revision: pending.revision,
-            failure_id: pending.failure_id,
-        };
-        partition.change_head = position;
-        partition.changes.insert(position, change.clone());
+        let mut head = partition.change_head;
+        let change = next_change(partition_key, &partition.change_epoch, &mut head, pending)?;
+        partition.append([change.clone()]);
         Ok(change)
     }
 
@@ -701,28 +468,8 @@ impl InMemoryProjectionProtocolState {
         if through <= partition.compacted_through {
             return Ok(partition.compacted_through);
         }
-        let expected_removed = through - partition.compacted_through;
-        let actual_removed = u64::try_from(
-            partition
-                .changes
-                .range((
-                    std::ops::Bound::Excluded(partition.compacted_through),
-                    std::ops::Bound::Included(through),
-                ))
-                .count(),
-        )
-        .map_err(|_| {
-            ProjectionProtocolError::InvalidBatch(
-                "projection change compaction count exceeds u64".into(),
-            )
-        })?;
-        if actual_removed != expected_removed {
-            return Err(ProjectionProtocolError::InvalidBatch(format!(
-                "projection change compaction expected to remove {expected_removed} contiguous entries but found {actual_removed}"
-            )));
-        }
-        partition.changes.retain(|position, _| *position > through);
-        partition.compacted_through = through;
+        partition.check_compaction(through)?;
+        partition.compact(through);
         Ok(through)
     }
 
@@ -744,5 +491,45 @@ impl InMemoryProjectionProtocolState {
             partition_key,
             head.saturating_sub(retention.max_retained_changes()),
         )
+    }
+}
+
+impl PartitionState {
+    /// Store changes that continue the log at `change_head + 1`.
+    pub(super) fn append(&mut self, changes: impl IntoIterator<Item = ProjectionChange>) {
+        for change in changes {
+            self.change_head = change.cursor.position();
+            self.changes.insert(self.change_head, change);
+        }
+    }
+
+    /// Prove the stored log holds every change a compaction through
+    /// `through` (at most the head) would remove.
+    pub(super) fn check_compaction(&self, through: u64) -> Result<(), ProjectionProtocolError> {
+        if through <= self.compacted_through {
+            return Ok(());
+        }
+        let expected_removed = through - self.compacted_through;
+        let actual_removed = self
+            .changes
+            .range((
+                std::ops::Bound::Excluded(self.compacted_through),
+                std::ops::Bound::Included(through),
+            ))
+            .count() as u64;
+        if actual_removed != expected_removed {
+            return Err(corrupt_storage(format!(
+                "projection change compaction expected to remove {expected_removed} contiguous entries but found {actual_removed}"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Drop every change at or below `through`. Never moves backwards.
+    pub(super) fn compact(&mut self, through: u64) {
+        if through > self.compacted_through {
+            self.changes.retain(|position, _| *position > through);
+            self.compacted_through = through;
+        }
     }
 }

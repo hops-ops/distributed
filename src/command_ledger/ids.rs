@@ -1,11 +1,12 @@
 use std::fmt;
 
+use sha2::{Digest, Sha256};
 use uuid::{Uuid, Variant};
 
 use super::CommandLedgerError;
 
 pub(crate) const SHA256_BYTES: usize = 32;
-pub(super) const COMMAND_REPLAY_VERSION: u16 = 2;
+pub(super) const COMMAND_REPLAY_VERSION: u16 = 3;
 
 /// Opaque identity for one concrete leaf repository instance.
 ///
@@ -48,6 +49,23 @@ impl CommandId {
     pub(crate) fn as_str(&self) -> &str {
         &self.0
     }
+}
+
+/// The command ID of work the host starts itself (a fired schedule, a
+/// delivered transport message), derived from a stable key the caller hashed.
+///
+/// The ID is the first 16 bytes of the digest with the RFC 4122 version-7 and
+/// variant bits set: the shape [`CommandId::parse`] requires. One key always
+/// yields one ID, so the ledger replays a repeated dispatch instead of
+/// running it again. Callers start the key with their own domain tag so two
+/// sources cannot derive the same ID.
+pub(crate) fn deterministic_command_id(key: Sha256) -> String {
+    let digest = key.finalize();
+    let mut bytes = [0u8; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    bytes[6] = (bytes[6] & 0x0f) | 0x70;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    Uuid::from_bytes(bytes).hyphenated().to_string()
 }
 
 impl fmt::Debug for CommandId {

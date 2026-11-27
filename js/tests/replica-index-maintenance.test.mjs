@@ -2,17 +2,45 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import { createCacheEngine } from '../dist/internal/cache-engine.js';
-import { replaceOptimisticLayerOn } from '../dist/replica/distributed-replica/impl-optimistic.js';
+import { relationshipMembership } from '../dist/replica/index-maintenance/engine.js';
+import { replicaCommandProjectionDelta } from '../dist/replica/command-runtime/symbols.js';
 import {
+	createDistributedReplica,
 	createReplicaIndexMaintenanceRegistry,
 	formatReplicaIndexStaleReason,
 	replicaIndexKey,
 	replicaRecordKey
 } from '../dist/replica/index.js';
+import { commandReceipt } from './fixtures/command-protocol.mjs';
 
 const Todo = Object.freeze({ id: 'Todo', identityFields: Object.freeze(['id']) });
 const Board = Object.freeze({ id: 'Board', identityFields: Object.freeze(['id']) });
 const Card = Object.freeze({ id: 'Card', identityFields: Object.freeze(['id']) });
+
+test('direct candidate-key membership preserves row identity and SQL null semantics', () => {
+	const plan = { path: ['object'], relationship: {
+		keyMapping: { kind: 'direct', local: ['namespace', 'revision'], remote: ['scope', 'version'] }
+	} };
+	const parent = { fields: { id: 'parent-id', namespace: 'team-a', revision: 'v1' } };
+	const records = new Map([['parent-key', parent]]);
+	const branch = { metadata: { parent: 'parent-key' } };
+	const target = { fields: { id: 'opaque-object-id', scope: 'team-a', version: 'v1' } };
+	const membership = () => relationshipMembership(plan, branch, target, records);
+	assert.deepEqual(membership(), { related: true });
+	target.fields.scope = 'team-b';
+	assert.deepEqual(membership(), { related: false });
+	target.fields.scope = 'team-a';
+	parent.fields.revision = 'v2';
+	assert.deepEqual(membership(), { related: false });
+	target.fields.version = 'v2';
+	assert.deepEqual(membership(), { related: true });
+	assert.equal(target.fields.id, 'opaque-object-id');
+	parent.fields.revision = null;
+	target.fields.version = null;
+	assert.deepEqual(membership(), { related: false });
+	delete target.fields.version;
+	assert.equal(membership().reason.code, 'missing_field');
+});
 
 const COMPLETE = Object.freeze({ kind: 'complete' });
 const COMPLETE_PAGINATION = Object.freeze({
@@ -223,9 +251,12 @@ function todoArtifact({
 }
 
 function snapshot(records, indexes) {
+	const recordsByKey = new Map(records.map((record) => [record.key, record]));
+	const indexesByKey = new Map(indexes.map((index) => [index.key, index]));
 	return Object.freeze({
-		records: Object.freeze(records),
-		indexes: Object.freeze(indexes)
+		record: (key) => recordsByKey.get(key),
+		index: (key) => indexesByKey.get(key),
+		indexes: () => indexes
 	});
 }
 
@@ -358,7 +389,7 @@ test('semantic layers recompute from confirmed state when an earlier layer disap
 	);
 });
 
-test('package-private replacement seam preserves replica receipt and diagnostic identity', () => {
+test('replacing an optimistic layer rebases it in place over its prefix', () => {
 	const engine = createCacheEngine();
 	const key = replicaRecordKey(Todo, 'replacement-seam');
 	engine.batch((writer) =>
@@ -382,43 +413,10 @@ test('package-private replacement seam preserves replica receipt and diagnostic 
 		writer.writeRecord({ key, fields: { title: 'suffix' } })
 	);
 
-	const receipt = {
-		causationId: 'causation-1',
-		expectations: new Map(),
-		observed: new Set()
-	};
-	const diagnostic = Object.freeze({
-		id: 'command-1',
-		sequence: 2,
-		state: 'accepted',
-		recordChanges: 1,
-		indexChanges: 0,
-		semanticChanges: 1
-	});
-	const events = [];
-	let syncCalls = 0;
-	let diagnosticSequence = 3;
-	const host = {
-		engine,
-		optimisticReceipts: new Map([['command-1', receipt]]),
-		diagnosticLayers: new Map([['command-1', diagnostic]]),
-		diagnostics: { enabled: true },
-		getDiagnosticLayerSequence: () => diagnosticSequence,
-		setDiagnosticLayerSequence: (value) => {
-			diagnosticSequence = value;
-		},
-		diagnosticEvent: (event) => events.push(event),
-		syncDiagnostics: () => {
-			syncCalls += 1;
-		},
-		retireDiagnosticLayer: () => {
-			throw new Error('replacement must not retire its layer');
-		}
-	};
 	const confirmed = engine.extract();
 	let prefix;
 	assert.equal(
-		replaceOptimisticLayerOn(host, 'command-1', (reader, writer) => {
+		engine.replaceOptimisticLayer('command-1', (reader, writer) => {
 			prefix = reader.record(key)?.fields;
 			writer.writeRecord({ key, fields: { status: 'actual' } });
 		}),
@@ -431,11 +429,72 @@ test('package-private replacement seam preserves replica receipt and diagnostic 
 		status: 'actual'
 	});
 	assert.equal(engine.optimisticLayerState('command-1'), 'accepted');
-	assert.equal(host.optimisticReceipts.get('command-1'), receipt);
-	assert.equal(host.diagnosticLayers.get('command-1'), diagnostic);
-	assert.equal(syncCalls, 0);
-	assert.deepEqual(events, []);
 	assert.deepEqual(engine.extract(), confirmed);
+});
+
+test('a projection-delta replacement preserves the replica receipt and diagnostic layer', () => {
+	const updates = [];
+	const events = [];
+	const replica = createDistributedReplica({
+		diagnostics: {
+			includeStructuralIdentities: false,
+			update: (state) => updates.push(state),
+			event: (event) => events.push(event),
+			operation: () => undefined
+		}
+	});
+	const write = (status) => (writer) =>
+		writer.writeRecord(Todo, 'replacement-seam', {
+			fields: { id: 'replacement-seam', status }
+		});
+	replica.createOptimisticLayer('command-1', write('preview'));
+	const expectation = {
+		projection: 'todos',
+		model: 'Todo',
+		scopeToken: 'opaque:scope'
+	};
+	assert.equal(
+		replica.markOptimisticLayerAccepted(
+			'command-1',
+			commandReceipt({
+				commandId: 'command-1',
+				causationId: 'causation-1',
+				expects: [expectation]
+			})
+		),
+		true
+	);
+	const layers = updates.at(-1).layers;
+	const receipts = updates.at(-1).receipts;
+	const syncCalls = updates.length;
+	events.length = 0;
+
+	assert.equal(
+		replica[replicaCommandProjectionDelta]('command-1', write('actual'), []),
+		true
+	);
+
+	assert.equal(updates.length, syncCalls);
+	assert.deepEqual(events, []);
+	// Rejection retires the layer the replacement kept, with its receipt.
+	assert.equal(replica.rejectOptimisticLayer('command-1'), true);
+	assert.deepEqual(events.slice(0, 2), [
+		{
+			kind: 'layer',
+			layer: 'command-1',
+			action: 'rejected',
+			recordChanges: layers[0].recordChanges,
+			indexChanges: layers[0].indexChanges
+		},
+		{
+			kind: 'receipt',
+			command: 'command-1',
+			state: 'rejected',
+			obligations: receipts[0].expectations.length,
+			observed: 0
+		}
+	]);
+	assert.equal(receipts[0].expectations.length, 1);
 });
 
 test('a stale complete index keeps a later patch ordered during rebase', () => {
@@ -555,6 +614,44 @@ test('reorders are deterministic and duplicates fail closed', () => {
 	);
 	assert.equal(duplicate[0].kind, 'stale');
 	assert.equal(duplicate[0].reason.code, 'duplicate_index_record');
+});
+
+test('a list filtered by a text column is maintained locally', () => {
+	const a = record(Todo, 'a', {
+		id: 'a',
+		active: true,
+		rank: 1,
+		tenantId: 'tenant-1'
+	});
+	const b = record(Todo, 'b', {
+		id: 'b',
+		active: true,
+		rank: 2,
+		tenantId: 'tenant-2'
+	});
+	const registry = createReplicaIndexMaintenanceRegistry();
+	registry.registerOperation(
+		todoArtifact({
+			where: unrestrictedFilter(literal({ tenantId: { _eq: 'tenant-1' } }))
+		}),
+		{ owner: 'one' }
+	);
+	const root = index('todos', [a.key], { arguments: { owner: 'one' } });
+
+	// Leaving the filter removes the row; entering it inserts the row. Neither
+	// needs the server: text equality is byte equality.
+	const left = registry.evaluate(snapshot([a, b], [root]), [
+		layer('leave', [upsert(Todo, 'a', { tenantId: 'tenant-2' })])
+	]);
+	assert.deepEqual(left[0].records, []);
+	const entered = registry.evaluate(snapshot([a, b], [root]), [
+		layer('enter', [upsert(Todo, 'b', { tenantId: 'tenant-1' })])
+	]);
+	assert.deepEqual(entered[0].records, [a.key, b.key]);
+	const differentCase = registry.evaluate(snapshot([a, b], [root]), [
+		layer('case', [upsert(Todo, 'b', { tenantId: 'TENANT-1' })])
+	]);
+	assert.equal(differentCase[0].kind, 'unchanged');
 });
 
 test('missing dependencies, claims, and offset windows become precise stale decisions', () => {

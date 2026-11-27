@@ -13,7 +13,8 @@ pub(in crate::in_memory_repo) fn stage_same_transaction_projection(
     protocol.require_registered_topology(&batch.topology)?;
 
     let partition_key = PartitionKey::new(&batch.topology, &batch.partition);
-    protocol.ensure_partition(&partition_key, &batch.change_epoch)?;
+    let change_epoch = protocol.change_epoch(&partition_key);
+    protocol.partition_mut(&partition_key, &change_epoch);
     if let Some(failure_id) = protocol
         .partitions
         .get(&partition_key)
@@ -31,31 +32,24 @@ pub(in crate::in_memory_repo) fn stage_same_transaction_projection(
     protocol.register_same_transaction_ownership(&partition_key, batch)?;
 
     let mutation = &batch.mutations[0];
+    let current = protocol.records.get(&mutation.scope);
+    crate::projection_protocol::validate_snapshot_write(current, None)?;
     let lock_key = mutation.mutation.lock_key();
-    let row_exists = staged_rows.contains_key(&lock_key);
-    let revision = match protocol.records.get(&mutation.scope) {
-        None if !row_exists => RecordRevision::new(mutation.scope.clone(), 1, 1)?,
-        None => {
-            return Err(ProjectionProtocolError::RecordAlreadyExists {
-                model: mutation.scope.model().to_string(),
-            });
-        }
-        Some(metadata) if metadata.tombstone => {
-            return Err(ProjectionProtocolError::RecordTombstoned {
-                model: mutation.scope.model().to_string(),
-            });
-        }
-        Some(_) if !row_exists => {
-            return Err(ProjectionProtocolError::RecordMissing {
-                model: mutation.scope.model().to_string(),
-            });
-        }
-        Some(metadata) => RecordRevision::new(
-            mutation.scope.clone(),
-            metadata.revision.incarnation(),
-            checked_next(metadata.revision.revision(), "record revision")?,
-        )?,
-    };
+    validate_physical_row(
+        &mutation.scope,
+        current,
+        staged_rows.contains_key(&lock_key),
+    )?;
+    let expectation = current.map_or(ProjectionRecordExpectation::Missing, |metadata| {
+        ProjectionRecordExpectation::Exact(metadata.revision.clone())
+    });
+    let (revision, _) = next_record(
+        &mutation.scope,
+        &expectation,
+        RecordTransition::Upsert,
+        current,
+        false,
+    )?;
 
     let change = protocol.append_change(
         &partition_key,
@@ -66,9 +60,11 @@ pub(in crate::in_memory_repo) fn stage_same_transaction_projection(
             scope: Some(mutation.scope.clone()),
             revision: Some(revision.clone()),
             failure_id: None,
+            program_id: program_id_for_model(&batch.ownership, mutation.scope.model()),
         },
     )?;
     let metadata = ProjectionRecordMetadata {
+        source_snapshot: None,
         revision: revision.clone(),
         tombstone: false,
         change: change.cursor.clone(),
@@ -83,7 +79,7 @@ pub(in crate::in_memory_repo) fn stage_same_transaction_projection(
         staged_rows,
     )?;
     if !staged_rows.contains_key(&lock_key) {
-        return Err(ProjectionProtocolError::InvalidBatch(format!(
+        return Err(corrupt_storage(format!(
             "direct projection upsert left model `{}` without a physical row",
             mutation.scope.model()
         )));
@@ -106,6 +102,7 @@ pub(in crate::in_memory_repo) fn stage_same_transaction_projection(
         revision: Some(revision),
         scope: mutation.scope.clone(),
         change: change.cursor.clone(),
+        program_id: change.program_id,
     };
     protocol
         .observations

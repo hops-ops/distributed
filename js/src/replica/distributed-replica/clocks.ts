@@ -32,10 +32,6 @@ export function sameRecordRevision(
 	);
 }
 
-export function recordKeyMatchesModel(recordKey: string, model: string): boolean {
-	return recordKey.startsWith(`record:${encodeURIComponent(model)}:`);
-}
-
 export function modelFromRecordKey(recordKey: string): string | undefined {
 	if (!recordKey.startsWith('record:')) return undefined;
 	const separator = recordKey.indexOf(':', 'record:'.length);
@@ -122,7 +118,7 @@ export function latestCursors(
 	live: DistributedProtocolEnvelope['live']
 ): readonly DistributedLiveCursor[] {
 	if (live !== undefined) {
-		return live.supported ? live.cursors : Object.freeze([]);
+		return live.mode === 'resumable' ? live.cursors : Object.freeze([]);
 	}
 	return Object.freeze(
 		snapshot.indexes.flatMap((index) =>
@@ -135,9 +131,10 @@ export function responsePathKey(path: readonly string[]): string {
 	return JSON.stringify(path);
 }
 
+/** Order two clocks of one record scope; the caller checks the scope. */
 export function compareRecordClock(
-	left: RecordProtocolClock,
-	right: RecordProtocolClock
+	left: { readonly incarnation: string; readonly revision: string },
+	right: { readonly incarnation: string; readonly revision: string }
 ): -1 | 0 | 1 {
 	const incarnation = compareDistributedDecimal(
 		left.incarnation,
@@ -153,15 +150,7 @@ export function compareEvidenceToProjectedFence(
 	fence: ProjectedRecordFence
 ): -1 | 0 | 1 | undefined {
 	if (evidence.scopeToken !== fence.clock.scopeToken) return undefined;
-	return compareRecordClock(
-		{
-			scopeToken: evidence.scopeToken,
-			incarnation: evidence.incarnation,
-			revision: evidence.revision,
-			tombstone: evidence.tombstone
-		},
-		fence.clock
-	);
+	return compareRecordClock(evidence, fence.clock);
 }
 
 export function sameRecordClock(
@@ -192,17 +181,6 @@ export function incrementCanonicalDecimal(value: string): string {
 	}
 	if (carry) digits.unshift('1');
 	return digits.join('');
-}
-
-export function compareCanonicalDecimalStrings(
-	left: string,
-	right: string
-): number {
-	return left.length === right.length
-		? left.localeCompare(right)
-		: left.length < right.length
-			? -1
-			: 1;
 }
 
 export function protocolInvalid(path: string): never {

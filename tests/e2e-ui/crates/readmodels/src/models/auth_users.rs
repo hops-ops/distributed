@@ -1,7 +1,7 @@
 //! Auth users imported from Zitadel Action ingress.
 
-use distributed::graphql::{read, ModelPermissions};
-use distributed::ReadModel;
+use distributed::graphql::{read, AuthorizedReadModel, ModelPermissions};
+use distributed::read_model::ReadModel;
 use serde::{Deserialize, Serialize};
 
 /// Imported IdP user. PK: `user_id` (= Zitadel subject / OIDC `sub` / session `x-user-id`).
@@ -23,9 +23,9 @@ pub struct AuthUsers {
     pub updated_at: String,
 }
 
-impl AuthUsers {
+impl AuthorizedReadModel for AuthUsers {
     /// Read authorization attached to the imported identity query model.
-    pub fn permissions() -> ModelPermissions<Self> {
+    fn permissions() -> ModelPermissions<Self> {
         ModelPermissions::new()
             .grant("user", read().all_columns())
             .grant("admin", read().all_columns())

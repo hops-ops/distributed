@@ -1,5 +1,0 @@
-error: domain-marked #[event] methods cannot use `?` in version one because it may skip post-transition capture
-  --> tests/compile_fail/domain_inferred_try_recorder.rs:18:9
-   |
-18 |         self.validate()?;
-   |         ^^^^^^^^^^^^^^^^

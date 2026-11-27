@@ -5,7 +5,8 @@ import type {
 	DistributedTrustedPresetCodec,
 	GraphqlResponseExtensions
 } from '../protocol.js';
-import type { ReplicaDiagnosticsSink } from './diagnostics.js';
+import type { Scheduler } from '../lib/backoff.js';
+import type { ReplicaDiagnosticsSink } from './diagnostics/types.js';
 
 export type ReplicaRevision = number | string | bigint;
 export type ReplicaValue =
@@ -217,6 +218,7 @@ export type ReplicaFilterOperator =
 	| '_is_null'
 	| '_like'
 	| '_ilike'
+	| '_icontains'
 	| '_contains'
 	| '_contained_in'
 	| '_has_key';
@@ -505,6 +507,8 @@ type ReplicaOperationArtifactBase<
 		readonly id: string;
 		readonly document: string;
 	};
+	/** `@window`: the keyset this operation pages by. */
+	readonly window?: ReplicaWindowArtifact;
 	/** Phantom slots preserve generated result/variables types. */
 	readonly __result?: TData;
 	readonly __variables?: TVariables;
@@ -517,6 +521,8 @@ export type ReplicaOperationSourceLocation = {
 };
 
 export type ReplicaOperationProtocol = {
+	/** Exact generated protocol generation for causal delivery context. */
+	readonly protocolHash?: string;
 	readonly version: 1;
 	/** Opaque service schema fingerprint, compared byte-for-byte. */
 	readonly schemaHash: string;
@@ -563,6 +569,46 @@ export type ReplicaOperationArtifact<
 	TData = Record<string, unknown>,
 	TVariables extends GraphqlVariables = GraphqlVariables
 > = ReplicaProtocolOperationArtifact<TData, TVariables>;
+
+/**
+ * One keyset column of a `@window` operation, in window order. Each row
+ * carries it at `responseKey`; a page after a row sets `variable` to it.
+ */
+export type ReplicaWindowKey = {
+	readonly field: string;
+	readonly responseKey: string;
+	readonly variable: string;
+	readonly direction: 'asc' | 'desc';
+	readonly codec: string;
+};
+
+/**
+ * The compiler's `@window` contract: the operation's `where` holds the rows
+ * after the cursor `keys` name, in `order_by` then primary-key order. With
+ * the cursor variables omitted it is the head page.
+ */
+export type ReplicaWindowArtifact = {
+	readonly limitVariable: string;
+	readonly pageSize: number;
+	readonly maxLimit: number;
+	readonly keys: readonly ReplicaWindowKey[];
+};
+
+/** A generated `@window` operation. */
+export type ReplicaWindowOperationArtifact<
+	TData = Record<string, unknown>,
+	TVariables extends GraphqlVariables = GraphqlVariables
+> = ReplicaOperationArtifact<TData, TVariables> & {
+	readonly window: ReplicaWindowArtifact;
+};
+
+/** The row type of a single-root list operation's data. */
+export type ReplicaWindowRow<TData> = TData[keyof TData] extends
+	| readonly (infer TRow)[]
+	| null
+	| undefined
+	? TRow
+	: never;
 
 /** Framework-neutral compiler metadata consumed by placement adapters. */
 export type ReplicaIslandMetadata = {
@@ -634,6 +680,11 @@ export type ReplicaTransportRequest<
 
 export type ReplicaLiveObserver<TData = unknown> = {
 	next(result: ReplicaResultEnvelope<TData>): void;
+	/**
+	 * The stream ended without completing. An error whose `retryable`
+	 * property is `true` (a lost socket, a server reset) is reopened after a
+	 * backoff, like a live failure frame; any other error is terminal.
+	 */
 	error(error: unknown): void;
 	complete(): void;
 };
@@ -655,7 +706,21 @@ export type ReplicaTransport = {
 };
 
 export type ReplicaStatus = 'loading' | 'ready' | 'stale' | 'error';
-export type ReplicaLiveState = 'off' | 'connecting' | 'active' | 'error';
+/**
+ * `reconnecting`: the stream's connection was lost and is being reopened.
+ * The admitted data stays readable and the loss is not one of the query's
+ * `errors`; {@link DistributedReplica.liveConnection} reports it once for the
+ * whole replica.
+ */
+export type ReplicaLiveState =
+	| 'off'
+	| 'connecting'
+	| 'active'
+	| 'reconnecting'
+	| 'error';
+
+/** Whether every watched live operation has its stream (`online`) or some are reopening a lost one. */
+export type ReplicaLiveConnection = 'online' | 'reconnecting';
 
 /** The exact runtime shape while some selected cache fields are still absent. */
 export type ReplicaSparse<T> = T extends readonly (infer TItem)[]
@@ -664,10 +729,31 @@ export type ReplicaSparse<T> = T extends readonly (infer TItem)[]
 		? { readonly [K in keyof T]?: ReplicaSparse<T[K]> }
 		: T;
 
+/**
+ * The provisional rows of one snapshot: rows that exist only as a command's
+ * preview, because the server has not returned them yet (a create still in
+ * flight). Commands on such a row would fail, so a page marks and disables it.
+ *
+ * A command that edits a row the server already returned (complete, rename,
+ * archive) never makes it pending: its preview shows, and the row stays
+ * usable.
+ *
+ * `has(row)` takes an object from the same snapshot's `data`. A row leaves
+ * the set as soon as the server row reaches the replica (by a live frame or
+ * a refetch), or when the command fails and its preview is rolled back, so a
+ * page never tracks command lifecycles itself.
+ */
+export type ReplicaPendingRows = Readonly<{
+	has(row: unknown): boolean;
+	/** How many result objects are provisional. */
+	size: number;
+}>;
+
 type ReplicaSnapshotState = {
 	readonly fetching: boolean;
 	readonly errors: readonly GqlError[];
 	readonly live: ReplicaLiveState;
+	readonly pending: ReplicaPendingRows;
 };
 
 /**
@@ -735,6 +821,17 @@ export type DistributedReplicaOptions = {
 	readonly onAuthorizationGenerationDispose?: () => void;
 	/** Opt-in framework-neutral diagnostics; absent in production by default. */
 	readonly diagnostics?: ReplicaDiagnosticsSink;
+	/** Clock and timers of the live reopen backoff and of retention (tests). */
+	readonly scheduler?: Scheduler;
+	/** Jitter source of the live reopen backoff (tests). */
+	readonly random?: () => number;
+	/**
+	 * How long an operation's protocol state and cached result outlive its
+	 * last watch or retained handle before they are collected. Default
+	 * 30 000 ms. `Infinity` never collects, for a replica that is discarded
+	 * whole (one server request).
+	 */
+	readonly retentionGraceMs?: number;
 };
 
 /** Server-issued authorization/cache namespace. Client-decoded claims never create one. */
@@ -852,10 +949,30 @@ export interface DistributedReplica {
 	readonly scope: ReplicaAuthoritativeScope | undefined;
 	/** Monotonic local fence for authorization changes and server scope changes. */
 	readonly authorizationGeneration: number;
+	/**
+	 * `reconnecting` while any watched live operation is reopening a lost
+	 * stream: one signal for an app-wide "reconnecting" notice, instead of an
+	 * error in every query.
+	 */
+	readonly liveConnection: ReplicaLiveConnection;
+	/** Call `listener` with each change of {@link liveConnection}; returns its removal. */
+	subscribeLiveConnection(
+		listener: (connection: ReplicaLiveConnection) => void
+	): () => void;
+	/** The operation's current snapshot. Registers and retains nothing. */
 	read<TData, TVariables extends GraphqlVariables>(
 		artifact: ReplicaOperationArtifact<TData, TVariables>,
 		variables: TVariables
 	): ReplicaSnapshot<TData>;
+	/**
+	 * Hold an operation as rendered without watching it: `dehydrate` includes
+	 * its result and nothing collects it until the returned release function
+	 * is called. Server rendering holds what it read for the transfer.
+	 */
+	retainOperation<TData, TVariables extends GraphqlVariables>(
+		artifact: ReplicaOperationArtifact<TData, TVariables>,
+		variables: TVariables
+	): () => void;
 	watch<TData, TVariables extends GraphqlVariables>(
 		artifact: ReplicaOperationArtifact<TData, TVariables>,
 		variables: TVariables,
@@ -879,7 +996,10 @@ export interface DistributedReplica {
 	 * they cannot choose or restore a cache scope.
 	 */
 	invalidateAuthorization(): void;
-	/** Serialize confirmed state reachable from operations rendered by this replica. */
+	/**
+	 * Serialize confirmed state reachable from the operations this replica
+	 * currently watches or retains.
+	 */
 	dehydrate(): ReplicaDehydratedState;
 	/**
 	 * Restore a server-rendered payload against the independently authoritative
@@ -893,6 +1013,16 @@ export interface DistributedReplica {
 	 * dehydrated its page subset. Auth/scope change still purges.
 	 */
 	hydrate(
+		state: ReplicaDehydratedState,
+		authoritativeScope: ReplicaAuthoritativeScope
+	): boolean;
+	/**
+	 * Validate a fresh transfer against independent server authority and the
+	 * exact active scope, then restart query/live transports without applying
+	 * the transfer's potentially older data. Preserves command/freshness state.
+	 * Returns false without mutating state when validation fails.
+	 */
+	reauthorize(
 		state: ReplicaDehydratedState,
 		authoritativeScope: ReplicaAuthoritativeScope
 	): boolean;
@@ -916,9 +1046,6 @@ export interface DistributedReplica {
 		revision: ReplicaRevision
 	): boolean;
 	markIndexStale(target: ReplicaIndexTarget, reason: string): boolean;
-	retainRecord(model: ReplicaModelArtifact, identity: ReplicaIdentity): void;
-	releaseRecord(model: ReplicaModelArtifact, identity: ReplicaIdentity): void;
-	gc(): readonly string[];
 	inspectRecord(
 		model: ReplicaModelArtifact,
 		identity: ReplicaIdentity

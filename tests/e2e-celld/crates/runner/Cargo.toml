@@ -3,7 +3,10 @@ name = "e2e-celld-runner"
 version.workspace = true
 edition.workspace = true
 publish = false
-description = "Runner for the celld GraphQL example (not make run in e2e-ui)"
+description = "The e2e-ui application on another command host: celld cells, NATS bus"
+
+[lib]
+path = "src/lib.rs"
 
 [[bin]]
 name = "e2e-celld"
@@ -11,5 +14,9 @@ path = "src/main.rs"
 
 [dependencies]
 distributed = { workspace = true }
-e2e-celld-graphql = { path = "../graphql-service" }
+e2e-service = { path = "../../../e2e-ui/crates/service" }
+todo-domain = { path = "../../../e2e-ui/crates/todo-domain" }
+chat-domain = { path = "../../../e2e-ui/crates/chat-domain" }
+axum = { workspace = true }
+serde_json = { workspace = true }
 tokio = { workspace = true }

@@ -14,10 +14,17 @@ import { pathToFileURL } from 'node:url';
 
 import { parse } from 'svelte/compiler';
 
-import type { DistributedBoundaryVariableSource } from '../boundary-variables.js';
+import { fnv1a64 } from '../../lib/fnv1a64.js';
+import { isMissing, isWithin } from '../../lib/node-fs.js';
+
+import {
+	DISTRIBUTED_BOUNDARY_BINDING_VERSION,
+	type DistributedBoundaryVariableSource
+} from '../boundary-variables.js';
+import { normalizeSearchParamSource } from '../search-variables.js';
 import { isGraphqlIslandBindings } from '../island-bindings.js';
 
-const BOUNDARY_PLAN_VERSION = 1;
+const BOUNDARY_PLAN_VERSION = 2;
 const VARIABLE_CODEC_VERSION = 2;
 const MAX_COMPONENTS = 4_096;
 const MAX_ISLANDS = 4_096;
@@ -80,7 +87,7 @@ export type DistributedSvelteKitBoundaryOccurrence = Readonly<{
 	directives: Readonly<{ load: boolean; live: boolean }>;
 	liveCoverage: DistributedIslandPlanInput['liveCoverage'];
 	binding: Readonly<{
-		version: 1;
+		version: 2;
 		id: string;
 		discovery: 'route_param' | 'empty' | 'explicit';
 		sources: Readonly<Record<string, DistributedBoundaryVariableSource>>;
@@ -558,7 +565,7 @@ function boundaryBinding(
 		if (explicit !== undefined) {
 			let normalized: DistributedBoundaryVariableSource;
 			try {
-				normalized = normalizeBindingSource(explicit, variable.name);
+				normalized = normalizeBindingSource(explicit, variable.name, variable.graphqlType);
 			} catch {
 				throw diagnostic(
 					'distributed.island.variable_source_invalid',
@@ -590,8 +597,8 @@ function boundaryBinding(
 	}
 	const sourceRecord = Object.freeze(Object.fromEntries(sources));
 	return Object.freeze({
-		version: 1,
-		id: `boundary-v1:${fnv1a64(`${entry.island.operationHash}\n${stableJson(sourceRecord)}`)}`,
+		version: DISTRIBUTED_BOUNDARY_BINDING_VERSION,
+		id: `boundary-v${DISTRIBUTED_BOUNDARY_BINDING_VERSION}:${fnv1a64(`${entry.island.operationHash}\n${stableJson(sourceRecord)}`)}`,
 		discovery: hasExplicit ? 'explicit' : hasRoute ? 'route_param' : 'empty',
 		sources: sourceRecord
 	});
@@ -608,7 +615,8 @@ function routeParameterNames(route: string): readonly string[] {
 
 function normalizeBindingSource(
 	value: unknown,
-	variable: string
+	variable: string,
+	graphqlType: string
 ): DistributedBoundaryVariableSource {
 	if (value === null || typeof value !== 'object' || Array.isArray(value)) {
 		throw new TypeError(`Distributed boundary variable ${variable} source must be an object`);
@@ -626,19 +634,7 @@ function normalizeBindingSource(
 			return Object.freeze({ kind: 'route_param', name });
 		}
 		case 'search_param': {
-			const name = ownDataValue(record, 'name');
-			if (typeof name !== 'string' || name.length === 0) {
-				throw new TypeError(`Distributed boundary variable ${variable} source name is invalid`);
-			}
-			const mode = ownDataValue(record, 'mode');
-			if (mode !== undefined && mode !== 'first' && mode !== 'all') {
-				throw new TypeError(`Distributed boundary variable ${variable} search mode is invalid`);
-			}
-			return Object.freeze({
-				kind: 'search_param',
-				name,
-				...(mode === undefined ? {} : { mode })
-			});
+			return normalizeSearchParamSource(record, variable, graphqlType);
 		}
 		case 'trusted_session':
 		case 'forwarded_prop': {
@@ -1120,11 +1116,6 @@ function contained(root: string, value: string, label: string): string {
 	return path;
 }
 
-function isWithin(root: string, target: string): boolean {
-	const path = relative(root, target);
-	return path === '' || (!path.startsWith(`..${sep}`) && path !== '..' && !isAbsolute(path));
-}
-
 function projectPath(cwd: string, path: string): string {
 	return portable(relative(cwd, path));
 }
@@ -1209,15 +1200,3 @@ function freezeStable(value: unknown): unknown {
 	return Object.freeze(value);
 }
 
-function fnv1a64(value: string): string {
-	let hash = 0xcbf29ce484222325n;
-	for (const byte of new TextEncoder().encode(value)) {
-		hash ^= BigInt(byte);
-		hash = BigInt.asUintN(64, hash * 0x100000001b3n);
-	}
-	return hash.toString(16).padStart(16, '0');
-}
-
-function isMissing(error: unknown): boolean {
-	return error !== null && typeof error === 'object' && 'code' in error && error.code === 'ENOENT';
-}

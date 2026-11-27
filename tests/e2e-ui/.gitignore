@@ -16,4 +16,4 @@ e2e/.auth
 playwright-report
 test-results
 blob-report
-gitops/cluster/e2e-identity/grants.yaml
+!Cargo.lock

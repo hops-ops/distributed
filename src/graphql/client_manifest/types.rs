@@ -1,4 +1,11 @@
 use super::*;
+use crate::projection::placement::{
+    ProjectionBindingState, ProjectionExecutionClass, ProjectionPlacement,
+};
+use crate::projection::{
+    ProjectionEnvelopeField, ProjectionRelationshipEffectKind, ProjectionScalarTransform,
+    ProjectionValue, ProjectionValueType,
+};
 
 fn deserialize_exact_u32<'de, D>(
     deserializer: D,
@@ -145,6 +152,101 @@ pub struct DistributedClientManifest {
     pub projectors: Vec<ClientProjector>,
     pub projection_programs: Vec<ClientProjectionProgram>,
     pub projection_bindings: Vec<ClientProjectionBinding>,
+    /// External read sources by section ([`ExternalReadSource::section`]),
+    /// each entry its source's client-manifest value, sorted by source name.
+    /// Omitted when empty, so a manifest without external sources (and its
+    /// fingerprint) is unchanged; a compiler refuses a section it does not
+    /// know.
+    ///
+    /// [`ExternalReadSource::section`]: crate::graphql::surface::ExternalReadSource::section
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub external: BTreeMap<String, Vec<serde_json::Value>>,
+}
+
+impl DistributedClientManifest {
+    /// The schema fingerprint of this manifest's content: every field except
+    /// the two fingerprints, as canonical JSON.
+    ///
+    /// The exporter stores it in `schema_fingerprint`; a consumer compares
+    /// the two to detect a manifest edited after export.
+    ///
+    /// # Errors
+    ///
+    /// The manifest cannot be serialized (a non-finite row-policy float).
+    pub fn computed_schema_fingerprint(&self) -> Result<String, ClientManifestError> {
+        #[derive(Serialize)]
+        struct SchemaMaterial<'a> {
+            manifest_version: u32,
+            protocol_version: u32,
+            service_id: &'a str,
+            surface: &'a ClientSurfaceIdentity,
+            execution: &'a ClientExecutionLimits,
+            capabilities: &'a ClientCapabilities,
+            scalar_codecs: &'a [ScalarCodec],
+            models: &'a [ClientModel],
+            roots: &'a [ClientRoot],
+            commands: &'a [ClientCommand],
+            protocol_operations: &'a ClientProtocolOperations,
+            projectors: &'a [ClientProjector],
+            projection_programs: &'a [ClientProjectionProgram],
+            projection_bindings: &'a [ClientProjectionBinding],
+            #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+            external: &'a BTreeMap<String, Vec<serde_json::Value>>,
+        }
+        hash_json(&SchemaMaterial {
+            manifest_version: self.manifest_version,
+            protocol_version: self.protocol_version,
+            service_id: &self.service_id,
+            surface: &self.surface,
+            execution: &self.execution,
+            capabilities: &self.capabilities,
+            scalar_codecs: &self.scalar_codecs,
+            models: &self.models,
+            roots: &self.roots,
+            commands: &self.commands,
+            protocol_operations: &self.protocol_operations,
+            projectors: &self.projectors,
+            projection_programs: &self.projection_programs,
+            projection_bindings: &self.projection_bindings,
+            external: &self.external,
+        })
+    }
+}
+
+impl ClientModel {
+    pub fn field(&self, name: &str) -> Option<&ClientField> {
+        self.fields.iter().find(|field| field.name == name)
+    }
+
+    pub fn relationship(&self, name: &str) -> Option<&ClientRelationship> {
+        self.relationships
+            .iter()
+            .find(|relationship| relationship.name == name)
+    }
+
+    /// The normalized identity fields; `None` for an embedded model.
+    pub fn identity(&self) -> Option<&[ClientKeyField]> {
+        match &self.normalization {
+            ModelNormalization::Normalized { fields, .. } => Some(fields),
+            ModelNormalization::Embedded => None,
+        }
+    }
+}
+
+impl ClientArgument {
+    /// The argument's GraphQL type reference (`[T!]!`, `T`, …).
+    pub fn graphql_type(&self) -> String {
+        let base = if self.list {
+            format!("[{}!]", self.type_name)
+        } else {
+            self.type_name.clone()
+        };
+        if self.nullable {
+            base
+        } else {
+            format!("{base}!")
+        }
+    }
 }
 
 /// Framework-owned operations generated alongside application operations.
@@ -152,6 +254,7 @@ pub struct DistributedClientManifest {
 /// Keeping these documents in the manifest means clients never synthesize a
 /// status query or guess the server's protocol field selection.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ClientProtocolOperations {
     pub version: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -159,6 +262,7 @@ pub struct ClientProtocolOperations {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ClientProtocolOperation {
     pub name: String,
     pub operation: String,
@@ -166,6 +270,7 @@ pub struct ClientProtocolOperation {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ClientCapabilities {
     pub live_queries: bool,
     pub record_revisions: bool,
@@ -180,12 +285,14 @@ pub struct ClientCapabilities {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ScalarCodec {
     pub scalar: String,
     pub codec: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ClientModel {
     pub id: String,
     pub typename: String,
@@ -206,7 +313,7 @@ pub struct ClientModel {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ModelNormalization {
     Normalized {
         fields: Vec<ClientKeyField>,
@@ -216,20 +323,27 @@ pub enum ModelNormalization {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ClientKeyField {
     pub name: String,
     pub codec: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ClientField {
     pub name: String,
     pub scalar: String,
     pub codec: String,
     pub nullable: bool,
+    /// The exact value shape of a `json` field, from the read model's Rust
+    /// type. Generated clients type the field with it instead of `unknown`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub json_type: Option<crate::table::JsonShape>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ClientFilterInput {
     pub type_name: String,
     pub fields: Vec<ClientFilterField>,
@@ -237,13 +351,14 @@ pub struct ClientFilterInput {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ClientFilterInputRelationship {
     pub field: String,
     pub target_type: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ClientRowPolicy {
     Unrestricted,
     Predicate { expression: FilterExpr },
@@ -251,6 +366,7 @@ pub enum ClientRowPolicy {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ClientRelationship {
     pub name: String,
     pub target_model: String,
@@ -272,6 +388,7 @@ pub struct ClientRelationship {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ClientRelationshipAggregate {
     pub name: String,
     pub arguments: Vec<ClientArgument>,
@@ -288,7 +405,7 @@ pub enum ClientRelationshipKind {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum RelationshipKeyMapping {
     Direct {
         local: Vec<String>,
@@ -319,6 +436,7 @@ pub enum ClientRelationshipMaintenance {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ClientRoot {
     pub id: String,
     pub operation: ClientRootOperation,
@@ -334,14 +452,14 @@ pub struct ClientRoot {
     pub live: bool,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ClientRootOperation {
     Query,
     Subscription,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ClientRootKind {
     List,
@@ -350,6 +468,7 @@ pub enum ClientRootKind {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ClientArgument {
     pub name: String,
     pub kind: ClientArgumentKind,
@@ -360,7 +479,7 @@ pub struct ClientArgument {
     pub codec: Option<String>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ClientArgumentKind {
     Filter,
@@ -371,6 +490,7 @@ pub enum ClientArgumentKind {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ClientFilterSemantics {
     pub fields: Vec<ClientFilterField>,
     pub relationships: Vec<String>,
@@ -378,18 +498,21 @@ pub struct ClientFilterSemantics {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ClientFilterField {
     pub name: String,
     pub operators: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ClientOrderSemantics {
     pub fields: Vec<String>,
     pub values: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ClientPaginationSemantics {
     pub kind: String,
     pub default_limit: u64,
@@ -398,6 +521,7 @@ pub struct ClientPaginationSemantics {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ClientAggregateSemantics {
     /// Exact GraphQL wrapper object selected by this root or relationship.
     pub wrapper_typename: String,
@@ -420,6 +544,7 @@ pub struct ClientAggregateSemantics {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ClientCommand {
     pub version: u32,
     pub name: String,
@@ -434,19 +559,21 @@ pub struct ClientCommand {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ClientCommandShape {
     None,
     Object { definition: ClientTypeDef },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ClientTypeDef {
     pub name: String,
     pub fields: Vec<ClientTypeField>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ClientTypeField {
     pub name: String,
     pub type_name: String,
@@ -470,18 +597,6 @@ pub struct ClientCommandExtensionSlots {
     pub direct_projection: Option<CommandDirectProjectionExtension>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub input_defaults: Option<CommandInputDefaultsExtension>,
-    #[serde(
-        default,
-        skip_serializing,
-        deserialize_with = "reject_legacy_command_authority"
-    )]
-    pub effects: Option<CommandEffectsExtension>,
-    #[serde(
-        default,
-        skip_serializing,
-        deserialize_with = "reject_legacy_command_authority"
-    )]
-    pub confirmations: Option<CommandConfirmationsExtension>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub projection: Option<CommandProjectionExtension>,
     /// Names and wire codecs only. Values are server-derived for the current
@@ -490,26 +605,18 @@ pub struct ClientCommandExtensionSlots {
     pub trusted_presets: Vec<ClientTrustedPresetDescriptor>,
 }
 
-fn reject_legacy_command_authority<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let _ = serde::de::IgnoredAny::deserialize(deserializer)?;
-    Err(serde::de::Error::custom(
-        "client manifest v2 rejects legacy command effects/confirmations authority",
-    ))
-}
-
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ClientTrustedPresetDescriptor {
     pub name: String,
     pub codec: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CommandConsistencyExtension {
     pub version: u32,
-    pub kind: String,
+    pub kind: CommandConsistency,
 }
 
 /// Opaque same-transaction target for one `Atomic<T>` command.
@@ -519,15 +626,17 @@ pub struct CommandConsistencyExtension {
 /// The role-selected client contract therefore needs only this exact identity,
 /// never the hidden topology inventory used to compile it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CommandDirectProjectionExtension {
     pub topology: ClientProjectionTopologyIdentity,
     pub model: String,
+    /// A `Constant` value is canonical JSON (sorted object keys).
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub partition: Option<serde_json::Value>,
-    pub change_epoch: String,
+    pub partition: Option<EffectExpression>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ClientProjectionTopologyIdentity {
     pub version: u32,
     pub name: String,
@@ -536,38 +645,20 @@ pub struct ClientProjectionTopologyIdentity {
 
 /// Generators applied once to the canonical command input before dispatch.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CommandInputDefaultsExtension {
     pub version: u32,
-    pub defaults: Vec<serde_json::Value>,
+    pub defaults: Vec<CommandInputDefault>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CommandEffectsExtension {
-    pub version: u32,
-    pub operations: Vec<serde_json::Value>,
-    pub fallback: String,
-}
-
-/// Declaration-owned projector progress expected after a fact commit.
-/// Entries use the same closed input-expression/key IR as optimistic effects.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CommandConfirmationsExtension {
-    pub version: u32,
-    /// `finite` contains the complete authorized edge set; `unavailable`
-    /// intentionally carries no topology and requires revalidation.
-    pub kind: String,
-    pub expected: Vec<serde_json::Value>,
-    pub fallback: String,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ClientProjector {
     pub version: u32,
     pub name: String,
     pub facts: Vec<String>,
     pub models: Vec<String>,
     pub dependencies: Vec<String>,
-    pub causal_confirmation: bool,
 }
 
 /// Opaque exact outward-event reference.
@@ -588,31 +679,9 @@ pub struct ClientProjectionBinding {
     pub version: u32,
     pub binding_id: String,
     pub program_id: String,
-    pub epoch: String,
-    pub state: ClientProjectionBindingState,
-    pub placement: ClientProjectionPlacement,
-    pub execution_class: ClientProjectionExecutionClass,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ClientProjectionBindingState {
-    Active,
-    Draining,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ClientProjectionPlacement {
-    Eventual,
-    Direct,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ClientProjectionExecutionClass {
-    Causal,
-    Background,
+    pub state: ProjectionBindingState,
+    pub placement: ProjectionPlacement,
+    pub execution_class: ProjectionExecutionClass,
 }
 
 /// One authorized portable projection program.
@@ -707,13 +776,15 @@ pub enum ClientProjectionAssignment {
 pub enum ClientProjectionExpression {
     Slot {
         slot: String,
-        value_type: ClientProjectionValueType,
+        value_type: ProjectionValueType,
     },
+    /// Only [client-intrinsic](ProjectionEnvelopeField::is_client_intrinsic)
+    /// fields; the others are slots.
     Envelope {
-        field: ClientProjectionEnvelopeField,
+        field: ProjectionEnvelopeField,
     },
     Constant {
-        value: ClientProjectionValue,
+        value: ProjectionValue,
     },
     Enum {
         enum_type: String,
@@ -726,7 +797,7 @@ pub enum ClientProjectionExpression {
         fields: Vec<ClientProjectionObjectField>,
     },
     Transform {
-        transform: ClientProjectionScalarTransform,
+        transform: ProjectionScalarTransform,
         arguments: Vec<ClientProjectionExpression>,
     },
 }
@@ -739,81 +810,15 @@ pub struct ClientProjectionObjectField {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(
-    tag = "type",
-    content = "name",
-    rename_all = "snake_case",
-    deny_unknown_fields
-)]
-pub enum ClientProjectionValueType {
-    Boolean,
-    I64,
-    U64,
-    F64,
-    String,
-    Enum(String),
-    Json,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ClientProjectionScalarTransform {
-    StringConcat,
-    FirstPresent,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ClientProjectionEnvelopeField {
-    OccurrenceVersion,
-    EventName,
-    EventVersion,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(
-    tag = "type",
-    content = "value",
-    rename_all = "snake_case",
-    deny_unknown_fields
-)]
-pub enum ClientProjectionValue {
-    Null,
-    Boolean(bool),
-    I64(String),
-    U64(String),
-    F64(String),
-    String(String),
-    Enum { enum_type: String, variant: String },
-    List(Vec<ClientProjectionValue>),
-    Object(Vec<ClientProjectionValueField>),
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ClientProjectionValueField {
-    pub name: String,
-    pub value: ClientProjectionValue,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ClientProjectionRelationshipEffect {
     pub ordinal: u32,
-    pub kind: ClientProjectionRelationshipEffectKind,
+    pub kind: ProjectionRelationshipEffectKind,
     pub source_model: String,
     pub relationship: String,
     pub target_model: String,
     pub source_key: Vec<ClientProjectionKeyField>,
     pub target_key: Vec<ClientProjectionKeyField>,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ClientProjectionRelationshipEffectKind {
-    Link,
-    Unlink,
-    Invalidate,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -992,7 +997,7 @@ pub enum ClientProjectionPreviewSource {
     Input { path: Vec<String> },
     GeneratedDefault { path: Vec<String> },
     TrustedPreset { name: String, codec: String },
-    Constant { value: ClientProjectionValue },
+    Constant { value: ProjectionValue },
     Null,
     Absent,
     Unknown,

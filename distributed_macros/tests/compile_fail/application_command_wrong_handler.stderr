@@ -1,5 +1,0 @@
-error: first Result type must be PreparedCommand<Outcome>
-  --> tests/compile_fail/application_command_wrong_handler.rs:13:13
-   |
-13 | ) -> Result<(), distributed::microsvc::HandlerError> {
-   |             ^^

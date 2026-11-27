@@ -1,38 +1,25 @@
 //! Read Models - storage-backed projections and read-optimized views.
 //!
-//! Relational models stage explicit row mutations:
-//!
-//! ```ignore
-//! use distributed::read_model::{ReadModelWritePlanBuilder, ReadModelWritePlanCommitExt};
-//!
-//! let mut read_models = ReadModelWritePlanBuilder::new();
-//! read_models.upsert(&player)?;
-//! read_models.upsert_related(&player, "weapons", &weapon)?;
-//! repo.read_models(read_models).commit(&mut aggregate).await?;
-//! ```
-//!
-//! Persistent repositories expose the staging shape through
-//! `ReadModelWritePlanCommitExt::read_models`, returning a future
-//! from `commit`.
-//!
-//! Distributed projectors can commit a write plan directly against a read-model
-//! adapter. Projection handlers should make those writes idempotent so bus
-//! retries can safely replay the same message:
+//! Read models are written only by projections, never by a command's
+//! commit. A projector commits a write plan against a read-model adapter.
+//! Projection handlers should make those writes idempotent so bus retries can
+//! safely replay the same message:
 //!
 //! ```ignore
 //! let mut read_models = ReadModelWritePlanBuilder::new();
 //! read_models.upsert(&view)?;
-//! let outcome = read_models.commit(&read_store)?;
+//! read_models.commit(&read_store)?;
 //! ```
 
-mod capabilities;
-pub mod change;
+pub(crate) mod change;
 pub(crate) mod in_memory;
 mod load;
 mod plan;
+mod scan;
 mod workspace;
 
 pub use change::ReadModelChange;
+pub use distributed_macros::ReadModel;
 
 use serde::{de::DeserializeOwned, Serialize};
 
@@ -89,10 +76,10 @@ pub trait RelationalReadModelIncludes: RelationalReadModel {
     fn include_target_schema(include: &str) -> Result<&'static TableSchema, TableStoreError>;
 }
 
-pub use capabilities::ReadModelQueryCapabilities;
 pub use in_memory::InMemoryReadModelStore;
 pub use load::{
     ReadModelIncludeRows, ReadModelLoadBuilder, ReadModelLoadGraph, ReadModelLoadRequest,
 };
 pub use plan::ReadModelWritePlanBuilder;
+pub use scan::{ReadModelScanCursor, ReadModelScanPage, ReadModelScanRequest};
 pub use workspace::{ReadModelWorkspace, ReadModelWorkspaceExt};

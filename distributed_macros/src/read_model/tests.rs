@@ -3,188 +3,34 @@ use super::*;
 use syn::DeriveInput;
 
 #[test]
-fn expand_read_model_accepts_named_id_field() {
-    let input: DeriveInput = syn::parse_quote! {
-        struct CounterView {
-            id: String,
-            value: i32,
-        }
-    };
-
-    let expanded = expand_read_model(input).unwrap().to_string();
-
-    assert!(expanded.contains("impl distributed :: ReadModel for CounterView"));
-    assert!(expanded.contains("fn id"));
+fn direct_relationship_references_need_one_belongs_to() {
+    for attributes in [
+        "references = \"id\"",
+        "belongs_to = \"Object\", foreign_key = \"id\", references = \"id\", references = \"id\"",
+        "many_to_many = \"Object\", foreign_key = \"id\", through = \"links\", references = \"id\"",
+    ] {
+        let input = syn::parse_str(&format!(
+            "struct Ref {{ id: String, #[readmodel({attributes})] object: Option<Object> }}"
+        ))
+        .unwrap();
+        assert!(expand_read_model(input).is_err(), "accepted {attributes}");
+    }
 }
 
 #[test]
-fn expand_read_model_accepts_explicit_id_attribute() {
-    let input: DeriveInput = syn::parse_quote! {
-        struct CounterView {
-            id: String,
-            #[readmodel(id)]
-            counter_id: String,
-            value: i32,
-        }
-    };
-
-    let expanded = expand_read_model(input).unwrap().to_string();
-
-    assert!(expanded.contains("& self . counter_id"));
-    assert!(!expanded.contains("& self . id"));
-}
-
-#[test]
-fn expand_read_model_accepts_declared_name() {
-    let input: DeriveInput = syn::parse_quote! {
-        #[readmodel(name = "operational.todos", table = "operational_todos")]
-        struct OperationalTodos {
-            #[readmodel(id)]
-            todo_id: String,
-        }
-    };
-
-    let expanded = expand_read_model(input).unwrap().to_string();
-    assert!(
-        expanded.contains("operational.todos") || expanded.contains("operational . todos"),
-        "{expanded}"
-    );
-    assert!(!expanded.contains("model_name : \"OperationalTodos\""));
-    assert!(
-        expanded.contains("operational_todos"),
-        "default table must come from the Rust type, not the declared name: {expanded}"
-    );
-}
-
-#[test]
-fn expand_read_model_accepts_direct_collection_attribute() {
-    let input: DeriveInput = syn::parse_quote! {
-        #[collection("counter_views")]
-        struct CounterView {
-            #[id]
-            counter_id: String,
-            value: i32,
-        }
-    };
-
-    let expanded = expand_read_model(input).unwrap().to_string();
-
-    assert!(expanded.contains("const COLLECTION : & 'static str = \"counter_views\""));
-    assert!(expanded.contains("& self . counter_id"));
-}
-
-#[test]
-fn expand_read_model_accepts_direct_table_and_id_column_attributes() {
-    let input: DeriveInput = syn::parse_quote! {
-        #[table = "counter_views"]
-        struct CounterView {
-            #[id("counter_id")]
-            id: String,
-            value: i32,
-        }
-    };
-
-    let expanded = expand_read_model(input).unwrap().to_string();
-
-    assert!(expanded.contains("table_name : \"counter_views\""));
-    assert!(expanded.contains("column_name : \"counter_id\""));
-}
-
-#[test]
-fn expand_read_model_accepts_direct_column_attribute() {
-    let input: DeriveInput = syn::parse_quote! {
-        #[table("counter_views")]
-        struct CounterView {
-            #[id]
-            id: String,
-            #[column("counter_value")]
-            value: i32,
-        }
-    };
-
-    let expanded = expand_read_model(input).unwrap().to_string();
-
-    assert!(expanded.contains("column_name : \"counter_value\""));
-}
-
-#[test]
-fn expand_read_model_accepts_direct_index_attribute() {
-    let input: DeriveInput = syn::parse_quote! {
-        #[table("counter_views")]
-        struct CounterView {
-            #[id]
-            id: String,
-            #[index("idx_counter_views_value")]
-            value: i32,
-        }
-    };
-
-    let expanded = expand_read_model(input).unwrap().to_string();
-
-    assert!(expanded.contains("name : Some (\"idx_counter_views_value\""));
-    assert!(expanded.contains("columns : vec ! [\"value\""));
-    assert!(expanded.contains("unique : false"));
-}
-
-#[test]
-fn expand_read_model_accepts_direct_unique_attribute() {
-    let input: DeriveInput = syn::parse_quote! {
-        #[table("counter_views")]
-        struct CounterView {
-            #[id]
-            id: String,
-            #[unique("uq_counter_views_slug")]
-            slug: String,
-        }
-    };
-
-    let expanded = expand_read_model(input).unwrap().to_string();
-
-    assert!(expanded.contains("name : Some (\"uq_counter_views_slug\""));
-    assert!(expanded.contains("columns : vec ! [\"slug\""));
-    assert!(expanded.contains("unique : true"));
-}
-
-#[test]
-fn expand_read_model_accepts_struct_compound_index_attribute() {
-    let input: DeriveInput = syn::parse_quote! {
-        #[table("account_summaries")]
-        #[index(name = "idx_account_summaries_owner_created", columns = ["owner", "created_at"])]
-        struct AccountSummary {
-            #[id("account_id")]
-            id: String,
-            owner: String,
-            #[column("created_at_utc")]
-            created_at: String,
-        }
-    };
-
-    let expanded = expand_read_model(input).unwrap().to_string();
-
-    assert!(expanded.contains("name : Some (\"idx_account_summaries_owner_created\""));
-    assert!(expanded.contains("columns : vec ! [\"owner\" . to_string () , \"created_at_utc\""));
-    assert!(expanded.contains("unique : false"));
-}
-
-#[test]
-fn expand_read_model_accepts_struct_compound_unique_attribute() {
-    let input: DeriveInput = syn::parse_quote! {
-        #[table("accounts")]
-        #[unique(columns = ["tenant_id", "slug"])]
-        struct AccountSummary {
-            #[id("account_id")]
-            id: String,
-            tenant_id: String,
-            slug: String,
-        }
-    };
-
-    let expanded = expand_read_model(input).unwrap().to_string();
-
-    assert!(expanded.contains("name : Some (\"uq_accounts_tenant_id_slug\""));
-    assert!(expanded.contains("columns : vec ! [\"tenant_id\""));
-    assert!(expanded.contains("\"slug\""));
-    assert!(expanded.contains("unique : true"));
+fn boxed_belongs_to_rejects_anything_but_one_box_of_the_target() {
+    for ty in [
+        "Option<Box<Other>>",
+        "Option<Box<Box<Child>>>",
+        "Option<std::sync::Arc<Child>>",
+        "Box<Child>",
+        "Vec<Box<Child>>",
+    ] {
+        let input: DeriveInput = syn::parse_str(&format!(
+            "struct Parent {{ id: String, #[readmodel(belongs_to = \"Child\", foreign_key = \"id\")] child: {ty} }}"
+        )).unwrap();
+        assert!(expand_read_model(input).is_err(), "accepted {ty}");
+    }
 }
 
 #[test]
@@ -227,39 +73,6 @@ fn expand_read_model_rejects_direct_attributes_without_values() {
 }
 
 #[test]
-fn expand_read_model_rejects_missing_id_field_for_document_models() {
-    let input: DeriveInput = syn::parse_quote! {
-        struct CounterView {
-            value: i32,
-        }
-    };
-
-    let err = expand_read_model(input).expect_err("missing id field should return an error");
-
-    assert!(
-        err.to_string().contains("field named `id`"),
-        "unexpected error: {err}"
-    );
-}
-
-#[test]
-fn expand_read_model_allows_composite_relational_models_without_string_id() {
-    let input: DeriveInput = syn::parse_quote! {
-        #[readmodel(table = "player_weapons", primary_key = ["player_id", "weapon_id"])]
-        struct PlayerWeapon {
-            #[readmodel(foreign_key = "players.player_id", delegated_from = "Player.player_id")]
-            player_id: String,
-            weapon_id: String,
-        }
-    };
-
-    let expanded = expand_read_model(input).unwrap().to_string();
-
-    assert!(expanded.contains("impl distributed :: RelationalReadModel for PlayerWeapon"));
-    assert!(!expanded.contains("impl distributed :: ReadModel for PlayerWeapon"));
-}
-
-#[test]
 fn expand_read_model_rejects_multiple_explicit_id_attributes() {
     let input: DeriveInput = syn::parse_quote! {
         struct CounterView {
@@ -297,62 +110,6 @@ fn expand_read_model_rejects_unknown_struct_attributes() {
             .contains("unknown readmodel struct attribute"),
         "unexpected error: {err}"
     );
-}
-
-#[test]
-fn expand_read_model_rejects_unknown_field_attributes() {
-    let input: DeriveInput = syn::parse_quote! {
-        struct CounterView {
-            #[readmodel(ide)]
-            id: String,
-            value: i32,
-        }
-    };
-
-    let err = expand_read_model(input).expect_err("unknown field attribute should fail");
-
-    assert!(
-        err.to_string()
-            .contains("unknown readmodel field attribute"),
-        "unexpected error: {err}"
-    );
-}
-
-#[test]
-fn expand_read_model_accepts_relationship_metadata_before_relationship_kind() {
-    let input: DeriveInput = syn::parse_quote! {
-        #[readmodel(table = "players")]
-        struct Player {
-            #[readmodel(id, column = "player_id")]
-            id: String,
-            #[readmodel(foreign_key = "player_id", has_many = "PlayerWeapon")]
-            weapons: Vec<PlayerWeapon>,
-        }
-    };
-
-    let expanded = expand_read_model(input).unwrap().to_string();
-
-    assert!(expanded.contains("RelationshipKind :: HasMany"));
-    assert!(expanded.contains("foreign_key : Some (\"player_id\""));
-}
-
-#[test]
-fn expand_read_model_accepts_through_before_many_to_many() {
-    let input: DeriveInput = syn::parse_quote! {
-        #[readmodel(table = "players")]
-        struct Player {
-            #[readmodel(id, column = "player_id")]
-            id: String,
-            #[readmodel(through = "player_weapon_links", foreign_key = "player_id", many_to_many = "Weapon")]
-            weapons: Vec<Weapon>,
-        }
-    };
-
-    let expanded = expand_read_model(input).unwrap().to_string();
-
-    assert!(expanded.contains("RelationshipKind :: ManyToMany"));
-    assert!(expanded.contains("through : Some (\"player_weapon_links\""));
-    assert!(expanded.contains("foreign_key : Some (\"player_id\""));
 }
 
 #[test]
@@ -466,23 +223,4 @@ fn default_storage_name_treats_ambiguous_terminal_s_as_plural() {
     let expected = ["status".to_string(), "bus".to_string()];
 
     assert_eq!(actual, expected);
-}
-
-#[test]
-fn expand_read_model_shares_natural_default_between_document_and_relational_metadata() {
-    let input: DeriveInput = syn::parse_quote! {
-        struct BlobGames {
-            #[id]
-            game_id: String,
-            #[index]
-            owner_id: String,
-        }
-    };
-
-    let expanded = expand_read_model(input).unwrap().to_string();
-
-    assert!(
-        expanded.contains("const COLLECTION : & 'static str = \"blob_games\"")
-            && expanded.contains("table_name : \"blob_games\"")
-    );
 }

@@ -6,8 +6,8 @@ import {
 } from '../../dist/replica/index.js';
 import { COMMAND_CONSISTENCY } from './command-protocol.mjs';
 
-export const REACT_FIXTURE_SCHEMA = `sha256:${'a'.repeat(64)}`;
-export const REACT_FIXTURE_SURFACE = Object.freeze({
+export const FIXTURE_SCHEMA = `sha256:${'a'.repeat(64)}`;
+export const FIXTURE_SURFACE = Object.freeze({
 	kind: 'role',
 	name: 'user'
 });
@@ -26,9 +26,9 @@ const RequiredRevalidationCommand = Object.freeze({
 	operationHash: `sha256:${'b'.repeat(64)}`,
 	protocol: Object.freeze({
 		version: 1,
-		schemaHash: REACT_FIXTURE_SCHEMA,
+		schemaHash: FIXTURE_SCHEMA,
 		protocolHash: `sha256:${'c'.repeat(64)}`,
-		surface: REACT_FIXTURE_SURFACE,
+		surface: FIXTURE_SURFACE,
 		operation: `sha256:${'b'.repeat(64)}`,
 		trustedPresets: Object.freeze([])
 	}),
@@ -129,8 +129,8 @@ export const TodosArtifact = Object.freeze({
 	document: 'query ReactFixtureTodos { todos { id title status } }',
 	protocol: Object.freeze({
 		version: 1,
-		schemaHash: REACT_FIXTURE_SCHEMA,
-		surface: REACT_FIXTURE_SURFACE,
+		schemaHash: FIXTURE_SCHEMA,
+		surface: FIXTURE_SURFACE,
 		operation: 'query:react-fixture-todos',
 		trustedPresets: Object.freeze([])
 	}),
@@ -219,8 +219,8 @@ export const TodoByIdArtifact = Object.freeze({
 		'query ReactFixtureTodoById($id: ID!) { todo(id: $id) { id title status } }',
 	protocol: Object.freeze({
 		version: 1,
-		schemaHash: REACT_FIXTURE_SCHEMA,
-		surface: REACT_FIXTURE_SURFACE,
+		schemaHash: FIXTURE_SCHEMA,
+		surface: FIXTURE_SURFACE,
 		operation: 'query:react-fixture-todo-by-id',
 		trustedPresets: Object.freeze([])
 	}),
@@ -302,6 +302,7 @@ export function todoFrame(
 		authorizationGeneration = 'auth-1',
 		position = '1',
 		source = 'query',
+		mode = 'resumable',
 		reset = false,
 		errors
 	} = {}
@@ -343,9 +344,9 @@ export function todoFrame(
 				snapshot: {
 					scopeToken: `snapshot:${root.field}`,
 					recordsComplete: true,
-					indexesComparable: true,
+					indexesComparable: mode === 'resumable',
 					records,
-					indexes: [
+					indexes: mode === 'snapshot' ? [] : [
 						{
 							projection: 'todos-projector',
 							scopeToken: `index:${root.field}`,
@@ -358,9 +359,9 @@ export function todoFrame(
 				...(source === 'live'
 					? {
 							live: {
-								supported: true,
-								reset,
-								cursors: [resume]
+								mode,
+								reset: mode === 'snapshot' || reset,
+								cursors: mode === 'snapshot' ? [] : [resume]
 							}
 						}
 					: {})

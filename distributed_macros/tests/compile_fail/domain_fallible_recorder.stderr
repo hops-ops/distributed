@@ -1,5 +1,0 @@
-error: domain-marked #[event] methods must omit the return type in version one; fallible recorders cannot prove post-transition capture safety
-  --> tests/compile_fail/domain_fallible_recorder.rs:10:28
-   |
-10 |     fn complete(&mut self) -> distributed::SourcedResult {
-   |                            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

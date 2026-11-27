@@ -144,10 +144,12 @@ impl ReadStore {
 #[cfg(all(test, feature = "sqlite"))]
 mod tests {
     use super::*;
-    use crate::graphql::compile::{compile_query, QueryPlan, RootKind, SelectionNode};
+    use crate::graphql::compile::{
+        compile_query, CompileError, QueryPlan, RootKind, SelectionNode,
+    };
     use crate::graphql::{claim, col, read, GraphqlEngine, ModelPermissions, ReadStore};
     use crate::microsvc::Session;
-    use crate::ReadModel;
+    use crate::read_model::ReadModel;
     use async_graphql::Request;
     use serde::{Deserialize, Serialize};
     use serde_json::json;
@@ -267,6 +269,7 @@ mod tests {
     #[tokio::test]
     async fn sql_store_compiles_todos_list_filter() {
         let engine = GraphqlEngine::builder(pool())
+            .identity(crate::graphql::IdentityConfig::dev_headers())
             .roles(&["user"])
             .model::<Todos>(todo_perms())
             .build()
@@ -286,6 +289,7 @@ mod tests {
     #[tokio::test]
     async fn same_blob_games_type_compiles_as_sql_or_cell() {
         let sql = GraphqlEngine::builder(pool())
+            .identity(crate::graphql::IdentityConfig::dev_headers())
             .roles(&["user"])
             .model::<BlobGames>(blob_perms())
             .model::<AuthUsers>(user_perms())
@@ -307,6 +311,7 @@ mod tests {
 
         let cells = MapCellByKey::new();
         let cell = GraphqlEngine::builder(pool())
+            .identity(crate::graphql::IdentityConfig::dev_headers())
             .roles(&["user"])
             .model::<BlobGames>(blob_perms())
             .model::<AuthUsers>(user_perms())
@@ -331,6 +336,7 @@ mod tests {
     async fn cell_store_rejects_list_filter_join_and_live() {
         let cells = MapCellByKey::new();
         let engine = GraphqlEngine::builder(pool())
+            .identity(crate::graphql::IdentityConfig::dev_headers())
             .roles(&["user"])
             .model::<BlobGames>(blob_perms())
             .model::<AuthUsers>(user_perms())
@@ -346,7 +352,10 @@ mod tests {
             &list_selection(),
         )
         .unwrap_err();
-        assert!(list.contains("fan out to N cells"), "{list}");
+        assert!(
+            matches!(&list, CompileError::UnsupportedOnCellStore(detail) if detail.contains("fan out to N cells")),
+            "{list}"
+        );
 
         let mut filtered = by_pk_selection("g1");
         filtered.args.insert(
@@ -362,7 +371,7 @@ mod tests {
             &filtered,
         )
         .unwrap_err();
-        assert!(filter.contains("filter"), "{filter}");
+        assert!(filter.to_string().contains("filter"), "{filter}");
 
         let join = compile_query(
             &engine.inner,
@@ -373,7 +382,7 @@ mod tests {
             &by_pk_with_owner_join("g1"),
         )
         .unwrap_err();
-        assert!(join.contains("join"), "{join}");
+        assert!(join.to_string().contains("join"), "{join}");
     }
 
     #[tokio::test]
@@ -384,6 +393,7 @@ mod tests {
             json!({ "game_id": "game-1", "owner_id": "alice", "score": 9 }),
         );
         let engine = GraphqlEngine::builder(pool())
+            .identity(crate::graphql::IdentityConfig::dev_headers())
             .roles(&["user"])
             .model::<BlobGames>(blob_perms())
             .model::<AuthUsers>(user_perms())
@@ -416,6 +426,7 @@ mod tests {
             json!({ "game_id": "game-malformed", "score": 10 }),
         );
         let engine = GraphqlEngine::builder(pool())
+            .identity(crate::graphql::IdentityConfig::dev_headers())
             .roles(&["user"])
             .model::<BlobGames>(blob_perms())
             .model::<AuthUsers>(user_perms())
@@ -442,6 +453,7 @@ mod tests {
     async fn graphql_owner_join_fails_on_cell_store() {
         let cells = MapCellByKey::new();
         let engine = GraphqlEngine::builder(pool())
+            .identity(crate::graphql::IdentityConfig::dev_headers())
             .roles(&["user"])
             .model::<BlobGames>(blob_perms())
             .model::<AuthUsers>(user_perms())

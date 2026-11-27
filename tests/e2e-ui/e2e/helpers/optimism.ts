@@ -5,7 +5,7 @@
  * before dispatch is released, the paint came from the client optimistic
  * layer — not a response or subscription frame.
  */
-import type { Page, Response } from '@playwright/test';
+import type { Page, Request, Response } from '@playwright/test';
 import { expect } from '@playwright/test';
 
 export type MutationNeedle =
@@ -38,28 +38,51 @@ function mutationMatches(postData: string | null, needle: string): boolean {
 	return (postData ?? '').includes(needle);
 }
 
+export type HeldGraphqlMutation = {
+	/** The response to the first request this route held, once it is fulfilled. */
+	readonly response: Promise<Response>;
+	/** Remove the route. Await `response` first: see holdGraphqlMutation. */
+	readonly dispose: () => Promise<void>;
+};
+
 /**
  * Install a GraphQL route that continues non-matching requests and delays
- * matching mutation dispatch by holdMs. Returns a disposer.
+ * matching mutation dispatch by holdMs.
+ *
+ * `response` is the held request's own response, not any matching one: a
+ * mutation the page sent before the route existed can answer after it is
+ * installed. Dispose only after `response`: Playwright releases a held request
+ * to the network when the route is removed while another request is still in
+ * the handler (its fallback re-syncs interception), and the held handler's
+ * `route.fulfill` then throws "Route is already handled!" despite
+ * `unrouteAll({ behavior: 'wait' })`.
  */
 export async function holdGraphqlMutation(
 	page: Page,
 	needle: string,
 	holdMs: number = DEFAULT_HOLD_MS
-): Promise<() => Promise<void>> {
+): Promise<HeldGraphqlMutation> {
+	let held: Request | undefined;
+	const response = page.waitForResponse((candidate) => candidate.request() === held, {
+		timeout: holdMs + 20_000
+	});
 	await page.route('**/graphql', async (route) => {
 		if (!mutationMatches(route.request().postData(), needle)) {
 			await route.continue();
 			return;
 		}
+		held ??= route.request();
 		// Hold before route.fetch so neither the command response nor a server
 		// projection/subscription can produce the state under assertion.
 		await new Promise((resolve) => setTimeout(resolve, holdMs));
-		const response = await route.fetch();
-		await route.fulfill({ response });
+		const fetched = await route.fetch();
+		await route.fulfill({ response: fetched });
 	});
-	return async () => {
-		await page.unrouteAll({ behavior: 'wait' });
+	return {
+		response,
+		dispose: async () => {
+			await page.unrouteAll({ behavior: 'wait' });
+		}
 	};
 }
 
@@ -88,12 +111,10 @@ export async function expectOptimisticPaint(
 		);
 	}
 
-	const dispose = await holdGraphqlMutation(page, options.needle, holdMs);
-	const pending = page.waitForResponse(
-		(response) =>
-			response.url().includes('/graphql') &&
-			mutationMatches(response.request().postData(), options.needle),
-		{ timeout: holdMs + 20_000 }
+	const { response: pending, dispose } = await holdGraphqlMutation(
+		page,
+		options.needle,
+		holdMs
 	);
 
 	try {

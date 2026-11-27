@@ -1,5 +1,0 @@
-error: command declaration requires `id = "..."`
- --> tests/compile_fail/application_command_missing_id.rs:2:10
-  |
-2 | async fn missing_id(_context: (), _input: ()) {}
-  |          ^^^^^^^^^^

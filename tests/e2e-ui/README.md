@@ -4,12 +4,13 @@ A copyable Distributed service and SvelteKit UI demonstrating one modeled
 projection from aggregate transition to server read model, generated GraphQL
 client, optimistic replica update, and causal confirmation.
 
-Rust · TypeScript · CQRS / ES · SvelteKit · celld · Kafka · NATS · RabbitMQ ·
-PSQL · SQLite · OIDC · Keycloak · Authentik
+Rust · TypeScript · CQRS / ES · SvelteKit · GraphQL `@live` · Postgres ·
+SQLite · celld + NATS (optional profile) · OIDC via Zitadel
 
-Default is **one command** (`make run`). The same UI can wait-dispatch Todo
-create/complete and `chat.post` to celld from [`../e2e-celld`](../e2e-celld).
-Todo commands are `portable_command!` declarations in `todo-domain`; hosts
+Default is **one command** (`make run`). [`../e2e-celld`](../e2e-celld) runs
+this same service crate on another command host: every Todo command and
+`chat.post` wait-dispatch to celld cells.
+Todo commands are `command!` declarations in `todo-domain`; hosts
 only `.mount` them. Chat is a small cell so `@live` still coming from GraphQL
 is the demo.
 
@@ -46,8 +47,13 @@ make up            # once: writes e2e-ui.env
 distributed dev
 ```
 
-The UI is at `http://localhost:5180`; GraphQL is at
-`http://127.0.0.1:8791/graphql`. The CLI loads `e2e-ui.env` when it exists.
+The public UI is at `http://localhost:8791`; GraphQL is at
+`http://localhost:8791/graphql`. The backend hosts the application gateway and
+proxies UI/auth requests to internal SvelteKit on port 5180. `PUBLIC_ORIGIN`
+selects the public URL and `UI_INTERNAL_ORIGIN` selects the UI upstream. Vite
+does not proxy API requests back to the gateway. Set `GATEWAY_DELIVERY=all` to
+opt into bounded query snapshots, coalescing and shared live delivery; the
+default `none` allocates none of those coordinators. The CLI loads `e2e-ui.env` when it exists.
 Demo users are `alice`, `bob`, and `admin` with password `Password1!`.
 
 `make run` is a convenience alias for the same zero-config command. Before
@@ -80,6 +86,15 @@ transition, browser rejection before GraphQL dispatch, direct API rejection
 while generations disagree, URL/app-state retention, compatible replica
 restoration, and incompatible replica revalidation.
 
+The same proof covers two consecutive UI-only edits retaining the API process.
+After each transition it submits a real Todo command, checks the command receipt
+and active generation, waits for the exact persisted row through GraphQL, then
+reloads the page and checks its rendered data independently of browser optimism.
+Todo creation is Eventual: its receipt is not a projection-completion barrier.
+Because the Todos query is `@load`, not `@live`, an immediate reload can capture
+pre-projection data that will not update by itself. The test therefore waits on
+authoritative data, not a fixed sleep or a longer DOM timeout.
+
 This is the **default one-process playground**. Optional celld:
 
 ```bash
@@ -87,7 +102,7 @@ cd tests/e2e-ui && make up && make up-celld-nats
 cd ../e2e-celld && make run
 ```
 
-`make up-celld-nats` starts celld 0.4 with its persistent local store, the Queue
+`make up-celld-nats` starts celld (version pinned in `/.celld-version`) with its persistent local store, the Queue
 relay, and NATS (`celld-nats-profile/`). `make test-celld-nats` only validates
 an already-running profile. Neither command is `make run`. GraphQL wait-dispatches
 Todo create/complete and `chat.post` to cells (one SQLite shard per todo or
@@ -104,10 +119,11 @@ is not limited to `+page.graphql`:
 - [`routes/todos/+page.graphql`](ui/src/routes/todos/+page.graphql) is
   page-owned SSR data.
 - [`routes/chat/+layout.graphql`](ui/src/routes/chat/+layout.graphql) owns the
-  finite `@load @live` lobby window across `/chat` and `/chat/about`; navigation
-  retains one normalized replica and live subscription. Its `limit` and
-  `offset` live as GraphQL defaults, so SSR and `ChatMessages.use()` share the
-  same canonical variables without application-level boundary constants.
+  `@load @live @window` lobby across `/chat` and `/chat/about`; navigation
+  retains one normalized replica and live subscription. Its `limit` lives as a
+  GraphQL default, so SSR and `ChatMessages.useWindow()`'s live head share the
+  same canonical variables without application-level boundary constants;
+  `fetchMore()` adds older keyset pages to the same ordered `rows`.
 - [`routes/chat/+layout.public.graphql`](ui/src/routes/chat/+layout.public.graphql)
   is the authorization-specific anonymous copy. Surface-qualified route
   documents are still discovered as layout-owned islands.
@@ -155,7 +171,6 @@ projection! {
     pub const TODOS: ProjectionDescriptor<EventualOnly> = {
         name: "project_todos",
         version: 1,
-        epoch: "e2e-ui-todos-v2",
         model: Todos,
         on {
             events: [
@@ -188,27 +203,31 @@ recovery or revalidation. Actual emitted occurrences—not the declaration—min
 exact obligations for the active projector binding. A no-op command therefore
 emits zero occurrences, mints zero obligations, and completes as `Succeeded`.
 
-Handlers use the fluent unit of work (eventual — projector applies the mutation):
+Todo commands are `command!` declarations
+(`crates/todo-domain/src/commands/complete.rs`). The macro loads the
+aggregate, calls the domain method with the session principal, commits, and
+returns the payload; the projector applies the mutation later (`Eventual`):
 
 ```rust
-let repo = ctx.repo();
-let mut todo = repo
-    .get(&input.todo_id)
-    .await?
-    .ok_or_else(|| HandlerError::NotFound(input.todo_id.clone()))?;
-todo.complete(&owner).map_err(rejected)?;
-
-let state = TodoState::from(&*todo);
-repo.publish_events()
-    .commit(todo)?
-    .causal(TodoStatusPayload {
-        todo_id: state.todo_id,
-        status: state.status,
-    })
+command! {
+    name: "todo.complete",
+    transition: domain_commands::Complete,
+    aggregate: Todo,
+    input: TodoCompleteInput,
+    outcome: Eventual<TodoStatusPayload>,
+    shard: |input| input.todo_id.clone(),
+    load: required,
+    roles: ["user", "admin"],
+    field: "todos_complete",
+    invoke: |todo, _input, principal| todo.complete(principal),
+    payload: |todo, _principal| TodoStatusPayload::from_todo(&**todo),
+}
 ```
 
-Blob uses a **handler-owned projected** commit: materialize the row from the
-same mutation used for event bindings, stage it, and seal `Atomic`:
+Blob uses a **handler-owned Atomic** commit
+(`crates/service/src/modules/blob.rs`): the handler materializes the
+row from the same mutation the event bindings use, stages it, and seals
+`Atomic`:
 
 ```rust
 let repo = ctx.repo();
@@ -217,14 +236,12 @@ let mut game = repo
     .await?
     .ok_or_else(|| HandlerError::NotFound(input.game_id.clone()))?;
 game.move_dir(&owner, direction).map_err(rejected)?;
-
-let row = SaveBlobGame()
-    .from_state(&BlobGameState::from(&*game))?;
-repo.readmodel(row)
-    .publish_events()
-    .commit(game)?
-    .projected()
+let row = sealed_row(&*game)?; // SaveBlobGame().from_state(&BlobGameState::from(game))
+repo.readmodel(row).publish_events().commit(game)?.atomic()
 ```
+
+A hand-written handler returning `PreparedCommand<Eventual<T>>` ends with
+`repo.publish_events().commit(aggregate)?.eventual(payload)` instead.
 
 `Atomic<BlobGames>` means aggregate history, command ledger, read-model row,
 and response evidence commit atomically. Its deliberately narrow eligibility
@@ -245,8 +262,8 @@ differs on purpose — do **not** collapse them into “always send a causal del
 Handler for Atomic — this *is* returning atomic read-model updates:
 
 ```rust
-let row = SaveBlobGame().from_state(&BlobGameState::from(&*game))?;
-repo.readmodel(row).publish_events().commit(game)?.projected()
+let row = sealed_row(&*game)?;
+repo.readmodel(row).publish_events().commit(game)?.atomic()
 // GraphQL returns BlobGames; extensions.records from same-tx evidence.
 ```
 
@@ -293,7 +310,7 @@ domain (`domain_commands::*`); client cache previews are auto-derived from
 input, defaults, and row-policy claims. Both Eventual and Direct surfaces may
 export those previews from the portable program. Eventual commands do not stage
 rows in the handler (the event handler applies the mutation later). Blob stages
-the mutation-derived row with `readmodel(row).commit()?.projected()` so the
+the mutation-derived row with `readmodel(row)…commit(game)?.atomic()` so the
 GraphQL response carries the authoritative row — possible only because apply
 happens in the command handler, not in a later event handler.
 
@@ -304,9 +321,10 @@ the single relationship declaration; `AuthUsers` does not need reverse
 collections for every model that references it.
 
 Read RBAC is attached to those same query models through
-`Todos::permissions()`, `BlobGames::permissions()`, and their peers. The
-runtime GraphQL engine and generated application surfaces reuse those
-declarations; `service.rs` does not recreate the grants.
+`impl AuthorizedReadModel for Todos`, `BlobGames`, and their peers.
+`e2e_readmodels::read_models()` lists each model once; schema bootstrap, the
+runtime GraphQL engine and generated application surfaces all read that list,
+so the service crate neither recreates the grants nor repeats the models.
 
 ## Outcomes
 
@@ -326,33 +344,36 @@ the normal GraphQL command result.
 | `crates/*-domain/` | Aggregates, replay events, and outward domain-state contracts. |
 | `crates/readmodels/` | Query shapes, relationships, and model-owned read RBAC. |
 | `crates/projections/` | Todo, Chat, and Blob event-to-read-model programs. |
-| `crates/service/src/handlers/events/` | Explicit projector handlers that apply modeled programs. |
-| `crates/service/src/handlers/commands/` | Repository → get/create → domain operation → fluent commit. |
-| `crates/service/src/service.rs` | Deployment catalog, placement, routes, and typed commands. |
+| `crates/*-domain/src/commands/` | `command!` handlers: repository → get/create → domain operation → fluent commit. Blob's Atomic commands seal `BlobGames` rows, so they live in `crates/service/src/modules/blob.rs` and `blob-domain` does not depend on the read models. |
+| `crates/service/src/application.rs` | Composition root: application name and client surfaces (declared once). |
+| `crates/service/src/modules/` | One module per bounded context (`todo`, `chat`, `blob`, `identity`) mounting its typed commands and projections; `compose.rs` lists them, and the application manifest is derived from that Service. |
+| `crates/service/src/host.rs` | Infrastructure: one host for SQLite and Postgres (`SqlStores`), OIDC, serving. |
 | `ui/src/routes/*/+page.graphql` | Co-located SSR/live reads. |
 | `ui/src/routes/*/+page.svelte` | `*.use()` and ordinary typed command calls. |
 | `.distributed/lifecycle/generations/<id>/ui/src/lib/generated/` | Immutable lifecycle-owned user/admin/public clients. |
 
-Todo and Chat mount catalog-pinned local causal executors through explicit
-`modeled_projector(...).handle(...)` event handlers. Those handlers apply the
+Todo and Chat mount catalog-pinned local causal executors with
+`consume_projection(projections.projector(TODOS))`: the runtime applies the
 shared plan without repeating its mapping — that is why the waiting client only
 has `.applies` previews until obligations complete. Blob has a catalog-pinned
 direct owner and no asynchronous event route or second writer: the command
 handler applies the same mutation IR and returns the row. The Zitadel provider
 ingestor remains an integration adapter, while its provider-event-to-`AuthUsers`
-mapping also lives in `e2e-projections` and runs from an explicit event handler.
+mapping also lives in `e2e-projections` and is consumed the same way.
 
-## Application composition (framework direction)
+## Application composition
 
-e2e-ui is the Full-process reference. Long-term wiring should follow
+e2e-ui is the reference for
 [docs/application-composition.md](../../docs/application-composition.md):
 
-- **Logical:** command defs + projection mounts + surfaces (product graph)
-- **Process role:** Full | CommandWriter | EventualProjector | QueryApi
-- **Runtime:** store + locks + bus + workers + GraphQL (dialect / host)
+- **Logical:** command mounts and projection mounts per module
+  (`modules/`), one `Service` (`modules/compose.rs`), client surfaces
+  (`application.rs`)
+- **Runtime:** stores, locks, bus, consumer and GraphQL from one database,
+  written once against `SqlStores` (`host.rs`)
 
 Atomic commands stay collocated with their write path; Eventual projectors
-may run in another process on the same packages.
+may run in another process on the same crates.
 
 ## Generation and tests
 
@@ -374,10 +395,16 @@ Client optimism is proven in two layers:
 1. **Offline artifacts** (`ui/tests/optimism-artifacts.test.mjs`, run via `make ui-test` /
    UI `npm test`): every demo write command must export non-empty
    `projection.preview.operations`; Atomic also needs `directProjection`.
-2. **Browser paint-before-wire** (the Chat, Todo, and Blob product journeys plus
-   `e2e/helpers/optimism.ts`): hold the GraphQL mutation response longer than the
-   assert deadline and require the UI to update first. The same journey then
-   proves authoritative convergence and continuity.
+2. **Browser optimism** (Playwright product journeys):
+   - Chat (`e2e/helpers/optimism.ts`, `expectOptimisticPaint`) holds the
+     mutation **before** it reaches the server and requires the UI to paint
+     first: paint before the wire.
+   - Blob holds the first move before `route.fetch()` (inline in
+     `blob.user.spec.ts`), so the board must move before the server sees it.
+   - Todo holds only the **response** (`route.fetch()` first, then a delay),
+     so it proves paint before the response, not before the wire.
+   
+   Each journey then proves authoritative convergence and continuity.
 
 ```bash
 # offline
@@ -404,6 +431,5 @@ GraphQL row grants enforce `owner_id = claim("x-user-id")`; the admin mutation
 tree is a separate generated application surface. Disable GraphiQL outside
 local development.
 
-See [PROJECTION_ROLLOUT.md](PROJECTION_ROLLOUT.md) for compatibility probes,
-remote activation, drain, rebuild/import, rollback, and obligation-minting
-controls.
+See [PROJECTION_ROLLOUT.md](PROJECTION_ROLLOUT.md) for how to change a
+projection: additive columns, breaking changes and a stopped projector.

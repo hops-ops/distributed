@@ -5,8 +5,7 @@ use super::{
     ProjectionScopeCodecError,
 };
 use crate::projection_protocol::{
-    ProjectionRecordScope, ProjectorTopologyId, ResolvedProjectionKey, ResolvedProjectionKeyField,
-    ResolvedProjectionObligation,
+    ProjectionRecordScope, ProjectorTopologyId, RecordKey, RecordKeyField,
 };
 use crate::table::{ColumnType, PrimaryKey, RowKey, RowValue, TableColumn, TableKind, TableSchema};
 
@@ -57,7 +56,6 @@ fn schema(
         columns,
         primary_key: PrimaryKey::new(primary_key.iter().copied()),
         version_column: Some("_sourced_version".into()),
-        foreign_keys: Vec::new(),
         indexes: Vec::new(),
         relationships: Vec::new(),
         kind: TableKind::ReadModel,
@@ -71,40 +69,45 @@ fn key_column(field: &str, column: &str, column_type: ColumnType) -> TableColumn
     }
 }
 
+struct CommandKey {
+    projector: String,
+    model: String,
+    partition: Option<serde_json::Value>,
+    key: RecordKey,
+}
+
 fn obligation(
-    codec: &ProjectionScopeCodec,
     projector: &str,
     model: &str,
     partition: Option<serde_json::Value>,
     fields: impl IntoIterator<Item = (&'static str, serde_json::Value)>,
-) -> ResolvedProjectionObligation {
-    let key = ResolvedProjectionKey {
-        fields: fields
-            .into_iter()
-            .map(|(field, value)| ResolvedProjectionKeyField {
-                field: field.into(),
-                value,
-            })
-            .collect(),
-    };
-    let scope = codec
-        .encode_resolved_obligation_scope(projector, model, &key, partition.as_ref())
-        .unwrap_or_else(|_| {
-            ProjectionRecordScope::new(
-                codec.topology().clone(),
-                codec.encode_partition(partition.as_ref()).unwrap(),
-                model,
-                b"invalid-test-key".to_vec(),
-            )
-            .unwrap()
-        });
-    ResolvedProjectionObligation {
+) -> CommandKey {
+    CommandKey {
         projector: projector.into(),
         model: model.into(),
         partition,
-        key,
-        scope,
+        key: RecordKey {
+            fields: fields
+                .into_iter()
+                .map(|(field, value)| RecordKeyField {
+                    field: field.into(),
+                    value,
+                })
+                .collect(),
+        },
     }
+}
+
+fn encode_obligation_scope(
+    codec: &ProjectionScopeCodec,
+    command: &CommandKey,
+) -> Result<ProjectionRecordScope, ProjectionScopeCodecError> {
+    codec.encode_resolved_obligation_scope(
+        &command.projector,
+        &command.model,
+        &command.key,
+        command.partition.as_ref(),
+    )
 }
 
 #[test]
@@ -126,7 +129,6 @@ fn obligation_and_row_keys_share_one_schema_ordered_composite_encoding() {
     let projector_partition =
         serde_json::from_str(r#"{"tenant":{"tier":2,"id":"t-1"},"region":"west"}"#).unwrap();
     let command = obligation(
-        &codec,
         "project_memberships",
         "Membership",
         Some(command_partition),
@@ -148,7 +150,7 @@ fn obligation_and_row_keys_share_one_schema_ordered_composite_encoding() {
         ),
     ]);
 
-    let obligation_scope = codec.encode_obligation_scope(&command).unwrap();
+    let obligation_scope = encode_obligation_scope(&codec, &command).unwrap();
     let row_scope = codec
         .encode_row_scope(
             "project_memberships",
@@ -206,7 +208,6 @@ fn integer_schema_controls_signedness_and_range() {
     .unwrap();
 
     let signed_command = obligation(
-        &codec,
         "project_memberships",
         "SignedRecord",
         None,
@@ -214,14 +215,13 @@ fn integer_schema_controls_signedness_and_range() {
     );
     let signed_row = RowKey::new([("id", RowValue::I64(-1))]);
     assert_eq!(
-        codec.encode_obligation_scope(&signed_command).unwrap(),
+        encode_obligation_scope(&codec, &signed_command).unwrap(),
         codec
             .encode_row_scope("project_memberships", "SignedRecord", None, &signed_row)
             .unwrap()
     );
 
     let unsigned_command = obligation(
-        &codec,
         "project_memberships",
         "UnsignedRecord",
         None,
@@ -229,21 +229,20 @@ fn integer_schema_controls_signedness_and_range() {
     );
     let unsigned_row = RowKey::new([("id", RowValue::U64(u64::MAX))]);
     assert_eq!(
-        codec.encode_obligation_scope(&unsigned_command).unwrap(),
+        encode_obligation_scope(&codec, &unsigned_command).unwrap(),
         codec
             .encode_row_scope("project_memberships", "UnsignedRecord", None, &unsigned_row)
             .unwrap()
     );
 
     let negative_unsigned = obligation(
-        &codec,
         "project_memberships",
         "UnsignedRecord",
         None,
         [("id", serde_json::json!(-1))],
     );
     assert!(matches!(
-        codec.encode_obligation_scope(&negative_unsigned),
+        encode_obligation_scope(&codec, &negative_unsigned),
         Err(ProjectionScopeCodecError::IntegerOutOfRange {
             expected: "unsigned 64-bit integer",
             ..
@@ -251,14 +250,13 @@ fn integer_schema_controls_signedness_and_range() {
     ));
 
     let too_large_signed = obligation(
-        &codec,
         "project_memberships",
         "SignedRecord",
         None,
         [("id", serde_json::json!(u64::MAX))],
     );
     assert!(matches!(
-        codec.encode_obligation_scope(&too_large_signed),
+        encode_obligation_scope(&codec, &too_large_signed),
         Err(ProjectionScopeCodecError::IntegerOutOfRange {
             expected: "signed 64-bit integer",
             ..
@@ -325,25 +323,23 @@ fn registration_and_topology_mismatches_fail_closed() {
     ));
 
     let wrong_projector = obligation(
-        &codec,
         "another_projector",
         "Record",
         None,
         [("id", serde_json::json!("r-1"))],
     );
     assert!(matches!(
-        codec.encode_obligation_scope(&wrong_projector),
+        encode_obligation_scope(&codec, &wrong_projector),
         Err(ProjectionScopeCodecError::ProjectorMismatch { .. })
     ));
     let unknown_model = obligation(
-        &codec,
         "project_memberships",
         "Unknown",
         None,
         [("id", serde_json::json!("r-1"))],
     );
     assert!(matches!(
-        codec.encode_obligation_scope(&unknown_model),
+        encode_obligation_scope(&codec, &unknown_model),
         Err(ProjectionScopeCodecError::UnknownModel { .. })
     ));
     assert!(matches!(
@@ -391,20 +387,18 @@ fn malformed_obligation_and_row_keys_fail_closed() {
     .unwrap();
 
     let missing = obligation(
-        &codec,
         "project_memberships",
         "Record",
         None,
         [("id", serde_json::json!("r-1"))],
     );
     assert!(matches!(
-        codec.encode_obligation_scope(&missing),
+        encode_obligation_scope(&codec, &missing),
         Err(ProjectionScopeCodecError::MissingKeyField { field, .. })
             if field == "active"
     ));
 
     let extra = obligation(
-        &codec,
         "project_memberships",
         "Record",
         None,
@@ -415,13 +409,12 @@ fn malformed_obligation_and_row_keys_fail_closed() {
         ],
     );
     assert!(matches!(
-        codec.encode_obligation_scope(&extra),
+        encode_obligation_scope(&codec, &extra),
         Err(ProjectionScopeCodecError::ExtraKeyField { field, .. })
             if field == "other"
     ));
 
     let duplicate = obligation(
-        &codec,
         "project_memberships",
         "Record",
         None,
@@ -432,13 +425,12 @@ fn malformed_obligation_and_row_keys_fail_closed() {
         ],
     );
     assert!(matches!(
-        codec.encode_obligation_scope(&duplicate),
+        encode_obligation_scope(&codec, &duplicate),
         Err(ProjectionScopeCodecError::DuplicateKeyField { field, .. })
             if field == "id"
     ));
 
     let null = obligation(
-        &codec,
         "project_memberships",
         "Record",
         None,
@@ -448,13 +440,12 @@ fn malformed_obligation_and_row_keys_fail_closed() {
         ],
     );
     assert!(matches!(
-        codec.encode_obligation_scope(&null),
+        encode_obligation_scope(&codec, &null),
         Err(ProjectionScopeCodecError::NullPrimaryKey { field, .. })
             if field == "id"
     ));
 
     let wrong_json_shape = obligation(
-        &codec,
         "project_memberships",
         "Record",
         None,
@@ -464,7 +455,7 @@ fn malformed_obligation_and_row_keys_fail_closed() {
         ],
     );
     assert!(matches!(
-        codec.encode_obligation_scope(&wrong_json_shape),
+        encode_obligation_scope(&codec, &wrong_json_shape),
         Err(ProjectionScopeCodecError::WrongJsonShape { field, .. })
             if field == "active"
     ));
@@ -517,14 +508,13 @@ fn malformed_obligation_and_row_keys_fail_closed() {
     ));
 
     let noncanonical_base64 = obligation(
-        &codec,
         "project_memberships",
         "BytesRecord",
         None,
         [("id", serde_json::json!("AB=="))],
     );
     assert!(matches!(
-        codec.encode_obligation_scope(&noncanonical_base64),
+        encode_obligation_scope(&codec, &noncanonical_base64),
         Err(ProjectionScopeCodecError::InvalidBytes { .. })
     ));
 }
@@ -537,7 +527,6 @@ fn codec_owns_registered_schema_independently_of_the_caller() {
         columns: vec![key_column("id", "record_id", ColumnType::Text)],
         primary_key: PrimaryKey::new(["record_id"]),
         version_column: None,
-        foreign_keys: Vec::new(),
         indexes: Vec::new(),
         relationships: Vec::new(),
         kind: TableKind::ReadModel,
@@ -583,7 +572,6 @@ fn graphql_json_columns_decode_lossless_composite_row_keys() {
             "attributes_json",
         ]),
         version_column: None,
-        foreign_keys: Vec::new(),
         indexes: Vec::new(),
         relationships: Vec::new(),
         kind: TableKind::ReadModel,

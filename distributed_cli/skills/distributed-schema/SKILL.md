@@ -16,7 +16,8 @@ for physical read-model SQL/SDL (override with `--entrypoint <path>`).
 The service must export a function that registers its read models / tables:
 
 ```rust
-use distributed::{ReadModelCatalog, ReadModel};
+use distributed::read_model::ReadModel;
+use distributed::table::ReadModelCatalog;
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, ReadModel)]
 #[table("orders")]
@@ -117,8 +118,6 @@ distributed schema --format atlas --name orders --db-secret orders-db \
   `#[readmodel(table = "...", primary_key = ["a", "b"])]`, `#[index(...)]`.
 - Rendered SQL is desired-state, not a diff. Diffing against the live database
   is the Atlas operator's job (`--format atlas`) or your migration tool's.
-- `distributed schema` and `distributed describe` also ship as `hops service schema` /
-  `hops service describe`.
 
 ## Reference
 

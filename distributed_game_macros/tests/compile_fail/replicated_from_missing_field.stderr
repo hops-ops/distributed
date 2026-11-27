@@ -1,0 +1,7 @@
+error[E0609]: no field `tier` on type `&Mob`
+  --> tests/compile_fail/replicated_from_missing_field.rs:16:5
+   |
+16 |     tier: u8,
+   |     ^^^^ unknown field
+   |
+   = note: available fields are: `x`, `y`

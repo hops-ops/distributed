@@ -4,9 +4,7 @@ import test from 'node:test';
 import {
 	createDistributedReplica
 } from '../dist/replica/index.js';
-import {
-	replicaResultObservation
-} from '../dist/replica/command-runtime.js';
+import { replicaResultObservation } from '../dist/replica/command-runtime/symbols.js';
 
 const Item = Object.freeze({ id: 'Item', identityFields: ['id'] });
 const SCHEMA_HASH = `sha256:${'a'.repeat(64)}`;
@@ -116,7 +114,7 @@ function frame(revision, value, operation = Query.id) {
 				...(operation === Query.live.id
 					? {
 							live: {
-								supported: true,
+								mode: 'resumable',
 								reset: false,
 								cursors: [
 									{

@@ -14,6 +14,9 @@ use crate::{repository::RepositoryError, EventRecordError};
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum HandlerError {
+    /// Supervisor generation admission is temporarily closed. Retain the exact
+    /// delivery and stop the receive loop until the host retries after reload.
+    ApplicationReloading,
     /// No handler registered for this command name.
     UnknownCommand(String),
     /// Payload decode / deserialization failed.
@@ -36,14 +39,21 @@ pub enum HandlerError {
     /// An explicitly repaired partition is waiting for its exact failed input;
     /// unrelated delivery must remain retryable and cannot invoke the handler.
     ProjectionRepairPending { failure_id: String },
-    /// The terminal failure is already durable. The transport must retain this
-    /// exact delivery and stop so an operator can repair then restart.
-    ProjectionTerminalRecorded { repair: ProjectionRepairHandle },
-    /// A permanent causal-projector failure could not be represented by a
-    /// durable terminal record. The transport must retain this exact delivery
-    /// and stop rather than applying an ordinary dead-letter/drop policy across
-    /// an unproven causal gap.
-    ProjectionDeliveryHalted { source: Box<HandlerError> },
+    /// The terminal failure of `projection` is already durable. The
+    /// projector's consumer must retain this exact delivery and stop so an
+    /// operator can repair then restart. Other projectors keep consuming.
+    ProjectionTerminalRecorded {
+        projection: String,
+        repair: ProjectionRepairHandle,
+    },
+    /// A permanent failure of `projection` could not be represented by a
+    /// durable terminal record. The projector's consumer must retain this
+    /// exact delivery and stop rather than applying an ordinary
+    /// dead-letter/drop policy across an unproven causal gap.
+    ProjectionDeliveryHalted {
+        projection: String,
+        source: Box<HandlerError>,
+    },
     /// Other error.
     Other(Box<dyn Error + Send + Sync>),
 }
@@ -51,6 +61,7 @@ pub enum HandlerError {
 impl fmt::Display for HandlerError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            HandlerError::ApplicationReloading => f.write_str("application generation is reloading"),
             HandlerError::UnknownCommand(name) => write!(f, "unknown command: {}", name),
             HandlerError::DecodeFailed(msg) => write!(f, "decode failed: {}", msg),
             HandlerError::Rejected(msg) => write!(f, "rejected: {}", msg),
@@ -68,13 +79,14 @@ impl fmt::Display for HandlerError {
                 f,
                 "projection repair is waiting for exact failed input `{failure_id}`"
             ),
-            HandlerError::ProjectionTerminalRecorded { repair } => write!(
+            HandlerError::ProjectionTerminalRecorded { projection, repair } => write!(
                 f,
-                "projection terminal failure `{}` was recorded; retain delivery and stop; repair handle: {repair}",
+                "projection `{projection}` terminal failure `{}` was recorded; retain delivery and stop; repair handle: {repair}",
                 repair.failure_id()
             ),
-            HandlerError::ProjectionDeliveryHalted { .. } => f.write_str(
-                "causal projector delivery halted before a durable terminal record was available; retain delivery and stop",
+            HandlerError::ProjectionDeliveryHalted { projection, .. } => write!(
+                f,
+                "projection `{projection}` delivery halted before a durable terminal record was available; retain delivery and stop",
             ),
             HandlerError::Other(e) => write!(f, "handler error: {}", e),
         }
@@ -86,7 +98,7 @@ impl Error for HandlerError {
         match self {
             HandlerError::Repository(e) => Some(e),
             HandlerError::Projection(e) => Some(e),
-            HandlerError::ProjectionDeliveryHalted { source } => Some(source.as_ref()),
+            HandlerError::ProjectionDeliveryHalted { source, .. } => Some(source.as_ref()),
             HandlerError::Other(e) => Some(e.as_ref()),
             _ => None,
         }
@@ -130,11 +142,17 @@ impl From<PayloadDecodeError> for HandlerError {
 }
 
 impl HandlerError {
+    /// The command was refused by a rule: `reason` is reported to the caller
+    /// (HTTP 422).
+    pub fn rejected(reason: impl fmt::Display) -> Self {
+        Self::Rejected(reason.to_string())
+    }
+
     /// Return the opaque operator repair handle carried by a durably recorded
     /// terminal projector failure.
     pub fn projection_repair_handle(&self) -> Option<&ProjectionRepairHandle> {
         match self {
-            Self::ProjectionTerminalRecorded { repair } => Some(repair),
+            Self::ProjectionTerminalRecorded { repair, .. } => Some(repair),
             _ => None,
         }
     }
@@ -142,6 +160,7 @@ impl HandlerError {
     /// Map this error to an HTTP-style status code.
     pub fn status_code(&self) -> u16 {
         match self {
+            HandlerError::ApplicationReloading => 503,
             HandlerError::UnknownCommand(_) => 404,
             HandlerError::DecodeFailed(_) => 400,
             HandlerError::Rejected(_) => 422,
@@ -201,7 +220,8 @@ impl HandlerError {
                     TransportErrorKind::Permanent
                 }
             }
-            HandlerError::ProjectionRepairPending { .. }
+            HandlerError::ApplicationReloading
+            | HandlerError::ProjectionRepairPending { .. }
             | HandlerError::NotFound(_)
             | HandlerError::Other(_) => TransportErrorKind::Retryable,
             HandlerError::ProjectionTerminalRecorded { .. }
@@ -228,7 +248,8 @@ impl From<HandlerError> for TransportError {
         let kind = error.transport_error_kind();
         let retain_and_stop = matches!(
             error,
-            HandlerError::ProjectionTerminalRecorded { .. }
+            HandlerError::ApplicationReloading
+                | HandlerError::ProjectionTerminalRecorded { .. }
                 | HandlerError::ProjectionDeliveryHalted { .. }
         );
         let transport = TransportError::new(kind, error.to_string()).with_source(error);
@@ -243,6 +264,16 @@ impl From<HandlerError> for TransportError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn application_reloading_retains_delivery_without_reclassifying_business_errors() {
+        let reload = TransportError::from(HandlerError::ApplicationReloading);
+        assert!(reload.is_retryable());
+        assert!(reload.should_retain_and_stop());
+        let rejection = TransportError::from(HandlerError::Rejected("invalid slug".into()));
+        assert!(rejection.is_permanent());
+        assert!(!rejection.should_retain_and_stop());
+    }
 
     #[test]
     fn transient_handler_errors_are_retryable() {

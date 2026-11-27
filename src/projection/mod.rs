@@ -10,6 +10,7 @@
 mod canonical;
 mod error;
 mod expression;
+mod macros;
 mod plan;
 mod program;
 mod provenance;
@@ -19,9 +20,10 @@ mod provenance;
 // contract before their owning tasks define one.
 pub mod catalog;
 pub mod executor;
-pub mod local_mounts;
+pub(crate) mod local_mounts;
 pub mod lower;
 pub mod placement;
+pub mod rebuild;
 
 pub use local_mounts::{
     LocalDirectMount, LocalEventualMount, LocalProjectionMounts, LocalProjectionMountsBuilder,
@@ -42,10 +44,10 @@ pub use plan::{
     ResolvedProjectionPlan, ResolvedProjectionRelationshipEffect,
 };
 pub use program::{
-    ProjectionArm, ProjectionEventSet, ProjectionField, ProjectionKeyField, ProjectionMutationKind,
+    MutationKind, ProjectionArm, ProjectionEventSet, ProjectionField, ProjectionKeyField,
     ProjectionOperation, ProjectionPartition, ProjectionPlanTemplate, ProjectionProgram,
     ProjectionProgramId, ProjectionProgramLimits, ProjectionRelationshipEffect,
-    ProjectionRelationshipEffectKind, MAX_PROJECTION_OPERATIONS_PER_OCCURRENCE,
+    ProjectionRelationshipEffectKind, SourceOrdering, MAX_PROJECTION_OPERATIONS_PER_OCCURRENCE,
     PROJECTION_OPERATION_SEMANTICS_VERSION, PROJECTION_PROGRAM_IR_VERSION,
 };
 pub use provenance::{
@@ -54,3 +56,6 @@ pub use provenance::{
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod source_snapshot_tests;

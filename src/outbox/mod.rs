@@ -2,8 +2,9 @@
 //!
 //! This module provides the outbox message type and commit helpers:
 //! - `OutboxMessage` - publishable message envelope plus delivery state
-//! - `OutboxMessageStatus` - Message status (Pending, InFlight, Published, Failed)
-//! - `OutboxCommit` - Helper for aggregate + outbox commits
+//! - `OutboxMessageStatus` - Message status (Pending, InFlight, Failed); a
+//!   published message is deleted
+//! - `AggregateCommit` - Helper for aggregate + outbox commits
 //!
 //! Outbox messages are durable publication work items. Their payload can be a
 //! domain event, integration event, command, or generic transport message.
@@ -24,7 +25,7 @@
 //! ## Example
 //!
 //! ```ignore
-//! use distributed::OutboxMessage;
+//! use distributed::outbox::OutboxMessage;
 //!
 //! // Create aggregate and domain event outbox message
 //! let mut order = Order::new();
@@ -38,18 +39,11 @@
 
 mod commit;
 mod message;
-mod table;
 
 // Outbox message record
 pub(crate) use message::PreparedDomainEvent;
 pub use message::{OutboxMessage, OutboxMessageStatus};
-pub(crate) use table::validate_outbox_message_table_write;
-pub use table::{
-    outbox_message_insert_plan, outbox_message_key, outbox_message_row_values,
-    outbox_message_schema, OUTBOX_MESSAGES_TABLE,
-};
 
 // Commit helpers
 #[allow(unused_imports)] // used by graphql causal commit
-pub(crate) use commit::start_immediate_publish;
-pub use commit::{AggregateCommit, CommitReceipt, OutboxPublishHook, OutboxPublisherConfig};
+pub use commit::{AggregateCommit, CommitReceipt, OutboxPublisherConfig};

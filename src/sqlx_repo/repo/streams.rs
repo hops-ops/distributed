@@ -19,32 +19,15 @@ where
         identity: &'a StreamIdentity,
     ) -> impl Future<Output = Result<Option<Entity>, RepositoryError>> + Send + 'a {
         async move {
-            let mut builder = QueryBuilder::<DB>::new("SELECT ");
-            builder.push(DB::EVENT_SELECT);
-            builder.push(" FROM aggregate_events WHERE aggregate_type = ");
-            builder.push_bind(identity.aggregate_type());
-            builder.push(" AND aggregate_id = ");
-            builder.push_bind(identity.aggregate_id());
-            builder.push(" ORDER BY sequence ASC");
-            let rows = builder
-                .build()
-                .fetch_all(&self.pool)
-                .await
-                .map_err(|err| repository_storage_error::<DB>("load stream", err))?;
-
-            if rows.is_empty() {
-                return Ok(None);
-            }
-
-            let mut events = Vec::with_capacity(rows.len());
-            for row in rows {
-                events.push(event_from_row::<DB>(row)?);
-            }
-
-            let mut entity = Entity::new();
-            entity.set_id(identity.aggregate_id());
-            entity.load_from_history(events);
-            Ok(Some(entity))
+            let mut connection = self.pool.acquire().await.map_err(|error| {
+                repository_storage_error::<DB>("acquire stream connection", error)
+            })?;
+            crate::repository::sql::load_stream(
+                &mut super::executor::ConnectionExecutor::<DB>(&mut connection),
+                identity,
+                None,
+            )
+            .await
         }
     }
 
@@ -112,56 +95,15 @@ where
         after_version: u64,
     ) -> impl Future<Output = Result<Option<Entity>, RepositoryError>> + Send + 'a {
         async move {
-            // Fetch only the post-snapshot tail. `after_version` is the snapshot
-            // version (an event sequence); `sequence > ?` skips already-folded
-            // rows so a fresh snapshot over a long stream no longer reads and
-            // decodes the entire history.
-            let after = repository_i64_from_u64(
-                DB::BACKEND,
-                after_version,
-                "snapshot tail lower bound",
-                DB::INTEGER_STORAGE,
-            )?;
-            let mut builder = QueryBuilder::<DB>::new("SELECT ");
-            builder.push(DB::EVENT_SELECT);
-            builder.push(" FROM aggregate_events WHERE aggregate_type = ");
-            builder.push_bind(identity.aggregate_type());
-            builder.push(" AND aggregate_id = ");
-            builder.push_bind(identity.aggregate_id());
-            builder.push(" AND sequence > ");
-            builder.push_bind(after);
-            builder.push(" ORDER BY sequence ASC");
-            let rows = builder
-                .build()
-                .fetch_all(&self.pool)
-                .await
-                .map_err(|err| repository_storage_error::<DB>("load stream tail", err))?;
-
-            let mut events = Vec::with_capacity(rows.len());
-            for row in rows {
-                events.push(event_from_row::<DB>(row)?);
-            }
-
-            // Empty tail is "snapshot current", "snapshot ahead of the stream",
-            // or "no event rows" (sqlite hardening deletes pre-snapshot rows).
-            // MAX(sequence) distinguishes a planted future snapshot (clamp) from
-            // a snapshot-only load (no rows → keep after_version).
-            let prefix = if events.is_empty() {
-                let stream_version =
-                    super::commit::stream_version::<DB, _>(&self.pool, identity).await?;
-                if stream_version == 0 {
-                    after_version
-                } else {
-                    after_version.min(stream_version)
-                }
-            } else {
-                after_version
-            };
-
-            let mut entity = Entity::new();
-            entity.set_id(identity.aggregate_id());
-            entity.load_tail_from_history(events, prefix);
-            Ok(Some(entity))
+            let mut connection = self.pool.acquire().await.map_err(|error| {
+                repository_storage_error::<DB>("acquire stream tail connection", error)
+            })?;
+            crate::repository::sql::load_stream(
+                &mut super::executor::ConnectionExecutor::<DB>(&mut connection),
+                identity,
+                Some(after_version),
+            )
+            .await
         }
     }
 }
@@ -180,6 +122,14 @@ where
     for<'q> &'q [u8]: Encode<'q, DB> + Type<DB>,
     for<'r> &'r str: sqlx::ColumnIndex<DB::Row>,
 {
+    fn get_causal_stream_tail<'a>(
+        &'a self,
+        identity: &'a StreamIdentity,
+        after_version: u64,
+    ) -> impl Future<Output = Result<Option<Entity>, RepositoryError>> + Send + 'a {
+        GetStream::get_stream_tail(self, identity, after_version)
+    }
+
     fn get_causal_stream<'a>(
         &'a self,
         identity: &'a StreamIdentity,

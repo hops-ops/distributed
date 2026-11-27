@@ -90,7 +90,7 @@ struct QueryEvidenceExtraction {
 
 impl QueryEvidencePlan {
     pub(super) fn new(root_response_key: String, root: QueryEvidenceNode) -> Result<Self, String> {
-        validate_response_key(&root_response_key)?;
+        validate_response_key(&root_response_key).map_err(|e| e.to_string())?;
         let mut size = QueryEvidencePlanSize::default();
         root.validate(&mut size)?;
         Ok(Self {
@@ -173,8 +173,8 @@ impl QueryEvidenceNode {
 
                 let mut response_keys = std::collections::BTreeSet::new();
                 for field in &object.fields {
-                    validate_response_key(&field.storage_key)?;
-                    validate_response_key(&field.response_key)?;
+                    validate_response_key(&field.storage_key).map_err(|e| e.to_string())?;
+                    validate_response_key(&field.response_key).map_err(|e| e.to_string())?;
                     if !response_keys.insert(field.response_key.as_str()) {
                         return Err(format!(
                             "query causal-evidence object repeats response key `{}`",
@@ -340,9 +340,8 @@ fn format_response_path(path: &[QueryResponsePathSegment]) -> String {
 #[cfg(test)]
 mod query_evidence_tests {
     use super::super::dialect::SqlDialect;
-    use super::super::projection::{chunked_json_object, compile_record_evidence_projection};
+    use super::super::projection::{chunked_json_object, record_identity_projection};
     use super::*;
-    use crate::graphql::permissions::read;
     use crate::table::{ColumnType, PrimaryKey, TableColumn, TableKind, TableSchema};
 
     fn hidden(ordinal: usize) -> String {
@@ -643,20 +642,15 @@ mod query_evidence_tests {
             ],
             primary_key: PrimaryKey::new(["sequence_id", "digest_bytes"]),
             version_column: None,
-            foreign_keys: Vec::new(),
             indexes: Vec::new(),
             relationships: Vec::new(),
             kind: TableKind::ReadModel,
         };
-        let permission = read().all_columns();
-        let mut binds = Vec::new();
         let mut bytes_paths = Vec::new();
-        let (pairs, record) = compile_record_evidence_projection(
+        let (pairs, record) = record_identity_projection(
             SqlDialect::Sqlite,
             &schema,
-            &permission,
             "t7",
-            &mut binds,
             &mut bytes_paths,
             "childrenAlias",
         )
@@ -675,16 +669,9 @@ mod query_evidence_tests {
         assert!(sql.contains(QUERY_EVIDENCE_HIDDEN_PREFIX), "{sql}");
         assert!(!sql.contains("'visible'"), "{sql}");
 
-        let (postgres_pairs, _) = compile_record_evidence_projection(
-            SqlDialect::Postgres,
-            &schema,
-            &permission,
-            "t7",
-            &mut Vec::new(),
-            &mut Vec::new(),
-            "",
-        )
-        .unwrap();
+        let (postgres_pairs, _) =
+            record_identity_projection(SqlDialect::Postgres, &schema, "t7", &mut Vec::new(), "")
+                .unwrap();
         assert_eq!(postgres_pairs[0].1, "t7.\"sequence_id\"");
         assert!(
             postgres_pairs[1].1.contains("replace(encode(")
@@ -708,25 +695,22 @@ mod query_evidence_tests {
             ],
             primary_key: PrimaryKey::new(["sequence_id"]),
             version_column: None,
-            foreign_keys: Vec::new(),
             indexes: Vec::new(),
             relationships: Vec::new(),
             kind: TableKind::ReadModel,
         };
-        let permission = read().all_columns();
 
-        let (pairs, record) = compile_record_evidence_projection(
-            SqlDialect::Sqlite,
-            &schema,
-            &permission,
-            "t0",
-            &mut Vec::new(),
-            &mut Vec::new(),
-            "",
+        // The compiler emits record evidence only for a model the selected
+        // surface gives a client-addressable identity (`ModelScan`).
+        let surface = crate::graphql::build_surface(
+            std::slice::from_ref(&schema),
+            &crate::graphql::SurfaceOptions::sqlite(),
         )
         .unwrap();
-
-        assert!(pairs.is_empty());
-        assert!(record.is_none());
+        assert!(
+            !crate::graphql::surface::model_has_client_normalized_identity(
+                &surface.models["BigIntRecord"]
+            )
+        );
     }
 }

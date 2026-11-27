@@ -1,31 +1,22 @@
-//! Direct-transport receive traits.
+//! What a transport implements so a consumer can read from it.
 //!
-//! A direct broker client (Postgres, RabbitMQ, Kafka, NATS, or the in-memory
-//! dev/test adapter) pulls messages with [`MessageSource`] and settles each
-//! one through [`ReceivedMessage`]. The [`run_source`](super::run_source) runner
-//! drives that loop: it dispatches through `Service::dispatch_message` and only
-//! then asks the adapter to acknowledge.
+//! A transport does three things: hand over the next delivery, acknowledge
+//! it, or ask for it again after a delay. Everything else — how often to
+//! retry, when to give up, where a given-up message goes, when to stop — is
+//! decided by [`run_source`](super::run_source) from
+//! [`RunOptions`](super::RunOptions).
 //!
-//! These are the *direct* receive shape. Knative / HTTP CloudEvents is a
-//! separate ingress shape (the platform invokes an endpoint; there is no local
-//! poll loop) and is intentionally not modeled through this trait.
+//! Knative / HTTP CloudEvents is a push shape (the platform calls an
+//! endpoint) and is not modeled here.
 
 use std::future::Future;
+use std::time::Duration;
 
 use super::{Message, OrderedDelivery, TransportError};
 
-/// A transport a runner can pull messages from, one at a time.
-///
-/// `recv` resolves to:
-/// - `Ok(Some(received))` — a message to dispatch and then settle;
-/// - `Ok(None)` — the source is drained/closed; the runner stops **gracefully**
-///   (this is the shutdown signal — an adapter wires its own stop into `recv`);
-/// - `Err(e)` — a transport-level receive failure, surfaced by the runner rather
-///   than swallowed.
-///
-/// The future is `Send` so the runner can be driven on multi-threaded executors.
+/// A transport a runner pulls deliveries from, one at a time.
 pub trait MessageSource: Send {
-    /// The settle handle for a received message.
+    /// A delivery and the means to settle it.
     type Received: ReceivedMessage;
 
     /// Stable label used for framework metrics.
@@ -33,23 +24,68 @@ pub trait MessageSource: Send {
         "unknown"
     }
 
-    /// Receive the next message, if any.
+    /// Whether each delivery can be settled independently of the others, in
+    /// any order, while later deliveries are still being received.
+    ///
+    /// True only for per-message acknowledgements (for example NATS JetStream
+    /// explicit acks). Positional (offset commit) and lease-based sources keep
+    /// the default `false`, and the runner then processes one delivery at a
+    /// time even when the router has several delivery lanes.
+    fn settles_independently(&self) -> bool {
+        false
+    }
+
+    /// Take the next delivery if one is available.
+    ///
+    /// `Ok(None)` means nothing is available now; it does not mean the source
+    /// is closed. A source may wait briefly for a delivery (a broker fetch
+    /// with a timeout) before returning `None`, but must return.
+    ///
+    /// The runner may drop this future when it is told to shut down. A
+    /// delivery claimed by a dropped call must become available again by the
+    /// transport's own redelivery (a lease expiring, an unacked message).
     fn recv(
         &mut self,
     ) -> impl Future<Output = Result<Option<Self::Received>, TransportError>> + Send + '_;
+
+    /// Resolve when [`recv`](Self::recv) is worth calling again after it
+    /// returned `None`.
+    ///
+    /// The runner calls this only when it runs until shutdown, so that an
+    /// empty source costs nothing. A source whose `recv` already waits for the
+    /// broker keeps the default, which resolves at once. A source whose `recv`
+    /// returns immediately must wait here (a poll interval or a notification).
+    fn ready(&mut self) -> impl Future<Output = ()> + Send + '_ {
+        std::future::ready(())
+    }
+
+    /// The run is over: write whatever this source still holds and give up
+    /// what it claimed. Called once when a run ends, however it ends.
+    ///
+    /// A source that records acknowledgements and writes them in batches (an
+    /// offset written once per batch) writes the last batch here. The default
+    /// holds nothing.
+    fn finish(&mut self) -> impl Future<Output = Result<(), TransportError>> + Send + '_ {
+        std::future::ready(Ok(()))
+    }
 }
 
-/// A message received from a transport, plus the means to settle it.
+/// One delivery of a message.
 ///
-/// Settlement consumes the value so a message can be settled exactly once. `ack`
-/// and `nack` are the universal primitives every transport supports; an adapter
-/// maps them to its native operation (a row completion, a delivery ack, an
-/// offset commit, a stream ack, …). `dead_letter` and `park` default to `nack`
-/// so a message is never silently dropped; adapters with native dead-letter or
-/// parking support should override them.
+/// Settling consumes the value, so a delivery is settled once.
 pub trait ReceivedMessage: Send {
-    /// The canonical message to dispatch.
+    /// The message to dispatch.
     fn message(&self) -> &Message;
+
+    /// How many times this message has been delivered to this consumer,
+    /// counting this delivery. The first delivery is 1.
+    ///
+    /// A source that cannot count deliveries keeps the default of 1; the
+    /// runner's [`max_attempts`](super::RunOptions::max_attempts) and backoff
+    /// growth then have no effect for it.
+    fn attempts(&self) -> u32 {
+        1
+    }
 
     /// Adapter-authenticated ordered source position for causal projection.
     ///
@@ -62,51 +98,22 @@ pub trait ReceivedMessage: Send {
         None
     }
 
-    /// A permanent decode failure for this delivery, if the transport could not
-    /// reconstruct the message from its stored representation.
+    /// Why this delivery could not be decoded into a message, if it could not.
     ///
-    /// Defaults to `None`: most adapters either decode successfully or fail the
-    /// whole `recv`. An adapter that can claim a row/offset *before* decoding it
-    /// (so the claim must be settled even when decoding fails) returns the
-    /// classified error here. The runner treats `Some(err)` as a permanent
-    /// failure routed through the [`FailurePolicy`](super::FailurePolicy) — the
-    /// same path as a permanent dispatch failure — so a corrupt row is
-    /// dead-lettered/parked rather than ack-and-ignored as an empty message.
+    /// A source that claims a delivery before decoding it returns the error
+    /// here so the claim can still be settled. The runner treats it as a
+    /// permanent failure and never dispatches the message.
     fn decode_error(&self) -> Option<&TransportError> {
         None
     }
 
-    /// Acknowledge successful handling. The transport removes the message.
-    ///
-    /// The runner calls this only after consumer execution has succeeded (and,
-    /// in inbox mode, after the inbox receipt has committed).
+    /// Handling is finished; never deliver this message to this consumer
+    /// again.
     fn ack(self) -> impl Future<Output = Result<(), TransportError>> + Send;
 
-    /// Negatively acknowledge so the transport redelivers the message later.
-    fn nack(self, reason: &str) -> impl Future<Output = Result<(), TransportError>> + Send;
-
-    /// Route the message to a dead-letter destination.
+    /// Deliver this message again, no sooner than `delay` from now.
     ///
-    /// Defaults to [`nack`](ReceivedMessage::nack): an adapter without a native
-    /// dead-letter destination keeps the message redeliverable rather than
-    /// dropping it, so a `DeadLetter` policy degrades to redelivery until the
-    /// adapter implements real dead-lettering.
-    fn dead_letter(self, reason: &str) -> impl Future<Output = Result<(), TransportError>> + Send
-    where
-        Self: Sized,
-    {
-        self.nack(reason)
-    }
-
-    /// Hold the message for manual intervention without acking or redelivering.
-    ///
-    /// Defaults to [`nack`](ReceivedMessage::nack) for adapters without native
-    /// parking; such adapters keep the message redeliverable rather than
-    /// dropping it.
-    fn park(self, reason: &str) -> impl Future<Output = Result<(), TransportError>> + Send
-    where
-        Self: Sized,
-    {
-        self.nack(reason)
-    }
+    /// A positional source (an offset or a log cursor) cannot deliver a later
+    /// message first; it holds its position for `delay`.
+    fn nack(self, delay: Duration) -> impl Future<Output = Result<(), TransportError>> + Send;
 }

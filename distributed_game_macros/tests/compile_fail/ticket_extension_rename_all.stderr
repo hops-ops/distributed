@@ -1,0 +1,5 @@
+error: #[derive(TicketExtension)] does not support `rename_all`; rename fields individually
+ --> tests/compile_fail/ticket_extension_rename_all.rs:4:9
+  |
+4 | #[serde(rename_all = "camelCase")]
+  |         ^^^^^^^^^^

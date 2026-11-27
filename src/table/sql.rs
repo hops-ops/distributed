@@ -1,8 +1,8 @@
 use std::collections::BTreeMap;
 
 use crate::table::{
-    ColumnType, TableMigrationArtifact, TableSchema, TableSchemaAdapter,
-    TableSchemaAdapterCapabilities, TableSchemaBootstrap, TableSchemaRegistry, TableStoreError,
+    ColumnType, TableMigrationArtifact, TableSchema, TableSchemaBootstrap, TableSchemaRegistry,
+    TableStoreError,
 };
 
 /// SQL dialect used to render table-schema migration artifacts.
@@ -10,47 +10,6 @@ use crate::table::{
 pub enum TableSqlDialect {
     Sqlite,
     Postgres,
-}
-
-/// Stateless adapter for generating SQL artifacts from table schemas.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct TableSqlSchemaAdapter {
-    dialect: TableSqlDialect,
-}
-
-impl TableSqlSchemaAdapter {
-    pub fn sqlite() -> Self {
-        Self {
-            dialect: TableSqlDialect::Sqlite,
-        }
-    }
-
-    pub fn postgres() -> Self {
-        Self {
-            dialect: TableSqlDialect::Postgres,
-        }
-    }
-
-    pub fn dialect(&self) -> TableSqlDialect {
-        self.dialect
-    }
-}
-
-impl TableSchemaAdapter for TableSqlSchemaAdapter {
-    fn schema_capabilities(&self) -> TableSchemaAdapterCapabilities {
-        TableSchemaAdapterCapabilities {
-            migration_artifacts: true,
-            schema_verification: false,
-            dev_bootstrap: false,
-        }
-    }
-
-    fn generate_migration_artifacts(
-        &self,
-        registry: &TableSchemaRegistry,
-    ) -> Result<Vec<TableMigrationArtifact>, TableStoreError> {
-        generate_table_migration_artifacts(registry, self.dialect)
-    }
 }
 
 pub fn generate_table_migration_artifacts(
@@ -76,6 +35,65 @@ pub fn table_schema_statements(
     }
     for schema in schemas {
         statements.extend(index_statements(schema));
+    }
+    Ok(statements)
+}
+
+/// Statements that bring existing tables' text columns to the collation
+/// [`table_schema_statements`] declares, for a bootstrap that finds tables an
+/// earlier release created (`CREATE TABLE IF NOT EXISTS` leaves them as they
+/// are). Postgres text columns used to take the database's default collation;
+/// each statement alters, in place, only the declared text columns that are
+/// not yet `COLLATE "C"`, so it is a catalog read once they are. Changing a
+/// text column's collation keeps its values and needs no table rewrite; the
+/// column's indexes are rebuilt. SQLite text is `BINARY` already.
+#[cfg(any(feature = "sqlite", feature = "postgres"))]
+pub(crate) fn text_collation_upgrades(
+    registry: &TableSchemaRegistry,
+    dialect: TableSqlDialect,
+) -> Result<Vec<String>, TableStoreError> {
+    const TAG: &str = "$distributed_collation$";
+    if dialect == TableSqlDialect::Sqlite {
+        return Ok(Vec::new());
+    }
+    let quote_literal = |value: &str| format!("'{}'", value.replace('\'', "''"));
+    let mut statements = Vec::new();
+    for schema in registry.schemas() {
+        let text_columns = schema
+            .columns
+            .iter()
+            .filter(|column| column.column_type == ColumnType::Text)
+            .map(|column| quote_literal(&column.column_name))
+            .collect::<Vec<_>>();
+        if text_columns.is_empty() {
+            continue;
+        }
+        let statement = format!(
+            "DO {TAG}\n\
+             DECLARE\n  target_table regclass := to_regclass({table});\n  target record;\n\
+             BEGIN\n\
+             FOR target IN\n\
+             SELECT a.attname FROM pg_attribute a\n\
+             WHERE a.attrelid = target_table AND a.attnum > 0 AND NOT a.attisdropped\n\
+             AND a.attname = ANY (ARRAY[{columns}]::text[])\n\
+             AND a.atttypid = 'text'::regtype\n\
+             AND a.attcollation <> (SELECT oid FROM pg_collation\n\
+             WHERE collname = 'C' AND collnamespace = 'pg_catalog'::regnamespace)\n\
+             LOOP\n\
+             EXECUTE format('ALTER TABLE %s ALTER COLUMN %I TYPE text COLLATE \"C\"', target_table, target.attname);\n\
+             END LOOP;\n\
+             END\n{TAG}",
+            table = quote_literal(&quote_identifier(&schema.table_name)),
+            columns = text_columns.join(", "),
+        );
+        // A name containing the dollar-quote tag would end the body early.
+        if statement.matches(TAG).count() != 2 {
+            return Err(TableStoreError::Metadata(format!(
+                "table `{}` has a name that cannot be quoted in a collation upgrade",
+                schema.table_name
+            )));
+        }
+        statements.push(statement);
     }
     Ok(statements)
 }
@@ -117,16 +135,11 @@ fn table_schemas_in_dependency_order(
 }
 
 fn schema_dependency_tables(schema: &TableSchema) -> impl Iterator<Item = &str> {
-    let column_foreign_keys = schema
+    schema
         .columns
         .iter()
         .filter_map(|column| column.foreign_key.as_ref())
-        .map(|foreign_key| foreign_key.table.as_str());
-    let schema_foreign_keys = schema
-        .foreign_keys
-        .iter()
-        .map(|foreign_key| foreign_key.table.as_str());
-    column_foreign_keys.chain(schema_foreign_keys)
+        .map(|foreign_key| foreign_key.table.as_str())
 }
 
 fn create_table_statement(
@@ -140,7 +153,7 @@ fn create_table_statement(
             let mut definition = format!(
                 "{} {}",
                 quote_identifier(&column.column_name),
-                sql_type(&column.column_type, column.jsonb, dialect)?
+                sql_type(&column.column_type, dialect)?
             );
             if !column.nullable || column.primary_key {
                 definition.push_str(" NOT NULL");
@@ -165,7 +178,7 @@ fn create_table_statement(
         definitions.push(format!(
             "{} {} NOT NULL DEFAULT 1",
             quote_identifier(version_column),
-            sql_type(&ColumnType::UnsignedInteger, false, dialect)?
+            sql_type(&ColumnType::UnsignedInteger, dialect)?
         ));
     }
 
@@ -189,22 +202,6 @@ fn create_table_statement(
                 quote_identifier(&foreign_key.column)
             ));
         }
-    }
-
-    for foreign_key in &schema.foreign_keys {
-        let already_declared_on_column = schema.columns.iter().any(|column| {
-            column.column_name == foreign_key.column
-                && column.foreign_key.as_ref() == Some(foreign_key)
-        });
-        if already_declared_on_column {
-            continue;
-        }
-        definitions.push(format!(
-            "FOREIGN KEY ({}) REFERENCES {} ({})",
-            quote_identifier(&foreign_key.column),
-            quote_identifier(&foreign_key.table),
-            quote_identifier(&foreign_key.column)
-        ));
     }
 
     Ok(format!(
@@ -237,7 +234,6 @@ fn index_statements(schema: &TableSchema) -> impl Iterator<Item = String> + '_ {
 
 fn sql_type(
     column_type: &ColumnType,
-    jsonb: bool,
     dialect: TableSqlDialect,
 ) -> Result<&'static str, TableStoreError> {
     let type_name = match (dialect, column_type) {
@@ -248,12 +244,13 @@ fn sql_type(
         (TableSqlDialect::Sqlite, ColumnType::Bytes) => "BLOB",
         (TableSqlDialect::Sqlite, ColumnType::Json) => "TEXT",
         (TableSqlDialect::Sqlite, ColumnType::Timestamp) => "TEXT",
-        (TableSqlDialect::Postgres, ColumnType::Text) => "text",
+        // Bytewise order and equality on every database locale, as on SQLite
+        // (whose default collation is BINARY) and in Rust.
+        (TableSqlDialect::Postgres, ColumnType::Text) => "text COLLATE \"C\"",
         (TableSqlDialect::Postgres, ColumnType::Boolean) => "boolean",
         (TableSqlDialect::Postgres, ColumnType::Integer | ColumnType::UnsignedInteger) => "bigint",
         (TableSqlDialect::Postgres, ColumnType::Float) => "double precision",
         (TableSqlDialect::Postgres, ColumnType::Bytes) => "bytea",
-        (TableSqlDialect::Postgres, ColumnType::Json) if jsonb => "jsonb",
         (TableSqlDialect::Postgres, ColumnType::Json) => "jsonb",
         (TableSqlDialect::Postgres, ColumnType::Timestamp) => "timestamptz",
         (_, ColumnType::Unsupported(type_name)) => {
@@ -378,14 +375,40 @@ pub fn bootstrap_result(registry: &TableSchemaRegistry) -> TableSchemaBootstrap 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::outbox::{outbox_message_schema, OUTBOX_MESSAGES_TABLE};
     use crate::table::{ForeignKey, PrimaryKey, TableColumn, TableSchema};
 
+    /// A table with text, nullable timestamp and defaulted timestamp columns.
+    fn deliveries_schema() -> TableSchema {
+        let column = |name: &str, column_type, nullable| TableColumn {
+            nullable,
+            ..TableColumn::new(name, name, column_type)
+        };
+        TableSchema {
+            model_name: "Delivery".into(),
+            table_name: "deliveries".into(),
+            columns: vec![
+                column("message_id", ColumnType::Text, false),
+                column("created_at", ColumnType::Timestamp, false),
+                column("claimed_until", ColumnType::Timestamp, true),
+                TableColumn {
+                    has_default: true,
+                    default: Some("CURRENT_TIMESTAMP".into()),
+                    ..column("updated_at", ColumnType::Timestamp, false)
+                },
+            ],
+            primary_key: PrimaryKey::new(["message_id"]),
+            version_column: None,
+            indexes: Vec::new(),
+            relationships: Vec::new(),
+            kind: crate::table::TableKind::ReadModel,
+        }
+    }
+
     #[test]
-    fn renders_outbox_table_schema_for_sqlite() {
+    fn renders_table_schema_for_sqlite() {
         let mut registry = TableSchemaRegistry::new();
         registry
-            .register_schema(outbox_message_schema().clone())
+            .register_schema(deliveries_schema())
             .expect("schema should register");
 
         let artifact = generate_table_migration_artifacts(&registry, TableSqlDialect::Sqlite)
@@ -397,7 +420,7 @@ mod tests {
         assert!(artifact
             .statements
             .iter()
-            .any(|statement| statement.contains("CREATE TABLE IF NOT EXISTS \"outbox_messages\"")));
+            .any(|statement| statement.contains("CREATE TABLE IF NOT EXISTS \"deliveries\"")));
         assert!(artifact
             .statements
             .iter()
@@ -411,10 +434,10 @@ mod tests {
     }
 
     #[test]
-    fn renders_outbox_table_schema_for_postgres_with_timestamp_columns() {
+    fn renders_table_schema_for_postgres_with_timestamp_columns() {
         let mut registry = TableSchemaRegistry::new();
         registry
-            .register_schema(outbox_message_schema().clone())
+            .register_schema(deliveries_schema())
             .expect("schema should register");
 
         let artifact = generate_table_migration_artifacts(&registry, TableSqlDialect::Postgres)
@@ -423,6 +446,11 @@ mod tests {
             .expect("artifact should exist");
 
         assert_eq!(artifact.name, "postgres-tables");
+        // Text compares bytewise without a per-query COLLATE.
+        assert!(artifact
+            .statements
+            .iter()
+            .any(|statement| statement.contains("\"message_id\" text COLLATE \"C\" NOT NULL")));
         assert!(artifact
             .statements
             .iter()
@@ -443,7 +471,6 @@ mod tests {
             columns: vec![TableColumn::new("parent_id", "parent_id", ColumnType::Text)],
             primary_key: PrimaryKey::new(["parent_id"]),
             version_column: None,
-            foreign_keys: Vec::new(),
             indexes: Vec::new(),
             relationships: Vec::new(),
             kind: crate::table::TableKind::ReadModel,
@@ -460,7 +487,6 @@ mod tests {
             ],
             primary_key: PrimaryKey::new(["child_id"]),
             version_column: None,
-            foreign_keys: Vec::new(),
             indexes: Vec::new(),
             relationships: Vec::new(),
             kind: crate::table::TableKind::ReadModel,
@@ -543,7 +569,6 @@ mod tests {
             columns: vec![column],
             primary_key: PrimaryKey::new(["note"]),
             version_column: None,
-            foreign_keys: Vec::new(),
             indexes: Vec::new(),
             relationships: Vec::new(),
             kind: crate::table::TableKind::ReadModel,
@@ -561,14 +586,11 @@ mod tests {
     fn bootstrap_result_lists_registered_tables() {
         let mut registry = TableSchemaRegistry::new();
         registry
-            .register_schema(outbox_message_schema().clone())
+            .register_schema(deliveries_schema())
             .expect("schema should register");
 
         let result = bootstrap_result(&registry);
 
-        assert_eq!(
-            result.bootstrapped_tables,
-            vec![OUTBOX_MESSAGES_TABLE.to_string()]
-        );
+        assert_eq!(result.bootstrapped_tables, vec!["deliveries".to_string()]);
     }
 }

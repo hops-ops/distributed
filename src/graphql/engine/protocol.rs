@@ -137,11 +137,7 @@ pub(crate) fn resolve_execution_authority(
             Ok(ExecutionAuthority {
                 privilege_role: application.privilege_key.clone(),
                 asserted_roles: asserted,
-                surface: ClientSurfaceIdentity::application_with_schema_roles(
-                    name,
-                    eligible_roles,
-                    schema_roles,
-                ),
+                surface: ClientSurfaceIdentity::application(name, eligible_roles, schema_roles),
             })
         }
     }
@@ -182,7 +178,7 @@ pub(crate) fn select_protocol_surface<'a>(
                 return Err(());
             }
             Ok((
-                ClientSurfaceIdentity::application_with_schema_roles(
+                ClientSurfaceIdentity::application(
                     name.clone(),
                     eligible_roles.clone(),
                     schema_roles.clone(),
@@ -236,6 +232,14 @@ pub(crate) fn resolve_protocol_preset(
             }
             serde_json::Value::Number(parsed.into())
         }
+        codec if crate::command::CommandUnsignedInteger::from_client_codec(codec).is_some() => {
+            let unsigned = crate::command::CommandUnsignedInteger::from_client_codec(codec)?;
+            let parsed = raw.parse::<u64>().ok()?;
+            if parsed > unsigned.client_max_value() || parsed.to_string() != raw {
+                return None;
+            }
+            serde_json::Value::Number(parsed.into())
+        }
         "float64" => {
             let parsed = raw.parse::<f64>().ok()?;
             if !parsed.is_finite() {
@@ -256,7 +260,8 @@ pub(crate) fn resolve_protocol_preset(
 pub(crate) fn protocol_trusted_presets(
     manifest: &DistributedClientManifest,
 ) -> Result<Vec<ClientTrustedPresetDescriptor>, GraphqlBuildError> {
-    trusted_preset_descriptors(manifest).map_err(|error| GraphqlBuildError(error.to_string()))
+    trusted_preset_descriptors(&manifest.models, &manifest.commands)
+        .map_err(|error| GraphqlBuildError(error.to_string()))
 }
 
 pub(crate) fn operation_fingerprint(document: &str) -> String {
@@ -290,23 +295,10 @@ pub(crate) fn has_multiple_protocol_query_roots(
     let Ok(document) = request.parsed_query() else {
         return false;
     };
-    let mut operations = document.operations.iter();
-    let operation = if let Some(requested) = operation_name.as_deref() {
-        operations
-            .find(|(name, _)| name.map(|name| name.as_str()) == Some(requested))
-            .map(|(_, operation)| operation)
-    } else {
-        let first = operations.next().map(|(_, operation)| operation);
-        if operations.next().is_some() {
-            None
-        } else {
-            first
-        }
-    };
-    let Some(operation) = operation else {
+    let Some(operation) = selected_operation(document, operation_name.as_deref()) else {
         return false;
     };
-    if operation.node.ty != async_graphql::parser::types::OperationType::Query {
+    if operation.ty != async_graphql::parser::types::OperationType::Query {
         return false;
     }
 
@@ -387,7 +379,7 @@ pub(crate) fn has_multiple_protocol_query_roots(
     let mut response_keys = BTreeSet::new();
     let mut remaining_selections = REQUEST_ANALYSIS_MAX_SELECTIONS;
     let analysis = collect_root_keys(
-        &operation.node.selection_set.node,
+        &operation.selection_set.node,
         document,
         &query_roots,
         &mut BTreeSet::new(),

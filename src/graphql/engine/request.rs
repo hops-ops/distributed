@@ -1,66 +1,101 @@
 use super::*;
 
+pub(super) enum ProtocolPreparationError {
+    RequiredPreset,
+    Internal,
+}
+
+impl From<()> for ProtocolPreparationError {
+    fn from(_: ()) -> Self {
+        Self::Internal
+    }
+}
+
+impl ProtocolPreparationError {
+    fn into_response(self) -> Response {
+        match self {
+            Self::RequiredPreset => {
+                let mut error =
+                    ServerError::new("required session input is missing or invalid", None);
+                let mut extensions = async_graphql::ErrorExtensionValues::default();
+                extensions.set("code", "BAD_REQUEST");
+                error.extensions = Some(extensions);
+                Response::from_errors(vec![error])
+            }
+            Self::Internal => protocol_internal_error_response(),
+        }
+    }
+}
+
+/// A request ready to execute, from [`GraphqlEngine::prepare`].
+struct Prepared {
+    schema: async_graphql::dynamic::Schema,
+    request: Request,
+    after: AfterExecution,
+}
+
+/// What each response needs once the schema has produced it.
+struct AfterExecution {
+    accumulator: Option<ProtocolResponseAccumulator>,
+    #[cfg(feature = "gateway")]
+    read: read_routing::ReadRequest,
+    root_field: String,
+}
+
+impl AfterExecution {
+    /// Attach the protocol envelope (and, under `gateway`, enforce the read's
+    /// freshness floor) on one response.
+    fn finish(&self, response: Response) -> Response {
+        let response = attach_protocol_response(response, self.accumulator.as_ref());
+        #[cfg(feature = "gateway")]
+        let response = read_routing::enforce_minimum(response, &self.read);
+        response
+    }
+}
+
 impl GraphqlEngine {
+    /// Whether `request` is a mutation this engine must not run: the bound
+    /// service's lifecycle gate is closed.
+    ///
+    /// The service checks the same gate for every write it runs. The engine
+    /// checks too because its mutations may go to a command host with no
+    /// service in this process, and because the refusal is a GraphQL
+    /// response, not a resolver error.
+    pub(crate) fn refuses_mutation(&self, request: &mut Request) -> bool {
+        !self.inner.lifecycle.mutations_open()
+            && selected_operation_type(request)
+                == Some(async_graphql::parser::types::OperationType::Mutation)
+    }
+
     pub async fn execute(&self, session: &Session, mut request: Request) -> Response {
-        if selected_operation_type(&mut request) == Some(async_graphql::parser::types::OperationType::Mutation)
-            && !crate::microsvc::lifecycle_mutations_open()
-        {
+        if self.refuses_mutation(&mut request) {
             return lifecycle_mutation_rejected();
         }
-        let authority = match resolve_execution_authority(&self.inner, session, &request) {
-            Ok(authority) => authority,
-            Err(()) => {
-                return Response::from_errors(vec![ServerError::new(
-                    "GraphQL execution requires a named application surface for multi-role principals, a membership-checked role surface, or an anonymous session",
-                    None,
-                )]);
-            }
-        };
-        let privilege = authority.privilege_role.clone();
-        let introspection = self.inner.graphiql && is_pure_introspection_request(&mut request);
-        let schema = if introspection {
-            self.inner
-                .graphiql_schemas
-                .get(&privilege)
-                .or_else(|| self.inner.schemas.get(&privilege))
-        } else {
-            self.inner.schemas.get(&privilege)
-        };
-        let Some(schema) = schema else {
-            return Response::from_errors(vec![ServerError::new(
-                format!("privilege pack `{privilege}` is not configured for GraphQL"),
-                None,
-            )]);
-        };
-        if has_multiple_protocol_query_roots(&self.inner, &privilege, &mut request) {
-            return protocol_multi_root_error_response();
-        }
+        self.execute_admitted(session, request).await
+    }
 
-        let accumulator = match self.protocol_accumulator(&authority, session, &request) {
-            Ok(accumulator) => accumulator,
-            Err(()) => return protocol_internal_error_response(),
+    /// [`Self::execute`] for a caller that has already asked
+    /// [`Self::refuses_mutation`] and answered a refusal its own way.
+    pub(crate) async fn execute_admitted(&self, session: &Session, request: Request) -> Response {
+        #[cfg(feature = "gateway")]
+        if delivery::action(&request).as_deref() == Some("validate") {
+            return self.validate_delivery(session, request).await;
+        }
+        let Prepared {
+            schema,
+            request,
+            after,
+        } = match self.prepare(session, request, false) {
+            Ok(prepared) => prepared,
+            Err(response) => return response,
         };
-        if introspection {
-            // The relaxed schema is defense-in-depth restricted even if a
-            // future classifier or request extension behaves unexpectedly.
-            request = request.only_introspection();
-        }
-        let mut request = request
-            .data(session.clone())
-            .data(authority)
-            .data(Arc::clone(&self.inner));
-        if let Some(accumulator) = &accumulator {
-            request = request.data(accumulator.clone());
-        }
         let start = std::time::Instant::now();
-        let response =
-            attach_protocol_response(schema.execute(request).await, accumulator.as_ref());
-        let status = metrics_status_for_response(&response);
-        let root_field = match &response.data {
-            Value::Object(map) => map.keys().next().map(|s| s.as_str()).unwrap_or("_"),
-            _ => "_",
-        };
-        record_metrics(session, root_field, status, start.elapsed());
+        let response = after.finish(schema.execute(request).await);
+        record_metrics(
+            &after.root_field,
+            metrics_status_for_response(&response),
+            start.elapsed(),
+        );
         response
     }
 
@@ -70,23 +105,42 @@ impl GraphqlEngine {
         session: &Session,
         mut request: Request,
     ) -> BoxStream<'static, async_graphql::Response> {
-        if selected_operation_type(&mut request) == Some(async_graphql::parser::types::OperationType::Mutation)
-            && !crate::microsvc::lifecycle_mutations_open()
-        {
+        if self.refuses_mutation(&mut request) {
             return stream::once(async { lifecycle_mutation_rejected() }).boxed();
         }
-        let authority = match resolve_execution_authority(&self.inner, session, &request) {
-            Ok(authority) => authority,
-            Err(()) => {
-                return stream::once(async {
-                    Response::from_errors(vec![ServerError::new(
-                        "GraphQL execution requires a named application surface for multi-role principals, a membership-checked role surface, or an anonymous session",
-                        None,
-                    )])
-                })
-                .boxed();
-            }
+        let Prepared {
+            schema,
+            request,
+            after,
+        } = match self.prepare(session, request, true) {
+            Ok(prepared) => prepared,
+            Err(response) => return stream::once(async move { response }).boxed(),
         };
+        schema
+            .execute_stream(request)
+            .map(move |response| after.finish(response))
+            .boxed()
+    }
+
+    /// Everything both entry points do before execution: authorize, pick the
+    /// schema, refuse multi-root causal reads, open the protocol accumulator
+    /// and read routing, and attach the request data resolvers read.
+    #[allow(
+        clippy::result_large_err,
+        reason = "the refusal is the response both callers return as-is"
+    )]
+    fn prepare(
+        &self,
+        session: &Session,
+        mut request: Request,
+        stream: bool,
+    ) -> Result<Prepared, Response> {
+        let authority = resolve_execution_authority(&self.inner, session, &request).map_err(|()| {
+            Response::from_errors(vec![ServerError::new(
+                "GraphQL execution requires a named application surface for multi-role principals, a membership-checked role surface, or an anonymous session",
+                None,
+            )])
+        })?;
         let privilege = authority.privilege_role.clone();
         let introspection = self.inner.graphiql && is_pure_introspection_request(&mut request);
         let schema = if introspection {
@@ -97,52 +151,67 @@ impl GraphqlEngine {
         } else {
             self.inner.schemas.get(&privilege)
         };
-        let Some(schema) = schema.cloned() else {
-            return stream::once(async move {
-                Response::from_errors(vec![ServerError::new(
-                    format!("privilege pack `{privilege}` is not configured for GraphQL"),
-                    None,
-                )])
-            })
-            .boxed();
-        };
+        let schema = schema.cloned().ok_or_else(|| {
+            Response::from_errors(vec![ServerError::new(
+                format!("privilege pack `{privilege}` is not configured for GraphQL"),
+                None,
+            )])
+        })?;
         if has_multiple_protocol_query_roots(&self.inner, &privilege, &mut request) {
-            return stream::once(async { protocol_multi_root_error_response() }).boxed();
+            return Err(protocol_multi_root_error_response());
         }
-        let accumulator = match self.protocol_accumulator(&authority, session, &request) {
-            Ok(accumulator) => accumulator,
-            Err(()) => {
-                return stream::once(async { protocol_internal_error_response() }).boxed();
-            }
-        };
-        if accumulator
-            .as_ref()
-            .is_some_and(|accumulator| accumulator.begin_stream().is_err())
-        {
-            return stream::once(async { protocol_internal_error_response() }).boxed();
+        let accumulator = self
+            .protocol_accumulator(&authority, session, &request)
+            .map_err(ProtocolPreparationError::into_response)?;
+        if let Some(accumulator) = &accumulator {
+            let opened = if stream {
+                accumulator.begin_stream().map_err(drop)
+            } else {
+                #[cfg(feature = "gateway")]
+                let opened = self.enable_delivery_capture(session, &request, accumulator);
+                #[cfg(not(feature = "gateway"))]
+                let opened = Ok(());
+                opened
+            };
+            opened.map_err(|()| protocol_internal_error_response())?;
         }
         if introspection {
+            // The relaxed schema is defense-in-depth restricted even if a
+            // future classifier or request extension behaves unexpectedly.
             request = request.only_introspection();
         }
+        #[cfg(feature = "gateway")]
+        let read = self
+            .prepare_read(session, &request)
+            .map_err(read_routing::delivery_error)?;
+        #[cfg(feature = "gateway")]
+        let mut request = request.data(read.clone());
+        let root_field = metric_root_field(&mut request, self.inner.role_surfaces.get(&privilege));
         let mut request = request
             .data(session.clone())
             .data(authority)
-            .data(std::sync::Arc::clone(&self.inner));
+            .data(Arc::clone(&self.inner));
         if let Some(accumulator) = &accumulator {
             request = request.data(accumulator.clone());
         }
-        schema
-            .execute_stream(request)
-            .map(move |response| attach_protocol_response(response, accumulator.as_ref()))
-            .boxed()
+        Ok(Prepared {
+            schema,
+            request,
+            after: AfterExecution {
+                accumulator,
+                #[cfg(feature = "gateway")]
+                read,
+                root_field,
+            },
+        })
     }
 
-    fn protocol_accumulator(
+    pub(super) fn protocol_accumulator(
         &self,
         authority: &ExecutionAuthority,
         session: &Session,
         request: &Request,
-    ) -> Result<Option<ProtocolResponseAccumulator>, ()> {
+    ) -> Result<Option<ProtocolResponseAccumulator>, ProtocolPreparationError> {
         let Some(runtime) = &self.inner.protocol else {
             return Ok(None);
         };
@@ -151,7 +220,10 @@ impl GraphqlEngine {
         let trusted_presets = surface_info
             .trusted_presets
             .iter()
-            .map(|descriptor| resolve_protocol_preset(session, descriptor).ok_or(()))
+            .map(|descriptor| {
+                resolve_protocol_preset(session, descriptor)
+                    .ok_or(ProtocolPreparationError::RequiredPreset)
+            })
             .collect::<Result<Vec<_>, _>>()?;
         let principal = request
             .data
@@ -203,7 +275,7 @@ impl GraphqlEngine {
             schema_fingerprint: &surface_info.schema_fingerprint,
             protocol_fingerprint: &surface_info.protocol_fingerprint,
             authorization_surface_fingerprint: authorization_fingerprint,
-            identity_mode: identity_mode_label(self.inner.identity.mode),
+            identity_mode: self.inner.identity.config().label(),
             verified_principal_partition: principal_partition.as_deref(),
             session_authorization_context,
             trusted_presets: &trusted_presets,
@@ -230,26 +302,9 @@ impl GraphqlEngine {
                 .get(&authority.privilege_role)
                 .cloned()
                 .ok_or(())?;
-            let selected_surface = match &surface_identity {
-                ClientSurfaceIdentity::Role { name } => self.inner.role_surfaces.get(name),
-                ClientSurfaceIdentity::Application { name, .. } => {
-                    self.inner.application_surfaces.get(name)
-                }
-            }
-            .cloned()
-            .ok_or(())?;
-            let export = DistributedClientSurfaceExport::from_selected_with_execution(
-                &runtime.service_id,
-                selected_surface,
-                ClientExecutionLimits::from_runtime(
-                    self.inner.max_depth,
-                    self.inner.max_complexity,
-                    self.inner.max_bool_width,
-                    self.inner.max_in_list,
-                )
-                .map_err(|_| ())?,
-            )
-            .map_err(|_| ())?;
+            // Selected by the verified authority above; this exact immutable
+            // export was validated when the engine's protocol surface was built.
+            let export = surface_info.export.clone();
             let issued_at_unix_ms = crate::time::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map_err(|_| ())?
@@ -282,19 +337,51 @@ impl GraphqlEngine {
 fn selected_operation_type(
     request: &mut Request,
 ) -> Option<async_graphql::parser::types::OperationType> {
-    let requested = request.operation_name.clone();
+    let name = request.operation_name.clone();
     let document = request.parsed_query().ok()?;
-    let mut operations = document.operations.iter();
-    if let Some(requested) = requested.as_deref() {
-        return operations
-            .find(|(name, _)| name.map(|name| name.as_str()) == Some(requested))
-            .map(|(_, operation)| operation.node.ty);
-    }
-    let operation = operations.next()?.1;
-    if operations.next().is_some() {
-        return None;
-    }
-    Some(operation.node.ty)
+    selected_operation(document, name.as_deref()).map(|operation| operation.ty)
+}
+
+/// The `root_field` metric label: the schema name (not the client's alias) of
+/// the selected operation's first root field, when the role's surface serves
+/// it; `_` otherwise, so client-chosen text never becomes a label value.
+pub(super) fn metric_root_field(request: &mut Request, surface: Option<&Arc<Surface>>) -> String {
+    use async_graphql::parser::types::Selection;
+
+    let name = request.operation_name.clone();
+    let Some(surface) = surface else {
+        return "_".to_owned();
+    };
+    let Ok(document) = request.parsed_query() else {
+        return "_".to_owned();
+    };
+    let Some(field) = selected_operation(document, name.as_deref()).and_then(|operation| {
+        operation
+            .selection_set
+            .node
+            .items
+            .iter()
+            .find_map(|item| match &item.node {
+                Selection::Field(field) => Some(field.node.name.node.as_str()),
+                _ => None,
+            })
+    }) else {
+        return "_".to_owned();
+    };
+    surface
+        .query_fields
+        .iter()
+        .chain(&surface.subscription_fields)
+        .map(|root| root.name.as_str())
+        .chain(
+            surface
+                .commands
+                .iter()
+                .map(|command| command.field_name.as_str()),
+        )
+        .find(|root| *root == field)
+        .map_or("_", |root| root)
+        .to_owned()
 }
 
 fn lifecycle_mutation_rejected() -> Response {
@@ -311,19 +398,31 @@ mod lifecycle_request_tests {
     use async_graphql::Request;
 
     #[test]
+    fn internal_protocol_preparation_errors_are_not_request_errors() {
+        let response = super::ProtocolPreparationError::from(()).into_response();
+        let expected = super::protocol_internal_error_response();
+        assert_eq!(
+            serde_json::to_value(response).unwrap(),
+            serde_json::to_value(expected).unwrap()
+        );
+    }
+
+    #[test]
     fn selected_operation_type_fails_closed_for_ambiguous_documents() {
         let mut mutation = Request::new("mutation Write { __typename }");
-        assert_eq!(selected_operation_type(&mut mutation), Some(OperationType::Mutation));
-
-        let mut selected = Request::new(
-            "query Read { __typename } mutation Write { __typename }",
-        )
-        .operation_name("Write");
-        assert_eq!(selected_operation_type(&mut selected), Some(OperationType::Mutation));
-
-        let mut ambiguous = Request::new(
-            "query Read { __typename } mutation Write { __typename }",
+        assert_eq!(
+            selected_operation_type(&mut mutation),
+            Some(OperationType::Mutation)
         );
+
+        let mut selected = Request::new("query Read { __typename } mutation Write { __typename }")
+            .operation_name("Write");
+        assert_eq!(
+            selected_operation_type(&mut selected),
+            Some(OperationType::Mutation)
+        );
+
+        let mut ambiguous = Request::new("query Read { __typename } mutation Write { __typename }");
         assert_eq!(selected_operation_type(&mut ambiguous), None);
     }
 }

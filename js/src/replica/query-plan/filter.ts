@@ -1,4 +1,5 @@
 import type { GraphqlVariables } from '../../types.js';
+import { compareUtf8 } from '../../lib/compare-utf8.js';
 
 import type {
 	ReplicaFilterArtifact,
@@ -203,6 +204,9 @@ export function evaluateCallerField(
 	}
 	const predicates: ReplicaFilterEvaluation[] = [];
 	for (const [rawOperator, rhs] of Object.entries(value)) {
+		// A null operand adds no predicate, as on the server: an omitted
+		// nullable variable (a window cursor) means "no constraint".
+		if (rhs === null) continue;
 		const operatorPath = [...path, rawOperator];
 		if (
 			!isFilterOperator(rawOperator) ||
@@ -484,6 +488,7 @@ export function evaluateComparison(
 	if (
 		operator === '_like' ||
 		operator === '_ilike' ||
+		operator === '_icontains' ||
 		operator === '_contains' ||
 		operator === '_contained_in' ||
 		operator === '_has_key'
@@ -504,15 +509,7 @@ export function evaluateComparison(
 	const validity = validateComparableValues(codec, left, right, path);
 	if (validity !== undefined) return filterUnknown(validity);
 	if (operator === '_eq' || operator === '_neq') {
-		if (codec === 'string' && left !== right) {
-			return filterUnknown(
-				reason(
-					'collation_not_portable',
-					path,
-					'non-identical strings require an explicit server collation contract'
-				)
-			);
-		}
+		// Strings are equal only when identical: see compareUtf8.
 		const equal = left === right;
 		return equal === (operator === '_eq') ? FILTER_MATCH : FILTER_NO_MATCH;
 	}
@@ -526,25 +523,28 @@ export function evaluateComparison(
 			reason('unsupported_operator', path, `operator ${operator} is not portable`)
 		);
 	}
-	if (!isPortableNumericCodec(codec)) {
+	let order: number;
+	if (codec === 'string') {
+		order = compareUtf8(left as string, right as string);
+	} else if (isPortableNumericCodec(codec)) {
+		order = (left as number) - (right as number);
+	} else {
 		return filterUnknown(
 			reason(
 				'unsupported_operator',
 				path,
-				`${operator} is portable only for certified numeric codecs`
+				`${operator} is portable only for strings and certified numeric codecs`
 			)
 		);
 	}
-	const a = left as number;
-	const b = right as number;
 	const matches =
 		operator === '_gt'
-			? a > b
+			? order > 0
 			: operator === '_gte'
-				? a >= b
+				? order >= 0
 				: operator === '_lt'
-					? a < b
-					: a <= b;
+					? order < 0
+					: order <= 0;
 	return matches ? FILTER_MATCH : FILTER_NO_MATCH;
 }
 
@@ -586,13 +586,6 @@ export function evaluateIn(
 			continue;
 		}
 		if (left === candidate) return negated ? FILTER_NO_MATCH : FILTER_MATCH;
-		if (codec === 'string') {
-			firstUnknown ??= reason(
-				'collation_not_portable',
-				[...path, index],
-				'non-identical strings in SQL IN require an explicit server collation contract'
-			);
-		}
 	}
 	if (firstUnknown !== undefined) return filterUnknown(firstUnknown);
 	return negated ? FILTER_MATCH : FILTER_NO_MATCH;
@@ -655,12 +648,6 @@ export function validateComparableValues(
 		`codec ${codec} has no certified replica comparison semantics`
 	);
 }
-
-/**
- * Protocol v1 orders strings by their unsigned UTF-8 bytes. The GraphQL SQL
- * compiler emits the matching binary collation for every textual ORDER BY,
- * making optimistic index maintenance identical on SQLite and PostgreSQL.
- */
 
 export function validateRowPolicyLiteral(
 	field: ReplicaFilterFieldArtifact,
@@ -961,6 +948,7 @@ export function isFilterOperator(value: string): value is ReplicaFilterOperator 
 		value === '_is_null' ||
 		value === '_like' ||
 		value === '_ilike' ||
+		value === '_icontains' ||
 		value === '_contains' ||
 		value === '_contained_in' ||
 		value === '_has_key'
@@ -971,7 +959,7 @@ export function isOperatorScalarCompatible(
 	scalar: string,
 	operator: ReplicaFilterOperator
 ): boolean {
-	if (operator === '_like' || operator === '_ilike') {
+	if (operator === '_like' || operator === '_ilike' || operator === '_icontains') {
 		return scalar === 'String';
 	}
 	if (

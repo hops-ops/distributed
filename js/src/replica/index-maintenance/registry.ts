@@ -1,6 +1,6 @@
 import type { GraphqlVariables } from '../../types.js';
 import type { DistributedTrustedPreset } from '../../protocol.js';
-import { canonicalizeOperationVariables } from '../identity.js';
+import { canonicalizeOperationVariables } from '../identity/codec.js';
 import { compareCodeUnits } from '../../lib/compare-code-units.js';
 import type { ReplicaOperationArtifact } from '../types.js';
 import type {
@@ -19,7 +19,6 @@ import {
 	planAffected,
 	reason,
 	stale,
-	validateIndexes,
 	type RegisteredPlan
 } from './engine.js';
 
@@ -52,18 +51,24 @@ class PurposeBuiltIndexMaintenanceRegistry
 		layers: readonly ReplicaIndexSemanticLayer[],
 		trustedPresets: readonly DistributedTrustedPreset[] = Object.freeze([])
 	): readonly ReplicaIndexMaintenanceDecision[] {
-		const applied = applyLayers(snapshot.records, layers);
-		const indexes = validateIndexes(snapshot.indexes);
+		const applied = applyLayers((key) => snapshot.record(key), layers);
+		if (
+			applied.recordChanges.length === 0 &&
+			applied.relationshipChanges.length === 0 &&
+			applied.allDependencies.size === 0
+		) {
+			// A plan is only ever affected by a change a layer carries.
+			return Object.freeze([]);
+		}
 		const plansByIndex = instantiatePlans(
 			[...this.#plans.values()].flat(),
-			indexes
+			snapshot,
+			applied
 		);
 		const decisions: ReplicaIndexMaintenanceDecision[] = [];
-		for (const [indexKey, plans] of [...plansByIndex].sort(([left], [right]) =>
-			compareCodeUnits(left, right)
+		for (const [indexKey, { index, plans }] of [...plansByIndex].sort(
+			([left], [right]) => compareCodeUnits(left, right)
 		)) {
-			const index = indexes.get(indexKey);
-			if (index === undefined) continue;
 			const affected = plans.filter((plan) => planAffected(plan, index, applied));
 			if (affected.length === 0) continue;
 			const signatures = new Set(affected.map(({ signature }) => signature));

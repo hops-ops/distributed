@@ -8,33 +8,77 @@ impl GraphqlEngineBuilder {
             protocol_namespace: None,
             client_applications: BTreeMap::new(),
             command_binding: None,
+            lifecycle: crate::microsvc::LifecycleGate::always_open(),
             causal_storage_identity: source.causal_storage_identity,
             pool: source.pool,
+            #[cfg(feature = "gateway")]
+            read_routing: None,
+            #[cfg(feature = "gateway")]
+            gateway_versions: None,
             catalog: BTreeMap::new(),
             by_table: BTreeMap::new(),
             permissions: BTreeMap::new(),
             roles: None,
             anonymous_role: "anonymous".into(),
-            default_limit: 100,
-            max_limit: 1000,
-            max_depth: crate::graphql::complexity::DEFAULT_MAX_DEPTH,
-            max_complexity: crate::graphql::complexity::DEFAULT_MAX_COMPLEXITY,
-            max_in_list: 1000,
-            max_bool_width: 256,
+            default_limit: cost::DEFAULT_LIMIT,
+            max_limit: cost::DEFAULT_MAX_LIMIT,
+            max_depth: cost::DEFAULT_MAX_DEPTH,
+            max_fields: cost::DEFAULT_MAX_FIELDS,
+            max_rows: cost::DEFAULT_MAX_ROWS,
+            max_in_list: cost::DEFAULT_MAX_IN_LIST,
+            max_bool_width: cost::DEFAULT_MAX_BOOL_WIDTH,
             // Fail-closed by default for unshipped GA: unknown/ungranted filter
             // and order keys must not silently no-op.
             strict_where: true,
             introspection_for_anonymous: true,
             statement_timeout: Duration::from_secs(5),
             graphiql: false,
+            subscriptions: true,
             typed_commands: TypedCommandInventory::empty(),
             projectors: Vec::new(),
             change_rx: None,
             pending_errors: Vec::new(),
-            // DevHeaders keeps ambient header tests/green; public scaffolds set OidcBearer (D6).
-            identity: IdentityConfig::dev_headers(),
+            identity: None,
+            websocket: WebsocketLimits::default(),
+            live_concurrency: crate::graphql::subscribe::DEFAULT_LIVE_CONCURRENCY,
             read_stores: BTreeMap::new(),
+            external: Vec::new(),
         }
+    }
+
+    /// Include live roots in the runtime schema and generated client surface.
+    /// Query-only gateway executors disable this before schema construction.
+    pub fn subscriptions(mut self, enabled: bool) -> Self {
+        self.subscriptions = enabled;
+        self
+    }
+
+    /// Opt in selected exact query documents to a read replica. The engine's
+    /// original repository remains the primary for current reads and evidence.
+    #[cfg(feature = "gateway")]
+    pub fn read_routing(mut self, routing: ReadRouting) -> Self {
+        if std::mem::discriminant(&self.pool) != std::mem::discriminant(&routing.replica) {
+            self.pending_errors
+                .push("read replica must use the primary SQL dialect".into());
+        }
+        self.read_routing = Some(routing);
+        self
+    }
+
+    /// Enable origin dependency validation after installing version coverage
+    /// in the engine's database. This allocates no gateway cache or coordinator.
+    #[cfg(feature = "gateway")]
+    pub fn gateway_versions(
+        mut self,
+        store: crate::graphql::delivery::GatewayVersionStore,
+    ) -> Self {
+        self.gateway_versions = Some(store);
+        self
+    }
+
+    /// Expose every model of `models` with its own permissions.
+    pub fn read_models(self, models: &crate::graphql::ReadModels) -> Self {
+        models.register(self)
     }
 
     pub fn model<M: RelationalReadModelIncludes>(mut self, perms: ModelPermissions<M>) -> Self {
@@ -49,9 +93,7 @@ impl GraphqlEngineBuilder {
                 Ok(target) => {
                     if let Err(e) = self.insert_catalog(target.clone(), false) {
                         // Shadow insert conflict only if different schema.
-                        if !e.0.contains("identical") {
-                            self.pending_errors.push(e.0);
-                        }
+                        self.pending_errors.push(e.0);
                     }
                 }
                 Err(err) => {
@@ -63,10 +105,14 @@ impl GraphqlEngineBuilder {
             }
         }
         for (role, perm) in perms.entries {
-            let key = (schema.model_name.clone(), role.clone());
-            match self.permissions.entry(key) {
+            match self
+                .permissions
+                .entry(role.clone())
+                .or_default()
+                .entry(schema.model_name.clone())
+            {
                 Entry::Vacant(entry) => {
-                    entry.insert(RoleModelPerm { permission: perm });
+                    entry.insert(perm);
                 }
                 Entry::Occupied(_) => {
                     self.pending_errors.push(format!(
@@ -85,7 +131,7 @@ impl GraphqlEngineBuilder {
     /// only relationship metadata may differ. This lets independently owned
     /// model crates form a GraphQL relationship graph without introducing
     /// circular Rust dependencies or a second projection model.
-    pub fn model_schema<M: crate::RelationalReadModel>(
+    pub fn model_schema<M: crate::read_model::RelationalReadModel>(
         mut self,
         schema: TableSchema,
         perms: ModelPermissions<M>,
@@ -102,10 +148,14 @@ impl GraphqlEngineBuilder {
             return self;
         }
         for (role, permission) in perms.entries {
-            let key = (schema.model_name.clone(), role.clone());
-            match self.permissions.entry(key) {
+            match self
+                .permissions
+                .entry(role.clone())
+                .or_default()
+                .entry(schema.model_name.clone())
+            {
                 Entry::Vacant(entry) => {
-                    entry.insert(RoleModelPerm { permission });
+                    entry.insert(permission);
                 }
                 Entry::Occupied(_) => {
                     self.pending_errors.push(format!(
@@ -187,12 +237,14 @@ impl GraphqlEngineBuilder {
             .map(|(n, _)| n.clone())
             .collect();
         for model in exposed {
-            let key = (model.clone(), role.to_string());
-            match self.permissions.entry(key) {
+            match self
+                .permissions
+                .entry(role.to_string())
+                .or_default()
+                .entry(model.clone())
+            {
                 Entry::Vacant(entry) => {
-                    entry.insert(RoleModelPerm {
-                        permission: read().all_columns().aggregations(),
-                    });
+                    entry.insert(read().all_columns().aggregations());
                 }
                 Entry::Occupied(_) => {
                     self.pending_errors.push(format!(
@@ -216,10 +268,14 @@ impl GraphqlEngineBuilder {
             ));
             return self;
         }
-        let key = (model.clone(), role.to_string());
-        match self.permissions.entry(key) {
+        match self
+            .permissions
+            .entry(role.to_string())
+            .or_default()
+            .entry(model.clone())
+        {
             Entry::Vacant(entry) => {
-                entry.insert(RoleModelPerm { permission: p });
+                entry.insert(p);
             }
             Entry::Occupied(_) => {
                 self.pending_errors.push(format!(
@@ -305,21 +361,9 @@ impl GraphqlEngineBuilder {
         self
     }
 
-    /// Register one exact named application surface for generated clients.
-    /// Both role sets are required: eligible principals may open the surface,
-    /// while schema roles determine its portable privilege intersection.
-    ///
-    /// The server still authorizes every request as its verified concrete role.
-    pub fn client_application_surface(
-        self,
-        application: impl Into<String>,
-        eligible_roles: impl IntoIterator<Item = impl Into<String>>,
-        schema_roles: impl IntoIterator<Item = impl Into<String>>,
-    ) -> Self {
-        self.client_application_surface_with_schema_roles(application, eligible_roles, schema_roles)
-    }
-
-    /// Register an application surface with distinct eligible and schema roles.
+    /// Register one exact named application surface for generated clients,
+    /// with distinct eligible and schema roles. The server still authorizes
+    /// every request as its verified concrete role.
     ///
     /// - `eligible_roles`: wire/protocol role list; multi-role principals may
     ///   open the surface when any asserted role is in this set.
@@ -327,7 +371,7 @@ impl GraphqlEngineBuilder {
     ///   non-empty subset of `eligible_roles`). Use e.g. eligible
     ///   `{admin,user}` + schema `{user}` so portable owner policies survive
     ///   without collapsing model permission definitions.
-    pub fn client_application_surface_with_schema_roles(
+    pub fn client_application_surface(
         mut self,
         application: impl Into<String>,
         eligible_roles: impl IntoIterator<Item = impl Into<String>>,
@@ -424,6 +468,10 @@ impl GraphqlEngineBuilder {
     /// inventory. This is the authoritative path: no second command list is
     /// accepted, and attachment later verifies the complete structural digest
     /// plus exact Rust input/output `TypeId`s.
+    ///
+    /// The engine also takes the service's
+    /// [`LifecycleGate`](crate::microsvc::LifecycleGate) and refuses those
+    /// mutations while it is closed.
     pub fn service(mut self, service: &Service) -> Self {
         if self.command_binding.is_some() {
             self.pending_errors
@@ -456,13 +504,14 @@ impl GraphqlEngineBuilder {
         }
         self.service_id = Some(binding.service_id.clone());
         self.command_binding = Some(binding);
+        self.lifecycle = service.lifecycle().clone();
         self
     }
 
     /// Mount a [`crate::graphql::ReadStore`] for one model. Default is SQL scan.
-    /// Does not record the store on the [`crate::RelationalReadModel`] type
+    /// Does not record the store on the [`crate::read_model::RelationalReadModel`] type
     /// (`DCS-DEC-008`).
-    pub fn read_store<M: crate::RelationalReadModel>(
+    pub fn read_store<M: crate::read_model::RelationalReadModel>(
         mut self,
         store: crate::graphql::ReadStore,
     ) -> Self {
@@ -483,32 +532,49 @@ impl GraphqlEngineBuilder {
         self
     }
 
+    // Query cost knobs. Each has one unit; `docs/graphql-query-cost.md`
+    // describes the model.
+
+    /// Page size of a list whose request gives no `limit` (default 100).
     pub fn default_limit(mut self, n: u64) -> Self {
         self.default_limit = n;
         self
     }
+    /// Largest page size any list resolves to (default 1000). A role's
+    /// `limit` may lower it further for that role's models.
     pub fn max_limit(mut self, n: u64) -> Self {
         self.max_limit = n;
         self
     }
+    /// Nesting levels: fields in the document, and relationships and `where`
+    /// filters in the compiled statement (default 8).
     pub fn max_depth(mut self, n: usize) -> Self {
         self.max_depth = n;
         self
     }
-    /// Maximum nested-selection complexity budget (default
-    /// [`crate::graphql::complexity::DEFAULT_MAX_COMPLEXITY`]).
-    ///
-    /// Cost uses relationship-aware weights (see `complexity` module), not only
-    /// flat GraphQL field counts, so multi-level `has_many` trees are bounded.
-    pub fn max_complexity(mut self, n: usize) -> Self {
-        self.max_complexity = n;
+    /// Selected fields in one document, every field once at every level
+    /// (default 500).
+    pub fn max_fields(mut self, n: usize) -> Self {
+        self.max_fields = n;
         self
     }
+    /// Model rows one root field's statement may produce (default 200,000).
+    ///
+    /// Every list counts its resolved limit: a page of `limit` rows costs
+    /// `limit × (1 + rows nested under one row)` and one object costs
+    /// `1 + rows nested under it`, so nested lists cost about the product of
+    /// their limits. A root field over budget fails with `BAD_REQUEST`
+    /// `row budget exceeded` before any SQL runs.
+    pub fn max_rows(mut self, n: u64) -> Self {
+        self.max_rows = n;
+        self
+    }
+    /// Entries in one `_in` / `_nin` list (default 1000).
     pub fn max_in_list(mut self, n: usize) -> Self {
         self.max_in_list = n;
         self
     }
-    /// Cap width of a single `_and` / `_or` list in client `where` (default 256).
+    /// Entries in one `_and` / `_or` list in client `where` (default 256).
     pub fn max_bool_width(mut self, n: usize) -> Self {
         self.max_bool_width = n;
         self
@@ -557,11 +623,44 @@ impl GraphqlEngineBuilder {
         self.graphiql = on;
         self
     }
-    /// Configure GraphQL HTTP identity mode (TrustedProxy / OidcBearer / Hybrid / DevHeaders).
+    /// Choose how requests are authenticated. Required: there is no default,
+    /// so an engine can never silently trust client-supplied identity headers.
     pub fn identity(mut self, config: IdentityConfig) -> Self {
-        self.identity = config;
+        self.identity = Some(config);
         self
     }
+    /// Bound origin WebSocket connections (lifetime, idleness, live queries).
+    pub fn websocket_limits(mut self, limits: WebsocketLimits) -> Self {
+        self.websocket = limits;
+        self
+    }
+    /// Run at most `n` live executions at once (default
+    /// [`DEFAULT_LIVE_CONCURRENCY`](crate::graphql::subscribe::DEFAULT_LIVE_CONCURRENCY)).
+    /// Subscribers to the same read share one execution per change; this
+    /// bounds how many distinct reads (first reads, refreshes and catch-ups
+    /// together) hold a pool connection at a time, so a write burst cannot
+    /// starve one-shot queries. Must be at least 1.
+    pub fn live_concurrency(mut self, n: usize) -> Self {
+        if n == 0 {
+            self.pending_errors
+                .push("live_concurrency must be at least 1".into());
+        }
+        self.live_concurrency = n;
+        self
+    }
+    /// Serve an external read source's roots (queries, `@live`
+    /// subscriptions, the client manifest); see
+    /// [`ExternalReadSource`](crate::graphql::surface::ExternalReadSource).
+    /// `@live` roots refresh when the change keys of their reads are
+    /// published on [`GraphqlEngine::change_hub`].
+    pub fn external_read_source(
+        mut self,
+        executor: Arc<dyn crate::graphql::surface::ExternalReadExecutor>,
+    ) -> Self {
+        self.external.push(executor);
+        self
+    }
+
     pub fn change_stream(mut self, rx: tokio::sync::broadcast::Receiver<ReadModelChange>) -> Self {
         self.change_rx = Some(rx);
         self
@@ -570,6 +669,20 @@ impl GraphqlEngineBuilder {
     pub fn build(mut self) -> Result<GraphqlEngine, GraphqlBuildError> {
         if !self.pending_errors.is_empty() {
             return Err(GraphqlBuildError(self.pending_errors.join("; ")));
+        }
+        let identity = self.identity.take().ok_or_else(|| {
+            GraphqlBuildError(
+                "GraphQL engine has no identity mode; call .identity(..) with IdentityConfig::oidc_bearer, ::gateway or ::dev_headers"
+                    .into(),
+            )
+        })?;
+        if self.websocket.max_lifetime.is_zero()
+            || self.websocket.idle_timeout.is_zero()
+            || self.websocket.max_live_queries == 0
+        {
+            return Err(GraphqlBuildError(
+                "GraphQL WebSocket limits must all be greater than zero".into(),
+            ));
         }
         if self.protocol_namespace.is_some() && self.protocol_token_key.is_none() {
             return Err(GraphqlBuildError(
@@ -617,48 +730,51 @@ impl GraphqlEngineBuilder {
 
         // Validate permissions.
         let declared_roles = self.roles.clone();
+        let external_sources = self
+            .external
+            .iter()
+            .map(|executor| executor.source())
+            .collect::<Vec<_>>();
+        for source in &external_sources {
+            for role in source.roles() {
+                if let Some(roles) = &declared_roles {
+                    if !roles.contains(&role) && role != self.anonymous_role {
+                        return Err(GraphqlBuildError(format!(
+                            "{} `{}` grants undeclared role `{role}`",
+                            source.section(),
+                            source.name()
+                        )));
+                    }
+                }
+            }
+        }
         let anonymous = self.anonymous_role.clone();
-        let perm_keys: Vec<_> = self.permissions.keys().cloned().collect();
-        for (model, role) in &perm_keys {
+        for (role, grants) in &self.permissions {
             if let Some(roles) = &declared_roles {
                 if !roles.contains(role) && role != &anonymous {
+                    let model = grants.keys().next().map(String::as_str).unwrap_or("");
                     return Err(GraphqlBuildError(format!(
                         "permission for undeclared role `{role}` (model `{model}`)"
                     )));
                 }
             }
-            let entry = self.catalog.get(model).ok_or_else(|| {
-                GraphqlBuildError(format!("permission for unknown model `{model}`"))
-            })?;
-            let perm = &self.permissions[&(model.clone(), role.clone())].permission;
-
-            // Column allowlist validation.
-            if !perm.all_columns {
-                if let Some(cols) = &perm.columns {
-                    for col in cols {
-                        if !entry
-                            .schema
-                            .columns
-                            .iter()
-                            .any(|c| c.column_name == *col && !c.skipped)
-                        {
-                            return Err(GraphqlBuildError(format!(
-                                "unknown column `{col}` in permission for `{model}` role `{role}`"
-                            )));
-                        }
-                    }
-                }
+            if role != &anonymous {
+                continue;
             }
-
-            if let Some(filter) = &perm.row_filter {
-                validate_filter(
-                    filter,
-                    &entry.schema,
-                    &self.catalog,
-                    role == &anonymous,
-                    model,
-                    role,
-                )?;
+            // Columns, literals and relationship paths are validated once, by
+            // the surface selection below. Only the engine knows which role
+            // is anonymous, and an anonymous session carries no claims.
+            for (model, grant) in grants {
+                let mut claims = Vec::new();
+                if let Some(filter) = &grant.row_filter {
+                    filter.visit_claims(|claim| claims.push(claim.to_string()));
+                }
+                if !claims.is_empty() {
+                    return Err(GraphqlBuildError(format!(
+                        "claim() is not allowed in anonymous role filters (model `{model}`, claims: {})",
+                        claims.join(", ")
+                    )));
+                }
             }
         }
 
@@ -714,6 +830,14 @@ impl GraphqlEngineBuilder {
             }
         };
 
+        let client_execution = ClientExecutionLimits::from_runtime(
+            self.max_depth,
+            self.max_fields,
+            self.max_rows,
+            self.max_bool_width,
+            self.max_in_list,
+        )
+        .map_err(|error| GraphqlBuildError(error.to_string()))?;
         let tables: Vec<TableSchema> = self
             .catalog
             .values()
@@ -725,7 +849,7 @@ impl GraphqlEngineBuilder {
                 SqlDialect::Postgres => SurfaceDialect::Postgres,
             },
             aggregates: true,
-            subscriptions: true,
+            subscriptions: self.subscriptions,
             default_limit: self.default_limit,
             max_limit: self.max_limit,
         };
@@ -736,6 +860,8 @@ impl GraphqlEngineBuilder {
                 .map_err(GraphqlBuildError)?
                 .with_service_binding(self.command_binding.clone())
                 .with_projection_owners(self.projectors.clone())
+                .map_err(GraphqlBuildError)?
+                .with_external_sources(external_sources.iter().cloned())
                 .map_err(GraphqlBuildError)?,
         );
         let query_protocol = if self.protocol_token_key.is_some() {
@@ -755,7 +881,8 @@ impl GraphqlEngineBuilder {
             })
             .transpose()?;
 
-        let mut roles: BTreeSet<String> = self.permissions.keys().map(|(_, r)| r.clone()).collect();
+        let mut roles: BTreeSet<String> = self.permissions.keys().cloned().collect();
+        roles.extend(external_sources.iter().flat_map(|source| source.roles()));
         if let Some(declared) = &declared_roles {
             roles.extend(declared.iter().cloned());
         }
@@ -767,19 +894,14 @@ impl GraphqlEngineBuilder {
         let mut role_surfaces = BTreeMap::new();
         let mut protocol_roles = BTreeMap::new();
         for role in &roles {
-            let grants = role_grants_from_model_role_perms(
-                role,
-                self.permissions
-                    .iter()
-                    .map(|(key, value)| (key, &value.permission)),
-            );
-            let role_surface = Arc::new(
-                surface_for_role(&full_surface, role, &grants).map_err(GraphqlBuildError)?,
-            );
+            let no_grants = BTreeMap::new();
+            let grants = self.permissions.get(role).unwrap_or(&no_grants);
+            let role_surface =
+                Arc::new(surface_for_role(&full_surface, role, grants).map_err(GraphqlBuildError)?);
             let schema = dyn_schema::build_role_schema(
                 &role_surface,
                 self.max_depth,
-                self.max_complexity,
+                self.max_fields,
                 role == &anonymous && !self.introspection_for_anonymous,
             )
             .map_err(GraphqlBuildError)?;
@@ -787,8 +909,7 @@ impl GraphqlEngineBuilder {
                 let graphiql_schema = dyn_schema::build_role_schema(
                     &role_surface,
                     self.max_depth.max(GRAPHIQL_INTROSPECTION_MAX_DEPTH_FLOOR),
-                    self.max_complexity
-                        .max(GRAPHIQL_INTROSPECTION_MAX_COMPLEXITY_FLOOR),
+                    self.max_fields.max(GRAPHIQL_INTROSPECTION_MAX_FIELDS_FLOOR),
                     role == &anonymous && !self.introspection_for_anonymous,
                 )
                 .map_err(GraphqlBuildError)?;
@@ -800,20 +921,18 @@ impl GraphqlEngineBuilder {
                     .as_deref()
                     .expect("protocol configuration validated a service ID");
                 let (authorization_fingerprint, claim_keys) =
-                    role_authorization_info(role, &self.permissions)?;
-                let manifest = DistributedClientSurfaceExport::from_selected_with_execution(
+                    role_authorization_info(role, &self.permissions, &full_surface.external)?;
+                let export = DistributedClientSurfaceExport::from_selected_with_execution(
                     service_id,
                     Arc::clone(&role_surface),
-                    ClientExecutionLimits::from_runtime(
-                        self.max_depth,
-                        self.max_complexity,
-                        self.max_bool_width,
-                        self.max_in_list,
-                    )
-                    .map_err(|error| GraphqlBuildError(error.to_string()))?,
+                    client_execution.clone(),
                 )
-                .and_then(|export| export.manifest())
                 .map_err(|error| {
+                    GraphqlBuildError(format!(
+                        "failed to derive GraphQL protocol surface for role `{role}`: {error}"
+                    ))
+                })?;
+                let manifest = export.manifest().map_err(|error| {
                     GraphqlBuildError(format!(
                         "failed to derive GraphQL protocol surface for role `{role}`: {error}"
                     ))
@@ -823,6 +942,7 @@ impl GraphqlEngineBuilder {
                     role.clone(),
                     ProtocolRoleInfo {
                         surface: ProtocolSurfaceInfo {
+                            export,
                             schema_fingerprint: manifest.schema_fingerprint,
                             protocol_fingerprint: manifest.protocol_fingerprint,
                             trusted_presets,
@@ -841,22 +961,13 @@ impl GraphqlEngineBuilder {
         for (application, registration) in &self.client_applications {
             // Schema privilege set drives grant intersection (portable policies).
             // Eligible set is stamped on the surface identity for protocol open.
-            let mut grants_by_role = BTreeMap::new();
             for role in &registration.schema_roles {
                 if !role_surfaces.contains_key(role) {
                     return Err(GraphqlBuildError(format!(
                         "client application surface `{application}` schema role `{role}` is not configured"
                     )));
                 }
-                grants_by_role.insert(
-                    role.clone(),
-                    role_grants_from_model_role_perms(
-                        role,
-                        self.permissions
-                            .iter()
-                            .map(|(key, value)| (key, &value.permission)),
-                    ),
-                );
+                self.permissions.entry(role.clone()).or_default();
             }
             for role in &registration.eligible_roles {
                 if !role_surfaces.contains_key(role) {
@@ -866,12 +977,12 @@ impl GraphqlEngineBuilder {
                 }
             }
             let application_surface = Arc::new(
-                surface_for_application_contract(
+                surface_for_application(
                     &full_surface,
                     application,
                     &registration.eligible_roles,
                     &registration.schema_roles,
-                    &grants_by_role,
+                    &self.permissions,
                 )
                 .map_err(GraphqlBuildError)?,
             );
@@ -880,18 +991,15 @@ impl GraphqlEngineBuilder {
                     .service_id
                     .as_deref()
                     .expect("protocol configuration validated a service ID");
-                let manifest = DistributedClientSurfaceExport::from_selected_with_execution(
+                let export = DistributedClientSurfaceExport::from_selected_with_execution(
                     service_id,
                     Arc::clone(&application_surface),
-                    ClientExecutionLimits::from_runtime(
-                        self.max_depth,
-                        self.max_complexity,
-                        self.max_bool_width,
-                        self.max_in_list,
-                    )
-                    .map_err(|error| GraphqlBuildError(error.to_string()))?,
+                    client_execution.clone(),
                 )
-                .and_then(|export| export.manifest())
+                .map_err(|error| GraphqlBuildError(format!(
+                    "failed to derive GraphQL protocol surface for application `{application}`: {error}"
+                )))?;
+                let manifest = export.manifest()
                 .map_err(|error| {
                     GraphqlBuildError(format!(
                         "failed to derive GraphQL protocol surface for application `{application}`: {error}"
@@ -907,7 +1015,11 @@ impl GraphqlEngineBuilder {
                 };
                 let (authorization_fingerprint, claim_keys) =
                     if registration.schema_roles.len() == 1 {
-                        role_authorization_info(&registration.schema_roles[0], &self.permissions)?
+                        role_authorization_info(
+                            &registration.schema_roles[0],
+                            &self.permissions,
+                            &full_surface.external,
+                        )?
                     } else {
                         // Multi-privilege: fingerprint the application surface grant
                         // intersection under the synthetic privilege key.
@@ -915,6 +1027,7 @@ impl GraphqlEngineBuilder {
                             &privilege_key,
                             &registration.schema_roles,
                             &self.permissions,
+                            &full_surface.external,
                         )?
                     };
                 // Ensure the privilege key has a role surface for projection
@@ -923,7 +1036,7 @@ impl GraphqlEngineBuilder {
                     let app_schema = dyn_schema::build_role_schema(
                         &application_surface,
                         self.max_depth,
-                        self.max_complexity,
+                        self.max_fields,
                         false,
                     )
                     .map_err(GraphqlBuildError)?;
@@ -932,21 +1045,13 @@ impl GraphqlEngineBuilder {
                         let graphiql_schema = dyn_schema::build_role_schema(
                             &application_surface,
                             self.max_depth.max(GRAPHIQL_INTROSPECTION_MAX_DEPTH_FLOOR),
-                            self.max_complexity
-                                .max(GRAPHIQL_INTROSPECTION_MAX_COMPLEXITY_FLOOR),
+                            self.max_fields.max(GRAPHIQL_INTROSPECTION_MAX_FIELDS_FLOOR),
                             false,
                         )
                         .map_err(GraphqlBuildError)?;
                         graphiql_schemas.insert(privilege_key.clone(), graphiql_schema);
                     }
                     role_surfaces.insert(privilege_key.clone(), Arc::clone(&application_surface));
-                    // Intersected grants as ReadPermission under the synthetic key
-                    // so compile_root finds privilege packs.
-                    insert_synthetic_privilege_permissions(
-                        &privilege_key,
-                        &registration.schema_roles,
-                        &mut self.permissions,
-                    );
                 }
                 protocol_applications.insert(
                     application.clone(),
@@ -955,6 +1060,7 @@ impl GraphqlEngineBuilder {
                         schema_roles: registration.schema_roles.clone(),
                         privilege_key,
                         surface: ProtocolSurfaceInfo {
+                            export,
                             schema_fingerprint: manifest.schema_fingerprint,
                             protocol_fingerprint: manifest.protocol_fingerprint,
                             trusted_presets,
@@ -989,7 +1095,6 @@ impl GraphqlEngineBuilder {
                 applications: protocol_applications,
             }
         });
-        let identity_validator = self.identity.oidc.clone().map(OidcValidator::new);
         let mut read_store_kinds = BTreeMap::new();
         let mut cell_getters = BTreeMap::new();
         for (model, store) in self.read_stores {
@@ -1001,21 +1106,24 @@ impl GraphqlEngineBuilder {
         let inner = Arc::new(EngineInner {
             service_id: self.service_id,
             command_binding: self.command_binding,
+            lifecycle: self.lifecycle,
             causal_storage_identity: self.causal_storage_identity,
             pool: self.pool,
+            #[cfg(feature = "gateway")]
+            read_routing: self.read_routing,
+            #[cfg(feature = "gateway")]
+            gateway_versions: self.gateway_versions,
             catalog: self.catalog,
             by_table: self.by_table,
-            permissions: self.permissions,
-            roles,
             anonymous_role: anonymous,
             default_limit: self.default_limit,
             max_limit: self.max_limit,
             max_depth: self.max_depth,
-            max_complexity: self.max_complexity,
+            max_rows: self.max_rows,
             max_in_list: self.max_in_list,
             max_bool_width: self.max_bool_width,
+            client_execution,
             strict_where: self.strict_where,
-            introspection_for_anonymous: self.introspection_for_anonymous,
             statement_timeout: self.statement_timeout,
             graphiql: self.graphiql,
             typed_commands: self.typed_commands,
@@ -1024,13 +1132,25 @@ impl GraphqlEngineBuilder {
             schemas,
             graphiql_schemas,
             change_hub,
+            live: crate::graphql::subscribe::LiveRegistries::new(self.live_concurrency),
             dialect,
-            identity: self.identity,
-            identity_validator,
+            identity: IdentityResolver::new(identity),
+            websocket: self.websocket,
             protocol,
             query_protocol,
             read_stores: read_store_kinds,
             cell_getters,
+            external_executors: self
+                .external
+                .into_iter()
+                .zip(external_sources)
+                .map(|(executor, source)| {
+                    (
+                        (source.section().to_string(), source.name().to_string()),
+                        executor,
+                    )
+                })
+                .collect(),
         });
 
         Ok(GraphqlEngine { inner })

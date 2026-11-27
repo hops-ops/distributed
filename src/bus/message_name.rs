@@ -86,7 +86,7 @@ impl Error for MessageNameError {}
 ///
 /// Returns the borrowed name when it is usable. Rejects empty/whitespace-only,
 /// over-long, control-character-bearing, and wildcard-bearing names. `.` is
-/// permitted (see the [module docs](self)); the value is returned unchanged so
+/// permitted (see the module docs); the value is returned unchanged so
 /// callers route on exactly what was provided.
 pub fn validate_message_name(name: &str) -> Result<&str, MessageNameError> {
     if name.trim().is_empty() {

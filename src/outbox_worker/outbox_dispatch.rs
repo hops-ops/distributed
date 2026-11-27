@@ -40,7 +40,15 @@ const OUTBOX_CONTENT_TYPE: &str = "application/octet-stream";
 /// Reserved metadata key prefix for framework-derived keys. User metadata must
 /// not use this prefix; keys here (payload codec, destination, source context)
 /// carry decode/routing semantics and must not be shadowable by user metadata.
-pub const SOURCED_METADATA_PREFIX: &str = "x-sourced-";
+pub const SOURCED_METADATA_PREFIX: &str = "x-distributed-";
+
+/// Metadata key naming the type of the aggregate a message came from.
+pub const SOURCE_AGGREGATE_TYPE: &str = "x-distributed-source-aggregate-type";
+
+/// Metadata key naming the aggregate a message came from: its stream id.
+/// Transports that partition (Kafka) key by it, so one aggregate's messages
+/// keep their order.
+pub const SOURCE_AGGREGATE_ID: &str = "x-distributed-source-aggregate-id";
 
 impl From<OutboxMessage> for Message {
     /// Map a durable outbox row to a canonical transport message.
@@ -66,7 +74,7 @@ impl From<OutboxMessage> for Message {
         };
 
         // User metadata first (correlation/trace/auth), then framework-derived
-        // keys under the reserved `x-sourced-` prefix. Any user key in the
+        // keys under the reserved `x-distributed-` prefix. Any user key in the
         // reserved namespace is dropped so framework values stay authoritative
         // and cannot be shadowed on case-insensitive lookup.
         let mut metadata: Vec<(String, String)> = outbox
@@ -89,16 +97,10 @@ impl From<OutboxMessage> for Message {
             metadata.push((format!("{SOURCED_METADATA_PREFIX}destination"), destination));
         }
         if let Some(source_type) = outbox.source_aggregate_type {
-            metadata.push((
-                format!("{SOURCED_METADATA_PREFIX}source-aggregate-type"),
-                source_type,
-            ));
+            metadata.push((SOURCE_AGGREGATE_TYPE.to_string(), source_type));
         }
         if let Some(source_id) = outbox.source_aggregate_id {
-            metadata.push((
-                format!("{SOURCED_METADATA_PREFIX}source-aggregate-id"),
-                source_id,
-            ));
+            metadata.push((SOURCE_AGGREGATE_ID.to_string(), source_id));
         }
         if let Some(sequence) = outbox.source_sequence {
             metadata.push((
@@ -386,7 +388,12 @@ where
             Ok(()) => published.push(claim),
             Err(publish_error) => {
                 match store
-                    .record_failure(&claim, &publish_error.to_string(), max_attempts)
+                    .record_failure(
+                        &claim,
+                        &publish_error.to_string(),
+                        publish_error.is_retryable(),
+                        max_attempts,
+                    )
                     .await?
                 {
                     OutboxPublishFailureAction::Released => outcome.released += 1,
@@ -510,9 +517,12 @@ mod tests {
             Some("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01")
         );
         assert_eq!(message.tracestate(), Some("vendor=value"));
-        assert_eq!(message.metadata("x-sourced-payload-codec"), Some("bytes"));
         assert_eq!(
-            message.metadata("x-sourced-payload-codec-version"),
+            message.metadata("x-distributed-payload-codec"),
+            Some("bytes")
+        );
+        assert_eq!(
+            message.metadata("x-distributed-payload-codec-version"),
             Some("1")
         );
     }
@@ -525,20 +535,26 @@ mod tests {
             "evt-1",
             "OrderCreated",
             b"\x01".to_vec(),
-            [("x-sourced-payload-codec".to_string(), "evil".to_string())]
-                .into_iter()
-                .collect(),
+            [(
+                "x-distributed-payload-codec".to_string(),
+                "evil".to_string(),
+            )]
+            .into_iter()
+            .collect(),
         )
         .unwrap();
         let message = Message::from(outbox);
         // The user's reserved-prefix key is dropped; lookup returns the
         // authoritative framework value, and there is exactly one such entry.
-        assert_eq!(message.metadata("x-sourced-payload-codec"), Some("bytes"));
+        assert_eq!(
+            message.metadata("x-distributed-payload-codec"),
+            Some("bytes")
+        );
         assert_eq!(
             message
                 .metadata
                 .iter()
-                .filter(|(k, _)| k == "x-sourced-payload-codec")
+                .filter(|(k, _)| k == "x-distributed-payload-codec")
                 .count(),
             1
         );
@@ -550,7 +566,10 @@ mod tests {
             OutboxMessage::create_to("cmd-1", "ShipOrder", "shipping", b"{}".to_vec()).unwrap();
         let message = Message::from(outbox);
         assert_eq!(message.kind, MessageKind::Command);
-        assert_eq!(message.metadata("x-sourced-destination"), Some("shipping"));
+        assert_eq!(
+            message.metadata("x-distributed-destination"),
+            Some("shipping")
+        );
     }
 
     fn dispatcher(
@@ -596,7 +615,7 @@ mod tests {
         );
         // The publisher saw the message id, and the row is completed only after.
         assert_eq!(dispatcher.publisher.ids(), vec!["evt-1".to_string()]);
-        assert!(load(&repo, &id).is_published());
+        assert!(!repo.outbox_storage().read().unwrap().contains_key(&id));
     }
 
     #[test]
@@ -617,10 +636,41 @@ mod tests {
     }
 
     #[test]
-    fn publish_failure_fails_row_at_attempt_ceiling() {
+    fn an_outage_never_fails_a_row_even_at_the_attempt_ceiling() {
         let repo = InMemoryRepository::new();
         let id = store_message(&repo, outbox("evt-1"));
+        // The publisher fails retryably (unknown outcome); the ceiling is 1.
         let dispatcher = dispatcher(&repo, true, 1);
+
+        let outcome = block_on(dispatcher.dispatch_ids(std::slice::from_ref(&id))).unwrap();
+
+        assert_eq!(outcome.failed, 0);
+        assert_eq!(outcome.released, 1);
+        let row = load(&repo, &id);
+        assert!(row.is_pending());
+        assert!(
+            row.available_at.is_some_and(|at| at > crate::time::now()),
+            "the released row waits before its next attempt"
+        );
+    }
+
+    #[test]
+    fn a_permanent_publish_failure_fails_the_row_at_the_attempt_ceiling() {
+        struct Rejecting;
+        impl MessagePublisher for Rejecting {
+            async fn publish(&self, _message: Message) -> Result<(), TransportError> {
+                Err(TransportError::permanent("message rejected"))
+            }
+        }
+        let repo = InMemoryRepository::new();
+        let id = store_message(&repo, outbox("evt-1"));
+        let dispatcher = OutboxDispatcher::new(
+            repo.outbox_store(),
+            Rejecting,
+            "immediate:test",
+            Duration::from_secs(60),
+            1,
+        );
 
         let outcome = block_on(dispatcher.dispatch_ids(std::slice::from_ref(&id))).unwrap();
 
@@ -640,7 +690,7 @@ mod tests {
 
         assert_eq!(outcome.claimed, 1);
         assert_eq!(outcome.published, 1);
-        assert!(load(&repo, &wanted).is_published());
+        assert!(!repo.outbox_storage().read().unwrap().contains_key(&wanted));
         // The unrequested row is untouched.
         assert!(load(&repo, &other).is_pending());
     }
@@ -680,6 +730,60 @@ mod tests {
         assert_eq!(drained.claimed, 1, "only evt-2 remains claimable");
         assert_eq!(drained.published, 1);
         assert_eq!(dispatcher.publisher.ids().len(), 2);
+    }
+
+    #[test]
+    fn queue_acceptance_and_competing_drain_do_not_imply_claim_settlement() {
+        use std::future::{poll_fn, Future};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::task::Poll;
+
+        struct HeldAcknowledgement {
+            accepted: AtomicBool,
+            release: Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+        }
+
+        impl MessagePublisher for HeldAcknowledgement {
+            async fn publish(&self, _message: Message) -> Result<(), TransportError> {
+                // The queue row is externally visible before the publisher's
+                // response reaches the alarm that owns the local claim.
+                self.accepted.store(true, Ordering::SeqCst);
+                let release = self.release.lock().unwrap().take().unwrap();
+                release.await.unwrap();
+                Ok(())
+            }
+        }
+
+        block_on(async {
+            let repo = InMemoryRepository::new();
+            let id = store_message(&repo, outbox("accepted-before-settlement"));
+            let (release, response) = tokio::sync::oneshot::channel();
+            let alarm = OutboxDispatcher::new(
+                repo.outbox_store(),
+                HeldAcknowledgement {
+                    accepted: AtomicBool::new(false),
+                    release: Mutex::new(Some(response)),
+                },
+                "alarm:test",
+                Duration::from_secs(60),
+                3,
+            );
+            let mut pending = Box::pin(alarm.dispatch_batch(1));
+            assert!(poll_fn(|cx| Poll::Ready(pending.as_mut().poll(cx)))
+                .await
+                .is_pending());
+            assert!(alarm.publisher.accepted.load(Ordering::SeqCst));
+            assert_eq!(repo.outbox_storage().read().unwrap().len(), 1);
+
+            let replay_drain = dispatcher(&repo, false, 3).dispatch_batch(1).await.unwrap();
+            assert_eq!(replay_drain.claimed, 0);
+            assert_eq!(replay_drain.published, 0);
+            assert_eq!(repo.outbox_storage().read().unwrap().len(), 1);
+
+            release.send(()).unwrap();
+            assert_eq!(pending.await.unwrap().published, 1);
+            assert!(!repo.outbox_storage().read().unwrap().contains_key(&id));
+        });
     }
 
     /// Publisher that fails one specific message id and records the rest.
@@ -723,8 +827,8 @@ mod tests {
         assert_eq!(outcome.claimed, 3);
         assert_eq!(outcome.published, 2);
         assert_eq!(outcome.released, 1);
-        assert!(load(&repo, "evt-1").is_published());
-        assert!(load(&repo, "evt-3").is_published());
+        assert!(!repo.outbox_storage().read().unwrap().contains_key("evt-1"));
+        assert!(!repo.outbox_storage().read().unwrap().contains_key("evt-3"));
         // The failed row is released for retry, untouched by the batched complete.
         let failed = load(&repo, "evt-2");
         assert!(failed.is_pending());
@@ -745,7 +849,7 @@ mod tests {
         assert_eq!(outcome.claimed, 3);
         assert_eq!(outcome.published, 3);
         for id in ["evt-1", "evt-2", "evt-3"] {
-            assert!(load(&repo, id).is_published());
+            assert!(!repo.outbox_storage().read().unwrap().contains_key(id));
         }
         assert_eq!(dispatcher.publisher.ids().len(), 3);
     }

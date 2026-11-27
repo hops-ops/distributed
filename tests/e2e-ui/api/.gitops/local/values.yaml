@@ -27,13 +27,15 @@ service:
 uiService:
   name: e2e-ui-ui
   port: 5180
-  targetPort: 5180
+  targetPort: 8791
 
 env:
   CARGO_TARGET_DIR: "/workspace/tests/e2e-ui/target"
   BIND: "0.0.0.0:8791"
   UI_BIND: "0.0.0.0"
   UI_PORT: "5180"
+  UI_INTERNAL_ORIGIN: "http://127.0.0.1:5180"
+  PUBLIC_ORIGIN: "http://e2e-ui-ui.default.svc.cluster.local:5180"
   UI_URL: "http://e2e-ui-ui.default.svc.cluster.local:5180"
   AUTH_URL: "http://e2e-ui-ui.default.svc.cluster.local:5180"
   AUTH_TRUST_HOST: "true"

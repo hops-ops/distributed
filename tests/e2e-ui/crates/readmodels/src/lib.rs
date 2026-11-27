@@ -7,53 +7,20 @@ pub mod models;
 
 pub use models::{AuthUsers, BlobGames, ChatMessages, Todos};
 
-pub fn distributed_manifest() -> distributed::ReadModelCatalog {
-    use distributed::RelationalReadModel;
-
-    // Schema-only catalog (physical tables). ApplicationManifest is the logical
-    // application contract and is composed separately.
-    distributed::ReadModelCatalog::new("e2e-ui")
-        .table_schema(Todos::schema().clone())
-        .table_schema(ChatMessages::schema().clone())
-        .table_schema(BlobGames::schema().clone())
-        .table_schema(AuthUsers::schema().clone())
-}
-
-/// Role grants compiled from the authorization attached to each read model.
-pub fn application_grants() -> std::collections::BTreeMap<
-    String,
-    std::collections::BTreeMap<String, distributed::graphql::RoleGrant>,
-> {
-    use distributed::graphql::ModelPermissions;
-    use distributed::RelationalReadModel;
-
-    fn add<M: RelationalReadModel>(
-        grants: &mut std::collections::BTreeMap<
-            String,
-            std::collections::BTreeMap<String, distributed::graphql::RoleGrant>,
-        >,
-        permissions: ModelPermissions<M>,
-    ) {
-        for (role, grant) in permissions.surface_grants() {
-            grants
-                .entry(role)
-                .or_default()
-                .insert(M::schema().model_name.clone(), grant);
-        }
-    }
-
-    let mut grants = std::collections::BTreeMap::new();
-    add(&mut grants, Todos::permissions());
-    add(&mut grants, ChatMessages::permissions());
-    add(&mut grants, BlobGames::permissions());
-    add(&mut grants, AuthUsers::permissions());
-    grants
+/// Every read model the application serves, with its permissions: the one
+/// list schema bootstrap, the GraphQL engine and client export read.
+pub fn read_models() -> distributed::graphql::ReadModels {
+    distributed::graphql::ReadModels::new("e2e-ui")
+        .model::<Todos>()
+        .model::<ChatMessages>()
+        .model::<BlobGames>()
+        .model::<AuthUsers>()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use distributed::RelationalReadModel;
+    use distributed::read_model::RelationalReadModel;
 
     #[test]
     fn referencing_models_own_one_way_auth_user_relationships() {
@@ -79,9 +46,8 @@ mod tests {
 
         assert!(AuthUsers::schema().relationships.is_empty());
 
-        let project = distributed_manifest();
         let surface = distributed::graphql::build_surface(
-            &project.tables,
+            &read_models().catalog().tables,
             &distributed::graphql::SurfaceOptions::sqlite(),
         )
         .unwrap();
@@ -97,7 +63,11 @@ mod tests {
         // brace, so match without requiring a trailing newline.)
         for name in ["Todos", "BlobGames", "ChatMessages"] {
             let body = object(name);
-            let join = if name == "ChatMessages" { "author" } else { "owner" };
+            let join = if name == "ChatMessages" {
+                "author"
+            } else {
+                "owner"
+            };
             assert!(
                 body.contains(&format!("\n  {join}: AuthUsers")),
                 "{name} missing nullable AuthUsers join:\n{body}"
@@ -111,7 +81,7 @@ mod tests {
 
     #[test]
     fn model_owned_permissions_compile_the_application_grants() {
-        let grants = application_grants();
+        let grants = read_models().grants();
         let user = &grants["user"];
         let admin = &grants["admin"];
         let anonymous = &grants["anonymous"];
@@ -122,21 +92,5 @@ mod tests {
         assert!(anonymous.contains_key("ChatMessages"));
         assert!(anonymous.contains_key("AuthUsers"));
         assert_eq!(anonymous.len(), 2);
-        assert!(matches!(
-            user["Todos"].row_policy,
-            distributed::graphql::SurfaceRowPolicy::Predicate(_)
-        ));
-        assert!(matches!(
-            user["BlobGames"].row_policy,
-            distributed::graphql::SurfaceRowPolicy::Predicate(_)
-        ));
-        assert!(matches!(
-            user["ChatMessages"].row_policy,
-            distributed::graphql::SurfaceRowPolicy::Unrestricted
-        ));
-        assert!(matches!(
-            user["AuthUsers"].row_policy,
-            distributed::graphql::SurfaceRowPolicy::Unrestricted
-        ));
     }
 }

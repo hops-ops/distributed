@@ -88,7 +88,11 @@ test.describe('chat (alice)', () => {
 		await expect(msg).toBeVisible({ timeout: 20_000 });
 		await expect(msg.locator('.ch-body')).toHaveText(body);
 
-		// Reload — message should still be there (RM + SSR)
+		// The first row is optimistic. Wait for the command receipt and
+		// projection before navigation can cancel the pending HTTP request.
+		await expect(page.locator('.ch-msg-block', { has: msg }).locator('.ch-status-footer')).toHaveText('Delivered');
+
+		// Reload — the confirmed message should still be there (RM + SSR)
 		await page.reload();
 		await expect(page.locator('.ch-msg', { hasText: body })).toBeVisible({
 			timeout: 20_000
@@ -102,7 +106,7 @@ test.describe('chat (alice)', () => {
 			timeout: 20_000
 		});
 
-		// Seed more than one page so offset history is meaningful (page size 25).
+		// Seed more than one page so history paging is meaningful (page size 25).
 		const stamp = Date.now();
 		const total = 30;
 		for (let i = 0; i < total; i += 1) {

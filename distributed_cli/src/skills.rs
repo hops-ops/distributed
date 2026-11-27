@@ -40,21 +40,21 @@ pub struct EmbeddedSkill {
     pub files: &'static [EmbeddedFile],
 }
 
-static SKILLS: [EmbeddedSkill; 4] = [
+static SKILLS: [EmbeddedSkill; 5] = [
     EmbeddedSkill {
         name: "distributed-usage",
-        description: "Build Distributed CQRS/event-sourced Rust services where you mostly write models and handlers while the framework and distributed generate persistence, transports, manifests, and deploy wiring. Use model-first TDD to specify plain aggregate behavior with fast unit tests before implementing models and thin handlers. Use when designing, testing, writing, or modifying a Distributed service or domain model.",
+        description: "Build Distributed CQRS/event-sourced Rust services where you mostly write models and handlers while the framework and distributed supply persistence, transports, manifests, and schema. Use model-first TDD to specify plain aggregate behavior with fast unit tests before implementing models and thin handlers. Use when creating, designing, testing, writing, or modifying a Distributed service or domain model.",
         files: &[EmbeddedFile {
             relative_path: "SKILL.md",
             contents: include_str!("../skills/distributed-usage/SKILL.md"),
         }],
     },
     EmbeddedSkill {
-        name: "distributed-ci",
-        description: "Set up CI, release workflows, and GitOps promotion for a Distributed service with distributed scaffold flags (--github, --gitops, --gitops-promote). Use when configuring pipelines, previews, releases, or deploy automation.",
+        name: "distributed-deploy",
+        description: "Deploy a Distributed service - container image, runtime environment, a Hops WebService resource, and an Atlas Operator schema resource for its read models. Use when writing deployment manifests, CI image builds, or database schema rollout for a Distributed service.",
         files: &[EmbeddedFile {
             relative_path: "SKILL.md",
-            contents: include_str!("../skills/distributed-ci/SKILL.md"),
+            contents: include_str!("../skills/distributed-deploy/SKILL.md"),
         }],
     },
     EmbeddedSkill {
@@ -71,6 +71,13 @@ static SKILLS: [EmbeddedSkill; 4] = [
         files: &[EmbeddedFile {
             relative_path: "SKILL.md",
             contents: include_str!("../skills/distributed-graphql/SKILL.md"),
+        }],
+    },    EmbeddedSkill {
+        name: "distributed-game",
+        description: "Build authoritative game zones with distributed_game - a plain Rust Zone for the simulation, replicated entities with interest management, durable facts settled into cells, and zones that watch world cells as pushed read models. Use when writing or scaling a game zone, its facts, its replication, or its world cells (native host or celld).",
+        files: &[EmbeddedFile {
+            relative_path: "SKILL.md",
+            contents: include_str!("../skills/distributed-game/SKILL.md"),
         }],
     },
 ];
@@ -179,7 +186,7 @@ fn managed_block(container: &str) -> String {
          \n\
          Skills for building services with Distributed live in `.agents/skills/`\n\
          (canonical source: `{container}/skills/`). Consult the relevant skill before\n\
-         scaffolding, CI, or schema work:\n\
+         service, deployment, or schema work:\n\
          \n"
     );
     for skill in embedded_skills() {

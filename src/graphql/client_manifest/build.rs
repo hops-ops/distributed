@@ -1,8 +1,8 @@
 use super::*;
 
-/// Convenience wrapper used heavily by unit tests; production uses
-/// [`client_manifest_from_surface_with_execution`].
-#[cfg_attr(not(test), allow(dead_code))]
+/// Unit-test shorthand for [`client_manifest_from_surface_with_execution`]
+/// with default limits.
+#[cfg(test)]
 pub(crate) fn client_manifest_from_surface(
     service_id: &str,
     identity: ClientSurfaceIdentity,
@@ -76,11 +76,18 @@ pub(super) fn client_manifest_from_surface_with_execution(
                         model.model_name, field.name, field.scalar
                     ))
                 })?;
+                let json_type = model
+                    .schema
+                    .columns
+                    .iter()
+                    .find(|column| !column.skipped && column.column_name == field.name)
+                    .and_then(|column| column.json_type.clone());
                 Ok(ClientField {
                     name: field.name.clone(),
                     scalar: field.scalar.clone(),
                     codec: codec.into(),
                     nullable: field.nullable,
+                    json_type,
                 })
             })
             .collect::<Result<_, ClientManifestError>>()?;
@@ -322,27 +329,14 @@ pub(super) fn client_manifest_from_surface_with_execution(
         let operation_hash = hash_bytes(operation.as_bytes());
         let consistency = CommandConsistencyExtension {
             version: 1,
-            kind: match command.consistency {
-                CommandConsistency::Succeeded => "succeeded",
-                CommandConsistency::Eventual => "eventual",
-                CommandConsistency::Atomic => "atomic",
-            }
-            .into(),
+            kind: command.consistency,
         };
         let direct_projection = command_direct_projection_extension(command, surface)?;
-        let input_defaults = (!command.input_defaults.is_empty())
-            .then(|| {
-                command
-                    .input_defaults
-                    .iter()
-                    .map(|default| serde_json::to_value(default).map(canonical_json_value))
-                    .collect::<Result<Vec<_>, _>>()
-                    .map(|defaults| CommandInputDefaultsExtension {
-                        version: 1,
-                        defaults,
-                    })
-            })
-            .transpose()?;
+        let input_defaults =
+            (!command.input_defaults.is_empty()).then(|| CommandInputDefaultsExtension {
+                version: 1,
+                defaults: command.input_defaults.clone(),
+            });
         let mut trusted_presets = command_trusted_preset_descriptors(command, surface)?;
         let projection = command_projection_extension(command, surface, &trusted_presets)?;
         if let Some(projection) = &projection {
@@ -388,8 +382,6 @@ pub(super) fn client_manifest_from_surface_with_execution(
                 consistency,
                 direct_projection,
                 input_defaults,
-                effects: None,
-                confirmations: None,
                 projection,
                 trusted_presets,
             },
@@ -410,16 +402,6 @@ pub(super) fn client_manifest_from_surface_with_execution(
         command_status,
     };
 
-    let confirming_projectors: BTreeSet<&str> = surface
-        .commands
-        .iter()
-        .flat_map(|command| {
-            command
-                .confirmations
-                .iter()
-                .map(|confirmation| confirmation.projector.as_str())
-        })
-        .collect();
     let mut projectors: Vec<ClientProjector> = surface
         .projectors
         .iter()
@@ -429,7 +411,6 @@ pub(super) fn client_manifest_from_surface_with_execution(
             facts: sorted_unique(projector.facts.clone()),
             models: sorted_unique(projector.models.clone()),
             dependencies: sorted_unique(projector.dependencies.clone()),
-            causal_confirmation: confirming_projectors.contains(projector.name.as_str()),
         })
         .collect();
     projectors.sort_by(|a, b| a.name.cmp(&b.name));
@@ -437,8 +418,14 @@ pub(super) fn client_manifest_from_surface_with_execution(
 
     let scalar_codecs = supported_scalar_codecs();
     let record_evidence = query_footprint_has_record_evidence(surface);
+    let external = client_external_sections(surface);
+    let live_external = surface.subscriptions
+        && surface
+            .external
+            .iter()
+            .any(|source| source.roots().iter().any(|root| root.live));
     let capabilities = ClientCapabilities {
-        live_queries: !surface.subscription_fields.is_empty(),
+        live_queries: !surface.subscription_fields.is_empty() || live_external,
         record_revisions: record_evidence,
         tombstones: record_evidence,
         causal_receipts: !commands.is_empty(),
@@ -449,49 +436,14 @@ pub(super) fn client_manifest_from_surface_with_execution(
         cache_scope: true,
         confirmed_persistence: false,
     };
-    let protocol_fingerprint = protocol_fingerprint()?;
+    let protocol_fingerprint = client_protocol_fingerprint()?;
 
-    #[derive(Serialize)]
-    struct SchemaMaterial<'a> {
-        manifest_version: u32,
-        protocol_version: u32,
-        service_id: &'a str,
-        surface: &'a ClientSurfaceIdentity,
-        execution: &'a ClientExecutionLimits,
-        capabilities: &'a ClientCapabilities,
-        scalar_codecs: &'a [ScalarCodec],
-        models: &'a [ClientModel],
-        roots: &'a [ClientRoot],
-        commands: &'a [ClientCommand],
-        protocol_operations: &'a ClientProtocolOperations,
-        projectors: &'a [ClientProjector],
-        projection_programs: &'a [ClientProjectionProgram],
-        projection_bindings: &'a [ClientProjectionBinding],
-    }
-    let schema_material = SchemaMaterial {
-        manifest_version: DISTRIBUTED_CLIENT_MANIFEST_VERSION,
-        protocol_version: DISTRIBUTED_CLIENT_PROTOCOL_VERSION,
-        service_id,
-        surface: &identity,
-        execution: &execution,
-        capabilities: &capabilities,
-        scalar_codecs: &scalar_codecs,
-        models: &models,
-        roots: &roots,
-        commands: &commands,
-        protocol_operations: &protocol_operations,
-        projectors: &projectors,
-        projection_programs: &projection_programs,
-        projection_bindings: &projection_bindings,
-    };
-    let schema_fingerprint = hash_json(&schema_material)?;
-
-    let manifest = DistributedClientManifest {
+    let mut manifest = DistributedClientManifest {
         manifest_version: DISTRIBUTED_CLIENT_MANIFEST_VERSION,
         protocol_version: DISTRIBUTED_CLIENT_PROTOCOL_VERSION,
         service_id: service_id.into(),
         surface: identity,
-        schema_fingerprint,
+        schema_fingerprint: String::new(),
         protocol_fingerprint,
         execution,
         capabilities,
@@ -503,10 +455,33 @@ pub(super) fn client_manifest_from_surface_with_execution(
         projectors,
         projection_programs,
         projection_bindings,
+        external,
     };
+    manifest.schema_fingerprint = manifest.computed_schema_fingerprint()?;
     // Validate the one exact scope-wide descriptor union while the complete
     // role-selected manifest is still available. The serialized manifest need
     // not duplicate this deterministic derivation.
-    trusted_preset_descriptors(&manifest)?;
+    trusted_preset_descriptors(&manifest.models, &manifest.commands)?;
     Ok(manifest)
+}
+
+/// Client-manifest entries of the selected surface's external read sources
+/// that expose a root, by section and sorted by source name.
+fn client_external_sections(surface: &Surface) -> BTreeMap<String, Vec<serde_json::Value>> {
+    let mut sources = surface
+        .external
+        .iter()
+        .filter(|source| !source.roots().is_empty())
+        .collect::<Vec<_>>();
+    sources.sort_by(|a, b| a.name().cmp(b.name()));
+    let mut sections = BTreeMap::<String, Vec<serde_json::Value>>::new();
+    for source in sources {
+        sections
+            .entry(source.section().to_string())
+            .or_default()
+            .push(canonical_json_value(
+                source.client_manifest(surface.subscriptions),
+            ));
+    }
+    sections
 }

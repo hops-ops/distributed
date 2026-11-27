@@ -4,33 +4,23 @@ import {
 	GRAPHQL_NAME
 } from './constants.js';
 import type {
-	ReplicaCommandConfirmations,
 	ReplicaCommandDirectProjection,
-	ReplicaCommandEffect,
 	ReplicaCommandEffectExpression,
-	ReplicaCommandEffectField,
-	ReplicaCommandEffectKey,
 	ReplicaCommandGenerators,
 	ReplicaCommandInputDefault,
 	ReplicaCommandShape,
 	ReplicaCommandTypeDefinition,
 	ReplicaCommandTypeField,
 	ReplicaMatchedTrustedPresetInventory,
-	ReplicaPreparedCommand,
-	ReplicaPreparedCommandEffect,
-	ReplicaPreparedConfirmations,
-	ReplicaPreparedEffectField,
-	ReplicaPreparedEffectKey
+	ReplicaPreparedCommand
 } from './types.js';
 import {
 	artifactInvalid,
-	inputInvalid,
-	requiredString
+	inputInvalid
 } from './util.js';
 import {
 	cloneDefinitionValue,
-	cloneJson,
-	cloneRelationship
+	cloneJson
 } from './clone.js';
 
 export function materializeInput(
@@ -53,128 +43,6 @@ export function materializeInput(
 				'input'
 			);
 	}
-}
-
-export function resolveEffect(
-	effect: ReplicaCommandEffect,
-	input: unknown,
-	path: string,
-	trustedPresets: ReplicaMatchedTrustedPresetInventory | undefined
-): ReplicaPreparedCommandEffect {
-	switch (effect.kind) {
-		case 'upsert':
-		case 'patch':
-			return Object.freeze({
-				kind: effect.kind,
-				model: requiredString(effect.model, `${path}.model`),
-				key: resolveKey(effect.key, input, `${path}.key`, trustedPresets),
-				fields: resolveFields(
-					effect.fields,
-					input,
-					`${path}.fields`,
-					trustedPresets
-				)
-			});
-		case 'delete':
-			return Object.freeze({
-				kind: effect.kind,
-				model: requiredString(effect.model, `${path}.model`),
-				key: resolveKey(effect.key, input, `${path}.key`, trustedPresets)
-			});
-		case 'link':
-		case 'unlink':
-			return Object.freeze({
-				kind: effect.kind,
-				relationship: cloneRelationship(
-					effect.relationship,
-					`${path}.relationship`
-				),
-				source: resolveKey(
-					effect.source,
-					input,
-					`${path}.source`,
-					trustedPresets
-				),
-				target: resolveKey(
-					effect.target,
-					input,
-					`${path}.target`,
-					trustedPresets
-				)
-			});
-		case 'invalidate_model':
-			return Object.freeze({
-				kind: effect.kind,
-				model: requiredString(effect.model, `${path}.model`)
-			});
-		case 'invalidate_relationship':
-			return Object.freeze({
-				kind: effect.kind,
-				relationship: cloneRelationship(
-					effect.relationship,
-					`${path}.relationship`
-				),
-				source: resolveKey(
-					effect.source,
-					input,
-					`${path}.source`,
-					trustedPresets
-				)
-			});
-		default:
-			artifactInvalid(`${path}.kind`);
-	}
-}
-
-export function resolveKey(
-	key: ReplicaCommandEffectKey,
-	input: unknown,
-	path: string,
-	trustedPresets: ReplicaMatchedTrustedPresetInventory | undefined
-): ReplicaPreparedEffectKey {
-	if (
-		key === null ||
-		typeof key !== 'object' ||
-		!Array.isArray(key.fields) ||
-		key.fields.length === 0
-	) {
-		artifactInvalid(path);
-	}
-	return Object.freeze({
-		fields: resolveFields(
-			key.fields,
-			input,
-			`${path}.fields`,
-			trustedPresets
-		)
-	});
-}
-
-export function resolveFields(
-	fields: readonly ReplicaCommandEffectField[],
-	input: unknown,
-	path: string,
-	trustedPresets: ReplicaMatchedTrustedPresetInventory | undefined
-): readonly ReplicaPreparedEffectField[] {
-	if (!Array.isArray(fields)) artifactInvalid(path);
-	const names = new Set<string>();
-	return Object.freeze(
-		fields.map((field, index) => {
-			const fieldPath = `${path}[${index}]`;
-			const name = requiredString(field.field, `${fieldPath}.field`);
-			if (names.has(name)) artifactInvalid(`${fieldPath}.field`);
-			names.add(name);
-			return Object.freeze({
-				field: name,
-				value: resolveExpression(
-					field.value,
-					input,
-					`${fieldPath}.value`,
-					trustedPresets
-				)
-			});
-		})
-	);
 }
 
 export function resolveExpression(
@@ -224,48 +92,6 @@ export function resolveInputPath(
 	return current as ReplicaValue;
 }
 
-export function resolveConfirmations(
-	confirmations: ReplicaCommandConfirmations | undefined,
-	input: unknown,
-	trustedPresets: ReplicaMatchedTrustedPresetInventory | undefined
-): ReplicaPreparedConfirmations | undefined {
-	if (confirmations === undefined) return undefined;
-	if (confirmations.kind === 'unavailable') {
-		return Object.freeze({ kind: 'unavailable' as const });
-	}
-	return Object.freeze({
-		kind: 'finite' as const,
-		expected: Object.freeze(
-			confirmations.expected.map((confirmation, index) => {
-				const path = `artifact.confirmations.expected[${index}]`;
-				const partition =
-					confirmation.partition === undefined
-						? undefined
-						: resolveExpression(
-								confirmation.partition,
-								input,
-								`${path}.partition`,
-								trustedPresets
-							);
-				return Object.freeze({
-					projector: requiredString(
-						confirmation.projector,
-						`${path}.projector`
-					),
-					model: requiredString(confirmation.model, `${path}.model`),
-					key: resolveKey(
-						confirmation.key,
-						input,
-						`${path}.key`,
-						trustedPresets
-					),
-					...(partition === undefined ? {} : { partition })
-				});
-			})
-		)
-	});
-}
-
 export function resolveDirectProjection(
 	direct: ReplicaCommandDirectProjection | undefined,
 	input: unknown,
@@ -285,8 +111,7 @@ export function resolveDirectProjection(
 		topology: Object.freeze({ ...direct.topology }),
 		model: direct.model,
 		identityFields: Object.freeze([...direct.identityFields]),
-		...(partition === undefined ? {} : { partition }),
-		changeEpoch: direct.changeEpoch
+		...(partition === undefined ? {} : { partition })
 	});
 }
 

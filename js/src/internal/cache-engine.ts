@@ -1,10 +1,7 @@
 /** Private cache engine; implementation lives in ./cache-engine/. */
-export {
-	CacheRevisionConflictError,
-	OptimisticLayerNotFoundError,
-	cacheIndexKey,
-	createCacheEngine
-} from './cache-engine/index.js';
+export { CacheRevisionConflictError, OptimisticLayerNotFoundError } from './cache-engine/errors.js';
+export { cacheEngineWork } from './cache-engine/work.js';
+export { cacheIndexKey, createCacheEngine } from './cache-engine/create.js';
 export type {
 	BaseCacheWriter,
 	BaseRecordClock,
@@ -37,4 +34,4 @@ export type {
 	SparseRecord,
 	SparseRecordMeta,
 	WatchOptions
-} from './cache-engine/index.js';
+} from './cache-engine/types.js';

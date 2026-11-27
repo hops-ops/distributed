@@ -97,8 +97,11 @@ pub struct TableColumn {
     pub primary_key: bool,
     pub foreign_key: Option<ForeignKey>,
     pub delegated_from: Option<String>,
-    pub jsonb: bool,
     pub skipped: bool,
+    /// The serialized shape of a JSON column's values, from the field's Rust
+    /// type ([`JsonType`](super::JsonType)); `None` for every other column.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub json_type: Option<super::JsonShape>,
 }
 
 impl TableColumn {
@@ -117,8 +120,8 @@ impl TableColumn {
             primary_key: false,
             foreign_key: None,
             delegated_from: None,
-            jsonb: false,
             skipped: false,
+            json_type: None,
         }
     }
 }
@@ -152,6 +155,10 @@ pub enum RelationshipKind {
 /// Relationship metadata for a relational table model.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RelationshipDef {
+    /// Ordered columns of the referenced primary or declared unique key.
+    /// Omission selects the primary key; row identity is never changed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub references: Option<String>,
     pub field_name: String,
     pub kind: RelationshipKind,
     pub target_model: String,
@@ -190,7 +197,6 @@ pub struct TableSchema {
     pub columns: Vec<TableColumn>,
     pub primary_key: PrimaryKey,
     pub version_column: Option<String>,
-    pub foreign_keys: Vec<ForeignKey>,
     pub indexes: Vec<TableIndex>,
     pub relationships: Vec<RelationshipDef>,
     /// Defaults to [`TableKind::ReadModel`]; skipped when serializing the default
@@ -290,10 +296,6 @@ impl TableSchema {
                     self.model_name, column
                 )));
             }
-        }
-
-        for foreign_key in &self.foreign_keys {
-            validate_foreign_key(&self.model_name, foreign_key)?;
         }
 
         let mut index_names = BTreeSet::new();
@@ -545,7 +547,6 @@ mod tests {
             ],
             primary_key: PrimaryKey::new(["player_id", "weapon_id"]),
             version_column: Some(DEFAULT_TABLE_VERSION_COLUMN.into()),
-            foreign_keys: vec![ForeignKey::new("players", "player_id")],
             indexes: vec![TableIndex::new(["player_id"])],
             relationships: Vec::new(),
             kind: TableKind::ReadModel,
@@ -560,7 +561,6 @@ mod tests {
             "columns": [],
             "primary_key": { "columns": [] },
             "version_column": null,
-            "foreign_keys": [],
             "indexes": [],
             "relationships": []
         }"#;
@@ -609,6 +609,7 @@ mod tests {
         let schema = valid_schema();
         let mut with_relationship = schema.clone();
         with_relationship.relationships.push(RelationshipDef {
+            references: None,
             field_name: "player".into(),
             kind: RelationshipKind::BelongsTo,
             target_model: "Player".into(),
@@ -667,6 +668,7 @@ mod tests {
     fn validate_rejects_relationships_without_foreign_keys() {
         let mut schema = valid_schema();
         schema.relationships.push(RelationshipDef {
+            references: None,
             field_name: "weapons".into(),
             kind: RelationshipKind::HasMany,
             target_model: "PlayerWeapon".into(),

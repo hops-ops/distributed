@@ -1,9 +1,11 @@
 use std::future::Future;
 use std::pin::Pin;
 
-use crate::aggregate::{hydrate, AggregateRepository, SnapshotPolicy};
-use crate::entity::{upcast_events_for_replay, Entity, EventRecord};
-use crate::repository::{GetStream, RepositoryError, SnapshotStore, StreamIdentity};
+use std::collections::HashMap;
+
+use crate::aggregate::{hydrate, replay_into, AggregateRepository, SnapshotPolicy, StreamReads};
+use crate::entity::{Entity, EventRecord};
+use crate::repository::{RepositoryError, SnapshotStore, StreamIdentity};
 
 use super::snapshottable::Snapshottable;
 use super::store::SnapshotRecord;
@@ -129,17 +131,11 @@ fn hydrate_prepared_snapshot<A: Snapshottable>(
     // slicing on the next commit).
     let history = agg.entity_mut().take_events();
 
-    // Upcasters may rewrite the post-snapshot events; the upcasted view clones
-    // only the events an upcaster rewrites. When none applies, replay straight
-    // from the filtered borrow — no clone of the post-snapshot tail.
-    let replay_result = match upcast_events_for_replay(
-        post_snapshot_tail(&history, snapshot.version),
-        A::upcasters(),
-    ) {
-        Ok(Some(upcasted)) => replay_events(&mut agg, upcasted.iter().map(|event| event.as_ref())),
-        Ok(None) => replay_events(&mut agg, post_snapshot_tail(&history, snapshot.version)),
-        Err(err) => Err(SnapshotHydrationError::Replay(err.to_string())),
-    };
+    let replay_result = replay_into(&mut agg, post_snapshot_tail(&history, snapshot.version))
+        .map_err(|err| match err {
+            RepositoryError::Replay(message) => SnapshotHydrationError::Replay(message),
+            other => SnapshotHydrationError::Replay(other.to_string()),
+        });
 
     // Restore the full history regardless of replay outcome before surfacing it.
     agg.entity_mut().restore_history(history);
@@ -155,23 +151,6 @@ fn post_snapshot_tail(
     history
         .iter()
         .filter(move |e| e.sequence > snapshot_version)
-}
-
-/// Replay a prepared event view — the borrowed post-snapshot tail, or an
-/// upcasted copy of it — with no intermediate allocation of its own.
-fn replay_events<'e, A: Snapshottable>(
-    agg: &mut A,
-    events: impl Iterator<Item = &'e EventRecord>,
-) -> Result<(), SnapshotHydrationError> {
-    agg.entity_mut().set_replaying(true);
-    for event in events {
-        if let Err(err) = agg.replay_event(event) {
-            agg.entity_mut().set_replaying(false);
-            return Err(SnapshotHydrationError::Replay(err.to_string()));
-        }
-    }
-    agg.entity_mut().set_replaying(false);
-    Ok(())
 }
 
 fn snapshot_record_for<A: Snapshottable>(aggregate: &A) -> Result<SnapshotRecord, RepositoryError> {
@@ -209,16 +188,16 @@ fn hydrate_with_optional_snapshot<A: Snapshottable>(
 
 impl<R, A> AggregateRepository<R, A>
 where
-    R: SnapshotStore + GetStream + Sync,
+    R: SnapshotStore + Sync,
     A: Snapshottable + Send,
 {
     /// Enable snapshot caching at the given event frequency.
     ///
     /// Snapshots are a transparent optimization: this configures snapshot
     /// behaviour on the **same** repository type and returns it. On commit a
-    /// snapshot is staged (when due) in the same transaction; on load the
-    /// aggregate is hydrated from a snapshot when one exists. Every other method
-    /// behaves identically with or without snapshots.
+    /// snapshot is staged (when due) in the same transaction; every read
+    /// hydrates from a snapshot plus the stream tail after it when one exists.
+    /// Every method behaves identically with or without snapshots.
     pub fn with_snapshots(mut self, frequency: u64) -> Self {
         assert!(
             frequency > 0,
@@ -228,8 +207,6 @@ where
         self.set_snapshot_policy(SnapshotPolicy::new(
             frequency,
             snapshot_record_if_due::<A>,
-            hydrate_from_store::<R, A>,
-            hydrate_all_from_store::<R, A>,
             load_from_store::<R, A>,
         ));
         self
@@ -251,115 +228,72 @@ fn snapshot_record_if_due<A: Snapshottable>(
     }
 }
 
-/// Load the snapshot cache record (if any) and hydrate `entity` from it.
-/// Captured as the `hydrate` hook of a `SnapshotPolicy` — used where the full
-/// stream is already in hand (batch loads, locked reads).
-fn hydrate_from_store<'a, R, A>(
+/// Load aggregates reading their snapshots **first**, so only the stream
+/// tails after them are fetched. Captured as the `load` hook of a
+/// `SnapshotPolicy`; every read of a snapshotting repository comes here.
+///
+/// The snapshots of the whole batch are read in one round trip and the tails
+/// in one [`StreamReads::tails`] call, so a queued repository takes the
+/// batch's locks together, in key order.
+///
+/// Degrades gracefully on a cache miss: a snapshot that cannot be used
+/// (identity, codec or schema-version mismatch, a version past the stream, a
+/// decode failure) is dropped and the round is read again with that stream
+/// read in full. Dropping the round first releases any locks its reads took,
+/// so the second read cannot wait on them. Each round drops at least one
+/// snapshot, so the loop ends.
+fn load_from_store<'a, R, A>(
     repo: &'a R,
-    identity: &'a StreamIdentity,
-    entity: Entity,
-) -> Pin<Box<dyn Future<Output = Result<A, RepositoryError>> + Send + 'a>>
-where
-    R: SnapshotStore + Sync,
-    A: Snapshottable + Send,
-{
-    Box::pin(async move {
-        let snapshot = repo.get_snapshot(identity).await?;
-        hydrate_with_optional_snapshot::<A>(entity, snapshot)
-    })
-}
-
-/// Load the snapshot cache records for a whole batch in one round trip and
-/// hydrate each entity from its record (if any). Captured as the `hydrate_all`
-/// hook of a `SnapshotPolicy` — fixes the N+1 of consulting the cache per
-/// aggregate on batch loads.
-fn hydrate_all_from_store<'a, R, A>(
-    repo: &'a R,
-    entities: Vec<(StreamIdentity, Entity)>,
+    identities: &'a [StreamIdentity],
+    reads: StreamReads<R>,
 ) -> Pin<Box<dyn Future<Output = Result<Vec<A>, RepositoryError>> + Send + 'a>>
 where
     R: SnapshotStore + Sync,
     A: Snapshottable + Send,
 {
     Box::pin(async move {
-        let identities: Vec<StreamIdentity> = entities
-            .iter()
-            .map(|(identity, _)| identity.clone())
-            .collect();
-        let mut snapshots = std::collections::HashMap::with_capacity(identities.len());
-        for record in repo.get_snapshots(&identities).await? {
+        let mut snapshots = HashMap::with_capacity(identities.len());
+        for record in repo.get_snapshots(identities).await? {
             let key =
                 StreamIdentity::new(&record.aggregate_type, &record.aggregate_id)?.storage_key();
             snapshots.insert(key, record);
         }
-        entities
-            .into_iter()
-            .map(|(identity, entity)| {
-                hydrate_with_optional_snapshot::<A>(
-                    entity,
-                    snapshots.remove(&identity.storage_key()),
-                )
-            })
-            .collect()
-    })
-}
+        loop {
+            let requests: Vec<(StreamIdentity, u64)> = identities
+                .iter()
+                .map(|identity| {
+                    let after = snapshots
+                        .get(&identity.storage_key())
+                        .map_or(0, |snapshot| snapshot.version);
+                    (identity.clone(), after)
+                })
+                .collect();
+            let entities = (reads.tails)(repo, &requests).await?;
 
-/// Own the whole load, reading the snapshot **first** so only the post-snapshot
-/// tail of the stream is fetched. Captured as the `load` hook of a
-/// `SnapshotPolicy`.
-///
-/// Ordering matters: the previous design fetched the entire stream and *then*
-/// filtered it against the snapshot, so a fresh snapshot over a long stream
-/// still paid the full I/O and decode cost. Here the snapshot bounds the read.
-///
-/// Degrades gracefully on a cache miss: if there is no snapshot, or it is
-/// unusable (identity/codec/schema-version mismatch, version past the
-/// stream, or decode failure), the aggregate is rebuilt from a full stream
-/// load — correct, just not optimized.
-fn load_from_store<'a, R, A>(
-    repo: &'a R,
-    identity: &'a StreamIdentity,
-) -> Pin<Box<dyn Future<Output = Result<Option<A>, RepositoryError>> + Send + 'a>>
-where
-    R: SnapshotStore + GetStream + Sync,
-    A: Snapshottable + Send,
-{
-    Box::pin(async move {
-        let Some(snapshot) = repo.get_snapshot(identity).await? else {
-            // No snapshot: a plain full load (same as a snapshotless repo).
-            return repo
-                .get_stream(identity)
-                .await?
-                .map(hydrate::<A>)
-                .transpose();
-        };
-
-        // Fetch only events after the snapshot. The returned entity records the
-        // true stream version even though it holds only the tail.
-        let Some(entity) = repo.get_stream_tail(identity, snapshot.version).await? else {
-            // The stream is gone but a snapshot lingers; nothing to hydrate.
-            return Ok(None);
-        };
-
-        // Decode and replay without crossing an await while holding the
-        // (possibly non-`Send`) snapshot payload: resolve to a concrete result
-        // first, then do any fallback I/O.
-        let prepared = prepare_snapshot::<A>(&entity, &snapshot)
-            .map(|payload| hydrate_prepared_snapshot::<A>(entity, &snapshot, payload));
-
-        match prepared {
-            Ok(Ok(aggregate)) => Ok(Some(aggregate)),
-            Ok(Err(err)) => Err(snapshot_hydration_error_to_repository_error(err)),
-            // Cache miss (stale/incompatible snapshot): the tail alone cannot
-            // rebuild the aggregate, so fall back to a full stream load. This is
-            // the I/O we hoped to avoid, but it only happens when the snapshot is
-            // unusable — the correct, safe outcome.
-            Err(SnapshotHydrationError::Cache(_)) => Ok(repo
-                .get_stream(identity)
-                .await?
-                .map(hydrate::<A>)
-                .transpose()?),
-            Err(SnapshotHydrationError::Replay(message)) => Err(RepositoryError::Replay(message)),
+            let mut aggregates = Vec::with_capacity(entities.len());
+            let mut missed = Vec::new();
+            for entity in entities {
+                let key = StreamIdentity::new(A::aggregate_type(), entity.id())?.storage_key();
+                let Some(snapshot) = snapshots.get(&key) else {
+                    aggregates.push(hydrate::<A>(entity)?);
+                    continue;
+                };
+                match prepare_snapshot::<A>(&entity, snapshot)
+                    .and_then(|payload| hydrate_prepared_snapshot::<A>(entity, snapshot, payload))
+                {
+                    Ok(aggregate) => aggregates.push(aggregate),
+                    Err(SnapshotHydrationError::Cache(_)) => missed.push(key),
+                    Err(SnapshotHydrationError::Replay(message)) => {
+                        return Err(RepositoryError::Replay(message))
+                    }
+                }
+            }
+            if missed.is_empty() {
+                return Ok(aggregates);
+            }
+            for key in missed {
+                snapshots.remove(&key);
+            }
         }
     })
 }
@@ -367,7 +301,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::repository::{CommitBatch, TransactionalCommit};
+    use crate::repository::{CommitBatch, GetStream, TransactionalCommit};
     use crate::{sourced, Aggregate, EventRecord};
 
     #[derive(Default)]
@@ -376,7 +310,7 @@ mod tests {
         value: u32,
     }
 
-    #[sourced(entity)]
+    #[sourced(entity, aggregate_type = "test_aggregate")]
     impl TestAggregate {
         #[event("Touched")]
         fn touch(&mut self) {
@@ -402,6 +336,141 @@ mod tests {
     #[derive(Default)]
     struct FailingSnapshotRepo {
         saw_snapshot: std::sync::atomic::AtomicBool,
+    }
+
+    struct CausalReadProbe {
+        inner: crate::InMemoryRepository,
+        reads: std::sync::Mutex<Vec<Option<u64>>>,
+    }
+    impl GetStream for CausalReadProbe {
+        async fn get_stream(&self, _: &StreamIdentity) -> Result<Option<Entity>, RepositoryError> {
+            panic!("causal snapshot loading must not use ordinary locking reads")
+        }
+    }
+    impl crate::command_ledger::CausalGetStream for CausalReadProbe {
+        async fn get_causal_stream(
+            &self,
+            identity: &StreamIdentity,
+        ) -> Result<Option<Entity>, RepositoryError> {
+            self.reads.lock().unwrap().push(None);
+            self.inner.get_stream(identity).await
+        }
+        async fn get_causal_stream_tail(
+            &self,
+            identity: &StreamIdentity,
+            after: u64,
+        ) -> Result<Option<Entity>, RepositoryError> {
+            self.reads.lock().unwrap().push(Some(after));
+            self.inner.get_stream_tail(identity, after).await
+        }
+    }
+    impl SnapshotStore for CausalReadProbe {
+        async fn get_snapshot(
+            &self,
+            identity: &StreamIdentity,
+        ) -> Result<Option<SnapshotRecord>, RepositoryError> {
+            self.inner.get_snapshot(identity).await
+        }
+        async fn save_snapshot(
+            &self,
+            identity: &StreamIdentity,
+            record: SnapshotRecord,
+        ) -> Result<(), RepositoryError> {
+            self.inner.save_snapshot(identity, record).await
+        }
+        async fn delete_snapshot(
+            &self,
+            identity: &StreamIdentity,
+        ) -> Result<bool, RepositoryError> {
+            self.inner.delete_snapshot(identity).await
+        }
+    }
+
+    #[tokio::test]
+    async fn causal_snapshots_use_only_tail_through_queued_wrappers() {
+        let inner = crate::InMemoryRepository::new();
+        let writer = AggregateRepository::new(inner.clone()).with_snapshots(2);
+        let mut aggregate = TestAggregate::default();
+        for _ in 0..3 {
+            aggregate.touch().unwrap();
+            writer.commit(&mut aggregate).await.unwrap();
+        }
+        let identity = StreamIdentity::new(TestAggregate::aggregate_type(), "snap-1").unwrap();
+        let reader = AggregateRepository::<_, TestAggregate>::new(crate::QueuedRepository::new(
+            CausalReadProbe {
+                inner,
+                reads: Default::default(),
+            },
+        ))
+        .with_snapshots(2);
+        // Repeated loads prove no queue lock leaks across a handler await.
+        for _ in 0..2 {
+            let loaded = tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                reader.get_causal(&identity),
+            )
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+            assert_eq!(loaded.value, 3);
+            assert_eq!(loaded.entity.version(), 3);
+            assert_eq!(loaded.entity.snapshot_version(), 2);
+            assert_eq!(loaded.entity.events().len(), 1);
+        }
+        assert_eq!(
+            *reader.repo().inner().reads.lock().unwrap(),
+            [Some(2), Some(2)]
+        );
+
+        // Invalid cache bytes retain the ordinary safe full-replay behavior,
+        // while still bypassing locking reads on that recovery path.
+        let mut snapshot = reader
+            .repo()
+            .get_snapshot(&identity)
+            .await
+            .unwrap()
+            .unwrap();
+        snapshot.payload = vec![255; 9];
+        reader
+            .repo()
+            .save_snapshot(&identity, snapshot)
+            .await
+            .unwrap();
+        let loaded = reader.get_causal(&identity).await.unwrap().unwrap();
+        assert_eq!(loaded.value, 3);
+        assert_eq!(
+            *reader.repo().inner().reads.lock().unwrap(),
+            [Some(2), Some(2), Some(2), Some(0)]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stale_snapshot_falls_back_to_a_full_load_through_a_queued_repo() {
+        let repo = AggregateRepository::<_, TestAggregate>::new(crate::QueuedRepository::new(
+            crate::InMemoryRepository::new(),
+        ))
+        .with_snapshots(2);
+        let mut aggregate = TestAggregate::default();
+        for _ in 0..3 {
+            aggregate.touch().unwrap();
+            repo.commit(&mut aggregate).await.unwrap();
+        }
+        let identity = StreamIdentity::new(TestAggregate::aggregate_type(), "snap-1").unwrap();
+        let mut snapshot = repo.repo().get_snapshot(&identity).await.unwrap().unwrap();
+        snapshot.payload = vec![255; 9];
+        repo.repo()
+            .save_snapshot(&identity, snapshot)
+            .await
+            .unwrap();
+
+        // The tail read and the fallback full read take the same stream lock.
+        let loaded = tokio::time::timeout(std::time::Duration::from_secs(1), repo.get("snap-1"))
+            .await
+            .expect("the fallback load must not wait on the tail load's lock")
+            .unwrap()
+            .unwrap();
+        assert_eq!(loaded.value, 3);
     }
 
     impl TransactionalCommit for FailingSnapshotRepo {

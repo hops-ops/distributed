@@ -1,10 +1,40 @@
 use serde_json::{json, Value as JsonValue};
 use sha2::{Digest, Sha256};
 
-use super::manifest::{refresh_schema_fingerprint, ClientManifest};
+use super::manifest::ClientManifest;
 use super::{
-    compile_client, ClientCompileInput, ClientDocument, ClientSurfaceSelector,
+    compile_client, ClientCompileError, ClientCompileInput, ClientDocument, ClientSurfaceIdentity,
+    DistributedClientManifest, GeneratedClientProject,
 };
+use crate::golden::assert_golden;
+
+/// Compile a test input built from manifest JSON; a manifest that does not
+/// decode is the same `client.manifest.invalid` the CLI reports.
+fn compile(
+    input: Result<ClientCompileInput, ClientCompileError>,
+) -> Result<GeneratedClientProject, ClientCompileError> {
+    input.and_then(compile_client)
+}
+
+pub(super) fn parse_manifest(
+    value: JsonValue,
+    selector: &ClientSurfaceIdentity,
+) -> Result<ClientManifest, ClientCompileError> {
+    let input = ClientCompileInput::from_manifest_json(value, selector.clone(), Vec::new())?;
+    ClientManifest::parse(input.manifest, &input.selector)
+}
+
+/// Re-stamp an edited manifest with the fingerprint of its content. A value
+/// that no longer decodes has none, and is left for the compiler to reject.
+pub(super) fn refresh_schema_fingerprint(value: &mut JsonValue) {
+    if let Ok(manifest) = serde_json::from_value::<DistributedClientManifest>(value.clone()) {
+        value["schema_fingerprint"] = JsonValue::String(
+            manifest
+                .computed_schema_fingerprint()
+                .expect("test manifest must be serializable"),
+        );
+    }
+}
 
 fn fingerprint(label: &str) -> String {
     let digest = Sha256::digest(label.as_bytes());
@@ -268,23 +298,13 @@ pub(super) fn manifest() -> JsonValue {
         "service_id": "todos-service",
         "surface": {"kind": "role", "name": "user"},
         "schema_fingerprint": fingerprint("schema"),
-        "protocol_fingerprint": "sha256:00fb342f3acb4dc1c1716a43cc3001c748d5f6c500ff831690d820e9e43e2782",
+        "protocol_fingerprint": distributed::graphql::client_protocol_fingerprint().unwrap(),
         "execution": {
             "max_depth": 8,
-            "max_complexity": 500,
+            "max_fields": 500,
+            "max_rows": 200000,
             "max_bool_width": 256,
-            "max_in_list": 1000,
-            "complexity": {
-                "version": 1,
-                "scalar": 1,
-                "belongs_to": 2,
-                "has_many": 10,
-                "m2m": 12,
-                "aggregate": 8,
-                "list_root": 3,
-                "by_pk": 1,
-                "list_fanout": 5
-            }
+            "max_in_list": 1000
         },
         "capabilities": {
             "live_queries": true,
@@ -414,7 +434,6 @@ fn install_create_projection(value: &mut JsonValue) {
         "version": 1,
         "binding_id": BINDING_ID,
         "program_id": PROGRAM_ID,
-        "epoch": "todos-projection-v2",
         "state": "active",
         "placement": "eventual",
         "execution_class": "causal"
@@ -601,8 +620,7 @@ fn projected_manifest() -> JsonValue {
                     "digest": fingerprint("todos topology")
                 },
                 "model": "Todo",
-                "partition": {"kind": "input", "path": ["tenantId"]},
-                "change_epoch": "todos-v1"
+                "partition": {"kind": "input", "path": ["tenantId"]}
             }
         }
     }]);
@@ -611,8 +629,7 @@ fn projected_manifest() -> JsonValue {
         "name": "todos",
         "facts": [],
         "models": ["Todo"],
-        "dependencies": ["todo_rows"],
-        "causal_confirmation": false
+        "dependencies": ["todo_rows"]
     }]);
     value["protocol_operations"] = json!({
         "version": 1,
@@ -760,6 +777,279 @@ fn generated_command_types_manifest() -> JsonValue {
     value
 }
 
+fn retained_projection_catalog(arm_count: usize) -> JsonValue {
+    let mut value = generated_command_types_manifest();
+    let arms = value["projection_programs"][0]["arms"]
+        .as_array_mut()
+        .unwrap();
+    let template = arms[0].clone();
+    for index in 1..arm_count {
+        let mut arm = template.clone();
+        arm["arm"] = json!(format!("retained-{index:03}"));
+        arm["event"] = json!({
+            "id": format!("event:todo.retained:v{index:03}"),
+            "name": "todo.retained",
+            "version": index
+        });
+        arm["operations"][0]["operation"] = json!(format!("retained-upsert-{index:03}"));
+        arms.push(arm);
+    }
+    refresh_schema_fingerprint(&mut value);
+    value
+}
+
+#[test]
+fn retained_projection_catalog_compiles_134_and_256_arms_with_one_selected_capability() {
+    let selected_preview = |manifest: &ClientManifest| {
+        let command = manifest
+            .commands
+            .iter()
+            .find(|command| command.extensions.projection.is_some())
+            .unwrap();
+        serde_json::to_value(
+            super::projection_delta::compile_command_preview(command, manifest)
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap()
+    };
+    let baseline = parse_manifest(
+        generated_command_types_manifest(),
+        &ClientSurfaceIdentity::role("user"),
+    )
+    .unwrap();
+    let expected = selected_preview(&baseline);
+    assert_eq!(
+        expected["capabilities"]["arms"].as_array().unwrap().len(),
+        1
+    );
+    for count in [128, 134, 256] {
+        let value = retained_projection_catalog(count);
+        let manifest = parse_manifest(value.clone(), &ClientSurfaceIdentity::role("user"))
+            .unwrap_or_else(|error| panic!("{count} retained arms: {error}"));
+        assert_eq!(manifest.projection_programs[0].arms.len(), count);
+        assert_eq!(selected_preview(&manifest), expected);
+        compile(ClientCompileInput::from_manifest_json(
+            value,
+            ClientSurfaceIdentity::role("user"),
+            vec![ClientDocument::new(
+                "src/routes/todos/+page.graphql",
+                "query Todo { todo(id: \"1\", tenantId: \"tenant\") { id tenantId } }",
+            )],
+        ))
+        .unwrap_or_else(|error| panic!("compile {count} retained arms: {error}"));
+    }
+}
+
+#[test]
+fn retained_projection_catalog_rejects_257_arms_and_preserves_nested_limits() {
+    let error = parse_manifest(
+        retained_projection_catalog(257),
+        &ClientSurfaceIdentity::role("user"),
+    )
+    .unwrap_err();
+    assert_eq!(error.code, "client.manifest.projection_program_arms");
+    for (mutation, expected) in [
+        (0, "client.manifest.projection_arm_id"),
+        (1, "client.manifest.projection_arm_order"),
+        (2, "client.manifest.projection_operation_id"),
+        (3, "client.manifest.projection_operations"),
+        // Repeated program arms never decode into a projection extension.
+        (4, "client.manifest.invalid"),
+    ] {
+        let mut value = retained_projection_catalog(134);
+        let arms = value["projection_programs"][0]["arms"]
+            .as_array_mut()
+            .unwrap();
+        match mutation {
+            0 => arms[1]["arm"] = arms[0]["arm"].clone(),
+            1 => arms.swap(0, 1),
+            2 => {
+                arms[1]["operations"][0]["operation"] =
+                    arms[0]["operations"][0]["operation"].clone()
+            }
+            3 => arms[1]["operations"] = json!(vec![arms[1]["operations"][0].clone(); 129]),
+            4 => {
+                let projection = &mut value["commands"][0]["extensions"]["projection"];
+                projection["program_arms"] =
+                    json!(vec![projection["program_arms"][0].clone(); 129]);
+            }
+            _ => unreachable!(),
+        }
+        refresh_schema_fingerprint(&mut value);
+        let error = parse_manifest(value, &ClientSurfaceIdentity::role("user")).unwrap_err();
+        assert_eq!(error.code, expected, "mutation {mutation}");
+    }
+}
+
+fn key_only_projection_manifest(composite: bool) -> JsonValue {
+    let mut value = generated_command_types_manifest();
+    value["capabilities"]["live_queries"] = json!(false);
+    value["capabilities"]["live_resume"] = json!(false);
+    value["commands"][0]["extensions"]["consistency"]["kind"] = json!("eventual");
+    value["commands"][0]["extensions"]
+        .as_object_mut()
+        .unwrap()
+        .remove("direct_projection");
+    value["commands"][0]["output"]["definition"]["name"] = json!("ProjectTodoPayload");
+    let key_names = if composite {
+        vec!["tenantId", "id"]
+    } else {
+        vec!["id"]
+    };
+    value["models"][0]["fields"]
+        .as_array_mut()
+        .unwrap()
+        .retain(|field| key_names.contains(&field["name"].as_str().unwrap()));
+    value["models"][0]["normalization"]["fields"]
+        .as_array_mut()
+        .unwrap()
+        .retain(|field| key_names.contains(&field["name"].as_str().unwrap()));
+    value["models"][0]["filter_input"]["fields"]
+        .as_array_mut()
+        .unwrap()
+        .retain(|field| key_names.contains(&field["name"].as_str().unwrap()));
+    value["roots"] = json!([by_pk_root()]);
+    value["roots"][0]["arguments"]
+        .as_array_mut()
+        .unwrap()
+        .retain(|field| key_names.contains(&field["name"].as_str().unwrap()));
+    let arm = &mut value["projection_programs"][0]["arms"][0];
+    arm["partition"] = json!({"kind": "unit"});
+    arm["operations"][0]["fields"] = json!([]);
+    let key = arm["operations"][0]["key"].as_array_mut().unwrap();
+    key.retain(|field| key_names.contains(&field["name"].as_str().unwrap()));
+    for (ordinal, field) in key.iter_mut().enumerate() {
+        field["ordinal"] = json!(ordinal);
+    }
+    value["commands"][0]["extensions"]["projection"]["preview_occurrences"][0]["values"]
+        .as_array_mut()
+        .unwrap()
+        .retain(|slot| {
+            key_names
+                .iter()
+                .any(|name| slot["slot"] == format!("state.{name}"))
+        });
+    refresh_schema_fingerprint(&mut value);
+    value
+}
+
+#[test]
+fn key_only_complete_projections_compile_identity_only_upserts() {
+    for composite in [false, true] {
+        for kind in [
+            "insert",
+            "upsert",
+            "recreate",
+            "insert_related",
+            "upsert_related",
+        ] {
+            let mut value = key_only_projection_manifest(composite);
+            value["projection_programs"][0]["arms"][0]["operations"][0]["kind"] = json!(kind);
+            refresh_schema_fingerprint(&mut value);
+            let manifest = parse_manifest(value.clone(), &ClientSurfaceIdentity::role("user"))
+                .unwrap_or_else(|error| panic!("{kind}, composite={composite}: {error}"));
+            let command = manifest
+                .commands
+                .iter()
+                .find(|command| command.extensions.projection.is_some())
+                .expect("modeled command");
+            let preview = super::projection_delta::compile_command_preview(command, &manifest)
+                .expect("compile identity-only preview")
+                .expect("projection preview");
+            let preview = serde_json::to_value(preview).unwrap();
+            assert_eq!(
+                preview["preview"]["operations"].as_array().unwrap().len(),
+                1
+            );
+            let mutation = &preview["preview"]["operations"][0]["mutation"];
+            assert_eq!(mutation["op"], "upsert");
+            assert_eq!(mutation["fields"], json!([]));
+            assert_eq!(mutation["replace"], json!([]));
+            assert_eq!(
+                mutation["scope"]["key"].as_array().unwrap().len(),
+                if composite { 2 } else { 1 }
+            );
+            assert_eq!(preview["preview"]["recoveries"], json!([]));
+            let query = if composite {
+                "query Todo { todo(id: \"1\", tenantId: \"tenant\") { id tenantId } }"
+            } else {
+                "query Todo { todo(id: \"1\") { id } }"
+            };
+            let project = compile(ClientCompileInput::from_manifest_json(
+                value,
+                ClientSurfaceIdentity::role("user"),
+                vec![ClientDocument::new("src/routes/todos/+page.graphql", query)],
+            ))
+            .expect("generate identity-only client");
+            let commands = file(&project, "commands.ts");
+            assert!(commands.contains("\"op\": \"upsert\""));
+            assert!(commands.contains("\"fields\": []"));
+            assert!(commands.contains("\"replace\": []"));
+        }
+    }
+}
+
+#[test]
+fn key_only_projection_exception_preserves_field_mask_validation() {
+    for kind in [
+        "insert",
+        "upsert",
+        "recreate",
+        "insert_related",
+        "upsert_related",
+        "patch",
+        "upsert_patch",
+    ] {
+        let mut value = generated_command_types_manifest();
+        let operation = &mut value["projection_programs"][0]["arms"][0]["operations"][0];
+        operation["kind"] = json!(kind);
+        operation["fields"] = json!([]);
+        refresh_schema_fingerprint(&mut value);
+        let error = parse_manifest(value, &ClientSurfaceIdentity::role("user"))
+            .expect_err("non-key fields still require a field mask");
+        assert_eq!(
+            error.code, "client.manifest.projection_field_mask",
+            "{kind}"
+        );
+    }
+    for kind in ["patch", "upsert_patch"] {
+        let mut value = key_only_projection_manifest(true);
+        value["projection_programs"][0]["arms"][0]["operations"][0]["kind"] = json!(kind);
+        refresh_schema_fingerprint(&mut value);
+        let error = parse_manifest(value, &ClientSurfaceIdentity::role("user"))
+            .expect_err("key-only models do not allow empty patches");
+        assert_eq!(error.code, "client.manifest.projection_field_mask");
+    }
+    let mut value = key_only_projection_manifest(true);
+    value["projection_programs"][0]["arms"][0]["operations"][0]["fields"] = json!([{
+        "ordinal": 0, "name": "id", "assignment": {"kind": "set", "expression": {
+            "kind": "slot", "slot": "state.id", "value_type": {"type": "string"}
+        }}
+    }]);
+    refresh_schema_fingerprint(&mut value);
+    let error = parse_manifest(value, &ClientSurfaceIdentity::role("user"))
+        .expect_err("identity must remain outside the field mask");
+    assert_eq!(error.code, "client.manifest.projection_field_mask");
+}
+
+#[test]
+fn key_only_projection_still_requires_the_exact_identity() {
+    for key in [
+        json!([]),
+        json!([{"ordinal": 0, "name": "id", "expression": {
+            "kind": "slot", "slot": "state.id", "value_type": {"type": "string"}
+        }}]),
+    ] {
+        let mut value = key_only_projection_manifest(true);
+        value["projection_programs"][0]["arms"][0]["operations"][0]["key"] = key;
+        refresh_schema_fingerprint(&mut value);
+        let error = parse_manifest(value, &ClientSurfaceIdentity::role("user"))
+            .expect_err("missing composite identity fields must reject");
+        assert_eq!(error.code, "client.manifest.projection_key");
+    }
+}
+
 fn embedded_model_invalidation_manifest() -> JsonValue {
     let mut value = generated_command_types_manifest();
     let command = &mut value["commands"][0];
@@ -787,7 +1077,7 @@ fn embedded_model_invalidation_manifest() -> JsonValue {
 #[test]
 fn embedded_model_invalidation_parses_compiles_and_generates_unkeyed_recovery() {
     let value = embedded_model_invalidation_manifest();
-    let manifest = ClientManifest::parse(value.clone(), &ClientSurfaceSelector::role("user"))
+    let manifest = parse_manifest(value.clone(), &ClientSurfaceIdentity::role("user"))
         .expect("embedded model invalidation must be valid client authority");
     let command = manifest
         .commands
@@ -813,9 +1103,9 @@ fn embedded_model_invalidation_parses_compiles_and_generates_unkeyed_recovery() 
         json!([{"kind": "model", "model": "Todo"}])
     );
 
-    let project = compile_client(ClientCompileInput::new(
+    let project = compile(ClientCompileInput::from_manifest_json(
         value,
-        ClientSurfaceSelector::role("user"),
+        ClientSurfaceIdentity::role("user"),
         vec![ClientDocument::new(
             "src/routes/todos/+page.graphql",
             "query Todos { todos { id } }",
@@ -851,7 +1141,7 @@ fn embedded_model_rejects_every_identity_dependent_projection_mutation() {
         operation["key"] = key.clone();
         refresh_schema_fingerprint(&mut value);
 
-        let error = ClientManifest::parse(value, &ClientSurfaceSelector::role("user"))
+        let error = parse_manifest(value, &ClientSurfaceIdentity::role("user"))
             .expect_err("identity-dependent operations must reject embedded models");
         assert_eq!(error.code, "client.manifest.projection_model", "{kind}");
     }
@@ -866,7 +1156,7 @@ fn embedded_model_invalidation_rejects_record_and_relationship_authority() {
             template["projection_programs"][0]["arms"][0]["operations"][0][member].clone();
         refresh_schema_fingerprint(&mut value);
 
-        let error = ClientManifest::parse(value, &ClientSurfaceSelector::role("user"))
+        let error = parse_manifest(value, &ClientSurfaceIdentity::role("user"))
             .expect_err("embedded model invalidation must remain unkeyed and fieldless");
         assert_eq!(
             error.code, "client.manifest.projection_invalidation",
@@ -885,7 +1175,7 @@ fn embedded_model_invalidation_rejects_record_and_relationship_authority() {
         "target_key": []
     }]);
     refresh_schema_fingerprint(&mut value);
-    let error = ClientManifest::parse(value, &ClientSurfaceSelector::role("user"))
+    let error = parse_manifest(value, &ClientSurfaceIdentity::role("user"))
         .expect_err("embedded model invalidation cannot carry relationship effects");
     assert_eq!(error.code, "client.manifest.projection_invalidation");
 }
@@ -896,7 +1186,7 @@ fn embedded_model_invalidation_requires_canonical_same_model_scope() {
     value["projection_programs"][0]["arms"][0]["operations"][0]["invalidations"] = json!([]);
     refresh_schema_fingerprint(&mut value);
 
-    let error = ClientManifest::parse(value, &ClientSurfaceSelector::role("user"))
+    let error = parse_manifest(value, &ClientSurfaceIdentity::role("user"))
         .expect_err("embedded model invalidation must retain its canonical model scope");
     assert_eq!(error.code, "client.manifest.projection_invalidation");
 }
@@ -912,7 +1202,7 @@ fn embedded_model_invalidation_rejects_relationship_invalidation_scope() {
     }]);
     refresh_schema_fingerprint(&mut value);
 
-    let error = ClientManifest::parse(value, &ClientSurfaceSelector::role("user"))
+    let error = parse_manifest(value, &ClientSurfaceIdentity::role("user"))
         .expect_err("embedded model invalidation cannot authorize relationship invalidation");
     assert_eq!(error.code, "client.manifest.projection_invalidation");
 }
@@ -928,7 +1218,7 @@ fn embedded_model_invalidation_rejects_foreign_existing_model_scope() {
         json!([{"kind": "model", "model": "Other"}]);
     refresh_schema_fingerprint(&mut value);
 
-    let error = ClientManifest::parse(value, &ClientSurfaceSelector::role("user"))
+    let error = parse_manifest(value, &ClientSurfaceIdentity::role("user"))
         .expect_err("embedded model invalidation cannot authorize a foreign model");
     assert_eq!(error.code, "client.manifest.projection_invalidation");
 }
@@ -942,7 +1232,7 @@ fn embedded_model_invalidation_preserves_duplicate_scope_rejection() {
         json!([invalidation.clone(), invalidation]);
     refresh_schema_fingerprint(&mut value);
 
-    let error = ClientManifest::parse(value, &ClientSurfaceSelector::role("user"))
+    let error = parse_manifest(value, &ClientSurfaceIdentity::role("user"))
         .expect_err("duplicate embedded model invalidation scope must remain invalid");
     assert_eq!(error.code, "client.manifest.projection_invalidation");
     assert!(
@@ -957,17 +1247,17 @@ fn rejects_legacy_top_level_json_command_shapes() {
         let mut value = projected_manifest();
         value["commands"][0][slot] = json!({"kind": "json", "codec": "json"});
 
-        let error = ClientManifest::parse(value, &ClientSurfaceSelector::role("user"))
+        let error = parse_manifest(value, &ClientSurfaceIdentity::role("user"))
             .expect_err("top-level JSON command shapes were removed in manifest v7");
         assert_eq!(error.code, "client.manifest.invalid");
         assert!(error.message.contains("unknown variant `json`"));
     }
 }
 
-fn input(source: &str) -> ClientCompileInput {
-    ClientCompileInput::new(
+fn input(source: &str) -> Result<ClientCompileInput, ClientCompileError> {
+    ClientCompileInput::from_manifest_json(
         manifest(),
-        ClientSurfaceSelector::role("user"),
+        ClientSurfaceIdentity::role("user"),
         vec![ClientDocument::new(
             "src/routes/todos/+page.graphql",
             source,
@@ -975,10 +1265,13 @@ fn input(source: &str) -> ClientCompileInput {
     )
 }
 
-fn input_with_manifest(manifest: JsonValue, source: &str) -> ClientCompileInput {
-    ClientCompileInput::new(
+fn input_with_manifest(
+    manifest: JsonValue,
+    source: &str,
+) -> Result<ClientCompileInput, ClientCompileError> {
+    ClientCompileInput::from_manifest_json(
         manifest,
-        ClientSurfaceSelector::role("user"),
+        ClientSurfaceIdentity::role("user"),
         vec![ClientDocument::new(
             "src/routes/todos/+page.graphql",
             source,
@@ -1015,7 +1308,7 @@ const CUSTOM_SCALAR_QUERY: &str = r#"
 "#;
 
 fn custom_scalar_project() -> super::GeneratedClientProject {
-    compile_client(input_with_manifest(
+    compile(input_with_manifest(
         custom_scalar_manifest(),
         CUSTOM_SCALAR_QUERY,
     ))
@@ -1084,7 +1377,7 @@ fn selected_relationship_artifact(relationship: JsonValue) -> JsonValue {
     let mut value = manifest();
     value["models"][0]["relationships"][0] = relationship;
     refresh_schema_fingerprint(&mut value);
-    let project = compile_client(input_with_manifest(
+    let project = compile(input_with_manifest(
         value,
         "query RelationshipPlan { todos { owner { id } } }",
     ))
@@ -1094,7 +1387,7 @@ fn selected_relationship_artifact(relationship: JsonValue) -> JsonValue {
 
 #[test]
 fn compiles_aliases_composite_wire_identity_live_and_load() {
-    let project = compile_client(input(
+    let project = compile(input(
         r#"
           query Todos($limit: Int!) @load @live {
             rows: todos(limit: $limit) {
@@ -1127,7 +1420,7 @@ fn compiles_aliases_composite_wire_identity_live_and_load() {
 
 #[test]
 fn operation_artifact_carries_normalized_source_provenance() {
-    let project = compile_client(input("query SourceLocated { todos { id } }"))
+    let project = compile(input("query SourceLocated { todos { id } }"))
         .expect("compile source-located operation");
     let artifact = operation_artifact(&project);
 
@@ -1143,9 +1436,9 @@ fn operation_artifact_carries_normalized_source_provenance() {
 
 #[test]
 fn component_load_compiles_to_a_framework_neutral_island_inventory() {
-    let project = compile_client(ClientCompileInput::new(
+    let project = compile(ClientCompileInput::from_manifest_json(
         manifest(),
-        ClientSurfaceSelector::role("user"),
+        ClientSurfaceIdentity::role("user"),
         vec![ClientDocument::new(
             "src/lib/todos/TodoSummary.graphql",
             "query TodoSummary($limit: Int!) @load @live { todos(limit: $limit) { id } }",
@@ -1183,22 +1476,20 @@ fn component_load_compiles_to_a_framework_neutral_island_inventory() {
 
 #[test]
 fn multiple_load_islands_may_share_one_future_boundary() {
-    let project = compile_client(
-        ClientCompileInput::new(
-            manifest(),
-            ClientSurfaceSelector::role("user"),
-            vec![
-                ClientDocument::new(
-                    "src/lib/todos/TodoCount.graphql",
-                    "query TodoCount @load { todos { id } }",
-                ),
-                ClientDocument::new(
-                    "src/lib/todos/TodoTitles.graphql",
-                    "query TodoTitles @load { todos { title } }",
-                ),
-            ],
-        ),
-    )
+    let project = compile(ClientCompileInput::from_manifest_json(
+        manifest(),
+        ClientSurfaceIdentity::role("user"),
+        vec![
+            ClientDocument::new(
+                "src/lib/todos/TodoCount.graphql",
+                "query TodoCount @load { todos { id } }",
+            ),
+            ClientDocument::new(
+                "src/lib/todos/TodoTitles.graphql",
+                "query TodoTitles @load { todos { title } }",
+            ),
+        ],
+    ))
     .expect("route ownership is no longer one-operation-per-route");
 
     assert_eq!(project.islands.len(), 2);
@@ -1206,18 +1497,18 @@ fn multiple_load_islands_may_share_one_future_boundary() {
 }
 
 #[test]
-fn enforces_the_selected_services_exact_depth_and_complexity_limits() {
+fn enforces_the_selected_services_exact_depth_and_row_limits() {
     let shallow_source = "query ExactDepth { todos { id } }";
     let mut exact_depth_manifest = manifest();
     exact_depth_manifest["execution"]["max_depth"] = json!(2);
     refresh_schema_fingerprint(&mut exact_depth_manifest);
-    compile_client(input_with_manifest(exact_depth_manifest, shallow_source))
+    compile(input_with_manifest(exact_depth_manifest, shallow_source))
         .expect("root and leaf fields exactly at max_depth must compile");
 
     let mut shallow_rejected_manifest = manifest();
     shallow_rejected_manifest["execution"]["max_depth"] = json!(1);
     refresh_schema_fingerprint(&mut shallow_rejected_manifest);
-    let error = compile_client(input_with_manifest(
+    let error = compile(input_with_manifest(
         shallow_rejected_manifest,
         shallow_source,
     ))
@@ -1228,7 +1519,7 @@ fn enforces_the_selected_services_exact_depth_and_complexity_limits() {
     let mut depth_manifest = manifest();
     depth_manifest["execution"]["max_depth"] = json!(3);
     refresh_schema_fingerprint(&mut depth_manifest);
-    let error = compile_client(input_with_manifest(
+    let error = compile(input_with_manifest(
         depth_manifest,
         "query TooDeep { todos { owner { owner { id } } } }",
     ))
@@ -1239,34 +1530,53 @@ fn enforces_the_selected_services_exact_depth_and_complexity_limits() {
     let mut exact_deep_manifest = manifest();
     exact_deep_manifest["execution"]["max_depth"] = json!(4);
     refresh_schema_fingerprint(&mut exact_deep_manifest);
-    compile_client(input_with_manifest(
+    compile(input_with_manifest(
         exact_deep_manifest,
         "query ExactDeep { todos { owner { owner { id } } } }",
     ))
     .expect("the exact recursive service depth boundary must compile");
 
-    let source = "query ExactCost { todos { id } }";
+    // A literal limit counts as given; nested lists multiply.
+    let source = "query ExactRows { todos(limit: 40) { id } }";
     let mut accepted_manifest = manifest();
-    accepted_manifest["execution"]["max_complexity"] = json!(18);
+    accepted_manifest["execution"]["max_rows"] = json!(40);
     refresh_schema_fingerprint(&mut accepted_manifest);
-    compile_client(input_with_manifest(accepted_manifest, source))
-        .expect("the exact service complexity boundary must compile");
+    compile(input_with_manifest(accepted_manifest, source))
+        .expect("the exact service row boundary must compile");
 
     let mut rejected_manifest = manifest();
-    rejected_manifest["execution"]["max_complexity"] = json!(17);
+    rejected_manifest["execution"]["max_rows"] = json!(39);
     refresh_schema_fingerprint(&mut rejected_manifest);
-    let error = compile_client(input_with_manifest(rejected_manifest, source))
-        .expect_err("complexity must fail at build time");
-    assert_eq!(error.code, "client.operation.complexity_limit");
-    assert!(
-        error.message.contains("operation complexity 18"),
-        "{error:?}"
-    );
+    let error = compile(input_with_manifest(rejected_manifest, source))
+        .expect_err("rows over budget must fail at build time");
+    assert_eq!(error.code, "client.operation.row_limit");
+    assert!(error.message.contains("may return 40 rows"), "{error:?}");
+
+    // An absent limit counts as the field's default (25); a literal above
+    // `max_limit` (100) counts as the cap.
+    let mut default_manifest = manifest();
+    default_manifest["execution"]["max_rows"] = json!(24);
+    refresh_schema_fingerprint(&mut default_manifest);
+    let error = compile(input_with_manifest(
+        default_manifest,
+        "query DefaultRows { todos { id } }",
+    ))
+    .expect_err("the default page counts");
+    assert!(error.message.contains("may return 25 rows"), "{error:?}");
+
+    let mut capped_manifest = manifest();
+    capped_manifest["execution"]["max_rows"] = json!(100);
+    refresh_schema_fingerprint(&mut capped_manifest);
+    compile(input_with_manifest(
+        capped_manifest,
+        "query CappedRows { todos(limit: 5000) { id } }",
+    ))
+    .expect("a limit above max_limit costs max_limit");
 }
 
 #[test]
 fn compiles_recursive_normalized_relationships_and_nested_fragments() {
-    let project = compile_client(input(
+    let project = compile(input(
         r#"
           query NestedOwner {
             todos {
@@ -1466,7 +1776,7 @@ fn relationship_filter_catalog_injects_its_referenced_source_keys() {
     });
     value["models"][0]["relationships"][0] = relationship;
     refresh_schema_fingerprint(&mut value);
-    let project = compile_client(input_with_manifest(
+    let project = compile(input_with_manifest(
         value,
         r#"query RelationshipFilter {
             todos(where: {owner: {title: {_eq: "owned"}}}) { id }
@@ -1492,9 +1802,9 @@ fn compiles_nested_list_arguments_coverage_and_variable_usage() {
     let mut value = manifest();
     value["models"][0]["relationships"][0] = normalized_list_relationship();
     refresh_schema_fingerprint(&mut value);
-    let project = compile_client(ClientCompileInput::new(
+    let project = compile(ClientCompileInput::from_manifest_json(
         value,
-        ClientSurfaceSelector::role("user"),
+        ClientSurfaceIdentity::role("user"),
         vec![ClientDocument::new(
             "src/routes/todos/+page.graphql",
             "query NestedList($take: Int!) { todos { copies: owner(limit: $take, offset: 0) { headline: title } } }",
@@ -1569,9 +1879,9 @@ fn compiles_embedded_objects_without_inventing_wire_identity() {
     value["roots"][3]["filter"]["relationships"] = json!(["details", "owner"]);
     refresh_schema_fingerprint(&mut value);
 
-    let project = compile_client(ClientCompileInput::new(
+    let project = compile(ClientCompileInput::from_manifest_json(
         value,
-        ClientSurfaceSelector::role("user"),
+        ClientSurfaceIdentity::role("user"),
         vec![ClientDocument::new(
             "src/routes/todos/+page.graphql",
             "query Embedded { todos { details { note } } }",
@@ -1590,7 +1900,7 @@ fn compiles_embedded_objects_without_inventing_wire_identity() {
 
 #[test]
 fn compiles_aggregate_count_and_nodes_with_exact_typenames_and_window() {
-    let project = compile_client(input(
+    let project = compile(input(
         r#"
           query AggregateTodos($where: todo_bool_exp) {
             stats: todos_aggregate(where: $where) { ...AggregateParts }
@@ -1629,7 +1939,7 @@ fn compiles_aggregate_count_and_nodes_with_exact_typenames_and_window() {
 
 #[test]
 fn compiles_count_only_without_inventing_nodes_or_record_identity() {
-    let project = compile_client(input(
+    let project = compile(input(
         "query CountOnly { summary: todos_aggregate { stats: aggregate { total: count } } }",
     ))
     .expect("compile count-only aggregate");
@@ -1673,9 +1983,9 @@ fn compiles_nullable_relationship_aggregate_from_declared_typenames() {
     });
     value["models"][0]["relationships"][0] = relationship;
     refresh_schema_fingerprint(&mut value);
-    let project = compile_client(ClientCompileInput::new(
+    let project = compile(ClientCompileInput::from_manifest_json(
         value,
-        ClientSurfaceSelector::role("user"),
+        ClientSurfaceIdentity::role("user"),
         vec![ClientDocument::new(
             "src/routes/todos/+page.graphql",
             "query RelationshipStats { todos { metrics: owner_aggregate { stats: aggregate { total: count } items: nodes { headline: title } } } }",
@@ -1697,7 +2007,7 @@ fn compiles_nullable_relationship_aggregate_from_declared_typenames() {
 
 #[test]
 fn preserves_enum_wire_syntax_and_json_runtime_value() {
-    let project = compile_client(input(
+    let project = compile(input(
         r#"
           query Ordered {
             todos(order_by: [{priority: asc}]) { id }
@@ -1713,7 +2023,7 @@ fn preserves_enum_wire_syntax_and_json_runtime_value() {
 
 #[test]
 fn emits_executable_filter_order_and_pagination_plans_with_hidden_dependencies() {
-    let project = compile_client(input(
+    let project = compile(input(
         r#"
           query Planned($where: todo_bool_exp, $order: [todo_order_by!]) {
             todos(where: $where, order_by: $order, limit: 10) { id }
@@ -1778,11 +2088,7 @@ fn generated_variable_codec_types_recursive_inputs_and_custom_scalars() {
     let project = custom_scalar_project();
     let generated = file(&project, &project.operations[0].module_path);
 
-    assert_eq!(
-        generated,
-        include_str!("../../tests/fixtures/generated-operation.ts"),
-        "the checked-in TypeScript consumer fixture must remain byte-exact"
-    );
+    assert_golden("generated-operation.ts", generated);
     assert!(generated.contains("readonly \"id\": string | number;"));
     assert!(generated.contains("readonly \"big\": number;"));
     assert!(generated.contains("readonly \"bytes\"?: string | null;"));
@@ -1843,7 +2149,7 @@ fn generated_variable_codec_types_recursive_inputs_and_custom_scalars() {
 
 #[test]
 fn generated_query_carries_row_policy_claim_contract_without_a_command_runtime() {
-    let project = compile_client(input_with_manifest(
+    let project = compile(input_with_manifest(
         row_policy_claim_manifest(),
         "query Todos { todos { id tenantId } }",
     ))
@@ -1887,7 +2193,7 @@ fn model_filter_contract_resolves_belongs_to_and_has_many_cycles() {
         }
     }
     refresh_schema_fingerprint(&mut recursive);
-    let project = compile_client(input_with_manifest(
+    let project = compile(input_with_manifest(
         recursive,
         "query RecursiveWhere($where: todo_bool_exp) { todos(where: $where) { id } }",
     ))
@@ -1920,7 +2226,7 @@ fn model_filter_contract_resolves_belongs_to_and_has_many_cycles() {
 
 #[test]
 fn literal_index_plans_inject_only_referenced_fields_and_validate_shape() {
-    let project = compile_client(input(
+    let project = compile(input(
         "query LiteralPlan { todos(where: {priority: {_eq: 3}}, order_by: [{priority: desc}]) { id } }",
     ))
     .expect("compile literal index plan");
@@ -1932,31 +2238,31 @@ fn literal_index_plans_inject_only_referenced_fields_and_validate_shape() {
     assert!(generated.contains("\"priority\": {"));
     assert!(generated.contains("\"_eq\": 3"));
 
-    let error = compile_client(input(
+    let error = compile(input(
         "query BadFilterField { todos(where: {missing: {_eq: 3}}) { id } }",
     ))
     .expect_err("unknown filter field must fail at build time");
     assert_eq!(error.code, "client.filter.field_denied_or_unknown");
 
-    let error = compile_client(input(
+    let error = compile(input(
         "query BadFilterOperator { todos(where: {priority: {_gt: 3}}) { id } }",
     ))
     .expect_err("unselected filter operator must fail at build time");
     assert_eq!(error.code, "client.filter.operator_denied_or_unknown");
 
-    let error = compile_client(input(
+    let error = compile(input(
         "query BadFilterLiteral { todos(where: {priority: {_eq: \"bad\"}}) { id } }",
     ))
     .expect_err("filter literals must match the selected scalar codec");
     assert_eq!(error.code, "client.filter.literal_type");
 
-    let error = compile_client(input(
+    let error = compile(input(
         "query BadFilterList { todos(where: {priority: {_in: [1, \"bad\"]}}) { id } }",
     ))
     .expect_err("every filter list item must match the selected scalar codec");
     assert_eq!(error.code, "client.filter.literal_type");
 
-    let error = compile_client(input(
+    let error = compile(input(
         "query AmbiguousOrder { todos(order_by: [{priority: asc, id: desc}]) { id } }",
     ))
     .expect_err("ambiguous order priority must fail at build time");
@@ -1965,7 +2271,7 @@ fn literal_index_plans_inject_only_referenced_fields_and_validate_shape() {
 
 #[test]
 fn scalar_literals_use_the_same_canonical_domains_as_variables() {
-    let project = compile_client(input_with_manifest(
+    let project = compile(input_with_manifest(
         literal_scalar_manifest(),
         r#"
           query LiteralScalarCodecs {
@@ -1999,7 +2305,7 @@ fn scalar_literals_use_the_same_canonical_domains_as_variables() {
     assert!(document.contains("decimal: 0.1"));
     assert!(!document.contains("0.100000000000000005"));
 
-    let rounded_float = compile_client(input_with_manifest(
+    let rounded_float = compile(input_with_manifest(
         literal_scalar_manifest(),
         "query RoundedFloat { todos(where: {ratio: {_eq: 9007199254740993}}) { id } }",
     ))
@@ -2014,7 +2320,7 @@ fn scalar_literals_use_the_same_canonical_domains_as_variables() {
         .expect("rounded document");
     assert!(!rounded_document.contains("9007199254740993"));
 
-    let mixed_json = compile_client(input_with_manifest(
+    let mixed_json = compile(input_with_manifest(
         custom_scalar_manifest(),
         "query MixedJson($id: ID!) { todos(where: {id: {_eq: $id}, payload: {_eq: {a: 1}}}) { id } }",
     ))
@@ -2025,7 +2331,7 @@ fn scalar_literals_use_the_same_canonical_domains_as_variables() {
         1
     );
 
-    let by_pk = compile_client(input(
+    let by_pk = compile(input(
         "query LiteralIds { todo(id: -0, tenantId: 1) { id } }",
     ))
     .expect("GraphQL integer ID literals coerce to canonical strings");
@@ -2063,21 +2369,21 @@ fn scalar_literals_use_the_same_canonical_domains_as_variables() {
             "JSON integer whose JavaScript decimal serialization changes",
         ),
     ] {
-        let error = match compile_client(input_with_manifest(literal_scalar_manifest(), source)) {
+        let error = match compile(input_with_manifest(literal_scalar_manifest(), source)) {
             Ok(_) => panic!("{label} must fail"),
             Err(error) => error,
         };
         assert_eq!(error.code, "client.filter.literal_type", "{label}");
     }
 
-    let error = compile_client(input("query WideLimit { todos(limit: 2147483648) { id } }"))
+    let error = compile(input("query WideLimit { todos(limit: 2147483648) { id } }"))
         .expect_err("root Int literals use the same signed 32-bit domain as variables");
     assert_eq!(error.code, "client.argument.literal_type");
 }
 
 #[test]
 fn canonicalizes_graphql_singletons_at_every_filter_and_order_list_position() {
-    let project = compile_client(input(
+    let project = compile(input(
         r#"
           query SingletonLists {
             todos(
@@ -2120,7 +2426,7 @@ fn enforces_filter_depth_and_width_limits_after_graphql_singleton_coercion() {
     let mut depth_manifest = manifest();
     depth_manifest["execution"]["max_depth"] = json!(2);
     refresh_schema_fingerprint(&mut depth_manifest);
-    compile_client(input_with_manifest(
+    compile(input_with_manifest(
         depth_manifest.clone(),
         r#"
           query ExactFilterDepth {
@@ -2142,7 +2448,7 @@ fn enforces_filter_depth_and_width_limits_after_graphql_singleton_coercion() {
         "query TooDeepNot { todos(where: {_not: {_not: {_not: null}}}) { id } }",
         "query TooDeepRelationship { todos(where: {owner: {owner: {owner: null}}}) { id } }",
     ] {
-        let error = compile_client(input_with_manifest(depth_manifest.clone(), source))
+        let error = compile(input_with_manifest(depth_manifest.clone(), source))
             .expect_err("null still enters _not and relationship filter children");
         assert_eq!(error.code, "client.filter.depth_limit", "{source}");
     }
@@ -2151,7 +2457,7 @@ fn enforces_filter_depth_and_width_limits_after_graphql_singleton_coercion() {
     width_manifest["execution"]["max_bool_width"] = json!(1);
     width_manifest["execution"]["max_in_list"] = json!(1);
     refresh_schema_fingerprint(&mut width_manifest);
-    compile_client(input_with_manifest(
+    compile(input_with_manifest(
         width_manifest.clone(),
         r#"
           query ExactFilterWidths {
@@ -2179,7 +2485,7 @@ fn enforces_filter_depth_and_width_limits_after_graphql_singleton_coercion() {
             "mixed IN list",
         ),
     ] {
-        let error = compile_client(input_with_manifest(width_manifest.clone(), source))
+        let error = compile(input_with_manifest(width_manifest.clone(), source))
             .expect_err("filter width above the exact service boundary must fail");
         assert_eq!(error.code, "client.filter.width_limit", "{label}");
     }
@@ -2191,7 +2497,7 @@ fn variable_codec_intersects_filter_depth_and_list_constraints() {
     value["execution"]["max_bool_width"] = json!(7);
     value["execution"]["max_in_list"] = json!(11);
     refresh_schema_fingerprint(&mut value);
-    let project = compile_client(input_with_manifest(
+    let project = compile(input_with_manifest(
         value,
         r#"
           query VariableConstraints(
@@ -2246,7 +2552,7 @@ fn relationship_selection_and_aggregate_filters_inherit_model_edge_depth() {
     });
     value["models"][0]["relationships"][0] = relationship;
     refresh_schema_fingerprint(&mut value);
-    let project = compile_client(input_with_manifest(
+    let project = compile(input_with_manifest(
         value,
         r#"
           query EdgeFilterDepth(
@@ -2274,18 +2580,18 @@ fn relationship_selection_and_aggregate_filters_inherit_model_edge_depth() {
 
 #[test]
 fn variable_nullability_is_compatible_but_never_weaker() {
-    compile_client(input(
+    compile(input(
         "query Strict($limit: Int!) { todos(limit: $limit) { id } }",
     ))
     .expect("non-null variable may satisfy nullable argument");
 
-    let error = compile_client(input(
+    let error = compile(input(
         "query Weak($tenantId: ID, $id: ID!) { todo(tenantId: $tenantId, id: $id) { title } }",
     ))
     .expect_err("nullable variable may not satisfy non-null argument");
     assert_eq!(error.code, "client.variable.type_mismatch");
 
-    let error = compile_client(input(
+    let error = compile(input(
         "query WeakItem($order: [todo_order_by]) { todos(order_by: $order) { id } }",
     ))
     .expect_err("nullable list item may not satisfy non-null item");
@@ -2294,7 +2600,7 @@ fn variable_nullability_is_compatible_but_never_weaker() {
 
 #[test]
 fn compiles_nested_filter_and_order_variables_with_recursive_value_sources() {
-    let project = compile_client(input(
+    let project = compile(input(
         r#"
           query Nested($priority: Int!, $direction: order_by!) {
             todos(
@@ -2320,19 +2626,19 @@ fn compiles_nested_filter_and_order_variables_with_recursive_value_sources() {
     assert!(generated.contains("\"kind\": \"enum\""));
     assert!(!generated.contains("Readonly<Record<string, unknown>>"));
 
-    let error = compile_client(input(
+    let error = compile(input(
         "query WrongNested($priority: String!) { todos(where: {priority: {_eq: $priority}}) { id } }",
     ))
     .expect_err("nested variable type must match its scalar position");
     assert_eq!(error.code, "client.variable.type_mismatch");
 
-    let error = compile_client(input(
+    let error = compile(input(
         "query MissingNested { todos(where: {priority: {_eq: $missing}}) { id } }",
     ))
     .expect_err("nested variable must be defined");
     assert_eq!(error.code, "client.variable.undefined");
 
-    let error = compile_client(input(
+    let error = compile(input(
         "query WrongListItem($priority: String!) { todos(where: {priority: {_in: [$priority]}}) { id } }",
     ))
     .expect_err("nested list-item variables must match the non-null scalar item type");
@@ -2341,7 +2647,7 @@ fn compiles_nested_filter_and_order_variables_with_recursive_value_sources() {
 
 #[test]
 fn compiles_variable_defaults_into_query_types_identity_and_island_plan() {
-    let project = compile_client(input(
+    let project = compile(input(
         "query Defaulted($limit: Int! = 10) @load { todos(limit: $limit) { id } }",
     ))
     .expect("defaults are compiler-owned inputs");
@@ -2380,9 +2686,9 @@ fn application_surfaces_are_explicit_and_fingerprint_separate_chunks() {
         .as_str()
         .expect("common fingerprint")
         .to_string();
-    let common_project = compile_client(ClientCompileInput::new(
+    let common_project = compile(ClientCompileInput::from_manifest_json(
         common.clone(),
-        ClientSurfaceSelector::application("web-common", ["user"], ["user"]),
+        ClientSurfaceIdentity::application("web-common", ["user"], ["user"]),
         vec![document.clone()],
     ))
     .expect("compile exact application surface");
@@ -2394,9 +2700,9 @@ fn application_surfaces_are_explicit_and_fingerprint_separate_chunks() {
     let mut changed_contract = common.clone();
     changed_contract["surface"]["eligible_roles"] = json!(["admin", "user"]);
     refresh_schema_fingerprint(&mut changed_contract);
-    let changed_project = compile_client(ClientCompileInput::new(
+    let changed_project = compile(ClientCompileInput::from_manifest_json(
         changed_contract,
-        ClientSurfaceSelector::application("web-common", ["admin", "user"], ["user"]),
+        ClientSurfaceIdentity::application("web-common", ["admin", "user"], ["user"]),
         vec![document.clone()],
     ))
     .expect("compile changed contract for the same application surface");
@@ -2404,9 +2710,9 @@ fn application_surfaces_are_explicit_and_fingerprint_separate_chunks() {
         file(&changed_project, "sveltekit.ts").contains("key: \"surface:application:web-common\"")
     );
 
-    let mismatch = compile_client(ClientCompileInput::new(
+    let mismatch = compile(ClientCompileInput::from_manifest_json(
         common,
-        ClientSurfaceSelector::role("user"),
+        ClientSurfaceIdentity::role("user"),
         vec![document.clone()],
     ))
     .expect_err("a role selector cannot relabel an application surface");
@@ -2420,9 +2726,9 @@ fn application_surfaces_are_explicit_and_fingerprint_separate_chunks() {
         "schema_roles": ["admin"],
     });
     refresh_schema_fingerprint(&mut elevated);
-    let elevated_project = compile_client(ClientCompileInput::new(
+    let elevated_project = compile(ClientCompileInput::from_manifest_json(
         elevated,
-        ClientSurfaceSelector::application("web-admin", ["admin"], ["admin"]),
+        ClientSurfaceIdentity::application("web-admin", ["admin"], ["admin"]),
         vec![document],
     ))
     .expect("compile separate elevated application surface");
@@ -2434,15 +2740,15 @@ fn application_surfaces_are_explicit_and_fingerprint_separate_chunks() {
 
 #[test]
 fn sveltekit_wrapper_exposes_framework_neutral_islands_without_routes() {
-    let input = ClientCompileInput::new(
+    let input = ClientCompileInput::from_manifest_json(
         manifest(),
-        ClientSurfaceSelector::role("user"),
+        ClientSurfaceIdentity::role("user"),
         vec![ClientDocument::new(
             "src/features/todos.graphql",
             "query Todos @load { todos { id } }",
         )],
     );
-    let project = compile_client(input).expect("adapter-owned island placement");
+    let project = compile(input).expect("adapter-owned island placement");
     assert!(project.islands[0].directives.load);
     assert!(project.files.iter().all(|file| file.path != "routes.ts"));
     let sveltekit = file(&project, "sveltekit.ts");
@@ -2466,7 +2772,7 @@ fn sveltekit_wrapper_exposes_framework_neutral_islands_without_routes() {
 
 #[test]
 fn sveltekit_wrapper_names_cannot_shadow_generated_runtime_exports() {
-    let error = compile_client(input(
+    let error = compile(input(
         r#"
           query useCommands {
             todos { id }
@@ -2481,7 +2787,7 @@ fn sveltekit_wrapper_names_cannot_shadow_generated_runtime_exports() {
 #[test]
 fn sveltekit_wrapper_names_fail_closed_on_typescript_keywords() {
     for name in ["default", "await"] {
-        let error = compile_client(input(&format!("query {name} {{ todos {{ id }} }}")))
+        let error = compile(input(&format!("query {name} {{ todos {{ id }} }}")))
             .expect_err("TypeScript keyword must not become a generated value binding");
         assert_eq!(error.code, "client.operation.sveltekit_identifier");
         assert!(error.message.contains(name), "{error}");
@@ -2490,14 +2796,14 @@ fn sveltekit_wrapper_names_fail_closed_on_typescript_keywords() {
         assert_eq!(source.line, 1);
     }
 
-    let project = compile_client(input("query awaited { todos { id } }"))
+    let project = compile(input("query awaited { todos { id } }"))
         .expect("near-keyword operation remains valid");
     assert!(file(&project, "sveltekit.ts").contains("export const awaited ="));
 }
 
 #[test]
 fn expands_root_named_and_inline_fragments_into_canonical_full_text() {
-    let project = compile_client(input(
+    let project = compile(input(
         r#"
           query Fragmented {
             ...Root
@@ -2522,7 +2828,7 @@ fn expands_root_named_and_inline_fragments_into_canonical_full_text() {
 
 #[test]
 fn merges_identical_root_objects_and_preserves_first_encounter_order() {
-    let project = compile_client(input(
+    let project = compile(input(
         r#"
           query Merged {
             ...First
@@ -2572,13 +2878,13 @@ fn rejects_fragment_graph_errors_deterministically() {
         ),
     ];
     for (source, code, message) in cases {
-        let error = compile_client(input(source)).expect_err(source);
+        let error = compile(input(source)).expect_err(source);
         assert_eq!(error.code, code, "{source}: {error}");
         assert!(error.message.contains(message), "{source}: {error}");
         assert!(error.source.is_some());
     }
 
-    let error = compile_client(input(
+    let error = compile(input(
         r#"
           query Unused { todos { id } }
           fragment ZedFirst on todo { id }
@@ -2592,7 +2898,7 @@ fn rejects_fragment_graph_errors_deterministically() {
 
 #[test]
 fn prevalidates_fragment_graph_through_nested_fields_before_lowering() {
-    let error = compile_client(input(
+    let error = compile(input(
         r#"
           query NestedCycle {
             todos { ...Recursive }
@@ -2607,7 +2913,7 @@ fn prevalidates_fragment_graph_through_nested_fields_before_lowering() {
     assert!(error.message.contains("Recursive -> Recursive"));
     assert_eq!(error.source.as_ref().map(|source| source.line), Some(6));
 
-    let error = compile_client(input(
+    let error = compile(input(
         "query NestedMissing { todos { owner { ...Missing } } }",
     ))
     .expect_err("undefined nested fragments precede unsupported relationship lowering");
@@ -2618,11 +2924,11 @@ fn prevalidates_fragment_graph_through_nested_fields_before_lowering() {
 #[test]
 fn fragment_definition_order_does_not_change_generated_output() {
     let operation = "query Stable { todos { ...First ...Second } }\n";
-    let left = compile_client(input(&format!(
+    let left = compile(input(&format!(
         "{operation}fragment First on todo {{ id }}\nfragment Second on todo {{ title }}\n"
     )))
     .expect("first definition order");
-    let right = compile_client(input(&format!(
+    let right = compile(input(&format!(
         "{operation}fragment Second on todo {{ title }}\nfragment First on todo {{ id }}\n"
     )))
     .expect("second definition order");
@@ -2647,7 +2953,7 @@ fn rejects_directives_on_every_fragment_surface() {
         ),
     ];
     for (source, code) in cases {
-        let error = compile_client(input(source)).expect_err(source);
+        let error = compile(input(source)).expect_err(source);
         assert_eq!(error.code, code, "{source}: {error}");
     }
 }
@@ -2662,7 +2968,7 @@ fn rejects_response_key_conflicts_at_the_later_selection() {
         }
       }
     "#;
-    let error = compile_client(input(source)).expect_err("field-name conflict");
+    let error = compile(input(source)).expect_err("field-name conflict");
     assert_eq!(error.code, "client.selection.conflict");
     assert_eq!(error.source.as_ref().map(|source| source.line), Some(5));
     assert!(error.message.contains("first selection at 4:"));
@@ -2671,7 +2977,7 @@ fn rejects_response_key_conflicts_at_the_later_selection() {
         "query ShapeConflict { todos { same: id same: id { value } } }",
         "query ArgumentConflict { rows: todos(limit: 1) { id } rows: todos(limit: 2) { id } }",
     ] {
-        let error = compile_client(input(source)).expect_err(source);
+        let error = compile(input(source)).expect_err(source);
         assert_eq!(error.code, "client.selection.conflict", "{source}: {error}");
     }
 }
@@ -2686,13 +2992,13 @@ fn fragment_expansion_is_bounded_by_depth_and_total_work() {
         ));
     }
     deep.push_str("fragment F65 on todo { id }\n");
-    let error = compile_client(input(&deep)).expect_err("depth bound");
+    let error = compile(input(&deep)).expect_err("depth bound");
     assert_eq!(error.code, "client.selection.depth");
 
     let spreads = "...Fields ".repeat(5_000);
     let expanded =
         format!("query Expanded {{ todos {{ {spreads} }} }} fragment Fields on todo {{ id }}");
-    let error = compile_client(input(&expanded)).expect_err("expansion work bound");
+    let error = compile(input(&expanded)).expect_err("expansion work bound");
     assert_eq!(error.code, "client.selection.expansion_bound");
 }
 
@@ -2709,7 +3015,7 @@ fn rejects_conditional_and_multi_root() {
         ),
     ];
     for (source, code) in cases {
-        let error = compile_client(input(source)).expect_err(source);
+        let error = compile(input(source)).expect_err(source);
         assert_eq!(error.code, code, "{source}: {error}");
         assert!(error.source.is_some());
     }
@@ -2740,7 +3046,7 @@ fn recursive_selection_shapes_fail_closed() {
         ),
     ];
     for (source, code) in cases {
-        let error = compile_client(input(source)).expect_err(source);
+        let error = compile(input(source)).expect_err(source);
         assert_eq!(error.code, code, "{source}: {error}");
         assert!(error.source.is_some());
     }
@@ -2753,9 +3059,9 @@ fn rejects_unknown_scalar_and_codec_instead_of_emitting_unknown() {
         .as_array_mut()
         .expect("array")
         .push(json!({"scalar": "Money", "codec": "money"}));
-    let error = compile_client(ClientCompileInput::new(
+    let error = compile(ClientCompileInput::from_manifest_json(
         invalid,
-        ClientSurfaceSelector::role("user"),
+        ClientSurfaceIdentity::role("user"),
         vec![ClientDocument::new(
             "src/routes/todos/+page.graphql",
             "query Todos { todos { id } }",
@@ -2769,9 +3075,9 @@ fn rejects_unknown_scalar_and_codec_instead_of_emitting_unknown() {
 fn rejects_well_formed_but_incompatible_protocol_fingerprint() {
     let mut invalid = manifest();
     invalid["protocol_fingerprint"] = json!(fingerprint("different protocol"));
-    let error = compile_client(ClientCompileInput::new(
+    let error = compile(ClientCompileInput::from_manifest_json(
         invalid,
-        ClientSurfaceSelector::role("user"),
+        ClientSurfaceIdentity::role("user"),
         vec![ClientDocument::new(
             "src/routes/todos/+page.graphql",
             "query Todos { todos { id } }",
@@ -2793,9 +3099,9 @@ fn live_companion_fails_closed_on_dependency_or_pagination_drift() {
         .expect("subscription");
     subscription["pagination"]["default_limit"] = json!(24);
     refresh_schema_fingerprint(&mut invalid);
-    let error = compile_client(ClientCompileInput::new(
+    let error = compile(ClientCompileInput::from_manifest_json(
         invalid,
-        ClientSurfaceSelector::role("user"),
+        ClientSurfaceIdentity::role("user"),
         vec![ClientDocument::new(
             "src/routes/todos/+page.graphql",
             "query Todos @live { todos { id } }",
@@ -2935,8 +3241,7 @@ fn command_protocol_and_extensions_are_preserved_exactly() {
         "name": "todos",
         "facts": ["TodoCreated"],
         "models": ["Todo"],
-        "dependencies": ["todo_rows"],
-        "causal_confirmation": true
+        "dependencies": ["todo_rows"]
     }]);
     value["protocol_operations"] = json!({
         "version": 1,
@@ -3110,10 +3415,118 @@ fn command_protocol_and_extensions_are_preserved_exactly() {
         ["values"][2]["source"] =
         json!({"kind": "trusted_preset", "name": "priority", "codec": "int32"});
     refresh_schema_fingerprint(&mut preset_i64_value);
+    // An unknown record identity drops the mutation, including its preset
+    // expression. The generated inventory must follow the compiled result,
+    // while the surface retains the complete trusted context contract.
+    let mut recovery_preset = preset_i64_value.clone();
+    recovery_preset["commands"][0]["extensions"]["projection"]["preview_occurrences"][0]
+        ["values"][1]["source"] = json!({"kind": "unknown"});
+    refresh_schema_fingerprint(&mut recovery_preset);
+    for (fixture, retained) in [(preset_i64_value.clone(), true), (recovery_preset, false)] {
+        let compiled = compile(input_with_manifest(fixture, "query Todos { todos { id } }"))
+            .expect("compile preset inventory after preview lowering");
+        let source = file(&compiled, "commands.ts");
+        let declaration = source
+            .split("export const Command_createTodo:")
+            .nth(1)
+            .unwrap();
+        let body = declaration
+            .split_once(" = ")
+            .unwrap()
+            .1
+            .split_once("\n};")
+            .unwrap()
+            .0;
+        let artifact: JsonValue = serde_json::from_str(&format!("{body}\n}}")).unwrap();
+        assert_eq!(
+            artifact["protocol"]["trustedPresets"],
+            json!([{"name": "priority", "codec": "int32"}])
+        );
+        if retained {
+            assert_eq!(
+                artifact["trustedPresets"],
+                json!([{"name": "priority", "codec": "int32"}])
+            );
+            assert!(!artifact["projection"]["preview"]["operations"]
+                .as_array()
+                .unwrap()
+                .is_empty());
+        } else {
+            let fixture: JsonValue = serde_json::from_str(include_str!(
+                "../../tests/fixtures/generated-recovery-preset-command.json"
+            ))
+            .unwrap();
+            assert_eq!(
+                artifact, fixture,
+                "JS bridge fixture must match compiler output"
+            );
+            assert!(artifact.get("trustedPresets").is_none());
+            assert!(artifact["projection"]["preview"]["operations"]
+                .as_array()
+                .unwrap()
+                .is_empty());
+            assert!(!artifact["projection"]["preview"]["recoveries"]
+                .as_array()
+                .unwrap()
+                .is_empty());
+        }
+    }
     let mut invalid_u64_source = input_i64_value.clone();
     invalid_u64_source["projection_programs"][0]["arms"][0]["operations"][0]["fields"][1]
         ["assignment"]["expression"]["value_type"] = json!({"type": "u64"});
     refresh_schema_fingerprint(&mut invalid_u64_source);
+    for codec in ["uint8", "uint16", "uint32", "uint64_safe_integer"] {
+        let mut unsigned = invalid_u64_source.clone();
+        unsigned["commands"][0]["input"]["definition"]["fields"][1]["type_name"] = json!("BigInt");
+        unsigned["commands"][0]["input"]["definition"]["fields"][1]["codec"] = json!(codec);
+        unsigned["models"][0]["fields"][2]["scalar"] = json!("BigInt");
+        unsigned["models"][0]["fields"][2]["codec"] = json!("json_number_precision_limited");
+        refresh_schema_fingerprint(&mut unsigned);
+        let compiled = compile(input_with_manifest(
+            unsigned.clone(),
+            "query Todos { todos { id priority } }",
+        ))
+        .expect("unsigned refined inputs prove U64 slots");
+        let source = file(&compiled, "commands.ts");
+        assert!(source.contains("readonly \"priority\": number;"));
+        let body = source
+            .split("export const Command_createTodo:")
+            .nth(1)
+            .unwrap()
+            .split_once(" = ")
+            .unwrap()
+            .1
+            .split_once("\n};")
+            .unwrap()
+            .0;
+        let artifact: JsonValue = serde_json::from_str(&format!("{body}\n}}")).unwrap();
+        assert_eq!(artifact["input"]["definition"]["fields"][1]["codec"], codec);
+        assert_eq!(
+            artifact["projection"]["preview"]["operations"][0]["mutation"]["fields"][1]["value"]
+                ["kind"],
+            "input"
+        );
+        if codec == "uint64_safe_integer" {
+            let fixture: JsonValue = serde_json::from_str(include_str!(
+                "../../tests/fixtures/generated-unsigned-command.json"
+            ))
+            .unwrap();
+            assert_eq!(
+                artifact, fixture,
+                "unsigned JS bridge must match generated output"
+            );
+        }
+        unsigned["commands"][0]["extensions"]["trusted_presets"] =
+            json!([{"name": "priority", "codec": codec}]);
+        unsigned["commands"][0]["extensions"]["projection"]["preview_occurrences"][0]["values"]
+            [2]["source"] = json!({"kind": "trusted_preset", "name": "priority", "codec": codec});
+        refresh_schema_fingerprint(&mut unsigned);
+        compile(input_with_manifest(
+            unsigned,
+            "query Todos { todos { id priority } }",
+        ))
+        .expect("unsigned trusted preset codec proves U64 slot");
+    }
     let mut invalid_constant_source = value.clone();
     invalid_constant_source["commands"][0]["extensions"]["projection"]["preview_occurrences"][0]
         ["values"][2]["source"] =
@@ -3225,9 +3638,9 @@ fn command_protocol_and_extensions_are_preserved_exactly() {
             }
         }));
     refresh_schema_fingerprint(&mut too_many_values);
-    let project = compile_client(ClientCompileInput::new(
+    let project = compile(ClientCompileInput::from_manifest_json(
         value,
-        ClientSurfaceSelector::role("user"),
+        ClientSurfaceIdentity::role("user"),
         vec![ClientDocument::new(
             "src/routes/todos/+page.graphql",
             "query Todos { todos { id } }",
@@ -3246,6 +3659,19 @@ fn command_protocol_and_extensions_are_preserved_exactly() {
     assert!(commands.contains("readonly \"tenantId\": string;"));
     assert!(commands.contains("\"mutationField\": \"createTodo\""));
     assert!(commands.contains("\"inputDefaults\""));
+    // The lazy catalog carries the defaults so a call returns its generated
+    // id before the command module loads.
+    let lazy = file(&project, "lazy-commands.ts");
+    let catalog = lazy
+        .split_once("const COMMAND_CATALOG = ")
+        .and_then(|(_, rest)| rest.split_once(" as const;"))
+        .map(|(catalog, _)| catalog)
+        .expect("lazy command catalog");
+    let catalog: JsonValue = serde_json::from_str(catalog).expect("catalog json");
+    assert_eq!(
+        catalog["todo.create"]["inputDefaults"],
+        json!([{"generator": "uuid_v7", "path": ["id"]}])
+    );
     assert!(commands.contains("\"projection\""));
     assert!(commands.contains("\"version\": 2"));
     assert!(commands.contains("\"deltaWireVersion\": 1"));
@@ -3287,9 +3713,9 @@ fn command_protocol_and_extensions_are_preserved_exactly() {
     assert!(sveltekit.contains("createCommands: createGeneratedCommands"));
     assert!(!sveltekit.contains("Readonly<Record<never, never>>"));
 
-    let partial = compile_client(ClientCompileInput::new(
+    let partial = compile(ClientCompileInput::from_manifest_json(
         partial_value,
-        ClientSurfaceSelector::role("user"),
+        ClientSurfaceIdentity::role("user"),
         vec![ClientDocument::new(
             "src/routes/todos/+page.graphql",
             "query Todos { todos { id } }",
@@ -3303,9 +3729,9 @@ fn command_protocol_and_extensions_are_preserved_exactly() {
     assert!(partial_commands.contains("\"kind\": \"record\""));
     assert!(partial_commands.contains("\"required\": false"));
 
-    let absent = compile_client(ClientCompileInput::new(
+    let absent = compile(ClientCompileInput::from_manifest_json(
         absent_value,
-        ClientSurfaceSelector::role("user"),
+        ClientSurfaceIdentity::role("user"),
         vec![ClientDocument::new(
             "src/routes/todos/+page.graphql",
             "query Todos { todos { id } }",
@@ -3320,9 +3746,9 @@ fn command_protocol_and_extensions_are_preserved_exactly() {
     assert!(absent_commands.contains("\"condition\": \"if_record_missing\""));
     assert!(!absent_commands.contains("\"op\": \"upsert\""));
 
-    let absent_object = compile_client(ClientCompileInput::new(
+    let absent_object = compile(ClientCompileInput::from_manifest_json(
         absent_object_value,
-        ClientSurfaceSelector::role("user"),
+        ClientSurfaceIdentity::role("user"),
         vec![ClientDocument::new(
             "src/routes/todos/+page.graphql",
             "query Todos { todos { id } }",
@@ -3335,9 +3761,9 @@ fn command_protocol_and_extensions_are_preserved_exactly() {
     assert!(!absent_object_commands.contains("\"name\": \"missing\""));
     assert!(!absent_object_commands.contains("\"op\": \"upsert\""));
 
-    let null = compile_client(ClientCompileInput::new(
+    let null = compile(ClientCompileInput::from_manifest_json(
         null_value,
-        ClientSurfaceSelector::role("user"),
+        ClientSurfaceIdentity::role("user"),
         vec![ClientDocument::new(
             "src/routes/todos/+page.graphql",
             "query Todos { todos { id } }",
@@ -3357,9 +3783,9 @@ fn command_protocol_and_extensions_are_preserved_exactly() {
         json_object_key_value,
         unknown_partition_value,
     ] {
-        let project = compile_client(ClientCompileInput::new(
+        let project = compile(ClientCompileInput::from_manifest_json(
             fallback,
-            ClientSurfaceSelector::role("user"),
+            ClientSurfaceIdentity::role("user"),
             vec![ClientDocument::new(
                 "src/routes/todos/+page.graphql",
                 "query Todos { todos { id } }",
@@ -3374,9 +3800,9 @@ fn command_protocol_and_extensions_are_preserved_exactly() {
         assert!(fallback_commands.contains("\"required\": true"));
     }
 
-    let delete = compile_client(ClientCompileInput::new(
+    let delete = compile(ClientCompileInput::from_manifest_json(
         delete_value,
-        ClientSurfaceSelector::role("user"),
+        ClientSurfaceIdentity::role("user"),
         vec![ClientDocument::new(
             "src/routes/todos/+page.graphql",
             "query Todos { todos { id } }",
@@ -3388,9 +3814,9 @@ fn command_protocol_and_extensions_are_preserved_exactly() {
     assert!(!delete_commands.contains("\"op\": \"upsert\""));
     assert!(!delete_commands.contains("\"op\": \"patch\""));
 
-    let multi_model = compile_client(ClientCompileInput::new(
+    let multi_model = compile(ClientCompileInput::from_manifest_json(
         multi_model_value,
-        ClientSurfaceSelector::role("user"),
+        ClientSurfaceIdentity::role("user"),
         vec![ClientDocument::new(
             "src/routes/todos/+page.graphql",
             "query Todos { todos { id } }",
@@ -3406,9 +3832,9 @@ fn command_protocol_and_extensions_are_preserved_exactly() {
     assert!(multi_model_commands.contains("\"model\": \"User\""));
 
     for (operation_count, boundary) in capability_boundaries {
-        let compiled = compile_client(ClientCompileInput::new(
+        let compiled = compile(ClientCompileInput::from_manifest_json(
             boundary,
-            ClientSurfaceSelector::role("user"),
+            ClientSurfaceIdentity::role("user"),
             vec![ClientDocument::new(
                 "src/routes/todos/+page.graphql",
                 "query Todos { todos { id } }",
@@ -3427,9 +3853,9 @@ fn command_protocol_and_extensions_are_preserved_exactly() {
     }
 
     for valid_i64 in [input_i64_value, preset_i64_value] {
-        compile_client(ClientCompileInput::new(
+        compile(ClientCompileInput::from_manifest_json(
             valid_i64,
-            ClientSurfaceSelector::role("user"),
+            ClientSurfaceIdentity::role("user"),
             vec![ClientDocument::new(
                 "src/routes/todos/+page.graphql",
                 "query Todos { todos { id } }",
@@ -3445,9 +3871,9 @@ fn command_protocol_and_extensions_are_preserved_exactly() {
         invalid_list_source,
         invalid_preset_source,
     ] {
-        let error = compile_client(ClientCompileInput::new(
+        let error = compile(ClientCompileInput::from_manifest_json(
             invalid_source,
-            ClientSurfaceSelector::role("user"),
+            ClientSurfaceIdentity::role("user"),
             vec![ClientDocument::new(
                 "src/routes/todos/+page.graphql",
                 "query Todos { todos { id } }",
@@ -3457,9 +3883,9 @@ fn command_protocol_and_extensions_are_preserved_exactly() {
         assert_eq!(error.code, "client.manifest.command_projection_source_type");
     }
 
-    let error = compile_client(ClientCompileInput::new(
+    let error = compile(ClientCompileInput::from_manifest_json(
         conflicting_slot_type,
-        ClientSurfaceSelector::role("user"),
+        ClientSurfaceIdentity::role("user"),
         vec![ClientDocument::new(
             "src/routes/todos/+page.graphql",
             "query Todos { todos { id } }",
@@ -3468,9 +3894,9 @@ fn command_protocol_and_extensions_are_preserved_exactly() {
     .expect_err("one opaque slot cannot claim conflicting value types");
     assert_eq!(error.code, "client.manifest.command_projection_slot_type");
 
-    let error = compile_client(ClientCompileInput::new(
+    let error = compile(ClientCompileInput::from_manifest_json(
         top_level_relationship_invalidation,
-        ClientSurfaceSelector::role("user"),
+        ClientSurfaceIdentity::role("user"),
         vec![ClientDocument::new(
             "src/routes/todos/+page.graphql",
             "query Todos { todos { id } }",
@@ -3479,9 +3905,9 @@ fn command_protocol_and_extensions_are_preserved_exactly() {
     .expect_err("top-level relationship invalidation lacks source-key provenance");
     assert_eq!(error.code, "client.manifest.projection_invalidation");
 
-    let no_preview = compile_client(ClientCompileInput::new(
+    let no_preview = compile(ClientCompileInput::from_manifest_json(
         no_preview_value,
-        ClientSurfaceSelector::role("user"),
+        ClientSurfaceIdentity::role("user"),
         vec![ClientDocument::new(
             "src/routes/todos/+page.graphql",
             "query Todos { todos { id } }",
@@ -3494,9 +3920,9 @@ fn command_protocol_and_extensions_are_preserved_exactly() {
     assert!(!no_preview_commands.contains("\"user_rows\""));
 
     for boundary in [occurrence_boundary, value_boundary] {
-        compile_client(ClientCompileInput::new(
+        compile(ClientCompileInput::from_manifest_json(
             boundary,
-            ClientSurfaceSelector::role("user"),
+            ClientSurfaceIdentity::role("user"),
             vec![ClientDocument::new(
                 "src/routes/todos/+page.graphql",
                 "query Todos { todos { id } }",
@@ -3505,9 +3931,9 @@ fn command_protocol_and_extensions_are_preserved_exactly() {
         .expect("projection preview accepts the frozen 128-entry boundary");
     }
     for overflow in [too_many_occurrences, too_many_values] {
-        let error = compile_client(ClientCompileInput::new(
+        let error = compile(ClientCompileInput::from_manifest_json(
             overflow,
-            ClientSurfaceSelector::role("user"),
+            ClientSurfaceIdentity::role("user"),
             vec![ClientDocument::new(
                 "src/routes/todos/+page.graphql",
                 "query Todos { todos { id } }",
@@ -3595,17 +4021,15 @@ fn manifest_v2_parses_exact_projection_program_binding_and_preview_contract() {
     install_create_projection(&mut value);
     refresh_schema_fingerprint(&mut value);
 
-    let parsed = ClientManifest::parse(value, &ClientSurfaceSelector::role("user"))
+    let parsed = parse_manifest(value, &ClientSurfaceIdentity::role("user"))
         .expect("manifest-v2 projection contract");
     assert_eq!(parsed.projection_programs.len(), 1);
     assert_eq!(parsed.projection_programs[0].version, 2);
     assert!(matches!(
         parsed.projection_programs[0].arms[0].partition,
-        super::manifest::ManifestProjectionPartition::Expression { .. }
+        super::manifest::ClientProjectionPartition::Expression { .. }
     ));
     assert_eq!(parsed.projection_bindings.len(), 1);
-    assert!(parsed.commands[0].extensions.effects.is_none());
-    assert!(parsed.commands[0].extensions.confirmations.is_none());
     assert_eq!(
         parsed.commands[0]
             .extensions
@@ -3623,30 +4047,31 @@ fn manifest_v2_has_no_legacy_projection_or_command_authority_decoder() {
     let mut stale_manifest = manifest();
     stale_manifest["manifest_version"] = json!(1);
     refresh_schema_fingerprint(&mut stale_manifest);
-    let error = ClientManifest::parse(stale_manifest, &ClientSurfaceSelector::role("user"))
+    let error = parse_manifest(stale_manifest, &ClientSurfaceIdentity::role("user"))
         .expect_err("manifest v1 must fail closed");
-    assert_eq!(error.code, "client.manifest.version");
+    assert_eq!(error.code, "client.manifest.invalid");
+    assert!(error.message.contains("version 1; expected 2"), "{error}");
 
     let mut stale_command = projected_manifest();
     stale_command["commands"][0]["extensions"]["version"] = json!(1);
     refresh_schema_fingerprint(&mut stale_command);
-    let error = ClientManifest::parse(stale_command, &ClientSurfaceSelector::role("user"))
+    let error = parse_manifest(stale_command, &ClientSurfaceIdentity::role("user"))
         .expect_err("command extensions v1 must fail closed");
-    assert_eq!(error.code, "client.manifest.command_extensions");
+    assert_eq!(error.code, "client.manifest.invalid");
 
-    let mut legacy_effects = projected_manifest();
-    legacy_effects["commands"][0]["extensions"]["effects"] =
+    let mut unknown_extension = projected_manifest();
+    unknown_extension["commands"][0]["extensions"]["effects"] =
         json!({"version": 1, "operations": [], "fallback": "revalidate"});
-    let error = ClientManifest::parse(legacy_effects, &ClientSurfaceSelector::role("user"))
-        .expect_err("legacy effects must not deserialize");
+    let error = parse_manifest(unknown_extension, &ClientSurfaceIdentity::role("user"))
+        .expect_err("unknown command extension slots must not deserialize");
     assert_eq!(error.code, "client.manifest.invalid");
 
     let mut unknown_projection_field = manifest();
     install_create_projection(&mut unknown_projection_field);
     unknown_projection_field["projection_programs"][0]["unexpected"] = json!(true);
-    let error = ClientManifest::parse(
+    let error = parse_manifest(
         unknown_projection_field,
-        &ClientSurfaceSelector::role("user"),
+        &ClientSurfaceIdentity::role("user"),
     )
     .expect_err("unknown projection fields must fail closed");
     assert_eq!(error.code, "client.manifest.invalid");
@@ -3655,9 +4080,9 @@ fn manifest_v2_has_no_legacy_projection_or_command_authority_decoder() {
     install_create_projection(&mut unsupported_program);
     unsupported_program["projection_programs"][0]["version"] = json!(3);
     refresh_schema_fingerprint(&mut unsupported_program);
-    let error = ClientManifest::parse(unsupported_program, &ClientSurfaceSelector::role("user"))
+    let error = parse_manifest(unsupported_program, &ClientSurfaceIdentity::role("user"))
         .expect_err("unknown projection program versions must fail closed");
-    assert_eq!(error.code, "client.manifest.projection_program_version");
+    assert_eq!(error.code, "client.manifest.invalid");
 
     let mut duplicate_operation = manifest();
     install_create_projection(&mut duplicate_operation);
@@ -3669,16 +4094,16 @@ fn manifest_v2_has_no_legacy_projection_or_command_authority_decoder() {
         .unwrap()
         .push(duplicate);
     refresh_schema_fingerprint(&mut duplicate_operation);
-    let error = ClientManifest::parse(duplicate_operation, &ClientSurfaceSelector::role("user"))
+    let error = parse_manifest(duplicate_operation, &ClientSurfaceIdentity::role("user"))
         .expect_err("projection operation IDs must be unique within a program");
     assert_eq!(error.code, "client.manifest.projection_operation_id");
 }
 
 #[test]
 fn generated_command_typescript_covers_typed_json_fields_and_no_input_wrappers() {
-    let project = compile_client(ClientCompileInput::new(
+    let project = compile(ClientCompileInput::from_manifest_json(
         generated_command_types_manifest(),
-        ClientSurfaceSelector::role("user"),
+        ClientSurfaceIdentity::role("user"),
         vec![ClientDocument::new(
             "src/routes/todos/+page.graphql",
             "query Todos { todos { id } }",
@@ -3686,10 +4111,7 @@ fn generated_command_typescript_covers_typed_json_fields_and_no_input_wrappers()
     ))
     .expect("compile generated command type fixture");
     let commands = file(&project, "commands.ts");
-    assert_eq!(
-        commands,
-        include_str!("../../tests/fixtures/generated-commands.ts")
-    );
+    assert_golden("generated-commands.ts", commands);
 }
 
 #[test]
@@ -3699,9 +4121,9 @@ fn generated_command_namespaces_reject_prefix_collisions() {
     value["commands"][1]["name"] = json!("todo.complete");
     refresh_schema_fingerprint(&mut value);
 
-    let error = compile_client(ClientCompileInput::new(
+    let error = compile(ClientCompileInput::from_manifest_json(
         value,
-        ClientSurfaceSelector::role("user"),
+        ClientSurfaceIdentity::role("user"),
         vec![ClientDocument::new(
             "src/routes/todos/+page.graphql",
             "query Todos { todos { id } }",
@@ -3717,10 +4139,9 @@ fn generated_command_namespaces_reject_prefix_collisions() {
 #[test]
 fn projected_command_requires_exact_role_safe_direct_projection() {
     let value = projected_manifest();
-    let parsed = ClientManifest::parse(value, &ClientSurfaceSelector::role("user"))
+    let parsed = parse_manifest(value, &ClientSurfaceIdentity::role("user"))
         .expect("valid projected direct target");
     assert!(parsed.projectors[0].facts.is_empty());
-    assert!(!parsed.projectors[0].causal_confirmation);
     let direct = parsed.commands[0]
         .extensions
         .direct_projection
@@ -3729,14 +4150,13 @@ fn projected_command_requires_exact_role_safe_direct_projection() {
     assert_eq!(direct.topology.version, 1);
     assert_eq!(direct.topology.name, "todos");
     assert_eq!(direct.model, "Todo");
-    assert_eq!(direct.change_epoch, "todos-v1");
     assert!(matches!(
         direct.partition,
-        Some(super::manifest::ManifestEffectExpression::Input { ref path })
+        Some(super::manifest::EffectExpression::Input { ref path })
             if path.as_slice() == ["tenantId"]
     ));
 
-    let project = compile_client(input_with_manifest(
+    let project = compile(input_with_manifest(
         projected_manifest(),
         "query Todos { todos { id } }",
     ))
@@ -3751,31 +4171,21 @@ fn projected_command_requires_exact_role_safe_direct_projection() {
         .expect("extensions")
         .remove("direct_projection");
     refresh_schema_fingerprint(&mut absent);
-    let error = ClientManifest::parse(absent, &ClientSurfaceSelector::role("user"))
+    let error = parse_manifest(absent, &ClientSurfaceIdentity::role("user"))
         .expect_err("projected direct target is mandatory");
     assert_eq!(error.code, "client.manifest.direct_projection_required");
 
     let mut non_projected = projected_manifest();
     non_projected["commands"][0]["extensions"]["consistency"]["kind"] = json!("succeeded");
     refresh_schema_fingerprint(&mut non_projected);
-    let error = ClientManifest::parse(non_projected, &ClientSurfaceSelector::role("user"))
+    let error = parse_manifest(non_projected, &ClientSurfaceIdentity::role("user"))
         .expect_err("succeeded commands cannot carry direct projection metadata");
     assert_eq!(error.code, "client.manifest.direct_projection_unexpected");
-
-    let mut impossible_confirmation = projected_manifest();
-    impossible_confirmation["projectors"][0]["causal_confirmation"] = json!(true);
-    refresh_schema_fingerprint(&mut impossible_confirmation);
-    let error = ClientManifest::parse(
-        impossible_confirmation,
-        &ClientSurfaceSelector::role("user"),
-    )
-    .expect_err("a direct-only owner cannot confirm asynchronous work");
-    assert_eq!(error.code, "client.manifest.projector_inventory");
 
     let mut embedded = projected_manifest();
     embedded["models"][0]["normalization"] = json!({"kind": "embedded"});
     refresh_schema_fingerprint(&mut embedded);
-    let error = ClientManifest::parse(embedded, &ClientSurfaceSelector::role("user"))
+    let error = parse_manifest(embedded, &ClientSurfaceIdentity::role("user"))
         .expect_err("direct projection requires a complete normalized identity");
     assert_eq!(error.code, "client.manifest.direct_projection_model");
 }
@@ -3786,7 +4196,7 @@ fn projected_command_rejects_tampered_topology_and_wrong_owner() {
     tampered["commands"][0]["extensions"]["direct_projection"]["topology"]["digest"] =
         json!(format!("sha256:{}", "AB".repeat(32)));
     refresh_schema_fingerprint(&mut tampered);
-    let error = ClientManifest::parse(tampered, &ClientSurfaceSelector::role("user"))
+    let error = parse_manifest(tampered, &ClientSurfaceIdentity::role("user"))
         .expect_err("topology digest must be canonical lowercase SHA-256");
     assert_eq!(error.code, "client.manifest.hash");
 
@@ -3794,7 +4204,7 @@ fn projected_command_rejects_tampered_topology_and_wrong_owner() {
     wrong_owner["commands"][0]["extensions"]["direct_projection"]["topology"]["name"] =
         json!("other_projector");
     refresh_schema_fingerprint(&mut wrong_owner);
-    let error = ClientManifest::parse(wrong_owner, &ClientSurfaceSelector::role("user"))
+    let error = parse_manifest(wrong_owner, &ClientSurfaceIdentity::role("user"))
         .expect_err("direct target must use the visible model owner");
     assert_eq!(error.code, "client.manifest.direct_projection_owner");
 
@@ -3804,9 +4214,9 @@ fn projected_command_rejects_tampered_topology_and_wrong_owner() {
     trusted_preset["commands"][0]["extensions"]["trusted_presets"] =
         json!([{"name": "current_tenant", "codec": "string"}]);
     refresh_schema_fingerprint(&mut trusted_preset);
-    ClientManifest::parse(trusted_preset.clone(), &ClientSurfaceSelector::role("user"))
+    parse_manifest(trusted_preset.clone(), &ClientSurfaceIdentity::role("user"))
         .expect("scope-bound trusted preset may define a direct target");
-    let project = compile_client(input_with_manifest(
+    let project = compile(input_with_manifest(
         trusted_preset,
         "query Todos { todos { id } }",
     ))
@@ -3881,9 +4291,9 @@ fn rejects_commands_without_causal_identity_or_normative_input_defaults() {
                 "operation_hash": fingerprint(status)
             }
         });
-        compile_client(ClientCompileInput::new(
+        compile(ClientCompileInput::from_manifest_json(
             value,
-            ClientSurfaceSelector::role("user"),
+            ClientSurfaceIdentity::role("user"),
             vec![ClientDocument::new(
                 "src/routes/todos/+page.graphql",
                 "query Todos { todos { id } }",
@@ -3903,7 +4313,7 @@ fn rejects_commands_without_causal_identity_or_normative_input_defaults() {
         compile(command(valid, "uuid_v4"))
             .expect_err("unsupported generator")
             .code,
-        "client.manifest.input_default_generator"
+        "client.manifest.invalid"
     );
 }
 
@@ -3933,23 +4343,23 @@ fn output_is_identical_for_shuffled_documents() {
             "query Todo { todo(tenantId: \"t\", id: \"1\") { title } }",
         ),
     ];
-    let left = compile_client(ClientCompileInput::new(
+    let left = compile(ClientCompileInput::from_manifest_json(
         left_manifest,
-        ClientSurfaceSelector::role("user"),
+        ClientSurfaceIdentity::role("user"),
         docs.clone(),
     ))
     .expect("left");
-    let right = compile_client(ClientCompileInput::new(
+    let right = compile(ClientCompileInput::from_manifest_json(
         right_manifest,
-        ClientSurfaceSelector::role("user"),
+        ClientSurfaceIdentity::role("user"),
         docs.into_iter().rev().collect(),
     ))
     .expect("right");
     assert_eq!(left, right);
 
-    let error = compile_client(ClientCompileInput::new(
+    let error = compile(ClientCompileInput::from_manifest_json(
         tampered_manifest,
-        ClientSurfaceSelector::role("user"),
+        ClientSurfaceIdentity::role("user"),
         vec![ClientDocument::new(
             "src/routes/todos/+page.graphql",
             "query Todos { todos { id } }",
@@ -3977,7 +4387,7 @@ fn manifest_parser_accepts_embedded_by_pk_and_zero_sized_windows() {
     }
     refresh_schema_fingerprint(&mut value);
 
-    ClientManifest::parse(value, &ClientSurfaceSelector::role("user"))
+    parse_manifest(value, &ClientSurfaceIdentity::role("user"))
         .expect("embedded models and zero-sized authorized windows are valid v6 contracts");
 }
 
@@ -3987,7 +4397,7 @@ fn manifest_parser_rejects_execution_limits_outside_javascript_integer_range() {
         let mut value = manifest();
         value["execution"][name] = json!(9_007_199_254_740_992_u64);
         refresh_schema_fingerprint(&mut value);
-        let error = ClientManifest::parse(value, &ClientSurfaceSelector::role("user"))
+        let error = parse_manifest(value, &ClientSurfaceIdentity::role("user"))
             .expect_err("runtime codec limits must remain exact JavaScript integers");
         assert_eq!(error.code, "client.manifest.execution_js_integer", "{name}");
     }
@@ -4023,7 +4433,7 @@ fn manifest_parser_rejects_list_roots_without_executable_query_plan_semantics() 
             });
         refresh_schema_fingerprint(&mut value);
 
-        let error = ClientManifest::parse(value, &ClientSurfaceSelector::role("user"))
+        let error = parse_manifest(value, &ClientSurfaceIdentity::role("user"))
             .expect_err("list roots require the complete executable query-plan contract");
         assert_eq!(error.code, expected_code, "missing {semantic}");
     }
@@ -4035,14 +4445,14 @@ fn manifest_parser_rejects_filter_input_target_and_argument_drift() {
     wrong_target["models"][0]["filter_input"]["relationships"][0]["target_type"] =
         json!("other_bool_exp");
     refresh_schema_fingerprint(&mut wrong_target);
-    let error = ClientManifest::parse(wrong_target, &ClientSurfaceSelector::role("user"))
+    let error = parse_manifest(wrong_target, &ClientSurfaceIdentity::role("user"))
         .expect_err("relationship filter targets must resolve to the target model contract");
     assert_eq!(error.code, "client.manifest.filter_input_target_type");
 
     let mut wrong_argument = manifest();
     wrong_argument["roots"][0]["arguments"][0]["type_name"] = json!("other_bool_exp");
     refresh_schema_fingerprint(&mut wrong_argument);
-    let error = ClientManifest::parse(wrong_argument, &ClientSurfaceSelector::role("user"))
+    let error = parse_manifest(wrong_argument, &ClientSurfaceIdentity::role("user"))
         .expect_err("root filter arguments must name the model filter contract");
     assert_eq!(error.code, "client.manifest.filter_argument_type");
 }
@@ -4061,15 +4471,15 @@ fn manifest_parser_accepts_mixed_per_model_revision_evidence() {
     value["capabilities"]["tombstones"] = json!(false);
     refresh_schema_fingerprint(&mut value);
 
-    ClientManifest::parse(value, &ClientSurfaceSelector::role("user"))
+    parse_manifest(value, &ClientSurfaceIdentity::role("user"))
         .expect("global record evidence describes the selected query footprint, not any model");
 }
 
 #[test]
 fn source_paths_fail_closed_before_they_can_inject_generated_typescript() {
-    let error = compile_client(ClientCompileInput::new(
+    let error = compile(ClientCompileInput::from_manifest_json(
         manifest(),
-        ClientSurfaceSelector::role("user"),
+        ClientSurfaceIdentity::role("user"),
         vec![ClientDocument::new(
             "src/injected*/\nexport const compromised = true;\n/**.graphql",
             "query Safe { todos { id } }",
@@ -4078,4 +4488,362 @@ fn source_paths_fail_closed_before_they_can_inject_generated_typescript() {
     .expect_err("reject adversarial source path");
     assert_eq!(error.code, "client.documents.invalid_path");
     assert!(!error.message.contains("export const compromised"));
+}
+
+#[test]
+fn generated_lazy_commands_defer_definitions_and_preserve_command_signatures() {
+    let project = compile(ClientCompileInput::from_manifest_json(
+        generated_command_types_manifest(),
+        ClientSurfaceIdentity::role("user"),
+        vec![ClientDocument::new(
+            "todos.graphql",
+            "query Todos { todos { id } }",
+        )],
+    ))
+    .expect("compile lazy commands");
+    let lazy = file(&project, "lazy-commands.ts");
+    assert!(lazy.contains("import type { COMMANDS, GeneratedCommandRuntimeOptions }"));
+    assert!(lazy.contains("import('./commands.js')"));
+    assert!(lazy.contains("\"hasInput\": false"));
+    assert!(lazy.contains("\"hasInput\": true"));
+    let wrapper = file(&project, "sveltekit.ts");
+    assert!(wrapper.contains("export function provideDistributedLazy("));
+    assert!(wrapper.contains("createCommands: createLazyCommands"));
+    assert!(wrapper.contains("createCommands: createGeneratedCommands"));
+    assert_golden(
+        "generated-lazy-commands.ts",
+        &lazy.replace("'./commands.js'", "'./generated-commands.js'"),
+    );
+}
+
+fn leaderboard_manifest() -> JsonValue {
+    let mut value = manifest();
+    value["external"]["leaderboards"] = json!([
+        {
+            "name": "xp",
+            "entry_typename": "LeaderboardEntry",
+            "order": "high_first",
+            "boards": "single",
+            "default_first": 3,
+            "max_first": 5,
+            "max_radius": 2,
+            "roots": [
+                {"name": "xpLeaderboard", "operation": "top", "list": true, "live": true,
+                 "arguments": [{"name": "first", "type_name": "Int", "nullable": true}]},
+                {"name": "xpMyRank", "operation": "my_rank", "list": false, "live": true,
+                 "arguments": []}
+            ]
+        },
+        {
+            "name": "season",
+            "entry_typename": "LeaderboardEntry",
+            "order": "low_first",
+            "boards": "family",
+            "default_first": 10,
+            "max_first": 100,
+            "max_radius": 25,
+            "roots": [
+                {"name": "seasonRank", "operation": "rank", "list": false, "live": false,
+                 "arguments": [
+                    {"name": "board", "type_name": "String", "nullable": false},
+                    {"name": "member", "type_name": "String", "nullable": false}
+                 ]}
+            ]
+        }
+    ]);
+    refresh_schema_fingerprint(&mut value);
+    value
+}
+
+const LEADERBOARD_PAGE: &str = r#"
+  query Todos($limit: Int!) {
+    todos(limit: $limit) { title }
+  }
+"#;
+
+#[test]
+fn leaderboard_roots_generate_typed_documents() {
+    let project = compile(input_with_manifest(
+        leaderboard_manifest(),
+        LEADERBOARD_PAGE,
+    ))
+    .unwrap();
+    let generated = file(&project, "leaderboards.ts");
+    assert!(generated.contains("export interface LeaderboardEntry {"));
+    assert!(generated
+        .contains("export type XpLeaderboardVariables = { readonly first?: number | null; };"));
+    assert!(generated.contains(
+        "export type XpLeaderboardData = { readonly xpLeaderboard: readonly LeaderboardEntry[] };"
+    ));
+    assert!(generated.contains(
+        r#"document: "query XpLeaderboard($first: Int) { xpLeaderboard(first: $first) { rank member score } }","#
+    ));
+    assert!(generated.contains(
+        r#"liveDocument: "subscription XpLeaderboard_Live($first: Int) { xpLeaderboard(first: $first) { rank member score } }","#
+    ));
+    // The viewer's rank takes no member argument: the server binds it from
+    // the verified session.
+    assert!(generated.contains("export type XpMyRankVariables = {};"));
+    assert!(generated.contains(r#"document: "query XpMyRank { xpMyRank { rank member score } }","#));
+    assert!(generated.contains(
+        "export type SeasonRankVariables = { readonly board: string; readonly member: string; };"
+    ));
+    assert!(generated.contains("liveDocument: null,"));
+    assert!(generated.contains("\"xpLeaderboard\": XpLeaderboardLeaderboard,"));
+    assert!(file(&project, "index.ts").contains("export * from './leaderboards.js';"));
+    assert_golden("generated-leaderboards.ts", generated);
+}
+
+#[test]
+fn manifests_without_leaderboards_generate_no_module() {
+    let project = compile(input(LEADERBOARD_PAGE)).unwrap();
+    assert!(project
+        .files
+        .iter()
+        .all(|file| file.path != "leaderboards.ts"));
+    assert!(!file(&project, "index.ts").contains("leaderboards"));
+}
+
+type ManifestMutation = Box<dyn Fn(&mut JsonValue)>;
+
+#[test]
+fn malformed_leaderboard_sections_are_refused() {
+    let cases: Vec<(&str, ManifestMutation)> = vec![
+        (
+            "a member argument on my_rank",
+            Box::new(|value: &mut JsonValue| {
+                value["external"]["leaderboards"][0]["roots"][1]["arguments"] =
+                    json!([{"name": "member", "type_name": "String", "nullable": false}]);
+            }),
+        ),
+        (
+            "a live rank root",
+            Box::new(|value: &mut JsonValue| {
+                value["external"]["leaderboards"][1]["roots"][0]["live"] = json!(true);
+            }),
+        ),
+        (
+            "an unknown operation",
+            Box::new(|value: &mut JsonValue| {
+                value["external"]["leaderboards"][0]["roots"][0]["operation"] = json!("everyone");
+            }),
+        ),
+        (
+            "a root colliding with a read-model root",
+            Box::new(|value: &mut JsonValue| {
+                value["external"]["leaderboards"][0]["roots"][0]["name"] = json!("todos");
+            }),
+        ),
+        (
+            "an unknown field",
+            Box::new(|value: &mut JsonValue| {
+                value["external"]["leaderboards"][0]["extra"] = json!(true);
+            }),
+        ),
+        (
+            "a family root without board",
+            Box::new(|value: &mut JsonValue| {
+                value["external"]["leaderboards"][1]["roots"][0]["arguments"] =
+                    json!([{"name": "member", "type_name": "String", "nullable": false}]);
+            }),
+        ),
+    ];
+    for (case, mutate) in cases {
+        let mut value = leaderboard_manifest();
+        mutate(&mut value);
+        refresh_schema_fingerprint(&mut value);
+        let error = compile(input_with_manifest(value, LEADERBOARD_PAGE)).expect_err(case);
+        assert_eq!(error.code, "client.manifest.leaderboard", "{case}: {error}");
+    }
+
+    // A section this compiler does not know is refused.
+    let mut unknown = leaderboard_manifest();
+    unknown["external"]["search"] = json!([{"name": "docs"}]);
+    refresh_schema_fingerprint(&mut unknown);
+    let error = compile(input_with_manifest(unknown, LEADERBOARD_PAGE)).unwrap_err();
+    assert_eq!(error.code, "client.manifest.external", "{error}");
+
+    // A stale fingerprint is still caught.
+    let mut tampered = leaderboard_manifest();
+    tampered["external"]["leaderboards"][0]["max_first"] = json!(50);
+    let error = compile(input_with_manifest(tampered, LEADERBOARD_PAGE)).unwrap_err();
+    assert_eq!(error.code, "client.manifest.schema_fingerprint");
+}
+
+/// The base manifest with the ordered comparisons a keyset needs on
+/// `priority` and the `(tenantId, id)` primary key.
+pub(super) fn window_manifest() -> JsonValue {
+    let mut value = manifest();
+    let operators = json!(["_eq", "_neq", "_gt", "_gte", "_lt", "_lte", "_in", "_nin"]);
+    let widen = |fields: &mut JsonValue| {
+        for field in fields.as_array_mut().expect("filter fields") {
+            if matches!(field["name"].as_str(), Some("priority" | "tenantId" | "id")) {
+                field["operators"] = operators.clone();
+            }
+        }
+    };
+    widen(&mut value["models"][0]["filter_input"]["fields"]);
+    for root in value["roots"].as_array_mut().expect("manifest roots") {
+        if !root["filter"].is_null() {
+            widen(&mut root["filter"]["fields"]);
+        }
+    }
+    refresh_schema_fingerprint(&mut value);
+    value
+}
+
+pub(super) const WINDOW_FEED: &str = r#"
+  query Feed($limit: Int! = 10) @live @window {
+    todos(where: {completed: {_eq: false}}, order_by: [{priority: desc}], limit: $limit) {
+      id
+      tenantId
+      rank: priority
+      title
+    }
+  }
+"#;
+
+#[test]
+fn window_lowers_its_keyset_into_the_where_and_the_artifact() {
+    let project = compile(input_with_manifest(window_manifest(), WINDOW_FEED)).expect("compile");
+    let operation = &project.operations[0];
+    let module = file(&project, &operation.module_path);
+    // The keyset is `order_by` then the primary key ascending, as the server
+    // orders; each column gets one nullable cursor variable.
+    assert!(
+        module.contains(
+            "query Feed($cursor_id: ID, $cursor_priority: Int, $cursor_tenantId: ID, $limit: Int! = 10)"
+        ),
+        "{module}"
+    );
+    assert!(
+        module.contains(
+            "where: {_and: [{completed: {_eq: false}}, {_or: [{priority: {_lt: $cursor_priority}}, {priority: {_eq: $cursor_priority}, tenantId: {_gt: $cursor_tenantId}}, {id: {_gt: $cursor_id}, priority: {_eq: $cursor_priority}, tenantId: {_eq: $cursor_tenantId}}]}]}"
+        ),
+        "{module}"
+    );
+    assert!(!module.contains("@window"), "{module}");
+    assert!(
+        module.contains(
+            "import type { ReplicaWindowOperationArtifact } from '@hops-ops/distributed/replica';"
+        ),
+        "{module}"
+    );
+    assert!(
+        module.contains("readonly \"cursor_priority\"?: number | null;"),
+        "{module}"
+    );
+    let artifact = operation_artifact(&project);
+    assert_eq!(
+        artifact["window"],
+        json!({
+            "limitVariable": "limit",
+            "pageSize": 10,
+            "maxLimit": 100,
+            "keys": [
+                {"field": "priority", "responseKey": "rank", "variable": "cursor_priority", "direction": "desc", "codec": "int32"},
+                {"field": "tenantId", "responseKey": "tenantId", "variable": "cursor_tenantId", "direction": "asc", "codec": "string"},
+                {"field": "id", "responseKey": "id", "variable": "cursor_id", "direction": "asc", "codec": "string"}
+            ]
+        })
+    );
+    // The live companion carries the same keyset `where`.
+    assert!(artifact["live"]["document"]
+        .as_str()
+        .unwrap()
+        .contains("$cursor_id: ID"));
+}
+
+#[test]
+fn window_without_a_where_adds_the_keyset_and_an_explicit_key_keeps_its_direction() {
+    let project = compile(input_with_manifest(
+        window_manifest(),
+        r#"
+          query Feed($limit: Int!) @window {
+            todos(order_by: [{priority: desc}, {id: desc}], limit: $limit) { id tenantId priority }
+          }
+        "#,
+    ))
+    .expect("compile");
+    let module = file(&project, &project.operations[0].module_path);
+    assert!(
+        module.contains("todos(limit: $limit, order_by: [{priority: desc}, {id: desc}], where: {_or: [{priority: {_lt: $cursor_priority}}, {id: {_lt: $cursor_id}, priority: {_eq: $cursor_priority}}, {id: {_eq: $cursor_id}, priority: {_eq: $cursor_priority}, tenantId: {_gt: $cursor_tenantId}}]})"),
+        "{module}"
+    );
+    // No limit default: the root's default limit is the page size.
+    assert_eq!(
+        operation_artifact(&project)["window"]["pageSize"],
+        json!(25)
+    );
+}
+
+#[test]
+fn window_rejects_documents_it_cannot_page_by_keyset() {
+    let cases = [
+        (
+            "offset",
+            "query F($limit: Int!) @window { todos(order_by: [{priority: desc}], limit: $limit, offset: 5) { id tenantId priority } }",
+            "client.window.offset",
+        ),
+        (
+            "literal limit",
+            "query F @window { todos(order_by: [{priority: desc}], limit: 5) { id tenantId priority } }",
+            "client.window.limit",
+        ),
+        (
+            "no order",
+            "query F($limit: Int!) @window { todos(limit: $limit) { id tenantId } }",
+            "client.window.order",
+        ),
+        (
+            "variable order",
+            "query F($limit: Int!, $order: [todo_order_by!]) @window { todos(order_by: $order, limit: $limit) { id tenantId } }",
+            "client.window.order",
+        ),
+        (
+            "nulls ordering",
+            "query F($limit: Int!) @window { todos(order_by: [{priority: desc_nulls_last}], limit: $limit) { id tenantId priority } }",
+            "client.window.order",
+        ),
+        (
+            "nullable key",
+            "query F($limit: Int!) @window { todos(order_by: [{title: asc}], limit: $limit) { id tenantId title } }",
+            "client.window.key",
+        ),
+        (
+            "boolean key",
+            "query F($limit: Int!) @window { todos(order_by: [{completed: asc}], limit: $limit) { id tenantId completed } }",
+            "client.window.key",
+        ),
+        (
+            "key not selected",
+            "query F($limit: Int!) @window { todos(order_by: [{priority: desc}], limit: $limit) { id tenantId } }",
+            "client.window.key_unselected",
+        ),
+        (
+            "cursor variable taken",
+            "query F($limit: Int!, $cursor_id: ID) @window { todos(where: {id: {_eq: $cursor_id}}, order_by: [{priority: desc}], limit: $limit) { id tenantId priority } }",
+            "client.window.variable",
+        ),
+        (
+            "two pages exceed the max limit",
+            "query F($limit: Int! = 51) @window { todos(order_by: [{priority: desc}], limit: $limit) { id tenantId priority } }",
+            "client.window.page_size",
+        ),
+        (
+            "by-pk root",
+            "query F($id: ID!, $tenantId: ID!) @window { todo(id: $id, tenantId: $tenantId) { id } }",
+            "client.window.root",
+        ),
+    ];
+    for (case, source, code) in cases {
+        let error = compile(input_with_manifest(window_manifest(), source)).expect_err(case);
+        assert_eq!(error.code, code, "{case}: {error}");
+    }
+    // A key needs the ordered comparison its direction uses.
+    let error = compile(input(
+        "query F($limit: Int!) @window { todos(order_by: [{priority: desc}], limit: $limit) { id tenantId priority } }",
+    ))
+    .expect_err("priority has no _lt in the base manifest");
+    assert_eq!(error.code, "client.window.key", "{error}");
 }

@@ -20,6 +20,8 @@ pub(crate) struct CompiledOperation {
     pub(crate) variables: Vec<CompiledVariable>,
     pub(crate) variable_codec: CompiledVariableCodec,
     pub(crate) root: CompiledRoot,
+    /// `@window`: the keyset contract the generated `useWindow` pages by.
+    pub(crate) window: Option<CompiledWindow>,
 }
 
 #[derive(Clone, Debug)]
@@ -249,7 +251,7 @@ pub(crate) struct CompiledFilterPlan {
     pub(crate) input: Option<CompiledArgument>,
     pub(crate) fields: Vec<CompiledFilterField>,
     pub(crate) relationships: Vec<CompiledRelationshipPlan>,
-    pub(crate) row_policy: ManifestRowPolicy,
+    pub(crate) row_policy: ClientRowPolicy,
     pub(super) variable_constraints: BTreeMap<String, VariableUseConstraint>,
 }
 
@@ -306,9 +308,9 @@ pub(crate) struct CompiledFilterField {
 pub(crate) struct CompiledRelationshipPlan {
     pub(crate) field: String,
     pub(crate) target_model: String,
-    pub(crate) kind: ManifestRelationshipKind,
-    pub(crate) key_mapping: ManifestRelationshipKeyMapping,
-    pub(crate) maintenance: ManifestRelationshipMaintenance,
+    pub(crate) kind: ClientRelationshipKind,
+    pub(crate) key_mapping: RelationshipKeyMapping,
+    pub(crate) maintenance: ClientRelationshipMaintenance,
     pub(crate) dependencies: Vec<String>,
 }
 
@@ -349,4 +351,6 @@ pub(crate) struct CompiledScalar {
     pub(crate) codec: String,
     pub(crate) nullable: bool,
     pub(crate) expose: bool,
+    /// The exact shape of a `json` field's values, when the model states it.
+    pub(crate) json_type: Option<distributed::table::JsonShape>,
 }

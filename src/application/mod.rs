@@ -6,30 +6,18 @@
 //! HTTP, GraphQL execution, brokers, and deployment clients are not required
 //! to construct these values.
 
-mod capability;
 mod command;
 mod error;
 mod identity;
 mod manifest;
 mod module;
-mod mount;
-mod plan;
+mod projection_contract;
 mod registration;
-mod runtime;
-mod runtime_host;
-mod topology;
+mod surface;
 
-pub use capability::{
-    Capability, CapabilityReason, CapabilityRequirement, SchemaLifecycleRequirement,
-};
 pub use command::{
     admit_command_session, command_roles_require_principal, CommandDefinition, CommandMount,
-    CommandMountFuture, CommandMountHandler, CommandMountRegistrar, CommandSpec, CommandTypeField,
-    CommandTypeSpec, EventSpec, TypeSpec,
-};
-pub(crate) use command::{
-    CommandMountExecution, CommandMountExecutionError, CommandMountExecutionFuture,
-    CommandMountExecutionResult, CommandMountInvocation,
+    CommandMountRegistrar, CommandSpec, CommandTypeField, CommandTypeSpec, EventSpec, TypeSpec,
 };
 pub use error::{ApplicationError, ApplicationResult};
 pub use identity::{canonical_json, sha256_fingerprint, LogicalId};
@@ -42,18 +30,15 @@ pub use manifest::{
 };
 pub use module::{
     ModelFieldSpec, ModelRelationshipSpec, ModelSpec, Module, ModuleBuilder, ModuleManifest,
-    ProjectionSpec, SurfaceAggregateSpec, SurfaceArgumentSpec, SurfaceCommandSpec, SurfaceRootSpec,
-    SurfaceSpec,
+    ProjectionSpec,
 };
-pub use mount::{MountSelector, ProcessPreset};
-pub use plan::{
-    compile_deployment_plan, DeploymentPlan, PlanFingerprint, ProcessIntent, ProcessPlan,
-    DEPLOYMENT_PLAN_SCHEMA_VERSION, MAX_DEPLOYMENT_PLAN_BYTES,
-};
+pub(crate) use projection_contract::compact_projection_program_contract;
+pub use projection_contract::expand_projection_program_contract;
 pub use registration::{Application, ApplicationBuilder, ContractCompiler};
-pub use runtime::{Runtime, RuntimeDialect};
-pub use runtime_host::{bind_single_process, CapabilityProviders, RuntimeHost};
-pub use topology::TopologyIntent;
+pub use surface::{
+    SurfaceAggregateSpec, SurfaceArgumentSpec, SurfaceCommandSpec, SurfaceContract,
+    SurfaceRootSpec, SurfaceSelectionSpec, SurfaceSpec,
+};
 
 /// Compile-time duplicate check emitted by the module macro for generated
 /// command definition IDs. It compares the complete IDs, not a truncated or

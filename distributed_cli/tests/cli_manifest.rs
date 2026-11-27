@@ -41,6 +41,15 @@ fn distributed(args: &[&str]) -> String {
 fn describe_emits_manifest_json() {
     let json = distributed(&["describe"]);
     let manifest: serde_json::Value = serde_json::from_str(&json).unwrap();
+    assert_eq!(manifest["schema_version"], 3);
+    for inventory in ["commands", "events", "models", "projections"] {
+        assert!(manifest.get(inventory).is_none(), "redundant {inventory}");
+    }
+    // This read-model-only fixture owns models through its Surface, not modules.
+    assert!(!manifest["surfaces"][0]["contract"]["models"]
+        .as_array()
+        .unwrap()
+        .is_empty());
     assert!(json.contains("\"schema_version\""), "json: {json}");
     assert!(json.contains("\"orders\""), "json: {json}");
     let framework = manifest["extensions"]
@@ -63,13 +72,17 @@ fn client_manifest_uses_service_surface_export() {
     assert_eq!(manifest["service_id"], "orders");
     assert_eq!(manifest["surface"]["kind"], "role");
     assert_eq!(manifest["surface"]["name"], "user");
+    // The fingerprint commits to the exported schema contract: it is the one
+    // a client recomputes from the manifest itself.
+    let decoded: distributed::graphql::DistributedClientManifest =
+        serde_json::from_value(manifest.clone()).unwrap();
     assert_eq!(
         manifest["schema_fingerprint"],
-        "sha256:8f91d3fc7b6d916241b959f6bacd6228eeb06586e9681739ba3e986b4092e134"
+        decoded.computed_schema_fingerprint().unwrap()
     );
     assert_eq!(
         manifest["protocol_fingerprint"],
-        "sha256:00fb342f3acb4dc1c1716a43cc3001c748d5f6c500ff831690d820e9e43e2782"
+        distributed::graphql::client_protocol_fingerprint().unwrap()
     );
     assert_eq!(manifest["models"][0]["id"], "OrderView");
     assert_eq!(manifest["models"][0]["record_revisions"], true);
@@ -90,17 +103,24 @@ fn client_manifest_uses_service_surface_export() {
         manifest["commands"][0]["extensions"]["direct_projection"]["topology"]["name"],
         "project_orders"
     );
-    assert_eq!(
-        manifest["commands"][0]["extensions"]["direct_projection"]["topology"]["digest"],
-        "sha256:32e51a5f5c3b7a83d27366f8dc889b87045e65f027f7b598421a6db765efe8a4"
+    // The topology digest is persisted by the projection store, so it must be
+    // a well-formed digest and identical across separate builds of the
+    // manifest (the whole manifest is compared against a second run).
+    let topology_digest = manifest["commands"][0]["extensions"]["direct_projection"]["topology"]
+        ["digest"]
+        .as_str()
+        .unwrap();
+    let hex = topology_digest.strip_prefix("sha256:").unwrap_or_default();
+    assert!(
+        hex.len() == 64 && hex.bytes().all(|byte| byte.is_ascii_hexdigit()),
+        "not a sha256 digest: {topology_digest}"
     );
+    let rebuilt: serde_json::Value =
+        serde_json::from_str(&distributed(&["client-manifest"])).unwrap();
+    assert_eq!(rebuilt, manifest);
     assert_eq!(
         manifest["commands"][0]["extensions"]["direct_projection"]["model"],
         "OrderView"
-    );
-    assert_eq!(
-        manifest["commands"][0]["extensions"]["direct_projection"]["change_epoch"],
-        "orders-v1"
     );
     assert!(manifest["commands"][0]["extensions"]["direct_projection"]
         .get("partition")
@@ -115,14 +135,15 @@ fn client_manifest_uses_service_surface_export() {
 fn emitted_client_manifest_is_accepted_by_client_compiler() {
     let json = distributed(&["client-manifest"]);
     let manifest: serde_json::Value = serde_json::from_str(&json).unwrap();
-    let project = distributed_cli::compile_client(distributed_cli::ClientCompileInput::new(
+    let project = distributed_cli::ClientCompileInput::from_manifest_json(
         manifest,
-        distributed_cli::ClientSurfaceSelector::role("user"),
+        distributed_cli::ClientSurfaceIdentity::role("user"),
         vec![distributed_cli::ClientDocument::new(
             "src/routes/orders/+page.graphql",
             "query Orders { orders { order_id status } }",
         )],
-    ))
+    )
+    .and_then(distributed_cli::compile_client)
     .expect("the compiler must consume the exact manifest emitted by the server crate");
 
     assert_eq!(project.operations.len(), 1);

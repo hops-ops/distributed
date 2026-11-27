@@ -26,6 +26,7 @@ export {
 	type DistributedLiveResumeExtensions,
 	type DistributedOpaqueString,
 	type DistributedProjectionExpectation,
+	type DistributedObservedRecord,
 	type DistributedProjectionObservation,
 	type DistributedProtocolValue,
 	type DistributedProtocolEnvelope,
@@ -36,9 +37,7 @@ export {
 	type DistributedTrustedPresetCodec,
 	type GraphqlResponseExtensions
 } from './protocol.js';
-export { documentToString, type GqlDocument } from './document.js';
 export {
-	applyWsDevHeaderParams,
 	buildAuthHeaders,
 	wsConnectionInitPayload
 } from './auth-headers.js';
@@ -50,7 +49,10 @@ export {
 export {
 	graphqlWsUrl,
 	httpUrlToWsUrl,
-	subscribe,
+	createGraphqlWsConnection,
+	GraphqlWsError,
+	type GraphqlWsConnection,
+	type GraphqlWsConnectionOptions,
 	type GqlWsHandlers,
 	type GqlWsResult,
 	type SubscribeOptions,

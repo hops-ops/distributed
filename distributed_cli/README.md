@@ -1,19 +1,20 @@
 # distributed_cli (`distributed`)
 
 Service tooling for [Distributed](https://crates.io/crates/distributed): a `distributed`
-binary — and a library — that scaffolds service crates, inspects a service's
+binary — and a library — that builds and runs applications, inspects a service's
 logical ApplicationManifest, and renders physical read-model schema artifacts
 (SQL or an Atlas Operator resource).
 
+The CLI, the `distributed` crate and the `@hops-ops/distributed` npm package
+release together, and an application must use one version of all three.
+From a checkout of this repository, run the CLI through Cargo:
+
 ```bash
-cargo install distributed_cli   # installs the `distributed` binary
+cargo run -p distributed_cli --bin distributed -- <command>
 ```
 
-It is also a library, so another CLI can mount its commands instead of
-reimplementing them. `hops`, for example, exposes the same surface under
-`hops service` by depending on this crate and dispatching with
-`distributed_cli::run`. **Everything below documented as `distributed <cmd>` is also
-available as `hops service <cmd>`.**
+Once a matching release is published, `cargo install distributed_cli
+--version <x.y.z>` installs the `distributed` binary.
 
 ## `distributed build` — one coherent application generation
 
@@ -31,8 +32,8 @@ process-supervisor JSON.
 
 The CLI asks Cargo for the workspace model, locates the crate that exports the
 typed `ApplicationManifest`, locates the runtime binary, and detects
-`ui/package.json`. A generated scaffold records the two Rust targets in Cargo
-package metadata. Existing workspaces with one conventional `*-service` library
+`ui/package.json`. A single-crate service names the two Rust targets in Cargo
+package metadata (`[package.metadata.distributed.application]` and `.runtime`). Existing workspaces with one conventional `*-service` library
 and one runtime binary need no metadata at all.
 
 The typed application export is the semantic boundary. It is composed from the
@@ -59,12 +60,24 @@ document, boundary binding, or UI build therefore leaves the prior generation
 active.
 Lifecycle receipts, the application manifest, and generated client trees are
 tool-owned state under `.distributed/lifecycle/`.
+During `distributed dev`, each process launch has a supervisor-owned identity.
+Client-only generations can retain an unchanged API process: the active cohort
+explicitly admits that instance, and its GraphQL responses advertise the current
+generation. Preparing, replaced and retired instances cannot dispatch mutations.
+Rollback launches receive new identities; schema compatibility alone never
+authorizes an old process. Upgrade the CLI and runtime together and restart dev
+after an upgrade so every member receives the matching lifecycle contract.
 Rust binaries remain in Cargo's target directory and SvelteKit output remains
 in its adapter-selected output directory.
 
-Use `--output json` for a machine-readable lifecycle report. The compatibility
-flags `--root`, `--catalog`, and `--config` exist for older low-level lifecycle
-fixtures; normal application builds do not use them.
+The discovered lifecycle also carries the absolute executable that initiated the
+CLI through its trusted compiler and UI child processes. Generated client
+commands therefore use that exact binary even when another `distributed`
+executable appears earlier on `PATH`, regardless of a project-local command
+override. Standalone Vite integrations retain their documented command setting
+and fallback behavior.
+
+Use `--output json` for a machine-readable lifecycle report.
 
 ## `distributed dev` — coherent local supervision
 
@@ -74,9 +87,9 @@ distributed dev
 ```
 
 `distributed dev` first generates and activates the typed application manifest
-and every declared client, then starts the Cargo runtime and `npm run dev` for
-`ui/`, waits for both readiness probes, and prints the usable API and browser
-URLs. No generated client tree or generation preflight exists in application
+and every declared client, then starts the Cargo runtime and the UI dev server
+(`npm run dev` in `ui/` unless the project says otherwise, below), waits for
+both readiness probes, and prints the usable API and browser URLs. No generated client tree or generation preflight exists in application
 source. Vite owns Svelte/CSS HMR; GraphQL or binding-only changes rebuild the
 client node without restarting Rust, while Rust contract changes rebuild the
 application and its downstream clients together. The browser switches
@@ -86,43 +99,53 @@ groups and their descendants.
 
 Shell environment variables win. The CLI then loads `<project-name>.env` and
 `.env` when present, without displaying their values. `BIND` selects the API
-address; `UI_HOST` and `UI_PORT` select the Vite URL. Infrastructure setup is
+address; `UI_HOST` and `UI_PORT` select the UI URL. Infrastructure setup is
 still project-specific—for example, the e2e UI's `make up` creates its local
 Zitadel/Postgres environment—but starting the application no longer needs a
 lifecycle shell script.
 
+### The UI and the addresses, in workspace metadata
+
+A SvelteKit project in `ui/` that uses npm needs no configuration. Anything
+else about the UI, and the addresses `dev` uses, is declared in the Cargo
+workspace's metadata; there is no other configuration file. Every key is
+optional, and an unknown key is an error:
+
+```toml
+[workspace.metadata.distributed.runtime]
+bind = "127.0.0.1:8791"            # API address; `BIND` overrides it
+
+[workspace.metadata.distributed.ui]
+path = "ui"                        # the UI directory, relative to the workspace
+package_manager = "npm"            # the program every command below is given to
+install = ["ci"]                   # default: `ci` beside package-lock.json, else `install`
+check = ["run", "check", "--if-present"]   # `distributed build`; [] skips the step
+build = ["run", "build"]
+dev = ["run", "dev", "--", "--host", "{host}", "--port", "{port}"]
+host = "localhost"                 # `UI_HOST` overrides it
+port = 5180                        # `UI_PORT` overrides it
+
+# Environment of the UI dev server, beyond what the CLI itself provides
+# (`DISTRIBUTED_API_ORIGIN`). `{api_url}` and `{ui_url}` are this session's
+# URLs. A value without a placeholder is the project's development default:
+# the shell or an `.env` file overrides it.
+[workspace.metadata.distributed.ui.env]
+AUTH_URL = "{ui_url}"
+```
+
+The CLI names no application variable and holds no secret: a project that needs
+a local-only secret for its dev server declares it here, as `tests/e2e-ui` does.
+
 The lifecycle CLI contract has black-box Bats coverage. It builds and starts a
-generated Rust application plus conventional SvelteKit project with no lifecycle JSON,
-as well as lower-level coverage for atomic activation, rollback, selective
-restarts, readiness, cancellation, and descendant cleanup:
+generated Rust application plus conventional SvelteKit project with no lifecycle
+configuration, and drives a small Cargo project
+(`tests/fixtures/lifecycle-project`) through atomic activation, drift checks,
+selective restarts, readiness, cancellation, and descendant cleanup:
 
 ```bash
 # Requires Bats; CI installs the pinned version used by the project.
 make test-cli-lifecycle
 ```
-
-## `distributed scaffold <name>` — generate a service crate
-
-```bash
-distributed scaffold orders --store postgres --transport http --gitops
-```
-
-Writes a ready-to-build Distributed service under `./<name>` (override with
-`--path`). Common flags: `--store <postgres|sqlite|in-memory>`, `--transport
-<http|knative>`, `--model <name>` (repeatable), `--read-models`, `--command` /
-`--event` (repeatable), `--bus <rabbitmq|kafka|psql|nats>`, `--gitops`,
-`--metrics prometheus`, `--tracing` / `--otel`, `--gitops-promote <argo|flux>`,
-`--github OWNER/REPO`, `--force`. See `distributed scaffold --help` for the full list.
-
-When used with `--gitops`, `--metrics prometheus` emits Prometheus Operator
-`ServiceMonitor` and `PrometheusRule` templates for HTTP services. The
-generated values default both resources to disabled; enable them only in
-clusters with the Prometheus Operator CRDs installed. Plain `--gitops` does not
-emit `monitoring.coreos.com` resources.
-
-`--tracing` enables Distributed's optional `otel` span feature, emits a default
-OTLP tracing setup in the generated `main.rs`, and renders OTLP environment
-values in the Helm chart without hard-coding an endpoint.
 
 ## `distributed skills init` — extract agent skills into a project
 
@@ -132,11 +155,11 @@ distributed skills list                    # names + descriptions of the embedde
 ```
 
 Materializes the **agent skills** embedded in the binary — markdown guidance
-for coding agents on using Distributed (`distributed-usage`, `distributed-ci`,
+for coding agents on using Distributed (`distributed-usage`, `distributed-deploy`,
 `distributed-schema`) — into `.distributed/skills/<name>/SKILL.md` (override
 the container with `--path <dir>`, which yields `<dir>/skills/...`). No network
-and no repo checkout: the binary that scaffolded your service carries the
-matching guidance for it.
+and no repo checkout: the binary carries the guidance that matches its
+own version.
 
 `--agents <list>` wires the skills for native discovery by agent harnesses.
 The canonical files live under the container; each harness location gets a
@@ -168,7 +191,8 @@ application-manifest entrypoint — by default `<crate>::application_manifest`.
 `<crate>::read_model_catalog`. Keep those owners separate:
 
 ```rust
-use distributed::{ReadModelCatalog, ReadModel};
+use distributed::read_model::ReadModel;
+use distributed::table::ReadModelCatalog;
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, ReadModel)]
@@ -237,7 +261,9 @@ from that selected surface. The runtime applies GraphQL singleton-list coercion,
 canonical scalar encoding, unknown-field rejection, and deterministic deep
 freezing before variables can identify a cache entry or reach the network.
 Manifest v7 and variable codec v2 carry the selected service's exact
-`max_depth`, `max_bool_width`, and `max_in_list` contract. Static literal and
+`max_depth`, `max_bool_width`, and `max_in_list` contract, and its `max_rows`
+budget ([query cost](../docs/graphql-query-cost.md)): an operation whose
+literal or default page sizes already exceed it fails to compile. Static literal and
 mixed-variable filters are rejected during generation when their known shape
 exceeds those limits; runtime variables carry per-use `filterBaseDepth` and
 `maxItems` constraints. Reused variables receive the most restrictive
@@ -252,6 +278,72 @@ supports typed explicit boundary registration when static discovery cannot
 prove ownership. Unsupported or unprovable selections fail at build time with
 their source location; the compiler does not emit a partial normalization plan
 or an adapter-specific route registry.
+
+## `distributed game-manifest` / `game-client` / `game-wasm` — typed game clients
+
+For [`distributed_game`](../distributed_game/README.md#generated-clients)
+zones. The zone's authoring derives (`#[derive(Replicated)]`,
+`#[derive(GameInput)]`, `#[derive(GameEvent)]`, `#[predict]`,
+`#[game_pure]`) describe a versioned `GameSurface` (schema v3): kinds with
+fields, wire types, priorities and client correction defaults, the input
+layout with its sanitize rules, events and the records they mention, the
+zone's client-predicted step, pure functions compiled to WebAssembly,
+constants and standalone record codecs. It is deliberately separate from
+the GraphQL client manifest above.
+
+```bash
+# Build and run the crate's surface export through the manifest harness
+# (default entrypoint `<crate>::game_surface`).
+distributed game-manifest --manifest-path game/Cargo.toml \
+  --entrypoint my_game::arena::game_surface --out target/arena.surface.json
+
+# Generate TypeScript (imports only `@hops-ops/distributed/game`).
+distributed game-client --manifest target/arena.surface.json --out web/src/generated/arena
+
+# CI: compare without writing (also catches surface drift via surface.json)
+distributed game-client --manifest target/arena.surface.json --out web/src/generated/arena --check
+
+# Compile the zone's `#[predict]` step and `#[game_pure]` functions to
+# web/src/generated/arena/wasm/arena.wasm
+# (skipped when the stamp says the sources are unchanged; --check verifies only).
+distributed game-wasm --manifest target/arena.surface.json --manifest-path game/Cargo.toml \
+  --out web/src/generated/arena
+```
+
+`game-manifest` accepts the same `--path` / `--manifest-path` /
+`--package` / `--features` / `--no-default-features` options as `describe`
+and validates the JSON it prints (or writes with `--out`). `game-client`
+owns its `--out` directory: it writes `schema.ts` (kind ids, typed field
+interfaces and accessors, wire types, correction defaults), `input.ts`
+(input interface, bit maps, encoder/decoder/sanitize), `events.ts` (record
+and event types, codecs, `onEvent`), `client.ts` (`create<Name>Client`, a
+`GameClient` with the encoder and corrections wired in and typed `on`),
+`index.ts` and `surface.json`, removes stale files it generated earlier,
+and refuses to delete files it did not. Output is deterministic.
+`--import-extension ts|js|none` picks the specifier style between the
+generated files (default `ts`, for Vite and Node type stripping). A surface
+with a predicted step also gets `predict.ts` (state and context layouts,
+`PREDICT_WASM_URL`, `create<Name>Prediction`), and `create<Name>Client`
+predicts with the compiled step by default. Pure functions add `pures.ts`
+(`create<Name>Pures`, one typed synchronous wrapper per function over the
+same module), constants add `constants.ts` (typed literals; floats are the
+exact binary32 values, and each value is validated against its type), and
+record codecs add `encode<Record>` / `decode<Record>` to `events.ts`.
+
+`game-wasm` builds the Cargo package the surface names as the declarer of
+its step and pure functions (one package per surface; `cargo rustc
+--release --target wasm32-unknown-unknown --crate-type cdylib`; install the
+target with `rustup target add wasm32-unknown-unknown`), checks the module
+is self-contained (no imports) and exports the ABI (`memory`,
+`dg_predict_abi`, `dg_predict_buffer`, `dg_predict_<step>`, every
+`dg_pure_<fn>`), and writes `<out>/wasm/<surface>.wasm` plus a stamp (the
+source fingerprint of the package and its local dependencies — the same
+one browser WASM pures use — the `rustc` identity, the required exports
+and the module hash). A surface with neither a step nor pure functions is
+an error. The module is a build output:
+keep `wasm/` out of version control and run `game-wasm` before bundling.
+Unlike browser WASM pures it needs no wasm-pack, wasm-bindgen glue or JSON
+bridge; the SDK instantiates the module directly over a binary ABI.
 
 ## `distributed describe` — manifest as JSON
 

@@ -16,7 +16,7 @@ import type { DemoWalkthrough, WalkthroughSample } from './types';
  * Query tabs must include the read-model struct, not only permissions or GraphQL.
  *
  * Service tab must always show:
- * - this demo modules/*.rs slice (MODULE_ID + routes)
+ * - this demo modules/*.rs slice (routes)
  * - compose.build_service (how modules join one Service)
  * - host.run (database, bus, workers, GraphQL serve)
  * - runner main (environment → run)
@@ -38,18 +38,25 @@ const hostAndRunnerSamples: WalkthroughSample[] = [
 		code: `// host.rs — library API used by the runner binary
 pub async fn run(
   database_url: &str,
-  options: HostOptions, // bind + IdentityConfig
+  options: HostOptions, // bind, identity, origins, gateway delivery
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
-  // Connect SQLite or Postgres. Create tables. Open the bus.
-  let service = build_service(repo, locks, read_models).with_bus(bus);
-  let gql = build_graphql_engine(&repo, &service, identity, Some(change_rx))?;
+  // postgres:// → PostgresStores, else SqliteStores; one host for both.
+  host(SqliteStores::connect(database_url).await?, options).await
+}
+
+async fn host<St: SqlStores>(stores: St, options: HostOptions) -> Result<(), BoxError> {
+  stores.bootstrap_read_models(read_models().catalog()).await?;
+  // with_bus also drains the outbox to the bus.
+  let service = build_service(&stores).with_bus(stores.bus("e2e-ui"));
+  let gql = build_graphql_engine_with_delivery(
+    stores.graphql_pool(), &service, options.identity.clone(), Some(change_rx), versions,
+  )?;
   let service = Arc::new(service.try_with_graphql(gql)?);
 
-  spawn_outbox_publish_loop(/* … */);
-  spawn_service_consumer_loop(|| build_service(/* … */).with_bus(bus));
-  // Optional Zitadel scrape loop.
+  spawn_service_consumer_loop(move || build_service(&stores).with_bus(stores.bus("e2e-ui")));
+  spawn_zitadel_scrape(service.clone()); // only when Zitadel env is set
 
-  serve_with_oidc(service, identity, &options.bind).await
+  serve(service, &options).await
 }`
 	},
 	{
@@ -66,6 +73,11 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     HostOptions {
       bind,
       identity: identity_from_env(), // OidcBearer or DevHeaders
+      public_origin: env::var("PUBLIC_ORIGIN")
+        .unwrap_or_else(|_| "http://localhost:8791".into()),
+      ui_origin: env::var("UI_INTERNAL_ORIGIN")
+        .unwrap_or_else(|_| "http://localhost:5180".into()),
+      delivery, // GATEWAY_DELIVERY=none|all
     },
   )
   .await
@@ -79,7 +91,7 @@ export const todosWalkthrough: DemoWalkthrough = {
 	title: 'Todos',
 	kicker: 'Query, then command, then domain, then projection',
 	summary:
-		'This page loads one GraphQL query into the client replica. Todo commands are Eventual. The client shows a safe preview from the command input and the domain transition. The event handler applies the same mutation program later. The client waits for projection obligations. The client does not wait for a response row. The same portable_command! declarations mount on a local Service (tests/e2e-ui) or wait-dispatch create and complete to a cell (tests/e2e-celld).',
+		'This page loads one GraphQL query into the client replica. Todo commands are Eventual. The client shows a safe preview from the command input and the domain transition. The event handler applies the same mutation program later. The client waits for projection obligations. The client does not wait for a response row. The same command! declarations mount on a local Service (tests/e2e-ui) or wait-dispatch every Todo transition to a cell (tests/e2e-celld).',
 	tabs: [
 {
 			id: 'query',
@@ -119,8 +131,8 @@ pub struct Todos {
 				{
 					file: 'readmodels/models/todos.rs · permissions',
 					caption: 'A user can read only the rows that the user owns. An admin can read all rows.',
-					code: `impl Todos {
-  pub fn permissions() -> ModelPermissions<Self> {
+					code: `impl AuthorizedReadModel for Todos {
+  fn permissions() -> ModelPermissions<Self> {
     ModelPermissions::new()
       .grant(
         "user",
@@ -150,16 +162,18 @@ const todos = $derived($query.complete ? $query.data.todos : []);`
 			samples: [
 				{
 					file: 'routes/todos/+page.svelte',
-					caption: 'Call the generated command. The replica cache updates the UI. Do not change local component state for this list.',
+					caption: 'Call the generated command. `todo_id` is a `uuid_v7()` input default. The replica cache updates the UI, and `$query.pending.has(row)` marks a preview until the server row replaces it. Do not keep local pending state for this list.',
 					code: `const commands = useCommands();
 
 await commands.todo.create({ title: text });
-await commands.todo.complete({ todo_id });`
+await commands.todo.complete({ todo_id });
+
+{@const saving = $query.pending.has(t)}`
 				},
 				{
-					file: 'todo-domain/src/commands.rs · complete',
+					file: 'todo-domain/src/commands/complete.rs',
 					caption: 'A thin portable command is shard + invoke + Eventual. The host does not write a handler body.',
-					code: `portable_command! {
+					code: `command! {
   name: "todo.complete",
   transition: domain_commands::Complete,
   aggregate: Todo,
@@ -170,13 +184,13 @@ await commands.todo.complete({ todo_id });`
   roles: ["user", "admin"],
   field: "todos_complete",
   invoke: |todo, _input, principal| todo.complete(principal),
-  payload: |todo| TodoStatusPayload::from_todo(&**todo),
+  payload: |todo, _principal| TodoStatusPayload::from_todo(&**todo),
 }`
 				},
 				{
 					file: 'modules/todo.rs · mount',
 					caption: 'The service (or cell) mounts the same domain values. Roles and handlers live in todo-domain.',
-					code: `Routes::for_aggregate::<R, L, Todo, S>(repo, locks, read_models)
+					code: `Routes::for_aggregate(stores)
   .mount(todo_domain::commands::create())
   .mount(todo_domain::commands::complete())
   .mount(todo_domain::commands::force_archive())`
@@ -186,44 +200,34 @@ await commands.todo.complete({ todo_id });`
 {
 			id: 'handlers',
 			label: '3 · Handlers',
-			lede: 'Most Todo commands are thin: load or create, invoke one domain method, commit Eventual. The framework writes that handler. `todo.create` and `todo.force_archive` still use a handle function when the body needs extra checks or payload fields. Either way, ctx.repo() is the capability. The host is SQLite, Postgres, or a cell.',
+			lede: 'Todo commands are thin: load or create, invoke one domain method, commit Eventual. The framework writes that handler. A command that needs more, like `chat.post`, names a handle function. Either way, ctx.repo() is the capability. The host is SQLite, Postgres, or a cell.',
 			principle: 'A command changes the write model. A table is only for reads.',
 			samples: [
 				{
-					file: 'todo-domain/src/commands.rs · complete (thin)',
+					file: 'todo-domain/src/commands/complete.rs · thin',
 					caption: 'No CausalCommandContext body. The mount loads by shard, invokes the domain, and commits Eventual.',
-					code: `portable_command! {
+					code: `command! {
   name: "todo.complete",
   // …
   load: required,
   invoke: |todo, _input, principal| todo.complete(principal),
-  payload: |todo| TodoStatusPayload::from_todo(&**todo),
+  payload: |todo, _principal| TodoStatusPayload::from_todo(&**todo),
 }`
 				},
 				{
-					file: 'todo-domain/src/commands.rs · handle_create',
-					caption: 'Escape hatch: get the principal, create the aggregate, call the domain, commit Eventual.',
-					code: `portable_command! {
+					file: 'todo-domain/src/commands/create.rs · thin',
+					caption: 'Still thin. `load: create` rejects an id that already has a todo. The principal comes from the session, never from the input.',
+					code: `command! {
   name: "todo.create",
   // …
+  load: create,
   guard: authenticated_user,
-  handle: handle_create,
+  invoke: |todo, input, principal| todo.create(&input.todo_id, principal, &input.title),
+  payload: |todo, _principal| { /* TodoCreatePayload from the todo */ },
   defaults: command_input_defaults! {
     input: TodoCreateInput;
     default input.todo_id = uuid_v7();
   },
-}
-
-pub async fn handle_create(
-  ctx: &CausalCommandContext<'_, Todo>,
-  input: TodoCreateInput,
-) -> Result<PreparedCommand<Eventual<TodoCreatePayload>>, HandlerError> {
-  let owner = principal(ctx)?;
-  let repo = ctx.repo();
-  let mut todo = repo.create();
-  todo.create(&input.todo_id, &owner, &input.title)
-    .map_err(rejected)?;
-  repo.publish_events().commit(todo)?.eventual(/* payload */)
 }`
 				}
 			]
@@ -237,8 +241,10 @@ pub async fn handle_create(
 				{
 					file: 'todo-domain · Todo',
 					caption: 'This aggregate is the consistency boundary for one todo.',
-					code: `#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+					code: `#[derive(Debug, Clone, Default, Serialize, Deserialize, Snapshot)]
+#[snapshot(id = "todo_id")]
 pub struct Todo {
+  #[serde(skip, default)]
   pub entity: Entity,
   pub todo_id: String,
   pub owner_id: String,
@@ -291,7 +297,6 @@ fn record_completed(&mut self) {
   pub const TODOS: ProjectionDescriptor<EventualOnly> = {
     name: "project_todos",
     version: 1,
-    epoch: "e2e-ui-todos-v2",
     model: Todos,
     on {
       events: [
@@ -345,65 +350,56 @@ mutation DeleteTodo {
 {
 			id: 'service',
 			label: '6 · Service + host',
-			lede: 'The domain crate is the same on both hosts. `tests/e2e-ui` is one process: SQLite or Postgres, a bus, GraphQL, and Eventual projectors. `tests/e2e-celld` is the same UI and GraphQL process, but Todo create and complete wait-dispatch to a cell (one private SQLite per todo id). GraphQL, `@live`, and projectors are not cell methods. Chat posts also wait-dispatch to a Chat cell on that path; Blob stays in-process.',
+			lede: 'The domain crate is the same on both hosts. `tests/e2e-ui` is one process: SQLite or Postgres, a bus, GraphQL, and Eventual projectors. `tests/e2e-celld` is the same UI and GraphQL process, but every Todo transition wait-dispatches to a cell (one private SQLite per todo id). GraphQL, `@live`, and projectors are not cell methods. Chat posts also wait-dispatch to a Chat cell on that path; Blob stays in-process.',
 			principle: 'Compose modules into one Service. Let the host start the process. Keep the runner small.',
 			samples: [
 				{
-					file: 'modules/todo.rs · MODULE_ID + routes()',
-					caption: 'This module lists the Todo commands and the Eventual projector. Both hosts call the same mounts.',
-					code: `pub const MODULE_ID: &str = "todo";
-
-pub fn routes<R, L, S>(...) -> TodoRoutes<R, L, S> {
-  Routes::for_aggregate::<R, L, Todo, S>(repo, locks, read_models)
+					file: 'modules/todo.rs · routes()',
+					caption: 'This module lists the Todo commands and the Eventual projection. Both hosts call the same mounts.',
+					code: `pub fn routes<St: ServiceStores>(
+  stores: &St,
+  projections: &LocalProjectionMounts,
+) -> Routes<AggregateDependencies<St, Todo>> {
+  Routes::for_aggregate(stores)
     .mount(todo_domain::commands::create())
     .mount(todo_domain::commands::complete())
     // … rename, reopen, archive, force_archive, purge …
-    .modeled_projector(todo_projector)
-    .handle(handlers::events::project_todos::handle)
+    .consume_projection(projections.projector(TODOS))
 }`
 				},
 				{
 					file: 'modules/compose.rs · build_service',
 					caption: 'List each module here. Do not hide composition in infrastructure code.',
-					code: `let todos = todo::routes(repo.clone(), locks.clone(), read_models.clone(), projections.todo);
-let chat = chat::routes(/* … */);
-let blob = blob::routes(/* … */);
-
-Service::new()
+					code: `Service::new()
   .named("e2e-ui")
-  .routes(todos)
-  .routes(chat)
-  .routes(blob)`
+  .routes(todo::routes(stores, &projections))
+  .routes(chat::routes(stores, &projections))
+  .routes(blob::routes(stores))
+  .routes(identity::routes(stores, &projections))`
 				},
 				{
-					file: 'application.rs · inventory',
-					caption: 'The surface names and the module list live at the service root.',
-					code: `pub const E2E_UI_APPLICATION: &str = "e2e-ui";
-pub const E2E_UI_MODULE_IDS: &[&str] = compose::MODULE_IDS;
-// todo | chat | blob | identity`
+					file: 'graphql.rs · application',
+					caption: 'The application manifest is derived from the Service. Its modules are the command namespaces. Do not list them by hand.',
+					code: `pub fn application(service: &Service) -> Result<Application, ApplicationError> {
+  let surface = SurfaceSpec::from_surface(E2E_UI_APPLICATION, &full_surface(service)?)?;
+  service.application(E2E_UI_APPLICATION, surface)
+}
+// modules: blob | chat | todo | zitadel`
 				},
 				...hostAndRunnerSamples,
 				{
-					file: 'e2e-celld · CelldTodoCommandHost',
-					caption: 'The celld example GraphQL process wait-dispatches todo.create and todo.complete to POST {CELLD_URL}/todo/{id}/{command}. Other commands stay local. SQL lists dual-write after the cell wait-path so the page can render.',
-					code: `// tests/e2e-celld — not make run
-impl CommandHost for CelldTodoCommandHost {
-  async fn invoke(&self, command, command_id, input, …) {
-    if command == "todo.create" || command == "todo.complete" {
-      let id = input["todo_id"];
-      HttpCommandHost::new(format!("{celld}/todo/{id}"))
-        .invoke(command, command_id, input, …)
-        .await?;
-      // then local dual-write so Eventual SQL lists fill
-    }
-    self.local.invoke(command, command_id, input, …).await
-  }
-}
+					file: 'e2e-celld · runner/src/host.rs · route_aggregate',
+					caption: 'The celld example is one runner crate over this service crate: the same `build_service`, another command host. `route_aggregate::<Todo>()` routes every mounted Todo command to POST {CELLD_URL}/todo/{todo_id}/{command}: the cell kind is the aggregate type, the shard each declaration\'s `shard:`. The cell answers with the command\'s typed payload, returned as-is; a payload that is not the declared output fails the command. Commands with no route run on the local Service. The cell outbox reaches the projectors through the celld Queue relay and NATS. There is no dual write.',
+					code: `// tests/e2e-celld/crates/runner/src/host.rs
+let service = build_service(&stores).with_bus(nats);  // e2e-service, unchanged
+CelldCommandHost::new(celld_url, service, internal_secret)?
+  .route_aggregate::<Todo>()?         // kind "todo", shard input.todo_id
+  .route_aggregate::<ChatMessage>()?  // kind "chat_message", shard input.message_id
 
 // cell class (tests/celld/worker): command HTTP + sealed GET only
 POST /todo/:id/todo.create   { commandId, input }
-POST /todo/:id/todo.complete
-GET  /todo/:id               // sealed row`
+GET  /todo/:id               // sealed row
+// cell outbox → celld Queue → /internal/celld-queue/relay → NATS → projectors`
 				}
 			]
 		}
@@ -426,13 +422,12 @@ export const chatWalkthrough: DemoWalkthrough = {
 			samples: [
 				{
 					file: 'routes/chat/+layout.graphql',
-					caption: '`@load` fills SSR. `@live` sends WebSocket frames for the same retained layout document.',
-					code: `query ChatMessages($limit: Int! = 25, $offset: Int! = 0) @load @live {
+					caption: '`@load` fills SSR. `@live` sends WebSocket frames for the same retained layout document. `@window` pages older rows by keyset cursor; `order_by` is the cursor.',
+					code: `query ChatMessages($limit: Int! = 25) @load @live @window {
   chat_messages(
     where: { room_id: { _eq: "lobby" } }
     limit: $limit
-    offset: $offset
-    order_by: [{ created_at: desc }]
+    order_by: [{ created_at: desc }, { message_id: desc }]
   ) {
     message_id
     room_id
@@ -462,8 +457,8 @@ pub struct ChatMessages {
 				{
 					file: 'readmodels/models/chat_messages.rs · permissions',
 					caption: 'Users, admins, and anonymous guests can read all columns.',
-					code: `impl ChatMessages {
-  pub fn permissions() -> ModelPermissions<Self> {
+					code: `impl AuthorizedReadModel for ChatMessages {
+  fn permissions() -> ModelPermissions<Self> {
     ModelPermissions::new()
       .grant("user", read().all_columns())
       .grant("admin", read().all_columns())
@@ -473,14 +468,12 @@ pub struct ChatMessages {
 				},
 				{
 					file: 'routes/chat/+page.svelte',
-					caption: 'The hook binds the replica. The page reverses the list for display.',
-					code: `const lobby = ChatMessages.use();
-const livePage = $derived.by(() => {
-  const pageMessages = Array.isArray($lobby.data?.chat_messages)
-    ? $lobby.data.chat_messages
-    : [];
-  return [...pageMessages].reverse();
-});`
+					caption: 'The newest page stays live; `fetchMore()` adds older pages. `rows` is one ordered, de-duplicated list, so the page only reverses it for display.',
+					code: `const lobby = ChatMessages.useWindow();
+const messages = $derived([...$lobby.rows].reverse());
+
+// Scroll-up, or the "earlier messages" button:
+await lobby.fetchMore(); // $lobby.hasMore, .fetchingMore, .fetchMoreError`
 				}
 			]
 		},
@@ -492,16 +485,12 @@ const livePage = $derived.by(() => {
 			samples: [
 				{
 					file: 'routes/chat/+page.svelte',
-					caption: 'The shared replica cache feeds every bound view. Wait on `receipt.projected` for the obligation.',
+					caption: '`message_id` (`uuid_v7()`) and `created_at` (`now()`) are input defaults. The preview shows this client\'s clock; the server stamps its own and that row replaces the preview. A row is Sent while `$lobby.pending.has(m)`, then Delivered.',
 					code: `const commands = useCommands();
-const receipt = await commands.chat.post({
-  message_id,
-  body,
-  room_id: LOBBY_ROOM,
-  created_at: String(now),
-});
-if (receipt.projected !== undefined) {
-  await receipt.projected;
+await commands.chat.post({ body, room_id: LOBBY_ROOM });
+
+function deliveryLabel(m: ChatMsg) {
+  return $lobby.pending.has(m) ? 'sent' : 'delivered';
 }`
 				},
 				{
@@ -524,14 +513,13 @@ export type GeneratedCommands = Readonly<Record<never, never>>;`
 			principle: 'Use the signed-in principal. Do not trust the author field in the request body.',
 			samples: [
 				{
-					file: 'chat-domain/src/commands.rs · handle_post',
-					caption: 'Get the principal. Reject a duplicate id. Create the aggregate. Call `post`. Commit Eventual.',
-					code: `pub async fn handle(
+					file: 'chat-domain/src/commands/post.rs · handle_post',
+					caption: 'Get the principal. Reject a duplicate id. Create the aggregate. Call `post`. Commit Eventual. `created_at` is already the host clock: the server overwrites the `now()` default before the handler runs.',
+					code: `pub async fn handle_post(
   ctx: &CausalCommandContext<'_, ChatMessage>,
   input: ChatPostInput,
 ) -> Result<PreparedCommand<Eventual<ChatPostPayload>>, HandlerError> {
   let author = principal(ctx)?;
-  let created_at = canonical_near_unix_millis(&input.created_at)?;
   let repo = ctx.repo();
 
   if repo.get(&input.message_id).await?.is_some() {
@@ -547,7 +535,7 @@ export type GeneratedCommands = Readonly<Record<never, never>>;`
     &input.room_id,
     &author,
     &input.body,
-    &created_at,
+    &input.created_at,
   )
   .map_err(rejected)?;
 
@@ -653,7 +641,6 @@ fn record_posted(
   pub const CHAT_MESSAGES: ProjectionDescriptor<DirectCandidate> = {
     name: "project_chat_messages",
     version: 1,
-    epoch: "e2e-ui-chat-v2",
     model: ChatMessages,
     on {
       events: [ChatMessagePostedDomainEvent],
@@ -676,60 +663,43 @@ mutation SaveChatMessage {
 {
 			id: 'service',
 			label: '6 · Service + host',
-			lede: 'The chat module mounts lobby posts. On the one-process playground it also mounts identity ingress. The module mounts the chat projector. `build_service` adds these routes to one Service. On `tests/e2e-celld`, `chat.post` wait-dispatches to a Chat cell; the local host dual-writes so this projector and `@live` still run. The host starts the process. The runner only reads the environment.',
+			lede: 'The chat module mounts lobby posts. The module mounts the chat projector. `build_service` adds these routes to one Service. On `tests/e2e-celld`, `chat.post` wait-dispatches to a Chat cell; the cell outbox reaches this projector through the celld Queue relay and NATS, so `@live` still runs. The host starts the process. The runner only reads the environment.',
 			principle: 'Compose modules into one Service. Let the host start the process. Keep the runner small.',
 			samples: [
 				{
 					file: 'modules/chat.rs · routes()',
-					caption: 'This module mounts ChatMessage commands, Zitadel ingress, and projectors.',
-					code: `pub const MODULE_ID: &str = "chat";
-
-pub fn routes<R, L, S>(...) -> ChatRoutes<R, L, S> {
-  Routes::for_aggregate::<R, L, ChatMessage, S>(repo, locks, read_models)
+					caption: 'This module mounts ChatMessage commands and the chat projector.',
+					code: `pub fn routes<St: ServiceStores>(
+  stores: &St,
+  projections: &LocalProjectionMounts,
+) -> Routes<AggregateDependencies<St, ChatMessage>> {
+  Routes::for_aggregate(stores)
     .mount(chat_domain::commands::post())
-    // Zitadel Action ingress + on-demand scrape (non-GraphQL).
-    .command(zitadel::COMMAND)
-    .guarded(zitadel::guard, zitadel::handle)
-    .modeled_projector(chat_projector)
-    .handle(project_chat_messages::handle)
-    .events(project_auth_user::EVENTS)
-    .guarded(project_auth_user::guard, project_auth_user::handle)
+    .consume_projection(projections.projector(CHAT_MESSAGES))
 }`
 				},
 				{
-					file: 'modules/compose.rs · MODULE_IDS + build_service',
+					file: 'modules/compose.rs · build_service',
 					caption: 'The module list is explicit: todo, chat, blob, and identity.',
-					code: `pub const MODULE_IDS: &[&str] = &[
-  todo::MODULE_ID, chat::MODULE_ID, blob::MODULE_ID, "identity",
-];
-
-Service::new()
+					code: `Service::new()
   .named("e2e-ui")
   .routes(todo::routes(/* … */))
   .routes(chat::routes(/* … */))  // ← this module
-  .routes(blob::routes(/* … */))`
+  .routes(blob::routes(/* … */))
+  .routes(identity::routes(/* … */))`
 				},
 				...hostAndRunnerSamples,
 				{
-					file: 'e2e-celld · CelldChatCommandHost',
-					caption: 'The celld example wait-dispatches chat.post to POST {CELLD_URL}/chat/{message_id}/chat.post. Then it dual-writes the local Chat service so Eventual projectors update SQL and GraphQL @live still fires. GraphQL is not a cell method.',
-					code: `// tests/e2e-celld — not make run
-impl CommandHost for CelldChatCommandHost {
-  async fn invoke(&self, command, command_id, input, …) {
-    if command == "chat.post" {
-      let id = input["message_id"];
-      HttpCommandHost::new(format!("{celld}/chat/{id}"))
-        .invoke(command, command_id, input, …)
-        .await?;
-      // then local dual-write so the projector + @live fill
-    }
-    self.local.invoke(command, command_id, input, …).await
-  }
-}
+					file: 'e2e-celld · runner/src/host.rs · route_aggregate',
+					caption: 'The celld example routes chat.post to POST {CELLD_URL}/chat_message/{message_id}/chat.post through the same `CelldCommandHost`, derived from the mounted declaration. The cell outbox reaches the chat projector through the celld Queue relay and NATS, so SQL updates and GraphQL @live fires. GraphQL is not a cell method.',
+					code: `// tests/e2e-celld/crates/runner/src/host.rs
+CelldCommandHost::new(celld_url, service, internal_secret)?
+  .route_aggregate::<ChatMessage>()?  // shard: |input| input.message_id.clone()
 
 // cell class (tests/celld/worker): command HTTP + sealed GET only
-POST /chat/:id/chat.post   { commandId, input }
-GET  /chat/:id             // sealed row`
+POST /chat_message/:id/chat.post   { commandId, input }
+GET  /chat_message/:id             // sealed row
+// cell outbox → celld Queue → relay → NATS → chat projector → @live`
 				}
 			]
 		}
@@ -757,14 +727,15 @@ export const blobWalkthrough: DemoWalkthrough = {
   blob_games(order_by: [{ game_id: asc }]) {
     game_id
     score
-    map_json
+    map
+    moves
     owner { user_id display_name }
   }
 }`
 				},
 				{
 					file: 'readmodels/models/blob_games.rs · BlobGames',
-					caption: 'This is the query row for one board. `map_json` is the serialized level. `owner` joins `AuthUsers`.',
+					caption: 'This is the query row for one board. `map` and `moves` are JSON columns typed from Rust: the generated client types `map` as rows of tile names and `moves` as directions. `owner` joins `AuthUsers`.',
 					code: `#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, ReadModel)]
 #[readmodel(primary_key = ["game_id"])]
 pub struct BlobGames {
@@ -775,7 +746,8 @@ pub struct BlobGames {
   pub player_dead: bool,
   pub current_level: i64,
   pub current_level_completed: bool,
-  pub map_json: String,
+  pub map: Vec<Vec<Tile>>,      // "player" | "hole" | "unvisited" | …
+  pub moves: Vec<Direction>,    // legal directions from here
   /// active | dead | level_complete
   pub status: String,
   #[readmodel(belongs_to = "AuthUsers", foreign_key = "owner_id")]
@@ -785,8 +757,8 @@ pub struct BlobGames {
 				{
 					file: 'readmodels/models/blob_games.rs · permissions',
 					caption: 'A user can read only owned rows. An admin can read all rows. This is the same claim pattern as todos.',
-					code: `impl BlobGames {
-  pub fn permissions() -> ModelPermissions<Self> {
+					code: `impl AuthorizedReadModel for BlobGames {
+  fn permissions() -> ModelPermissions<Self> {
     ModelPermissions::new()
       .grant(
         "user",
@@ -805,6 +777,8 @@ pub struct BlobGames {
 const games = $derived(
   $query.complete ? $query.data.blob_games : []
 );
+// selected.map: readonly (readonly Tile[])[] — no JSON.parse, no casts.
+<div class="cell tile-{cell}">…</div>
 
 <SelectedBlobGame />`
 				},
@@ -833,54 +807,53 @@ const query = SelectedBlobGame.use(
 			samples: [
 				{
 					file: 'Why pure reduce (not only Atomic seal)',
-					caption: 'Optimism from input cannot calculate `map_json`. A known-row pure function can calculate it.',
+					caption: 'Optimism from input cannot calculate `map`. A known-row pure function can calculate it.',
 					code: `// Without a pure function: the UI waits for the Atomic body.
 // With a pure function: known BlobGames row + direction → simulate_move
-//   → assign map_json, score, player_dead, status immediately.
+//   → assign map, moves, score, player_dead, status immediately.
 // After commit: the Atomic response overwrites with the server row.
 // If the row is missing: the pure function returns null. Do not invent.`
 				},
 				{
 					file: 'routes/blob/[[gameId]]/+page.svelte',
-					caption: 'The input is only `game_id` and `direction`. Load the generated WASM hosts before the first move.',
-					code: `onMount(() => {
-  void ensurePureFunctionsReady(); // generated/user/pures.ts
-});
-
+					caption: 'The input is only `game_id` and `direction`. The domain lists the legal moves, so the page has no board rules.',
+					code: `if (!selected.moves.includes(direction)) return; // edge: no command
 await commands.blob.move({ game_id, direction });
-// pure may patch map_json/score/… from known row;
-// Atomic seal confirms or corrects`
+// the pure patches map/moves/score/… from the known row;
+// the Atomic seal confirms or corrects`
 				},
 				{
-					file: 'blob-domain/src/commands.rs · move_dir',
-					caption: 'The domain mount names the pure function, the WASM package, the keys, the args, and the assign fields.',
-					code: `.mount(blob_domain::commands::move_dir())
-// preview: blob.simulate_move → blobSimulateMove WASM`
+					file: 'service/src/modules/blob.rs · blob.move',
+					caption: 'The command names the pure and the read model. The key, the argument and the patched columns come from the Rust types, and declaration fails if they disagree with `BlobGames`.',
+					code: `command! {
+  name: "blob.move",
+  outcome: Atomic<BlobGames>,
+  preview_reduce_known_record:
+    CommandProjectionPureReduce::known_record::<BlobGames>(PREVIEW_MOVE),
+  …
+}`
 				},
 				{
 					file: 'generated/user/pures.ts',
-					caption: 'The generated client hosts WASM. The app has no TypeScript simulate file.',
+					caption: 'The generated client hosts WASM and starts loading it in the browser. Until it is ready the pure returns null, so there is no optimism yet. The app has no TypeScript simulate file.',
 					code: `const pureHost_0 = createWasmJsonPure({
-  load: () => import('$lib/blob/pkg/blob_wasm.js'),
-  exportName: 'blobSimulateMove',
+  load: () => import('$lib/wasm/blob-domain/blob_domain.js'),
+  exportName: 'preview_move',
 });
 export const PURE_FUNCTIONS = {
-  'blob.simulate_move': pureHost_0.pure,
-} as const;
-export async function ensurePureFunctionsReady() {
-  await pureHost_0.ensureReady();
-}`
+  'blob-domain::preview_move': pureHost_0.pure,
+} as const;`
 				},
 				{
 					file: 'Runtime shape (framework)',
 					caption: 'The replica pure function always has this shape: (record, args) → assign fields or null.',
 					code: `// createWasmJsonPure JSON-roundtrips to WASM:
 //   pure(record, args) {
-//     return JSON.parse(wasm.blobSimulateMove(
+//     return JSON.parse(wasm.preview_move(
 //       JSON.stringify(record), JSON.stringify(args)
 //     )) ?? null;
 //   }
-// Validation (direction, map parse, edge) lives in the domain pure.`
+// Decoding and validation (direction, tiles, edge) live in Rust.`
 				}
 			]
 		},
@@ -891,9 +864,9 @@ export async function ensurePureFunctionsReady() {
 			principle: 'A command changes the write model. A table is only for reads.',
 			samples: [
 				{
-					file: 'blob-domain/src/commands.rs · handle_move',
+					file: 'service/src/modules/blob.rs · handle_move',
 					caption: 'Load the game. Call `move_dir`. Stage `SaveBlobGame`. Commit Atomic. The Atomic row is replica authority.',
-					code: `pub async fn handle(
+					code: `pub async fn handle_move(
   ctx: &CausalCommandContext<'_, BlobGame>,
   input: BlobMoveInput,
 ) -> Result<PreparedCommand<Atomic<BlobGames>>, HandlerError> {
@@ -913,13 +886,10 @@ export async function ensurePureFunctionsReady() {
   // move_dir → core::simulate_move (same pure as client WASM)
   game.move_dir(&owner, dir).map_err(rejected)?;
 
-  let row = SaveBlobGame()
-    .from_state(&BlobGameState::from(&*game))
-    .map_err(|error| HandlerError::Other(Box::new(error)))?;
-  repo.readmodel(row)
-    .publish_events()
-    .commit(game)?
-    .atomic()  // sealed row → replica authority
+  // sealed_row = SaveBlobGame().from_state(&BlobGameState::from(game))
+  let row = sealed_row(&*game)?;
+  repo.readmodel(row).publish_events().commit(game)?.atomic()
+  // sealed row → replica authority
 }`
 				}
 			]
@@ -927,19 +897,20 @@ export async function ensurePureFunctionsReady() {
 {
 			id: 'domain',
 			label: '4 · Domain + pure core',
-			lede: 'The `blob-domain` crate has two faces. `core` holds the pure board rules. Those rules can compile to WASM. `models` holds the sourced aggregate. The pure function has no ownership and no Entity. Those stay on the aggregate. The client and the server share `core`. Optimism cannot diverge from the Atomic commit.',
+			lede: 'The `blob-domain` crate has two faces. `core` holds the pure board rules and the tile and direction types. Those rules can compile to WASM. `models` holds the sourced aggregate. The domain does not know the read models: the commands that seal `BlobGames` rows live with the service. The pure function has no ownership and no Entity. Those stay on the aggregate. The client and the server share `core`. Optimism cannot diverge from the Atomic commit.',
 			principle: 'Start with the domain. Share the pure function. Do not write a second ruleset.',
 			samples: [
 				{
 					file: 'blob-domain/src/core · simulate_move',
 					caption: 'This function is pure. Input is map, score, and direction. Output is the next board. There is no Entity, no ownership, and no I/O.',
 					code: `pub fn simulate_move(
-  map: &[Vec<u8>],
+  map: &[Vec<Tile>],
   score: i64,
   direction: Direction,
 ) -> Result<MovePreview, SimulateError> {
   // step player, mark visited, hole/suicide/score, level complete…
-  Ok(MovePreview { map, score, player_dead, level_complete })
+  Ok(MovePreview { map, moves, score, player_dead,
+                   current_level_completed, status })
 }`
 				},
 				{
@@ -955,7 +926,7 @@ export async function ensurePureFunctionsReady() {
   self.record_moved(
     preview.score,
     preview.player_dead,
-    preview.level_complete,
+    preview.current_level_completed,
     preview.map,
     direction.as_str().to_string(),
   )?;
@@ -963,22 +934,30 @@ export async function ensurePureFunctionsReady() {
 }`
 				},
 				{
-					file: 'blob-domain · wasm export',
-					caption: 'The WASM adapter takes record JSON and args JSON. It returns assign JSON or None. None is fail-closed.',
-					code: `#[wasm_bindgen(js_name = blobSimulateMove)]
-pub fn blob_simulate_move(record_json: &str, args_json: &str)
-  -> Option<String>
-{
-  // parse map_json / score / direction → simulate_move → assign fields
-  // None = fail closed (illegal move or bad input)
+					file: 'blob-domain/src/core/preview.rs · PREVIEW_MOVE',
+					caption: '`wasm_pure!` declares the browser pure from typed Rust: the row, the arguments and the output. The `wasm` build exports it; the JSON bridge is the framework\'s. None is fail-closed.',
+					code: `#[derive(Deserialize, JsonType)]
+pub struct MoveRow { pub map: Vec<Vec<Tile>>, pub score: i64 }
+#[derive(Deserialize, JsonType)]
+pub struct MoveArgs { pub direction: Direction }
+
+pub fn preview_move(row: MoveRow, args: MoveArgs) -> Option<MovePreview> {
+  simulate_move(&row.map, row.score, args.direction).ok()
+}
+
+distributed::wasm_pure! {
+  pub const PREVIEW_MOVE = preview_move(MoveRow, MoveArgs) -> MovePreview;
 }`
 				},
 				{
-					file: 'blob-domain · features + make wasm',
-					caption: 'The server builds the default `domain` feature. The client pure function builds with `--features wasm`.',
+					file: 'blob-domain · features + distributed build',
+					caption: 'The server builds the default `domain` feature. `distributed build` (and `distributed dev`) compiles the declaring package with wasm-pack and `--features wasm` into `$lib/wasm/blob-domain`. There is no separate make target.',
 					code: `// Cargo.toml
-// default = ["domain"]  → aggregate + levels + distributed
-// wasm                 → blobSimulateMove (make wasm → $lib/blob/pkg)`
+// default = ["domain"]  → aggregate + levels
+// wasm                 → the preview_move export
+//
+// The output path and export name come from PREVIEW_MOVE:
+// wasm/<package>/<package_snake>, export = the function name`
 				}
 			]
 		},
@@ -995,7 +974,6 @@ pub fn blob_simulate_move(record_json: &str, args_json: &str)
   pub const BLOB_GAMES: ProjectionDescriptor<DirectCandidate> = {
     name: "project_blob",
     version: 1,
-    epoch: "e2e-ui-blob-v2",
     model: BlobGames,
     on {
       events: [
@@ -1040,12 +1018,10 @@ mutation SaveBlobGame {
 			principle: 'Compose modules into one Service. Let the host start the process. Keep the runner small.',
 			samples: [
 				{
-					file: 'modules/blob.rs · MODULE_ID + routes()',
+					file: 'modules/blob.rs · routes()',
 					caption: 'This module mounts start, move, and start_level. All three are Atomic. Move declares the WASM pure function.',
-					code: `pub const MODULE_ID: &str = "blob";
-
-pub fn routes<R, L, S>(...) -> BlobRoutes<R, L, S> {
-  Routes::for_aggregate::<R, L, BlobGame, S>(repo, locks, read_models)
+					code: `pub fn routes<St: ServiceStores>(stores: &St) -> Routes<AggregateDependencies<St, BlobGame>> {
+  Routes::for_aggregate(stores)
     .mount(blob_domain::commands::start())
     .mount(blob_domain::commands::move_dir())
     .mount(blob_domain::commands::start_level())
@@ -1054,13 +1030,12 @@ pub fn routes<R, L, S>(...) -> BlobRoutes<R, L, S> {
 				{
 					file: 'modules/compose.rs · blob routes',
 					caption: 'This is the same Service composition as todos and chat.',
-					code: `let blob = blob::routes(repo, locks, read_models, projections.blob);
-
-Service::new()
+					code: `Service::new()
   .named("e2e-ui")
-  .routes(todos)
-  .routes(chat)
-  .routes(blob)  // ← this module`
+  .routes(todo::routes(stores, &projections))
+  .routes(chat::routes(stores, &projections))
+  .routes(blob::routes(stores))  // ← this module
+  .routes(identity::routes(stores, &projections))`
 				},
 				...hostAndRunnerSamples
 			]
@@ -1110,8 +1085,8 @@ pub struct Todos {
 				{
 					file: 'readmodels/models/todos.rs · admin grant',
 					caption: 'The `e2e-ui-admin` privilege pack uses the admin grant. That grant reads all rows.',
-					code: `impl Todos {
-  pub fn permissions() -> ModelPermissions<Self> {
+					code: `impl AuthorizedReadModel for Todos {
+  fn permissions() -> ModelPermissions<Self> {
     ModelPermissions::new()
       .grant(
         "user",
@@ -1124,15 +1099,15 @@ pub struct Todos {
 }`
 				},
 				{
-					file: 'service.rs · dual surfaces',
-					caption: 'One engine opens three surfaces: user, admin, and public.',
-					code: `.client_application_surface_with_schema_roles(
-  "e2e-ui",
-  ["admin", "user"], // eligible
-  ["user"],          // portable privilege pack
-)
-.client_application_surface("e2e-ui-admin", ["admin"])
-.client_application_surface("e2e-ui-public", ["anonymous"])`
+					file: 'modules/graphql.rs · build_engine surfaces',
+					caption: 'One engine opens three surfaces: user, admin, and public. Each surface names its eligible roles and its privilege pack. Client export reads the same table.',
+					code: `for surface in CLIENT_SURFACES {
+  b = b.client_application_surface(
+    surface.name,                       // "e2e-ui" | "e2e-ui-admin" | "e2e-ui-public"
+    surface.eligible_roles.iter().copied(),
+    surface.schema_roles.iter().copied(), // portable privilege pack
+  );
+}`
 				}
 			]
 		},
@@ -1175,33 +1150,28 @@ pub struct Todos {
 {
 			id: 'handlers',
 			label: '3 · Handlers',
-			lede: 'The handler loads the aggregate. Then it calls `force_archive`. Then it commits Eventual. Authorization is the role, the surface, and the mount guard. There is no special HTTP path.',
+			lede: 'The command loads the aggregate. Then it calls `force_archive`. Then it commits Eventual. Authorization is the role, the surface, and the mount guard. There is no special HTTP path.',
 			principle: 'Use the signed-in principal. Do not trust the request body for identity.',
 			samples: [
 				{
-					file: 'todo-domain/src/commands.rs · handle_force_archive',
-					caption: 'Get the admin principal. Load the todo. Call the domain. Commit Eventual.',
-					code: `pub async fn handle(
-  ctx: &CausalCommandContext<'_, Todo>,
-  input: TodoForceArchiveInput,
-) -> Result<PreparedCommand<Eventual<TodoForceArchivePayload>>, HandlerError> {
-  let admin = principal(ctx)?;
-  let repo = ctx.repo();
-  let mut todo = repo
-    .get(&input.todo_id)
-    .await?
-    .ok_or_else(|| HandlerError::NotFound(input.todo_id.clone()))?;
-
-  todo.force_archive().map_err(rejected)?;
-  let state = TodoState::from(&*todo);
-  repo.publish_events()
-    .commit(todo)?
-    .eventual(TodoForceArchivePayload {
+					file: 'todo-domain/src/commands/force_archive.rs · thin',
+					caption: 'Admins only. Load the todo. Call the domain. The payload names the admin from the session.',
+					code: `command! {
+  name: "todo.force_archive",
+  // …
+  load: required,
+  roles: ["admin"],
+  guard: admin_user,
+  invoke: |todo, _input, _principal| todo.force_archive(),
+  payload: |todo, principal| {
+    let state = TodoState::from(&**todo);
+    TodoForceArchivePayload {
       todo_id: state.todo_id,
       owner_id: state.owner_id,
       status: state.status,
-      archived_by: admin,
-    })
+      archived_by: principal.to_string(),
+    }
+  },
 }`
 				}
 			]
@@ -1215,8 +1185,10 @@ pub struct Todos {
 				{
 					file: 'todo-domain · Todo',
 					caption: 'This is the same aggregate shape as the user surface.',
-					code: `#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+					code: `#[derive(Debug, Clone, Default, Serialize, Deserialize, Snapshot)]
+#[snapshot(id = "todo_id")]
 pub struct Todo {
+  #[serde(skip, default)]
   pub entity: Entity,
   pub todo_id: String,
   pub owner_id: String,
@@ -1268,7 +1240,6 @@ fn record_force_archived(&mut self) {
   pub const TODOS: ProjectionDescriptor<EventualOnly> = {
     name: "project_todos",
     version: 1,
-    epoch: "e2e-ui-todos-v2",
     model: Todos,
     on {
       events: [
@@ -1326,7 +1297,7 @@ mutation DeleteTodo {
 				{
 					file: 'modules/graphql.rs · dual surfaces',
 					caption: 'The service crate opens the user, admin, and public surfaces.',
-					code: `.client_application_surface_with_schema_roles(
+					code: `.client_application_surface(
   "e2e-ui",
   ["admin", "user"],
   ["user"],
@@ -1335,11 +1306,17 @@ mutation DeleteTodo {
 .client_application_surface("e2e-ui-public", ["anonymous"])`
 				},
 				{
-					file: 'application.rs · surface constants',
-					caption: 'These names are stable. Client generation and host identity use them.',
-					code: `pub const DISTRIBUTED_CLIENT_SURFACE: &str = "e2e-ui";
-pub const DISTRIBUTED_ADMIN_CLIENT_SURFACE: &str = "e2e-ui-admin";
-pub const DISTRIBUTED_PUBLIC_CLIENT_SURFACE: &str = "e2e-ui-public";`
+					file: 'application.rs · client surfaces',
+					caption: 'Each surface is declared once. The engine, client generation and host identity use it.',
+					code: `pub const CLIENT_SURFACE: ClientSurface = ClientSurface {
+  name: "e2e-ui", eligible_roles: &["admin", "user"], schema_roles: &["user"],
+};
+pub const ADMIN_CLIENT_SURFACE: ClientSurface = ClientSurface {
+  name: "e2e-ui-admin", eligible_roles: &["admin"], schema_roles: &["admin"],
+};
+pub const PUBLIC_CLIENT_SURFACE: ClientSurface = ClientSurface {
+  name: "e2e-ui-public", eligible_roles: &["anonymous"], schema_roles: &["anonymous"],
+};`
 				},
 				...hostAndRunnerSamples
 			]
@@ -1409,7 +1386,7 @@ const client = provideDistributed({
 });`
 				},
 				{
-					file: 'service.rs · oidc_bearer_config',
+					file: 'modules/graphql.rs · oidc_bearer_config',
 					caption: 'This claim map sets the allowed engine roles on the session.',
 					code: `oidc.claim_map.engine_roles = vec![
   "user".into(),
@@ -1436,17 +1413,15 @@ IdentityConfig::oidc_bearer(oidc)`
 				{
 					file: 'src/graphql/identity/resolve.rs',
 					caption: 'If there is no bearer token and `require_auth` is false, the session is anonymous. That path is for `e2e-ui-public`.',
-					code: `IdentityMode::OidcBearer => {
-  let oidc = config.oidc.as_ref().ok_or(AuthError::Unauthorized)?;
+					code: `(IdentityConfig::OidcBearer(oidc), Some(validator)) => {
   match extract_bearer(headers)? {
-    None => {
-      if oidc.require_auth {
-        Err(AuthError::Unauthorized)
-      } else {
-        Ok(ResolvedIdentity::unverified(Session::new()))
-      }
+    Some(token) => {
+      let (session, principal) =
+        validator.validate_and_map_principal_async(&token).await?;
+      Ok(ResolvedIdentity::verified(session, principal))
     }
-    Some(token) => oidc_identity(&token, oidc),
+    None if oidc.require_auth => Err(AuthError::Unauthorized),
+    None => Ok(ResolvedIdentity::unverified(Session::new())),
   }
 }`
 				},
@@ -1492,28 +1467,34 @@ IdentityConfig::oidc_bearer(oidc)`
 		{
 			id: 'service',
 			label: '5 · Service + host',
-			lede: 'Identity is not a domain aggregate. Identity is service-crate wiring. That wiring includes OIDC or dev headers, claim maps, and the chat module Zitadel ingress. The ingress fills `AuthUsers`. The host starts the Service. The host also starts the scrape, outbox, and consumer loops. The runner only supplies `DATABASE_URL`, `BIND`, and OIDC environment variables.',
+			lede: 'Identity is not a domain aggregate. Identity is service-crate wiring. That wiring includes OIDC or dev headers, claim maps, and the identity module Zitadel ingress. The ingress fills `AuthUsers`. The host starts the Service. The host also starts the scrape and consumer loops; the bus drains the outbox. The runner only supplies `DATABASE_URL`, `BIND`, and OIDC environment variables.',
 			principle: 'Keep identity on the transport. Compose modules. Keep domain crates pure.',
 			samples: [
 				{
-					file: 'modules/compose.rs · MODULE_IDS',
-					caption: 'Identity is an inventory slot. Command mounts live on chat, todo, and blob.',
-					code: `pub const MODULE_IDS: &[&str] = &[
-  todo::MODULE_ID,
-  chat::MODULE_ID,
-  blob::MODULE_ID,
-  "identity",
-];`
+					file: 'modules/compose.rs · build_service',
+					caption: 'Identity is a module with no aggregate. It mounts the Zitadel commands and the `AuthUsers` projection. Its commands are `zitadel.*`, so the derived manifest names that module `zitadel`.',
+					code: `Service::new()
+  .named("e2e-ui")
+  .routes(todo::routes(stores, &projections))
+  .routes(chat::routes(stores, &projections))
+  .routes(blob::routes(stores))
+  .routes(identity::routes(stores, &projections))`
 				},
 				{
-					file: 'modules/chat.rs · Zitadel ingress',
-					caption: 'These are service-crate extension commands. They are not GraphQL user mutations.',
-					code: `.command(handlers::ingestors::zitadel::COMMAND)
-.guarded(zitadel::guard, zitadel::handle)
-.command(handlers::ingestors::zitadel_scrape::COMMAND)
-.guarded(zitadel_scrape::guard, zitadel_scrape::handle)
-.events(project_auth_user::EVENTS)
-.guarded(project_auth_user::guard, project_auth_user::handle)`
+					file: 'modules/identity.rs · Zitadel ingress',
+					caption: 'These are typed commands with no aggregate. Each user profile they publish commits with its command ledger receipt. Each command has its own HTTP edge: it checks the shared secret and dispatches as the ingestor. No user role can call them, and every other command path stays closed.',
+					code: `Routes::for_stores(stores.events().clone(), stores.read_models().clone())
+  .typed_command(zitadel::command())
+  .handle(zitadel::handle)
+  .typed_command(zitadel_scrape::command())
+  .handle(zitadel_scrape::Scrape(stores.read_models().clone()))
+  .consume_projection(projections.projector(AUTH_USERS))
+
+// compose.rs
+Service::new()
+  // ...
+  .with_http_command(zitadel::COMMAND, zitadel::http_edge)
+  .with_http_command(zitadel_scrape::COMMAND, zitadel_scrape::http_edge)`
 				},
 				{
 					file: 'modules/graphql.rs · identity_from_env',
@@ -1527,7 +1508,7 @@ IdentityConfig::oidc_bearer(oidc)`
 		{
 			id: 'events',
 			label: '6 · Directory',
-			lede: 'People appear as `AuthUsers` rows. Zitadel ingest and scrape emit domain events that fill those rows. Chat author and blob owner join this directory. Do not store a second display name.',
+			lede: 'People appear as `AuthUsers` rows. Zitadel ingest and scrape publish user profiles as external facts, and a projection fills those rows. Chat author and blob owner join this directory. Do not store a second display name.',
 			principle: 'Fill `AuthUsers` from identity events. Do not fill it from user commands.',
 			samples: [
 				{
@@ -1550,53 +1531,26 @@ pub struct AuthUsers {
 }`
 				},
 				{
-					file: 'handlers/events/project_auth_user.rs',
-					caption: 'These Zitadel events upsert or update status on `AuthUsers`.',
-					code: `pub const EVENTS: &[&str] = &[
-  "zitadel.user.human.created.v1",
-  "zitadel.user.human.updated.v1",
-  "zitadel.user.human.deactivated.v1",
-  "zitadel.user.human.reactivated.v1",
-  "zitadel.user.machine.created.v1",
-];
+					file: 'projections/auth_users.rs · AUTH_USERS',
+					caption: 'The ingestor publishes a `ZitadelUserProfile` with `publish_external`, identified by the delivery it came from. The projection writes it to `AuthUsers` as it is.',
+					code: `#[derive(Serialize, Deserialize, distributed::DomainEvent)]
+#[domain_event(name = "zitadel.user_profile", version = 1)]
+pub struct ZitadelUserProfile { /* the AuthUsers columns */ }
 
-pub async fn handle<R, L, S>(
-  ctx: &Context<'_, AuthDeps<R, L, S>>,
-) -> Result<Value, HandlerError> {
-  let payload: ZitadelUserPayload = decode_payload(ctx.message())?;
-  let name = ctx.message().name();
-  let row = if name.contains("deactivated")
-    || name.contains("reactivated")
-  {
-    map_zitadel_user_status(name, &payload)
-  } else {
-    map_zitadel_user_upsert(name, &payload)
+distributed::projection! {
+  pub const AUTH_USERS: ProjectionDescriptor<EventualOnly> = {
+    name: "project_auth_users",
+    version: 1,
+    model: AuthUsers,
+    on {
+      events: [ZitadelUserProfile],
+      mutation: SaveAuthUser,
+      input: { user: body },
+    },
   };
-  let store = ctx.read_model_store();
-  let mut plan = ReadModelWritePlanBuilder::new();
-  plan.upsert(&row).map_err(read_model_error)?;
-  plan.commit(store).await.map_err(read_model_error)?;
-  Ok(json!({
-    "event": name,
-    "user_id": row.user_id,
-    "status": row.status,
-    "display_name": row.display_name,
-  }))
 }`
 				}
 			]
 		}
 	]
 };
-
-export const allWalkthroughs: DemoWalkthrough[] = [
-	todosWalkthrough,
-	chatWalkthrough,
-	blobWalkthrough,
-	adminWalkthrough,
-	sessionWalkthrough
-];
-
-export function walkthroughById(id: string): DemoWalkthrough | undefined {
-	return allWalkthroughs.find((d) => d.id === id);
-}

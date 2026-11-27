@@ -1,0 +1,5 @@
+node_modules/
+dist/
+# Generated game clients + WASM (`distributed game-client`/`game-wasm`), built
+# from the Rust surfaces by the Vite plugin, scripts/games.mjs and run.sh gen.
+src/generated/

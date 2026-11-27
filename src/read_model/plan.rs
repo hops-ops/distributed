@@ -1,15 +1,13 @@
 //! Detached builder that stages read-model mutations into a write plan.
 
-use std::cmp::Ordering;
 use std::collections::BTreeMap;
 
 use crate::repository::ReadModelWritePlanStore;
 use crate::table::{
-    column_name_for, has_many_join_columns, key_fingerprint, key_from_row,
+    column_name_for, has_many_join_columns, key_fingerprint, key_from_row, sort_writes,
     validate_expected_version, validate_key, DeleteTableRowMutation, ExpectedVersion, PatchMode,
     PatchTableRowMutation, RelationshipDef, RelationshipKind, RowKey, RowPatch, RowValues,
-    RowWriteMode, TableCommitOutcome, TableMutation, TableRowMutation, TableSchema,
-    TableStoreError, TableWritePlan,
+    RowWriteMode, TableMutation, TableRowMutation, TableSchema, TableStoreError, TableWritePlan,
 };
 
 use super::{ReadModelLoadRequest, RelationalReadModel, Versioned};
@@ -227,35 +225,18 @@ impl ReadModelWritePlanBuilder {
     }
 
     pub fn into_write_plan(self) -> Result<TableWritePlan, TableStoreError> {
-        // Precompute each mutation's sort key once; building the formatted key
-        // inside the comparator would allocate two Strings per comparison.
-        let mut mutations = self
-            .mutations
-            .into_iter()
-            .map(|staged| (staged.mutation.sort_key(), staged))
-            .collect::<Vec<_>>();
-        mutations.sort_by(|(left_key, left), (right_key, right)| {
-            left.mutation
-                .operation_rank()
-                .cmp(&right.mutation.operation_rank())
-                .then_with(|| {
-                    left.mutation
-                        .dependency_order(&right.mutation)
-                        .unwrap_or(Ordering::Equal)
-                })
-                .then_with(|| left_key.cmp(right_key))
-                .then(left.sequence.cmp(&right.sequence))
-        });
-        let mutations = mutations
-            .into_iter()
-            .map(|(_, staged)| staged.mutation)
-            .collect::<Vec<_>>();
+        let mutations = sort_writes(self.mutations, |staged| {
+            staged.mutation.write_position(staged.sequence)
+        })
+        .into_iter()
+        .map(|staged| staged.mutation)
+        .collect::<Vec<_>>();
         let plan = TableWritePlan::new(mutations);
         plan.validate()?;
         Ok(plan)
     }
 
-    pub async fn commit<S>(self, store: &S) -> Result<TableCommitOutcome, TableStoreError>
+    pub async fn commit<S>(self, store: &S) -> Result<(), TableStoreError>
     where
         S: ReadModelWritePlanStore + ?Sized,
     {
@@ -287,76 +268,14 @@ impl ReadModelWritePlanBuilder {
         Ok(self)
     }
 
-    pub(crate) fn stage_projection_full_row<M>(
-        &mut self,
-        key: RowKey,
-        values: RowValues,
-        mode: RowWriteMode,
-        expected_version: ExpectedVersion,
-    ) -> Result<&mut Self, TableStoreError>
-    where
-        M: RelationalReadModel,
-    {
-        let schema = validated_schema::<M>()?;
-        validate_key(schema, &key)?;
-        let mutation = TableRowMutation {
-            schema,
-            key,
-            values,
-            expected_version,
-            mode,
-        };
-        self.push(TableMutation::UpsertRow(mutation));
-        Ok(self)
-    }
-
-    pub(crate) fn stage_projection_patch<M>(
-        &mut self,
-        key: RowKey,
-        patch: RowPatch,
-        mode: PatchMode,
-    ) -> Result<&mut Self, TableStoreError>
-    where
-        M: RelationalReadModel,
-    {
-        let schema = validated_schema::<M>()?;
-        validate_key(schema, &key)?;
-        let mutation = PatchTableRowMutation {
-            schema,
-            key,
-            patch,
-            expected_version: ExpectedVersion::Any,
-            mode,
-        };
-        self.push(TableMutation::PatchRow(mutation));
-        Ok(self)
-    }
-
-    pub(crate) fn stage_projection_delete<M>(
-        &mut self,
-        key: RowKey,
-    ) -> Result<&mut Self, TableStoreError>
-    where
-        M: RelationalReadModel,
-    {
-        let schema = validated_schema::<M>()?;
-        validate_key(schema, &key)?;
-        self.push(TableMutation::DeleteRow(DeleteTableRowMutation {
-            schema,
-            key,
-            expected_version: ExpectedVersion::Any,
-        }));
-        Ok(self)
-    }
-
-    pub(crate) fn stage_projection_related_row<P, C>(
-        &mut self,
+    /// Framework-only: fill a related child row's delegated relationship
+    /// columns from its parent row and return the child's primary key, the
+    /// same way [`Self::upsert_related`] does for hand-written server code.
+    pub(crate) fn projection_related_row<P, C>(
         relationship_field: &str,
         parent_row: &RowValues,
-        mut child_row: RowValues,
-        mode: RowWriteMode,
-        expected_version: ExpectedVersion,
-    ) -> Result<&mut Self, TableStoreError>
+        child_row: &mut RowValues,
+    ) -> Result<RowKey, TableStoreError>
     where
         P: RelationalReadModel,
         C: RelationalReadModel,
@@ -369,10 +288,9 @@ impl ReadModelWritePlanBuilder {
             parent_row,
             relationship,
             child_schema,
-            &mut child_row,
+            child_row,
         )?;
-        let key = key_from_row(child_schema, &child_row)?;
-        self.stage_projection_full_row::<C>(key, child_row, mode, expected_version)
+        key_from_row(child_schema, child_row)
     }
 
     fn stage_related_row<P, C>(

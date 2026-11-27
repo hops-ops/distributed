@@ -9,12 +9,10 @@ pub trait Aggregate: Sized + Default {
 
     /// Stable aggregate type used by stream-aware persistence.
     ///
-    /// The default is a development fallback based on Rust's type name so
-    /// existing examples keep working. Production persistence should override
-    /// this with an explicit, durable application name.
-    fn aggregate_type() -> &'static str {
-        std::any::type_name::<Self>()
-    }
+    /// It is part of every stream's identity, so it must be a durable
+    /// application name: renaming or moving the Rust type must not change it.
+    /// `#[sourced(entity, aggregate_type = "...")]` emits it.
+    fn aggregate_type() -> &'static str;
 
     fn new_empty() -> Self {
         Self::default()
@@ -30,109 +28,49 @@ pub trait Aggregate: Sized + Default {
     }
 }
 
-#[macro_export]
-macro_rules! impl_aggregate {
-    ($ty:ty, $entity:ident, $replay:ident) => {
-        $crate::impl_aggregate!($ty, $entity, $replay, String);
-    };
-    ($ty:ty, $entity:ident, $replay:ident, aggregate_type = $aggregate_type:literal) => {
-        $crate::impl_aggregate!(
-            $ty,
-            $entity,
-            $replay,
-            String,
-            aggregate_type = $aggregate_type
-        );
-    };
-    ($ty:ty, $entity:ident, $replay:ident, $err:ty) => {
-        impl $crate::Aggregate for $ty {
-            type ReplayError = $err;
-
-            fn entity(&self) -> &$crate::Entity {
-                &self.$entity
-            }
-
-            fn entity_mut(&mut self) -> &mut $crate::Entity {
-                &mut self.$entity
-            }
-
-            fn replay_event(
-                &mut self,
-                event: &$crate::EventRecord,
-            ) -> Result<(), Self::ReplayError> {
-                Self::$replay(self, event)
-            }
-        }
-    };
-    ($ty:ty, $entity:ident, $replay:ident, $err:ty, aggregate_type = $aggregate_type:literal) => {
-        impl $crate::Aggregate for $ty {
-            type ReplayError = $err;
-
-            fn aggregate_type() -> &'static str {
-                $aggregate_type
-            }
-
-            fn entity(&self) -> &$crate::Entity {
-                &self.$entity
-            }
-
-            fn entity_mut(&mut self) -> &mut $crate::Entity {
-                &mut self.$entity
-            }
-
-            fn replay_event(
-                &mut self,
-                event: &$crate::EventRecord,
-            ) -> Result<(), Self::ReplayError> {
-                Self::$replay(self, event)
-            }
-        }
-    };
-}
-
-// Note: The `aggregate!` macro is now provided as a proc-macro from distributed_macros.
-// It generates the event enum, TryFrom impl, apply method, and Aggregate trait impl.
-// Use: aggregate!(MyAggregate, entity_field { "EventName"(args) => method_name, ... });
-
 /// Hydrate an aggregate from an entity by replaying its events.
 pub fn hydrate<A: Aggregate>(entity: Entity) -> Result<A, RepositoryError> {
     let mut agg = A::new_empty();
     *agg.entity_mut() = entity;
 
-    // Take the events out of the entity so we can iterate them while holding a
-    // mutable borrow of `agg` during replay. `hydrate` is only ever called with
-    // a full-history entity, so `prefix_version == 0` and restoring via
-    // `load_from_history` reproduces the exact loaded version/committed_version.
+    // Take the events out of the entity so they can be iterated while `agg` is
+    // borrowed mutably, then put them back. `hydrate` is only called with a
+    // full-history entity, so `load_from_history` reproduces the loaded
+    // version and committed version.
     let history = agg.entity_mut().take_events();
-
-    // Upcasters may rewrite events for replay, but the durable history is
-    // unchanged: replay from the upcasted view (which clones only the events an
-    // upcaster rewrites), then restore the originals. When no upcaster applies —
-    // no upcasters registered, or every event already current — the borrowed
-    // history is replayed directly with no clone.
-    match upcast_events_for_replay(history.iter(), A::upcasters())
-        .map_err(|err| RepositoryError::Replay(err.to_string()))?
-    {
-        Some(upcasted) => replay_into(&mut agg, upcasted.iter().map(|event| event.as_ref()))?,
-        None => replay_into(&mut agg, history.iter())?,
-    }
-
+    let replayed = replay_into(&mut agg, history.iter());
     agg.entity_mut().load_from_history(history);
-
-    Ok(agg)
+    replayed.map(|()| agg)
 }
 
-fn replay_into<'e, A: Aggregate>(
+/// Replay `events` into `agg`: the one replay loop, used for a full history
+/// and for the tail after a snapshot.
+///
+/// Upcasters may rewrite events for replay; the durable history is unchanged.
+/// When no upcaster applies, the borrowed events are replayed with no clone.
+/// Domain-event capture is suppressed while replaying.
+pub(crate) fn replay_into<'e, A: Aggregate>(
+    agg: &mut A,
+    events: impl Iterator<Item = &'e EventRecord> + Clone,
+) -> Result<(), RepositoryError> {
+    let upcasted = upcast_events_for_replay(events.clone(), A::upcasters())
+        .map_err(|err| RepositoryError::Replay(err.to_string()))?;
+    agg.entity_mut().set_replaying(true);
+    let replayed = match &upcasted {
+        Some(upcasted) => apply_each(agg, upcasted.iter().map(|event| event.as_ref())),
+        None => apply_each(agg, events),
+    };
+    agg.entity_mut().set_replaying(false);
+    replayed
+}
+
+fn apply_each<'e, A: Aggregate>(
     agg: &mut A,
     events: impl Iterator<Item = &'e EventRecord>,
 ) -> Result<(), RepositoryError> {
-    agg.entity_mut().set_replaying(true);
     for event in events {
-        if let Err(err) = agg.replay_event(event) {
-            agg.entity_mut().set_replaying(false);
-            return Err(RepositoryError::Replay(err.to_string()));
-        }
+        agg.replay_event(event)
+            .map_err(|err| RepositoryError::Replay(err.to_string()))?;
     }
-    agg.entity_mut().set_replaying(false);
     Ok(())
 }

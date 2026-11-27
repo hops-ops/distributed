@@ -1,5 +1,5 @@
 import type { GraphqlVariables } from '../../types.js';
-import { canonicalizeOperationVariables } from '../identity.js';
+import { canonicalizeOperationVariables } from '../identity/codec.js';
 import type { MaterializedReplicaResult } from '../materialize.js';
 import type {
 	ReplicaOperationArtifact,
@@ -94,7 +94,10 @@ export class ReplicaWatchState<TData, TVariables extends GraphqlVariables>
 		const next: ReplicaSnapshot<TData> = keepData
 			? (Object.freeze({
 					...nextRaw,
-					data: this.#snapshot.data
+					data: this.#snapshot.data,
+					// The same signature marks the same rows provisional; the kept
+					// objects are the ones the kept set holds.
+					pending: this.#snapshot.pending
 				}) as ReplicaSnapshot<TData>)
 			: nextRaw;
 		if (!snapshotEqual(this.#snapshot, next)) {

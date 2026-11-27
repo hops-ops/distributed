@@ -1,17 +1,19 @@
 //! Compile-pass checks for command_input_defaults!.
 
-use distributed::graphql::{typed_command, Succeeded};
-use distributed::{command_input_defaults, GraphqlInput};
+use distributed::command::CommandInput;
+use distributed::command::{typed_command, Succeeded};
+use distributed::command_input_defaults;
 use serde::Deserialize;
 
-#[derive(Clone, Deserialize, GraphqlInput)]
+#[derive(Clone, Deserialize, CommandInput)]
 #[allow(dead_code)]
 struct PlanInput {
     id: String,
     title: String,
+    created_at: String,
 }
 
-#[derive(Clone, serde::Serialize, distributed::GraphqlOutput)]
+#[derive(Clone, serde::Serialize, distributed::command::CommandOutput)]
 struct PlanOutput {
     id: String,
 }
@@ -21,6 +23,7 @@ fn generated_input_defaults_compile() {
     let _defaults = command_input_defaults! {
         input: PlanInput;
         default input.id = uuid_v7();
+        default input.created_at = now();
     };
     let _ =
         typed_command::<PlanInput, Succeeded<PlanOutput>>("plan.create").input_defaults(_defaults);

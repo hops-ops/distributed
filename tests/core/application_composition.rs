@@ -1,0 +1,1141 @@
+use std::collections::BTreeMap;
+use std::sync::Arc;
+
+use distributed::application::ApplicationManifest;
+use distributed::application::{
+    admit_command_session, command_roles_require_principal, Application, ApplicationExtension,
+    CommandDefinition, CommandMount, CommandSpec, CommandTypeField, CommandTypeSpec,
+    ContractCompiler, Module, ProjectionSpec, SurfaceSelectionSpec, SurfaceSpec,
+};
+use distributed::command::{typed_command, CommandConsistency, Succeeded};
+use distributed::command::{CommandInput, CommandOutput};
+use distributed::graphql::{
+    build_surface, col, prune_client_manifest, read, surface_for_application, surface_for_role,
+    ClientCommandPureReduce, ClientProjectionArm, ClientProjectionEventRef,
+    ClientProjectionFallback, ClientProjectionMutationKind, ClientProjectionOperation,
+    ClientProjectionPartition, ClientProjectionProgram, ClientSurfaceIdentity,
+    CommandProjectionArmRef, CommandProjectionExtension, CommandProjectionPreviewOccurrence,
+    DistributedClientSurfaceExport, ReadPermission, Surface, SurfaceOptions,
+};
+use distributed::projection::{
+    PROJECTION_OPERATION_SEMANTICS_VERSION, PROJECTION_PROGRAM_IR_VERSION,
+};
+use distributed::read_model::{ReadModel, RelationalReadModel};
+use serde::{Deserialize, Serialize};
+
+#[derive(Clone, Debug, Default, Deserialize, ReadModel, Serialize)]
+#[table("todos")]
+struct TodoView {
+    #[id("todo_id")]
+    todo_id: String,
+    title: String,
+    status: String,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, ReadModel, Serialize)]
+#[table("chat_messages")]
+struct ChatView {
+    #[id("message_id")]
+    message_id: String,
+    body: String,
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Deserialize, CommandInput)]
+struct ContractCommandInput {
+    title: String,
+}
+
+#[derive(Clone, Serialize, CommandOutput)]
+struct ContractCommandOutput {
+    id: String,
+}
+
+fn typed_definition(id: &'static str, roles: &[&str]) -> CommandDefinition {
+    let command = typed_command::<ContractCommandInput, Succeeded<ContractCommandOutput>>(id)
+        .roles(roles.iter().copied());
+    CommandDefinition::from_typed_command(command, None)
+        .expect("typed contract should compile without an executable mount")
+}
+
+fn command_module() -> Module {
+    Module::new("todo-contract")
+        .command_definitions([
+            typed_definition("todo.allowed", &["user"]),
+            typed_definition("todo.forbidden", &["admin"]),
+        ])
+        .build()
+        .expect("typed command module should compile")
+}
+
+fn command_catalog() -> Surface {
+    full_surface()
+        .with_module(&command_module())
+        .expect("module contracts should bind before authorization")
+}
+
+fn grants_for(role: &str) -> BTreeMap<String, ReadPermission> {
+    BTreeMap::from([(
+        "TodoView".into(),
+        read().all_columns().rows(col("status").eq(role)),
+    )])
+}
+
+fn command_names(surface: &Surface) -> Vec<String> {
+    surface
+        .commands()
+        .iter()
+        .map(|command| command.command_name.clone())
+        .collect()
+}
+
+fn command(id: &str) -> CommandSpec {
+    CommandSpec::try_new(
+        id,
+        id.replace('.', "_"),
+        CommandTypeSpec {
+            name: format!("{id}Input"),
+            fields: vec![CommandTypeField {
+                unsigned_integer: None,
+                name: "title".into(),
+                type_name: "String".into(),
+                nullable: false,
+                list: false,
+                item_nullable: false,
+                nested: None,
+            }],
+        },
+        CommandTypeSpec {
+            name: format!("{id}Output"),
+            fields: vec![CommandTypeField {
+                unsigned_integer: None,
+                name: "id".into(),
+                type_name: "String".into(),
+                nullable: false,
+                list: false,
+                item_nullable: false,
+                nested: None,
+            }],
+        },
+        CommandConsistency::Eventual,
+    )
+    .expect("test command should be portable")
+}
+
+fn definition(id: &str) -> CommandDefinition {
+    CommandDefinition::contract(command(id))
+}
+
+fn application_with_commands(order: &[&str]) -> Application {
+    let definitions = order.iter().map(|id| definition(id)).collect::<Vec<_>>();
+    let module = Module::new("todo")
+        .command_definitions(definitions)
+        .build()
+        .expect("test module should be valid");
+    Application::new("todo-app")
+        .module(module)
+        .build()
+        .expect("test application should be valid")
+}
+
+fn full_surface() -> Surface {
+    build_surface(&[TodoView::schema().clone()], &SurfaceOptions::sqlite())
+        .expect("non-empty Surface should compile")
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Deserialize, CommandInput)]
+struct UnsignedContractInput {
+    small: u8,
+    optional: Option<u16>,
+    items: Vec<Option<u32>>,
+    revision: u64,
+    signed: i64,
+    title: String,
+}
+
+#[derive(Clone, Serialize, CommandOutput)]
+struct UnsignedContractOutput {
+    small: u8,
+    optional: Option<u16>,
+    items: Vec<Option<u32>>,
+    revision: u64,
+    signed: i64,
+    title: String,
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Deserialize, CommandInput)]
+struct UnsignedContractInputEnvelope {
+    nested: UnsignedContractInput,
+}
+
+#[derive(Clone, Serialize, CommandOutput)]
+struct UnsignedContractOutputEnvelope {
+    nested: UnsignedContractOutput,
+}
+
+#[derive(Default)]
+struct UnsignedContractAggregate {
+    entity: distributed::Entity,
+}
+
+impl distributed::Aggregate for UnsignedContractAggregate {
+    type ReplayError = String;
+
+    fn aggregate_type() -> &'static str {
+        "unsigned-contract"
+    }
+    fn entity(&self) -> &distributed::Entity {
+        &self.entity
+    }
+    fn entity_mut(&mut self) -> &mut distributed::Entity {
+        &mut self.entity
+    }
+    fn replay_event(&mut self, _: &distributed::EventRecord) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+#[test]
+fn unsigned_surface_command_contract_round_trips() {
+    use distributed::microsvc::{CausalCommandContext, Routes, Service};
+    use distributed::{AggregateRepository, InMemoryRepository};
+
+    let routes = Routes::new().with_repo(AggregateRepository::<_, UnsignedContractAggregate>::new(
+        InMemoryRepository::new(),
+    ));
+    let service = Service::new().named("unsigned-app").routes(
+        routes
+            .typed_command(typed_command::<
+                UnsignedContractInput,
+                Succeeded<UnsignedContractOutput>,
+            >("unsigned.flat"))
+            .handle(
+                |_: &CausalCommandContext<'_, UnsignedContractAggregate>,
+                 _: UnsignedContractInput| async {
+                    unreachable!("manifest compilation must not execute handlers")
+                },
+            )
+            .typed_command(typed_command::<
+                UnsignedContractInputEnvelope,
+                Succeeded<UnsignedContractOutputEnvelope>,
+            >("unsigned.nested"))
+            .handle(
+                |_: &CausalCommandContext<'_, UnsignedContractAggregate>,
+                 _: UnsignedContractInputEnvelope| async {
+                    unreachable!("manifest compilation must not execute handlers")
+                },
+            ),
+    );
+    let surface = full_surface().with_service(&service).unwrap();
+    let spec = SurfaceSpec::from_surface("web", &surface).unwrap();
+    let contract = serde_json::to_value(&spec.contract).unwrap();
+    for command in contract["commands"].as_array().unwrap() {
+        for direction in ["input", "output"] {
+            let mut fields = command[direction]["fields"].as_array().unwrap();
+            if fields[0]["name"] == "nested" {
+                assert!(fields[0].get("unsigned_integer").is_none());
+                fields = fields[0]["nested"]["fields"].as_array().unwrap();
+            }
+            for (name, width) in [
+                ("small", "u8"),
+                ("optional", "u16"),
+                ("items", "u32"),
+                ("revision", "u64"),
+            ] {
+                let field = fields.iter().find(|field| field["name"] == name).unwrap();
+                assert_eq!(field["unsigned_integer"], width);
+                assert_eq!(field["type_name"], "BigInt");
+            }
+            for name in ["signed", "title"] {
+                let field = fields.iter().find(|field| field["name"] == name).unwrap();
+                assert!(field.get("unsigned_integer").is_none());
+            }
+        }
+    }
+    let application = service.application("unsigned-app", spec).unwrap();
+    let manifest = application.manifest();
+    let bytes = manifest.canonical_bytes().unwrap();
+    let decoded = ApplicationManifest::from_canonical_bytes(&bytes).unwrap();
+    assert_eq!(&decoded, manifest);
+    assert_eq!(decoded.canonical_bytes().unwrap(), bytes);
+
+    let mut tampered = manifest.clone();
+    tampered.surfaces[0].contract.commands[0]
+        .input
+        .as_mut()
+        .unwrap()
+        .fields[0]
+        .unsigned_integer = Some(distributed::command::CommandUnsignedInteger::U64);
+    tampered.surfaces[0].fingerprint = distributed::application::sha256_fingerprint(
+        &tampered.surfaces[0].canonical_bytes().unwrap(),
+    );
+    assert!(tampered
+        .refresh_fingerprints()
+        .unwrap_err()
+        .to_string()
+        .contains("not compatible"));
+}
+
+#[test]
+fn ordinary_surface_command_contract_keeps_unrefined_field_shape() {
+    let module = command_module();
+    let surface = full_surface().with_module(&module).unwrap();
+    let spec = SurfaceSpec::from_surface("web", &surface).unwrap();
+    let contract = serde_json::to_value(&spec.contract).unwrap();
+    for command in contract["commands"].as_array().unwrap() {
+        for (direction, name) in [("input", "title"), ("output", "id")] {
+            assert_eq!(
+                command[direction]["fields"],
+                serde_json::json!([{
+                    "name": name, "type_name": "String", "nullable": false,
+                    "list": false, "item_nullable": false,
+                }])
+            );
+        }
+    }
+    let application = Application::new("ordinary-app")
+        .module(module)
+        .surface(spec)
+        .build()
+        .unwrap();
+    let bytes = application.manifest().canonical_bytes().unwrap();
+    assert_eq!(
+        ApplicationManifest::from_canonical_bytes(&bytes).unwrap(),
+        *application.manifest()
+    );
+}
+
+#[test]
+fn generated_surface_above_opaque_json_budget_round_trips() {
+    let tables = (0..500)
+        .map(|index| {
+            let mut table = TodoView::schema().clone();
+            table.model_name = format!("CatalogView{index:03}");
+            table.table_name = format!("catalog_view_{index:03}");
+            table
+        })
+        .collect::<Vec<_>>();
+    let surface = build_surface(&tables, &SurfaceOptions::sqlite()).unwrap();
+    let spec = SurfaceSpec::from_surface("catalog", &surface).unwrap();
+    let contract_bytes = serde_json::to_vec(&spec.contract).unwrap().len();
+    assert!(
+        contract_bytes > distributed::application::MAX_MANIFEST_JSON_BYTES,
+        "fixture must exceed opaque JSON budget: {contract_bytes}"
+    );
+    let application = Application::try_new("catalog-app", [], [spec]).unwrap();
+    let bytes = application.manifest().canonical_bytes().unwrap();
+    assert!(bytes.len() <= distributed::application::MAX_APPLICATION_MANIFEST_BYTES);
+    assert_eq!(
+        ApplicationManifest::from_canonical_bytes(&bytes).unwrap(),
+        *application.manifest()
+    );
+}
+
+fn selected_surface() -> Surface {
+    let full = full_surface();
+    let grants = BTreeMap::from([(
+        "user".to_string(),
+        BTreeMap::from([(
+            "TodoView".to_string(),
+            read()
+                .all_columns()
+                .aggregations()
+                .rows(col("status").eq("open")),
+        )]),
+    )]);
+    surface_for_application(&full, "web", &["user".into()], &["user".into()], &grants)
+        .expect("role/application-selected Surface should compile")
+}
+
+#[test]
+fn explicit_module_commands_filter_allowed_and_forbidden_role_application_inventory() {
+    let catalog = command_catalog();
+    let user_grants = grants_for("user");
+    let role = surface_for_role(&catalog, "user", &user_grants).unwrap();
+    assert_eq!(command_names(&role), vec!["todo.allowed"]);
+
+    let application = surface_for_application(
+        &catalog,
+        "web",
+        &["admin".into(), "user".into()],
+        &["user".into()],
+        &BTreeMap::from([("user".into(), user_grants)]),
+    )
+    .unwrap();
+    assert_eq!(command_names(&application), vec!["todo.allowed"]);
+    let spec = SurfaceSpec::from_surface("web", &application).unwrap();
+    assert_eq!(spec.contract.selection.eligible_roles(), ["admin", "user"]);
+    assert_eq!(spec.contract.selection.schema_roles(), ["user"]);
+    assert_eq!(spec.contract.commands.len(), 1);
+    assert_eq!(spec.contract.commands[0].id, "todo.allowed");
+    assert_eq!(
+        serde_json::to_value(&spec.contract.selection).unwrap(),
+        serde_json::json!({
+            "kind": "application",
+            "name": "web",
+            "eligible_roles": ["admin", "user"],
+            "schema_roles": ["user"],
+        })
+    );
+    let client = ContractCompiler::from_surface("command-client", "web", Arc::new(application))
+        .unwrap()
+        .client_manifest()
+        .unwrap();
+    match client.surface {
+        ClientSurfaceIdentity::Application {
+            eligible_roles,
+            schema_roles,
+            ..
+        } => {
+            assert_eq!(eligible_roles, ["admin", "user"]);
+            assert_eq!(schema_roles, ["user"]);
+        }
+        other => panic!("expected application client identity, got {other:?}"),
+    }
+}
+
+#[test]
+fn role_and_application_command_closure_rejects_missing_unauthorized_and_tampered_inventories() {
+    let module = command_module();
+    let catalog = command_catalog();
+    let user_grants = grants_for("user");
+    let selected = surface_for_application(
+        &catalog,
+        "web",
+        &["admin".into(), "user".into()],
+        &["user".into()],
+        &BTreeMap::from([("user".into(), user_grants.clone())]),
+    )
+    .unwrap();
+    let valid = SurfaceSpec::from_surface("web", &selected).unwrap();
+    Application::try_new("valid-command-closure", [module.clone()], [valid.clone()])
+        .expect("authorized command closure should compile");
+
+    let mut missing = valid.clone();
+    missing.contract.commands.clear();
+    missing.fingerprint =
+        distributed::application::sha256_fingerprint(&missing.canonical_bytes().unwrap());
+    let error = Application::try_new("missing-command", [module.clone()], [missing])
+        .expect_err("missing selected command must fail closed");
+    assert!(error
+        .to_string()
+        .contains("exact authorized command closure"));
+
+    let mut tampered = valid.clone();
+    tampered.contract.commands[0].roles = vec!["admin".into()];
+    tampered.fingerprint =
+        distributed::application::sha256_fingerprint(&tampered.canonical_bytes().unwrap());
+    let error = Application::try_new("tampered-command", [module.clone()], [tampered])
+        .expect_err("tampered selected command must fail closed");
+    assert!(error.to_string().contains("not compatible"));
+
+    let admin = surface_for_application(
+        &catalog,
+        "admin-web",
+        &["admin".into()],
+        &["admin".into()],
+        &BTreeMap::from([("admin".into(), grants_for("admin"))]),
+    )
+    .unwrap();
+    let admin_spec = SurfaceSpec::from_surface("web", &admin).unwrap();
+    let forbidden_command = admin_spec.contract.commands[0].clone();
+    let mut unauthorized = valid;
+    unauthorized
+        .contract
+        .commands
+        .push(forbidden_command.clone());
+    unauthorized
+        .contract
+        .commands
+        .sort_by(|left, right| left.id.cmp(&right.id));
+    unauthorized.fingerprint =
+        distributed::application::sha256_fingerprint(&unauthorized.canonical_bytes().unwrap());
+    let error = Application::try_new("unauthorized-command", [module], [unauthorized])
+        .expect_err("unauthorized selected command must fail closed");
+    assert!(error
+        .to_string()
+        .contains("exact authorized command closure"));
+
+    let role_surface = surface_for_role(&catalog, "user", &user_grants).unwrap();
+    let role_valid = SurfaceSpec::from_surface("user", &role_surface).unwrap();
+
+    let mut role_unauthorized = role_valid.clone();
+    role_unauthorized.contract.commands.push(forbidden_command);
+    role_unauthorized
+        .contract
+        .commands
+        .sort_by(|left, right| left.id.cmp(&right.id));
+    role_unauthorized.fingerprint =
+        distributed::application::sha256_fingerprint(&role_unauthorized.canonical_bytes().unwrap());
+    let error = Application::try_new(
+        "unauthorized-role-command",
+        [command_module()],
+        [role_unauthorized],
+    )
+    .expect_err("unauthorized role command must fail closed");
+    assert!(error
+        .to_string()
+        .contains("exact authorized command closure"));
+
+    let mut role_tampered = role_valid.clone();
+    role_tampered.contract.commands[0].roles = vec!["admin".into()];
+    role_tampered.fingerprint =
+        distributed::application::sha256_fingerprint(&role_tampered.canonical_bytes().unwrap());
+    let error = Application::try_new("tampered-role-command", [command_module()], [role_tampered])
+        .expect_err("tampered role command must fail closed");
+    assert!(error.to_string().contains("not compatible"));
+
+    let mut role_missing = role_valid;
+    role_missing.contract.commands.clear();
+    role_missing.fingerprint =
+        distributed::application::sha256_fingerprint(&role_missing.canonical_bytes().unwrap());
+    let error = Application::try_new("missing-role-command", [command_module()], [role_missing])
+        .expect_err("role command closure must fail closed");
+    assert!(error
+        .to_string()
+        .contains("exact authorized command closure"));
+}
+
+#[test]
+fn module_identity_is_identical_across_full_and_split_selection() {
+    let full = application_with_commands(&["todo.create", "todo.archive"]);
+    let split = application_with_commands(&["todo.archive", "todo.create"]);
+
+    assert_eq!(full.manifest().commands, split.manifest().commands);
+    assert_eq!(
+        full.manifest().canonical_bytes().unwrap(),
+        split.manifest().canonical_bytes().unwrap()
+    );
+}
+
+#[test]
+fn normalized_manifest_fits_without_serializing_duplicate_model_inventory() {
+    use distributed::application::{ModelFieldSpec, ModelSpec, MAX_APPLICATION_MANIFEST_BYTES};
+    let models = (0..64).map(|index| {
+        ModelSpec::try_new(
+            format!("Catalog{index:03}"),
+            format!("catalog_{index:03}"),
+            (0..400).map(|field| ModelFieldSpec {
+                name: format!("field_{field:03}_with_a_descriptive_domain_attribute_name"),
+                scalar: "String".into(),
+                nullable: false,
+            }),
+            ["field_000_with_a_descriptive_domain_attribute_name"],
+        )
+        .unwrap()
+    });
+    let module = Module::new("catalog").models(models).build().unwrap();
+    let manifest = ApplicationManifest::try_from_modules("catalog-app", [module], []).unwrap();
+    let bytes = manifest.canonical_bytes().unwrap();
+    assert!(bytes.len() < MAX_APPLICATION_MANIFEST_BYTES);
+    let mut redundant = serde_json::from_slice::<serde_json::Value>(&bytes).unwrap();
+    redundant["models"] = serde_json::to_value(&manifest.models).unwrap();
+    let redundant_bytes = serde_json::to_vec(&redundant).unwrap();
+    assert!(redundant_bytes.len() > 4 * 1024 * 1024);
+    assert!(redundant_bytes.len() < MAX_APPLICATION_MANIFEST_BYTES);
+    let error = ApplicationManifest::from_canonical_bytes(&redundant_bytes)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("unknown field `models`"), "{error}");
+    assert_eq!(
+        ApplicationManifest::from_canonical_bytes(&bytes).unwrap(),
+        manifest
+    );
+}
+
+#[test]
+fn manifest_reconstruction_rejects_excessive_inventory_before_cloning() {
+    let mut manifest =
+        ApplicationManifest::try_from_modules("app", [command_module()], []).unwrap();
+    let mut wire = serde_json::to_value(&manifest).unwrap();
+    let command = wire["modules"][0]["commands"][0].clone();
+    wire["modules"][0]["commands"] = serde_json::Value::Array(vec![
+        command;
+        distributed::application::MAX_MANIFEST_COLLECTION_ITEMS
+            + 1
+    ]);
+    let error = serde_json::from_value::<ApplicationManifest>(wire).unwrap_err();
+    assert!(error.to_string().contains("derived commands"), "{error}");
+    manifest.modules[0].commands = vec![
+        manifest.commands[0].clone();
+        distributed::application::MAX_MANIFEST_COLLECTION_ITEMS + 1
+    ];
+    let error = manifest.canonical_bytes().unwrap_err();
+    assert!(error.to_string().contains("derived commands"), "{error}");
+}
+
+#[test]
+fn manifest_wire_derives_inventories_without_accepting_a_second_authority() {
+    let manifest =
+        ApplicationManifest::try_from_modules("normalized-app", [command_module()], []).unwrap();
+    let bytes = manifest.canonical_bytes().unwrap();
+    let wire: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(wire["schema_version"], 3);
+    for field in ["commands", "events", "models", "projections"] {
+        assert!(
+            wire.get(field).is_none(),
+            "{field} is derived, not wire authority"
+        );
+        let mut redundant = wire.clone();
+        redundant[field] = serde_json::json!([]);
+        assert!(serde_json::from_value::<ApplicationManifest>(redundant).is_err());
+    }
+    assert_eq!(
+        ApplicationManifest::from_canonical_bytes(&bytes).unwrap(),
+        manifest
+    );
+    let mut inconsistent = manifest.clone();
+    inconsistent.commands.clear();
+    assert!(inconsistent.canonical_bytes().is_err());
+
+    let mut old = wire;
+    old["schema_version"] = serde_json::json!(1);
+    assert!(ApplicationManifest::from_canonical_bytes(&serde_json::to_vec(&old).unwrap()).is_err());
+}
+
+#[test]
+fn application_manifest_is_byte_deterministic_and_contains_no_executable_data() {
+    let spec = command("todo.create");
+    let mount = CommandMount::from_typed_route(spec.clone(), "todo.create");
+    let definition = CommandDefinition::with_mount(spec, mount).unwrap();
+    let module = Module::new("todo")
+        .command_definition(definition)
+        .build()
+        .expect("mounted module should be valid");
+    let application = Application::new("todo-app")
+        .module(module)
+        .extension(
+            ApplicationExtension::try_new(
+                "ui",
+                1,
+                serde_json::json!({
+                    "default_view": "board",
+                    "columns": ["title", "status"],
+                    "literal_url": "https://domain.example/view",
+                    "literal_path": "orders/today"
+                }),
+            )
+            .unwrap(),
+        )
+        .build()
+        .unwrap();
+
+    let first = application.manifest().canonical_bytes().unwrap();
+    let second = application.manifest().canonical_bytes().unwrap();
+    assert_eq!(first, second);
+    let value: serde_json::Value = serde_json::from_slice(&first).unwrap();
+    assert!(value.get("schema_version").is_some());
+    assert!(value["fingerprints"]["canonical"]
+        .as_str()
+        .unwrap()
+        .starts_with("sha256:"));
+    let extensions = value["extensions"].as_array().unwrap();
+    let framework = extensions
+        .iter()
+        .find(|extension| extension["id"] == "distributed.framework")
+        .unwrap();
+    assert_eq!(framework["version"], 1);
+    assert_eq!(framework["value"]["release"], env!("CARGO_PKG_VERSION"));
+    let ui = extensions
+        .iter()
+        .find(|extension| extension["id"] == "ui")
+        .unwrap();
+    assert_eq!(ui["value"]["literal_url"], "https://domain.example/view");
+    assert_eq!(ui["value"]["literal_path"], "orders/today");
+    assert!(!String::from_utf8(first.clone())
+        .unwrap()
+        .contains("handler"));
+    assert!(!String::from_utf8(first.clone())
+        .unwrap()
+        .contains("application_composition"));
+    assert!(ApplicationManifest::from_canonical_bytes(&first).is_ok());
+
+    let mut missing_version = value.clone();
+    missing_version
+        .as_object_mut()
+        .unwrap()
+        .remove("schema_version");
+    let missing_version = serde_json::to_vec(&missing_version).unwrap();
+    assert!(ApplicationManifest::from_canonical_bytes(&missing_version).is_err());
+
+    let mut missing_framework = application.manifest().clone();
+    missing_framework
+        .extensions
+        .retain(|extension| extension.id != "distributed.framework");
+    assert!(missing_framework
+        .validate()
+        .unwrap_err()
+        .to_string()
+        .contains("missing framework compatibility"));
+
+    let mut skewed_framework = application.manifest().clone();
+    skewed_framework
+        .extensions
+        .iter_mut()
+        .find(|extension| extension.id == "distributed.framework")
+        .unwrap()
+        .value["release"] = serde_json::json!("0.0.0-skewed");
+    assert!(skewed_framework
+        .validate()
+        .unwrap_err()
+        .to_string()
+        .contains("does not match compiling framework"));
+
+    for field in [
+        "tables",
+        "services",
+        "endpoints",
+        "transport",
+        "observability",
+    ] {
+        let mut legacy_owner = value.clone();
+        legacy_owner[field] = serde_json::json!([]);
+        let legacy_owner = serde_json::to_vec(&legacy_owner).unwrap();
+        assert!(
+            ApplicationManifest::from_canonical_bytes(&legacy_owner).is_err(),
+            "legacy logical-manifest field `{field}` must not decode"
+        );
+    }
+}
+
+#[test]
+fn manifest_provenance_separates_logical_and_artifact_identity() {
+    let application = application_with_commands(&["todo.create"]);
+    let first = application
+        .manifest()
+        .clone()
+        .with_source_revision("git:one");
+    let second = application
+        .manifest()
+        .clone()
+        .with_source_revision("git:two");
+
+    assert_eq!(
+        first.logical_fingerprint().unwrap(),
+        second.logical_fingerprint().unwrap()
+    );
+    assert_ne!(first.fingerprint().unwrap(), second.fingerprint().unwrap());
+    let decoded =
+        ApplicationManifest::from_canonical_bytes(&first.canonical_bytes().unwrap()).unwrap();
+    assert_eq!(
+        decoded.provenance.source_revision.as_deref(),
+        Some("git:one")
+    );
+    assert!(String::from_utf8(first.canonical_bytes().unwrap())
+        .unwrap()
+        .contains("git:one"));
+}
+
+#[test]
+fn contract_compiler_pins_manifest_sdl_and_client_to_one_surface() {
+    let selected = selected_surface();
+    let compiler =
+        ContractCompiler::from_surface("contract-only", "web", Arc::new(selected.clone())).unwrap();
+    let manifest = compiler.manifest().unwrap();
+    let sdl = compiler.graphql_sdl().unwrap();
+    let client = compiler.client_manifest().unwrap();
+
+    assert!(sdl.contains("TodoView"));
+    assert_eq!(manifest.surfaces.len(), 1);
+    assert!(matches!(
+        &manifest.surfaces[0].contract.selection,
+        SurfaceSelectionSpec::Application { name, .. } if name == "web"
+    ));
+    assert!(client
+        .models
+        .iter()
+        .any(|model| model.typename == "TodoView"));
+    assert!(ContractCompiler::new("contract-only")
+        .with_surface("web", Arc::new(selected))
+        .unwrap()
+        .with_surface("other", Arc::new(full_surface()))
+        .is_err());
+    assert!(matches!(
+        client.surface,
+        ClientSurfaceIdentity::Application { ref name, .. } if name == "web"
+    ));
+}
+
+#[test]
+fn surface_contract_retains_policy_literals_and_rejects_stale_model_material() {
+    let selected = selected_surface();
+    let spec = distributed::application::SurfaceSpec::from_surface("web", &selected).unwrap();
+    let row_policy = &spec.contract.models[0].row_policy;
+    assert_eq!(row_policy["kind"], "predicate");
+    assert!(row_policy.get("expression").is_some());
+    assert_ne!(row_policy, &serde_json::json!("predicate"));
+
+    let mut stale = spec.clone();
+    stale.contract.models[0].table = "other_table".into();
+    stale.fingerprint =
+        distributed::application::sha256_fingerprint(&stale.canonical_bytes().unwrap());
+    let error = Application::try_new("stale", [], [stale]).unwrap_err();
+    assert!(error.to_string().contains("model fingerprint"), "{error}");
+}
+
+#[test]
+fn explicit_definition_mount_identity_and_missing_pairing_fail_closed() {
+    let spec = command("todo.create");
+    let other = command("todo.other");
+    let mount = CommandMount::contract(other);
+    let error = CommandDefinition::with_mount(spec, mount).unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("definition and executable mount"));
+
+    let duplicate = Module::new("todo")
+        .command_definitions([definition("todo.create"), definition("todo.create")])
+        .build()
+        .expect_err("duplicate definitions must fail closed");
+    assert!(duplicate.to_string().contains("duplicate command identity"));
+}
+
+#[test]
+fn nested_fingerprints_and_projection_references_are_fail_closed() {
+    let application = application_with_commands(&["todo.create"]);
+    let bytes = application.manifest().canonical_bytes().unwrap();
+    let mut value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    value["modules"][0]["commands"][0]["fingerprint"] = serde_json::json!("");
+    let malformed: ApplicationManifest = serde_json::from_value(value)
+        .expect("the malformed value should still be structurally deserializable");
+    assert!(malformed.clone().refresh_fingerprints().is_err());
+    assert!(ApplicationManifest::from_canonical_bytes(
+        &serde_json::to_vec(&serde_json::to_value(malformed).unwrap()).unwrap()
+    )
+    .is_err());
+
+    let mut projection =
+        ProjectionSpec::try_new("todo.list", std::iter::empty::<String>(), ["TodoView"]).unwrap();
+    projection.dependencies.push("projection:missing".into());
+    projection.dependencies.sort();
+    projection.fingerprint =
+        distributed::application::sha256_fingerprint(&projection.canonical_bytes().unwrap());
+    let module = Module::new("todo")
+        .surface(
+            distributed::application::SurfaceSpec::from_surface("web", &selected_surface())
+                .unwrap(),
+        )
+        .projection(projection)
+        .build()
+        .unwrap();
+    let error = Application::try_new("projection-owner", [module], [])
+        .expect_err("missing projection dependencies must fail closed");
+    assert!(error.to_string().contains("missing"));
+}
+
+#[test]
+fn module_commands_only_keeps_command_identity() {
+    let projection =
+        ProjectionSpec::try_new("project_todos", ["todo.created"], ["TodoView"]).unwrap();
+    let module = Module::new("todo")
+        .command_definitions([definition("todo.create")])
+        .projection(projection)
+        .build()
+        .unwrap();
+    let commands = module.commands_only().unwrap();
+    let projectors = module.projectors_only().unwrap();
+    assert_eq!(module.commands()[0].id, commands.commands()[0].id);
+    assert!(projectors.commands().is_empty());
+    assert!(commands.manifest().projections.is_empty());
+    assert!(!module.manifest().projections.is_empty());
+    assert_eq!(module.module().id(), "todo");
+}
+
+#[test]
+fn roles_are_admission_without_a_second_guard() {
+    let roles = vec!["user".into(), "admin".into()];
+    assert!(command_roles_require_principal(&roles));
+    assert_eq!(
+        admit_command_session(&roles, None, &["user"]).unwrap_err(),
+        "unauthenticated"
+    );
+    assert!(admit_command_session(&roles, Some("alice"), &["user"]).is_ok());
+    assert!(admit_command_session(&["anonymous".into()], None, &[]).is_ok());
+    assert_eq!(
+        admit_command_session(&roles, Some("   "), &["user"]).unwrap_err(),
+        "unauthenticated"
+    );
+}
+
+#[test]
+fn contract_export_prunes_unselected_read_models() {
+    let tables = [TodoView::schema().clone(), ChatView::schema().clone()];
+    let full = build_surface(&tables, &SurfaceOptions::sqlite()).unwrap();
+    let grants = BTreeMap::from([(
+        "user".to_string(),
+        BTreeMap::from([
+            ("TodoView".to_string(), read().all_columns()),
+            ("ChatView".to_string(), read().all_columns()),
+        ]),
+    )]);
+    let selected =
+        surface_for_application(&full, "web", &["user".into()], &["user".into()], &grants).unwrap();
+    let export = DistributedClientSurfaceExport::from_contract("todo-app", selected).unwrap();
+    let todos_only = prune_client_manifest(export.manifest().unwrap(), ["TodoView"]).unwrap();
+    assert!(todos_only
+        .models
+        .iter()
+        .any(|model| model.typename == "TodoView"));
+    assert!(!todos_only
+        .models
+        .iter()
+        .any(|model| model.typename == "ChatView"));
+    let chat_only = prune_client_manifest(export.manifest().unwrap(), ["ChatView"]).unwrap();
+    assert!(chat_only
+        .models
+        .iter()
+        .any(|model| model.typename == "ChatView"));
+    assert!(!chat_only
+        .models
+        .iter()
+        .any(|model| model.typename == "TodoView"));
+}
+
+#[test]
+fn prune_drops_unselected_command_optimism_and_causal_slots() {
+    let tables = [TodoView::schema().clone(), ChatView::schema().clone()];
+    let full = build_surface(&tables, &SurfaceOptions::sqlite()).unwrap();
+    let grants = BTreeMap::from([(
+        "user".to_string(),
+        BTreeMap::from([
+            ("TodoView".to_string(), read().all_columns()),
+            ("ChatView".to_string(), read().all_columns()),
+        ]),
+    )]);
+    let catalog = full.with_module(&command_module()).unwrap();
+    let selected =
+        surface_for_application(&catalog, "web", &["user".into()], &["user".into()], &grants)
+            .unwrap();
+    let export = DistributedClientSurfaceExport::from_contract("todo-app", selected).unwrap();
+    let mut manifest = export.manifest().unwrap();
+    attach_todo_and_chat_command_optimism(&mut manifest);
+
+    let before = serde_json::to_string(&manifest).unwrap();
+    assert!(
+        before.contains("ChatView"),
+        "setup must include ChatView optimism"
+    );
+    assert!(before.contains("TodoView"));
+
+    let todos_only = prune_client_manifest(manifest, ["TodoView"]).unwrap();
+    let after = serde_json::to_string(&todos_only).unwrap();
+    assert!(
+        !after.contains("ChatView"),
+        "pruned manifest leaked ChatView: {after}"
+    );
+    assert!(todos_only
+        .models
+        .iter()
+        .any(|model| model.typename == "TodoView"));
+    for program in &todos_only.projection_programs {
+        for arm in &program.arms {
+            assert!(
+                arm.operations
+                    .iter()
+                    .all(|operation| operation.model == "TodoView"),
+                "unselected-model operations must be gone"
+            );
+        }
+    }
+    for command in &todos_only.commands {
+        if let Some(projection) = &command.extensions.projection {
+            assert!(projection
+                .pure_reduces
+                .iter()
+                .all(|reduce| reduce.model == "TodoView"));
+            assert!(projection
+                .program_arms
+                .iter()
+                .all(|arm| arm.program_id == "project_todos"));
+            assert!(projection
+                .preview_occurrences
+                .iter()
+                .all(|occurrence| occurrence.event.name == "todo.completed"));
+            for (index, occurrence) in projection.preview_occurrences.iter().enumerate() {
+                assert_eq!(occurrence.ordinal as usize, index);
+            }
+        }
+    }
+}
+
+fn attach_todo_and_chat_command_optimism(
+    manifest: &mut distributed::graphql::DistributedClientManifest,
+) {
+    let todo_event = ClientProjectionEventRef {
+        id: "todo.completed".into(),
+        name: "todo.completed".into(),
+        version: 1,
+    };
+    let chat_event = ClientProjectionEventRef {
+        id: "chat.posted".into(),
+        name: "chat.posted".into(),
+        version: 1,
+    };
+    manifest
+        .projectors
+        .push(distributed::graphql::ClientProjector {
+            version: 1,
+            name: "project_mixed".into(),
+            facts: vec!["todo.completed".into(), "chat.posted".into()],
+            models: vec!["TodoView".into(), "ChatView".into()],
+            dependencies: Vec::new(),
+        });
+    manifest.projection_programs.push(ClientProjectionProgram {
+        version: 2,
+        program_id: "project_todos".into(),
+        name: "project_todos".into(),
+        program_version: 1,
+        ir_version: PROJECTION_PROGRAM_IR_VERSION,
+        operation_semantics_version: PROJECTION_OPERATION_SEMANTICS_VERSION,
+        arms: vec![ClientProjectionArm {
+            arm: "complete".into(),
+            event: todo_event.clone(),
+            partition: ClientProjectionPartition::Unit,
+            operations: vec![ClientProjectionOperation {
+                operation: "upsert_todo".into(),
+                ordinal: 0,
+                kind: ClientProjectionMutationKind::Upsert,
+                model: "TodoView".into(),
+                key: Vec::new(),
+                fields: Vec::new(),
+                relationships: Vec::new(),
+                invalidations: Vec::new(),
+            }],
+        }],
+    });
+    manifest.projection_programs.push(ClientProjectionProgram {
+        version: 2,
+        program_id: "project_chat".into(),
+        name: "project_chat".into(),
+        program_version: 1,
+        ir_version: PROJECTION_PROGRAM_IR_VERSION,
+        operation_semantics_version: PROJECTION_OPERATION_SEMANTICS_VERSION,
+        arms: vec![ClientProjectionArm {
+            arm: "post".into(),
+            event: chat_event.clone(),
+            partition: ClientProjectionPartition::Unit,
+            operations: vec![ClientProjectionOperation {
+                operation: "upsert_chat".into(),
+                ordinal: 0,
+                kind: ClientProjectionMutationKind::Upsert,
+                model: "ChatView".into(),
+                key: Vec::new(),
+                fields: Vec::new(),
+                relationships: Vec::new(),
+                invalidations: Vec::new(),
+            }],
+        }],
+    });
+    let command = manifest
+        .commands
+        .first_mut()
+        .expect("module commands should compile onto the surface");
+    command.extensions.projection = Some(CommandProjectionExtension {
+        version: 2,
+        event_set: vec![chat_event.clone(), todo_event.clone()],
+        program_arms: vec![
+            CommandProjectionArmRef {
+                event: chat_event.clone(),
+                program_id: "project_chat".into(),
+                arm: "post".into(),
+            },
+            CommandProjectionArmRef {
+                event: todo_event.clone(),
+                program_id: "project_todos".into(),
+                arm: "complete".into(),
+            },
+        ],
+        preview_occurrences: vec![
+            CommandProjectionPreviewOccurrence {
+                ordinal: 0,
+                event: chat_event,
+                values: Vec::new(),
+            },
+            CommandProjectionPreviewOccurrence {
+                ordinal: 1,
+                event: todo_event,
+                values: Vec::new(),
+            },
+        ],
+        pure_reduces: vec![
+            ClientCommandPureReduce {
+                fn_name: "todo.status".into(),
+                client_module: "pures".into(),
+                client_export: "todoStatus".into(),
+                wasm_package: String::new(),
+                wasm_export: String::new(),
+                model: "TodoView".into(),
+                key: Vec::new(),
+                args: Vec::new(),
+                assign: Vec::new(),
+            },
+            ClientCommandPureReduce {
+                fn_name: "chat.echo".into(),
+                client_module: "pures".into(),
+                client_export: "chatEcho".into(),
+                wasm_package: String::new(),
+                wasm_export: String::new(),
+                model: "ChatView".into(),
+                key: Vec::new(),
+                args: Vec::new(),
+                assign: Vec::new(),
+            },
+        ],
+        fallback: ClientProjectionFallback::Revalidate,
+    });
+}
+
+#[test]
+fn application_surface_must_expose_a_schema_role() {
+    let mut surface =
+        distributed::application::SurfaceSpec::from_surface("web", &selected_surface()).unwrap();
+    let distributed::application::SurfaceSelectionSpec::Application { schema_roles, .. } =
+        &mut surface.contract.selection
+    else {
+        panic!("application selection");
+    };
+    schema_roles.clear();
+    surface.fingerprint =
+        distributed::application::sha256_fingerprint(&surface.canonical_bytes().unwrap());
+    let error = Application::try_new("role-owner", [], [surface])
+        .expect_err("application surfaces without schema roles must fail closed");
+    assert!(error.to_string().contains("schema role"));
+}
+
+/// The gateway's physical bindings (origins, hosts) are deployment detail:
+/// declaring the same gateway over different backends keeps the application
+/// identity, and none of the physical values leak into it.
+#[cfg(feature = "gateway")]
+#[test]
+fn gateway_physical_bindings_do_not_rewrite_application_identity() {
+    use distributed::gateway::{Binding, BindingKind, Gateway, GatewayConfig, Route, RoutePath};
+    fn ui(origin: &str) -> Gateway {
+        GatewayConfig {
+            bindings: vec![Binding::new(
+                "ui",
+                BindingKind::UiProxy {
+                    origin: origin.into(),
+                },
+            )],
+            routes: vec![Route::new("ui", RoutePath::prefix("/"), "ui")],
+        }
+        .build()
+        .unwrap()
+    }
+    let a = Application::new("site")
+        .build()
+        .unwrap()
+        .with_gateway("public", &ui("http://a.internal:3000"))
+        .unwrap();
+    let b = Application::new("site")
+        .build()
+        .unwrap()
+        .with_gateway("public", &ui("http://b.internal:4000"))
+        .unwrap();
+    assert_eq!(a.canonical_bytes().unwrap(), b.canonical_bytes().unwrap());
+    assert!(!String::from_utf8(a.canonical_bytes().unwrap())
+        .unwrap()
+        .contains("internal"));
+}

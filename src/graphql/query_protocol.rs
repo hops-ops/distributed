@@ -8,33 +8,26 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
-use async_graphql::Value;
 #[cfg(any(feature = "sqlite", feature = "postgres"))]
 use sqlx::{Encode, Executor, IntoArguments, Type};
 
 use super::compile::{ExtractedQueryEvidence, QueryResponsePathSegment, SqlPlan};
-use super::engine::EngineInner;
-#[cfg(any(feature = "sqlite", feature = "postgres"))]
-use super::engine::GraphqlPool;
-#[cfg(any(feature = "sqlite", feature = "postgres"))]
-use super::execute;
 use super::protocol::{
-    DistributedIndexRevision, DistributedLiveMetadata, DistributedQuerySnapshot,
-    DistributedRecordRevision, ProtocolResponseAccumulator, RequestedLiveResume,
-    MAX_LIVE_RESUME_CURSORS,
+    DistributedIndexRevision, DistributedLiveMetadata, DistributedLiveMode,
+    DistributedQuerySnapshot, DistributedRecordRevision, ProtocolResponseAccumulator,
+    RequestedLiveResume, MAX_LIVE_RESUME_CURSORS,
 };
 use super::surface::{Surface, SurfaceProjectionOwner, SurfaceRowPolicy};
 use crate::projection::placement::ProjectionBindingState;
 use crate::projection_protocol::{
-    CompiledProjectionTopology, ProjectionChangeCursor, ProjectionChangeRead, ProjectionEpoch,
-    ProjectionLiveRecordBatchRequest, ProjectionLiveRecordRequest, ProjectionPartition,
-    ProjectionPartitionSnapshot, ProjectionPartitionSpec, ProjectionProtocolError,
-    ProjectionScopeCodec, ProjectorTopologyId,
+    CompiledProjectionTopology, PartitionId, ProjectionChangeCursor, ProjectionChangeRead,
+    ProjectionLiveRecordBatchRequest, ProjectionLiveRecordRequest, ProjectionPartitionSnapshot,
+    ProjectionPartitionSpec, ProjectionProtocolError, ProjectionScopeCodec, ProjectorTopologyId,
 };
 #[cfg(any(feature = "sqlite", feature = "postgres"))]
 use crate::sqlx_repo::projection_protocol::{
     read_projection_changes_in_executor, read_projection_live_record_batch_in_executor,
-    read_projection_partition_snapshot_in_executor, with_projection_read_snapshot,
+    read_projection_partition_snapshot_in_executor,
 };
 #[cfg(any(feature = "sqlite", feature = "postgres"))]
 use crate::sqlx_repo::repo::SqlxRepoBackend;
@@ -43,15 +36,27 @@ use crate::sqlx_repo::repo::SqlxRepoBackend;
 pub(crate) struct QueryProjectorRuntime {
     pub(crate) name: String,
     pub(crate) codec: Arc<ProjectionScopeCodec>,
-    pub(crate) static_partition: Option<ProjectionPartition>,
-    pub(crate) change_epoch: Option<ProjectionEpoch>,
+    pub(crate) static_partition: Option<PartitionId>,
     models: BTreeSet<String>,
     dependencies: BTreeSet<String>,
+    /// Public causal-observation identity for each output model. Modeled
+    /// projections use their versioned program ID; legacy projections retain
+    /// the physical owner name as their public identity.
+    public_projection_by_model: BTreeMap<String, String>,
+    /// Modeled changes must carry their authoring identity on the durable
+    /// change row. Legacy rows may derive the historical physical identity.
+    requires_semantic_identity: bool,
 }
 
 impl QueryProjectorRuntime {
     pub(crate) fn supports_resume(&self) -> bool {
-        self.static_partition.is_some() && self.change_epoch.is_some()
+        self.static_partition.is_some()
+    }
+
+    pub(crate) fn public_projection_for_model(&self, model: &str) -> Option<&str> {
+        self.public_projection_by_model
+            .get(model)
+            .map(String::as_str)
     }
 
     /// A partition-wide change cursor is safe to expose only when every model
@@ -161,14 +166,14 @@ impl QueryProtocolRuntime {
     }
 
     /// Build one conservative vector over every physical dependency touched by
-    /// an exact query plan. Missing, denied, dynamic, epochless, or ambiguous
+    /// an exact query plan. Missing, denied, dynamic, or ambiguous
     /// ownership makes the vector incomparable; no scalar maximum is invented.
     ///
     /// Tables with **zero** surface projectors are skipped rather than failing
     /// the plan. Join targets such as `auth_users` are often populated by
     /// integration handlers without a unit-resume owner; they still participate
     /// in dirty matching via `tables_touched`, but must not force
-    /// `live.supported = false` for an otherwise resumable root model (e.g.
+    /// snapshot-only live delivery for an otherwise resumable root model (e.g.
     /// `chat_messages` with a nested `author` selection).
     pub(crate) fn index_plan(&self, role_surface: &Surface, tables: &[String]) -> QueryIndexPlan {
         if tables.is_empty() {
@@ -227,11 +232,6 @@ impl QueryProtocolRuntime {
         }
     }
 
-    #[allow(dead_code)]
-    pub(crate) fn is_empty(&self) -> bool {
-        self.projectors.is_empty()
-    }
-
     #[cfg(test)]
     pub(crate) fn topology_for_model(
         &self,
@@ -247,6 +247,13 @@ impl QueryProtocolRuntime {
         self.model_owners
             .get(model)
             .map(|owner| owner.static_partition.is_some())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn public_projection_for_model(&self, model: &str) -> Option<&str> {
+        self.model_owners
+            .get(model)
+            .and_then(|owner| owner.public_projection_for_model(model))
     }
 }
 
@@ -307,24 +314,18 @@ fn compile_legacy_query_projector(
             projector.name
         )
     })?;
-    let change_epoch = projector
-        .change_epoch
-        .as_deref()
-        .map(ProjectionEpoch::new)
-        .transpose()
-        .map_err(|error| {
-            format!(
-                "query protocol projector `{}` has invalid change epoch: {error}",
-                projector.name
-            )
-        })?;
     Ok(Arc::new(QueryProjectorRuntime {
         name: projector.name.clone(),
         codec,
         static_partition,
-        change_epoch,
         models: projector.models.iter().cloned().collect(),
         dependencies: projector.dependencies.iter().cloned().collect(),
+        public_projection_by_model: projector
+            .models
+            .iter()
+            .map(|model| (model.clone(), projector.name.clone()))
+            .collect(),
+        requires_semantic_identity: false,
     }))
 }
 
@@ -369,6 +370,7 @@ fn compile_modeled_query_projector(
     validate_modeled_partition_binding(projector, first_program, first_binding)?;
 
     let mut models = BTreeSet::new();
+    let mut public_projection_by_model = BTreeMap::new();
     for modeled in &active {
         let (program, binding) = modeled.raw().ok_or_else(|| {
             format!(
@@ -390,14 +392,6 @@ fn compile_modeled_query_projector(
                 projector.name
             ));
         }
-        if modeled.epoch() != first.epoch() {
-            return Err(format!(
-                "query protocol modeled owner `{}` has incompatible active change epochs `{}` and `{}`",
-                projector.name,
-                first.epoch().as_str(),
-                modeled.epoch().as_str()
-            ));
-        }
         if binding.partition() != first_binding.partition()
             || program.partition() != first_program.partition()
         {
@@ -406,7 +400,18 @@ fn compile_modeled_query_projector(
                 projector.name
             ));
         }
-        models.extend(modeled.output_models().iter().cloned());
+        for model in modeled.output_models() {
+            models.insert(model.clone());
+            if public_projection_by_model
+                .insert(model.clone(), modeled.program_id().to_string())
+                .is_some()
+            {
+                return Err(format!(
+                    "query protocol modeled owner `{}` has ambiguous active program identity for model `{model}`",
+                    projector.name
+                ));
+            }
+        }
     }
     if models.is_empty() {
         return Err(format!(
@@ -451,12 +456,6 @@ fn compile_modeled_query_projector(
     } else {
         None
     };
-    let change_epoch = ProjectionEpoch::new(first.epoch().as_str()).map_err(|error| {
-        format!(
-            "query protocol modeled owner `{}` has invalid active change epoch: {error}",
-            projector.name
-        )
-    })?;
     let dependencies = models
         .iter()
         .map(|model| {
@@ -473,9 +472,10 @@ fn compile_modeled_query_projector(
         name: projector.name.clone(),
         codec,
         static_partition,
-        change_epoch: Some(change_epoch),
         models,
         dependencies,
+        public_projection_by_model,
+        requires_semantic_identity: true,
     })))
 }
 
@@ -500,12 +500,6 @@ fn validate_modeled_partition_binding(
     Ok(())
 }
 
-pub(crate) struct ProtocolQueryExecution {
-    pub(crate) value: Value,
-    pub(crate) snapshot: DistributedQuerySnapshot,
-    pub(crate) live: Option<DistributedLiveMetadata>,
-}
-
 struct PreparedRecordProbe {
     request: ProjectionLiveRecordRequest,
     paths: Vec<Vec<String>>,
@@ -517,10 +511,15 @@ struct PreparedQueryEvidence {
     indexes: QueryIndexPlan,
 }
 
-const MAX_PROTOCOL_EVIDENCE_ITEMS: usize = 4_096;
+/// Records, indexes or observations one envelope may carry; pinned for the
+/// client in `tests/fixtures/protocol-envelope-v1.json`.
+pub(crate) const MAX_PROTOCOL_EVIDENCE_ITEMS: usize = 4_096;
 
 struct PreparedLiveChange {
+    /// Physical owner used for change-log routing and opaque scope tokens.
     projection: String,
+    /// Versioned semantic identity used in public causal observations.
+    public_projection: Option<String>,
     change: crate::projection_protocol::ProjectionChange,
 }
 
@@ -529,146 +528,18 @@ struct PreparedLiveMetadata {
     changes: Vec<PreparedLiveChange>,
 }
 
-/// Execute the physical query and all record/index evidence reads inside one
-/// adapter snapshot. The returned GraphQL value has already had every hidden
-/// compiler key removed.
+/// Read every record/index evidence row a query result needs, inside the
+/// result's own snapshot (`connection`), and assemble the wire metadata.
 #[cfg(any(feature = "sqlite", feature = "postgres"))]
-pub(crate) async fn execute_query_with_protocol(
-    inner: &EngineInner,
-    role_surface: Arc<Surface>,
-    accumulator: ProtocolResponseAccumulator,
-    plan: &SqlPlan,
-    live_resume: Option<RequestedLiveResume>,
-) -> Result<ProtocolQueryExecution, String> {
-    #[derive(serde::Serialize)]
-    struct QueryPlanInstance<'a> {
-        domain: &'static str,
-        version: u32,
-        sql: &'a str,
-        binds: &'a [super::compile::BindValue],
-        tables: &'a [String],
-    }
-
-    // Query and subscription documents retain distinct public operation
-    // hashes, but matching compiler plans share one comparable snapshot scope.
-    // This prevents a lagging refresh from being treated as authoritative over
-    // a newer live frame merely because the transport operation differs.
-    accumulator
-        .bind_query_snapshot_scope(&QueryPlanInstance {
-            domain: "distributed.graphql.query-plan-instance",
-            version: 1,
-            sql: &plan.sql,
-            binds: &plan.binds,
-            tables: &plan.tables_touched,
-        })
-        .map_err(|error| format!("query snapshot scope failed: {error}"))?;
-
-    // The snapshot helper accepts an HRTB closure whose returned future may
-    // borrow only its connection. Keep every other input owned by the closure
-    // so plan/runtime references cannot escape into that future.
-    let plan = plan.clone();
-    let runtime = inner.query_protocol.clone();
-    let statement_timeout = inner.statement_timeout;
-    match &inner.pool {
-        #[cfg(feature = "sqlite")]
-        GraphqlPool::Sqlite(pool) => {
-            let run = with_projection_read_snapshot(pool, move |connection| {
-                let role_surface = Arc::clone(&role_surface);
-                let accumulator = accumulator.clone();
-                let plan = plan.clone();
-                let runtime = runtime.clone();
-                let live_resume = live_resume.clone();
-                Box::pin(async move {
-                    let executed = execute::execute_sqlite_in_connection(connection, &plan)
-                        .await
-                        .map_err(query_execution_error)?;
-                    finish_protocol_query::<sqlx::Sqlite>(
-                        connection,
-                        &runtime,
-                        &role_surface,
-                        &accumulator,
-                        &plan,
-                        executed,
-                        live_resume,
-                    )
-                    .await
-                })
-            });
-            execute::apply_statement_timeout(statement_timeout, async {
-                run.await.map_err(|error| error.to_string())
-            })
-            .await
-        }
-        #[cfg(feature = "postgres")]
-        GraphqlPool::Postgres(pool) => {
-            let run = with_projection_read_snapshot(pool, move |connection| {
-                let role_surface = Arc::clone(&role_surface);
-                let accumulator = accumulator.clone();
-                let plan = plan.clone();
-                let runtime = runtime.clone();
-                let live_resume = live_resume.clone();
-                Box::pin(async move {
-                    let timeout_ms =
-                        i64::try_from(statement_timeout.as_millis()).unwrap_or(i64::MAX);
-                    sqlx::query(sqlx::AssertSqlSafe(format!(
-                        "SET LOCAL statement_timeout = '{timeout_ms}ms'"
-                    )))
-                    .execute(&mut *connection)
-                    .await
-                    .map_err(|error| {
-                        query_execution_error(format!("statement_timeout: {error}"))
-                    })?;
-                    let executed = execute::execute_postgres_in_connection(connection, &plan)
-                        .await
-                        .map_err(query_execution_error)?;
-                    finish_protocol_query::<sqlx::Postgres>(
-                        connection,
-                        &runtime,
-                        &role_surface,
-                        &accumulator,
-                        &plan,
-                        executed,
-                        live_resume,
-                    )
-                    .await
-                })
-            });
-            execute::apply_statement_timeout(statement_timeout, async {
-                run.await.map_err(|error| error.to_string())
-            })
-            .await
-        }
-        #[allow(unreachable_patterns)]
-        _ => Err("no database pool available for GraphQL execution".into()),
-    }
-}
-
-#[cfg(not(any(feature = "sqlite", feature = "postgres")))]
-pub(crate) async fn execute_query_with_protocol(
-    _inner: &EngineInner,
-    _role_surface: Arc<Surface>,
-    _accumulator: ProtocolResponseAccumulator,
-    _plan: &SqlPlan,
-    _live_resume: Option<RequestedLiveResume>,
-) -> Result<ProtocolQueryExecution, String> {
-    Err("no database pool available for GraphQL execution".into())
-}
-
-#[cfg(any(feature = "sqlite", feature = "postgres"))]
-fn query_execution_error(error: String) -> ProjectionProtocolError {
-    ProjectionProtocolError::InvalidBatch(format!("GraphQL query snapshot failed: {error}"))
-}
-
-#[cfg(any(feature = "sqlite", feature = "postgres"))]
-async fn finish_protocol_query<DB>(
+pub(crate) async fn finish_protocol_query<DB>(
     connection: &mut DB::Connection,
     runtime: &QueryProtocolRuntime,
     role_surface: &Surface,
     accumulator: &ProtocolResponseAccumulator,
     plan: &SqlPlan,
-    executed: execute::ExecutedSql,
+    evidence: ExtractedQueryEvidence,
     live_resume: Option<RequestedLiveResume>,
-) -> Result<ProtocolQueryExecution, ProjectionProtocolError>
+) -> Result<(DistributedQuerySnapshot, Option<DistributedLiveMetadata>), ProjectionProtocolError>
 where
     DB: SqlxRepoBackend,
     for<'c> &'c mut DB::Connection: Executor<'c, Database = DB>,
@@ -680,7 +551,7 @@ where
     for<'q> &'q [u8]: Encode<'q, DB> + Type<DB>,
     for<'r> &'r str: sqlx::ColumnIndex<DB::Row>,
 {
-    let prepared = prepare_query_evidence(runtime, role_surface, plan, executed.evidence)?;
+    let prepared = prepare_query_evidence(runtime, role_surface, plan, evidence)?;
     // Store evidence batches are deliberately capped at 128 to bound one SQL
     // statement. A query snapshot may carry up to 4,096 records, so read it in
     // bounded chunks inside this same database snapshot and preserve positional
@@ -707,16 +578,11 @@ where
             .static_partition
             .as_ref()
             .expect("comparable index plans retain a static partition");
-        let epoch = projector
-            .change_epoch
-            .as_ref()
-            .expect("comparable index plans retain a change epoch");
         partitions.push(
             read_projection_partition_snapshot_in_executor::<DB>(
                 connection,
                 projector.codec.topology(),
                 partition,
-                epoch,
             )
             .await?,
         );
@@ -736,18 +602,24 @@ where
         }
         None => (None, Vec::new()),
     };
-    let snapshot = wire_query_snapshot(
+    let mut snapshot = wire_query_snapshot(
         accumulator,
         prepared,
         record_metadata,
         partitions,
         live_changes,
     )?;
-    Ok(ProtocolQueryExecution {
-        value: executed.value,
-        snapshot,
-        live,
-    })
+    if live
+        .as_ref()
+        .is_some_and(|metadata| metadata.mode == DistributedLiveMode::Snapshot)
+    {
+        // A safe query vector can still exceed the live cursor budget. Snapshot
+        // delivery has one contract regardless of why resumability is unavailable.
+        snapshot.indexes_comparable = false;
+        snapshot.indexes.clear();
+        snapshot.observations.clear();
+    }
+    Ok((snapshot, live))
 }
 
 fn prepare_query_evidence(
@@ -843,7 +715,7 @@ where
     {
         return Ok(PreparedLiveMetadata {
             metadata: DistributedLiveMetadata {
-                supported: false,
+                mode: DistributedLiveMode::Snapshot,
                 reset: true,
                 cursors: Vec::new(),
             },
@@ -860,10 +732,7 @@ where
             .static_partition
             .as_ref()
             .expect("comparable live plans retain a static partition");
-        let epoch = projector
-            .change_epoch
-            .as_ref()
-            .expect("comparable live plans retain a change epoch");
+        let epoch = partition_snapshot.epoch.as_ref();
         let position = partition_snapshot
             .head
             .as_ref()
@@ -919,10 +788,7 @@ where
                 .static_partition
                 .as_ref()
                 .expect("comparable live plans retain a static partition");
-            let epoch = projector
-                .change_epoch
-                .as_ref()
-                .expect("comparable live plans retain a change epoch");
+            let epoch = partition_snapshot.epoch.as_ref();
             if accumulator
                 .verify_live_resume_position(
                     &supplied,
@@ -942,14 +808,18 @@ where
             let after = if position == 0 {
                 None
             } else {
-                match ProjectionChangeCursor::new(
-                    projector.codec.topology().clone(),
-                    partition.clone(),
-                    epoch.clone(),
-                    position,
-                ) {
-                    Ok(cursor) => Some(cursor),
-                    Err(_) => {
+                // A position past zero names a change, so its partition and
+                // epoch exist.
+                match epoch.map(|epoch| {
+                    ProjectionChangeCursor::new(
+                        projector.codec.topology().clone(),
+                        partition.clone(),
+                        epoch.clone(),
+                        position,
+                    )
+                }) {
+                    Some(Ok(cursor)) => Some(cursor),
+                    Some(Err(_)) | None => {
                         reset = true;
                         continue;
                     }
@@ -1023,8 +893,28 @@ where
                             break;
                         }
                         replayed_changes.extend(changes.into_iter().map(|change| {
+                            // Modeled identity is part of the persisted change
+                            // evidence. Never relabel an old/null row from the
+                            // currently active program after a cold restart.
+                            let public_projection = change
+                                .program_id
+                                .map(|program_id| program_id.to_string())
+                                .or_else(|| {
+                                    if projector.requires_semantic_identity {
+                                        None
+                                    } else {
+                                        change
+                                            .scope
+                                            .as_ref()
+                                            .and_then(|scope| {
+                                                projector.public_projection_for_model(scope.model())
+                                            })
+                                            .map(str::to_owned)
+                                    }
+                                });
                             PreparedLiveChange {
                                 projection: projector.name.clone(),
+                                public_projection,
                                 change,
                             }
                         }));
@@ -1043,7 +933,7 @@ where
 
     Ok(PreparedLiveMetadata {
         metadata: DistributedLiveMetadata {
-            supported: true,
+            mode: DistributedLiveMode::Resumable,
             reset,
             cursors: current,
         },
@@ -1121,22 +1011,14 @@ fn wire_query_snapshot(
             .static_partition
             .as_ref()
             .expect("comparable index plans retain a static partition");
-        let epoch = projector
-            .change_epoch
-            .as_ref()
-            .expect("comparable index plans retain a change epoch");
+        let epoch = partition_snapshot.epoch.as_ref();
         let position = partition_snapshot
             .head
             .as_ref()
             .map(|cursor| cursor.position())
             .unwrap_or(0);
         let scope_token = accumulator
-            .issue_index_scope_parts(
-                &snapshot_scope,
-                projector.codec.topology(),
-                partition,
-                epoch,
-            )
+            .issue_index_scope_parts(&snapshot_scope, projector.codec.topology(), partition)
             .map_err(|error| ProjectionProtocolError::InvalidBatch(error.to_string()))?;
         let resume = if issue_index_resumes {
             Some(
@@ -1208,24 +1090,35 @@ fn wire_query_snapshot(
                         live_record_fences.insert(scope_key, (clock, wire_record));
                     }
                 }
-                let observation = super::protocol::DistributedProjectionObservation {
-                    causation_id: change.causation_id.clone(),
-                    projection: live.projection.clone(),
-                    model: scope.model().to_string(),
-                    scope_token: accumulator
-                        .issue_projection_obligation_scope(
-                            &change.causation_id,
-                            &live.projection,
-                            scope.model(),
-                            crate::projection_protocol::ProjectionObservationKind::Record,
-                            scope,
-                        )
-                        .map_err(|error| {
-                            ProjectionProtocolError::InvalidBatch(error.to_string())
-                        })?,
-                };
-                if observation_tokens.insert(observation.scope_token.as_str().to_string()) {
-                    observations.push(observation);
+                // A retained pre-identity change still contributes its
+                // authoritative row/revision. It cannot, however, mint a
+                // modeled causal observation because its authoring program is
+                // unknown. Keep the readable data and omit only that proof.
+                if let Some(projection) = live.public_projection.clone() {
+                    let observation = super::protocol::DistributedProjectionObservation {
+                        causation_id: change.causation_id.clone(),
+                        projection,
+                        model: scope.model().to_string(),
+                        scope_token: accumulator
+                            .issue_projection_obligation_scope(
+                                &change.causation_id,
+                                &live.projection,
+                                scope.model(),
+                                crate::projection_protocol::ProjectionObservationKind::Record,
+                                scope,
+                            )
+                            .map_err(|error| {
+                                ProjectionProtocolError::InvalidBatch(error.to_string())
+                            })?,
+                        // The frame's own record evidence carries the row clock.
+                        record: None,
+                    };
+                    if observation_tokens.insert((
+                        observation.projection.clone(),
+                        observation.scope_token.as_str().to_string(),
+                    )) {
+                        observations.push(observation);
+                    }
                 }
             }
             crate::projection_protocol::ProjectionChangeKind::Observation => {
@@ -1239,24 +1132,33 @@ fn wire_query_snapshot(
                         "live projection observation omitted its kind".into(),
                     )
                 })?;
-                let observation = super::protocol::DistributedProjectionObservation {
-                    causation_id: change.causation_id.clone(),
-                    projection: live.projection.clone(),
-                    model: scope.model().to_string(),
-                    scope_token: accumulator
-                        .issue_projection_obligation_scope(
-                            &change.causation_id,
-                            &live.projection,
-                            scope.model(),
-                            kind,
-                            scope,
-                        )
-                        .map_err(|error| {
-                            ProjectionProtocolError::InvalidBatch(error.to_string())
-                        })?,
-                };
-                if observation_tokens.insert(observation.scope_token.as_str().to_string()) {
-                    observations.push(observation);
+                // As with record changes, legacy/unversioned modeled history
+                // remains queryable but cannot be advertised as causal proof.
+                if let Some(projection) = live.public_projection.clone() {
+                    let observation = super::protocol::DistributedProjectionObservation {
+                        causation_id: change.causation_id.clone(),
+                        projection,
+                        model: scope.model().to_string(),
+                        scope_token: accumulator
+                            .issue_projection_obligation_scope(
+                                &change.causation_id,
+                                &live.projection,
+                                scope.model(),
+                                kind,
+                                scope,
+                            )
+                            .map_err(|error| {
+                                ProjectionProtocolError::InvalidBatch(error.to_string())
+                            })?,
+                        // The frame's own record evidence carries the row clock.
+                        record: None,
+                    };
+                    if observation_tokens.insert((
+                        observation.projection.clone(),
+                        observation.scope_token.as_str().to_string(),
+                    )) {
+                        observations.push(observation);
+                    }
                 }
             }
             crate::projection_protocol::ProjectionChangeKind::Checkpoint
@@ -1313,5 +1215,329 @@ mod tests {
     fn query_index_budget_accepts_4096_and_rejects_4097() {
         assert!(query_index_budget_allows(MAX_PROTOCOL_EVIDENCE_ITEMS));
         assert!(!query_index_budget_allows(MAX_PROTOCOL_EVIDENCE_ITEMS + 1));
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn wire_snapshot_preserves_persisted_modeled_identity_and_receipt_scope() {
+        use std::collections::{BTreeMap, BTreeSet};
+
+        use crate::graphql::protocol::{ProtocolTokenCodec, ProtocolTokenPurpose};
+        use crate::projection_protocol::{
+            ProjectionChangeRead, ProjectionCommitBatch, ProjectionEpoch, ProjectionInputCursor,
+            ProjectionInputFingerprint, ProjectionModelOwnership, ProjectionObservationKind,
+            ProjectionObservationRequest, ProjectionObservationTarget, ProjectionProtocolStore,
+            ProjectionRecordExpectation, ProjectionRecordMutation, ProjectionSource,
+            RecordTransition, TrustedProjectionInput,
+        };
+        use crate::sqlite_repo::SqliteRepository;
+        use crate::table::{
+            ColumnType, ExpectedVersion, PrimaryKey, RowKey, RowValue, RowValues, RowWriteMode,
+            TableColumn, TableKind, TableMutation, TableRowMutation, TableSchema,
+            TableSchemaRegistry,
+        };
+
+        let topology = ProjectorTopologyId::new(1, "query-wire-modeled", [0x4a; 32]).unwrap();
+        static SCHEMA: std::sync::LazyLock<TableSchema> =
+            std::sync::LazyLock::new(|| TableSchema {
+                model_name: "WireView".into(),
+                table_name: "wire_views".into(),
+                columns: vec![
+                    TableColumn {
+                        primary_key: true,
+                        ..TableColumn::new("id", "id", ColumnType::Text)
+                    },
+                    TableColumn::new("title", "title", ColumnType::Text),
+                ],
+                primary_key: PrimaryKey::new(["id"]),
+                version_column: Some(crate::table::DEFAULT_TABLE_VERSION_COLUMN.into()),
+                indexes: Vec::new(),
+                relationships: Vec::new(),
+                kind: TableKind::ReadModel,
+            });
+        let schema = &*SCHEMA;
+        let mut table_registry = TableSchemaRegistry::new();
+        table_registry.register_schema(schema.clone()).unwrap();
+        let repository = SqliteRepository::connect_and_migrate("sqlite::memory:")
+            .await
+            .unwrap();
+        repository
+            .bootstrap_table_schema_for_dev(&table_registry)
+            .await
+            .unwrap();
+        let program_id = crate::projection::ProjectionProgramId::parse(&format!(
+            "pp1:sha256:{}",
+            "4".repeat(64)
+        ))
+        .unwrap();
+        let ownership = ProjectionModelOwnership::new("WireView", "wire_views")
+            .unwrap()
+            .with_program_id(program_id);
+        repository
+            .register_projection_models(&topology, std::slice::from_ref(&ownership))
+            .await
+            .unwrap();
+
+        let codec = Arc::new(
+            ProjectionScopeCodec::with_models(topology.clone(), [("WireView", schema)]).unwrap(),
+        );
+        let partition = codec.encode_partition(None).unwrap();
+        let key = RowKey::new([("id", RowValue::String("wire-1".into()))]);
+        let scope = codec
+            .encode_row_scope_in_partition("WireView", partition.clone(), &key)
+            .unwrap();
+        let mut values = RowValues::new();
+        values.insert("id", RowValue::String("wire-1".into()));
+        values.insert("title", RowValue::String("persisted".into()));
+        let mutation = TableMutation::UpsertRow(TableRowMutation {
+            schema: &schema,
+            key: key.clone(),
+            values,
+            expected_version: ExpectedVersion::Any,
+            mode: RowWriteMode::Upsert,
+        });
+        let input = TrustedProjectionInput::mint(
+            ProjectionInputCursor::new(
+                topology.clone(),
+                partition.clone(),
+                ProjectionSource::new("wire-source", b"wire-partition".to_vec()).unwrap(),
+                ProjectionEpoch::new("wire-source-v1").unwrap(),
+                1,
+            )
+            .unwrap(),
+            ProjectionInputFingerprint::from_canonical_bytes(b"wire-input"),
+            "wire-message-1",
+            "wire-cause-1",
+            crate::projection_protocol::ProjectionGeneration::initial(),
+            true,
+        )
+        .unwrap();
+        let commit = repository
+            .commit_projection(ProjectionCommitBatch {
+                input,
+                ownership: vec![ownership],
+                mutations: vec![ProjectionRecordMutation::new(
+                    scope.clone(),
+                    mutation,
+                    ProjectionRecordExpectation::Missing,
+                    RecordTransition::Upsert,
+                )
+                .unwrap()],
+                observations: vec![ProjectionObservationRequest {
+                    kind: ProjectionObservationKind::Record,
+                    target: ProjectionObservationTarget::StagedRecord(scope.clone()),
+                }],
+            })
+            .await
+            .unwrap();
+        let stored_change = match repository
+            .projection_changes(&topology, &partition, None, 16)
+            .await
+            .unwrap()
+        {
+            ProjectionChangeRead::Changes { changes, .. } => changes
+                .into_iter()
+                .find(|change| {
+                    change.kind == crate::projection_protocol::ProjectionChangeKind::RecordUpsert
+                })
+                .expect("stored record change"),
+            other => panic!("unexpected projection change read: {other:?}"),
+        };
+        assert_eq!(stored_change.program_id, Some(program_id));
+        assert!(commit
+            .changes
+            .iter()
+            .any(|change| change.program_id == Some(program_id)));
+
+        let cache_scope = ProtocolTokenCodec::new([0x4b; 32])
+            .issue(ProtocolTokenPurpose::CacheScope, &("wire", "cache"))
+            .unwrap();
+        let token_codec = ProtocolTokenCodec::new([0x4b; 32]);
+        let accumulator = ProtocolResponseAccumulator::new(
+            super::super::protocol::DistributedEnvelopeV1::new(
+                "sha256:wire-schema",
+                "wire-auth",
+                cache_scope,
+                None,
+            ),
+            token_codec,
+        );
+        accumulator
+            .bind_query_snapshot_scope(&serde_json::json!({
+                "sql": "SELECT wire_views",
+                "tables": ["wire_views"]
+            }))
+            .unwrap();
+
+        let runtime = Arc::new(QueryProjectorRuntime {
+            name: "wire-physical-projector".into(),
+            codec: Arc::clone(&codec),
+            static_partition: Some(partition.clone()),
+            models: BTreeSet::from(["WireView".into()]),
+            dependencies: BTreeSet::from(["wire_views".into()]),
+            public_projection_by_model: BTreeMap::from([(
+                "WireView".into(),
+                program_id.to_string(),
+            )]),
+            requires_semantic_identity: true,
+        });
+        let snapshot_scope = accumulator.query_snapshot_scope().unwrap();
+        let initial_cursor = accumulator
+            .issue_live_resume_position(
+                &runtime.name,
+                &snapshot_scope,
+                runtime.codec.topology(),
+                &partition,
+                Some(stored_change.cursor.epoch()),
+                0,
+            )
+            .unwrap();
+        let partition_snapshot = ProjectionPartitionSnapshot {
+            epoch: Some(stored_change.cursor.epoch().clone()),
+            head: Some(stored_change.cursor.clone()),
+            compacted_through: 0,
+        };
+        let prepared_live = PreparedQueryEvidence {
+            records_complete: true,
+            records: Vec::new(),
+            indexes: QueryIndexPlan {
+                comparable: true,
+                projectors: vec![Arc::clone(&runtime)],
+            },
+        };
+        let mut connection = repository.pool().acquire().await.unwrap();
+        let live_metadata = wire_live_metadata::<sqlx::Sqlite>(
+            &mut *connection,
+            &accumulator,
+            &prepared_live,
+            std::slice::from_ref(&partition_snapshot),
+            RequestedLiveResume::Cursors(vec![initial_cursor.clone()]),
+        )
+        .await
+        .unwrap();
+        assert_eq!(live_metadata.metadata.mode, DistributedLiveMode::Resumable);
+        assert!(!live_metadata.metadata.reset);
+        assert_eq!(live_metadata.changes.len(), 1);
+        assert_eq!(
+            live_metadata.changes[0].public_projection.as_deref(),
+            Some(program_id.to_string().as_str())
+        );
+        let live_changes = live_metadata.changes;
+        drop(connection);
+        let record = repository
+            .projection_record(&scope)
+            .await
+            .unwrap()
+            .expect("stored record metadata");
+        let prepared = PreparedQueryEvidence {
+            records_complete: true,
+            records: vec![PreparedRecordProbe {
+                request: ProjectionLiveRecordRequest::new(&codec, "WireView", key).unwrap(),
+                paths: vec![vec!["wire_views".into(), "0".into()]],
+            }],
+            indexes: QueryIndexPlan {
+                comparable: true,
+                projectors: vec![Arc::clone(&runtime)],
+            },
+        };
+        let snapshot = wire_query_snapshot(
+            &accumulator,
+            prepared,
+            vec![Some(record)],
+            vec![partition_snapshot.clone()],
+            live_changes,
+        )
+        .unwrap();
+        assert_eq!(
+            snapshot.observations.len(),
+            1,
+            "modeled proof is on the wire"
+        );
+        let observation = &snapshot.observations[0];
+        assert_eq!(observation.causation_id, "wire-cause-1");
+        assert_eq!(observation.projection, program_id.to_string());
+        assert_eq!(observation.model, "WireView");
+
+        // A sealed command receipt uses the same physical scope material and
+        // semantic public label. The opaque token must be byte-for-byte equal
+        // to the live observation, while the physical owner stays private.
+        let receipt_scope = accumulator
+            .issue_projection_obligation_scope(
+                "wire-cause-1",
+                &runtime.name,
+                "WireView",
+                ProjectionObservationKind::Record,
+                &scope,
+            )
+            .unwrap();
+        assert_eq!(observation.scope_token, receipt_scope);
+
+        // Nulling the durable identity models pre-migration history: the row
+        // and record fence remain readable, but the wire must not relabel it
+        // as the currently active semantic program.
+        sqlx::query("UPDATE projection_changes SET program_id = NULL WHERE change_position = ?")
+            .bind(stored_change.cursor.position() as i64)
+            .execute(repository.pool())
+            .await
+            .unwrap();
+        let legacy_change = match repository
+            .projection_changes(&topology, &partition, None, 16)
+            .await
+            .unwrap()
+        {
+            ProjectionChangeRead::Changes { changes, .. } => changes
+                .into_iter()
+                .find(|change| {
+                    change.kind == crate::projection_protocol::ProjectionChangeKind::RecordUpsert
+                })
+                .expect("stored legacy record change"),
+            other => panic!("unexpected legacy projection change read: {other:?}"),
+        };
+        assert!(legacy_change.program_id.is_none());
+        let mut connection = repository.pool().acquire().await.unwrap();
+        let legacy_live = wire_live_metadata::<sqlx::Sqlite>(
+            &mut *connection,
+            &accumulator,
+            &prepared_live,
+            std::slice::from_ref(&partition_snapshot),
+            RequestedLiveResume::Cursors(vec![initial_cursor]),
+        )
+        .await
+        .unwrap();
+        assert_eq!(legacy_live.changes.len(), 1);
+        assert!(legacy_live.changes[0].public_projection.is_none());
+        let legacy_changes = legacy_live.changes;
+        drop(connection);
+        let legacy_snapshot = wire_query_snapshot(
+            &accumulator,
+            PreparedQueryEvidence {
+                records_complete: true,
+                records: vec![PreparedRecordProbe {
+                    request: ProjectionLiveRecordRequest::new(
+                        &codec,
+                        "WireView",
+                        RowKey::new([("id", RowValue::String("wire-1".into()))]),
+                    )
+                    .unwrap(),
+                    paths: vec![vec!["wire_views".into(), "0".into()]],
+                }],
+                indexes: QueryIndexPlan {
+                    comparable: true,
+                    projectors: vec![runtime],
+                },
+            },
+            vec![Some(
+                repository
+                    .projection_record(&scope)
+                    .await
+                    .unwrap()
+                    .expect("legacy row metadata remains readable"),
+            )],
+            vec![partition_snapshot],
+            legacy_changes,
+        )
+        .unwrap();
+        assert_eq!(legacy_snapshot.observations, Vec::new());
+        assert_eq!(legacy_snapshot.records.len(), 1);
     }
 }

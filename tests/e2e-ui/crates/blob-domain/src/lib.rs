@@ -1,30 +1,24 @@
-//! Blob game domain — one crate, three faces:
+//! Blob game domain — one crate, two faces:
 //!
-//! - [`core`] — pure board rules (always available; WASM-eligible)
-//! - [`models`] / [`levels`] — aggregate host (`feature = "domain"`, default)
-//! - [`wasm`] — `blobSimulateMove` for the client (`feature = "wasm"`)
+//! - [`core`] — pure board rules and the [`PREVIEW_MOVE`] browser pure
+//!   (always available; compiled to WASM with `--features wasm`)
+//! - [`models`] / [`levels`] — the event-sourced aggregate (`feature = "domain"`, default)
 //!
-//! Tile ints match the client board helpers (player=9, hole=0, unvisited=1, …).
+//! The `blob.*` commands, which seal `BlobGames` rows, live with the service
+//! (`e2e-service`): the domain does not know the read models.
 
 pub mod core;
 
-#[cfg(feature = "domain")]
-pub mod commands;
 #[cfg(feature = "domain")]
 pub mod levels;
 #[cfg(feature = "domain")]
 pub mod models;
 
-#[cfg(feature = "wasm")]
-pub mod wasm;
-
-pub use core::{simulate_move, tile, Direction, MovePreview, SimulateError};
-
-#[cfg(feature = "domain")]
-pub use commands::{
-    move_dir, start, start_level, BlobMoveInput, BlobStartInput, BlobStartLevelInput, Move, Start,
-    StartLevel,
+pub use core::{
+    legal_moves, preview_move, simulate_move, Direction, MoveArgs, MovePreview, MoveRow,
+    SimulateError, Tile, PREVIEW_MOVE,
 };
+
 #[cfg(feature = "domain")]
 pub use levels::{demo_map, generate_level, generate_level_with, is_hamiltonian_passable};
 #[cfg(feature = "domain")]

@@ -1,26 +1,24 @@
 import {
-	sameAuthCredential,
-	snapshotAuthCredential
-} from '../identity.js';
-import {
-	createDistributedReplica,
-	createReplicaGraphqlTransport,
-	type DistributedReplica,
-	type DistributedReplicaOptions,
-	type ReplicaAuthoritativeScope,
-	type ReplicaCommandReceipt,
-	type ReplicaCommandRuntime,
-	type ReplicaCommandRuntimeOptions,
-	type ReplicaGraphqlTransport,
-	type ReplicaOperationArtifact,
-	type ReplicaSnapshot,
-	type ReplicaWatch,
-	type WatchReplicaOptions
+	createDistributedClient,
+	prefetchReplicaOperation,
+	type CreateDistributedClientOptions,
+	type DistributedHydration,
+	type DistributedHydrationAuthority,
+	type DistributedSessionSource
+} from '../client.js';
+import type {
+	DistributedReplica,
+	ReplicaGraphqlTransport,
+	ReplicaPendingRows,
+	ReplicaOperationArtifact,
+	ReplicaSnapshot,
+	ReplicaWatch,
+	ReplicaWindowOperationArtifact,
+	ReplicaWindowRow,
+	WatchReplicaOptions
 } from '../replica/index.js';
-import type { GqlAuth, GqlError, GraphqlVariables } from '../types.js';
-import type { WebSocketConstructor } from '../websocket.js';
-import type { FetchLike } from '../request.js';
-import { replicaCommandProjectedLifecycleOf } from '../replica/command-runtime.js';
+import { replicaWindowPageSize } from '../replica/window.js';
+import type { GqlError, GraphqlVariables } from '../types.js';
 import { authFromPageData, type PageGraphqlData } from './auth.js';
 import {
 	defineDistributedBoundaryBinding,
@@ -39,23 +37,15 @@ import {
 	type SveltekitBoundaryRetention
 } from './boundary-lifecycle.js';
 import {
+	SveltekitWindowStoreImpl,
+	type SveltekitWindowStore,
+	type UseSveltekitWindowOptions
+} from './window.js';
+import {
 	distributedReloadLifecycle,
 	registerDistributedReloadClient,
 	type DistributedReloadOptions
 } from './lifecycle.js';
-
-type UnknownCommandEntries = Readonly<Record<string, never>>;
-
-export type SveltekitSessionSource = Readonly<{
-	/** Current credential. HTTP, WS, and commands all call this exact source. */
-	getAuth(): GqlAuth | Promise<GqlAuth>;
-	/**
-	 * Notify on token, logout, role, tenant, or session changes.
-	 *
-	 * The adapter re-reads `getAuth`; callers never label a cache scope.
-	 */
-	subscribe?(listener: () => void): () => void;
-}>;
 
 export type SveltekitPageDataSource<TData extends PageGraphqlData> = Readonly<{
 	get(): TData;
@@ -64,87 +54,37 @@ export type SveltekitPageDataSource<TData extends PageGraphqlData> = Readonly<{
 
 export type SveltekitPageDataSessionSource<TData extends PageGraphqlData> =
 	Readonly<{
-		session: SveltekitSessionSource;
+		session: DistributedSessionSource;
 		get(): TData;
 		set(next: TData): void;
 	}>;
 
-export type SveltekitReplicaHydration = Readonly<{
-	version: 1;
-	state: import('../replica/index.js').ReplicaDehydratedState;
-	readonly operations?: readonly string[];
-	/** Exact variable-binding fingerprints used to create this SSR seed. */
-	readonly bindings?: readonly string[];
-}>;
-
-/**
- * Independently trusted SSR/session authority for one hydration transfer.
- *
- * Do not persist this beside replica state. State never authorizes its own
- * scope; the adapter compares its embedded scope to this server-owned value.
- */
-export type SveltekitReplicaAuthority = Readonly<{
-	version: 1;
-	scope: ReplicaAuthoritativeScope;
-}>;
-
 export type SveltekitDistributedPageData = PageGraphqlData &
 	Readonly<{
-		distributed?: SveltekitReplicaHydration;
-		distributedAuthority?: SveltekitReplicaAuthority;
+		distributed?: DistributedHydration;
+		distributedAuthority?: DistributedHydrationAuthority;
 	}>;
-
-export type SveltekitCommandRuntimeLike<TCommands> = Pick<
-	ReplicaCommandRuntime<UnknownCommandEntries>,
-	'dispose' | 'pendingCommandIds'
-> &
-	Readonly<{
-		commands: TCommands;
-	}>;
-
-export type SveltekitCommandRuntimeFactory<TCommands> = (
-	replica: DistributedReplica,
-	transport: ReplicaGraphqlTransport,
-	options: SveltekitCommandRuntimeFactoryOptions
-) => SveltekitCommandRuntimeLike<TCommands>;
-
-export type SveltekitCommandRuntimeFactoryOptions = Pick<
-	ReplicaCommandRuntimeOptions,
-	'diagnostics' | 'lifecycle'
->;
 
 export type CreateDistributedSvelteKitOptions<TCommands = Readonly<Record<never, never>>> =
-	Readonly<{
-		session: SveltekitSessionSource;
-		/** Same-origin `/graphql` by default. */
-		url?: string | (() => string);
-		fetch?: FetchLike;
-		webSocket?: WebSocketConstructor;
-		/**
-		 * Set to SvelteKit's `$app/environment` `browser` flag. When false,
-		 * store subscriptions remain side-effect-free during component SSR.
-		 */
-		browser?: boolean;
-		hydration?: SveltekitReplicaHydration;
-		/** Required with `hydration`; must come from current trusted SSR page data. */
-		authority?: SveltekitReplicaAuthority;
-		createCommands?: SveltekitCommandRuntimeFactory<TCommands>;
-		replica?: Omit<DistributedReplicaOptions, 'transport'>;
-		/** Generated boundary operations accepted by this component-tree client. */
-		boundaries: readonly DistributedBoundaryOperation[];
-		/** Redacted structural lifecycle events for boundary ownership diagnostics. */
-		onBoundaryDiagnostic?: (event: SveltekitBoundaryLifecycleDiagnostic) => void;
-		onAuthError?: (error: unknown) => void;
-		/** Generated clients supply the surface key; apps may declare safe state partitions. */
-		reload?: DistributedReloadOptions;
-	}>;
+	Omit<CreateDistributedClientOptions<TCommands>, 'lifecycle' | 'acceptsHydration'> &
+		Readonly<{
+			/** Generated boundary operations accepted by this component-tree client. */
+			boundaries: readonly DistributedBoundaryOperation[];
+			/** Redacted structural lifecycle events for boundary ownership diagnostics. */
+			onBoundaryDiagnostic?: (event: SveltekitBoundaryLifecycleDiagnostic) => void;
+			/**
+			 * Set to SvelteKit's `$app/environment` `browser` flag. When false,
+			 * store subscriptions remain side-effect-free during component SSR.
+			 */
+			browser?: boolean;
+			/** Generated clients supply the surface key; apps may declare safe state partitions. */
+			reload?: DistributedReloadOptions;
+		}>;
 
 export type SveltekitQuerySnapshot<TData> = ReplicaSnapshot<TData> &
 	Readonly<{
 	loading: boolean;
 	error?: GqlError;
-	/** Successful causal commands still waiting for projection visibility. */
-	pending: readonly ReplicaCommandReceipt<unknown>[];
 	refetch(): Promise<void>;
 }>;
 
@@ -164,7 +104,8 @@ export interface SveltekitQueryStore<TData> {
 	readonly live: ReplicaSnapshot<TData>['live'];
 	readonly errors: readonly GqlError[];
 	readonly error: GqlError | undefined;
-	readonly pending: readonly ReplicaCommandReceipt<unknown>[];
+	/** `$query.pending.has(row)`: the row is a preview the server has not returned yet. */
+	readonly pending: ReplicaPendingRows;
 }
 
 export type UseSveltekitOperationOptions = Readonly<{
@@ -185,6 +126,30 @@ type UseOperationArguments<TVariables extends GraphqlVariables> =
 				variables: TVariables,
 				options?: UseSveltekitOperationOptions
 		  ];
+
+type UseWindowArguments<TVariables extends GraphqlVariables> =
+	Record<string, never> extends TVariables
+		?
+				| []
+				| [variables: TVariables]
+				| [variables: TVariables, options: UseSveltekitWindowOptions]
+		: [variables: TVariables, options?: UseSveltekitWindowOptions];
+
+/** A generated `@window` operation: everything a query has, plus `useWindow`. */
+export type SveltekitWindowOperation<
+	TData,
+	TVariables extends GraphqlVariables
+> = SveltekitBoundOperation<TData, TVariables> &
+	Readonly<{
+		/**
+		 * The live head page plus every page `fetchMore()` loaded, as one
+		 * ordered, de-duplicated `rows` list. Cursor and `limit` variables
+		 * are the window's; pass the operation's other variables.
+		 */
+		useWindow(
+			...args: UseWindowArguments<TVariables>
+		): SveltekitWindowStore<ReplicaWindowRow<TData>>;
+	}>;
 
 export type SveltekitBoundOperation<
 	TData,
@@ -211,6 +176,9 @@ export type DistributedSvelteKitClient<TCommands> = Readonly<{
 	replica: DistributedReplica;
 	transport: ReplicaGraphqlTransport;
 	commands: TCommands;
+	operation<TData, TVariables extends GraphqlVariables>(
+		artifact: ReplicaWindowOperationArtifact<TData, TVariables>
+	): SveltekitWindowOperation<TData, TVariables>;
 	operation<TData, TVariables extends GraphqlVariables>(
 		artifact: ReplicaOperationArtifact<TData, TVariables>
 	): SveltekitBoundOperation<TData, TVariables>;
@@ -242,13 +210,15 @@ export type DistributedSvelteKitClient<TCommands> = Readonly<{
 	 * generation and returns false so the bound operation refetches.
 	 */
 	hydrate(
-		hydration: SveltekitReplicaHydration,
-		authority: SveltekitReplicaAuthority
+		hydration: DistributedHydration,
+		authority: DistributedHydrationAuthority
 	): boolean;
 	prefetch(
 		artifact: ReplicaOperationArtifact<unknown, GraphqlVariables>,
 		variables: GraphqlVariables
 	): Promise<void>;
+	/** Load deferred command code without dispatching a command. */
+	preloadCommands(): Promise<void>;
 	invalidateAuthorization(): void;
 	destroy(): void;
 }>;
@@ -276,7 +246,8 @@ export type SveltekitBoundBoundaryOperation<
 }>;
 
 /**
- * Bind the framework-neutral replica to Svelte's readable-store lifecycle.
+ * Bind the framework-neutral client to Svelte's readable-store lifecycle and
+ * to the generated page/layout boundaries this component tree owns.
  *
  * Generated `$distributed` modules call this once, then export
  * `client.operation(Operation_Todos)` and `client.commands`.
@@ -284,155 +255,55 @@ export type SveltekitBoundBoundaryOperation<
 export function createDistributedSvelteKit<TCommands = Readonly<Record<never, never>>>(
 	options: CreateDistributedSvelteKitOptions<TCommands>
 ): DistributedSvelteKitClient<TCommands> {
-	if (
-		options.session === null ||
-		typeof options.session !== 'object' ||
-		typeof options.session.getAuth !== 'function'
-	) {
-		throw new TypeError('Distributed SvelteKit requires one session source');
-	}
-	if (!Array.isArray(options.boundaries)) {
+	if (!Array.isArray(options?.boundaries)) {
 		throw new TypeError('Distributed SvelteKit requires generated boundary operations');
 	}
-	if (
-		(options.hydration === undefined) !==
-		(options.authority === undefined)
-	) {
-		throw new TypeError(
-			'Distributed SvelteKit hydration requires separate trusted SSR authority'
-		);
-	}
-
-	let replica: DistributedReplica | undefined;
-	let boundaryController: DistributedSvelteKitBoundaryController | undefined;
 	const boundaryIds = Object.freeze(
 		[...new Set(options.boundaries.map(({ binding }) => binding.id))].sort()
 	);
-	const auth = createAuthorizationFence(
-		options.session,
-		() => {
-			boundaryController?.disposeScope();
-			replica?.invalidateAuthorization();
+	// Boundary retention ends with every authorization generation; the replica
+	// announces each one, including those the client itself closes.
+	let boundaries: DistributedSvelteKitBoundaryController | undefined;
+	const reload = options.browser === true ? options.reload : undefined;
+	const client = createDistributedClient<TCommands>({
+		...options,
+		acceptsHydration: (hydration) =>
+			(hydration.bindings ?? []).every((id) => boundaryIds.includes(id)),
+		replica: {
+			...options.replica,
+			onAuthorizationGenerationDispose: () => {
+				boundaries?.disposeScope();
+				options.replica?.onAuthorizationGenerationDispose?.();
+			}
 		},
-		options.onAuthError
-	);
-	const configuredUrl = options.url;
-	const transport = createReplicaGraphqlTransport({
-		getUrl:
-			typeof configuredUrl === 'function'
-				? configuredUrl
-				: () => configuredUrl ?? '/graphql',
-		getAuth: auth.read,
-		...(options.fetch === undefined ? {} : { fetch: options.fetch }),
-		...(options.webSocket === undefined
-			? {}
-			: { webSocket: options.webSocket })
+		lifecycle:
+			reload === undefined
+				? undefined
+				: {
+						commands: distributedReloadLifecycle,
+						register: (replica, runtime) =>
+							registerDistributedReloadClient(replica, runtime, reload)
+					}
 	});
-	replica = createDistributedReplica({
-		transport,
-		...(options.replica ?? {}),
-		onAuthorizationGenerationDispose: () => {
-			boundaryController?.disposeScope();
-			options.replica?.onAuthorizationGenerationDispose?.();
-		}
-	});
-	boundaryController = new DistributedSvelteKitBoundaryController(
-		replica,
+	boundaries = new DistributedSvelteKitBoundaryController(
+		client.replica,
 		options.boundaries,
 		options.onBoundaryDiagnostic
 	);
-
-	const stores = new Set<SveltekitQueryStoreImpl<unknown>>();
-	const pending = new PendingReceiptStore();
-	let destroyed = false;
-	const hydrate = (
-		hydration: SveltekitReplicaHydration,
-		authority: SveltekitReplicaAuthority
-	): boolean => {
-		let accepted = false;
-		try {
-			const expected = validatedHydrationAuthority(authority);
-			const hydrationBindings = [...(hydration.bindings ?? [])].sort();
-			if (hydrationBindings.some((value) => !boundaryIds.includes(value))) {
-				throw new TypeError(
-					'Distributed SvelteKit hydration boundary binding fingerprint changed'
-				);
-			}
-			const active = replica!.scope;
-			if (active !== undefined && !sameReplicaScope(active, expected)) {
-				throw new TypeError(
-					'Distributed SvelteKit hydration authority changed before session invalidation'
-				);
-			}
-			accepted =
-				hydration?.version === 1 &&
-				replica!.hydrate(hydration.state, expected);
-		} catch {
-			accepted = false;
-		}
-		if (!accepted) {
-			boundaryController!.disposeScope();
-			replica!.invalidateAuthorization();
-		}
-		return accepted;
+	const controller = boundaries;
+	const assertAlive = (): void => {
+		if (!client.alive()) throw new Error('Distributed SvelteKit client is destroyed');
 	};
-	if (options.hydration !== undefined && options.authority !== undefined) {
-		hydrate(options.hydration, options.authority);
-	}
-
-	// Hydration must precede command authority registration: trusted presets are
-	// server-derived and restored only as part of an exact authoritative seed.
-	const commandRuntime = options.createCommands?.(
-		replica,
-		transport,
-		Object.freeze({
-			...(options.replica?.diagnostics === undefined
-				? {}
-				: { diagnostics: options.replica.diagnostics }),
-			...(options.browser === true && options.reload !== undefined
-				? { lifecycle: distributedReloadLifecycle() }
-				: {})
-		})
-	);
-	let unregisterReload: (() => void) | undefined;
-	try {
-		unregisterReload =
-			options.browser === true && options.reload !== undefined
-				? registerDistributedReloadClient(replica, commandRuntime, options.reload)
-				: undefined;
-	} catch (error) {
-		// Client construction is transactional: a malformed reload declaration
-		// must not retain its session subscription or command authority.
-		try {
-			commandRuntime?.dispose();
-		} catch {
-			// Preserve the construction failure; disposal is best effort here.
-		}
-		try {
-			auth.dispose();
-		} catch {
-			// Preserve the construction failure; disposal is best effort here.
-		}
-		throw error;
-	}
-	const commands =
-		commandRuntime === undefined
-			? (Object.freeze({}) as TCommands)
-			: wrapCommandTree(commandRuntime.commands, pending);
-
-	const operation = <TData, TVariables extends GraphqlVariables>(
+	const lifecycle: SveltekitStoreLifecycle = Object.freeze({
+		isAlive: client.alive,
+		activateWatches: () => options.browser ?? true,
+		active: client.track,
+		idle: client.release
+	});
+	const operation = (<TData, TVariables extends GraphqlVariables>(
 		artifact: ReplicaOperationArtifact<TData, TVariables>
 	): SveltekitBoundOperation<TData, TVariables> =>
-		bindOperation(replica!, artifact, pending, {
-			isAlive: () => !destroyed,
-			activateWatches: () => options.browser ?? true,
-			active: (store) => {
-				stores.add(store as SveltekitQueryStoreImpl<unknown>);
-			},
-			idle: (store) => {
-				stores.delete(store as SveltekitQueryStoreImpl<unknown>);
-			}
-		});
+		bindOperation(client.replica, artifact, lifecycle)) as DistributedSvelteKitClient<TCommands>['operation'];
 	const boundary = <
 		TData,
 		TVariables extends GraphqlVariables,
@@ -470,51 +341,33 @@ export function createDistributedSvelteKit<TCommands = Readonly<Record<never, ne
 	};
 
 	return Object.freeze({
-		replica,
-		transport,
-		commands,
+		replica: client.replica,
+		transport: client.transport,
+		commands: client.commands,
 		operation,
 		boundary,
 		retainBoundary(instance, context) {
-			if (destroyed) {
-				throw new Error('Distributed SvelteKit client is destroyed');
-			}
-			return boundaryController!.retain(instance, context);
+			assertAlive();
+			return controller.retain(instance, context);
 		},
 		retainLocation(location, context) {
-			if (destroyed) {
-				throw new Error('Distributed SvelteKit client is destroyed');
-			}
-			return boundaryController!.retainLocation(location, context);
+			assertAlive();
+			return controller.retainLocation(location, context);
 		},
 		prefetchLocation(pathname, context) {
-			if (destroyed) {
-				return Promise.reject(
-					new Error('Distributed SvelteKit client is destroyed')
-				);
+			if (!client.alive()) {
+				return Promise.reject(new Error('Distributed SvelteKit client is destroyed'));
 			}
-			return boundaryController!.prefetchLocation(pathname, context);
+			return controller.prefetchLocation(pathname, context);
 		},
-		hydrate,
-		prefetch(artifact, variables) {
-			return prefetchReplicaOperation(replica!, artifact, variables);
-		},
-		invalidateAuthorization(): void {
-			if (!destroyed) {
-				boundaryController!.disposeScope();
-				replica!.invalidateAuthorization();
-			}
-		},
+		hydrate: client.hydrate,
+		prefetch: client.prefetch,
+		preloadCommands: client.preloadCommands,
+		invalidateAuthorization: client.invalidateAuthorization,
 		destroy(): void {
-			if (destroyed) return;
-			destroyed = true;
-			auth.dispose();
-			boundaryController!.destroy();
-			for (const store of [...stores]) store.destroy();
-			stores.clear();
-			pending.clear();
-			unregisterReload?.();
-			commandRuntime?.dispose();
+			if (!client.alive()) return;
+			controller.destroy();
+			client.destroy();
 		}
 	});
 }
@@ -530,12 +383,25 @@ export function bindSveltekitOperation<
 	TVariables extends GraphqlVariables
 >(
 	replica: DistributedReplica,
+	artifact: ReplicaWindowOperationArtifact<TData, TVariables>
+): SveltekitWindowOperation<TData, TVariables>;
+export function bindSveltekitOperation<
+	TData,
+	TVariables extends GraphqlVariables
+>(
+	replica: DistributedReplica,
+	artifact: ReplicaOperationArtifact<TData, TVariables>
+): SveltekitBoundOperation<TData, TVariables>;
+export function bindSveltekitOperation<
+	TData,
+	TVariables extends GraphqlVariables
+>(
+	replica: DistributedReplica,
 	artifact: ReplicaOperationArtifact<TData, TVariables>
 ): SveltekitBoundOperation<TData, TVariables> {
 	return bindOperation(
 		replica,
 		artifact,
-		new PendingReceiptStore(),
 		{
 			isAlive: () => true,
 			activateWatches: () => true,
@@ -548,7 +414,7 @@ export function bindSveltekitOperation<
 /** Map SvelteKit page data into the one shared transport/session source. */
 export function sessionSourceFromPageData<TData extends PageGraphqlData>(
 	source: SveltekitPageDataSource<TData>
-): SveltekitSessionSource {
+): DistributedSessionSource {
 	if (
 		source === null ||
 		typeof source !== 'object' ||
@@ -558,6 +424,12 @@ export function sessionSourceFromPageData<TData extends PageGraphqlData>(
 	}
 	return Object.freeze({
 		getAuth: () => authFromPageData(source.get()),
+		getHydration: () => {
+			const data: SveltekitDistributedPageData = source.get();
+			return data.distributed === undefined || data.distributedAuthority === undefined
+				? undefined
+				: { hydration: data.distributed, authority: data.distributedAuthority };
+		},
 		...(source.subscribe === undefined
 			? {}
 			: { subscribe: source.subscribe.bind(source) })
@@ -597,8 +469,7 @@ export function createPageDataSessionSource<TData extends PageGraphqlData>(
 function bindOperation<TData, TVariables extends GraphqlVariables>(
 	replica: DistributedReplica,
 	artifact: ReplicaOperationArtifact<TData, TVariables>,
-	pending: PendingReceiptStore,
-	lifecycle: SveltekitStoreLifecycle<TData>
+	lifecycle: SveltekitStoreLifecycle
 ): SveltekitBoundOperation<TData, TVariables> {
 	const use = (
 		...args: UseOperationArguments<TVariables>
@@ -612,14 +483,42 @@ function bindOperation<TData, TVariables extends GraphqlVariables>(
 			Object.freeze({
 				live: useOptions?.live ?? artifact.live !== undefined
 			}),
-			pending,
 			lifecycle
 		);
 		return store;
 	};
+	const window = artifact.window;
+	const useWindow =
+		window === undefined
+			? undefined
+			: (
+					variables: TVariables = {} as TVariables,
+					options: UseSveltekitWindowOptions = {}
+				): SveltekitWindowStore<unknown> => {
+					const pageSize = replicaWindowPageSize(window, options.pageSize);
+					const live = options.live ?? artifact.live !== undefined;
+					const open = (values: GraphqlVariables, pageLive: boolean) =>
+						use(...([values, { live: pageLive }] as UseOperationArguments<TVariables>));
+					// The head keeps the caller's variables (and so the cache key
+					// SSR seeded) unless a page size overrides the default limit.
+					const head =
+						options.pageSize === undefined
+							? variables
+							: { ...variables, [window.limitVariable]: pageSize };
+					return new SveltekitWindowStoreImpl(
+						window,
+						artifact.roots[0]!.responseKey,
+						open,
+						variables,
+						pageSize,
+						head,
+						live
+					);
+				};
 	return Object.freeze({
 		artifact,
 		use,
+		...(useWindow === undefined ? {} : { useWindow }),
 		read: (variables: TVariables) => replica.read(artifact, variables),
 		prefetch: (variables: TVariables) =>
 			prefetchReplicaOperation(replica, artifact, variables),
@@ -641,22 +540,11 @@ function bindOperation<TData, TVariables extends GraphqlVariables>(
 	});
 }
 
-function prefetchReplicaOperation<TData, TVariables extends GraphqlVariables>(
-	replica: DistributedReplica,
-	artifact: ReplicaOperationArtifact<TData, TVariables>,
-	variables: TVariables
-): Promise<void> {
-	const snapshot = replica.read(artifact, variables);
-	if (snapshot.complete && !snapshot.stale) return Promise.resolve();
-	const watch = replica.watch(artifact, variables, { live: false });
-	return watch.refresh().finally(() => watch.destroy());
-}
-
-type SveltekitStoreLifecycle<TData> = Readonly<{
+type SveltekitStoreLifecycle = Readonly<{
 	isAlive(): boolean;
 	activateWatches(): boolean;
-	active(store: SveltekitQueryStoreImpl<TData>): void;
-	idle(store: SveltekitQueryStoreImpl<TData>): void;
+	active(store: Readonly<{ destroy(): void }>): void;
+	idle(store: Readonly<{ destroy(): void }>): void;
 }>;
 
 class SveltekitQueryStoreImpl<TData> implements SveltekitQueryStore<TData> {
@@ -664,14 +552,12 @@ class SveltekitQueryStoreImpl<TData> implements SveltekitQueryStore<TData> {
 	readonly #artifact: ReplicaOperationArtifact<TData, GraphqlVariables>;
 	readonly #variables: GraphqlVariables;
 	readonly #options: WatchReplicaOptions;
-	readonly #pending: PendingReceiptStore;
-	readonly #lifecycle: SveltekitStoreLifecycle<TData>;
+	readonly #lifecycle: SveltekitStoreLifecycle;
 	readonly #listeners = new Set<
 		(snapshot: SveltekitQuerySnapshot<TData>) => void
 	>();
 	#watch: ReplicaWatch<TData> | undefined;
 	#unsubscribeWatch: (() => void) | undefined;
-	#unsubscribePending: (() => void) | undefined;
 	#snapshot: SveltekitQuerySnapshot<TData>;
 	#destroyed = false;
 
@@ -680,19 +566,15 @@ class SveltekitQueryStoreImpl<TData> implements SveltekitQueryStore<TData> {
 		artifact: ReplicaOperationArtifact<TData, GraphqlVariables>,
 		variables: GraphqlVariables,
 		options: WatchReplicaOptions,
-		pending: PendingReceiptStore,
-		lifecycle: SveltekitStoreLifecycle<TData>
+		lifecycle: SveltekitStoreLifecycle
 	) {
 		this.#replica = replica;
 		this.#artifact = artifact;
 		this.#variables = variables;
 		this.#options = options;
-		this.#pending = pending;
 		this.#lifecycle = lifecycle;
-		this.#snapshot = querySnapshot(
-			replica.read(artifact, variables),
-			pending.get(),
-			() => this.refetch()
+		this.#snapshot = querySnapshot(replica.read(artifact, variables), () =>
+			this.refetch()
 		);
 	}
 
@@ -700,7 +582,6 @@ class SveltekitQueryStoreImpl<TData> implements SveltekitQueryStore<TData> {
 		if (!this.#destroyed && this.#watch === undefined) {
 			this.#snapshot = querySnapshot(
 				this.#replica.read(this.#artifact, this.#variables),
-				this.#pending.get(),
 				() => this.refetch()
 			);
 		}
@@ -754,11 +635,7 @@ class SveltekitQueryStoreImpl<TData> implements SveltekitQueryStore<TData> {
 		);
 		try {
 			await temporary.refresh();
-			this.#snapshot = querySnapshot(
-				temporary.get(),
-				this.#pending.get(),
-				() => this.refetch()
-			);
+			this.#snapshot = querySnapshot(temporary.get(), () => this.refetch());
 		} finally {
 			temporary.destroy();
 		}
@@ -798,7 +675,7 @@ class SveltekitQueryStoreImpl<TData> implements SveltekitQueryStore<TData> {
 	get error(): GqlError | undefined {
 		return this.#snapshot.error;
 	}
-	get pending(): readonly ReplicaCommandReceipt<unknown>[] {
+	get pending(): ReplicaPendingRows {
 		return this.#snapshot.pending;
 	}
 
@@ -811,26 +688,16 @@ class SveltekitQueryStoreImpl<TData> implements SveltekitQueryStore<TData> {
 				this.#options
 			);
 			this.#watch = watch;
-			this.#snapshot = querySnapshot(
-				watch.get(),
-				this.#pending.get(),
-				() => this.refetch()
-			);
+			this.#snapshot = querySnapshot(watch.get(), () => this.refetch());
 			this.#unsubscribeWatch = watch.subscribe((snapshot) => {
-				this.#publish(snapshot, this.#pending.get());
-			});
-			this.#unsubscribePending = this.#pending.subscribe((receipts) => {
-				const current = this.#watch;
-				if (current !== undefined) this.#publish(current.get(), receipts);
+				this.#publish(snapshot);
 			});
 			this.#lifecycle.active(this);
 		} catch (error) {
 			this.#unsubscribeWatch?.();
-			this.#unsubscribePending?.();
 			watch?.destroy();
 			this.#watch = undefined;
 			this.#unsubscribeWatch = undefined;
-			this.#unsubscribePending = undefined;
 			throw error;
 		}
 	}
@@ -838,126 +705,23 @@ class SveltekitQueryStoreImpl<TData> implements SveltekitQueryStore<TData> {
 	#deactivate(): void {
 		if (this.#watch === undefined) return;
 		this.#unsubscribeWatch?.();
-		this.#unsubscribePending?.();
 		this.#watch.destroy();
 		this.#watch = undefined;
 		this.#unsubscribeWatch = undefined;
-		this.#unsubscribePending = undefined;
 		this.#lifecycle.idle(this);
 	}
 
-	#publish(
-		replicaSnapshot: ReplicaSnapshot<TData>,
-		receipts: readonly ReplicaCommandReceipt<unknown>[]
-	): void {
+	#publish(replicaSnapshot: ReplicaSnapshot<TData>): void {
 		if (this.#destroyed) return;
-		const next = querySnapshot(replicaSnapshot, receipts, () => this.refetch());
+		const next = querySnapshot(replicaSnapshot, () => this.refetch());
 		if (sameQuerySnapshot(this.#snapshot, next)) return;
 		this.#snapshot = next;
 		for (const listener of [...this.#listeners]) listener(next);
 	}
 }
 
-class PendingReceiptStore {
-	readonly #receipts = new Map<string, ReplicaCommandReceipt<unknown>>();
-	readonly #listeners = new Set<
-		(receipts: readonly ReplicaCommandReceipt<unknown>[]) => void
-	>();
-	#snapshot: readonly ReplicaCommandReceipt<unknown>[] = Object.freeze([]);
-
-	get(): readonly ReplicaCommandReceipt<unknown>[] {
-		return this.#snapshot;
-	}
-
-	subscribe(
-		listener: (receipts: readonly ReplicaCommandReceipt<unknown>[]) => void
-	): () => void {
-		this.#listeners.add(listener);
-		return () => this.#listeners.delete(listener);
-	}
-
-	track(receipt: ReplicaCommandReceipt<unknown>): void {
-		const lifecycle =
-			replicaCommandProjectedLifecycleOf(receipt) ?? receipt.projected;
-		if (lifecycle === undefined || this.#receipts.has(receipt.commandId)) {
-			return;
-		}
-		this.#receipts.set(receipt.commandId, receipt);
-		this.#publish();
-		void lifecycle.then(
-			() => this.#remove(receipt.commandId),
-			() => this.#remove(receipt.commandId)
-		);
-	}
-
-	clear(): void {
-		if (this.#receipts.size === 0) return;
-		this.#receipts.clear();
-		this.#publish();
-		this.#listeners.clear();
-	}
-
-	#remove(commandId: string): void {
-		if (!this.#receipts.delete(commandId)) return;
-		this.#publish();
-	}
-
-	#publish(): void {
-		this.#snapshot = Object.freeze([...this.#receipts.values()]);
-		for (const listener of [...this.#listeners]) listener(this.#snapshot);
-	}
-}
-
-function wrapCommandTree<TCommands>(
-	value: TCommands,
-	pending: PendingReceiptStore
-): TCommands {
-	if (typeof value === 'function') {
-		const command = value as (...args: unknown[]) => unknown;
-		return ((...args: unknown[]) => {
-			const result = command(...args);
-			if (isPromiseLike(result)) {
-				return result.then((receipt: unknown) => {
-					if (isCommandReceipt(receipt)) pending.track(receipt);
-					return receipt;
-				});
-			}
-			return result;
-		}) as TCommands;
-	}
-	if (value === null || typeof value !== 'object') return value;
-	const output = Object.create(null) as Record<string, unknown>;
-	for (const key of Object.keys(value)) {
-		output[key] = wrapCommandTree(
-			(value as Record<string, unknown>)[key],
-			pending
-		);
-	}
-	return Object.freeze(output) as TCommands;
-}
-
-function isCommandReceipt(
-	value: unknown
-): value is ReplicaCommandReceipt<unknown> {
-	return (
-		value !== null &&
-		typeof value === 'object' &&
-		typeof (value as { commandId?: unknown }).commandId === 'string' &&
-		typeof (value as { status?: unknown }).status === 'function'
-	);
-}
-
-function isPromiseLike(value: unknown): value is Promise<unknown> {
-	return (
-		value !== null &&
-		(typeof value === 'object' || typeof value === 'function') &&
-		typeof (value as { then?: unknown }).then === 'function'
-	);
-}
-
 function querySnapshot<TData>(
 	snapshot: ReplicaSnapshot<TData>,
-	pending: readonly ReplicaCommandReceipt<unknown>[],
 	refetch: () => Promise<void>
 ): SveltekitQuerySnapshot<TData> {
 	return Object.freeze({
@@ -966,7 +730,6 @@ function querySnapshot<TData>(
 		...(snapshot.errors[0] === undefined
 			? {}
 			: { error: snapshot.errors[0] }),
-		pending,
 		refetch
 	}) as SveltekitQuerySnapshot<TData>;
 }
@@ -985,88 +748,5 @@ function sameQuerySnapshot<TData>(
 		left.live === right.live &&
 		left.errors === right.errors &&
 		left.pending === right.pending
-	);
-}
-
-function createAuthorizationFence(
-	source: SveltekitSessionSource,
-	invalidate: () => void,
-	onError: ((error: unknown) => void) | undefined
-): Readonly<{ read(): Promise<GqlAuth>; dispose(): void }> {
-	let current: Readonly<GqlAuth> | undefined;
-	let queue = Promise.resolve();
-	let disposed = false;
-	const read = (): Promise<GqlAuth> => {
-		const candidate = Promise.resolve().then(() => source.getAuth());
-		const transition = queue.then(async () => {
-			try {
-				const next = snapshotAuthCredential(await candidate);
-				if (
-					current !== undefined &&
-					!sameAuthCredential(current, next)
-				) {
-					invalidate();
-				}
-				current = next;
-				return next;
-			} catch (error) {
-				current = undefined;
-				invalidate();
-				throw error;
-			}
-		});
-		queue = transition.then(
-			() => undefined,
-			() => undefined
-		);
-		return transition;
-	};
-	const unsubscribe = source.subscribe?.(() => {
-		if (disposed) return;
-		void read().catch((error: unknown) => onError?.(error));
-	});
-	// Snapshot the bind-time credential so a later first request can fence a
-	// token refresh that retained the same unverified JWT subject.
-	void read().catch((error: unknown) => onError?.(error));
-	return Object.freeze({
-		read,
-		dispose(): void {
-			if (disposed) return;
-			disposed = true;
-			unsubscribe?.();
-		}
-	});
-}
-
-function validatedHydrationAuthority(
-	value: SveltekitReplicaAuthority
-): ReplicaAuthoritativeScope {
-	const scope = value?.scope;
-	if (
-		value?.version !== 1 ||
-		scope === null ||
-		typeof scope !== 'object' ||
-		scope.protocolVersion !== 1 ||
-		typeof scope.schemaHash !== 'string' ||
-		scope.schemaHash.length === 0 ||
-		typeof scope.authorizationGeneration !== 'string' ||
-		scope.authorizationGeneration.length === 0 ||
-		typeof scope.cacheScope !== 'string' ||
-		scope.cacheScope.length === 0
-	) {
-		throw new TypeError('Distributed SvelteKit hydration authority is invalid');
-	}
-	return scope;
-}
-
-function sameReplicaScope(
-	left: ReplicaAuthoritativeScope,
-	right: ReplicaAuthoritativeScope
-): boolean {
-	return (
-		left.protocolVersion === right.protocolVersion &&
-		left.schemaHash === right.schemaHash &&
-		left.authorizationGeneration === right.authorizationGeneration &&
-		left.cacheScope === right.cacheScope
 	);
 }

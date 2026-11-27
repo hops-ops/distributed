@@ -16,16 +16,17 @@ import { COMMAND_CONSISTENCY } from './fixtures/command-protocol.mjs';
 import {
 	assertReplicaAdapterConformance,
 	ControlledReplicaTransport,
-	REACT_FIXTURE_SCHEMA,
+	FIXTURE_SCHEMA,
+	TodoModel,
 	TodosArtifact,
 	todoFrame
 } from './fixtures/adapter-conformance.mjs';
 import {
 	createDistributedReplica,
 	createReplicaCommandRuntime,
-	createReplicaDiagnostics
+	createReplicaDiagnostics,
+	replicaRecordKey
 } from '../dist/replica/index.js';
-import { replicaCommandProjectedLifecycle } from '../dist/replica/command-runtime.js';
 
 async function flushMicrotasks() {
 	for (let iteration = 0; iteration < 12; iteration += 1) {
@@ -236,69 +237,47 @@ test('component SSR subscriptions stay transport-free when browser is false', as
 	client.destroy();
 });
 
-test('caller projection cancellation does not hide a globally pending command', async () => {
-	let resolveGlobal;
-	let rejectCaller;
-	const globallyProjected = new Promise((resolve) => {
-		resolveGlobal = resolve;
-	});
-	const callerProjected = new Promise((_resolve, reject) => {
-		rejectCaller = reject;
-	});
-	const receiptValue = {
-		commandId: 'command-pending-after-caller-deadline',
-		state: 'succeeded_pending_projection',
-		result: { accepted: true },
-		metadata: {},
-		status: () => Promise.resolve({ state: 'succeeded_pending_projection' }),
-		projected: callerProjected
-	};
-	Object.defineProperty(receiptValue, replicaCommandProjectedLifecycle, {
-		value: globallyProjected
-	});
-	const receipt = Object.freeze(receiptValue);
-	const client = createDistributedSvelteKit({
-		boundaries: [],
-		session: { getAuth: () => ({ accessToken: 'token' }) },
-		browser: false,
-		createCommands() {
-			return {
-				commands: {
-					save: () => Promise.resolve(receipt)
-				},
-				dispose() {}
-			};
-		}
-	});
-	const query = client.operation(TodosArtifact).use();
-	const unsubscribe = query.subscribe(() => undefined);
-
-	const returned = await client.commands.save();
-	assert.equal(returned, receipt);
-	assert.deepEqual(query.get().pending, [receipt]);
-
-	const callerOutcome = assert.rejects(
-		callerProjected,
-		/caller deadline/
+test('$query.pending marks rows the server has not returned yet', () => {
+	const replica = createDistributedReplica();
+	const store = bindSveltekitOperation(replica, TodosArtifact).use();
+	const unsubscribe = store.subscribe(() => undefined);
+	replica.writeResult(
+		TodosArtifact,
+		{},
+		todoFrame(TodosArtifact, [{ id: 'todo-1', title: 'saved', status: 'open' }]),
+		'network'
 	);
-	rejectCaller(new Error('caller deadline'));
-	await callerOutcome;
-	await flushMicrotasks();
-	assert.deepEqual(
-		query.get().pending,
-		[receipt],
-		'the adapter must observe the command-wide causal lifecycle'
-	);
-
-	resolveGlobal({
-		commandId: receipt.commandId,
-		state: 'atomic'
+	// Editing a row the server returned shows the preview but is not pending.
+	replica.createOptimisticLayer('command-rename', (writer) => {
+		writer.writeRecord(TodoModel, 'todo-1', { fields: { title: 'renaming' } });
 	});
-	await flushMicrotasks();
-	assert.deepEqual(query.get().pending, []);
+	const [renamed] = store.get().data.todos;
+	assert.equal(renamed.title, 'renaming');
+	assert.equal(store.get().pending.has(renamed), false);
+
+	// A created row exists only as the command's preview: it is pending.
+	replica.createOptimisticLayer('command-create', (writer) => {
+		writer.writeRecord(TodoModel, 'todo-2', {
+			fields: { id: 'todo-2', title: 'new', status: 'open' }
+		});
+		writer.writeIndex(
+			{ field: 'todos', arguments: {}, dependencies: ['todos'], complete: true },
+			[replicaRecordKey(TodoModel, 'todo-1'), replicaRecordKey(TodoModel, 'todo-2')]
+		);
+	});
+	const [, created] = store.get().data.todos;
+	assert.equal(created.title, 'new');
+	assert.equal(store.get().pending.has(created), true);
+	assert.equal(store.pending.has(created), true);
+
+	replica.rejectOptimisticLayer('command-create');
+	replica.rejectOptimisticLayer('command-rename');
+	const [restored] = store.get().data.todos;
+	assert.equal(restored.title, 'saved');
+	assert.equal(store.get().data.todos.length, 1);
+	assert.equal(store.get().pending.size, 0);
 	unsubscribe();
-	query.destroy();
-	client.destroy();
+	store.destroy();
 });
 
 test('pre-subscribe refetch uses one temporary HTTP watch and never opens live', async () => {
@@ -404,7 +383,7 @@ test('Svelte composition shares one diagnostics sink with operations and generat
 		operationHash,
 		protocol: Object.freeze({
 			version: 1,
-			schemaHash: REACT_FIXTURE_SCHEMA,
+			schemaHash: FIXTURE_SCHEMA,
 			protocolHash: `sha256:${'c'.repeat(64)}`,
 			surface: Object.freeze({ kind: 'role', name: 'user' }),
 			operation: operationHash,
@@ -478,7 +457,7 @@ test('Svelte composition shares one diagnostics sink with operations and generat
 		}
 	});
 
-	client.operation(TodosArtifact).read({});
+	client.replica.retainOperation(TodosArtifact, {});
 	const snapshot = diagnostics.snapshot();
 	assert.equal(factoryOptions.diagnostics, diagnostics);
 	assert.deepEqual(

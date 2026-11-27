@@ -1,4 +1,5 @@
 import type { ReplicaClientSurface, ReplicaValue } from '../types.js';
+import { isUnsignedInteger, unsignedIntegerMaximum } from '../../unsigned-integer.js';
 import { createReplicaCommandId } from '../command-id.js';
 import { isPlainRecord } from '../../lib/is-plain-record.js';
 import {
@@ -169,6 +170,11 @@ export function cloneScalar(
 	value: unknown,
 	path: string
 ): ReplicaValue {
+	const unsignedMaximum = unsignedIntegerMaximum(codec);
+	if (unsignedMaximum !== undefined) {
+		if (!isUnsignedInteger(value, unsignedMaximum)) inputInvalid(path);
+		return value;
+	}
 	switch (codec) {
 		case 'string':
 		case 'string_unvalidated_timestamp':
@@ -302,17 +308,24 @@ export function generateDefault(
 	path: string
 ): string {
 	switch (entry.generator) {
-			case 'uuid_v7':
-				return validateUuidV7(
-					(generators?.uuidV7 ?? createReplicaCommandId)(),
-					path,
-					'REPLICA_COMMAND_INPUT_INVALID'
-				);
+		case 'uuid_v7':
+			return validateUuidV7(
+				(generators?.uuidV7 ?? createReplicaCommandId)(),
+				path,
+				'REPLICA_COMMAND_INPUT_INVALID'
+			);
 		case 'ulid':
 			return validateUlid(
 				(generators?.ulid ?? createUlid)(),
 				path
 			);
+		case 'now': {
+			const millis = (generators?.now ?? Date.now)();
+			if (!Number.isSafeInteger(millis) || millis < 0) {
+				inputInvalid(path);
+			}
+			return String(millis);
+		}
 		default:
 			artifactInvalid(`${path}.generator`);
 	}

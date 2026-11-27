@@ -1,5 +1,0 @@
-error: command id must be 2+ dot-separated lowercase ASCII identifier segments
- --> tests/compile_fail/application_command_invalid_id.rs:5:10
-  |
-5 |     id = "../Admin",
-  |          ^^^^^^^^^^

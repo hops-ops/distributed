@@ -6,14 +6,15 @@ import {
 	DistributedProtocolError,
 	parseDistributedProtocolEnvelope,
 	parseGraphqlResponseExtensions,
-	requestGraphql,
-	subscribe
+	createGraphqlWsConnection,
+	requestGraphql
 } from '@hops-ops/distributed';
 import {
 	COMMAND_CONSISTENCY,
 	COMMAND_STATE,
 	commandReceipt
 } from './fixtures/command-protocol.mjs';
+import { FakeScheduler } from './fixtures/game-harness.mjs';
 
 function distributedEnvelope() {
 	return {
@@ -81,7 +82,7 @@ function distributedEnvelope() {
 			observations: []
 		},
 		live: {
-			supported: true,
+			mode: "resumable",
 			reset: false,
 			cursors: [
 				{
@@ -102,6 +103,49 @@ function responseExtensions() {
 		distributed: distributedEnvelope()
 	};
 }
+
+test('unsigned trusted presets accept only exact bounded integers', () => {
+	for (const [codec, maximum] of [['uint8', 255], ['uint16', 65_535],
+		['uint32', 4_294_967_295], ['uint64_safe_integer', Number.MAX_SAFE_INTEGER]]) {
+		for (const value of [0, 1, maximum]) {
+			const envelope = distributedEnvelope();
+			envelope.trustedPresets = [{ name: 'revision', codec, value }];
+			assert.equal(parseDistributedProtocolEnvelope(envelope).trustedPresets[0].value, value);
+		}
+		for (const value of [-1, -0, 1.5, NaN, Infinity, maximum + 1, '1', 1n]) {
+			const envelope = distributedEnvelope();
+			envelope.trustedPresets = [{ name: 'revision', codec, value }];
+			assert.throws(() => parseDistributedProtocolEnvelope(envelope), DistributedProtocolError);
+		}
+	}
+});
+
+test('an observation may name the row revision its projector wrote', () => {
+	const record = {
+		scopeToken: 'opaque:record-scope',
+		incarnation: '1',
+		revision: '18446744073709551615'
+	};
+	const envelope = distributedEnvelope();
+	envelope.command.observations[0].record = record;
+	assert.deepEqual(
+		parseDistributedProtocolEnvelope(envelope).command.observations[0].record,
+		record
+	);
+	for (const invalid of [
+		null,
+		{ ...record, scopeToken: '' },
+		{ ...record, incarnation: '01' },
+		{ ...record, revision: 2 }
+	]) {
+		const malformed = distributedEnvelope();
+		malformed.command.observations[0].record = invalid;
+		assert.throws(
+			() => parseDistributedProtocolEnvelope(malformed),
+			DistributedProtocolError
+		);
+	}
+});
 
 test('protocol parser validates receipts while retaining future metadata opaquely', () => {
 	assert.deepEqual(COMMAND_CONSISTENCY, {
@@ -237,7 +281,7 @@ test('protocol parser requires exact live snapshot alignment', () => {
 			parseDistributedProtocolEnvelope({
 				...envelope,
 				snapshot: undefined,
-				live: { supported: false, reset: true, cursors: [] }
+				live: { mode: "snapshot", reset: true, cursors: [] }
 			}),
 		(error) =>
 			error instanceof DistributedProtocolError &&
@@ -253,7 +297,7 @@ test('protocol parser requires exact live snapshot alignment', () => {
 					indexes: [],
 					observations: []
 				},
-				live: { supported: true, reset: true, cursors: [] }
+				live: { mode: "resumable", reset: true, cursors: [] }
 			}),
 		(error) =>
 			error instanceof DistributedProtocolError &&
@@ -333,6 +377,28 @@ test('protocol parser requires exact live snapshot alignment', () => {
 	}
 });
 
+test('snapshot delivery requires an explicit cursorless reset and fails closed on old modes', () => {
+	const base = distributedEnvelope();
+	const envelope = {
+		...base,
+		snapshot: { ...base.snapshot, indexesComparable: false, indexes: [], observations: [] },
+		live: { mode: 'snapshot', reset: true, cursors: [] }
+	};
+	assert.equal(parseDistributedProtocolEnvelope(envelope).live.mode, 'snapshot');
+	for (const live of [
+		{ supported: false, reset: true, cursors: [] },
+		{ ...envelope.live, supported: false },
+		{ ...envelope.live, mode: 'unknown' },
+		{ ...envelope.live, reset: false },
+		{ ...envelope.live, cursors: base.live.cursors }
+	]) {
+		assert.throws(() => parseDistributedProtocolEnvelope({ ...envelope, live }), DistributedProtocolError);
+	}
+	assert.throws(() => parseDistributedProtocolEnvelope({
+		...envelope, snapshot: base.snapshot
+	}), DistributedProtocolError);
+});
+
 test('protocol parser accepts 64 resume cursors and rejects 65', () => {
 	const cursors = Array.from({ length: 65 }, (_, index) => ({
 		projection: `projection-${index}`,
@@ -349,7 +415,7 @@ test('protocol parser accepts 64 resume cursors and rejects 65', () => {
 	const accepted = parseDistributedProtocolEnvelope({
 		...envelope,
 		snapshot: { ...envelope.snapshot, indexes: indexes.slice(0, 64) },
-		live: { supported: true, reset: false, cursors: cursors.slice(0, 64) }
+		live: { mode: "resumable", reset: false, cursors: cursors.slice(0, 64) }
 	});
 	assert.equal(accepted.live.cursors.length, 64);
 	assert.equal(accepted.snapshot.indexes.length, 64);
@@ -358,7 +424,7 @@ test('protocol parser accepts 64 resume cursors and rejects 65', () => {
 		() =>
 			parseDistributedProtocolEnvelope({
 				...envelope,
-				live: { supported: true, reset: false, cursors }
+				live: { mode: "resumable", reset: false, cursors }
 			}),
 		(error) =>
 			error instanceof DistributedProtocolError &&
@@ -369,7 +435,7 @@ test('protocol parser accepts 64 resume cursors and rejects 65', () => {
 			parseDistributedProtocolEnvelope({
 				...envelope,
 				snapshot: { ...envelope.snapshot, indexes },
-				live: { supported: false, reset: true, cursors: [] }
+				live: { mode: "snapshot", reset: true, cursors: [] }
 			}),
 		(error) =>
 			error instanceof DistributedProtocolError &&
@@ -494,23 +560,25 @@ class FakeWebSocket {
 	}
 }
 
-test('GraphQL-WS preserves valid envelopes and terminates on incompatible frames', () => {
+test('GraphQL-WS preserves valid envelopes and terminates on incompatible frames', async () => {
 	FakeWebSocket.instances.length = 0;
+	const scheduler = new FakeScheduler();
+	const connection = createGraphqlWsConnection({
+		getUrl: () => '/graphql',
+		webSocket: FakeWebSocket,
+		scheduler
+	});
 	const next = [];
 	const errors = [];
-	const stop = subscribe(
+	const stop = connection.subscribe(
 		'subscription Live { live { id } }',
-		{},
 		{
 			onNext: (result) => next.push(result),
 			onError: (error) => errors.push(error)
 		},
-		{
-			webSocket: FakeWebSocket,
-			httpUrl: '/graphql',
-			resume: distributedEnvelope().live.cursors
-		}
+		{ resume: distributedEnvelope().live.cursors }
 	);
+	await new Promise((resolve) => setImmediate(resolve));
 	const socket = FakeWebSocket.instances[0];
 	socket.open();
 	socket.message({ type: 'connection_ack' });
@@ -535,24 +603,23 @@ test('GraphQL-WS preserves valid envelopes and terminates on incompatible frames
 	});
 	assert.deepEqual(errors, []);
 	stop();
+	assert.deepEqual(socket.sent.at(-1), { type: 'complete', id: '1' });
 
 	const rejectedNext = [];
 	const rejectedErrors = [];
-	subscribe(
+	connection.subscribe(
 		'subscription Live { live { id } }',
-		{},
 		{
 			onNext: (result) => rejectedNext.push(result),
 			onError: (error) => rejectedErrors.push(error)
-		},
-		{ webSocket: FakeWebSocket, httpUrl: '/graphql' }
+		}
 	);
-	const rejectedSocket = FakeWebSocket.instances[1];
-	rejectedSocket.open();
-	rejectedSocket.message({ type: 'connection_ack' });
+	await new Promise((resolve) => setImmediate(resolve));
+	assert.equal(FakeWebSocket.instances.length, 1, 'the idle socket is reused');
+	const rejectedSocket = socket;
 	rejectedSocket.message({
 		type: 'next',
-		id: '1',
+		id: '2',
 		payload: {
 			data: { live: { id: 'must-not-be-trusted' } },
 			extensions: {
@@ -572,7 +639,9 @@ test('GraphQL-WS preserves valid envelopes and terminates on incompatible frames
 	);
 	assert.deepEqual(rejectedSocket.sent.at(-1), {
 		type: 'complete',
-		id: '1'
+		id: '2'
 	});
-	assert.equal(rejectedSocket.closeCount, 1);
+	assert.equal(rejectedSocket.closeCount, 0);
+	await scheduler.advance(1_000);
+	assert.equal(rejectedSocket.closeCount, 1, 'an idle socket closes');
 });

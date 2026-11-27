@@ -47,17 +47,29 @@ impl SurfaceOptions {
     }
 }
 
-/// Row-authorization semantics retained on the role/application surface.
+/// Row authorization for one model on a selected role/application surface.
 ///
-/// `ServerOnly` is the fail-closed representation when a predicate differs
-/// across application roles or references a field that is not authorized on
-/// the selected surface. Clients may revalidate such collections but must not
-/// evaluate membership locally.
+/// The server executes [`filter`](Self::filter) on every access path. The
+/// variant says what the client contract may learn: a `Predicate` is exported
+/// and evaluated locally; a `ServerOnly` predicate is never exported, because
+/// it differs across the application's schema roles or references something
+/// the selected surface does not authorize. Clients may revalidate such
+/// collections but must not evaluate membership locally.
 #[derive(Clone, Debug, PartialEq)]
 pub enum SurfaceRowPolicy {
     Unrestricted,
     Predicate(FilterExpr),
-    ServerOnly,
+    ServerOnly(FilterExpr),
+}
+
+impl SurfaceRowPolicy {
+    /// The predicate the server enforces, whether or not it is exported.
+    pub fn filter(&self) -> Option<&FilterExpr> {
+        match self {
+            Self::Unrestricted => None,
+            Self::Predicate(filter) | Self::ServerOnly(filter) => Some(filter),
+        }
+    }
 }
 
 /// Semantic category for one GraphQL field argument.
@@ -172,6 +184,7 @@ pub struct SurfaceTypeField {
     pub nullable: bool,
     pub list: bool,
     pub item_nullable: bool,
+    pub unsigned_integer: Option<crate::command::CommandUnsignedInteger>,
     pub nested: Option<Box<SurfaceTypeDef>>,
 }
 
@@ -197,14 +210,9 @@ pub struct SurfaceCommand {
     pub output: SurfaceCommandShape,
     pub consistency: CommandConsistency,
     pub(crate) input_defaults: Vec<CommandInputDefault>,
-    pub(crate) effects: Option<CommandEffects>,
-    pub(crate) confirmations: Vec<CommandProjectionConfirmation>,
     pub(crate) projected_model: Option<CommandProjectedModel>,
     pub(crate) direct_projection: Option<CommandDirectProjectionTarget>,
     pub(crate) projections: CommandProjectionEvents,
-    /// Authorization selection erased at least one required confirmation.
-    /// No hidden projector/model/key IDs may survive into client artifacts.
-    pub(crate) confirmation_unavailable: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -225,7 +233,6 @@ pub struct SurfaceProjectionOwner {
     pub facts: Vec<String>,
     pub models: Vec<String>,
     pub dependencies: Vec<String>,
-    pub(crate) change_epoch: Option<String>,
     pub(crate) partition: ProjectionPartitionSpec,
     pub(in crate::graphql::surface) kind: SurfaceProjectionOwnerKind,
     pub(crate) modeled: Vec<SurfaceModeledProjection>,
@@ -263,23 +270,10 @@ impl SurfaceProjectionOwner {
             .collect()
     }
 
-    pub(crate) fn binding_change_epoch(&self) -> Option<String> {
-        if self.modeled.is_empty() {
-            return self.change_epoch.clone();
-        }
-        self.modeled
-            .iter()
-            .find(|modeled| {
-                modeled.state() == crate::projection::placement::ProjectionBindingState::Active
-            })
-            .or_else(|| self.modeled.first())
-            .map(|modeled| modeled.epoch().as_str().to_owned())
-    }
-
     pub(crate) fn active_modeled_program_id_for(
         &self,
         model: &str,
-    ) -> Option<crate::ProjectionProgramId> {
+    ) -> Option<crate::projection::ProjectionProgramId> {
         self.modeled
             .iter()
             .find(|modeled| {
@@ -310,6 +304,49 @@ impl Deref for SurfaceProjector {
 }
 
 impl SurfaceProjector {
+    /// Begin snapshot rebuild maintenance for this projector's one active,
+    /// locally hosted eventual binding.
+    #[allow(private_bounds)]
+    pub async fn begin_snapshot_rebuild(
+        &self,
+        store: &impl crate::projection_protocol::ProjectionProtocolStore,
+    ) -> Result<
+        crate::projection::rebuild::SnapshotProjectionRebuild,
+        crate::projection_protocol::ProjectionProtocolError,
+    > {
+        use crate::projection::placement::ProjectionExecutorRoute;
+        use crate::projection_protocol::{ProjectionProtocolError, ProjectorTopologyId};
+        let invalid = |message: &str| ProjectionProtocolError::InvalidBatch(message.into());
+        let [projection] = self.modeled.as_slice() else {
+            return Err(invalid(
+                "snapshot rebuild requires exactly one modeled binding",
+            ));
+        };
+        if !projection.is_causally_eligible()
+            || !matches!(projection.route(), ProjectionExecutorRoute::Local { .. })
+        {
+            return Err(invalid(
+                "snapshot rebuild requires an active local eventual binding",
+            ));
+        }
+        let physical = projection
+            .raw()
+            .ok_or_else(|| invalid("snapshot rebuild requires a generated binding"))?
+            .1
+            .physical_topology()
+            .ok_or_else(|| invalid("snapshot rebuild requires a physical topology"))?;
+        let executor = projection
+            .server_executor()
+            .cloned()
+            .ok_or_else(|| invalid("snapshot rebuild requires a generated executor"))?;
+        crate::projection::rebuild::SnapshotProjectionRebuild::begin(
+            store,
+            ProjectorTopologyId::new(physical.version(), physical.name(), physical.digest())?,
+            executor,
+        )
+        .await
+    }
+
     pub fn new(name: impl Into<String>) -> Self {
         Self {
             owner: SurfaceProjectionOwner {
@@ -317,7 +354,6 @@ impl SurfaceProjector {
                 facts: Vec::new(),
                 models: Vec::new(),
                 dependencies: Vec::new(),
-                change_epoch: None,
                 partition: ProjectionPartitionSpec::unit(),
                 kind: SurfaceProjectionOwnerKind::Async,
                 modeled: Vec::new(),
@@ -341,15 +377,6 @@ impl SurfaceProjector {
     /// per program is accepted when the owner registry is attached.
     pub fn modeled(mut self, projection: SurfaceModeledProjection) -> Self {
         self.owner.modeled.push(projection);
-        self
-    }
-
-    /// Register the opaque change-log epoch owned by this projector topology.
-    ///
-    /// Epoch contents have no ordering meaning. They fence live resume and
-    /// same-transaction record-change evidence across projector rebuilds.
-    pub fn change_epoch(mut self, epoch: impl Into<String>) -> Self {
-        self.owner.change_epoch = Some(epoch.into());
         self
     }
 
@@ -381,7 +408,6 @@ impl SurfaceProjector {
             &self.owner.facts,
             &self.owner.models,
             &self.owner.partition,
-            self.owner.change_epoch.as_deref(),
         )
     }
 }
@@ -396,8 +422,8 @@ impl From<SurfaceProjector> for SurfaceProjectionOwner {
 ///
 /// It intentionally has no fact inventory and cannot be passed to an
 /// asynchronous projector route. The owner still supplies the complete model
-/// topology, partition codec, and change epoch used by direct commits, query
-/// evidence, live changes, and generated clients.
+/// topology and partition codec used by direct commits, query evidence, live
+/// changes, and generated clients.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SurfaceDirectProjection {
     owner: SurfaceProjectionOwner,
@@ -411,7 +437,6 @@ impl SurfaceDirectProjection {
                 facts: Vec::new(),
                 models: Vec::new(),
                 dependencies: Vec::new(),
-                change_epoch: None,
                 partition: ProjectionPartitionSpec::unit(),
                 kind: SurfaceProjectionOwnerKind::Direct,
                 modeled: Vec::new(),
@@ -436,12 +461,6 @@ impl SurfaceDirectProjection {
     /// Attach one exact same-transaction modeled projection.
     pub fn modeled(mut self, projection: SurfaceModeledProjection) -> Self {
         self.owner.modeled.push(projection);
-        self
-    }
-
-    /// Register the opaque change-log epoch for direct record evidence.
-    pub fn change_epoch(mut self, epoch: impl Into<String>) -> Self {
-        self.owner.change_epoch = Some(epoch.into());
         self
     }
 
@@ -478,6 +497,21 @@ pub struct SurfaceModel {
     pub aggregations: bool,
     /// Filtered schema clone (columns limited for role surfaces).
     pub(crate) schema: TableSchema,
+}
+
+impl SurfaceModel {
+    /// Stop exporting the row predicate; the server keeps enforcing it.
+    pub(crate) fn keep_row_policy_server_only(&mut self) {
+        if let SurfaceRowPolicy::Predicate(filter) = &self.row_policy {
+            self.row_policy = SurfaceRowPolicy::ServerOnly(filter.clone());
+        }
+    }
+
+    /// Whether this privilege may read `column`.
+    #[cfg(feature = "graphql")]
+    pub(crate) fn allows_column(&self, column: &str) -> bool {
+        self.columns.iter().any(|field| field.name == column)
+    }
 }
 
 /// Whether this selected Surface exposes a complete client-safe normalized
@@ -540,8 +574,10 @@ pub struct Surface {
     pub(crate) projectors_attached: bool,
     /// Non-serializable provenance proving typed commands came from one
     /// executable Service inventory rather than a lookalike command list.
-    pub(crate) service_binding:
-        Option<crate::graphql::command_contract::TypedServiceCommandBinding>,
+    pub(crate) service_binding: Option<crate::command::TypedServiceCommandBinding>,
+    /// External read sources ([`super::ExternalReadSource`]). On a role or
+    /// application surface each one carries only that selection's grant.
+    pub(crate) external: Vec<std::sync::Arc<dyn super::ExternalReadSource>>,
 }
 
 /// Debug output is intentionally limited to already-authorized public IDs.
@@ -564,7 +600,9 @@ impl std::fmt::Debug for Surface {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum SurfaceSelection {
     Catalog,
-    Role { name: String },
+    Role {
+        name: String,
+    },
     Application {
         name: String,
         eligible_roles: Vec<String>,
@@ -573,160 +611,6 @@ pub(crate) enum SurfaceSelection {
 }
 
 impl Surface {
-    /// Serialize the complete behavior-affecting Surface IR once. Application
-    /// manifests, SDL metadata, and client exports use this snapshot as their
-    /// shared identity input; none of them re-walks a table catalog.
-    pub(crate) fn canonical_contract_value(&self) -> Result<serde_json::Value, String> {
-        let selection = match &self.selection {
-            SurfaceSelection::Catalog => serde_json::json!({"kind": "catalog"}),
-            SurfaceSelection::Role { name } => serde_json::json!({"kind": "role", "name": name}),
-            SurfaceSelection::Application {
-                name,
-                eligible_roles,
-                schema_roles,
-            } => {
-                let mut eligible_roles = eligible_roles.clone();
-                let mut schema_roles = schema_roles.clone();
-                eligible_roles.sort();
-                eligible_roles.dedup();
-                schema_roles.sort();
-                schema_roles.dedup();
-                serde_json::json!({
-                    "kind": "application",
-                    "name": name,
-                    "eligible_roles": eligible_roles,
-                    "schema_roles": schema_roles,
-                })
-            }
-        };
-        let models = self
-            .models
-            .values()
-            .map(|model| {
-                let mut columns = model.columns.clone();
-                columns.sort_by(|left, right| left.name.cmp(&right.name));
-                let mut primary_key = model.primary_key.clone();
-                primary_key.sort();
-                let mut relationships = model
-                    .relationships
-                    .iter()
-                    .map(|relationship| {
-                        serde_json::json!({
-                            "name": relationship.name,
-                            "target_model": relationship.target_model,
-                            "target_object": relationship.target_object,
-                            "kind": format!("{:?}", relationship.kind).to_ascii_lowercase(),
-                            "list": relationship.list,
-                            "nullable": relationship.nullable,
-                            "arguments": relationship
-                                .arguments
-                                .iter()
-                                .map(argument_value)
-                                .collect::<Vec<_>>(),
-                            "keys": relationship_keys_value(&relationship.keys),
-                            "dependencies": relationship.dependencies,
-                            "aggregate": relationship.aggregate.as_ref().map(|aggregate| {
-                                serde_json::json!({
-                                    "name": aggregate.name,
-                                    "type_name": aggregate.type_name,
-                                    "arguments": aggregate
-                                        .arguments
-                                        .iter()
-                                        .map(argument_value)
-                                        .collect::<Vec<_>>(),
-                                    "dependencies": aggregate.dependencies,
-                                })
-                            }),
-                        })
-                    })
-                    .collect::<Vec<_>>();
-                relationships.sort_by(|left, right| left["name"].as_str().cmp(&right["name"].as_str()));
-                serde_json::json!({
-                    "model_name": model.model_name,
-                    "table_name": model.table_name,
-                    "object_name": model.object_name,
-                    "columns": columns,
-                    "relationships": relationships,
-                    "primary_key": primary_key,
-                    "row_policy": row_policy_value(&model.row_policy),
-                    "role_limit": model.role_limit,
-                    "aggregations": model.aggregations,
-                })
-            })
-            .collect::<Vec<_>>();
-        let mut roots = self
-            .query_fields
-            .iter()
-            .map(|root| root_value("query", root))
-            .chain(self.subscription_fields.iter().map(|root| root_value("subscription", root)))
-            .collect::<Vec<_>>();
-        roots.sort_by(|left, right| {
-            (left["operation"].as_str(), left["name"].as_str())
-                .cmp(&(right["operation"].as_str(), right["name"].as_str()))
-        });
-        let mut commands = self
-            .commands
-            .iter()
-            .map(|command| {
-                serde_json::json!({
-                    "command_name": command.command_name,
-                    "field_name": command.field_name,
-                    "roles": command.roles,
-                    "input": command_shape_value(&command.input),
-                    "output": command_shape_value(&command.output),
-                    "consistency": command.consistency,
-                    "input_defaults": command.input_defaults,
-                    "effects": command.effects,
-                    "confirmations": command.confirmations,
-                    "projected_model": command.projected_model.as_ref().map(|model| model.model.clone()),
-                    "direct_projection": command.direct_projection.as_ref().map(|target| target.canonical_value()),
-                    "projections": command.projections,
-                    "confirmation_unavailable": command.confirmation_unavailable,
-                })
-            })
-            .collect::<Vec<_>>();
-        commands.sort_by(|left, right| left["command_name"].as_str().cmp(&right["command_name"].as_str()));
-        let mut projectors = self
-            .projectors
-            .iter()
-            .map(|owner| {
-                let modeled = owner
-                    .modeled
-                    .iter()
-                    .map(|modeled| modeled.canonical_contract_value())
-                    .collect::<Result<Vec<_>, _>>()?;
-                Ok::<_, String>(serde_json::json!({
-                    "name": owner.name,
-                    "facts": owner.facts,
-                    "models": owner.models,
-                    "dependencies": owner.dependencies,
-                    "change_epoch": owner.change_epoch,
-                    "partition": owner.partition,
-                    "kind": if owner.is_direct() { "direct" } else { "async" },
-                    "modeled": modeled,
-                }))
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        projectors.sort_by(|left, right| left["name"].as_str().cmp(&right["name"].as_str()));
-        let value = serde_json::json!({
-            "version": 1,
-            "selection": selection,
-            "dialect": format!("{:?}", self.dialect).to_ascii_lowercase(),
-            "aggregates": self.aggregates,
-            "subscriptions": self.subscriptions,
-            "default_limit": self.default_limit,
-            "max_limit": self.max_limit,
-            "models": models,
-            "roots": roots,
-            "comparison_ops": self.comparison_ops,
-            "commands": commands,
-            "commands_attached": self.commands_attached,
-            "projectors": projectors,
-            "projectors_attached": self.projectors_attached,
-        });
-        Ok(crate::application::canonical_json(&value))
-    }
-
     /// Inventory of query root field names (sorted).
     pub fn query_root_names(&self) -> Vec<&str> {
         let mut names: Vec<&str> = self.query_fields.iter().map(|f| f.name.as_str()).collect();
@@ -789,7 +673,7 @@ impl Surface {
                 &self.projectors,
                 &self.models,
             )?;
-            validate_command_confirmation_topology(&self.commands, &self.projectors, &self.models)?;
+            validate_command_projection_topology(&self.commands, &self.projectors, &self.models)?;
         }
         self.commands_attached = true;
         Ok(self)
@@ -805,10 +689,7 @@ impl Surface {
 
     /// Bind several explicit logical modules before role/application
     /// authorization selection.
-    pub fn with_modules<'a, I>(
-        mut self,
-        modules: I,
-    ) -> Result<Self, String>
+    pub fn with_modules<'a, I>(mut self, modules: I) -> Result<Self, String>
     where
         I: IntoIterator<Item = &'a crate::application::Module>,
     {
@@ -825,7 +706,8 @@ impl Surface {
         for module in modules {
             contracts.extend(module.typed_command_contracts()?);
         }
-        let inventory = crate::graphql::commands::TypedCommandInventory::from_contracts(&contracts)?;
+        let inventory =
+            crate::graphql::commands::TypedCommandInventory::from_contracts(&contracts)?;
         self = self.with_typed_commands(&inventory)?;
         Ok(self)
     }
@@ -856,7 +738,7 @@ impl Surface {
     #[cfg(any(test, feature = "graphql"))]
     pub(crate) fn with_service_binding(
         mut self,
-        binding: Option<crate::graphql::command_contract::TypedServiceCommandBinding>,
+        binding: Option<crate::command::TypedServiceCommandBinding>,
     ) -> Self {
         self.service_binding = binding;
         self
@@ -873,6 +755,45 @@ impl Surface {
 
     /// Attach and validate a mixed registry of asynchronous projectors and
     /// same-transaction-only projection owners.
+    /// Attach external read sources to the unselected catalog Surface. Role
+    /// and application selection keep each one only where it is granted.
+    pub fn with_external_sources(
+        mut self,
+        sources: impl IntoIterator<Item = std::sync::Arc<dyn super::ExternalReadSource>>,
+    ) -> Result<Self, String> {
+        if !matches!(self.selection, SurfaceSelection::Catalog) {
+            return Err(
+                "external read sources can only be attached to the unselected catalog Surface before authorization selection"
+                    .into(),
+            );
+        }
+        let sources = sources.into_iter().collect::<Vec<_>>();
+        let roots = self
+            .query_fields
+            .iter()
+            .chain(&self.subscription_fields)
+            .map(|root| root.name.as_str())
+            .chain(
+                self.commands
+                    .iter()
+                    .map(|command| command.field_name.as_str()),
+            )
+            .collect::<Vec<_>>();
+        let types = self
+            .models
+            .values()
+            .map(|model| model.object_name.as_str())
+            .collect::<Vec<_>>();
+        super::external::validate_external_sources(&sources, &roots, &types)?;
+        self.external = sources;
+        Ok(self)
+    }
+
+    /// External read sources visible on this selection.
+    pub fn external_sources(&self) -> &[std::sync::Arc<dyn super::ExternalReadSource>] {
+        &self.external
+    }
+
     pub fn with_projection_owners(
         mut self,
         projectors: impl IntoIterator<Item = SurfaceProjectionOwner>,
@@ -906,11 +827,7 @@ impl Surface {
                 }
                 for modeled in &projector.modeled {
                     modeled.validate_for_surface(&projector.name, projector.kind, &self.models)?;
-                    if !modeled_registrations.insert((
-                        modeled.binding_id(),
-                        modeled.epoch().as_str().to_owned(),
-                        modeled.state(),
-                    )) {
+                    if !modeled_registrations.insert((modeled.binding_id(), modeled.state())) {
                         return Err(format!(
                             "projection binding `{}` is registered more than once on the Surface",
                             modeled.binding_id()
@@ -939,7 +856,6 @@ impl Surface {
                 }
                 projector.models = projector.binding_models();
                 projector.facts = projector.binding_facts();
-                projector.change_epoch = projector.binding_change_epoch();
                 projector.partition = modeled_owner_partition_contract(&projector)?;
             }
             match projector.kind {
@@ -971,14 +887,6 @@ impl Surface {
                 &projector.models,
                 &format!("projector `{}` model", projector.name),
             )?;
-            if let Some(epoch) = projector.change_epoch.as_deref() {
-                crate::projection_protocol::ProjectionEpoch::new(epoch).map_err(|error| {
-                    format!(
-                        "projector `{}` change-log epoch is invalid: {error}",
-                        projector.name
-                    )
-                })?;
-            }
             projector.partition.validate().map_err(|error| {
                 format!(
                     "projector `{}` has invalid partition declaration: {error}",
@@ -1004,109 +912,7 @@ impl Surface {
         bind_surface_direct_projection_targets(&mut self.commands, &out, &self.models)?;
         self.projectors = out;
         self.projectors_attached = true;
-        validate_command_confirmation_topology(&self.commands, &self.projectors, &self.models)?;
+        validate_command_projection_topology(&self.commands, &self.projectors, &self.models)?;
         Ok(self)
-    }
-}
-
-fn root_value(operation: &str, root: &RootField) -> serde_json::Value {
-    serde_json::json!({
-        "operation": operation,
-        "name": root.name,
-        "kind": match root.kind {
-            RootKind::List => "list",
-            RootKind::ByPk => "by_pk",
-            RootKind::Aggregate => "aggregate",
-        },
-        "object": root.object,
-        "model_name": root.model_name,
-        "arguments": root.arguments.iter().map(argument_value).collect::<Vec<_>>(),
-        "dependencies": root.dependencies,
-        "default_limit": root.default_limit,
-        "max_limit": root.max_limit,
-    })
-}
-
-fn argument_value(argument: &SurfaceArgument) -> serde_json::Value {
-    serde_json::json!({
-        "name": argument.name,
-        "kind": argument_kind_name(argument.kind),
-        "type_name": argument.type_name,
-        "nullable": argument.nullable,
-        "list": argument.list,
-    })
-}
-
-fn argument_kind_name(kind: SurfaceArgumentKind) -> &'static str {
-    match kind {
-        SurfaceArgumentKind::Filter => "filter",
-        SurfaceArgumentKind::Order => "order",
-        SurfaceArgumentKind::Limit => "limit",
-        SurfaceArgumentKind::Offset => "offset",
-        SurfaceArgumentKind::PrimaryKey => "primary_key",
-    }
-}
-
-fn command_shape_value(shape: &SurfaceCommandShape) -> serde_json::Value {
-    match shape {
-        SurfaceCommandShape::None => serde_json::Value::Null,
-        SurfaceCommandShape::Typed(definition) => type_def_value(definition),
-    }
-}
-
-fn type_def_value(definition: &SurfaceTypeDef) -> serde_json::Value {
-    serde_json::json!({
-        "name": definition.name,
-        "fields": definition.fields.iter().map(|field| serde_json::json!({
-            "name": field.name,
-            "type_name": field.type_name,
-            "nullable": field.nullable,
-            "list": field.list,
-            "item_nullable": field.item_nullable,
-            "nested": field.nested.as_deref().map(type_def_value),
-        })).collect::<Vec<_>>(),
-    })
-}
-
-fn row_policy_value(policy: &SurfaceRowPolicy) -> serde_json::Value {
-    match policy {
-        SurfaceRowPolicy::Unrestricted => serde_json::json!({"kind": "unrestricted"}),
-        SurfaceRowPolicy::Predicate(predicate) => {
-            serde_json::json!({"kind": "predicate", "expression": predicate})
-        }
-        SurfaceRowPolicy::ServerOnly => serde_json::json!({"kind": "server_only"}),
-    }
-}
-
-fn relationship_keys_value(keys: &SurfaceRelationshipKeys) -> serde_json::Value {
-    match keys {
-        SurfaceRelationshipKeys::Direct { local, remote } => {
-            serde_json::json!({"kind": "direct", "local": local, "remote": remote})
-        }
-        SurfaceRelationshipKeys::Through {
-            local,
-            remote,
-            table,
-            source_foreign_key,
-            target_foreign_key,
-        } => serde_json::json!({
-            "kind": "through",
-            "local": local,
-            "remote": remote,
-            "table": table,
-            "source_foreign_key": source_foreign_key,
-            "target_foreign_key": target_foreign_key,
-        }),
-        SurfaceRelationshipKeys::ThroughOpaque {
-            local,
-            remote,
-            dependency,
-        } => serde_json::json!({
-            "kind": "through_opaque",
-            "local": local,
-            "remote": remote,
-            "dependency": dependency,
-        }),
-        SurfaceRelationshipKeys::Embedded => serde_json::json!({"kind": "embedded"}),
     }
 }

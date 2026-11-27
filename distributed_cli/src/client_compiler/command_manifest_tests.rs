@@ -1,23 +1,24 @@
 use std::collections::BTreeMap;
 
 use super::command_manifest::validate_command_manifest;
+use distributed::command::InputDefaultGenerator;
+
 use super::manifest::{
-    hash_bytes, ManifestCommand, ManifestCommandConsistency, ManifestCommandExtensions,
-    ManifestCommandShape, ManifestConfirmationKind, ManifestConfirmations, ManifestConsistencyKind,
-    ManifestEffects, ManifestField, ManifestFilterField, ManifestFilterInput, ManifestInputDefault,
-    ManifestInputDefaultGenerator, ManifestInputDefaults, ManifestKeyField, ManifestModel,
-    ManifestNormalization, ManifestProjector, ManifestProtocolOperation,
-    ManifestProtocolOperations, ManifestRevalidationFallback, ManifestRowPolicy,
-    ManifestTrustedPresetDescriptor, ManifestTypeDef, ManifestTypeField,
+    hash_bytes, ClientCommand, ClientCommandExtensionSlots, ClientCommandShape, ClientField,
+    ClientFilterField, ClientFilterInput, ClientKeyField, ClientModel, ClientProjector,
+    ClientProtocolOperation, ClientProtocolOperations, ClientRowPolicy,
+    ClientTrustedPresetDescriptor, ClientTypeDef, ClientTypeField, CommandConsistency,
+    CommandConsistencyExtension, CommandInputDefault, CommandInputDefaultsExtension,
+    ModelNormalization,
 };
 
 fn field(
     name: &str,
     type_name: &str,
     codec: Option<&str>,
-    nested: Option<ManifestTypeDef>,
-) -> ManifestTypeField {
-    ManifestTypeField {
+    nested: Option<ClientTypeDef>,
+) -> ClientTypeField {
+    ClientTypeField {
         name: name.into(),
         type_name: type_name.into(),
         nullable: false,
@@ -28,52 +29,55 @@ fn field(
     }
 }
 
-fn model() -> ManifestModel {
-    ManifestModel {
+fn model() -> ClientModel {
+    ClientModel {
         id: "Todo".into(),
         typename: "Todo".into(),
         source_table: "todos".into(),
         dependencies: vec!["todos".into()],
-        normalization: ManifestNormalization::Normalized {
-            fields: vec![ManifestKeyField {
+        normalization: ModelNormalization::Normalized {
+            fields: vec![ClientKeyField {
                 name: "id".into(),
                 codec: "string".into(),
             }],
             encoding: "length_prefixed_v1".into(),
         },
         fields: vec![
-            ManifestField {
+            ClientField {
                 name: "id".into(),
                 scalar: "ID".into(),
                 codec: "string".into(),
                 nullable: false,
+                json_type: None,
             },
-            ManifestField {
+            ClientField {
                 name: "payload".into(),
                 scalar: "Bytea".into(),
                 codec: "base64".into(),
                 nullable: false,
+                json_type: None,
             },
-            ManifestField {
+            ClientField {
                 name: "title".into(),
                 scalar: "String".into(),
                 codec: "string".into(),
                 nullable: false,
+                json_type: None,
             },
         ],
         relationships: Vec::new(),
-        filter_input: ManifestFilterInput {
+        filter_input: ClientFilterInput {
             type_name: "todos_bool_exp".into(),
             fields: ["id", "payload", "title"]
                 .into_iter()
-                .map(|name| ManifestFilterField {
+                .map(|name| ClientFilterField {
                     name: name.into(),
                     operators: vec!["_eq".into()],
                 })
                 .collect(),
             relationships: Vec::new(),
         },
-        row_policy: ManifestRowPolicy::Unrestricted,
+        row_policy: ClientRowPolicy::Unrestricted,
         record_revisions: true,
         tombstones: true,
     }
@@ -90,8 +94,8 @@ fn codecs() -> BTreeMap<String, String> {
     .collect()
 }
 
-fn input() -> ManifestTypeDef {
-    ManifestTypeDef {
+fn input() -> ClientTypeDef {
+    ClientTypeDef {
         name: "CreateTodoInput".into(),
         fields: vec![
             field("id", "ID", Some("string"), None),
@@ -99,7 +103,7 @@ fn input() -> ManifestTypeDef {
                 "metadata",
                 "TodoMetadataInput",
                 None,
-                Some(ManifestTypeDef {
+                Some(ClientTypeDef {
                     name: "TodoMetadataInput".into(),
                     fields: vec![field("title", "String", Some("string"), None)],
                 }),
@@ -108,8 +112,8 @@ fn input() -> ManifestTypeDef {
     }
 }
 
-fn output() -> ManifestTypeDef {
-    ManifestTypeDef {
+fn output() -> ClientTypeDef {
+    ClientTypeDef {
         name: "CreateTodoPayload".into(),
         fields: vec![
             field("id", "ID", Some("string"), None),
@@ -117,7 +121,7 @@ fn output() -> ManifestTypeDef {
                 "todo",
                 "TodoResult",
                 None,
-                Some(ManifestTypeDef {
+                Some(ClientTypeDef {
                     name: "TodoResult".into(),
                     fields: vec![
                         field("id", "ID", Some("string"), None),
@@ -129,59 +133,56 @@ fn output() -> ManifestTypeDef {
     }
 }
 
-fn command() -> ManifestCommand {
+fn command() -> ClientCommand {
     let operation = "mutation Client_createTodo($commandId: ID!, $input: CreateTodoInput!) { createTodo(commandId: $commandId, input: $input) { id todo { id title } } }";
-    ManifestCommand {
+    ClientCommand {
         version: 1,
         name: "CreateTodo".into(),
         mutation_field: "createTodo".into(),
         grants: vec!["user".into()],
-        input: ManifestCommandShape::Object {
+        input: ClientCommandShape::Object {
             definition: input(),
         },
-        output: ManifestCommandShape::Object {
+        output: ClientCommandShape::Object {
             definition: output(),
         },
         operation: operation.into(),
         operation_hash: hash_bytes(operation.as_bytes()),
-        extensions: ManifestCommandExtensions {
+        extensions: ClientCommandExtensionSlots {
             version: 2,
-            consistency: ManifestCommandConsistency {
+            consistency: CommandConsistencyExtension {
                 version: 1,
-                kind: ManifestConsistencyKind::Eventual,
+                kind: CommandConsistency::Eventual,
             },
             direct_projection: None,
-            input_defaults: Some(ManifestInputDefaults {
+            input_defaults: Some(CommandInputDefaultsExtension {
                 version: 1,
-                defaults: vec![ManifestInputDefault {
+                defaults: vec![CommandInputDefault {
                     path: vec!["id".into()],
-                    generator: ManifestInputDefaultGenerator::UuidV7,
+                    generator: InputDefaultGenerator::UuidV7,
                 }],
             }),
-            effects: None,
-            confirmations: None,
             projection: None,
             trusted_presets: Vec::new(),
         },
     }
 }
 
-fn projector() -> ManifestProjector {
-    ManifestProjector {
+fn projector() -> ClientProjector {
+    ClientProjector {
         version: 1,
         name: "todos".into(),
         facts: vec!["TodoCreated".into()],
         models: vec!["Todo".into()],
         dependencies: vec!["todos".into()],
-        causal_confirmation: true,
     }
 }
 
-fn protocol() -> ManifestProtocolOperations {
+fn protocol() -> ClientProtocolOperations {
     let operation = "query Distributed_CommandStatus($commandId: ID!) { commandStatus(commandId: $commandId) { state } }";
-    ManifestProtocolOperations {
+    ClientProtocolOperations {
         version: 1,
-        command_status: Some(ManifestProtocolOperation {
+        command_status: Some(ClientProtocolOperation {
             name: "Distributed_CommandStatus".into(),
             operation: operation.into(),
             operation_hash: hash_bytes(operation.as_bytes()),
@@ -190,13 +191,13 @@ fn protocol() -> ManifestProtocolOperations {
 }
 
 fn validate(
-    command: &ManifestCommand,
+    command: &ClientCommand,
 ) -> Result<super::command_manifest::CommandManifestValidation, super::ClientCompileError> {
     validate_commands(std::slice::from_ref(command))
 }
 
 fn validate_commands(
-    commands: &[ManifestCommand],
+    commands: &[ClientCommand],
 ) -> Result<super::command_manifest::CommandManifestValidation, super::ClientCompileError> {
     validate_command_manifest(
         commands,
@@ -209,7 +210,7 @@ fn validate_commands(
     )
 }
 
-fn command_with_identity(name: &str, mutation_field: &str) -> ManifestCommand {
+fn command_with_identity(name: &str, mutation_field: &str) -> ClientCommand {
     let mut command = command();
     command.name = name.into();
     command.mutation_field = mutation_field.into();
@@ -235,7 +236,7 @@ fn requires_byte_exact_canonical_operation_and_recursive_codecs() {
     assert_eq!(error.code, "client.manifest.command_operation");
 
     let mut wrong_codec = command();
-    let ManifestCommandShape::Object { definition } = &mut wrong_codec.input else {
+    let ClientCommandShape::Object { definition } = &mut wrong_codec.input else {
         unreachable!()
     };
     definition.fields[1].nested.as_mut().expect("nested").fields[0].codec = Some("json".into());
@@ -249,7 +250,7 @@ fn unreferenced_trusted_preset_descriptors_fail_closed() {
     trusted
         .extensions
         .trusted_presets
-        .push(ManifestTrustedPresetDescriptor {
+        .push(ClientTrustedPresetDescriptor {
             name: "subject".into(),
             codec: "string".into(),
         });
@@ -258,41 +259,22 @@ fn unreferenced_trusted_preset_descriptors_fail_closed() {
 }
 
 #[test]
-fn legacy_command_authority_has_no_v2_decoder() {
+fn command_extensions_v1_has_no_decoder() {
     let mut old_version = command();
     old_version.extensions.version = 1;
     let error = validate(&old_version).expect_err("extensions v1 must fail closed");
     assert_eq!(error.code, "client.manifest.command_extensions");
-
-    let mut effects = command();
-    effects.extensions.effects = Some(ManifestEffects {
-        version: 1,
-        operations: Vec::new(),
-        fallback: ManifestRevalidationFallback::Revalidate,
-    });
-    let error = validate(&effects).expect_err("legacy effects must fail closed");
-    assert_eq!(error.code, "client.manifest.legacy_command_authority");
-
-    let mut confirmations = command();
-    confirmations.extensions.confirmations = Some(ManifestConfirmations {
-        version: 1,
-        kind: ManifestConfirmationKind::Unavailable,
-        expected: Vec::new(),
-        fallback: ManifestRevalidationFallback::Revalidate,
-    });
-    let error = validate(&confirmations).expect_err("legacy confirmations must fail closed");
-    assert_eq!(error.code, "client.manifest.legacy_command_authority");
 }
 
 #[test]
 fn rejects_empty_outputs_and_ambiguous_command_type_namespaces() {
     let mut empty = command();
-    empty.output = ManifestCommandShape::None;
+    empty.output = ClientCommandShape::None;
     let error = validate(&empty).expect_err("GraphQL mutation output cannot be empty");
     assert_eq!(error.code, "client.manifest.command_output");
 
     let mut overlaps_input = command();
-    overlaps_input.output = ManifestCommandShape::Object {
+    overlaps_input.output = ClientCommandShape::Object {
         definition: input(),
     };
     let error = validate(&overlaps_input).expect_err("input/output type IDs cannot overlap");
@@ -304,7 +286,7 @@ fn rejects_empty_outputs_and_ambiguous_command_type_namespaces() {
         .expect("identical output definitions may be shared across commands");
 
     let mut conflicting = second;
-    let ManifestCommandShape::Object { definition } = &mut conflicting.output else {
+    let ClientCommandShape::Object { definition } = &mut conflicting.output else {
         unreachable!()
     };
     definition.fields[0].nullable = true;
@@ -313,7 +295,7 @@ fn rejects_empty_outputs_and_ambiguous_command_type_namespaces() {
     assert_eq!(error.code, "client.manifest.command_type_reference");
 
     let mut model_collision = command();
-    let ManifestCommandShape::Object { definition } = &mut model_collision.input else {
+    let ClientCommandShape::Object { definition } = &mut model_collision.input else {
         unreachable!()
     };
     definition.name = "Todo".into();
@@ -322,7 +304,7 @@ fn rejects_empty_outputs_and_ambiguous_command_type_namespaces() {
     assert_eq!(error.code, "client.manifest.command_type_namespace");
 
     let mut scalar_collision = command();
-    let ManifestCommandShape::Object { definition } = &mut scalar_collision.input else {
+    let ClientCommandShape::Object { definition } = &mut scalar_collision.input else {
         unreachable!()
     };
     definition.name = "String".into();
@@ -331,7 +313,7 @@ fn rejects_empty_outputs_and_ambiguous_command_type_namespaces() {
     assert_eq!(error.code, "client.manifest.command_type_namespace");
 
     let mut non_projected_model_output = command();
-    let ManifestCommandShape::Object { definition } = &mut non_projected_model_output.output else {
+    let ClientCommandShape::Object { definition } = &mut non_projected_model_output.output else {
         unreachable!()
     };
     definition.name = "Todo".into();
@@ -343,19 +325,19 @@ fn rejects_empty_outputs_and_ambiguous_command_type_namespaces() {
 #[test]
 fn accepts_shapes_beyond_removed_compiler_only_size_limits() {
     let mut deep = command();
-    let mut nested = ManifestTypeDef {
+    let mut nested = ClientTypeDef {
         name: "Deep40".into(),
         fields: vec![field("value", "String", Some("string"), None)],
     };
     for depth in (0..40).rev() {
         let type_name = format!("Deep{depth}");
         let child_name = nested.name.clone();
-        nested = ManifestTypeDef {
+        nested = ClientTypeDef {
             name: type_name,
             fields: vec![field("child", &child_name, None, Some(nested))],
         };
     }
-    let ManifestCommandShape::Object { definition } = &mut deep.input else {
+    let ClientCommandShape::Object { definition } = &mut deep.input else {
         unreachable!()
     };
     let nested_name = nested.name.clone();
@@ -365,7 +347,7 @@ fn accepts_shapes_beyond_removed_compiler_only_size_limits() {
     validate(&deep).expect("Surface has no 32-level command type limit");
 
     let mut wide = command();
-    let ManifestCommandShape::Object { definition } = &mut wide.input else {
+    let ClientCommandShape::Object { definition } = &mut wide.input else {
         unreachable!()
     };
     let mut fields = (0..4_097)
@@ -385,7 +367,7 @@ fn query_only_protocol_has_no_command_status_or_causal_capability() {
         &codecs(),
         &[],
         false,
-        &ManifestProtocolOperations {
+        &ClientProtocolOperations {
             version: 1,
             command_status: None,
         },

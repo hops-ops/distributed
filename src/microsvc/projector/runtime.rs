@@ -6,7 +6,7 @@ use serde_json::Value;
 
 use crate::bus::{Message, MessageKind, OrderedDelivery};
 use crate::projection_protocol::{
-    CompiledProjectionTopology, ProjectionEpoch, ProjectionGeneration, ProjectionInputCursor,
+    CompiledProjectionTopology, ProjectionGeneration, ProjectionInputCursor,
     ProjectionInputDisposition, ProjectionModelOwnership, ProjectionProtocolError,
     ProjectionProtocolStore, ProjectionWorkspace, ProjectorTopologyId, TrustedProjectionInput,
 };
@@ -30,6 +30,21 @@ pub(in crate::microsvc) type ProjectorRepairFuture<'a> =
     Pin<Box<dyn Future<Output = Result<Option<ProjectionGeneration>, HandlerError>> + Send + 'a>>;
 pub(in crate::microsvc) type ProjectorRepairLookupFuture<'a> =
     Pin<Box<dyn Future<Output = Result<bool, HandlerError>> + Send + 'a>>;
+pub(in crate::microsvc) type ProjectorStoppedFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<Vec<ProjectionRepairHandle>, HandlerError>> + Send + 'a>>;
+
+/// The repair handles of the failures stopping `topology` in `store`.
+async fn stopped_failures<S: ProjectionProtocolStore>(
+    store: &S,
+    topology: &ProjectorTopologyId,
+) -> Result<Vec<ProjectionRepairHandle>, HandlerError> {
+    Ok(store
+        .stopped_projection_failures(topology)
+        .await?
+        .into_iter()
+        .map(ProjectionRepairHandle::for_failure)
+        .collect())
+}
 
 pub(in crate::microsvc) trait ErasedProjectorHandler<D>: Send + Sync {
     fn dispatch<'a>(
@@ -39,7 +54,7 @@ pub(in crate::microsvc) trait ErasedProjectorHandler<D>: Send + Sync {
         ordered: Option<&'a OrderedDelivery>,
     ) -> ProjectorDispatchFuture<'a>;
 
-    fn registration(&self) -> ProjectorRegistration;
+    fn compiled(&self) -> &CompiledProjectionTopology;
 
     fn bootstrap<'a>(&'a self, dependencies: &'a D) -> ProjectorDispatchFuture<'a>;
 
@@ -54,24 +69,27 @@ pub(in crate::microsvc) trait ErasedProjectorHandler<D>: Send + Sync {
         dependencies: &'a D,
         handle: &'a ProjectionRepairHandle,
     ) -> ProjectorRepairLookupFuture<'a>;
+
+    /// The failures stopping this projector's partitions now.
+    fn stopped<'a>(&'a self, dependencies: &'a D) -> ProjectorStoppedFuture<'a>;
 }
 
 #[derive(Clone)]
 pub(in crate::microsvc) struct ProjectorRegistration {
     pub(in crate::microsvc) topology: ProjectorTopologyId,
     pub(in crate::microsvc) ownership: Vec<ProjectionModelOwnership>,
+    /// The event names the projector consumes.
+    pub(in crate::microsvc) events: Vec<String>,
 }
 
 pub(super) struct RegisteredProjector<I> {
     pub(super) compiled: CompiledProjectionTopology,
-    pub(super) change_epoch: ProjectionEpoch,
     pub(super) handle: Arc<ProjectorHandlerFn<I>>,
 }
 
 #[cfg(feature = "graphql")]
 pub(in crate::microsvc) struct RegisteredModeledProjector {
     pub(in crate::microsvc) compiled: CompiledProjectionTopology,
-    pub(in crate::microsvc) change_epoch: ProjectionEpoch,
     pub(in crate::microsvc) executor: crate::projection::lower::ProjectionServerExecutorDescriptor,
     pub(in crate::microsvc) handle: Option<Arc<ModeledProjectorHandlerFn>>,
 }
@@ -81,11 +99,8 @@ impl<D> ErasedProjectorHandler<D> for RegisteredModeledProjector
 where
     D: CausalProjectionRouteDependencies + Send + Sync + 'static,
 {
-    fn registration(&self) -> ProjectorRegistration {
-        ProjectorRegistration {
-            topology: self.compiled.topology().clone(),
-            ownership: self.compiled.ownership().to_vec(),
-        }
+    fn compiled(&self) -> &CompiledProjectionTopology {
+        &self.compiled
     }
 
     fn bootstrap<'a>(&'a self, dependencies: &'a D) -> ProjectorDispatchFuture<'a> {
@@ -140,6 +155,13 @@ where
         })
     }
 
+    fn stopped<'a>(&'a self, dependencies: &'a D) -> ProjectorStoppedFuture<'a> {
+        Box::pin(stopped_failures(
+            dependencies.__causal_projection_store(),
+            self.compiled.topology(),
+        ))
+    }
+
     fn dispatch<'a>(
         &'a self,
         dependencies: &'a D,
@@ -169,44 +191,43 @@ where
                 )
             })?;
             let store = dependencies.__causal_projection_store();
-            let occurrence =
-                match crate::DomainEventOccurrence::from_canonical_bytes(&message.payload) {
-                    Ok(occurrence)
-                        if occurrence.id() == message_id
-                            && occurrence.descriptor().name == message.name
-                            && occurrence.causation_id() == Some(causation_id) =>
-                    {
-                        occurrence
-                    }
-                    Ok(_) => {
-                        return record_ingress_failure(
-                            store,
-                            &self.compiled,
-                            self.change_epoch.clone(),
-                            message,
-                            ordered,
-                            message_id,
-                            causation_id,
-                            HandlerError::DecodeFailed(
-                                "domain occurrence differs from its transport envelope".into(),
-                            ),
-                        )
-                        .await
-                    }
-                    Err(error) => {
-                        return record_ingress_failure(
-                            store,
-                            &self.compiled,
-                            self.change_epoch.clone(),
-                            message,
-                            ordered,
-                            message_id,
-                            causation_id,
-                            HandlerError::Other(Box::new(error)),
-                        )
-                        .await
-                    }
-                };
+            let occurrence = match crate::domain_event::DomainEventOccurrence::from_canonical_bytes(
+                &message.payload,
+            ) {
+                Ok(occurrence)
+                    if occurrence.id() == message_id
+                        && occurrence.descriptor().name == message.name
+                        && occurrence.causation_id() == Some(causation_id) =>
+                {
+                    occurrence
+                }
+                Ok(_) => {
+                    return record_ingress_failure(
+                        store,
+                        &self.compiled,
+                        message,
+                        ordered,
+                        message_id,
+                        causation_id,
+                        HandlerError::DecodeFailed(
+                            "domain occurrence differs from its transport envelope".into(),
+                        ),
+                    )
+                    .await
+                }
+                Err(error) => {
+                    return record_ingress_failure(
+                        store,
+                        &self.compiled,
+                        message,
+                        ordered,
+                        message_id,
+                        causation_id,
+                        HandlerError::Other(Box::new(error)),
+                    )
+                    .await
+                }
+            };
             let lowered = if self.executor.matches(&occurrence) {
                 match self.executor.plan(&occurrence) {
                     Ok(lowered) => Some(lowered),
@@ -214,7 +235,6 @@ where
                         return record_ingress_failure(
                             store,
                             &self.compiled,
-                            self.change_epoch.clone(),
                             message,
                             ordered,
                             message_id,
@@ -292,16 +312,27 @@ where
             )?;
             match store.projection_input_disposition(&trusted).await? {
                 ProjectionInputDisposition::Pending => {}
+                ProjectionInputDisposition::Redelivery => {
+                    store
+                        .commit_projection(crate::projection_protocol::ProjectionCommitBatch {
+                            input: trusted,
+                            ownership: self.compiled.ownership().to_vec(),
+                            mutations: Vec::new(),
+                            observations: Vec::new(),
+                        })
+                        .await?;
+                    return Ok(());
+                }
                 ProjectionInputDisposition::Duplicate(_) | ProjectionInputDisposition::Stale(_) => {
                     return Ok(())
                 }
             }
             let failure_input = trusted.clone();
-            let workspace = ProjectionWorkspace::new(
+            let workspace = ProjectionWorkspace::new_with_program_id(
                 self.compiled.codec(),
                 partition_value,
                 trusted,
-                self.change_epoch.clone(),
+                Some(self.executor.program_id),
             )?;
             let (context, workspace) =
                 CausalProjectorContext::new(message, D::Store::clone(store), workspace);
@@ -309,20 +340,13 @@ where
                 let (projection, applied) =
                     ModeledProjection::new(self.executor.program_id, lowered);
                 if let Err(error) = handle(context, projection).await {
-                    return handle_projector_error(
-                        store,
-                        failure_input,
-                        self.change_epoch.clone(),
-                        "modeled_handler",
-                        error,
-                    )
-                    .await;
+                    return handle_projector_error(store, failure_input, "modeled_handler", error)
+                        .await;
                 }
                 if !applied.load(std::sync::atomic::Ordering::Acquire) {
                     return handle_projector_error(
                         store,
                         failure_input,
-                        self.change_epoch.clone(),
                         "modeled_handler",
                         HandlerError::Rejected(
                             "modeled projector handler returned without applying its projection"
@@ -333,14 +357,8 @@ where
                 }
             } else if let Some(lowered) = lowered {
                 if let Err(error) = context.apply_portable(lowered).await {
-                    return handle_projector_error(
-                        store,
-                        failure_input,
-                        self.change_epoch.clone(),
-                        "modeled_apply",
-                        error,
-                    )
-                    .await;
+                    return handle_projector_error(store, failure_input, "modeled_apply", error)
+                        .await;
                 }
             }
             let workspace = workspace
@@ -354,7 +372,6 @@ where
                     return record_terminal_protocol_failure(
                         store,
                         failure_input,
-                        self.change_epoch.clone(),
                         "modeled_workspace_seal",
                         error,
                     )
@@ -364,14 +381,13 @@ where
             match store.commit_projection(batch).await {
                 Ok(_) => Ok(()),
                 Err(ProjectionProtocolError::PartitionStopped { failure_id }) => {
-                    Err(terminal_recorded(failure_id))
+                    Err(terminal_recorded(self.compiled.topology(), failure_id))
                 }
                 Err(error) if projection_error_is_retryable(&error) => Err(error.into()),
                 Err(error) => {
                     record_terminal_protocol_failure(
                         store,
                         failure_input,
-                        self.change_epoch.clone(),
                         "modeled_commit_projection",
                         error,
                     )
@@ -387,11 +403,8 @@ where
     D: CausalProjectionRouteDependencies + Send + Sync + 'static,
     I: serde::de::DeserializeOwned + Send + 'static,
 {
-    fn registration(&self) -> ProjectorRegistration {
-        ProjectorRegistration {
-            topology: self.compiled.topology().clone(),
-            ownership: self.compiled.ownership().to_vec(),
-        }
+    fn compiled(&self) -> &CompiledProjectionTopology {
+        &self.compiled
     }
 
     fn bootstrap<'a>(&'a self, dependencies: &'a D) -> ProjectorDispatchFuture<'a> {
@@ -446,6 +459,13 @@ where
         })
     }
 
+    fn stopped<'a>(&'a self, dependencies: &'a D) -> ProjectorStoppedFuture<'a> {
+        Box::pin(stopped_failures(
+            dependencies.__causal_projection_store(),
+            self.compiled.topology(),
+        ))
+    }
+
     fn dispatch<'a>(
         &'a self,
         dependencies: &'a D,
@@ -487,7 +507,6 @@ where
                             return record_ingress_failure(
                                 dependencies.__causal_projection_store(),
                                 &self.compiled,
-                                self.change_epoch.clone(),
                                 message,
                                 ordered,
                                 message_id,
@@ -501,7 +520,6 @@ where
                         return record_ingress_failure(
                             dependencies.__causal_projection_store(),
                             &self.compiled,
-                            self.change_epoch.clone(),
                             message,
                             ordered,
                             message_id,
@@ -567,6 +585,17 @@ where
             )?;
             match store.projection_input_disposition(&trusted).await? {
                 ProjectionInputDisposition::Pending => {}
+                ProjectionInputDisposition::Redelivery => {
+                    store
+                        .commit_projection(crate::projection_protocol::ProjectionCommitBatch {
+                            input: trusted,
+                            ownership: self.compiled.ownership().to_vec(),
+                            mutations: Vec::new(),
+                            observations: Vec::new(),
+                        })
+                        .await?;
+                    return Ok(());
+                }
                 ProjectionInputDisposition::Duplicate(_) | ProjectionInputDisposition::Stale(_) => {
                     return Ok(())
                 }
@@ -580,7 +609,6 @@ where
                         return handle_projector_error(
                             store,
                             failure_input,
-                            self.change_epoch.clone(),
                             "json_decode",
                             HandlerError::from(error),
                         )
@@ -594,30 +622,18 @@ where
                     return handle_projector_error(
                         store,
                         failure_input,
-                        self.change_epoch.clone(),
                         "typed_decode",
                         HandlerError::from(error),
                     )
                     .await
                 }
             };
-            let workspace = ProjectionWorkspace::new(
-                self.compiled.codec(),
-                partition_value,
-                trusted,
-                self.change_epoch.clone(),
-            )?;
+            let workspace =
+                ProjectionWorkspace::new(self.compiled.codec(), partition_value, trusted)?;
             let (context, workspace) =
                 CausalProjectorContext::new(message, D::Store::clone(store), workspace);
             if let Err(error) = (self.handle)(context, input).await {
-                return handle_projector_error(
-                    store,
-                    failure_input,
-                    self.change_epoch.clone(),
-                    "handler_error",
-                    error,
-                )
-                .await;
+                return handle_projector_error(store, failure_input, "handler_error", error).await;
             }
             let workspace = workspace
                 .lock()
@@ -630,7 +646,6 @@ where
                     return record_terminal_protocol_failure(
                         store,
                         failure_input,
-                        self.change_epoch.clone(),
                         "workspace_seal",
                         error,
                     )
@@ -640,14 +655,13 @@ where
             match store.commit_projection(batch).await {
                 Ok(_) => Ok(()),
                 Err(ProjectionProtocolError::PartitionStopped { failure_id }) => {
-                    Err(terminal_recorded(failure_id))
+                    Err(terminal_recorded(self.compiled.topology(), failure_id))
                 }
                 Err(error) if projection_error_is_retryable(&error) => Err(error.into()),
                 Err(error) => {
                     record_terminal_protocol_failure(
                         store,
                         failure_input,
-                        self.change_epoch.clone(),
                         "commit_projection",
                         error,
                     )

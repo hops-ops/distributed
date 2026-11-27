@@ -1,10 +1,6 @@
-export { createDistributedReplica } from './distributed-replica.js';
-export {
-	createReplicaDevelopmentCapability,
-	createReplicaDiagnostics,
-	inspectReplicaCommandArtifact,
-	inspectReplicaOperationArtifact
-} from './diagnostics.js';
+export { createDistributedReplica } from './distributed-replica/index.js';
+export { createReplicaDevelopmentCapability, createReplicaDiagnostics } from './diagnostics/event-log.js';
+export { inspectReplicaCommandArtifact, inspectReplicaOperationArtifact } from './diagnostics/inspect.js';
 export type {
 	ReplicaArtifactSourceLocation,
 	ReplicaCommandArtifactInspection,
@@ -34,31 +30,21 @@ export type {
 	ReplicaOperationArtifactInspection,
 	ReplicaOperationIndexInspection,
 	ReplicaOperationInjectedFieldInspection
-} from './diagnostics.js';
+} from './diagnostics/types.js';
 export { createReplicaGraphqlTransport } from './graphql-transport.js';
 export { createReplicaUuidV7 } from './command-id.js';
 export type {
+	ReplicaDocumentTransport,
 	ReplicaGraphqlTransport,
 	ReplicaGraphqlTransportOptions
 } from './graphql-transport.js';
-export {
-	canonicalizeOperationVariables,
-	replicaIndexKey,
-	replicaRecordKey
-} from './identity.js';
-export {
-	prepareReplicaCommand,
-	ReplicaCommandContractError,
-	verifyReplicaCommandReceipt
-} from './commands.js';
-export {
-	createReplicaCommandRuntime,
-	ReplicaCommandRuntimeError
-} from './command-runtime.js';
-export {
-	createReplicaIndexedDbPersistence,
-	REPLICA_OFFLINE_COMMAND_OUTBOX_SUPPORTED
-} from './persistence.js';
+export { canonicalizeOperationVariables } from './identity/codec.js';
+export { replicaIndexKey, replicaRecordKey } from './identity/keys.js';
+export { prepareReplicaCommand } from './commands/prepare.js';
+export { ReplicaCommandContractError } from './commands/errors.js';
+export { verifyReplicaCommandReceipt } from './commands/receipt.js';
+export { createReplicaCommandRuntime } from './command-runtime/create.js';
+export { ReplicaCommandRuntimeError } from './command-runtime/errors.js';
 export type {
 	ReplicaBoundCommand,
 	ReplicaBoundCommands,
@@ -75,27 +61,14 @@ export type {
 	ReplicaCommandTransport,
 	ReplicaCommandTransportRequest,
 	ReplicaCommandTransportResult
-} from './command-runtime.js';
-export type {
-	ReplicaIndexedDbFactory,
-	ReplicaIndexedDbPersistence,
-	ReplicaIndexedDbPersistenceOptions,
-	ReplicaPersistenceModelPolicy,
-	ReplicaPersistencePolicy
-} from './persistence.js';
+} from './command-runtime/types.js';
 export type {
 	PrepareReplicaCommandOptions,
 	ReplicaCommandArtifact,
-	ReplicaCommandConfirmation,
-	ReplicaCommandConfirmations,
 	ReplicaCommandContractErrorCode,
 	ReplicaCommandDirectProjection,
-	ReplicaCommandEffect,
 	ReplicaCommandEffectExpression,
-	ReplicaCommandEffectField,
-	ReplicaCommandEffectKey,
 	ReplicaCommandEffectRelationship,
-	ReplicaCommandEffects,
 	ReplicaCommandGenerators,
 	ReplicaCommandInputDefault,
 	ReplicaCommandInputDefaults,
@@ -107,31 +80,24 @@ export type {
 	ReplicaCommandVariables,
 	ReplicaTrustedPresetDescriptor,
 	ReplicaPreparedCommand,
-	ReplicaPreparedCommandEffect,
-	ReplicaPreparedConfirmation,
-	ReplicaPreparedConfirmations,
-	ReplicaPreparedEffectField,
-	ReplicaPreparedEffectKey,
 	ReplicaReceiptVerification
-} from './commands.js';
-export { createWasmJsonPure } from './projection-delta/index.js';
+} from './commands/types.js';
+export { createWasmJsonPure } from './projection-delta/wasm-pure.js';
 export type {
 	CreateWasmJsonPureOptions,
-	PreparedCommandProjection,
-	PreparedProjectionOperation,
-	ReplicaCommandProjection,
 	WasmJsonModule,
 	WasmJsonPureHost
-} from './projection-delta/index.js';
-export {
-	compareReplicaOrder,
-	decideReplicaPaginationMaintenance,
-	evaluateReplicaFilter
-} from './query-plan.js';
-export {
-	createReplicaIndexMaintenanceRegistry,
-	formatReplicaIndexStaleReason
-} from './index-maintenance.js';
+} from './projection-delta/wasm-pure.js';
+export type {
+	PreparedCommandProjection,
+	PreparedProjectionOperation,
+	ReplicaCommandProjection
+} from './projection-delta/types.js';
+export { compareReplicaOrder } from './query-plan/order.js';
+export { decideReplicaPaginationMaintenance } from './query-plan/pagination.js';
+export { evaluateReplicaFilter } from './query-plan/filter.js';
+export { createReplicaIndexMaintenanceRegistry } from './index-maintenance/registry.js';
+export { formatReplicaIndexStaleReason } from './index-maintenance/engine.js';
 export type {
 	ReplicaIndexDependencyChange,
 	ReplicaIndexMaintenanceDecision,
@@ -146,7 +112,7 @@ export type {
 	ReplicaIndexRelationshipChange,
 	ReplicaIndexSemanticChange,
 	ReplicaIndexSemanticLayer
-} from './index-maintenance.js';
+} from './index-maintenance/types.js';
 export type {
 	ReplicaFilterEvaluation,
 	ReplicaFilterEvaluationOptions,
@@ -157,7 +123,7 @@ export type {
 	ReplicaQueryPlanReason,
 	ReplicaQueryPlanReasonCode,
 	ReplicaRelationshipFilterRequest
-} from './query-plan.js';
+} from './query-plan/types.js';
 export type {
 	DistributedReplicaOptions,
 	DistributedReplica,
@@ -183,6 +149,7 @@ export type {
 	ReplicaIslandOperation,
 	ReplicaListValue,
 	ReplicaLiveObserver,
+	ReplicaLiveConnection,
 	ReplicaLiveState,
 	ReplicaLiteralValue,
 	ReplicaModelArtifact,
@@ -213,6 +180,7 @@ export type {
 	ReplicaRootSelection,
 	ReplicaScalarSelection,
 	ReplicaSelectionStorage,
+	ReplicaPendingRows,
 	ReplicaSparse,
 	ReplicaSnapshot,
 	ReplicaStatus,
@@ -234,21 +202,16 @@ export type {
 	ReplicaVariableScalarInputRef,
 	ReplicaValue,
 	ReplicaWatch,
+	ReplicaWindowArtifact,
+	ReplicaWindowKey,
+	ReplicaWindowOperationArtifact,
+	ReplicaWindowRow,
 	ReplicaWriteSource,
 	WatchReplicaOptions
 } from './types.js';
 
-export {
-	lowerMutationCache,
-	MUTATION_CACHE_VISIBILITY_FULL,
-	MUTATION_CACHE_VISIBILITY_UNAUTHORIZED,
-} from './mutation-cache.js';
 export type {
-	MutationCacheEffect,
-	MutationCacheProgram,
-	MutationCacheVisibility,
-	MutationField,
-	MutationOperation,
-	MutationProgram,
-	MutationTarget,
-} from './mutation-cache.js';
+	ReplicaLazyCommandCatalog,
+	ReplicaLazyCommandModule,
+	ReplicaLazyCommandRuntime
+} from './command-runtime/lazy.js';

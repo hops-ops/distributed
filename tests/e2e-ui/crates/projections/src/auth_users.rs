@@ -1,114 +1,160 @@
-//! Zitadel integration-event projection into the AuthUsers query model.
+//! Auth users: the Zitadel profile fact + its projection into `auth_users`.
 
+use distributed::mutation::Mutation;
+use distributed::mutation_file;
+use distributed::projection::lower::{EventualOnly, ProjectionDescriptor};
 use e2e_readmodels::AuthUsers;
 use serde::{Deserialize, Serialize};
 
-/// Provider envelope published by `zitadel.ingress.v1`.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct ZitadelUserPayload {
-    pub schema_version: u32,
-    pub source: String,
-    pub delivery_id: String,
-    pub provider: String,
-    pub provider_subject: String,
+/// One Zitadel user's profile as the identity ingestor last saw it.
+///
+/// An external fact: the ingestor publishes it with
+/// `publish_external`, identified by the provider delivery it came from, and
+/// [`AUTH_USERS`] writes it to `auth_users` as it is (the row is the profile).
+#[derive(
+    Debug, Clone, PartialEq, Eq, Serialize, Deserialize, distributed::domain_event::DomainEvent,
+)]
+#[domain_event(name = "zitadel.user_profile", version = 1)]
+pub struct ZitadelUserProfile {
+    /// Zitadel subject (OIDC `sub`, session `x-user-id`).
+    pub user_id: String,
+    pub email: String,
+    pub display_name: String,
+    /// `human` | `machine`
     pub user_kind: String,
-    pub emails: Vec<ZitadelEmail>,
-    pub display_name: Option<String>,
+    /// `pending` | `approved` | `rejected`
     pub approval_status: String,
-    pub ingested_at: String,
+    /// `active` | `deactivated`
+    pub status: String,
+    /// When the ingestor saw it (ms since the epoch); not part of the profile.
+    pub updated_at: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct ZitadelEmail {
-    pub address: String,
-    pub primary: bool,
-    pub verified: bool,
+impl ZitadelUserProfile {
+    /// Whether this profile differs from the `stored` row (or there is none).
+    /// `updated_at` is when a profile was seen, not part of it.
+    pub fn differs_from(&self, stored: Option<&AuthUsers>) -> bool {
+        stored.is_none_or(|stored| {
+            (
+                &stored.user_id,
+                &stored.email,
+                &stored.display_name,
+                &stored.user_kind,
+                &stored.approval_status,
+                &stored.status,
+            ) != (
+                &self.user_id,
+                &self.email,
+                &self.display_name,
+                &self.user_kind,
+                &self.approval_status,
+                &self.status,
+            )
+        })
+    }
 }
 
-/// Map a created/updated provider event into an upsert row.
-pub fn map_zitadel_user_upsert(event_name: &str, payload: &ZitadelUserPayload) -> AuthUsers {
-    let email = payload
-        .emails
-        .iter()
-        .find(|email| email.primary)
-        .or_else(|| payload.emails.first())
-        .map(|email| email.address.clone())
-        .unwrap_or_default();
-    let display_name = payload
-        .display_name
-        .clone()
-        .filter(|name| !name.trim().is_empty())
-        .unwrap_or_else(|| {
-            if email.is_empty() {
-                payload.provider_subject.clone()
-            } else {
-                email.clone()
-            }
-        });
-    let status = if event_name.contains("deactivated") {
-        "deactivated".into()
-    } else {
-        "active".into()
+/// Mutation: complete-row upsert of an auth user.
+///
+/// The constructor name matches the document operation: `mutation SaveAuthUser`.
+#[allow(non_snake_case)]
+pub fn SaveAuthUser() -> Mutation<()> {
+    mutation_file!("src/mutations/save_auth_user.mutation.graphql")
+}
+
+distributed::projection! {
+    pub const AUTH_USERS: ProjectionDescriptor<EventualOnly> = {
+        name: "project_auth_users",
+        version: 1,
+        model: AuthUsers,
+        on {
+            events: [ZitadelUserProfile],
+            mutation: SaveAuthUser,
+            input: { user: body },
+        },
     };
-    AuthUsers {
-        user_id: payload.provider_subject.clone(),
-        email,
-        display_name,
-        user_kind: payload.user_kind.clone(),
-        approval_status: payload.approval_status.clone(),
-        status,
-        updated_at: payload.ingested_at.clone(),
-    }
-}
-
-/// Map a deactivate/reactivate provider event into its current user row.
-pub fn map_zitadel_user_status(event_name: &str, payload: &ZitadelUserPayload) -> AuthUsers {
-    let mut row = map_zitadel_user_upsert(event_name, payload);
-    if event_name.contains("reactivated") {
-        row.status = "active".into();
-    } else if event_name.contains("deactivated") {
-        row.status = "deactivated".into();
-    }
-    row
 }
 
 #[cfg(test)]
 mod tests {
+    use distributed::domain_event::{DomainEventOccurrence, ExternalEventSource};
+    use distributed::projection::MutationKind;
+    use distributed::table::RowValue;
+
     use super::*;
 
-    fn payload() -> ZitadelUserPayload {
-        ZitadelUserPayload {
-            schema_version: 1,
-            source: "zitadel".into(),
-            delivery_id: "d1".into(),
-            provider: "zitadel".into(),
-            provider_subject: "user-99".into(),
+    fn ada() -> ZitadelUserProfile {
+        ZitadelUserProfile {
+            user_id: "user-99".into(),
+            email: "ada@example.com".into(),
+            display_name: "Ada".into(),
             user_kind: "human".into(),
-            emails: vec![ZitadelEmail {
-                address: "ada@example.com".into(),
-                primary: true,
-                verified: true,
-            }],
-            display_name: Some("Ada".into()),
             approval_status: "pending".into(),
-            ingested_at: "2026-01-01T00:00:00Z".into(),
+            status: "deactivated".into(),
+            updated_at: "1".into(),
         }
     }
 
     #[test]
-    fn created_maps_active_user() {
-        let row = map_zitadel_user_upsert("zitadel.user.human.created.v1", &payload());
-        assert_eq!(row.user_id, "user-99");
-        assert_eq!(row.email, "ada@example.com");
-        assert_eq!(row.display_name, "Ada");
-        assert_eq!(row.status, "active");
-        assert_eq!(row.approval_status, "pending");
+    fn a_profile_upserts_its_row() {
+        let occurrence = DomainEventOccurrence::capture_external(
+            ExternalEventSource {
+                producer: "zitadel.ingress.v1".into(),
+                stream: "delivery-1".into(),
+                position: 1,
+                key: "user-99".into(),
+            },
+            std::time::SystemTime::UNIX_EPOCH,
+            Default::default(),
+            &ada(),
+        )
+        .unwrap();
+        let lowered = AUTH_USERS
+            .server_executor()
+            .unwrap()
+            .plan(&occurrence)
+            .unwrap();
+        let [(resolved, record)] = lowered.records().collect::<Vec<_>>()[..] else {
+            panic!("expected one record");
+        };
+        assert_eq!(resolved.kind(), MutationKind::Upsert);
+        for (column, value) in [
+            ("user_id", "user-99"),
+            ("display_name", "Ada"),
+            ("status", "deactivated"),
+            ("approval_status", "pending"),
+        ] {
+            assert_eq!(
+                record.values().get(column),
+                Some(&RowValue::String(value.into())),
+                "{column}"
+            );
+        }
     }
 
     #[test]
-    fn deactivated_sets_status() {
-        let row = map_zitadel_user_status("zitadel.user.human.deactivated.v1", &payload());
-        assert_eq!(row.status, "deactivated");
-        assert_eq!(row.user_id, "user-99");
+    fn only_a_changed_profile_differs() {
+        let profile = ada();
+        let row = AuthUsers {
+            user_id: profile.user_id.clone(),
+            email: profile.email.clone(),
+            display_name: profile.display_name.clone(),
+            user_kind: profile.user_kind.clone(),
+            approval_status: profile.approval_status.clone(),
+            status: profile.status.clone(),
+            updated_at: "0".into(),
+        };
+        assert!(profile.differs_from(None));
+        assert!(!profile.differs_from(Some(&row)), "only updated_at differs");
+        let renamed = AuthUsers {
+            display_name: "Ada L.".into(),
+            ..row.clone()
+        };
+        assert!(profile.differs_from(Some(&renamed)));
+        let active = AuthUsers {
+            status: "active".into(),
+            ..row
+        };
+        assert!(profile.differs_from(Some(&active)));
     }
 }

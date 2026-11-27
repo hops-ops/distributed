@@ -1,9 +1,9 @@
 use super::*;
+use crate::command::{typed_command, Eventual, PreparedCommand, Succeeded};
+use crate::command::{CommandInputType, CommandOutputType, CommandTypeDef, CommandTypeField};
 use crate::graphql::{
-    build_surface, claim, col, rel, surface_for_application, surface_for_role, typed_command,
-    Eventual, GraphqlInputType, GraphqlOutputType, GraphqlTypeDef, GraphqlTypeField,
-    PreparedCommand, RoleGrant, Succeeded, SurfaceCommand, SurfaceOptions, SurfaceProjector,
-    SurfaceTypeField,
+    build_surface, claim, col, read, rel, surface_for_application, surface_for_role,
+    ReadPermission, SurfaceCommand, SurfaceOptions, SurfaceProjector, SurfaceTypeField,
 };
 use crate::microsvc::{CausalCommandContext, HandlerError, Routes, Service};
 use crate::table::{
@@ -11,13 +11,13 @@ use crate::table::{
 };
 use std::any::TypeId;
 
-#[derive(Serialize, crate::DomainEvent)]
+#[derive(Serialize, crate::domain_event::DomainEvent)]
 #[domain_event(name = "todo.projected", version = 1)]
 struct ManifestTodoProjected {
     todo_id: String,
 }
 
-#[derive(Serialize, crate::DomainEvent)]
+#[derive(Serialize, crate::domain_event::DomainEvent)]
 #[domain_event(name = "todo.archived", version = 1)]
 struct ManifestTodoArchived {
     todo_id: String,
@@ -72,7 +72,6 @@ fn users() -> TableSchema {
         ],
         primary_key: PrimaryKey::new(["user_id"]),
         version_column: Some("_sourced_version".into()),
-        foreign_keys: Vec::new(),
         indexes: Vec::new(),
         relationships: Vec::new(),
         kind: TableKind::ReadModel,
@@ -94,9 +93,9 @@ fn todos() -> TableSchema {
         ],
         primary_key: PrimaryKey::new(["todo_id"]),
         version_column: Some("_sourced_version".into()),
-        foreign_keys: Vec::new(),
         indexes: Vec::new(),
         relationships: vec![RelationshipDef {
+            references: None,
             field_name: "owner".into(),
             kind: RelationshipKind::BelongsTo,
             target_model: "UserView".into(),
@@ -125,7 +124,6 @@ fn memberships() -> TableSchema {
         ],
         primary_key: PrimaryKey::new(["tenant_id", "user_id"]),
         version_column: None,
-        foreign_keys: Vec::new(),
         indexes: Vec::new(),
         relationships: Vec::new(),
         kind: TableKind::ReadModel,
@@ -145,9 +143,9 @@ fn teams() -> TableSchema {
         ],
         primary_key: PrimaryKey::new(["team_id"]),
         version_column: None,
-        foreign_keys: Vec::new(),
         indexes: Vec::new(),
         relationships: vec![RelationshipDef {
+            references: None,
             field_name: "members".into(),
             kind: RelationshipKind::ManyToMany,
             target_model: "UserView".into(),
@@ -175,7 +173,6 @@ fn team_members() -> TableSchema {
         ],
         primary_key: PrimaryKey::new(["team_id", "user_id"]),
         version_column: None,
-        foreign_keys: Vec::new(),
         indexes: Vec::new(),
         relationships: Vec::new(),
         kind: TableKind::Operational,
@@ -184,11 +181,12 @@ fn team_members() -> TableSchema {
 
 #[derive(Deserialize)]
 struct CompleteInput;
-impl GraphqlInputType for CompleteInput {
-    fn graphql_type() -> GraphqlTypeDef {
-        GraphqlTypeDef::new(
+impl CommandInputType for CompleteInput {
+    fn command_type() -> CommandTypeDef {
+        CommandTypeDef::new(
             "CompleteTodoInput",
-            vec![GraphqlTypeField {
+            vec![CommandTypeField {
+                unsigned_integer: None,
                 name: "todo_id".into(),
                 type_name: "String".into(),
                 nullable: false,
@@ -203,11 +201,12 @@ impl GraphqlInputType for CompleteInput {
 
 #[derive(Serialize)]
 struct CompletePayload;
-impl GraphqlOutputType for CompletePayload {
-    fn graphql_type() -> GraphqlTypeDef {
-        GraphqlTypeDef::new(
+impl CommandOutputType for CompletePayload {
+    fn command_type() -> CommandTypeDef {
+        CommandTypeDef::new(
             "CompleteTodoPayload",
-            vec![GraphqlTypeField {
+            vec![CommandTypeField {
+                unsigned_integer: None,
                 name: "todo_id".into(),
                 type_name: "String".into(),
                 nullable: false,
@@ -227,6 +226,10 @@ struct ManifestAggregate {
 
 impl crate::Aggregate for ManifestAggregate {
     type ReplayError = std::convert::Infallible;
+
+    fn aggregate_type() -> &'static str {
+        "manifest_aggregate"
+    }
 
     fn entity(&self) -> &crate::Entity {
         &self.entity
@@ -335,7 +338,7 @@ fn modeled_surface(
         full_surface(),
         state,
         execution_class,
-        crate::ProjectionPartition::Unit,
+        crate::projection::ProjectionPartition::Unit,
     )
 }
 
@@ -347,14 +350,14 @@ fn modeled_causal_surface(
         causal_full_surface(),
         state,
         execution_class,
-        crate::ProjectionPartition::Unit,
+        crate::projection::ProjectionPartition::Unit,
     )
 }
 
 fn modeled_surface_with_partition(
     state: crate::projection::placement::ProjectionBindingState,
     execution_class: crate::projection::placement::ProjectionExecutionClass,
-    partition: crate::ProjectionPartition,
+    partition: crate::projection::ProjectionPartition,
 ) -> Surface {
     modeled_surface_with_base(full_surface(), state, execution_class, partition)
 }
@@ -363,7 +366,7 @@ fn modeled_surface_with_base(
     mut surface: Surface,
     state: crate::projection::placement::ProjectionBindingState,
     execution_class: crate::projection::placement::ProjectionExecutionClass,
-    partition: crate::ProjectionPartition,
+    partition: crate::projection::ProjectionPartition,
 ) -> Surface {
     use crate::projection::catalog::ProjectionBindingActivation;
     use crate::projection::placement::{
@@ -371,16 +374,16 @@ fn modeled_surface_with_base(
         ProjectionPhysicalTopology, ProjectionSourceBinding, PROJECTION_PARTITION_CODEC_VERSION,
     };
     use crate::projection::{
-        ProjectionArm, ProjectionField, ProjectionOperation, ProjectionTarget,
-    };
-    use crate::projection_protocol::{ProjectionEpoch, ProjectorTopologyId};
-    use crate::{
-        ProjectionAssignment, ProjectionExpression, ProjectionKeyField, ProjectionMutationKind,
+        MutationKind, ProjectionAssignment, ProjectionExpression, ProjectionKeyField,
         ProjectionProgram, ProjectionValueType,
     };
+    use crate::projection::{
+        ProjectionArm, ProjectionField, ProjectionOperation, ProjectionTarget,
+    };
+    use crate::projection_protocol::ProjectorTopologyId;
 
-    let selector = crate::ProjectionEventSelector::try_from_descriptor(
-        &<ManifestTodoProjected as crate::DomainEvent>::DESCRIPTOR,
+    let selector = crate::projection::ProjectionEventSelector::try_from_descriptor(
+        &<ManifestTodoProjected as crate::domain_event::DomainEvent>::DESCRIPTOR,
     )
     .unwrap();
     let key = ProjectionKeyField::try_new(
@@ -408,7 +411,7 @@ fn modeled_surface_with_base(
     let operation = ProjectionOperation::try_new(
         "project-todo",
         0,
-        ProjectionMutationKind::Upsert,
+        MutationKind::Upsert,
         ProjectionTarget::try_new("TodoView", "todos").unwrap(),
         vec![key],
         vec![key_field, field],
@@ -436,16 +439,12 @@ fn modeled_surface_with_base(
     let catalog =
         crate::projection::catalog::ProjectionCatalog::try_new(vec![binding.clone()]).unwrap();
     let active = catalog
-        .activate(
-            vec![ProjectionBindingActivation::new(
-                binding.id(),
-                binding.program_id(),
-                ProjectionEpoch::new("todos-modeled-v1").unwrap(),
-                state,
-                Some(ProjectionExecutorRoute::local("todos-service").unwrap()),
-            )],
-            None,
-        )
+        .activate(vec![ProjectionBindingActivation::new(
+            binding.id(),
+            binding.program_id(),
+            state,
+            Some(ProjectionExecutorRoute::local("todos-service").unwrap()),
+        )])
         .unwrap();
     let modeled = crate::graphql::SurfaceModeledProjection::try_from_catalog(
         program,
@@ -479,7 +478,7 @@ fn modeled_surface_with_base(
 }
 
 fn projected_surface() -> Surface {
-    use super::super::command_contract::{CommandEffects, CommandProjectedModel, EffectExpression};
+    use crate::command::{CommandProjectedModel, EffectExpression};
 
     let todo_schema: &'static TableSchema = Box::leak(Box::new(todos()));
     let mut surface = build_surface(&[todo_schema.clone(), users()], &SurfaceOptions::sqlite())
@@ -489,6 +488,7 @@ fn projected_surface() -> Surface {
         .columns
         .iter()
         .map(|column| SurfaceTypeField {
+            unsigned_integer: None,
             name: column.name.clone(),
             type_name: column.scalar.clone(),
             nullable: column.nullable,
@@ -505,6 +505,7 @@ fn projected_surface() -> Surface {
         input: SurfaceCommandShape::Typed(SurfaceTypeDef {
             name: "ProjectTodoInput".into(),
             fields: vec![SurfaceTypeField {
+                unsigned_integer: None,
                 name: "todo_id".into(),
                 type_name: "String".into(),
                 nullable: false,
@@ -519,8 +520,6 @@ fn projected_surface() -> Surface {
         }),
         consistency: CommandConsistency::Atomic,
         input_defaults: Vec::new(),
-        effects: Some(CommandEffects::revalidate()),
-        confirmations: Vec::new(),
         projected_model: Some(CommandProjectedModel {
             output_type_id: TypeId::of::<()>(),
             model: "TodoView".into(),
@@ -532,15 +531,13 @@ fn projected_surface() -> Surface {
         }),
         direct_projection: None,
         projections: Default::default(),
-        confirmation_unavailable: false,
     }];
     surface.commands_attached = true;
     surface
         .with_projectors([SurfaceProjector::new("project_todo_domain")
             .facts(["todo.changed", "user.changed"])
             .models(["TodoView", "UserView"])
-            .partition_by(["todo_id"])
-            .change_epoch("todo-domain-v1")])
+            .partition_by(["todo_id"])])
         .expect("projected topology")
 }
 
@@ -550,7 +547,7 @@ fn projected_command_exports_opaque_role_safe_direct_target() {
     let selected = surface_for_role(
         &full,
         "user",
-        &BTreeMap::from([("TodoView".into(), RoleGrant::all_columns())]),
+        &BTreeMap::from([("TodoView".into(), read().all_columns())]),
     )
     .expect("role selection");
     assert!(
@@ -579,9 +576,10 @@ fn projected_command_exports_opaque_role_safe_direct_target() {
     assert_eq!(direct.model, "TodoView");
     assert_eq!(
         direct.partition,
-        Some(serde_json::json!({"kind": "input", "path": ["todo_id"]}))
+        Some(EffectExpression::Input {
+            path: vec!["todo_id".into()]
+        })
     );
-    assert_eq!(direct.change_epoch, "todo-domain-v1");
 
     let direct_wire = serde_json::to_value(direct).expect("direct target wire");
     assert_eq!(
@@ -591,64 +589,12 @@ fn projected_command_exports_opaque_role_safe_direct_target() {
             .keys()
             .map(String::as_str)
             .collect::<BTreeSet<_>>(),
-        BTreeSet::from(["change_epoch", "model", "partition", "topology"])
+        BTreeSet::from(["model", "partition", "topology"])
     );
     let wire = serde_json::to_string(&manifest).expect("client manifest wire");
     assert!(!wire.contains("UserView"));
     assert!(!wire.contains("users"));
     assert!(!wire.contains("user.changed"));
-}
-
-#[test]
-fn legacy_effect_presets_are_not_v2_client_authority() {
-    use super::super::command_contract::{
-        CommandEffect, CommandEffects, EffectExpression, EffectFieldValue, EffectKey,
-    };
-
-    let mut full = projected_surface();
-    full.commands[0].effects = Some(CommandEffects::new([CommandEffect::Patch {
-        model: "TodoView".into(),
-        key: EffectKey {
-            fields: vec![EffectFieldValue {
-                field: "todo_id".into(),
-                value: EffectExpression::Input {
-                    path: vec!["todo_id".into()],
-                },
-            }],
-        },
-        fields: vec![EffectFieldValue {
-            field: "owner_id".into(),
-            value: EffectExpression::TrustedPreset {
-                name: "x-user-id".into(),
-            },
-        }],
-    }]));
-    let selected = surface_for_role(
-        &full,
-        "user",
-        &BTreeMap::from([
-            ("TodoView".into(), RoleGrant::all_columns()),
-            ("UserView".into(), RoleGrant::all_columns()),
-        ]),
-    )
-    .expect("role selection");
-    let manifest = client_manifest_from_surface(
-        "todos-service",
-        ClientSurfaceIdentity::role("user"),
-        &selected,
-    )
-    .expect("trusted preset descriptor manifest");
-
-    assert!(manifest.commands[0].extensions.trusted_presets.is_empty());
-    let wire = serde_json::to_value(manifest).expect("manifest JSON");
-    assert!(wire["commands"][0]["extensions"].get("effects").is_none());
-    assert!(wire["commands"][0]["extensions"]
-        .get("confirmations")
-        .is_none());
-    assert!(
-        !wire.to_string().contains("preset-value"),
-        "static artifacts must never freeze a runtime preset value"
-    );
 }
 
 #[test]
@@ -658,8 +604,8 @@ fn projected_command_export_rejects_absent_or_wrong_direct_target() {
         &full,
         "user",
         &BTreeMap::from([
-            ("TodoView".into(), RoleGrant::all_columns()),
-            ("UserView".into(), RoleGrant::all_columns()),
+            ("TodoView".into(), read().all_columns()),
+            ("UserView".into(), read().all_columns()),
         ]),
     )
     .expect("role selection");
@@ -679,8 +625,8 @@ fn projected_command_export_rejects_absent_or_wrong_direct_target() {
         &full,
         "user",
         &BTreeMap::from([
-            ("TodoView".into(), RoleGrant::all_columns()),
-            ("UserView".into(), RoleGrant::all_columns()),
+            ("TodoView".into(), read().all_columns()),
+            ("UserView".into(), read().all_columns()),
         ]),
     )
     .expect("role selection");
@@ -698,20 +644,14 @@ fn projected_command_export_rejects_absent_or_wrong_direct_target() {
     assert!(error.0.contains("differs from retained model"));
 }
 
-fn grants() -> BTreeMap<String, BTreeMap<String, RoleGrant>> {
+fn grants() -> BTreeMap<String, BTreeMap<String, ReadPermission>> {
     BTreeMap::from([
         (
             "admin".into(),
             BTreeMap::from([
-                (
-                    "TodoView".into(),
-                    RoleGrant::all_columns().with_aggregations(),
-                ),
-                (
-                    "UserView".into(),
-                    RoleGrant::all_columns().with_aggregations(),
-                ),
-                ("MembershipView".into(), RoleGrant::all_columns()),
+                ("TodoView".into(), read().all_columns().aggregations()),
+                ("UserView".into(), read().all_columns().aggregations()),
+                ("MembershipView".into(), read().all_columns()),
             ]),
         ),
         (
@@ -719,14 +659,15 @@ fn grants() -> BTreeMap<String, BTreeMap<String, RoleGrant>> {
             BTreeMap::from([
                 (
                     "TodoView".into(),
-                    RoleGrant::all_columns()
+                    read()
+                        .all_columns()
                         .rows(col("owner_id").eq(claim("x-user-id")))
                         .limit(25),
                 ),
-                ("UserView".into(), RoleGrant::columns(["display_name"])),
+                ("UserView".into(), read().columns(["display_name"])),
                 (
                     "MembershipView".into(),
-                    RoleGrant::columns(["tenant_id", "role"]),
+                    read().columns(["tenant_id", "role"]),
                 ),
             ]),
         ),
@@ -741,11 +682,80 @@ fn manifest_for_all_models(
     let grants = full
         .models
         .keys()
-        .map(|model| (model.clone(), RoleGrant::all_columns().with_aggregations()))
+        .map(|model| (model.clone(), read().all_columns().aggregations()))
         .collect();
     let selected = surface_for_role(full, role, &grants).expect("role surface");
     client_manifest_from_surface(service_id, ClientSurfaceIdentity::role(role), &selected)
         .expect("client manifest")
+}
+
+#[test]
+fn selected_export_cache_is_shared_concurrently_but_returned_manifests_are_independent() {
+    let full = full_surface();
+    let selected = surface_for_role(&full, "user", &grants()["user"]).unwrap();
+    let fresh = client_manifest_from_surface(
+        "todos-service",
+        ClientSurfaceIdentity::role("user"),
+        &selected,
+    )
+    .unwrap();
+    let export = DistributedClientSurfaceExport::from_selected("todos-service", selected).unwrap();
+    let barrier = Arc::new(std::sync::Barrier::new(8));
+    let threads: Vec<_> = (0..8)
+        .map(|_| {
+            let export = export.clone();
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                barrier.wait();
+                let manifest = export.manifest_ref().unwrap();
+                (
+                    manifest as *const DistributedClientManifest as usize,
+                    manifest.clone(),
+                )
+            })
+        })
+        .collect();
+    let expected_address =
+        export.manifest_ref().unwrap() as *const DistributedClientManifest as usize;
+    for thread in threads {
+        let (address, manifest) = thread.join().unwrap();
+        assert_eq!(address, expected_address);
+        assert_eq!(manifest, fresh);
+    }
+    let mut detached = export.manifest().unwrap();
+    detached.models.clear();
+    detached.projection_programs.clear();
+    detached.schema_fingerprint.clear();
+    assert_eq!(export.manifest_ref().unwrap(), &fresh);
+    assert_eq!(export.clone().manifest().unwrap(), fresh);
+}
+
+#[test]
+fn selected_export_caches_do_not_alias_role_application_or_execution_limits() {
+    let full = full_surface();
+    let grants = grants();
+    let user = surface_for_role(&full, "user", &grants["user"]).unwrap();
+    let admin = surface_for_role(&full, "admin", &grants["admin"]).unwrap();
+    let application =
+        surface_for_application(&full, "web", &["user".into()], &["user".into()], &grants).unwrap();
+    let user_export =
+        DistributedClientSurfaceExport::from_selected("todos-service", user.clone()).unwrap();
+    let admin_export =
+        DistributedClientSurfaceExport::from_selected("todos-service", admin).unwrap();
+    let app_export =
+        DistributedClientSurfaceExport::from_selected("todos-service", application).unwrap();
+    let mut limits = ClientExecutionLimits::default();
+    limits.max_bool_width += 1;
+    let limited =
+        DistributedClientSurfaceExport::from_selected_with_execution("todos-service", user, limits)
+            .unwrap();
+    let baseline = user_export.manifest_ref().unwrap();
+    for other in [&admin_export, &app_export, &limited] {
+        let manifest = other.manifest_ref().unwrap();
+        assert!(!std::ptr::eq(baseline, manifest));
+        assert_ne!(baseline.schema_fingerprint, manifest.schema_fingerprint);
+    }
+    assert_ne!(user_export.identity(), app_export.identity());
 }
 
 #[test]
@@ -759,13 +769,20 @@ fn role_manifest_is_deterministic_and_hides_denied_identity_and_commands() {
     assert_eq!(first, second);
     assert_eq!(first.manifest_version, 2);
     assert_eq!(first.schema_fingerprint, second.schema_fingerprint);
-    assert_eq!(
-        first.schema_fingerprint,
-        "sha256:d170cb2de47ed71c0127206a5a42970abff278cec2bcb494551da554053f3a83"
-    );
+    // Stable across builds: an export built afresh from the same inputs
+    // carries the same fingerprint.
+    let rebuilt = DistributedClientSurfaceExport::from_selected(
+        "todos-service",
+        surface_for_role(&full, "user", &grants()["user"]).unwrap(),
+    )
+    .unwrap()
+    .manifest()
+    .unwrap();
+    assert_eq!(first.schema_fingerprint, rebuilt.schema_fingerprint);
+    // The protocol fingerprint is the crate's, independent of the surface.
     assert_eq!(
         first.protocol_fingerprint,
-        "sha256:00fb342f3acb4dc1c1716a43cc3001c748d5f6c500ff831690d820e9e43e2782"
+        client_protocol_fingerprint().unwrap()
     );
 
     let user = first
@@ -795,7 +812,7 @@ fn role_manifest_is_deterministic_and_hides_denied_identity_and_commands() {
         }
     );
     assert_eq!(
-        trusted_preset_descriptors(&first).unwrap(),
+        trusted_preset_descriptors(&first.models, &first.commands).unwrap(),
         vec![ClientTrustedPresetDescriptor {
             name: "x-user-id".into(),
             codec: "string".into(),
@@ -860,11 +877,10 @@ fn role_manifest_is_deterministic_and_hides_denied_identity_and_commands() {
         .iter()
         .any(|command| command.name == "todo.force_archive"));
     assert_eq!(first.commands[0].grants, vec!["user"]);
-    assert!(first.commands.iter().all(|command| {
-        command.extensions.consistency.kind == "succeeded"
-            && command.extensions.effects.is_none()
-            && command.extensions.confirmations.is_none()
-    }));
+    assert!(first
+        .commands
+        .iter()
+        .all(|command| command.extensions.consistency.kind == CommandConsistency::Succeeded));
 
     let json = serde_json::to_string(&first).unwrap();
     assert!(!json.contains("secret"));
@@ -877,15 +893,42 @@ fn role_manifest_is_deterministic_and_hides_denied_identity_and_commands() {
 }
 
 #[test]
+fn unsigned_command_fields_export_refined_codecs_and_change_fingerprints() {
+    use crate::command::CommandUnsignedInteger;
+    let mut full = full_surface();
+    let command = &mut full.commands[0];
+    let SurfaceCommandShape::Typed(definition) = &mut command.input else {
+        unreachable!()
+    };
+    definition.fields[0].type_name = "BigInt".into();
+    let signed = manifest_for_all_models("todos-service", "user", &full);
+    let SurfaceCommandShape::Typed(definition) = &mut full.commands[0].input else {
+        unreachable!()
+    };
+    definition.fields[0].unsigned_integer = Some(CommandUnsignedInteger::U64);
+    let unsigned = manifest_for_all_models("todos-service", "user", &full);
+    let wire = serde_json::to_value(&unsigned).unwrap();
+    assert_eq!(
+        wire["commands"][0]["input"]["definition"]["fields"][0]["type_name"],
+        "BigInt"
+    );
+    assert_eq!(
+        wire["commands"][0]["input"]["definition"]["fields"][0]["codec"],
+        "uint64_safe_integer"
+    );
+    assert_ne!(signed.schema_fingerprint, unsigned.schema_fingerprint);
+}
+
+#[test]
 fn role_and_application_partition_manifests_hide_raw_paths_and_denied_values() {
     use crate::projection::placement::{ProjectionBindingState, ProjectionExecutionClass};
 
     let mut full = modeled_surface_with_partition(
         ProjectionBindingState::Active,
         ProjectionExecutionClass::Causal,
-        crate::ProjectionPartition::Expression(
-            crate::ProjectionExpression::body_path(
-                crate::ProjectionValueType::String,
+        crate::projection::ProjectionPartition::Expression(
+            crate::projection::ProjectionExpression::body_path(
+                crate::projection::ProjectionValueType::String,
                 ["private_partition_path"],
             )
             .unwrap(),
@@ -897,18 +940,25 @@ fn role_and_application_partition_manifests_hide_raw_paths_and_denied_values() {
         .unwrap()
         .projections
         .add_preview(
-            crate::graphql::CommandProjectionPreview::new()
+            crate::command::CommandProjectionPreview::new()
                 .events(crate::events![ManifestTodoProjected])
                 .field(
                     ["private_partition_path"],
-                    crate::graphql::CommandProjectionPreviewSource::constant(
-                        crate::ProjectionValue::string("denied-partition-value"),
+                    crate::command::CommandProjectionPreviewSource::constant(
+                        crate::projection::ProjectionValue::string("denied-partition-value"),
                     ),
                 ),
         );
     let all_grants = grants();
     let role = surface_for_role(&full, "user", &all_grants["user"]).unwrap();
-    let application = surface_for_application(&full, "web", &["user".into()], &["user".into()], &all_grants).unwrap();
+    let application = surface_for_application(
+        &full,
+        "web",
+        &["user".into()],
+        &["user".into()],
+        &all_grants,
+    )
+    .unwrap();
 
     for (identity, selected) in [
         (ClientSurfaceIdentity::role("user"), role),
@@ -932,7 +982,7 @@ fn role_and_application_partition_manifests_hide_raw_paths_and_denied_values() {
 }
 
 #[test]
-fn manifest_v2_decode_rejects_unknown_versions_fields_and_legacy_authority() {
+fn manifest_v2_decode_rejects_unknown_versions_and_fields() {
     let full = full_surface();
     let selected = surface_for_role(&full, "user", &grants()["user"]).unwrap();
     let baseline = client_manifest_from_surface(
@@ -957,29 +1007,9 @@ fn manifest_v2_decode_rejects_unknown_versions_fields_and_legacy_authority() {
     slots["commands"][0]["extensions"]["version"] = serde_json::json!(1);
     assert!(serde_json::from_value::<DistributedClientManifest>(slots).is_err());
 
-    for legacy in ["effects", "confirmations"] {
-        let mut hostile = value.clone();
-        hostile["commands"][0]["extensions"][legacy] = serde_json::json!(null);
-        assert!(
-            serde_json::from_value::<DistributedClientManifest>(hostile).is_err(),
-            "v2 must reject even null legacy `{legacy}` authority"
-        );
-    }
-
-    let mut mixed = value.clone();
-    mixed["commands"][0]["extensions"]["projection"] = serde_json::json!({
-        "version": 1,
-        "event_set": [],
-        "program_arms": [],
-        "preview_occurrences": [],
-        "fallback": "revalidate"
-    });
-    mixed["commands"][0]["extensions"]["effects"] = serde_json::json!({
-        "version": 1,
-        "operations": [],
-        "fallback": "revalidate"
-    });
-    assert!(serde_json::from_value::<DistributedClientManifest>(mixed).is_err());
+    let mut unknown_slot = value.clone();
+    unknown_slot["commands"][0]["extensions"]["effects"] = serde_json::json!(null);
+    assert!(serde_json::from_value::<DistributedClientManifest>(unknown_slot).is_err());
 
     for version in [1, 3] {
         let mut program = value.clone();
@@ -1078,11 +1108,43 @@ fn manifest_v2_decode_rejects_unknown_versions_fields_and_legacy_authority() {
         "fallback": "revalidate"
     });
     assert!(serde_json::from_value::<DistributedClientManifest>(extension).is_err());
+}
 
-    assert_ne!(
-        baseline.protocol_fingerprint,
-        "sha256:30f19c9f4d29280a02ddf67c4df62cdc92c4e8090792f43d6b1bdafea3e31273",
-        "manifest v2 projection semantics must not share the v1 protocol fingerprint"
+#[test]
+fn protocol_fingerprint_commits_to_every_wire_version_and_scalar_codec() {
+    // A protocol change must change the fingerprint, so the fingerprint must
+    // hash every version that defines the wire, including the v2 projection
+    // semantics that separate manifest v2 from v1.
+    let material = serde_json::to_value(protocol_material()).unwrap();
+    assert_eq!(
+        material,
+        serde_json::json!({
+            "manifest_version": DISTRIBUTED_CLIENT_PROTOCOL_MANIFEST_EPOCH,
+            "protocol_version": DISTRIBUTED_CLIENT_PROTOCOL_VERSION,
+            "key_encoding": KEY_ENCODING,
+            "command_extension_slots_version": COMMAND_EXTENSION_SLOTS_VERSION,
+            "projector_entry_version": PROJECTOR_ENTRY_VERSION,
+            "protocol_operations_version": PROTOCOL_OPERATIONS_VERSION,
+            "query_capabilities_version": QUERY_CAPABILITIES_VERSION,
+            "projection_program_version": projections::CLIENT_PROJECTION_PROGRAM_VERSION,
+            "projection_binding_version": projections::CLIENT_PROJECTION_BINDING_VERSION,
+            "projection_operation_semantics_version":
+                projections::CLIENT_PROJECTION_OPERATION_SEMANTICS_VERSION,
+            "command_projection_extension_version":
+                projections::COMMAND_PROJECTION_EXTENSION_VERSION,
+            "unsigned_command_codecs_version": 1,
+            "scalar_codecs": supported_scalar_codecs(),
+        })
+    );
+    assert_eq!(material["manifest_version"], 2);
+    assert_eq!(material["command_projection_extension_version"], 2);
+    assert_eq!(
+        client_protocol_fingerprint().unwrap(),
+        hash_json(&protocol_material()).unwrap()
+    );
+    assert_eq!(
+        client_protocol_fingerprint().unwrap(),
+        client_protocol_fingerprint().unwrap()
     );
 }
 
@@ -1168,7 +1230,7 @@ fn active_causal_modeled_projection_exports_exact_command_plan() {
     assert_eq!(manifest.projection_bindings.len(), 1);
     assert_eq!(
         manifest.projection_bindings[0].state,
-        ClientProjectionBindingState::Active
+        ProjectionBindingState::Active
     );
     let operation = &manifest.projection_programs[0].arms[0].operations[0];
     assert_eq!(operation.key.len(), 1);
@@ -1214,18 +1276,18 @@ fn client_projection_arms_are_canonical_across_declaration_order() {
         SurfaceProjectionArm, SurfaceProjectionOperation, SurfaceSelectedProjectionProgram,
     };
     use crate::projection::{
-        PROJECTION_OPERATION_SEMANTICS_VERSION, PROJECTION_PROGRAM_IR_VERSION,
+        MutationKind, ProjectionAssignment, ProjectionExpression, ProjectionField,
+        ProjectionKeyField, ProjectionPartition, ProjectionValueType,
     };
-    use crate::{
-        ProjectionAssignment, ProjectionExpression, ProjectionField, ProjectionKeyField,
-        ProjectionMutationKind, ProjectionPartition, ProjectionValueType,
+    use crate::projection::{
+        PROJECTION_OPERATION_SEMANTICS_VERSION, PROJECTION_PROGRAM_IR_VERSION,
     };
 
     let surface = build_surface(&[todos(), users()], &SurfaceOptions::sqlite()).unwrap();
     let operation = || SurfaceProjectionOperation {
         operation_id: "project-todo".into(),
         staging_ordinal: 0,
-        kind: ProjectionMutationKind::Patch,
+        kind: MutationKind::Patch,
         model: "TodoView".into(),
         storage: "todos".into(),
         key: vec![ProjectionKeyField::try_new(
@@ -1246,18 +1308,21 @@ fn client_projection_arms_are_canonical_across_declaration_order() {
         invalidations: Vec::new(),
         force_revalidate: false,
     };
-    let arm = |name: &str, descriptor: &crate::DomainEventDescriptor| SurfaceProjectionArm {
-        arm_id: name.into(),
-        selector: crate::ProjectionEventSelector::try_from_descriptor(descriptor).unwrap(),
-        operations: vec![operation()],
+    let arm = |name: &str, descriptor: &crate::domain_event::DomainEventDescriptor| {
+        SurfaceProjectionArm {
+            arm_id: name.into(),
+            selector: crate::projection::ProjectionEventSelector::try_from_descriptor(descriptor)
+                .unwrap(),
+            operations: vec![operation()],
+        }
     };
     let archived = arm(
         "archived",
-        &<ManifestTodoArchived as crate::DomainEvent>::DESCRIPTOR,
+        &<ManifestTodoArchived as crate::domain_event::DomainEvent>::DESCRIPTOR,
     );
     let projected = arm(
         "projected",
-        &<ManifestTodoProjected as crate::DomainEvent>::DESCRIPTOR,
+        &<ManifestTodoProjected as crate::domain_event::DomainEvent>::DESCRIPTOR,
     );
     let selected = |arms| SurfaceSelectedProjectionProgram {
         name: "canonical-client-arms".into(),
@@ -1267,7 +1332,7 @@ fn client_projection_arms_are_canonical_across_declaration_order() {
         partition: ProjectionPartition::Unit,
         arms,
     };
-    let program_id = crate::ProjectionProgramId::parse(
+    let program_id = crate::projection::ProjectionProgramId::parse(
         "pp1:sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
     )
     .unwrap();
@@ -1295,12 +1360,12 @@ fn draining_and_background_bindings_are_visible_but_cannot_mint_command_work() {
         (
             ProjectionBindingState::Draining,
             ProjectionExecutionClass::Causal,
-            ClientProjectionBindingState::Draining,
+            ProjectionBindingState::Draining,
         ),
         (
             ProjectionBindingState::Active,
             ProjectionExecutionClass::Background,
-            ClientProjectionBindingState::Active,
+            ProjectionBindingState::Active,
         ),
     ] {
         let full = modeled_surface(state, class);
@@ -1327,9 +1392,12 @@ fn draining_and_background_bindings_are_visible_but_cannot_mint_command_work() {
 #[test]
 fn draining_manifest_compiles_current_revalidation_without_projection_authority() {
     use crate::projection::placement::{ProjectionBindingState, ProjectionExecutionClass};
+    // The compiler links the non-test build of this crate, so its manifest
+    // type is not `crate`'s here: hand it the manifest as the JSON a service
+    // exports.
     use distributed_cli::{
         compile_client, ClientCompileInput, ClientDocument,
-        ClientSurfaceSelector as CompilerSurfaceSelector,
+        ClientSurfaceIdentity as CompilerSurfaceIdentity,
     };
 
     let full = modeled_causal_surface(
@@ -1345,16 +1413,17 @@ fn draining_manifest_compiles_current_revalidation_without_projection_authority(
     .unwrap();
     assert_eq!(
         manifest.projection_bindings[0].state,
-        ClientProjectionBindingState::Draining
+        ProjectionBindingState::Draining
     );
-    let project = compile_client(ClientCompileInput::new(
+    let project = ClientCompileInput::from_manifest_json(
         serde_json::to_value(manifest).unwrap(),
-        CompilerSurfaceSelector::role("admin"),
+        CompilerSurfaceIdentity::role("admin"),
         vec![ClientDocument::new(
             "src/routes/todos/+page.graphql",
             "query Todos { todos { todo_id } }",
         )],
-    ))
+    )
+    .and_then(compile_client)
     .expect("compile the server-generated Draining manifest");
     let generated = project
         .files
@@ -1406,11 +1475,11 @@ fn denied_modeled_projection_exports_no_program_event_slot_or_preset_identity() 
         .find(|command| command.command_name == "todo.complete")
         .unwrap();
     command.projections.previews[0].preview.fields[0].source =
-        crate::graphql::CommandProjectionPreviewSource::trusted("denied-owner-secret", "string");
+        crate::command::CommandProjectionPreviewSource::trusted("denied-owner-secret", "string");
     let selected = surface_for_role(
         &full,
         "user",
-        &BTreeMap::from([("UserView".into(), RoleGrant::all_columns())]),
+        &BTreeMap::from([("UserView".into(), read().all_columns())]),
     )
     .unwrap();
     let manifest = client_manifest_from_surface(
@@ -1498,8 +1567,8 @@ fn belongs_to_relationships_stay_nullable_independent_of_fk_storage() {
             &full,
             "user",
             &BTreeMap::from([
-                ("TodoView".into(), RoleGrant::all_columns()),
-                ("UserView".into(), RoleGrant::all_columns()),
+                ("TodoView".into(), read().all_columns()),
+                ("UserView".into(), read().all_columns()),
             ]),
         )
         .unwrap();
@@ -1543,13 +1612,11 @@ fn query_protocol_capabilities_are_complete_or_explicitly_revalidate() {
         .with_projectors([
             SurfaceProjector::new("project_todos")
                 .facts(["todo.changed"])
-                .models(["TodoView"])
-                .change_epoch("todos-v1"),
+                .models(["TodoView"]),
             SurfaceProjector::new("project_users")
                 .facts(["user.changed"])
                 .models(["UserView"])
-                .partition_constant(serde_json::json!({"scope": "all"}))
-                .change_epoch("users-v1"),
+                .partition_constant(serde_json::json!({"scope": "all"})),
         ])
         .unwrap();
     let fully_owned = manifest_for_all_models("query-capabilities", "user", &fully_owned);
@@ -1572,8 +1639,7 @@ fn query_protocol_capabilities_are_complete_or_explicitly_revalidate() {
         .with_projectors([SurfaceProjector::new("project_users")
             .facts(["user.changed"])
             .models(["UserView"])
-            .partition_by(["tenant_id"])
-            .change_epoch("users-v1")])
+            .partition_by(["tenant_id"])])
         .unwrap();
     let dynamic = manifest_for_all_models("query-capabilities", "user", &dynamic);
     assert!(dynamic.capabilities.record_revisions);
@@ -1585,15 +1651,14 @@ fn query_protocol_capabilities_are_complete_or_explicitly_revalidate() {
         .unwrap()
         .with_projectors([SurfaceProjector::new("project_users")
             .facts(["user.changed"])
-            .models(["UserView"])
-            .change_epoch("users-v1")])
+            .models(["UserView"])])
         .unwrap();
     let row_filtered = surface_for_role(
         &row_filtered,
         "user",
         &BTreeMap::from([(
             "UserView".into(),
-            RoleGrant::all_columns().rows(col("user_id").eq("visible-user")),
+            read().all_columns().rows(col("user_id").eq("visible-user")),
         )]),
     )
     .unwrap();
@@ -1610,18 +1675,6 @@ fn query_protocol_capabilities_are_complete_or_explicitly_revalidate() {
         "partition-wide positions and changes must not cross a row-authorization boundary"
     );
 
-    let epochless = build_surface(&[users()], &SurfaceOptions::sqlite())
-        .unwrap()
-        .with_projectors([SurfaceProjector::new("project_users")
-            .facts(["user.changed"])
-            .models(["UserView"])])
-        .unwrap();
-    let epochless = manifest_for_all_models("query-capabilities", "user", &epochless);
-    assert!(epochless.capabilities.record_revisions);
-    assert!(epochless.capabilities.tombstones);
-    assert!(!epochless.capabilities.live_resume);
-    assert_eq!(epochless.capabilities.query_fallback, "revalidate");
-
     let unowned = build_surface(&[users()], &SurfaceOptions::sqlite()).unwrap();
     let unowned = manifest_for_all_models("query-capabilities", "user", &unowned);
     assert!(!unowned.capabilities.record_revisions);
@@ -1637,8 +1690,7 @@ fn query_protocol_capabilities_are_complete_or_explicitly_revalidate() {
         .unwrap()
         .with_projectors([SurfaceProjector::new("project_todos")
             .facts(["todo.changed"])
-            .models(["TodoView"])
-            .change_epoch("todos-v1")])
+            .models(["TodoView"])])
         .unwrap();
     let mixed = manifest_for_all_models("query-capabilities", "user", &mixed);
     assert!(!mixed.capabilities.record_revisions);
@@ -1664,12 +1716,10 @@ fn query_protocol_capabilities_are_complete_or_explicitly_revalidate() {
     .with_projectors([
         SurfaceProjector::new("project_teams")
             .facts(["team.changed"])
-            .models(["TeamView"])
-            .change_epoch("teams-v1"),
+            .models(["TeamView"]),
         SurfaceProjector::new("project_users")
             .facts(["user.changed"])
-            .models(["UserView"])
-            .change_epoch("users-v1"),
+            .models(["UserView"]),
     ])
     .unwrap();
     let uncovered_join = manifest_for_all_models("query-capabilities", "user", &uncovered_join);
@@ -1684,8 +1734,7 @@ fn query_protocol_capabilities_are_complete_or_explicitly_revalidate() {
         .unwrap()
         .with_projectors([SurfaceProjector::new("project_users")
             .facts(["user.changed"])
-            .models(["UserView"])
-            .change_epoch("users-v1")])
+            .models(["UserView"])])
         .unwrap();
     let query_only = manifest_for_all_models("query-capabilities", "user", &query_only);
     assert!(query_only.capabilities.record_revisions);
@@ -1755,7 +1804,6 @@ fn bigint_keys_embed_until_decimal_string_identity_is_available() {
         }],
         primary_key: PrimaryKey::new(["account_id"]),
         version_column: None,
-        foreign_keys: Vec::new(),
         indexes: Vec::new(),
         relationships: Vec::new(),
         kind: TableKind::ReadModel,
@@ -1772,9 +1820,9 @@ fn bigint_keys_embed_until_decimal_string_identity_is_available() {
         ],
         primary_key: PrimaryKey::new(["invoice_id"]),
         version_column: None,
-        foreign_keys: Vec::new(),
         indexes: Vec::new(),
         relationships: vec![RelationshipDef {
+            references: None,
             field_name: "account".into(),
             kind: RelationshipKind::BelongsTo,
             target_model: "AccountView".into(),
@@ -1791,9 +1839,11 @@ fn bigint_keys_embed_until_decimal_string_identity_is_available() {
         &BTreeMap::from([
             (
                 "AccountView".into(),
-                RoleGrant::all_columns().rows(col("account_id").eq(9_007_199_254_740_992_i64)),
+                read()
+                    .all_columns()
+                    .rows(col("account_id").eq(9_007_199_254_740_992_i64)),
             ),
-            ("InvoiceView".into(), RoleGrant::all_columns()),
+            ("InvoiceView".into(), read().all_columns()),
         ]),
     )
     .unwrap();
@@ -1832,15 +1882,14 @@ fn bigint_keys_embed_until_decimal_string_identity_is_available() {
 fn application_surface_is_common_contract_with_safe_role_limit_semantics() {
     let full = full_surface();
     let all_grants = grants();
-    let selected =
-        surface_for_application(
-            &full,
-            "web",
-            &["user".into(), "admin".into()],
-            &["user".into(), "admin".into()],
-            &all_grants,
-        )
-            .unwrap();
+    let selected = surface_for_application(
+        &full,
+        "web",
+        &["user".into(), "admin".into()],
+        &["user".into(), "admin".into()],
+        &all_grants,
+    )
+    .unwrap();
     let manifest = client_manifest_from_surface(
         "todos-service",
         ClientSurfaceIdentity::application("web", ["admin", "user"], ["admin", "user"]),
@@ -1901,13 +1950,13 @@ fn mixed_target_projectors_are_omitted_for_role_and_application_surfaces() {
         ])
         .unwrap();
     let restricted = BTreeMap::from([
-        ("TodoView".into(), RoleGrant::all_columns()),
-        ("UserView".into(), RoleGrant::all_columns()),
+        ("TodoView".into(), read().all_columns()),
+        ("UserView".into(), read().all_columns()),
     ]);
     let admin = BTreeMap::from([
-        ("TodoView".into(), RoleGrant::all_columns()),
-        ("UserView".into(), RoleGrant::all_columns()),
-        ("TeamView".into(), RoleGrant::all_columns()),
+        ("TodoView".into(), read().all_columns()),
+        ("UserView".into(), read().all_columns()),
+        ("TeamView".into(), read().all_columns()),
     ]);
 
     let role = surface_for_role(&full, "restricted", &restricted).unwrap();
@@ -1979,10 +2028,10 @@ fn aggregate_nodes_export_exact_role_bounded_window_semantics() {
         &full,
         "admin",
         &BTreeMap::from([
-            ("TeamView".into(), RoleGrant::all_columns()),
+            ("TeamView".into(), read().all_columns()),
             (
                 "UserView".into(),
-                RoleGrant::all_columns().with_aggregations().limit(13),
+                read().all_columns().aggregations().limit(13),
             ),
         ]),
     )
@@ -2065,11 +2114,8 @@ fn opaque_m2m_plan_preserves_invalidation_without_leaking_join_internals() {
         &full,
         "admin",
         &BTreeMap::from([
-            ("TeamView".into(), RoleGrant::all_columns()),
-            (
-                "UserView".into(),
-                RoleGrant::all_columns().with_aggregations(),
-            ),
+            ("TeamView".into(), read().all_columns()),
+            ("UserView".into(), read().all_columns().aggregations()),
         ]),
     )
     .unwrap();
@@ -2155,11 +2201,8 @@ fn opaque_m2m_plan_preserves_invalidation_without_leaking_join_internals() {
         &renamed_full,
         "admin",
         &BTreeMap::from([
-            ("TeamView".into(), RoleGrant::all_columns()),
-            (
-                "UserView".into(),
-                RoleGrant::all_columns().with_aggregations(),
-            ),
+            ("TeamView".into(), read().all_columns()),
+            ("UserView".into(), read().all_columns().aggregations()),
         ]),
     )
     .unwrap();
@@ -2191,8 +2234,8 @@ fn opaque_m2m_plan_preserves_invalidation_without_leaking_join_internals() {
         &full,
         "limited",
         &BTreeMap::from([
-            ("TeamView".into(), RoleGrant::columns(["name"])),
-            ("UserView".into(), RoleGrant::all_columns()),
+            ("TeamView".into(), read().columns(["name"])),
+            ("UserView".into(), read().all_columns()),
         ]),
     )
     .unwrap();
@@ -2234,9 +2277,9 @@ fn visible_read_model_join_emits_explicit_local_m2m_plan() {
         &full,
         "admin",
         &BTreeMap::from([
-            ("TeamView".into(), RoleGrant::all_columns()),
-            ("UserView".into(), RoleGrant::all_columns()),
-            ("TeamMemberView".into(), RoleGrant::all_columns()),
+            ("TeamView".into(), read().all_columns()),
+            ("UserView".into(), read().all_columns()),
+            ("TeamMemberView".into(), read().all_columns()),
         ]),
     )
     .unwrap();
@@ -2279,10 +2322,11 @@ fn relational_row_policy_is_server_only_when_relationship_key_is_hidden() {
         &BTreeMap::from([
             (
                 "TodoView".into(),
-                RoleGrant::columns(["todo_id", "title", "completed"])
+                read()
+                    .columns(["todo_id", "title", "completed"])
                     .rows(rel("owner", col("display_name").eq("Patrick"))),
             ),
-            ("UserView".into(), RoleGrant::columns(["display_name"])),
+            ("UserView".into(), read().columns(["display_name"])),
         ]),
     )
     .unwrap();
@@ -2315,15 +2359,14 @@ fn relational_row_policy_is_server_only_when_relationship_key_is_hidden() {
 #[test]
 fn application_role_sets_are_canonical_before_fingerprinting() {
     let full = full_surface();
-    let selected =
-        surface_for_application(
-            &full,
-            "web",
-            &["admin".into(), "user".into()],
-            &["admin".into(), "user".into()],
-            &grants(),
-        )
-        .unwrap();
+    let selected = surface_for_application(
+        &full,
+        "web",
+        &["admin".into(), "user".into()],
+        &["admin".into(), "user".into()],
+        &grants(),
+    )
+    .unwrap();
     let first = client_manifest_from_surface(
         "todos-service",
         ClientSurfaceIdentity::Application {
@@ -2374,4 +2417,52 @@ fn catalog_or_mismatched_surface_cannot_be_labeled_as_authorized() {
     )
     .unwrap_err();
     assert!(error.to_string().contains("does not match"));
+}
+
+#[test]
+fn json_columns_give_one_client_contract_for_every_dialect() {
+    #[derive(
+        Clone, Default, serde::Serialize, serde::Deserialize, crate::read_model::ReadModel,
+    )]
+    #[readmodel(primary_key = ["board_id"])]
+    struct Boards {
+        board_id: String,
+        cells: Vec<Vec<String>>,
+        #[readmodel(jsonb)]
+        metadata: serde_json::Value,
+    }
+    use crate::read_model::RelationalReadModel;
+
+    let manifest = |options: SurfaceOptions| {
+        let full = build_surface(&[Boards::schema().clone()], &options).expect("surface");
+        manifest_for_all_models("boards-service", "user", &full)
+    };
+    let sqlite = manifest(SurfaceOptions::sqlite());
+    let postgres = manifest(SurfaceOptions::postgres());
+    assert_eq!(sqlite.schema_fingerprint, postgres.schema_fingerprint);
+    assert_eq!(sqlite, postgres);
+
+    let operators = |field: &str| {
+        postgres
+            .roots
+            .iter()
+            .find_map(|root| root.filter.as_ref())
+            .unwrap()
+            .fields
+            .iter()
+            .find(|candidate| candidate.name == field)
+            .unwrap()
+            .operators
+            .clone()
+    };
+    for field in ["cells", "metadata"] {
+        let operators = operators(field);
+        assert!(operators.iter().any(|op| op == "_eq"), "{operators:?}");
+        for postgres_only in ["_contains", "_contained_in", "_has_key"] {
+            assert!(
+                !operators.iter().any(|op| op == postgres_only),
+                "{operators:?}"
+            );
+        }
+    }
 }

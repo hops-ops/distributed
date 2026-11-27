@@ -21,6 +21,7 @@ use super::{
     ProjectionDeltaScope, ProjectionDeltaSurfaceIdentity,
 };
 use crate::command_ledger::{CausationId, PrincipalPartitionId};
+use crate::domain_event::DomainEventOccurrence;
 use crate::graphql::client_manifest::DistributedClientSurfaceExport;
 use crate::graphql::protocol::{
     CommandProjectionLifecycleProofV1, CommandProjectionMetadataV1, CommandProjectionObligationV1,
@@ -29,18 +30,16 @@ use crate::graphql::protocol::{
 };
 use crate::graphql::surface::{Surface, SurfaceModeledProjection};
 use crate::projection::placement::{ProjectionBinding, ProjectionExecutorRoute};
+use crate::projection::{
+    ProjectionEventSelector, ProjectionProgram, ProjectionRelationshipEffectKind,
+    ResolvedProjectionKey, ResolvedProjectionMutation, ResolvedProjectionPartition,
+    ResolvedProjectionPartitionRef, ResolvedProjectionPlan, ResolvedProjectionRelationshipEffect,
+};
 use crate::projection_protocol::{
     ProjectionCausationEvidenceBatch, ProjectionObservation, ProjectionObservationKind,
-    ProjectionScopeCodec, ProjectorTopologyId,
-    ResolvedProjectionKey as ProtocolResolvedProjectionKey,
-    ResolvedProjectionKeyField as ProtocolResolvedProjectionKeyField,
+    ProjectionScopeCodec, ProjectorTopologyId, RecordKey, RecordKeyField,
 };
-use crate::{
-    DomainEventOccurrence, ProjectionEventSelector, ProjectionProgram,
-    ProjectionRelationshipEffectKind, ResolvedProjectionKey, ResolvedProjectionMutation,
-    ResolvedProjectionPartition, ResolvedProjectionPartitionRef, ResolvedProjectionPlan,
-    ResolvedProjectionRelationshipEffect,
-};
+use crate::table::ColumnType;
 
 /// Maximum lifetime of a request-scoped modeled projection authority.
 ///
@@ -105,10 +104,13 @@ impl ProtocolProjectionRequestSeed {
             return Err(ProjectionRuntimeAuthorityError::InvalidAuthority);
         }
         let manifest = export
-            .manifest()
+            .manifest_ref()
             .map_err(|_| ProjectionRuntimeAuthorityError::InvalidAuthority)?;
-        let expected = crate::graphql::client_manifest::trusted_preset_descriptors(&manifest)
-            .map_err(|_| ProjectionRuntimeAuthorityError::InvalidAuthority)?;
+        let expected = crate::graphql::client_manifest::trusted_preset_descriptors(
+            &manifest.models,
+            &manifest.commands,
+        )
+        .map_err(|_| ProjectionRuntimeAuthorityError::InvalidAuthority)?;
         let mut preset_names = BTreeSet::new();
         if trusted_presets.len() != expected.len()
             || trusted_presets.iter().any(|preset| {
@@ -259,6 +261,14 @@ impl ProtocolProjectionRequestSeed {
                 if candidate.causation_id != causation_id
                     || candidate.scope.topology() != entry.codec.topology()
                     || candidate.scope.model() != obligation.model
+                    // A modeled observation is proof for the exact semantic
+                    // program that authored it. Physical projector names are
+                    // shared across deployments and cannot establish this
+                    // identity after an upgrade or cold restart. Legacy
+                    // observations have no program ID and remain readable,
+                    // but cannot satisfy a modeled obligation.
+                    || candidate.program_id.map(|id| id.to_string())
+                        != Some(identity.program_id.clone())
                     || !entry
                         .binding
                         .outputs()
@@ -444,7 +454,6 @@ impl ProtocolProjectionRequestSeed {
                 projection.is_causally_eligible()
                     && projection.program_id().to_string() == identity.program_id
                     && projection.binding_id().to_string() == identity.binding_id
-                    && projection.epoch().as_str() == identity.epoch
                     && projection.selected_program().is_some_and(|selected| {
                         selected.ir_version == identity.program_ir_version
                             && selected.operation_semantics_version
@@ -478,7 +487,6 @@ impl ProtocolProjectionRequestSeed {
                 projection.is_causal_evidence_eligible()
                     && projection.program_id().to_string() == identity.program_id
                     && projection.binding_id().to_string() == identity.binding_id
-                    && projection.epoch().as_str() == identity.epoch
                     && projection.selected_program().is_some_and(|selected| {
                         selected.ir_version == identity.program_ir_version
                             && selected.operation_semantics_version
@@ -523,11 +531,11 @@ impl ProtocolProjectionRequestSeed {
         .with_trusted_presets(self.trusted_presets.clone());
         let manifest = self
             .export
-            .manifest()
+            .manifest_ref()
             .map_err(|_| ProjectionRuntimeAuthorityError::InvalidAuthority)?;
         metadata
             .delta
-            .validate_replay_scope(&manifest, &authority)
+            .validate_replay_scope(manifest, &authority)
             .map_err(ProjectionRuntimeAuthorityError::Delta)
     }
 
@@ -575,7 +583,7 @@ impl ProtocolProjectionRequestSeed {
         .with_trusted_presets(self.trusted_presets.clone());
         let manifest = self
             .export
-            .manifest()
+            .manifest_ref()
             .map_err(|_| ProjectionRuntimeAuthorityError::InvalidAuthority)?;
         let identity = &metadata.delta.identity;
         // Lifecycle authority may be exercised against an unchanged outer
@@ -696,7 +704,6 @@ impl ProtocolProjectionRequestSeed {
                 .any(|projection| {
                     projection.program_id().to_string() == identity.program_id
                         && projection.binding_id().to_string() == identity.binding_id
-                        && projection.epoch().as_str() == identity.epoch
                         && projection.selected_program().is_some_and(|program| {
                             program.ir_version == identity.program_ir_version
                                 && program.operation_semantics_version
@@ -758,7 +765,7 @@ impl ProtocolProjectionRequestSeed {
         .with_trusted_presets(self.trusted_presets.clone());
         let manifest = self
             .export
-            .manifest()
+            .manifest_ref()
             .map_err(|_| ProjectionRuntimeAuthorityError::InvalidAuthority)?;
         let identity = &metadata.delta.identity;
         if identity.manifest_version != manifest.manifest_version
@@ -802,6 +809,15 @@ fn trusted_preset_value_matches(codec: &str, value: &serde_json::Value) -> bool 
         "json_number_precision_limited" => value
             .as_i64()
             .is_some_and(|value| (-9_007_199_254_740_991..=9_007_199_254_740_991).contains(&value)),
+        codec if crate::command::CommandUnsignedInteger::from_client_codec(codec).is_some() => {
+            crate::command::CommandUnsignedInteger::from_client_codec(codec).is_some_and(
+                |unsigned| {
+                    value
+                        .as_u64()
+                        .is_some_and(|value| value <= unsigned.client_max_value())
+                },
+            )
+        }
         "float64" => value.as_f64().is_some_and(f64::is_finite),
         "json" => true,
         _ => false,
@@ -811,6 +827,27 @@ fn trusted_preset_value_matches(codec: &str, value: &serde_json::Value) -> bool 
 #[cfg(test)]
 mod trusted_preset_tests {
     use super::trusted_preset_value_matches;
+
+    #[test]
+    fn unsigned_presets_require_exact_bounded_integers() {
+        for (codec, max) in [
+            ("uint8", 255_u64),
+            ("uint16", 65_535),
+            ("uint32", 4_294_967_295),
+            ("uint64_safe_integer", 9_007_199_254_740_991),
+        ] {
+            assert!(trusted_preset_value_matches(codec, &serde_json::json!(0)));
+            assert!(trusted_preset_value_matches(codec, &serde_json::json!(max)));
+            for invalid in [
+                serde_json::json!(-1),
+                serde_json::json!(1.5),
+                serde_json::json!(max + 1),
+                serde_json::json!("1"),
+            ] {
+                assert!(!trusted_preset_value_matches(codec, &invalid));
+            }
+        }
+    }
 
     #[test]
     fn base64_preset_inventory_requires_canonical_standard_encoding() {
@@ -899,7 +936,6 @@ pub(crate) struct ProtocolProjectionProgramRegistry {
 struct ProjectionRegistryKey {
     program_id: String,
     binding_id: String,
-    epoch: String,
 }
 
 #[derive(Clone)]
@@ -925,10 +961,7 @@ impl ProtocolProjectionProgramRegistry {
                     "projection registry requires the unselected catalog Surface".into(),
                 ));
             };
-            if program
-                .id()
-                .map_err(|error| ProjectionRuntimeAuthorityError::Registry(error.to_string()))?
-                != modeled.program_id()
+            if program.id() != modeled.program_id()
                 || binding.id() != modeled.binding_id()
                 || binding.program_id() != modeled.program_id()
             {
@@ -964,7 +997,7 @@ impl ProtocolProjectionProgramRegistry {
             };
             if entries.insert(key, entry).is_some() {
                 return Err(ProjectionRuntimeAuthorityError::Registry(
-                    "modeled projection registry repeats one exact program/binding/epoch".into(),
+                    "modeled projection registry repeats one exact program/binding".into(),
                 ));
             }
         }
@@ -1071,7 +1104,6 @@ impl ProtocolProjectionProgramRegistry {
                 .position(|modeled| {
                     modeled.program_id().to_string() == projection.program_id
                         && modeled.binding_id().to_string() == projection.binding_id
-                        && modeled.epoch().as_str() == projection.epoch
                 })
                 .ok_or(ProjectionRuntimeAuthorityError::InvalidAuthority)?;
             used.insert(index);
@@ -1122,7 +1154,6 @@ impl ProtocolProjectionProgramRegistry {
                     .find(|projection| {
                         projection.program_id().to_string() == identity.program_id
                             && projection.binding_id().to_string() == identity.binding_id
-                            && projection.epoch().as_str() == identity.epoch
                     })
                     .ok_or(ProjectionRuntimeAuthorityError::InvalidAuthority)?;
                 let entry = self.exact(projection)?;
@@ -1195,7 +1226,6 @@ impl ProtocolProjectionProgramRegistry {
                     .position(|modeled| {
                         modeled.program_id().to_string() == identity.program_id
                             && modeled.binding_id().to_string() == identity.binding_id
-                            && modeled.epoch().as_str() == identity.epoch
                     })
                     .ok_or(ProjectionRuntimeAuthorityError::InvalidObservation)?;
                 let plan = resolved
@@ -1264,10 +1294,9 @@ impl ProtocolProjectionProgramRegistry {
     ) -> Result<&ProtocolProjectionProgram, ProjectionRuntimeAuthorityError> {
         let entry = self.entries.get(&registry_key(projection)).ok_or_else(|| {
             ProjectionRuntimeAuthorityError::Registry(format!(
-                "selected modeled projection `{}` / `{}` / `{}` is not mounted",
+                "selected modeled projection `{}` / `{}` is not mounted",
                 projection.program_id(),
-                projection.binding_id(),
-                projection.epoch().as_str()
+                projection.binding_id()
             ))
         })?;
         if entry.route != *projection.route()
@@ -1383,13 +1412,13 @@ fn authorized_key_matches(
 
 fn protocol_resolved_key(
     key: &ResolvedProjectionKey,
-) -> Result<ProtocolResolvedProjectionKey, ProjectionRuntimeAuthorityError> {
-    Ok(ProtocolResolvedProjectionKey {
+) -> Result<RecordKey, ProjectionRuntimeAuthorityError> {
+    Ok(RecordKey {
         fields: key
             .fields()
             .iter()
             .map(|field| {
-                Ok(ProtocolResolvedProjectionKeyField {
+                Ok(RecordKeyField {
                     field: field.name().to_owned(),
                     value: projection_value_json(field.value().as_ref())?,
                 })
@@ -1402,7 +1431,6 @@ fn registry_key(projection: &SurfaceModeledProjection) -> ProjectionRegistryKey 
     ProjectionRegistryKey {
         program_id: projection.program_id().to_string(),
         binding_id: projection.binding_id().to_string(),
-        epoch: projection.epoch().as_str().to_owned(),
     }
 }
 
@@ -1453,7 +1481,7 @@ fn delta_value_json(
 }
 
 fn projection_value_json(
-    value: crate::ProjectionValueRef<'_>,
+    value: crate::projection::ProjectionValueRef<'_>,
 ) -> Result<serde_json::Value, ProjectionRuntimeAuthorityError> {
     let delta = super::DeltaValue::try_from_projection_ref(value)
         .map_err(ProjectionRuntimeAuthorityError::Delta)?;
@@ -1505,7 +1533,7 @@ impl ProtocolProjectionDeltaRequestAuthority {
             return Err(ProjectionRuntimeAuthorityError::InvalidAuthority);
         }
         export
-            .manifest()
+            .manifest_ref()
             .map_err(|_| ProjectionRuntimeAuthorityError::InvalidAuthority)?;
         let surface = export.surface().clone();
         SelectedSurfacePolicyVisibility::try_new(&surface)
@@ -1593,9 +1621,8 @@ impl ProtocolProjectionDeltaRequestAuthority {
     ) -> Result<CommandProjectionMetadataV1, ProjectionRuntimeAuthorityError> {
         delta
             .validate_replay_scope(
-                &self
-                    .export
-                    .manifest()
+                self.export
+                    .manifest_ref()
                     .map_err(|_| ProjectionRuntimeAuthorityError::InvalidAuthority)?,
                 self,
             )
@@ -1608,7 +1635,7 @@ impl ProtocolProjectionDeltaRequestAuthority {
         let mut obligations = Vec::with_capacity(observations.len());
         let manifest = self
             .export
-            .manifest()
+            .manifest_ref()
             .map_err(|_| ProjectionRuntimeAuthorityError::InvalidAuthority)?;
         for observation in observations {
             let projection = delta
@@ -1622,7 +1649,6 @@ impl ProtocolProjectionDeltaRequestAuthority {
             let eligible_projection = eligible.iter().find(|modeled| {
                 modeled.program_id().to_string() == projection.program_id
                     && modeled.binding_id().to_string() == projection.binding_id
-                    && modeled.epoch().as_str() == projection.epoch
             });
             if observation.scope.model() != observation.model
                 || observation.scope.topology().name() != observation.projector
@@ -1697,7 +1723,7 @@ impl ProtocolProjectionDeltaRequestAuthority {
         }
         let manifest = self
             .export
-            .manifest()
+            .manifest_ref()
             .map_err(|_| ProjectionRuntimeAuthorityError::InvalidAuthority)?;
         if surface != &ProjectionDeltaSurfaceIdentity::from(&manifest.surface) {
             return Err(ProjectionRuntimeAuthorityError::InvalidAuthority);
@@ -1707,7 +1733,7 @@ impl ProtocolProjectionDeltaRequestAuthority {
         self.codec
             .verify(
                 &token,
-                ProtocolTokenPurpose::ProjectionPartition,
+                ProtocolTokenPurpose::PartitionId,
                 &PartitionTokenMaterial {
                     domain: "distributed.graphql.projection-partition",
                     version: 1,
@@ -1739,7 +1765,6 @@ impl ProtocolProjectionDeltaRequestAuthority {
                 Ok(super::ProjectionDeltaProjectionIdentity {
                     program_id: projection.program_id().to_string(),
                     binding_id: projection.binding_id().to_string(),
-                    epoch: projection.epoch().as_str().to_owned(),
                     program_ir_version: selected.ir_version,
                     operation_semantics_version: selected.operation_semantics_version,
                 })
@@ -1769,7 +1794,7 @@ impl ProjectionPartitionScopeEncoder for ProtocolProjectionDeltaRequestAuthority
         let token = self
             .codec
             .issue(
-                ProtocolTokenPurpose::ProjectionPartition,
+                ProtocolTokenPurpose::PartitionId,
                 &PartitionTokenMaterial {
                     domain: "distributed.graphql.projection-partition",
                     version: 1,
@@ -1830,7 +1855,7 @@ impl ProjectionVisibilityEvaluator for ProtocolProjectionDeltaRequestAuthority {
                 })
             }
             crate::graphql::surface::SurfaceRowPolicy::Predicate(_)
-            | crate::graphql::surface::SurfaceRowPolicy::ServerOnly => {
+            | crate::graphql::surface::SurfaceRowPolicy::ServerOnly(_) => {
                 Ok(AuthorizationTransition {
                     before: ProjectionDeltaVisibility::Unknown,
                     after: ProjectionDeltaVisibility::Unknown,
@@ -1889,19 +1914,20 @@ fn evaluate_complete_after_policy(
     predicate: &crate::graphql::filter::FilterExpr,
     trusted_presets: &[crate::graphql::protocol::DistributedTrustedPreset],
 ) -> ProjectionDeltaVisibility {
-    let mut row = BTreeMap::new();
+    use crate::graphql::filter::Truth;
+
+    let mut row = serde_json::Map::new();
     for column in &model.schema.columns {
         let value = mutation
             .fields()
             .iter()
             .find(|field| field.name() == column.field_name)
             .and_then(|field| match field.value() {
-                crate::ResolvedProjectionValue::Value(value) => {
+                crate::projection::ResolvedProjectionValue::Value(value) => {
                     projection_value_json(value.as_ref()).ok()
                 }
-                crate::ResolvedProjectionValue::Absent | crate::ResolvedProjectionValue::Unset => {
-                    None
-                }
+                crate::projection::ResolvedProjectionValue::Absent
+                | crate::projection::ResolvedProjectionValue::Unset => None,
             })
             .or_else(|| {
                 mutation
@@ -1912,120 +1938,38 @@ fn evaluate_complete_after_policy(
                     .and_then(|field| projection_value_json(field.value().as_ref()).ok())
             });
         if let Some(value) = value {
-            row.insert(column.column_name.as_str(), value);
+            row.insert(column.column_name.clone(), value);
         }
     }
-    match evaluate_filter(predicate, &row, trusted_presets) {
-        Some(true) => ProjectionDeltaVisibility::Authorized,
-        Some(false) => ProjectionDeltaVisibility::Denied,
-        None => ProjectionDeltaVisibility::Unknown,
-    }
-}
-
-fn evaluate_filter(
-    predicate: &crate::graphql::filter::FilterExpr,
-    row: &BTreeMap<&str, serde_json::Value>,
-    trusted_presets: &[crate::graphql::protocol::DistributedTrustedPreset],
-) -> Option<bool> {
-    use crate::graphql::filter::{CmpOp, FilterExpr};
-
-    match predicate {
-        FilterExpr::And(items) => {
-            let evaluated = items
-                .iter()
-                .map(|item| evaluate_filter(item, row, trusted_presets))
-                .collect::<Vec<_>>();
-            if evaluated.contains(&Some(false)) {
-                Some(false)
-            } else if evaluated.iter().all(|value| *value == Some(true)) {
-                Some(true)
-            } else {
-                None
-            }
-        }
-        FilterExpr::Or(items) => {
-            let evaluated = items
-                .iter()
-                .map(|item| evaluate_filter(item, row, trusted_presets))
-                .collect::<Vec<_>>();
-            if evaluated.contains(&Some(true)) {
-                Some(true)
-            } else if evaluated.iter().all(|value| *value == Some(false)) {
-                Some(false)
-            } else {
-                None
-            }
-        }
-        FilterExpr::Not(item) => evaluate_filter(item, row, trusted_presets).map(|value| !value),
-        FilterExpr::Cmp { column, op, rhs } => {
-            let left = row.get(column.as_str())?;
-            let right = policy_operand(rhs, trusted_presets)?;
-            match op {
-                CmpOp::Eq => Some(left == &right),
-                CmpOp::Neq => Some(left != &right),
-                CmpOp::Gt
-                | CmpOp::Gte
-                | CmpOp::Lt
-                | CmpOp::Lte
-                | CmpOp::Like
-                | CmpOp::Ilike
-                | CmpOp::Contains
-                | CmpOp::ContainedIn
-                | CmpOp::HasKey => None,
-            }
-        }
-        FilterExpr::In {
-            column,
-            values,
-            negated,
-        } => {
-            let left = row.get(column.as_str())?;
-            let mut unknown = false;
-            let matched =
-                values
-                    .iter()
-                    .any(|operand| match policy_operand(operand, trusted_presets) {
-                        Some(right) => left == &right,
-                        None => {
-                            unknown = true;
-                            false
-                        }
-                    });
-            if matched {
-                Some(!negated)
-            } else if unknown {
-                None
-            } else {
-                Some(*negated)
-            }
-        }
-        FilterExpr::IsNull { column, is_null } => row
-            .get(column.as_str())
-            .map(|value| value.is_null() == *is_null),
-        FilterExpr::Rel { .. } => None,
-    }
-}
-
-fn policy_operand(
-    operand: &crate::graphql::filter::Operand,
-    trusted_presets: &[crate::graphql::protocol::DistributedTrustedPreset],
-) -> Option<serde_json::Value> {
-    use crate::graphql::filter::{LitValue, Operand};
-
-    match operand {
-        Operand::Claim(claim) => trusted_presets
+    let claims = |claim: &crate::graphql::filter::ClaimRef, column_type: &ColumnType| {
+        let preset = trusted_presets
             .iter()
-            .find(|preset| preset.name == claim.header)
-            .map(|preset| preset.value.clone()),
-        Operand::Lit(LitValue::String(value)) => Some(serde_json::Value::String(value.clone())),
-        Operand::Lit(LitValue::I64(value)) => Some(serde_json::Value::Number((*value).into())),
-        Operand::Lit(LitValue::F64(value)) => {
-            serde_json::Number::from_f64(*value).map(serde_json::Value::Number)
-        }
-        Operand::Lit(LitValue::Bool(value)) => Some(serde_json::Value::Bool(*value)),
-        Operand::Lit(LitValue::Json(value)) => Some(value.clone()),
-        Operand::Lit(LitValue::Null) => Some(serde_json::Value::Null),
+            .find(|preset| preset.name == claim.header)?;
+        preset_literal(&preset.value, column_type)
+    };
+    match predicate.evaluate(&model.schema, &row, &claims) {
+        Truth::True => ProjectionDeltaVisibility::Authorized,
+        Truth::False => ProjectionDeltaVisibility::Denied,
+        Truth::Unknown => ProjectionDeltaVisibility::Unknown,
     }
+}
+
+/// A trusted preset as the literal the SQL compiler binds for a claim
+/// compared with a column of `column_type`. `None` when the preset's wire
+/// value is not that type, which leaves the comparison undecided.
+fn preset_literal(
+    value: &serde_json::Value,
+    column_type: &ColumnType,
+) -> Option<crate::graphql::filter::LitValue> {
+    use crate::graphql::filter::LitValue;
+
+    Some(match column_type {
+        ColumnType::Text | ColumnType::Timestamp => LitValue::String(value.as_str()?.to_string()),
+        ColumnType::Boolean => LitValue::Bool(value.as_bool()?),
+        ColumnType::Integer | ColumnType::UnsignedInteger => LitValue::I64(value.as_i64()?),
+        ColumnType::Float => LitValue::F64(value.as_f64()?),
+        ColumnType::Json | ColumnType::Bytes | ColumnType::Unsupported(_) => return None,
+    })
 }
 
 impl ProjectionDeltaRequestAuthority for ProtocolProjectionDeltaRequestAuthority {

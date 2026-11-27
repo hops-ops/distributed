@@ -19,12 +19,12 @@
 //!
 //! - [`MessagePublisher`] — the single publish boundary, with each adapter's
 //!   durable publish threshold documented;
-//! - [`OutboxDispatcher`](crate::OutboxDispatcher) / [`OutboxDispatchOutcome`](crate::OutboxDispatchOutcome) — map durable outbox rows to
+//! - [`OutboxDispatcher`](crate::outbox_worker::OutboxDispatcher) / [`OutboxDispatchOutcome`](crate::outbox_worker::OutboxDispatchOutcome) — map durable outbox rows to
 //!   `Message` and dispatch them, sharing one claim → publish → complete path
 //!   between background polling and after-commit immediate dispatch.
 //!
 //! Concrete adapters build on these traits: the Postgres outbox-backed source
-//! ([`OutboxSource`](crate::OutboxSource)) is always available; the NATS JetStream and RabbitMQ
+//! ([`OutboxSource`](crate::outbox_worker::OutboxSource)) is always available; the NATS JetStream and RabbitMQ
 //! adapters are behind the `nats` and `rabbitmq` features. The Knative/HTTP
 //! ingress shape and the Kafka adapter are still separate slices. Everything
 //! builds on the vocabulary defined here:
@@ -32,16 +32,10 @@
 //! - [`TransportError`] / [`TransportErrorKind`] — retryable vs permanent
 //!   classification the runner uses to decide between redelivery and the
 //!   failure policy.
-//! - [`FailurePolicy`] / [`FailureAction`] — what happens to a permanent
-//!   failure: dead-letter, park, log-and-ack, retry, or stop.
-//! - [`RunOptions`] / [`ConsumerDeliveryMode`] / [`InboxHook`] — idempotent
-//!   dispatch by default, with a placeholder hook for the future consumer
-//!   inbox.
-//! - [`TransportCapabilities`] — how each transport differs in receive
-//!   durability, publish confirmation, retry ownership, acknowledgement, and
-//!   Knative integration.
-//! - [`validate_stable_message_id`] — the rules an inbox-enabled run uses to
-//!   reject messages that lack a usable deduplication key.
+//! - [`RunOptions`] — when a consumer run ends, how it spaces retries, when
+//!   it gives up, and where a given-up message goes ([`DeadLetterSink`]).
+//! - [`validate_stable_message_id`] — the rules for an id usable as a
+//!   deduplication key.
 //!
 //! # Two confirmation thresholds
 //!
@@ -70,11 +64,11 @@
 //! - the handler's aggregate / read-model / outbox writes committed;
 //! - in inbox mode, the inbox receipt committed atomically with those effects.
 //!
-//! How that acknowledgement maps back to the transport is adapter-owned and
-//! described by [`ConsumerAckKind`]: a row completion, a delivery ack, an offset
-//! commit, a stream ack, or a 2xx HTTP response. The default never silently
-//! acknowledges a handler error — retryable failures redeliver and permanent
-//! failures go through the [`FailurePolicy`].
+//! How that acknowledgement maps back to the transport is adapter-owned: a
+//! row completion, a delivery ack, an offset commit, a stream ack, or a 2xx
+//! HTTP response. The default never silently acknowledges a handler error —
+//! retryable failures redeliver and permanent failures go through the
+//! [`FailurePolicy`].
 //!
 //! Producer-side immediate dispatch is *not* a transport acknowledgement: it is
 //! best-effort delivery after the local transaction commits. Consumer-side
@@ -82,19 +76,20 @@
 //! publish guarantee.
 
 mod bus;
-mod capabilities;
 mod celld_queue;
+mod dead_letter;
 mod error;
 mod failure_policy;
 mod handlers;
+mod idle;
 mod in_memory_bus;
 #[cfg(feature = "kafka")]
 mod kafka;
 #[cfg(feature = "kafka")]
 mod kafka_bus;
-#[cfg(feature = "http")]
+#[cfg(feature = "knative")]
 mod knative;
-#[cfg(feature = "http")]
+#[cfg(feature = "knative")]
 mod knative_bus;
 mod message;
 mod message_name;
@@ -110,9 +105,12 @@ mod publisher;
 mod rabbitmq;
 #[cfg(feature = "rabbitmq")]
 mod rabbitmq_bus;
+#[cfg(feature = "redis-streams")]
+mod redis_streams;
 mod router;
 mod run_options;
 mod runner;
+mod shutdown;
 mod source;
 #[cfg(any(feature = "postgres", feature = "sqlite"))]
 mod sql_bus_common;
@@ -120,15 +118,18 @@ mod sql_bus_common;
 mod sqlite_bus;
 mod stable_id;
 mod topology;
+mod wire_envelope;
 
 #[cfg(feature = "kafka")]
 pub use kafka::{KafkaPublisher, KafkaReceived, KafkaSource};
 #[cfg(feature = "kafka")]
 pub use kafka_bus::{KafkaBus, KafkaBusConnect};
-#[cfg(feature = "http")]
+#[cfg(feature = "knative")]
 pub use knative::knative_triggers;
-#[cfg(feature = "http")]
+#[cfg(feature = "knative")]
 pub use knative_bus::KnativeBus;
+#[cfg(feature = "knative")]
+pub(crate) use knative_bus::KIND_ATTRIBUTE as KNATIVE_KIND_ATTRIBUTE;
 #[cfg(feature = "nats")]
 pub use nats::{NatsJetStreamSource, NatsPublisher, NatsReceived};
 #[cfg(feature = "nats")]
@@ -139,32 +140,44 @@ pub use rabbitmq::{RabbitPublisher, RabbitReceived, RabbitSource};
 pub use rabbitmq_bus::{RabbitBus, RabbitBusConnect};
 
 pub use bus::{Bus, BusConsumer};
-pub use capabilities::{ConsumerAckKind, KnativeIntegrationKind, TransportCapabilities};
-#[cfg(all(feature = "workers-rs", target_arch = "wasm32"))]
+#[cfg(all(feature = "cloudflare-workers", target_arch = "wasm32"))]
 pub use celld_queue::CelldQueueHttpPublisher;
-#[cfg(feature = "workers-rs")]
+#[cfg(feature = "cloudflare-workers")]
 pub use celld_queue::CelldQueuePublisher;
 pub use celld_queue::{
     celld_queue_relay_handler, CelldQueueEnvelope, CelldQueueRelay, CelldQueueRelayHandler,
     CELLD_QUEUE_ENVELOPE_VERSION, CELLD_QUEUE_MAX_BODY_BYTES, CELLD_QUEUE_RELAY_PATH,
+};
+pub use dead_letter::{
+    DeadLetter, DeadLetterSink, InMemoryDeadLetters, PublishDeadLetters, DEAD_LETTER_EVENT,
 };
 #[cfg(any(feature = "nats", feature = "kafka", feature = "rabbitmq"))]
 pub(crate) use error::retryable;
 pub use error::{TransportError, TransportErrorKind};
 pub use failure_policy::{FailureAction, FailurePolicy};
 pub use handlers::{Handlers, MessageHandler};
+pub use idle::{IdleGroup, IdleMember};
 pub use in_memory_bus::{InMemoryBus, InMemoryReceived};
-#[cfg(any(feature = "nats", feature = "kafka", feature = "rabbitmq"))]
-pub(crate) use message::{message_from_wire, strip_address_prefix};
+#[cfg(any(feature = "nats", feature = "rabbitmq"))]
+pub(crate) use message::strip_address_prefix;
 pub use message::{Message, MessageKind, PayloadDecodeError, SubscriptionPlan};
 pub use message_name::{validate_message_name, MessageNameError, MAX_MESSAGE_NAME_LEN};
 pub use ordered_delivery::OrderedDelivery;
 #[cfg(feature = "postgres")]
 pub use postgres_bus::{LogReceived, PostgresBus, QueueReceived};
 pub use publisher::MessagePublisher;
-pub use router::MessageRouter;
-pub use run_options::{ConsumerDeliveryMode, InboxHook, NoInbox, RunOptions};
+#[cfg(feature = "redis-streams")]
+pub use redis_streams::{
+    RedisStreamBus, RedisStreamPublisher, RedisStreamReceived, DEFAULT_REDIS_BLOCK,
+    DEFAULT_REDIS_DEDUPE_TTL, DEFAULT_REDIS_LEASE, DEFAULT_REDIS_STREAM_PREFIX,
+};
+pub use router::{LaneSet, MessageRouter};
+pub use run_options::{
+    RetryBackoff, RunOptions, RunUntil, DEFAULT_LANE_WINDOW, DEFAULT_RETRY_BACKOFF_BASE,
+    DEFAULT_RETRY_BACKOFF_MAX,
+};
 pub use runner::run_source;
+pub use shutdown::Shutdown;
 pub use source::{MessageSource, ReceivedMessage};
 #[cfg(feature = "sqlite")]
 pub use sqlite_bus::{SqliteBus, SqliteLogReceived, SqliteQueueReceived};
@@ -173,3 +186,4 @@ pub use topology::{
     resolve_consumer_group, validate_consumer_group, validate_namespace, BusTopologyConfig,
     DEFAULT_BUS_NAMESPACE, MAX_TOPOLOGY_NAME_LEN,
 };
+pub use wire_envelope::WireEnvelope;

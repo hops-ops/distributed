@@ -3,13 +3,12 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::projection::placement::{
     ProjectionBindingState, ProjectionExecutionClass, ProjectionPlacement,
 };
-use crate::projection_protocol::MAX_PROJECTION_PARTITION_BYTES;
-use crate::{
-    ProjectionInvalidation, ProjectionMutationKind, ProjectionRelationshipEffectKind,
-    ResolvedProjectionKey, ResolvedProjectionMutation, ResolvedProjectionPartition,
-    ResolvedProjectionPartitionRef, ResolvedProjectionPlan, ResolvedProjectionRelationshipEffect,
-    ResolvedProjectionValue,
+use crate::projection::{
+    MutationKind, ProjectionInvalidation, ProjectionRelationshipEffectKind, ResolvedProjectionKey,
+    ResolvedProjectionMutation, ResolvedProjectionPartition, ResolvedProjectionPartitionRef,
+    ResolvedProjectionPlan, ResolvedProjectionRelationshipEffect, ResolvedProjectionValue,
 };
+use crate::projection_protocol::MAX_PROJECTION_PARTITION_BYTES;
 
 use super::authorization::{
     ProjectionAuthorization, ProjectionPartitionScopeEncoder, ProjectionVisibilityEvaluator,
@@ -36,7 +35,7 @@ use super::{
 /// context, or projection source from different authorization selections.
 pub(crate) struct ProjectionDeltaAuthority<'a, R> {
     surface: &'a crate::graphql::surface::Surface,
-    manifest: crate::graphql::client_manifest::DistributedClientManifest,
+    manifest: &'a crate::graphql::client_manifest::DistributedClientManifest,
     context: ProjectionDeltaContext,
     authorization: SelectedSurfaceAuthorization<'a, R, R>,
 }
@@ -65,10 +64,10 @@ where
         request: &'a R,
     ) -> Result<Self, ProjectionDeltaError> {
         let manifest = export
-            .manifest()
+            .manifest_ref()
             .map_err(|_| ProjectionDeltaError::ProjectionIdentityMismatch)?;
         let context = ProjectionDeltaContext::from_manifest(
-            &manifest,
+            manifest,
             request.authorization_generation(),
             request.cache_scope(),
             request.command_causation_id(),
@@ -108,7 +107,7 @@ where
             .ok_or(ProjectionDeltaError::ProjectionIdentityMismatch)?;
         ProjectionDeltaSource::try_from_export(
             selected_projection,
-            &self.manifest,
+            self.manifest,
             self.context.wire_identity(),
         )
     }
@@ -129,7 +128,6 @@ pub(crate) struct ProjectionDeltaSource {
     authority: ProjectionDeltaIdentity,
     program_id: String,
     binding_id: String,
-    epoch: String,
     program_ir_version: u16,
     operation_semantics_version: u16,
     placement: ProjectionPlacement,
@@ -159,32 +157,10 @@ impl ProjectionDeltaSource {
             .iter()
             .find(|binding| binding.binding_id == binding_id)
             .ok_or(ProjectionDeltaError::ProjectionIdentityMismatch)?;
-        let manifest_state = match manifest_binding.state {
-            crate::graphql::client_manifest::ClientProjectionBindingState::Active => {
-                ProjectionBindingState::Active
-            }
-            crate::graphql::client_manifest::ClientProjectionBindingState::Draining => {
-                ProjectionBindingState::Draining
-            }
-        };
-        let manifest_placement = match manifest_binding.placement {
-            crate::graphql::client_manifest::ClientProjectionPlacement::Eventual => {
-                ProjectionPlacement::Eventual
-            }
-            crate::graphql::client_manifest::ClientProjectionPlacement::Direct => {
-                ProjectionPlacement::Direct
-            }
-        };
-        let manifest_execution = match manifest_binding.execution_class {
-            crate::graphql::client_manifest::ClientProjectionExecutionClass::Causal => {
-                ProjectionExecutionClass::Causal
-            }
-            crate::graphql::client_manifest::ClientProjectionExecutionClass::Background => {
-                ProjectionExecutionClass::Background
-            }
-        };
+        let manifest_state = manifest_binding.state;
+        let manifest_placement = manifest_binding.placement;
+        let manifest_execution = manifest_binding.execution_class;
         if manifest_binding.program_id != program_id
-            || manifest_binding.epoch != projection.epoch().as_str()
             || manifest_program.name != selected.name
             || manifest_program.program_version != selected.version
             || manifest_program.ir_version != selected.ir_version
@@ -199,7 +175,6 @@ impl ProjectionDeltaSource {
             authority,
             program_id,
             binding_id,
-            epoch: projection.epoch().as_str().to_owned(),
             program_ir_version: selected.ir_version,
             operation_semantics_version: selected.operation_semantics_version,
             placement: projection.placement(),
@@ -215,7 +190,6 @@ impl ProjectionDeltaSource {
         ProjectionDeltaProjectionIdentity {
             program_id: self.program_id.clone(),
             binding_id: self.binding_id.clone(),
-            epoch: self.epoch.clone(),
             program_ir_version: self.program_ir_version,
             operation_semantics_version: self.operation_semantics_version,
         }
@@ -372,7 +346,6 @@ fn lower_projection_delta(
         if sources.iter().any(|existing: &&ProjectionDeltaSource| {
             existing.program_id == source.program_id
                 && existing.binding_id == source.binding_id
-                && existing.epoch == source.epoch
                 && existing.program_ir_version == source.program_ir_version
                 && existing.operation_semantics_version == source.operation_semantics_version
         }) {
@@ -665,7 +638,7 @@ fn lower_record_consequence(
             recoveries,
         );
     };
-    if mutation.kind() == ProjectionMutationKind::Delete {
+    if mutation.kind() == MutationKind::Delete {
         return push_operation(
             operations,
             ProjectionDeltaOperation {
@@ -772,14 +745,14 @@ fn lower_record_consequence(
     )
 }
 
-fn complete_write(kind: ProjectionMutationKind) -> bool {
+fn complete_write(kind: MutationKind) -> bool {
     matches!(
         kind,
-        ProjectionMutationKind::Insert
-            | ProjectionMutationKind::Upsert
-            | ProjectionMutationKind::Recreate
-            | ProjectionMutationKind::InsertRelated
-            | ProjectionMutationKind::UpsertRelated
+        MutationKind::Insert
+            | MutationKind::Upsert
+            | MutationKind::Recreate
+            | MutationKind::InsertRelated
+            | MutationKind::UpsertRelated
     )
 }
 

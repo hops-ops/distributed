@@ -10,6 +10,8 @@
 mod receive_loop;
 
 #[cfg(test)]
+mod lane_tests;
+#[cfg(test)]
 mod tests;
 
 pub use receive_loop::run_source;

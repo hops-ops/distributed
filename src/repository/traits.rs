@@ -2,9 +2,9 @@ use std::future::Future;
 
 use crate::entity::{Entity, EventRecord};
 use crate::outbox::OutboxMessage;
-use crate::read_model::{ReadModelLoadGraph, ReadModelLoadRequest, ReadModelQueryCapabilities};
+use crate::read_model::{ReadModelLoadGraph, ReadModelLoadRequest};
 use crate::snapshot::SnapshotRecord;
-use crate::table::{TableAdapterCapabilities, TableCommitOutcome, TableStoreError, TableWritePlan};
+use crate::table::{TableStoreError, TableWritePlan};
 
 use super::inbox::InboxReceipt;
 use super::{RepositoryError, StreamIdentity};
@@ -34,11 +34,13 @@ pub enum SnapshotWrite {
 pub struct CommitBatch<'a> {
     pub streams: Vec<StreamWrite<'a>>,
     pub outbox_messages: Vec<OutboxMessage>,
-    pub read_model_plans: Vec<TableWritePlan>,
     pub snapshots: Vec<SnapshotWrite>,
     /// Consumer inbox receipts to record in the same transaction (the optional
     /// effectively-once effect fence). Empty for the default idempotent path.
     pub inbox_receipts: Vec<InboxReceipt>,
+    /// Schedule writes ([`crate::schedule`]), owned by the batch's one
+    /// stream and stored in the same transaction on every backend.
+    pub schedules: Vec<crate::schedule::ScheduleWrite>,
 }
 
 impl<'a> CommitBatch<'a> {
@@ -46,9 +48,9 @@ impl<'a> CommitBatch<'a> {
         Self {
             streams,
             outbox_messages: Vec::new(),
-            read_model_plans: Vec::new(),
             snapshots: Vec::new(),
             inbox_receipts: Vec::new(),
+            schedules: Vec::new(),
         }
     }
 
@@ -121,6 +123,7 @@ pub trait GetStream: Send + Sync {
     /// persisted stream position (`max(sequence)`), not the tail length.
     /// When `after_version` is past the stream (stale or planted snapshot
     /// cache), prefix is clamped so hydrate treats that snapshot as a miss.
+    /// A missing stream is `None`, whatever `after_version` is.
     ///
     /// [`get_stream`]: GetStream::get_stream
     fn get_stream_tail<'a>(
@@ -132,6 +135,31 @@ pub trait GetStream: Send + Sync {
         // same hydrated aggregate; only the I/O is heavier.
         let _ = after_version;
         self.get_stream(identity)
+    }
+
+    /// Load several tails at once: each request is an identity and the
+    /// version after which to read (0 reads the whole stream), with the same
+    /// contract as [`get_stream_tail`]. Missing streams are skipped, and
+    /// entities may come back in any order.
+    ///
+    /// This is the read every snapshot-aware load goes through. The default
+    /// reads each tail with [`get_stream_tail`]; a wrapper that must take
+    /// several streams together (the queued repository's locks) overrides it.
+    ///
+    /// [`get_stream_tail`]: GetStream::get_stream_tail
+    fn get_stream_tails<'a>(
+        &'a self,
+        requests: &'a [(StreamIdentity, u64)],
+    ) -> impl Future<Output = Result<Vec<Entity>, RepositoryError>> + Send + 'a {
+        async move {
+            let mut entities = Vec::with_capacity(requests.len());
+            for (identity, after_version) in requests {
+                if let Some(entity) = self.get_stream_tail(identity, *after_version).await? {
+                    entities.push(entity);
+                }
+            }
+            Ok(entities)
+        }
     }
 }
 
@@ -185,17 +213,26 @@ impl<T> Repository for T where T: GetStream + TransactionalCommit {}
 
 /// Adapter contract for committing read-model write plans.
 pub trait ReadModelWritePlanStore: Send + Sync {
-    fn read_model_capabilities(&self) -> TableAdapterCapabilities;
-
     fn commit_write_plan(
         &self,
         plan: TableWritePlan,
-    ) -> impl Future<Output = Result<TableCommitOutcome, TableStoreError>> + Send + '_;
+    ) -> impl Future<Output = Result<(), TableStoreError>> + Send + '_;
 }
 
 /// Primary-key relational read-model query contract.
 pub trait RelationalReadModelQueryStore: Send + Sync {
-    fn read_model_query_capabilities(&self) -> ReadModelQueryCapabilities;
+    /// Optional bounded normalized-row scan. Unsupported adapters fail closed.
+    fn scan_read_model(
+        &self,
+        _request: crate::read_model::ReadModelScanRequest,
+    ) -> impl Future<Output = Result<crate::read_model::ReadModelScanPage, TableStoreError>> + Send + '_
+    {
+        async {
+            Err(TableStoreError::Metadata(
+                "bounded read-model scan is unsupported by this adapter".into(),
+            ))
+        }
+    }
 
     fn load_graph(
         &self,

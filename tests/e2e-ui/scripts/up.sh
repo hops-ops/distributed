@@ -10,7 +10,7 @@ ZITADEL_HOST="${ZITADEL_HOST:-http://localhost:18080}"
 OUT="${E2E_UI_ENV:-$ROOT/e2e-ui.env}"
 # Prefer localhost (not 127.0.0.1): SvelteKit only skips Secure cookies for
 # hostname === "localhost" over http. 127.0.0.1 forces Secure and breaks OIDC.
-UI_ORIGIN="${E2E_UI_ORIGIN:-http://localhost:5180}"
+UI_ORIGIN="${PUBLIC_ORIGIN:-${E2E_UI_ORIGIN:-http://localhost:8791}}"
 API_ORIGIN="${E2E_API_ORIGIN:-http://127.0.0.1:8791}"
 PROJECT_NAME="${E2E_OIDC_PROJECT:-e2e-ui}"
 APP_NAME="${E2E_OIDC_APP:-e2e-ui-web}"
@@ -59,8 +59,11 @@ for i in $(seq 1 60); do
   fi
 done
 
-echo "==> Wait for Zitadel (API via proxy; first boot can take ~30–90s)"
-for i in $(seq 1 90); do
+# First boot runs every Zitadel migration; on a cold Docker VM that can take
+# well over three minutes. ZITADEL_WAIT_TRIES × 2s bounds the wait.
+ZITADEL_WAIT_TRIES="${ZITADEL_WAIT_TRIES:-180}"
+echo "==> Wait for Zitadel (API via proxy; first boot can take minutes)"
+for i in $(seq 1 "$ZITADEL_WAIT_TRIES"); do
   if curl -fsS --max-time 2 "$ZITADEL_HOST/debug/healthz" >/dev/null 2>&1 \
     || curl -fsS --max-time 2 "$ZITADEL_HOST/debug/ready" >/dev/null 2>&1; then
     echo "    zitadel probe ok (${i} tries)"
@@ -73,7 +76,7 @@ for i in $(seq 1 90); do
   fi
   wait_tick "zitadel health" "$i" 5
   sleep 2
-  if [[ $i -eq 90 ]]; then
+  if [[ $i -eq $ZITADEL_WAIT_TRIES ]]; then
     echo "ERROR: Zitadel unreachable"
     docker compose -f "$COMPOSE" logs --tail=100 zitadel || true
     exit 1
@@ -298,8 +301,8 @@ if [[ -z "$APP_ID" ]]; then
       redirectUris: [
         ($ui + "/auth/callback/oidc"),
         ($ui + "/auth/callback"),
-        "http://127.0.0.1:5180/auth/callback/oidc",
-        "http://localhost:5180/auth/callback/oidc"
+        "http://127.0.0.1:8791/auth/callback/oidc",
+        "http://localhost:8791/auth/callback/oidc"
       ],
       responseTypes: ["OIDC_RESPONSE_TYPE_CODE"],
       grantTypes: [
@@ -311,10 +314,10 @@ if [[ -z "$APP_ID" ]]; then
       postLogoutRedirectUris: [
         ($ui + "/"),
         $ui,
-        "http://127.0.0.1:5180/",
-        "http://127.0.0.1:5180",
-        "http://localhost:5180/",
-        "http://localhost:5180"
+        "http://127.0.0.1:8791/",
+        "http://127.0.0.1:8791",
+        "http://localhost:8791/",
+        "http://localhost:8791"
       ],
       version: "OIDC_VERSION_1_0",
       devMode: true,
@@ -341,8 +344,8 @@ else
         redirectUris: [
           ($ui + "/auth/callback/oidc"),
           ($ui + "/auth/callback"),
-          "http://127.0.0.1:5180/auth/callback/oidc",
-          "http://localhost:5180/auth/callback/oidc"
+          "http://127.0.0.1:8791/auth/callback/oidc",
+          "http://localhost:8791/auth/callback/oidc"
         ],
         responseTypes: ["OIDC_RESPONSE_TYPE_CODE"],
         grantTypes: [
@@ -354,10 +357,10 @@ else
         postLogoutRedirectUris: [
           ($ui + "/"),
           $ui,
-          "http://127.0.0.1:5180/",
-          "http://127.0.0.1:5180",
-          "http://localhost:5180/",
-          "http://localhost:5180"
+          "http://127.0.0.1:8791/",
+          "http://127.0.0.1:8791",
+          "http://localhost:8791/",
+          "http://localhost:8791"
         ],
         devMode: true,
         accessTokenType: "OIDC_TOKEN_TYPE_JWT",
@@ -553,7 +556,7 @@ ADMIN_M_UID=$(create_machine "e2e-ui-admin-m" "admin" "$ADMIN_M_KEY")
 echo "    e2e-ui-admin-m → $ADMIN_M_UID"
 
 # OIDC audience for JWT validation: project id (Zitadel project-scoped aud)
-DATABASE_URL="postgres://e2e:e2e@127.0.0.1:5433/e2e_ui"
+DATABASE_URL="postgres://e2e:e2e@127.0.0.1:${E2E_APP_DB_PORT:-5433}/e2e_ui"
 # Keep Auth.js session cookie decryption stable across re-bootstrap.
 # Rotating AUTH_SECRET → JWTSessionError: no matching decryption secret.
 if [[ -z "${AUTH_SECRET:-}" && -f "$OUT" ]]; then
@@ -602,6 +605,8 @@ ZITADEL_PROJECT_ID="$(_dq "$PROJECT_ID")"
 # Server-only: custom /login uses Session API + CreateCallback (never expose to browser).
 ZITADEL_SERVICE_USER_TOKEN="$(_dq "$LOGIN_PAT")"
 LOGIN_V2_BASE_URI="$(_dq "$LOGIN_V2_BASE_URI")"
+PUBLIC_ORIGIN="$(_dq "$UI_ORIGIN")"
+UI_INTERNAL_ORIGIN="http://localhost:5180"
 E2E_UI_ORIGIN="$(_dq "$UI_ORIGIN")"
 E2E_API_ORIGIN="$(_dq "$API_ORIGIN")"
 E2E_MACHINE_USER_KEY="$(_dq "$USER_M_KEY")"

@@ -1,5 +1,4 @@
 use super::*;
-use crate::projection_protocol::{ResolvedProjectionKey, ResolvedProjectionObligation};
 use crate::table::{
     DeleteTableRowMutation, ExpectedVersion, PrimaryKey, RowKey, RowValue, TableSchema,
 };
@@ -8,8 +7,8 @@ fn topology() -> ProjectorTopologyId {
     ProjectorTopologyId::new(1, "todos", [7; 32]).unwrap()
 }
 
-fn partition() -> ProjectionPartition {
-    ProjectionPartition::new(b"tenant:a".to_vec()).unwrap()
+fn partition() -> PartitionId {
+    PartitionId::new(b"tenant:a".to_vec()).unwrap()
 }
 
 fn scope(model: &str, key: &[u8]) -> ProjectionRecordScope {
@@ -23,7 +22,6 @@ fn schema() -> &'static TableSchema {
         columns: Vec::new(),
         primary_key: PrimaryKey::new(["id"]),
         version_column: None,
-        foreign_keys: Vec::new(),
         indexes: Vec::new(),
         relationships: Vec::new(),
         kind: Default::default(),
@@ -42,6 +40,7 @@ fn same_transaction_evidence() -> SameTransactionProjectionEvidence {
     .unwrap();
     SameTransactionProjectionEvidence {
         records: vec![ProjectionRecordMetadata {
+            source_snapshot: None,
             revision: revision.clone(),
             tombstone: false,
             change: change.clone(),
@@ -54,6 +53,7 @@ fn same_transaction_evidence() -> SameTransactionProjectionEvidence {
             scope: Some(scope.clone()),
             revision: Some(revision.clone()),
             failure_id: None,
+            program_id: None,
         }],
         observations: vec![ProjectionObservation {
             causation_id: "cause-1".into(),
@@ -61,6 +61,7 @@ fn same_transaction_evidence() -> SameTransactionProjectionEvidence {
             revision: Some(revision),
             scope,
             change,
+            program_id: None,
         }],
     }
 }
@@ -82,14 +83,8 @@ fn failure_batch() -> ProjectionFailureBatch {
         true,
     )
     .unwrap();
-    ProjectionFailureBatch::new(
-        input,
-        ProjectionEpoch::new("changes-v1").unwrap(),
-        "failure-1",
-        "decode_error",
-        b"bad payload".to_vec(),
-    )
-    .unwrap()
+    ProjectionFailureBatch::new(input, "failure-1", "decode_error", b"bad payload".to_vec())
+        .unwrap()
 }
 
 #[test]
@@ -191,7 +186,7 @@ fn record_expectations_and_mutation_kinds_fail_closed() {
             first_scope.clone(),
             delete.clone(),
             ProjectionRecordExpectation::Exact(revision),
-            ProjectionMutationKind::Delete,
+            RecordTransition::Delete,
         ),
         Err(ProjectionProtocolError::ScopeMismatch { .. })
     ));
@@ -200,44 +195,10 @@ fn record_expectations_and_mutation_kinds_fail_closed() {
             first_scope,
             delete,
             ProjectionRecordExpectation::Missing,
-            ProjectionMutationKind::Delete,
+            RecordTransition::Delete,
         ),
         Err(ProjectionProtocolError::InvalidBatch(_))
     ));
-}
-
-#[test]
-fn absent_and_explicit_null_obligation_partitions_survive_round_trip() {
-    let topology = ProjectorTopologyId::new(1, "todos", [9; 32]).unwrap();
-    let partition = super::super::ProjectionPartition::new(b"unit".to_vec()).unwrap();
-    let scope = super::super::ProjectionRecordScope::new(
-        topology,
-        partition,
-        "TodoView",
-        b"todo-1".to_vec(),
-    )
-    .unwrap();
-    let absent = ResolvedProjectionObligation {
-        projector: "todos".into(),
-        model: "TodoView".into(),
-        key: ResolvedProjectionKey { fields: Vec::new() },
-        partition: None,
-        scope,
-    };
-    let explicit_null = ResolvedProjectionObligation {
-        partition: Some(serde_json::Value::Null),
-        ..absent.clone()
-    };
-    let absent_json = serde_json::to_value(&absent).unwrap();
-    let null_json = serde_json::to_value(&explicit_null).unwrap();
-    assert!(absent_json.get("partition").is_none());
-    assert_eq!(null_json.get("partition"), Some(&serde_json::Value::Null));
-    assert_eq!(
-        serde_json::from_value::<ResolvedProjectionObligation>(null_json)
-            .unwrap()
-            .partition,
-        Some(serde_json::Value::Null)
-    );
 }
 
 #[test]
@@ -380,4 +341,96 @@ fn failure_batch_validation_rechecks_all_mutable_identity_and_payload_fields() {
     for (case, batch) in cases {
         assert!(batch.validate().is_err(), "{case} must be rejected");
     }
+}
+
+fn change_at(position: u64) -> ProjectionChange {
+    ProjectionChange {
+        cursor: ProjectionChangeCursor::new(
+            topology(),
+            partition(),
+            ProjectionEpoch::new("changes-v1").unwrap(),
+            position,
+        )
+        .unwrap(),
+        kind: ProjectionChangeKind::Checkpoint,
+        causation_id: "cause".into(),
+        observation_kind: None,
+        scope: None,
+        revision: None,
+        failure_id: None,
+        program_id: None,
+    }
+}
+
+#[test]
+fn change_read_window_decides_reset_empty_and_resume() {
+    use std::ops::ControlFlow;
+    let epoch = ProjectionEpoch::new("changes-v1").unwrap();
+    let window = |after: Option<u64>, compacted, limit| {
+        let after = after.map(|position| change_at(position).cursor);
+        change_read_window(
+            &topology(),
+            &partition(),
+            Some((&epoch, 5, compacted)),
+            after.as_ref(),
+            limit,
+        )
+        .unwrap()
+    };
+    let reset = |read| {
+        matches!(
+            read,
+            ControlFlow::Break(ProjectionChangeRead::ResetRequired { .. })
+        )
+    };
+    let empty = |read| {
+        matches!(
+            read,
+            ControlFlow::Break(ProjectionChangeRead::Changes { changes, .. }) if changes.is_empty()
+        )
+    };
+
+    assert_eq!(window(None, 0, 10), ControlFlow::Continue(0));
+    assert_eq!(window(Some(2), 2, 10), ControlFlow::Continue(2));
+    assert!(reset(window(None, 2, 10)));
+    assert!(reset(window(Some(1), 2, 10)));
+    assert!(reset(window(Some(6), 0, 10)));
+    assert!(empty(window(Some(5), 0, 10)));
+    assert!(empty(window(Some(3), 0, 0)));
+    assert!(reset(
+        change_read_window(
+            &topology(),
+            &partition(),
+            None,
+            Some(&change_at(1).cursor),
+            10
+        )
+        .unwrap()
+    ));
+}
+
+#[test]
+fn change_page_rejects_a_log_with_holes() {
+    let epoch = ProjectionEpoch::new("changes-v1").unwrap();
+    let page = |start, positions: &[u64]| {
+        change_page(
+            &topology(),
+            &partition(),
+            (&epoch, 5, 0),
+            start,
+            positions.iter().copied().map(change_at).collect(),
+        )
+    };
+    let corrupt = |result: Result<ProjectionChangeRead, ProjectionProtocolError>| {
+        matches!(result, Err(ProjectionProtocolError::StorageCorruption(_)))
+    };
+
+    assert!(matches!(
+        page(2, &[3, 4]),
+        Ok(ProjectionChangeRead::Changes { changes, .. }) if changes.len() == 2
+    ));
+    assert!(corrupt(page(2, &[])));
+    assert!(corrupt(page(2, &[4, 5])));
+    assert!(corrupt(page(2, &[3, 5])));
+    assert!(corrupt(page(4, &[5, 6])));
 }

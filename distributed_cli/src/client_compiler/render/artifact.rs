@@ -7,11 +7,11 @@ use super::super::graphql::{
     Cardinality, CompiledArgument, CompiledBranch, CompiledBranchSemantic, CompiledFilterField,
     CompiledFilterPlan, CompiledMember, CompiledObject, CompiledOperation, CompiledOrderField,
     CompiledOrderPlan, CompiledPaginationPlan, CompiledRelationshipPlan, CompiledStorage,
-    CompiledVariableCodec,
+    CompiledVariableCodec, CompiledWindow,
 };
 use super::super::manifest::{
-    ClientManifest, ManifestRelationshipKeyMapping, ManifestRelationshipKind,
-    ManifestRelationshipMaintenance, ManifestRowPolicy, ManifestTrustedPresetDescriptor,
+    ClientManifest, ClientRelationshipKind, ClientRelationshipMaintenance, ClientRowPolicy,
+    ClientTrustedPresetDescriptor, RelationshipKeyMapping,
 };
 use super::super::ClientCompileError;
 
@@ -27,6 +27,8 @@ struct Artifact<'a> {
     protocol: ArtifactProtocol<'a>,
     #[serde(skip_serializing_if = "Option::is_none")]
     live: Option<ArtifactLive<'a>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    window: Option<&'a CompiledWindow>,
 }
 
 #[derive(Serialize)]
@@ -41,10 +43,12 @@ struct ArtifactProtocol<'a> {
     version: u32,
     #[serde(rename = "schemaHash")]
     schema_hash: &'a str,
-    surface: &'a super::super::manifest::ManifestSurface,
+    #[serde(rename = "protocolHash")]
+    protocol_hash: &'a str,
+    surface: &'a super::super::manifest::ClientSurfaceIdentity,
     operation: &'a str,
     #[serde(rename = "trustedPresets")]
-    trusted_presets: &'a [ManifestTrustedPresetDescriptor],
+    trusted_presets: &'a [ClientTrustedPresetDescriptor],
 }
 
 #[derive(Serialize)]
@@ -111,7 +115,7 @@ struct ArtifactFilter<'a> {
     fields: Vec<ArtifactFilterField<'a>>,
     relationships: Vec<ArtifactRelationship<'a>>,
     #[serde(rename = "rowPolicy")]
-    row_policy: &'a ManifestRowPolicy,
+    row_policy: &'a ClientRowPolicy,
 }
 
 #[derive(Serialize)]
@@ -128,10 +132,10 @@ struct ArtifactRelationship<'a> {
     field: &'a str,
     #[serde(rename = "targetModel")]
     target_model: &'a str,
-    kind: ManifestRelationshipKind,
+    kind: ClientRelationshipKind,
     #[serde(rename = "keyMapping")]
     key_mapping: ArtifactRelationshipKeyMapping<'a>,
-    maintenance: ManifestRelationshipMaintenance,
+    maintenance: ClientRelationshipMaintenance,
     dependencies: &'a [String],
 }
 
@@ -256,6 +260,7 @@ pub(super) fn render_operation_artifact_json(
         protocol: ArtifactProtocol {
             version: 1,
             schema_hash: &manifest.schema_fingerprint,
+            protocol_hash: &manifest.protocol_fingerprint,
             surface: &manifest.surface,
             operation: &operation.query_hash,
             trusted_presets: &manifest.trusted_presets,
@@ -264,6 +269,7 @@ pub(super) fn render_operation_artifact_json(
             id: &live.hash,
             document: &live.document,
         }),
+        window: operation.window.as_ref(),
     };
     let artifact_json = serde_json::to_string_pretty(&artifact).map_err(|error| {
         ClientCompileError::manifest(
@@ -368,10 +374,10 @@ fn artifact_relationship(relationship: &CompiledRelationshipPlan) -> ArtifactRel
         target_model: &relationship.target_model,
         kind: relationship.kind,
         key_mapping: match &relationship.key_mapping {
-            ManifestRelationshipKeyMapping::Direct { local, remote } => {
+            RelationshipKeyMapping::Direct { local, remote } => {
                 ArtifactRelationshipKeyMapping::Direct { local, remote }
             }
-            ManifestRelationshipKeyMapping::Through {
+            RelationshipKeyMapping::Through {
                 local,
                 remote,
                 table,
@@ -384,7 +390,7 @@ fn artifact_relationship(relationship: &CompiledRelationshipPlan) -> ArtifactRel
                 source_foreign_key,
                 target_foreign_key,
             },
-            ManifestRelationshipKeyMapping::ThroughOpaque {
+            RelationshipKeyMapping::ThroughOpaque {
                 local,
                 remote,
                 dependency,
@@ -393,7 +399,7 @@ fn artifact_relationship(relationship: &CompiledRelationshipPlan) -> ArtifactRel
                 remote,
                 dependency,
             },
-            ManifestRelationshipKeyMapping::Embedded => ArtifactRelationshipKeyMapping::Embedded,
+            RelationshipKeyMapping::Embedded => ArtifactRelationshipKeyMapping::Embedded,
         },
         maintenance: relationship.maintenance,
         dependencies: &relationship.dependencies,

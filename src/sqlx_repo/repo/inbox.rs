@@ -37,9 +37,15 @@ where
         age: std::time::Duration,
     ) -> impl Future<Output = Result<u64, RepositoryError>> + Send {
         async move {
-            // Compare against the database clock to avoid client/server skew;
-            // the backend renders the cutoff expression.
-            let mut builder = DB::inbox_purge_query(age);
+            // Compare against the database clock to avoid client/server skew.
+            // An age past any stored time deletes nothing; clamping it keeps
+            // the subtraction inside the integer range.
+            let age = crate::repository::sql::duration_micros(age).unwrap_or(i64::MAX / 2);
+            let mut builder =
+                QueryBuilder::<DB>::new("DELETE FROM consumer_inbox WHERE processed_at < ");
+            builder.push(DB::NOW);
+            builder.push(" - ");
+            builder.push_bind(age);
             let result = builder
                 .build()
                 .execute(&self.pool)

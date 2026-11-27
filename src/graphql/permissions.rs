@@ -25,7 +25,6 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::marker::PhantomData;
 
 use super::filter::FilterExpr;
-use super::surface::RoleGrant;
 
 /// Per-role read access for one model.
 #[derive(Clone, Debug)]
@@ -96,57 +95,6 @@ impl ReadPermission {
             .as_ref()
             .is_some_and(|cols| cols.contains(name))
     }
-
-    #[allow(dead_code)]
-    pub(crate) fn allowed_columns_for<'a>(
-        &self,
-        schema_columns: impl Iterator<Item = &'a str>,
-    ) -> BTreeSet<String> {
-        if self.all_columns {
-            schema_columns.map(str::to_string).collect()
-        } else {
-            self.columns.clone().unwrap_or_default()
-        }
-    }
-
-    /// Map to feature-free surface IR grant (A12). Row filters / limits stay on
-    /// [`ReadPermission`] for execute; IR only needs column + aggregation surface.
-    pub fn to_role_grant(&self) -> RoleGrant {
-        role_grant_from_read_permission(self)
-    }
-}
-
-/// Pure A12 mapper: engine [`ReadPermission`] → surface [`RoleGrant`].
-pub fn role_grant_from_read_permission(perm: &ReadPermission) -> RoleGrant {
-    let mut g = if perm.all_columns {
-        RoleGrant::all_columns()
-    } else {
-        RoleGrant::columns(perm.columns.clone().unwrap_or_default())
-    };
-    if perm.aggregations {
-        g = g.with_aggregations();
-    }
-    if let Some(predicate) = &perm.row_filter {
-        g = g.rows(predicate.clone());
-    }
-    if let Some(limit) = perm.limit {
-        g = g.limit(limit);
-    }
-    g
-}
-
-/// Collect IR grants for one role from `(model_name, role) → ReadPermission` pairs.
-pub fn role_grants_from_model_role_perms<'a>(
-    role: &str,
-    entries: impl IntoIterator<Item = (&'a (String, String), &'a ReadPermission)>,
-) -> BTreeMap<String, RoleGrant> {
-    let mut out = BTreeMap::new();
-    for ((model, r), perm) in entries {
-        if r == role {
-            out.insert(model.clone(), role_grant_from_read_permission(perm));
-        }
-    }
-    out
 }
 
 /// Typed bag of `(role, ReadPermission)` pairs for one model.
@@ -175,52 +123,115 @@ impl<M> ModelPermissions<M> {
         self
     }
 
-    /// Export the same role grants for application-surface compilation.
-    ///
-    /// This keeps runtime GraphQL authorization and generated-client
-    /// authorization sourced from one model-owned declaration.
-    pub fn surface_grants(&self) -> BTreeMap<String, RoleGrant> {
-        self.entries
-            .iter()
-            .map(|(role, permission)| (role.clone(), permission.to_role_grant()))
-            .collect()
+    /// The grants keyed by role, for selecting a role or application surface
+    /// outside the engine (manifest export, generated clients).
+    pub fn by_role(&self) -> BTreeMap<String, ReadPermission> {
+        self.entries.iter().cloned().collect()
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+/// A read model whose read permissions are declared next to it.
+///
+/// ```ignore
+/// impl AuthorizedReadModel for Todos {
+///     fn permissions() -> ModelPermissions<Self> {
+///         ModelPermissions::new().grant("admin", read().all_columns())
+///     }
+/// }
+/// ```
+pub trait AuthorizedReadModel: crate::read_model::RelationalReadModelIncludes {
+    /// Who may read this model, which columns and which rows.
+    fn permissions() -> ModelPermissions<Self>;
+}
 
-    #[test]
-    fn a12_all_columns_maps() {
-        let g = role_grant_from_read_permission(&read().all_columns());
-        assert!(g.all_columns);
-        assert!(g.columns.is_empty());
-        assert!(!g.aggregations);
+/// The read models one application serves, each with its permissions.
+///
+/// The single list every consumer reads: schema bootstrap
+/// ([`catalog`](Self::catalog)), the GraphQL engine
+/// (`GraphqlEngineBuilder::read_models`), role grants for client export
+/// ([`grants`](Self::grants)) and table names ([`table_names`](Self::table_names)).
+#[derive(Clone)]
+pub struct ReadModels {
+    catalog: crate::table::ReadModelCatalog,
+    models: Vec<RegisteredReadModel>,
+}
+
+#[derive(Clone)]
+struct RegisteredReadModel {
+    model_name: String,
+    grants: Vec<(String, ReadPermission)>,
+    #[cfg(feature = "graphql")]
+    register: fn(super::GraphqlEngineBuilder) -> super::GraphqlEngineBuilder,
+}
+
+#[cfg(feature = "graphql")]
+fn register_model<M: AuthorizedReadModel>(
+    builder: super::GraphqlEngineBuilder,
+) -> super::GraphqlEngineBuilder {
+    builder.model::<M>(M::permissions())
+}
+
+impl ReadModels {
+    /// An empty catalog named `name`.
+    pub fn new(name: impl Into<String>) -> Self {
+        Self {
+            catalog: crate::table::ReadModelCatalog::new(name),
+            models: Vec::new(),
+        }
     }
 
-    #[test]
-    fn a12_column_list_and_aggregations() {
-        let g =
-            role_grant_from_read_permission(&read().columns(["order_id", "status"]).aggregations());
-        assert!(!g.all_columns);
-        assert!(g.columns.contains("order_id"));
-        assert!(g.columns.contains("status"));
-        assert!(!g.columns.contains("meta"));
-        assert!(g.aggregations);
-        assert!(g.allows_column("order_id"));
-        assert!(!g.allows_column("meta"));
+    /// Serve `M` with its own permissions.
+    ///
+    /// # Panics
+    ///
+    /// When `M`'s schema is invalid or collides with a model already listed.
+    pub fn model<M: AuthorizedReadModel>(mut self) -> Self {
+        self.catalog = self.catalog.read_model::<M>();
+        self.models.push(RegisteredReadModel {
+            model_name: M::schema().model_name.clone(),
+            grants: M::permissions().entries,
+            #[cfg(feature = "graphql")]
+            register: register_model::<M>,
+        });
+        self
     }
 
-    #[test]
-    fn a12_role_grants_from_model_role_perms_filters_role() {
-        let user = read().columns(["a"]);
-        let admin = read().all_columns().aggregations();
-        let key_u = ("M".to_string(), "user".to_string());
-        let key_a = ("M".to_string(), "admin".to_string());
-        let map = role_grants_from_model_role_perms("user", [(&key_u, &user), (&key_a, &admin)]);
-        assert_eq!(map.len(), 1);
-        assert!(map["M"].columns.contains("a"));
-        assert!(!map["M"].all_columns);
+    /// The physical tables, for schema bootstrap and Surface building.
+    pub fn catalog(&self) -> &crate::table::ReadModelCatalog {
+        &self.catalog
+    }
+
+    /// Grants by role, then model name.
+    pub fn grants(&self) -> BTreeMap<String, BTreeMap<String, ReadPermission>> {
+        let mut grants = BTreeMap::<String, BTreeMap<String, ReadPermission>>::new();
+        for model in &self.models {
+            for (role, grant) in &model.grants {
+                grants
+                    .entry(role.clone())
+                    .or_default()
+                    .insert(model.model_name.clone(), grant.clone());
+            }
+        }
+        grants
+    }
+
+    /// The table names, in catalog order.
+    pub fn table_names(&self) -> Vec<String> {
+        self.catalog
+            .tables
+            .iter()
+            .map(|table| table.table_name.clone())
+            .collect()
+    }
+
+    #[cfg(feature = "graphql")]
+    pub(crate) fn register(
+        &self,
+        mut builder: super::GraphqlEngineBuilder,
+    ) -> super::GraphqlEngineBuilder {
+        for model in &self.models {
+            builder = (model.register)(builder);
+        }
+        builder
     }
 }

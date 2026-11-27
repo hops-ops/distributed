@@ -113,13 +113,8 @@ pub(super) fn command_direct_projection_extension(
             // exact without revealing that hidden ownership inventory.
         }
         [owner] if owner.name == topology.name() => {
-            if !target.topology_matches(
-                &owner.name,
-                &owner.facts,
-                &owner.models,
-                &owner.partition,
-                owner.change_epoch.as_deref(),
-            ) || !target.protocol_topology_matches(topology)
+            if !target.topology_matches(&owner.name, &owner.facts, &owner.models, &owner.partition)
+                || !target.protocol_topology_matches(topology)
             {
                 return Err(ClientManifestError(format!(
                     "typed projected command `{}` direct target differs from visible owner `{}`",
@@ -150,17 +145,12 @@ pub(super) fn command_direct_projection_extension(
         }
     }
 
-    let change_epoch = target.change_epoch.clone().ok_or_else(|| {
-        ClientManifestError(format!(
-            "typed projected command `{}` direct target has no registered change-log epoch",
-            command.command_name
-        ))
-    })?;
-    let partition = target
-        .partition
-        .as_ref()
-        .map(|partition| serde_json::to_value(partition).map(canonical_json_value))
-        .transpose()?;
+    let partition = target.partition.clone().map(|partition| match partition {
+        EffectExpression::Constant { value } => EffectExpression::Constant {
+            value: canonical_json_value(value),
+        },
+        other => other,
+    });
     let digest = topology
         .digest()
         .iter()
@@ -174,7 +164,6 @@ pub(super) fn command_direct_projection_extension(
         },
         model: target.model.clone(),
         partition,
-        change_epoch,
     }))
 }
 pub(super) fn command_trusted_preset_descriptors(
@@ -218,7 +207,10 @@ pub(super) fn command_trusted_preset_descriptors(
         .map(|(name, codec)| ClientTrustedPresetDescriptor { name, codec })
         .collect())
 }
-pub(super) fn command_operation(
+/// The one GraphQL document a generated client sends for a command: the
+/// mutation field with its `commandId` (and `input`), selecting every output
+/// field. A manifest's `operation` is exactly this text.
+pub fn command_operation(
     mutation_field: &str,
     input: &ClientCommandShape,
     output: &ClientCommandShape,
@@ -243,7 +235,9 @@ pub(super) fn command_operation(
     format!("mutation {operation_name}{variables} {{ {mutation_field}{arguments}{selection} }}")
 }
 
-pub(super) fn command_status_operation() -> String {
+/// The one GraphQL document a generated client sends to read a command's
+/// status.
+pub fn command_status_operation() -> String {
     "query Distributed_CommandStatus($commandId: ID!) { commandStatus(commandId: $commandId) { state } }"
         .into()
 }

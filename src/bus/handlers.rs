@@ -9,7 +9,7 @@
 //! let handlers = Handlers::new()
 //!     .on_event("seat.reserved", |msg: &Message| async move { /* ... */ Ok(()) })
 //!     .on_command("place.bet",   |msg: &Message| async move { Ok(()) });
-//! bus.subscribe(Arc::new(handlers), RunOptions::idempotent()).await?;
+//! bus.subscribe(Arc::new(handlers), RunOptions::until_idle()).await?;
 //! ```
 //!
 //! Deliberately minimal: handlers take `&Message` (no `Context`, dependencies,
@@ -232,7 +232,7 @@ mod tests {
                 }
             }),
         );
-        block_on(bus.subscribe(handlers, RunOptions::idempotent())).unwrap();
+        block_on(bus.subscribe(handlers, RunOptions::until_idle())).unwrap();
         assert_eq!(count.load(Ordering::SeqCst), 3);
     }
 
@@ -250,7 +250,7 @@ mod tests {
                 Ok(())
             }
         }));
-        block_on(bus.listen(handlers, RunOptions::idempotent())).unwrap();
+        block_on(bus.listen(handlers, RunOptions::until_idle())).unwrap();
         assert_eq!(count.load(Ordering::SeqCst), 2);
     }
 }

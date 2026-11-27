@@ -1,5 +1,15 @@
 export { authFromPageData, type PageGraphqlData } from './auth.js';
 export {
+	createDistributedLeaderboardStore,
+	loadDistributedLeaderboard,
+	useDistributedLeaderboard,
+	type DistributedLeaderboardLive,
+	type DistributedLeaderboardOperation,
+	type DistributedLeaderboardSnapshot,
+	type DistributedLeaderboardStore,
+	type UseDistributedLeaderboardOptions
+} from './leaderboard.js';
+export {
 	distributedReloadLifecycle,
 	registerDistributedReloadClient,
 	validateDistributedReloadLocation,
@@ -24,6 +34,7 @@ export {
 	type DistributedBoundaryVariableSource,
 	type DistributedBoundaryVariableSources
 } from './boundary-variables.js';
+export type { DistributedSearchParamSource, DistributedSearchScalar } from './search-variables.js';
 export {
 	constant,
 	defineGraphqlIslandBindings,
@@ -45,6 +56,7 @@ export {
 	defineDistributedSvelteKitOperation,
 	provideDistributedSvelteKitClient,
 	retainDistributedSvelteKitBoundary,
+	useDistributedLiveConnection,
 	useDistributedSvelteKitClient,
 	useDistributedSvelteKitCommands
 } from './context.js';
@@ -57,19 +69,28 @@ export {
 	type DistributedSvelteKitClient,
 	type SveltekitBoundOperation,
 	type SveltekitBoundBoundaryOperation,
-	type SveltekitCommandRuntimeFactory,
-	type SveltekitCommandRuntimeFactoryOptions,
-	type SveltekitCommandRuntimeLike,
 	type SveltekitDistributedPageData,
 	type SveltekitPageDataSessionSource,
 	type SveltekitPageDataSource,
 	type SveltekitQuerySnapshot,
 	type SveltekitQueryStore,
-	type SveltekitReplicaAuthority,
-	type SveltekitReplicaHydration,
-	type SveltekitSessionSource,
+	type SveltekitWindowOperation,
 	type UseSveltekitOperationOptions
 } from './replica.js';
+export type {
+	SveltekitWindowSnapshot,
+	SveltekitWindowStore,
+	UseSveltekitWindowOptions
+} from './window.js';
+// The framework-neutral client contracts, under this entry's names.
+export type {
+	DistributedCommandRuntimeFactory as SveltekitCommandRuntimeFactory,
+	DistributedCommandRuntimeFactoryOptions as SveltekitCommandRuntimeFactoryOptions,
+	DistributedCommandRuntimeLike as SveltekitCommandRuntimeLike,
+	DistributedHydrationAuthority as SveltekitReplicaAuthority,
+	DistributedHydration as SveltekitReplicaHydration,
+	DistributedSessionSource as SveltekitSessionSource
+} from '../client.js';
 export {
 	createDistributedSvelteKitServer,
 	type CreateDistributedSvelteKitServerOptions,

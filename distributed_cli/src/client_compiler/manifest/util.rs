@@ -1,8 +1,3 @@
-use std::collections::BTreeMap;
-
-use serde_json::Value as JsonValue;
-use sha2::{Digest, Sha256};
-
 use super::*;
 
 pub(crate) fn validate_exact_operation_hash(
@@ -19,11 +14,6 @@ pub(crate) fn validate_exact_operation_hash(
         ));
     }
     Ok(())
-}
-
-pub(crate) fn hash_bytes(bytes: &[u8]) -> String {
-    let digest = Sha256::digest(bytes);
-    format!("sha256:{digest:x}")
 }
 
 pub(crate) fn validate_hash(value: &str, label: &str) -> Result<(), ClientCompileError> {
@@ -51,36 +41,20 @@ pub(crate) fn validate_nonempty(value: &str, label: &str) -> Result<(), ClientCo
     Ok(())
 }
 
-pub(crate) fn canonical_json_value(value: JsonValue) -> JsonValue {
-    match value {
-        JsonValue::Array(values) => {
-            JsonValue::Array(values.into_iter().map(canonical_json_value).collect())
-        }
-        JsonValue::Object(values) => {
-            let sorted = values
-                .into_iter()
-                .map(|(key, value)| (key, canonical_json_value(value)))
-                .collect::<BTreeMap<_, _>>();
-            JsonValue::Object(sorted.into_iter().collect())
-        }
-        scalar => scalar,
-    }
-}
-
 #[cfg(test)]
 mod canonical_wire_tests {
-    use super::super::{ManifestFilterExpr, ManifestLitValue, ManifestOperand};
+    use super::super::{FilterExpr, LitValue, Operand};
 
     #[test]
     fn filter_expr_serialization_is_canonical_across_map_backends() {
         let mut value = serde_json::Map::new();
         value.insert("z".into(), serde_json::json!(2));
         value.insert("a".into(), serde_json::json!(1));
-        let expression = ManifestFilterExpr::In {
+        let expression = FilterExpr::In {
             column: "metadata".into(),
-            values: vec![ManifestOperand::Lit(ManifestLitValue::Json(
-                serde_json::Value::Object(value),
-            ))],
+            values: vec![Operand::Lit(LitValue::Json(serde_json::Value::Object(
+                value,
+            )))],
             negated: false,
         };
 

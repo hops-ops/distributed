@@ -1,0 +1,21 @@
+# A minimal Distributed project for the lifecycle tests. A test copies this
+# directory and replaces the three `@...@` placeholders.
+[workspace]
+members = ["service", "runner", "ui"]
+resolver = "2"
+
+[workspace.metadata.distributed.runtime]
+package = "fixture-runner"
+binary = "fixture"
+bind = "127.0.0.1:@API_PORT@"
+
+# The UI is the same listener as the API, started by Cargo, so the project
+# needs no JavaScript toolchain. `install` only has to succeed.
+[workspace.metadata.distributed.ui]
+package_manager = "cargo"
+install = ["--version"]
+check = []
+build = []
+dev = ["run", "--quiet", "--package", "fixture-ui", "--", "{host}:{port}"]
+host = "127.0.0.1"
+port = @UI_PORT@

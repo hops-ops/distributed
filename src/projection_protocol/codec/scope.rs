@@ -3,14 +3,17 @@ use std::sync::Arc;
 
 use super::constants::{PARTITION_ENCODING_DOMAIN, RECORD_KEY_ENCODING_DOMAIN};
 use super::key::{
-    encode_json, encode_typed_key_value, key_column, row_value_from_graphql_json,
-    typed_value_from_json, typed_value_from_row, validate_model_schema, validate_registration_name,
-    CanonicalEncoder, TypedKeyValue,
+    encode_json, encode_typed_key_value, key_column, typed_value_from_row, validate_model_schema,
+    validate_registration_name, CanonicalEncoder, TypedKeyValue,
 };
+#[cfg(any(feature = "graphql", test))]
+use super::key::{row_value_from_graphql_json, typed_value_from_json};
 use super::ProjectionScopeCodecError;
+#[cfg(any(feature = "graphql", test))]
+use crate::projection_protocol::RecordKey;
 use crate::projection_protocol::{
-    ProjectionPartition, ProjectionRecordScope, ProjectorTopologyId, ResolvedProjectionKey,
-    ResolvedProjectionObligation, MAX_PROJECTION_PARTITION_BYTES, MAX_PROJECTION_RECORD_KEY_BYTES,
+    PartitionId, ProjectionRecordScope, ProjectorTopologyId, MAX_PROJECTION_PARTITION_BYTES,
+    MAX_PROJECTION_RECORD_KEY_BYTES,
 };
 use crate::table::{RowKey, TableColumn, TableSchema};
 
@@ -85,7 +88,7 @@ impl ProjectionScopeCodec {
     pub(crate) fn encode_partition(
         &self,
         partition: Option<&serde_json::Value>,
-    ) -> Result<ProjectionPartition, ProjectionScopeCodecError> {
+    ) -> Result<PartitionId, ProjectionScopeCodecError> {
         let mut encoder = CanonicalEncoder::new(
             "projection partition",
             PARTITION_ENCODING_DOMAIN,
@@ -98,35 +101,15 @@ impl ProjectionScopeCodec {
                 encode_json(&mut encoder, partition)?;
             }
         }
-        ProjectionPartition::new(encoder.finish()).map_err(Into::into)
+        PartitionId::new(encoder.finish()).map_err(Into::into)
     }
 
-    /// Lower a command-ledger obligation into its exact durable record scope.
-    #[allow(dead_code)]
-    pub(crate) fn encode_obligation_scope(
-        &self,
-        obligation: &ResolvedProjectionObligation,
-    ) -> Result<ProjectionRecordScope, ProjectionScopeCodecError> {
-        let computed = self.encode_resolved_obligation_scope(
-            &obligation.projector,
-            &obligation.model,
-            &obligation.key,
-            obligation.partition.as_ref(),
-        )?;
-        if computed != obligation.scope {
-            return Err(ProjectionScopeCodecError::StoredScopeMismatch {
-                projector: obligation.projector.clone(),
-                model: obligation.model.clone(),
-            });
-        }
-        Ok(computed)
-    }
-
+    #[cfg(any(feature = "graphql", test))]
     pub(crate) fn encode_resolved_obligation_scope(
         &self,
         projector: &str,
         model: &str,
-        key: &ResolvedProjectionKey,
+        key: &RecordKey,
         partition_value: Option<&serde_json::Value>,
     ) -> Result<ProjectionRecordScope, ProjectionScopeCodecError> {
         self.validate_projector(projector)?;
@@ -207,7 +190,7 @@ impl ProjectionScopeCodec {
     pub(crate) fn encode_row_scope_in_partition(
         &self,
         model: &str,
-        partition: ProjectionPartition,
+        partition: PartitionId,
         key: &RowKey,
     ) -> Result<ProjectionRecordScope, ProjectionScopeCodecError> {
         let schema = self.model(model)?;
@@ -228,6 +211,8 @@ impl ProjectionScopeCodec {
     /// Physical query rows do not carry their hidden causal partition. Query
     /// evidence uses these canonical bytes to find the one live record across
     /// partitions, then returns that record's exact stored scope.
+    // Only the SQL live-record read, for the GraphQL query path, needs it.
+    #[cfg_attr(not(feature = "graphql"), allow(dead_code))]
     pub(crate) fn encode_unpartitioned_row_key(
         &self,
         model: &str,
@@ -244,6 +229,7 @@ impl ProjectionScopeCodec {
     /// decimal string used by GraphQL `BigInt`. Byte keys require canonical
     /// standard-base64. Returned [`RowKey`] values use physical column names,
     /// ready for [`Self::encode_unpartitioned_row_key`].
+    #[cfg(any(feature = "graphql", test))]
     pub(crate) fn row_key_from_json_columns(
         &self,
         model: &str,

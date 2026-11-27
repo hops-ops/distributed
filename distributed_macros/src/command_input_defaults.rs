@@ -65,7 +65,7 @@ impl CommandInputDefaults {
             .into_iter()
             .map(|default| default.expand(&input, &framework));
         quote! {
-            #framework::graphql::__command_input_defaults::<#input>(
+            #framework::command::__command_input_defaults::<#input>(
                 vec![#(#defaults),*]
             )
         }
@@ -75,6 +75,7 @@ impl CommandInputDefaults {
 enum InputDefaultGenerator {
     UuidV7,
     Ulid,
+    Now,
 }
 
 struct InputDefault {
@@ -103,10 +104,11 @@ impl InputDefault {
         let generator = match generator.to_string().as_str() {
             "uuid_v7" => InputDefaultGenerator::UuidV7,
             "ulid" => InputDefaultGenerator::Ulid,
+            "now" => InputDefaultGenerator::Now,
             _ => {
                 return Err(syn::Error::new(
                     generator.span(),
-                    "unknown input-default generator; expected uuid_v7() or ulid()",
+                    "unknown input-default generator; expected uuid_v7(), ulid() or now()",
                 ));
             }
         };
@@ -123,10 +125,13 @@ impl InputDefault {
         let marker = marker_path(input, marker_name);
         match self.generator {
             InputDefaultGenerator::UuidV7 => quote! {
-                #framework::graphql::__input_default_uuid_v7::<#input, #marker>()
+                #framework::command::__input_default_uuid_v7::<#input, #marker>()
             },
             InputDefaultGenerator::Ulid => quote! {
-                #framework::graphql::__input_default_ulid::<#input, #marker>()
+                #framework::command::__input_default_ulid::<#input, #marker>()
+            },
+            InputDefaultGenerator::Now => quote! {
+                #framework::command::__input_default_now::<#input, #marker>()
             },
         }
     }

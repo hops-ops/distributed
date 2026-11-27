@@ -6,11 +6,11 @@ use std::sync::Arc;
 use crate::graphql::SurfaceProjector;
 #[cfg(feature = "graphql")]
 use crate::projection::lower::ProjectionDescriptor;
-use crate::projection_protocol::{CompiledProjectionTopology, ProjectionEpoch};
+#[cfg(feature = "graphql")]
+use crate::projection::ProjectionProgramId;
+use crate::projection_protocol::CompiledProjectionTopology;
 use crate::read_model::RelationalReadModel;
 use crate::table::TableSchema;
-#[cfg(feature = "graphql")]
-use crate::ProjectionProgramId;
 
 use super::super::dependencies::CausalProjectionRouteDependencies;
 use super::super::service::{HandlerSpec, Routes};
@@ -187,18 +187,6 @@ where
                 self.declaration.name
             );
         }
-        let change_epoch = self.declaration.change_epoch.as_ref().unwrap_or_else(|| {
-            panic!(
-                "causal projector `{}` requires a change-log epoch",
-                self.declaration.name
-            )
-        });
-        let change_epoch = ProjectionEpoch::new(change_epoch.clone()).unwrap_or_else(|error| {
-            panic!(
-                "causal projector `{}` has an invalid change-log epoch: {error}",
-                self.declaration.name
-            )
-        });
         let compiled = CompiledProjectionTopology::compile(
             &self.declaration.name,
             &self.declaration.facts,
@@ -217,7 +205,6 @@ where
             spec,
             Box::new(RegisteredProjector::<I> {
                 compiled,
-                change_epoch,
                 handle: boxed_projector_handler(handler),
             }),
         )

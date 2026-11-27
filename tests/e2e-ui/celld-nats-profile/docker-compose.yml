@@ -2,7 +2,7 @@
 # Not the default playground (`tests/e2e-ui/docker/docker-compose.yml` + make run).
 # Not a three-process GraphQL/commands/projectors matrix.
 #
-# NATS only. celld 0.4 runs through its CLI with a persistent local dev store.
+# NATS only. celld runs through its CLI with a persistent local dev store.
 #
 #   docker compose -f tests/e2e-ui/celld-nats-profile/docker-compose.yml up -d
 #   NATS_URL=nats://127.0.0.1:14222

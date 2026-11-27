@@ -1,21 +1,32 @@
 # e2e-celld
 
-New example, sibling of `tests/e2e-ui`. It is **not** `make run` in e2e-ui.
+The e2e-ui application on another command host. It is **not** `make run` in
+e2e-ui: the modules are the same, the host is not.
 
 | Crate | Role |
 |---|---|
-| `todo-domain` / `chat-domain` / `blob-domain` | **same** domain crates as e2e-ui (path deps) |
-| `e2e-celld-todo` | Todo mounts + `CelldRoute` (kind/shard/payload) for `TodoCell` |
-| `e2e-celld-chat` | Chat mounts + `CelldRoute` for `ChatCell`; `@live` stays here |
-| `e2e-celld-blob` | Blob Atomic commands (in-process) |
-| `e2e-celld-identity` | Zitadel ingress/scrape + AuthUsers projector |
-| `e2e-celld-graphql` | GraphQL process (`graphql_router_with_host`) |
-| `tests/celld/worker` | `TodoCell` + `ChatCell` |
+| `e2e-service` (`../e2e-ui/crates/service`) | **the** e2e-ui service: modules, projections, GraphQL surfaces, Zitadel ingestor, `build_service` |
+| `e2e-celld-runner` (`crates/runner`) | the celld host: command routing, NATS bus, Queue relay route, `e2e-celld` binary |
+| `tests/celld/worker` | `TodoCell` + `ChatCell` over the same `todo-domain` / `chat-domain` declarations |
 | `tests/celld/relay-worker` | Queue-only canonical-message relay |
 
-`distributed::cell_host::CelldCommandHost` wait-dispatches `todo.create` /
-`todo.complete` / `chat.post` to `{CELLD_URL}/{kind}/{shard}/{command}`.
-Aggregate crates only supply a `CelldRoute` (kind, shard id, payload map).
+The runner mounts `e2e_service::build_service` unchanged and adds only what
+celld changes:
+
+```rust
+CelldCommandHost::new(celld_url, service, internal_secret)?
+    .route_aggregate::<Todo>()?
+    .route_aggregate::<ChatMessage>()?
+```
+
+`route_aggregate::<A>()` routes every command of `A` mounted on the service
+to `{CELLD_URL}/{kind}/{shard}/{command}`: `kind` is `A::aggregate_type()`
+(`todo`, `chat_message`), `shard` the declaration's `shard:`. The cell answers
+with the command's typed payload, and the host returns it as-is after checking
+it against the declared output: a missing, undeclared or mistyped field fails
+the command; nothing is filled in. A command of `A` without a declared shard
+fails `route_aggregate` at startup.
+
 The cell commits its complete aggregate state and outbox as one versioned
 SQLite value, then publishes pending messages to celld Queue through
 `CelldQueuePublisher`. A Queue-only Worker relays canonical messages to the
@@ -51,11 +62,18 @@ make test               # cargo test --workspace (CI)
 ```sh
 cd tests/e2e-ui
 make up                 # Zitadel + Postgres (read models + login)
-make up-celld-nats      # celld 0.4 local store + NATS
+make up-celld-nats      # celld local store + Queue relay + NATS
 
 cd ../e2e-celld
-make run                # GraphQL :8791 + UI :5180 (watches sources)
+make run                # public gateway :8791 + internal UI :5180 (watches sources)
+make test-browser       # the full e2e-ui Playwright suite against this app
 ```
+
+`make test-browser` runs every Playwright project (setup, user, admin, anon)
+of `tests/e2e-ui` against this app; CI's live celld job does the same. On a
+cold checkout, build once first (`cargo run -p distributed_cli -- build
+tests/e2e-celld` from the repository root): `distributed dev` gives the API
+five minutes to become ready, and a cold compile can take longer.
 
 Eventual projectors and `@live` use **Postgres** from `e2e-ui.env`
 (`DATABASE_URL`). There is no SQLite read-model path. Cells still keep
@@ -78,8 +96,9 @@ The Cargo workspace declares `../e2e-ui/ui` as its UI component. Both
 `distributed build` and `distributed dev` resolve it within the repository;
 CI and users do not launch a second unmanaged `npm run dev` process.
 
-Open `http://localhost:5180`. The navbar shows a **celld** badge. Sign in
+Open `http://localhost:8791`. The navbar shows a **celld** badge. Sign in
 (`alice` / `Password1!` when Zitadel is up). Todos create/complete and
 lobby posts go to cells; open Chat in two tabs to see `@live` still fire.
 
-Override a busy celld port: `CELLD_HTTP_PORT=18880 make run`.
+celld listens on 18880 by default (Zitadel owns 18080). Override a busy port
+with `CELLD_HTTP_PORT=<port>` on both `make up-celld-nats` and `make run`.

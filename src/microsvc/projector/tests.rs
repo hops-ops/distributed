@@ -11,36 +11,43 @@ use crate::projection_protocol::{
     ProjectionInputCursor, ProjectionProtocolStore, ProjectionQuerySnapshotRequest,
 };
 #[cfg(feature = "graphql")]
-use crate::projection_protocol::{ProjectionEpoch, ProjectionScopeCodec, ProjectorTopologyId};
+use crate::projection_protocol::{ProjectionScopeCodec, ProjectorTopologyId};
+use crate::read_model::RelationalReadModel;
 use crate::table::{RowKey, RowValue};
-use crate::{InMemoryRepository, RelationalReadModel};
+use crate::InMemoryRepository;
 
 use crate::microsvc::Service;
 
 const FACT_NAME: &str = "task15.todo_changed";
 
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, crate::DomainState)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, crate::domain_event::DomainState)]
 #[domain_state(version = 1)]
 struct TodoChanged {
     id: String,
     title: String,
 }
 
-#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize, crate::ReadModel)]
+#[derive(
+    Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize, crate::read_model::ReadModel,
+)]
 #[readmodel(table = "task15_primary_views", primary_key = ["id"])]
 struct PrimaryView {
     id: String,
     title: String,
 }
 
-#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize, crate::ReadModel)]
+#[derive(
+    Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize, crate::read_model::ReadModel,
+)]
 #[readmodel(table = "task15_secondary_views", primary_key = ["id"])]
 struct SecondaryView {
     id: String,
     title: String,
 }
 
-#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize, crate::ReadModel)]
+#[derive(
+    Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize, crate::read_model::ReadModel,
+)]
 #[readmodel(table = "task15_malformed_views", primary_key = ["id"])]
 struct MalformedView {
     id: String,
@@ -48,146 +55,86 @@ struct MalformedView {
 
 #[cfg(feature = "graphql")]
 fn generated_modeled_projector_program(
-) -> Result<crate::ProjectionProgram, crate::ProjectionProgramError> {
+) -> Result<crate::projection::ProjectionProgram, crate::projection::ProjectionProgramError> {
+    modeled_projector_program("title")
+}
+
+/// The projector's program, with the row's title taken from the event's
+/// `title_from` field.
+#[cfg(feature = "graphql")]
+fn modeled_projector_program(
+    title_from: &'static str,
+) -> Result<crate::projection::ProjectionProgram, crate::projection::ProjectionProgramError> {
     use crate::mutation::{
-        body_field_binding, compile_projection, MutationAssignment, MutationConflictTarget,
-        MutationEventBinding, MutationExpression, MutationField, MutationKeyField, MutationKind,
-        MutationOperation, MutationProgram, ProjectionHandler,
+        body_field_binding, compile_projection, MutationColumn, MutationOperation, MutationProgram,
+        ProjectionHandler,
     };
+    use crate::projection::MutationKind;
     use crate::projection::{
         ProjectionEventSelector, ProjectionPartition, ProjectionTarget, ProjectionValueType,
     };
 
-    let string_path = |segments: &[&str]| {
-        MutationExpression::input_path(
-            ProjectionValueType::String,
-            segments.iter().copied().map(str::to_owned),
-        )
-        .map_err(|e| crate::ProjectionProgramError::InvalidOperation {
-            operation: "task11-generated-multi-table".into(),
-            reason: e.to_string(),
-        })
-    };
-    let key_id = || {
-        MutationKeyField::try_new(0, "id", string_path(&["id"])?).map_err(|e| {
-            crate::ProjectionProgramError::InvalidOperation {
-                operation: "task11-generated-multi-table".into(),
-                reason: e.to_string(),
-            }
-        })
-    };
-    let field = |ordinal, name, path: &[&str]| {
-        MutationField::try_new(ordinal, name, MutationAssignment::set(string_path(path)?)).map_err(
-            |e| crate::ProjectionProgramError::InvalidOperation {
-                operation: "task11-generated-multi-table".into(),
-                reason: e.to_string(),
-            },
-        )
-    };
-    let primary = MutationOperation::try_new(
-        "upsert-primary",
-        0,
-        MutationKind::Upsert,
-        ProjectionTarget::try_new("PrimaryView", "task15_primary_views")?,
-        vec![key_id()?],
-        vec![field(0, "id", &["id"])?, field(1, "title", &["title"])?],
-        Some(MutationConflictTarget::PrimaryKey),
-        Vec::new(),
-        Vec::new(),
-        None,
-    )
-    .map_err(|e| crate::ProjectionProgramError::InvalidOperation {
-        operation: "task11-generated-multi-table".into(),
-        reason: e.to_string(),
-    })?;
-    let secondary = MutationOperation::try_new(
-        "upsert-secondary",
+    let column = |name: &str| MutationColumn::try_new(name, ProjectionValueType::String, [name]);
+    let mutation = MutationProgram::try_new(
+        "task11_multi_mutation",
         1,
-        MutationKind::Upsert,
-        ProjectionTarget::try_new("SecondaryView", "task15_secondary_views")?,
-        vec![key_id()?],
-        vec![field(0, "id", &["id"])?, field(1, "title", &["title"])?],
-        Some(MutationConflictTarget::PrimaryKey),
-        Vec::new(),
-        Vec::new(),
-        None,
-    )
-    .map_err(|e| crate::ProjectionProgramError::InvalidOperation {
-        operation: "task11-generated-multi-table".into(),
-        reason: e.to_string(),
-    })?;
-    let mutation_program =
-        MutationProgram::try_new("task11_multi_mutation", 1, vec![primary, secondary]).map_err(
-            |e| crate::ProjectionProgramError::InvalidOperation {
-                operation: "task11-generated-multi-table".into(),
-                reason: e.to_string(),
-            },
-        )?;
-    let selector =
-        ProjectionEventSelector::try_from_descriptor(&crate::DomainEventDescriptor::state::<
-            TodoChanged,
-        >("task15.todo_changed", 1))?;
-    let bindings = vec![
-        body_field_binding(["id"], ["id"], ProjectionValueType::String).map_err(|e| {
-            crate::ProjectionProgramError::InvalidOperation {
-                operation: "task11-generated-multi-table".into(),
-                reason: e.to_string(),
-            }
-        })?,
-        body_field_binding(["title"], ["title"], ProjectionValueType::String).map_err(|e| {
-            crate::ProjectionProgramError::InvalidOperation {
-                operation: "task11-generated-multi-table".into(),
-                reason: e.to_string(),
-            }
-        })?,
-    ];
-    let binding =
-        MutationEventBinding::try_new(selector, bindings, mutation_program).map_err(|e| {
-            crate::ProjectionProgramError::InvalidOperation {
-                operation: "task11-generated-multi-table".into(),
-                reason: e.to_string(),
-            }
-        })?;
+        vec![
+            MutationOperation::try_new(
+                "upsert-primary",
+                MutationKind::Upsert,
+                ProjectionTarget::try_new("PrimaryView", "task15_primary_views")?,
+                vec![column("id")?],
+                vec![column("id")?, column("title")?],
+            )?,
+            MutationOperation::try_new(
+                "upsert-secondary",
+                MutationKind::Upsert,
+                ProjectionTarget::try_new("SecondaryView", "task15_secondary_views")?,
+                vec![column("id")?],
+                vec![column("id")?, column("title")?],
+            )?,
+        ],
+    )?;
+    let selector = ProjectionEventSelector::try_from_descriptor(
+        &crate::domain_event::DomainEventDescriptor::state::<TodoChanged>("task15.todo_changed", 1),
+    )?;
     compile_projection(
         "task11-generated-multi-table",
         1,
         ProjectionPartition::Unit,
-        [ProjectionHandler::from_binding("changed", binding)],
+        [ProjectionHandler::try_new(
+            "changed",
+            selector,
+            vec![
+                body_field_binding(["id"], ["id"], ProjectionValueType::String)?,
+                body_field_binding(["title"], [title_from], ProjectionValueType::String)?,
+            ],
+            mutation,
+        )?],
     )
-    .map_err(|e| crate::ProjectionProgramError::InvalidOperation {
-        operation: "task11-generated-multi-table".into(),
-        reason: e.to_string(),
-    })
-}
-
-#[cfg(feature = "graphql")]
-fn generated_modeled_projector_resolve(
-    occurrence: &crate::DomainEventOccurrence,
-) -> Result<crate::ResolvedProjectionPlan, crate::ProjectionProgramError> {
-    crate::mutation::resolve_mutation_program(&generated_modeled_projector_program()?, occurrence)
 }
 
 #[cfg(feature = "graphql")]
 fn generated_modeled_projector_lower(
-    plan: &crate::ResolvedProjectionPlan,
+    plan: &crate::projection::ResolvedProjectionPlan,
 ) -> Result<
     crate::projection::lower::LoweredProjectionPlan,
     crate::projection::lower::ProjectionLoweringError,
 > {
     use crate::projection::lower::{finish_lowering, lower_model_mutation};
-    let mut builder = crate::read_model::ReadModelWritePlanBuilder::new();
+    let mut records = Vec::new();
     for mutation in plan.mutations() {
         match mutation.target().model() {
-            "PrimaryView" => lower_model_mutation::<PrimaryView>(&mut builder, mutation)?,
-            "SecondaryView" => lower_model_mutation::<SecondaryView>(&mut builder, mutation)?,
+            "PrimaryView" => records.push(lower_model_mutation::<PrimaryView>(mutation)?),
+            "SecondaryView" => records.push(lower_model_mutation::<SecondaryView>(mutation)?),
             other => {
                 return Err(crate::projection::lower::ProjectionLoweringError::Table(
-                    crate::TableStoreError::Metadata(format!("unknown model `{other}`")),
+                    crate::table::TableStoreError::Metadata(format!("unknown model `{other}`")),
                 ));
             }
         }
     }
-    finish_lowering(builder, plan)
+    finish_lowering(plan, records)
 }
 
 #[cfg(feature = "graphql")]
@@ -208,12 +155,31 @@ fn generated_modeled_projector_inventory() -> Result<
 #[cfg(feature = "graphql")]
 const GENERATED_MODELED_PROJECTOR: crate::projection::lower::ProjectionDescriptor<
     crate::projection::lower::EventualOnly,
-> = crate::mutation::descriptor_from_factories(
+> = crate::projection::lower::ProjectionDescriptor::new(
     "task11-generated-multi-table",
     1,
-    "task11-generated-v1",
-    generated_modeled_projector_program,
-    generated_modeled_projector_resolve,
+    || {
+        static PROGRAM: crate::projection::lower::ProjectionProgramCell =
+            crate::projection::lower::ProjectionProgramCell::new();
+        PROGRAM.get_or_build(generated_modeled_projector_program)
+    },
+    generated_modeled_projector_lower,
+    generated_modeled_projector_inventory,
+);
+
+/// The same projection after a release changed its program: the title is
+/// now the event's id.
+#[cfg(feature = "graphql")]
+const CHANGED_MODELED_PROJECTOR: crate::projection::lower::ProjectionDescriptor<
+    crate::projection::lower::EventualOnly,
+> = crate::projection::lower::ProjectionDescriptor::new(
+    "task11-generated-multi-table",
+    1,
+    || {
+        static PROGRAM: crate::projection::lower::ProjectionProgramCell =
+            crate::projection::lower::ProjectionProgramCell::new();
+        PROGRAM.get_or_build(|| modeled_projector_program("id"))
+    },
     generated_modeled_projector_lower,
     generated_modeled_projector_inventory,
 );
@@ -222,14 +188,12 @@ fn primary_projector() -> SurfaceProjector {
     SurfaceProjector::new("task15_a_primary")
         .facts([FACT_NAME])
         .models(["PrimaryView"])
-        .change_epoch("task15-primary-v1")
 }
 
 fn secondary_projector() -> SurfaceProjector {
     SurfaceProjector::new("task15_b_secondary")
         .facts([FACT_NAME])
         .models(["SecondaryView"])
-        .change_epoch("task15-secondary-v1")
 }
 
 fn fact_message(id: &str, title: &str) -> Message {
@@ -250,6 +214,16 @@ fn row_key(id: &str) -> RowKey {
 fn generated_modeled_projector(
     route: crate::projection::placement::ProjectionExecutorRoute,
 ) -> (SurfaceProjector, ProjectorTopologyId) {
+    modeled_projector(GENERATED_MODELED_PROJECTOR, route)
+}
+
+#[cfg(feature = "graphql")]
+fn modeled_projector(
+    descriptor: crate::projection::lower::ProjectionDescriptor<
+        crate::projection::lower::EventualOnly,
+    >,
+    route: crate::projection::placement::ProjectionExecutorRoute,
+) -> (SurfaceProjector, ProjectorTopologyId) {
     use crate::graphql::SurfaceModeledProjection;
     use crate::projection::catalog::{ProjectionBindingActivation, ProjectionCatalog};
     use crate::projection::placement::{
@@ -259,7 +233,7 @@ fn generated_modeled_projector(
 
     let topology = ProjectorTopologyId::new(1, "task11-generated-runtime", [0x6b; 32]).unwrap();
     let binding = ProjectionBinding::materialize_eventual(
-        GENERATED_MODELED_PROJECTOR.eventual(),
+        descriptor.eventual(),
         ProjectionSourceBinding::try_new("task11-domain", "ordered-domain-events", 1).unwrap(),
         ProjectionOwner::try_new("task11-generated-owner").unwrap(),
         "distributed-projection-partition",
@@ -284,24 +258,16 @@ fn generated_modeled_projector(
     .unwrap();
     let catalog = ProjectionCatalog::try_new(vec![binding.clone()]).unwrap();
     let active = catalog
-        .activate(
-            vec![ProjectionBindingActivation::new(
-                binding.id(),
-                binding.program_id(),
-                ProjectionEpoch::new("task11-generated-v1").unwrap(),
-                ProjectionBindingState::Active,
-                Some(route),
-            )],
-            None,
-        )
+        .activate(vec![ProjectionBindingActivation::new(
+            binding.id(),
+            binding.program_id(),
+            ProjectionBindingState::Active,
+            Some(route),
+        )])
         .unwrap();
-    let modeled = SurfaceModeledProjection::try_from_descriptor(
-        GENERATED_MODELED_PROJECTOR,
-        &catalog,
-        &active,
-        binding.id(),
-    )
-    .unwrap();
+    let modeled =
+        SurfaceModeledProjection::try_from_descriptor(descriptor, &catalog, &active, binding.id())
+            .unwrap();
     (
         SurfaceProjector::new("task11-generated-runtime").modeled(modeled),
         topology,
@@ -354,7 +320,7 @@ async fn explicit_modeled_projector_handler_applies_the_compiled_projection() {
         .await
         .unwrap();
 
-    service.run(RunOptions::idempotent()).await.unwrap();
+    service.run(RunOptions::until_idle()).await.unwrap();
 
     assert!(invoked.load(Ordering::Acquire));
     let ordered = bus.ordered_topic_evidence(FACT_NAME, 0);
@@ -380,9 +346,9 @@ async fn explicit_modeled_projector_handler_applies_the_compiled_projection() {
 
 #[cfg(feature = "graphql")]
 fn modeled_fact_message(id: &str, title: &str, event_version: u64) -> Message {
-    let mut occurrence = crate::DomainEventOccurrence::capture(
-        crate::DomainEventDescriptor::state::<TodoChanged>(FACT_NAME, event_version),
-        crate::DomainEventEnvelope {
+    let mut occurrence = crate::domain_event::DomainEventOccurrence::capture(
+        crate::domain_event::DomainEventDescriptor::state::<TodoChanged>(FACT_NAME, event_version),
+        crate::domain_event::DomainEventEnvelope {
             aggregate_type: "todo".into(),
             aggregate_id: id.into(),
             aggregate_sequence: 1,
@@ -515,7 +481,7 @@ async fn the_same_catalog_program_executes_in_a_separate_projector_service() {
         .await
         .unwrap();
     projector_service
-        .run(RunOptions::idempotent())
+        .run(RunOptions::until_idle())
         .await
         .unwrap();
 
@@ -613,7 +579,7 @@ async fn generated_mount_applies_both_modeled_rows_through_one_causal_commit() {
         .await
         .unwrap();
 
-    service.run(RunOptions::idempotent()).await.unwrap();
+    service.run(RunOptions::until_idle()).await.unwrap();
 
     let ordered = bus.ordered_topic_evidence(FACT_NAME, 0);
     let primary = repository
@@ -662,6 +628,154 @@ async fn generated_mount_applies_both_modeled_rows_through_one_causal_commit() {
     }
 }
 
+/// The stored change epoch of the modeled projector's one partition, read
+/// from the head of its change log.
+#[cfg(feature = "graphql")]
+async fn stored_change_epoch(
+    repository: &InMemoryRepository,
+    topology: &ProjectorTopologyId,
+) -> crate::projection_protocol::ProjectionEpoch {
+    use crate::projection_protocol::ProjectionChangeRead;
+
+    let partition = ProjectionScopeCodec::new(topology.clone())
+        .encode_partition(None)
+        .unwrap();
+    match repository
+        .projection_changes(topology, &partition, None, 100)
+        .await
+        .unwrap()
+    {
+        ProjectionChangeRead::Changes {
+            head: Some(head), ..
+        } => head.epoch().clone(),
+        other => panic!("the partition has a readable change log: {other:?}"),
+    }
+}
+
+#[cfg(feature = "graphql")]
+async fn modeled_title(
+    repository: &InMemoryRepository,
+    topology: &ProjectorTopologyId,
+    bus: &InMemoryBus,
+    id: &str,
+) -> Option<String> {
+    let ordered = bus.ordered_topic_evidence(FACT_NAME, 0);
+    repository
+        .projection_query_snapshot(&modeled_snapshot_request(
+            topology,
+            &ordered,
+            "PrimaryView",
+            PrimaryView::schema(),
+            id,
+        ))
+        .await
+        .unwrap()
+        .row
+        .and_then(|row| row.get_serde::<String>("title").ok())
+}
+
+/// A store an earlier release wrote: its partition was created with the
+/// epoch the application declared then. The service starts on it and
+/// delivers into the same change log, with nothing reset or refused.
+#[cfg(feature = "graphql")]
+#[tokio::test]
+async fn a_partition_created_with_a_declared_epoch_keeps_it_when_the_service_starts() {
+    use crate::projection::placement::ProjectionExecutorRoute;
+    use crate::projection_protocol::ProjectionEpoch;
+
+    let repository = InMemoryRepository::new();
+    let bus = InMemoryBus::new();
+    let (projector, topology) = modeled_projector(
+        GENERATED_MODELED_PROJECTOR,
+        ProjectionExecutorRoute::local("task11-service").unwrap(),
+    );
+    let declared = ProjectionEpoch::new("todos-v1").unwrap();
+    repository.insert_projection_partition(
+        &topology,
+        &ProjectionScopeCodec::new(topology.clone())
+            .encode_partition(None)
+            .unwrap(),
+        &declared,
+    );
+    let service = Service::new()
+        .named("task11-service")
+        .routes(
+            Routes::new()
+                .with_read_model_store(repository.clone())
+                .consume_projection(projector),
+        )
+        .with_bus(bus.clone());
+    bus.publish_message(modeled_fact_message("todo-kept", "delivered", 1))
+        .await
+        .unwrap();
+
+    service.run(RunOptions::until_idle()).await.unwrap();
+
+    assert_eq!(
+        modeled_title(&repository, &topology, &bus, "todo-kept")
+            .await
+            .as_deref(),
+        Some("delivered")
+    );
+    assert_eq!(stored_change_epoch(&repository, &topology).await, declared);
+}
+
+/// During a rollout two nodes of one service run different programs of the
+/// same projection. Both write the one partition: each event is projected by
+/// the program of the node that received it, into one change log.
+#[cfg(feature = "graphql")]
+#[tokio::test]
+async fn nodes_on_different_projection_programs_write_the_same_partition() {
+    use crate::projection::placement::ProjectionExecutorRoute;
+
+    let repository = InMemoryRepository::new();
+    let bus = InMemoryBus::new();
+    let node = |descriptor| {
+        let (projector, topology) = modeled_projector(
+            descriptor,
+            ProjectionExecutorRoute::local("task11-service").unwrap(),
+        );
+        let service = Service::new()
+            .named("task11-service")
+            .routes(
+                Routes::new()
+                    .with_read_model_store(repository.clone())
+                    .consume_projection(projector),
+            )
+            .with_bus(bus.clone());
+        (service, topology)
+    };
+    let (previous, topology) = node(GENERATED_MODELED_PROJECTOR);
+    let (next, next_topology) = node(CHANGED_MODELED_PROJECTOR);
+    assert_eq!(topology, next_topology);
+    assert_ne!(
+        GENERATED_MODELED_PROJECTOR.program_id().unwrap(),
+        CHANGED_MODELED_PROJECTOR.program_id().unwrap()
+    );
+
+    bus.publish_message(modeled_fact_message("todo-1", "first", 1))
+        .await
+        .unwrap();
+    previous.run(RunOptions::until_idle()).await.unwrap();
+    let epoch = stored_change_epoch(&repository, &topology).await;
+
+    bus.publish_message(modeled_fact_message("todo-2", "second", 1))
+        .await
+        .unwrap();
+    next.run(RunOptions::until_idle()).await.unwrap();
+    bus.publish_message(modeled_fact_message("todo-3", "third", 1))
+        .await
+        .unwrap();
+    let (previous, _) = node(GENERATED_MODELED_PROJECTOR);
+    previous.run(RunOptions::until_idle()).await.unwrap();
+
+    let title = |id| modeled_title(&repository, &topology, &bus, id);
+    assert_eq!(title("todo-1").await.as_deref(), Some("first"));
+    assert_eq!(title("todo-2").await.as_deref(), Some("todo-2"));
+    assert_eq!(title("todo-3").await.as_deref(), Some("third"));
+    assert_eq!(stored_change_epoch(&repository, &topology).await, epoch);
+}
+
 #[cfg(feature = "graphql")]
 #[tokio::test]
 async fn same_name_different_version_is_an_empty_unit_checkpoint_not_a_failure() {
@@ -683,7 +797,7 @@ async fn same_name_different_version_is_an_empty_unit_checkpoint_not_a_failure()
         .await
         .unwrap();
 
-    service.run(RunOptions::idempotent()).await.unwrap();
+    service.run(RunOptions::until_idle()).await.unwrap();
 
     let ordered = bus.ordered_topic_evidence(FACT_NAME, 0);
     let snapshot = repository
@@ -768,7 +882,7 @@ async fn public_builder_fans_one_fact_out_and_replays_partial_success_exactly() 
         .await
         .unwrap();
 
-    service.run(RunOptions::idempotent()).await.unwrap();
+    service.run(RunOptions::until_idle()).await.unwrap();
     assert_eq!(
         *calls.lock().unwrap(),
         vec!["primary", "secondary", "secondary"],
@@ -878,17 +992,427 @@ async fn service_fans_same_fact_out_across_projector_only_route_bundles() {
     bus.publish_message(fact_message("todo-2", "cross bundle"))
         .await
         .unwrap();
-    service.run(RunOptions::idempotent()).await.unwrap();
+    service.run(RunOptions::until_idle()).await.unwrap();
 
     assert_eq!(INFERRED_PRIMARY_CALLS.load(Ordering::SeqCst), 1);
     assert_eq!(secondary_calls.load(Ordering::SeqCst), 1);
+}
+
+/// Two projectors of one fact in a named service. With `primary_rejects` the
+/// primary projector's handler refuses every input it is given, the way a
+/// release with a deterministic projection bug does.
+fn two_projector_service(
+    repository: &InMemoryRepository,
+    primary_rejects: bool,
+    applied: &Arc<Mutex<Vec<(&'static str, String)>>>,
+) -> Service {
+    let primary_applied = Arc::clone(applied);
+    let secondary_applied = Arc::clone(applied);
+    Service::new().named("task15-isolation").routes(
+        Routes::new()
+            .with_read_model_store(repository.clone())
+            .causal_projector::<TodoChanged>(primary_projector())
+            .model::<PrimaryView>()
+            .handle(move |context: CausalProjectorContext, fact: TodoChanged| {
+                let applied = Arc::clone(&primary_applied);
+                async move {
+                    applied.lock().unwrap().push(("primary", fact.id.clone()));
+                    if primary_rejects {
+                        return Err(HandlerError::rejected("the primary view cannot hold this"));
+                    }
+                    context
+                        .project(&PrimaryView {
+                            id: fact.id,
+                            title: fact.title,
+                        })
+                        .await?;
+                    Ok(())
+                }
+            })
+            .causal_projector::<TodoChanged>(secondary_projector())
+            .model::<SecondaryView>()
+            .handle(move |context: CausalProjectorContext, fact: TodoChanged| {
+                let applied = Arc::clone(&secondary_applied);
+                async move {
+                    applied.lock().unwrap().push(("secondary", fact.id.clone()));
+                    context
+                        .project(&SecondaryView {
+                            id: fact.id,
+                            title: fact.title,
+                        })
+                        .await?;
+                    Ok(())
+                }
+            }),
+    )
+}
+
+/// The 2026-11-25 halt: a rollout leaves one projection unable to accept its
+/// inputs. That projector must stop alone with a recorded failure, and resume
+/// from its failed input once the release is corrected and the failure
+/// repaired.
+#[tokio::test]
+async fn a_projector_that_rejects_its_input_stops_alone_and_resumes_after_repair() {
+    rejecting_projector_stops_alone_and_resumes_after_repair(InMemoryBus::new()).await;
+}
+
+/// The same on a durable bus whose group is set explicitly, as an
+/// application does: the projectors still consume as separate groups.
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn a_rejecting_projector_stops_alone_on_a_sql_bus_with_an_explicit_group() {
+    use sqlx::Row as _;
+
+    let directory =
+        std::env::temp_dir().join(format!("projector-isolation-{}", uuid::Uuid::now_v7()));
+    std::fs::create_dir(&directory).unwrap();
+    struct Cleanup(std::path::PathBuf);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    let _cleanup = Cleanup(directory.clone());
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .connect_with(
+            sqlx::sqlite::SqliteConnectOptions::new()
+                .filename(directory.join("bus.sqlite"))
+                .create_if_missing(true),
+        )
+        .await
+        .unwrap();
+    let bus = crate::bus::SqliteBus::new(pool.clone()).group("isolation");
+    bus.ensure_tables().await.unwrap();
+
+    rejecting_projector_stops_alone_and_resumes_after_repair(bus).await;
+
+    let mut consumers: Vec<String> = sqlx::query("SELECT consumer FROM bus_offset")
+        .fetch_all(&pool)
+        .await
+        .unwrap()
+        .iter()
+        .map(|row| row.get("consumer"))
+        .collect();
+    consumers.sort();
+    assert_eq!(
+        consumers,
+        ["isolation-task15_a_primary", "isolation-task15_b_secondary"],
+        "one cursor per projector; the service has no event handler of its own"
+    );
+}
+
+async fn rejecting_projector_stops_alone_and_resumes_after_repair<B>(bus: B)
+where
+    B: Bus + crate::bus::BusConsumer + Clone + 'static,
+{
+    let repository = InMemoryRepository::new();
+    let applied = Arc::new(Mutex::new(Vec::new()));
+    let take = |applied: &Arc<Mutex<Vec<(&'static str, String)>>>| {
+        std::mem::take(&mut *applied.lock().unwrap())
+    };
+    let ids = |projector: &str, applied: &[(&'static str, String)]| -> Vec<String> {
+        applied
+            .iter()
+            .filter(|(name, _)| *name == projector)
+            .map(|(_, id)| id.clone())
+            .collect()
+    };
+
+    bus.publish_message(fact_message("a", "before the rollout"))
+        .await
+        .unwrap();
+    two_projector_service(&repository, false, &applied)
+        .with_bus(bus.clone())
+        .run(RunOptions::until_idle())
+        .await
+        .unwrap();
+    let before = take(&applied);
+    assert_eq!(ids("primary", &before), ["a"]);
+    assert_eq!(ids("secondary", &before), ["a"]);
+
+    // The rollout: the primary projector now rejects its inputs.
+    for id in ["b", "c"] {
+        bus.publish_message(fact_message(id, "after the rollout"))
+            .await
+            .unwrap();
+    }
+    let stopped = two_projector_service(&repository, true, &applied)
+        .with_bus(bus.clone())
+        .run(RunOptions::until_idle())
+        .await
+        .expect_err("the rejecting projector reports its terminal stop");
+    assert!(stopped.is_permanent() && stopped.should_retain_and_stop());
+    let handle = repair_handle(&stopped);
+    assert!(
+        matches!(
+            stopped
+                .source()
+                .and_then(|source| source.downcast_ref::<HandlerError>()),
+            Some(HandlerError::ProjectionTerminalRecorded { projection, .. })
+                if projection == "task15_a_primary"
+        ),
+        "the failure is recorded and names its projection: {stopped}"
+    );
+    assert!(
+        stopped.to_string().contains("task15_a_primary"),
+        "{stopped}"
+    );
+    let during = take(&applied);
+    assert_eq!(
+        ids("secondary", &during),
+        ["b", "c"],
+        "the other projector keeps delivering, in order"
+    );
+    assert_eq!(
+        ids("primary", &during),
+        ["b"],
+        "no later input passes the failed one"
+    );
+
+    // A restart changes nothing: the stop is durable and still local.
+    bus.publish_message(fact_message("d", "while stopped"))
+        .await
+        .unwrap();
+    let still_stopped = two_projector_service(&repository, true, &applied)
+        .with_bus(bus.clone())
+        .run(RunOptions::until_idle())
+        .await
+        .expect_err("the stop survives a restart");
+    assert_eq!(repair_handle(&still_stopped), handle);
+    // A host learns of the stop from the store, without the run's error.
+    let stopped_service = two_projector_service(&repository, true, &applied);
+    assert_eq!(
+        stopped_service.stopped_projections().await.unwrap(),
+        [crate::microsvc::StoppedProjection {
+            projection: "task15_a_primary".into(),
+            repair: handle.clone(),
+        }]
+    );
+    let while_stopped = take(&applied);
+    assert_eq!(ids("secondary", &while_stopped), ["d"]);
+    assert!(ids("primary", &while_stopped).is_empty());
+
+    // The release is corrected and the operator repairs the failure.
+    let repaired = two_projector_service(&repository, false, &applied);
+    assert_eq!(repaired.repair_projection(&handle).await.unwrap().get(), 2);
+    assert!(repaired.stopped_projections().await.unwrap().is_empty());
+    repaired
+        .with_bus(bus.clone())
+        .run(RunOptions::until_idle())
+        .await
+        .unwrap();
+    let after = take(&applied);
+    assert_eq!(
+        ids("primary", &after),
+        ["b", "c", "d"],
+        "the repaired projector resumes from its failed input"
+    );
+    assert!(ids("secondary", &after).is_empty());
+}
+
+/// A long-running service does not return when a projector stops. A host
+/// still learns which projector stopped, and gets its repair handle, from
+/// the store, while the other projector keeps running.
+#[tokio::test]
+async fn a_long_running_host_can_ask_which_projectors_are_stopped() {
+    let repository = InMemoryRepository::new();
+    let bus = InMemoryBus::new();
+    let applied = Arc::new(Mutex::new(Vec::new()));
+    let secondary = |applied: &Arc<Mutex<Vec<(&'static str, String)>>>| -> Vec<String> {
+        applied
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(name, _)| *name == "secondary")
+            .map(|(_, id)| id.clone())
+            .collect()
+    };
+
+    bus.publish_message(fact_message("a", "before the rollout"))
+        .await
+        .unwrap();
+    two_projector_service(&repository, false, &applied)
+        .with_bus(bus.clone())
+        .run(RunOptions::until_idle())
+        .await
+        .unwrap();
+
+    let shutdown = crate::bus::Shutdown::new();
+    let running = tokio::spawn(
+        two_projector_service(&repository, true, &applied)
+            .with_bus(bus.clone())
+            .run(RunOptions::until_shutdown(shutdown.clone())),
+    );
+    // The host's own service over the same stores, as its API process has.
+    let host = two_projector_service(&repository, true, &applied);
+    assert!(host.stopped_projections().await.unwrap().is_empty());
+
+    bus.publish_message(fact_message("b", "after the rollout"))
+        .await
+        .unwrap();
+    let stopped = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            let stopped = host.stopped_projections().await.unwrap();
+            if !stopped.is_empty() {
+                break stopped;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the stop is visible while the service runs");
+    assert_eq!(stopped.len(), 1);
+    assert_eq!(stopped[0].projection, "task15_a_primary");
+    assert!(!running.is_finished(), "the service keeps running");
+
+    bus.publish_message(fact_message("c", "while stopped"))
+        .await
+        .unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while secondary(&applied) != ["a", "b", "c"] {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the other projector keeps delivering");
+
+    shutdown.trigger();
+    let error = running
+        .await
+        .unwrap()
+        .expect_err("the run reports the stop when it ends");
+    assert_eq!(repair_handle(&error), stopped[0].repair);
+}
+
+/// An event handler that retries until a projector has projected the same
+/// event. The in-memory bus hands a failed delivery straight back, so the
+/// handler's consumer must still let the projector's consumer run.
+#[tokio::test]
+async fn a_retrying_handler_does_not_starve_the_projector_it_waits_for() {
+    let repository = InMemoryRepository::new();
+    let bus = InMemoryBus::new();
+    let projected = Arc::new(AtomicBool::new(false));
+    let retries = Arc::new(AtomicUsize::new(0));
+    let (mark_projected, wait_for_projection, count_retries) = (
+        Arc::clone(&projected),
+        Arc::clone(&projected),
+        Arc::clone(&retries),
+    );
+    let service = Service::new()
+        .named("task15-starvation")
+        .routes(
+            Routes::new()
+                .with_read_model_store(repository.clone())
+                .causal_projector::<TodoChanged>(primary_projector())
+                .model::<PrimaryView>()
+                .handle(move |context: CausalProjectorContext, fact: TodoChanged| {
+                    let projected = Arc::clone(&mark_projected);
+                    async move {
+                        context
+                            .project(&PrimaryView {
+                                id: fact.id,
+                                title: fact.title,
+                            })
+                            .await?;
+                        projected.store(true, Ordering::SeqCst);
+                        Ok(())
+                    }
+                }),
+        )
+        .routes(Routes::new().with_dependencies(()).event(FACT_NAME).handle(
+            move |_: &crate::microsvc::Context<()>| {
+                let projected = Arc::clone(&wait_for_projection);
+                let retries = Arc::clone(&count_retries);
+                async move {
+                    if projected.load(Ordering::SeqCst) {
+                        return Ok(serde_json::json!({}));
+                    }
+                    retries.fetch_add(1, Ordering::SeqCst);
+                    Err(HandlerError::Other("the row is not projected yet".into()))
+                }
+            },
+        ))
+        .with_bus(bus.clone());
+
+    bus.publish_message(fact_message("a", "awaited"))
+        .await
+        .unwrap();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        service.run(RunOptions::until_idle()),
+    )
+    .await
+    .expect("the retrying handler let the projector run")
+    .unwrap();
+
+    assert!(projected.load(Ordering::SeqCst));
+    assert!(
+        retries.load(Ordering::SeqCst) > 0,
+        "the handler ran before the projection and retried"
+    );
+}
+
+/// A handler publishes the fact a projector consumes, after that projector's
+/// consumer has already found nothing to do. One drain still projects it.
+#[tokio::test]
+async fn one_drain_projects_what_a_handler_published_during_it() {
+    const TRIGGER: &str = "task15.trigger";
+    let repository = InMemoryRepository::new();
+    let bus = InMemoryBus::new();
+    let projected = Arc::new(Mutex::new(Vec::new()));
+    let record = Arc::clone(&projected);
+    let publisher = bus.clone();
+    let service = Service::new()
+        .named("task15-drain")
+        .routes(
+            Routes::new()
+                .with_read_model_store(repository.clone())
+                .causal_projector::<TodoChanged>(primary_projector())
+                .model::<PrimaryView>()
+                .handle(move |context: CausalProjectorContext, fact: TodoChanged| {
+                    let record = Arc::clone(&record);
+                    async move {
+                        context
+                            .project(&PrimaryView {
+                                id: fact.id.clone(),
+                                title: fact.title,
+                            })
+                            .await?;
+                        record.lock().unwrap().push(fact.id);
+                        Ok(())
+                    }
+                }),
+        )
+        .routes(Routes::new().with_dependencies(()).event(TRIGGER).handle(
+            move |_: &crate::microsvc::Context<()>| {
+                let publisher = publisher.clone();
+                async move {
+                    // Long enough for the projector's consumer to go idle.
+                    for _ in 0..8 {
+                        tokio::task::yield_now().await;
+                    }
+                    publisher
+                        .publish_message(fact_message("late", "published by a handler"))
+                        .await
+                        .map_err(|error| HandlerError::Other(Box::new(error)))?;
+                    Ok(serde_json::json!({}))
+                }
+            },
+        ))
+        .with_bus(bus.clone());
+
+    bus.publish_message(Message::new(TRIGGER, MessageKind::Event, b"{}".to_vec()).with_id("t-1"))
+        .await
+        .unwrap();
+    service.run(RunOptions::until_idle()).await.unwrap();
+
+    assert_eq!(*projected.lock().unwrap(), ["late"]);
 }
 
 fn malformed_service(repository: InMemoryRepository, invoked: Arc<AtomicUsize>) -> Service {
     let projector = SurfaceProjector::new("task15_malformed")
         .facts(["task15.malformed"])
         .models(["MalformedView"])
-        .change_epoch("task15-malformed-v1")
         .partition_by(["tenant"]);
     Service::new().routes(
         Routes::new()
@@ -932,7 +1456,7 @@ async fn malformed_ingress_emits_safe_handle_and_repair_restart_stays_terminal()
 
     let first = malformed_service(repository.clone(), Arc::clone(&invoked))
         .with_bus(bus.clone())
-        .run(RunOptions::idempotent())
+        .run(RunOptions::until_idle())
         .await
         .expect_err("malformed ingress must retain its exact position and stop");
     let first_handle = repair_handle(&first);
@@ -961,7 +1485,7 @@ async fn malformed_ingress_emits_safe_handle_and_repair_restart_stays_terminal()
     );
     let second = repaired
         .with_bus(bus)
-        .run(RunOptions::idempotent())
+        .run(RunOptions::until_idle())
         .await
         .expect_err("unchanged malformed bytes must stop the repaired generation again");
     let second_handle = repair_handle(&second);
@@ -1012,7 +1536,7 @@ async fn unrecorded_permanent_projector_failure_retains_and_stops_under_drop_pol
         .unwrap();
 
         let error = service
-            .run(RunOptions::idempotent().with_failure_policy(policy))
+            .run(RunOptions::until_idle().with_failure_policy(policy))
             .await
             .expect_err("unrecorded permanent projector failure must stop the runner");
         assert!(error.is_permanent());

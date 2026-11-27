@@ -4,7 +4,7 @@ struct Todo {
     entity: Entity,
 }
 
-#[sourced(entity)]
+#[sourced(entity, aggregate_type = "todo")]
 impl Todo {
     #[event("done")]
     pub fn complete(&mut self) {}

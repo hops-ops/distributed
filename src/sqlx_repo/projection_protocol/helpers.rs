@@ -7,13 +7,6 @@ pub(super) fn protocol_storage_error<DB: SqlxRepoBackend>(
     ProjectionProtocolError::Repository(repository_storage_error::<DB>(operation, error))
 }
 
-pub(super) fn corrupt_storage(message: impl Into<String>) -> ProjectionProtocolError {
-    ProjectionProtocolError::InvalidBatch(format!(
-        "corrupt projection protocol storage: {}",
-        message.into()
-    ))
-}
-
 pub(super) fn to_i64<DB: SqlxRepoBackend>(
     value: u64,
     field: &'static str,
@@ -103,4 +96,18 @@ pub(super) fn decode_observation_kind(
 ) -> Result<ProjectionObservationKind, ProjectionProtocolError> {
     ProjectionObservationKind::from_storage_str(value)
         .ok_or_else(|| corrupt_storage(format!("unknown projection observation kind `{value}`")))
+}
+
+pub(super) fn decode_program_id(
+    value: Option<String>,
+) -> Result<Option<crate::projection::ProjectionProgramId>, ProjectionProtocolError> {
+    value
+        .map(|value| {
+            crate::projection::ProjectionProgramId::parse(&value).map_err(|error| {
+                corrupt_storage(format!(
+                    "invalid stored projection program identity: {error}"
+                ))
+            })
+        })
+        .transpose()
 }

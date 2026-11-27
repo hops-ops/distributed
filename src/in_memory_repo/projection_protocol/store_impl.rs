@@ -1,6 +1,20 @@
 use super::*;
 
 impl ProjectionProtocolStore for InMemoryRepository {
+    async fn projection_rebuild_records(
+        &self,
+        context: &crate::projection::rebuild::RebuildContext,
+    ) -> Result<Vec<ProjectionRecordMetadata>, ProjectionProtocolError> {
+        self.snapshot_rebuild_records(context).await
+    }
+
+    async fn commit_projection_rebuild(
+        &self,
+        plan: crate::projection::rebuild::SnapshotProjectionRebuildPlan,
+    ) -> Result<usize, ProjectionProtocolError> {
+        self.apply_snapshot_rebuild(plan).await
+    }
+
     fn register_projection_models<'a>(
         &'a self,
         topology: &'a ProjectorTopologyId,
@@ -25,14 +39,15 @@ impl ProjectionProtocolStore for InMemoryRepository {
                 .projection_protocol
                 .write()
                 .map_err(|_| RepositoryError::LockPoisoned("projection ownership write"))?;
-            let mut staged = protocol.clone();
-            staged.registered_topologies.insert(topology.clone());
+            // `validate_ownership_batch` rejected declarations that disagree
+            // with each other, so each one is checked against stored state.
             for declaration in ownership {
                 let key = RegisteredModelKey {
                     topology: topology.clone(),
                     model: declaration.model.clone(),
                 };
-                if let Some(previous) = staged.authoritative_table_owners.get(&declaration.table) {
+                if let Some(previous) = protocol.authoritative_table_owners.get(&declaration.table)
+                {
                     if previous != &key {
                         return Err(ProjectionProtocolError::InvalidBatch(format!(
                             "projection table `{}` already has authoritative owner `{}` in another topology",
@@ -47,7 +62,7 @@ impl ProjectionProtocolStore for InMemoryRepository {
                         declaration.table
                     )));
                 }
-                if let Some(previous) = staged.registered_models.get(&key) {
+                if let Some(previous) = protocol.registered_models.get(&key) {
                     if previous != &declaration.table {
                         return Err(ProjectionProtocolError::InvalidBatch(format!(
                             "projection model `{}` is already registered for table `{previous}`",
@@ -55,28 +70,37 @@ impl ProjectionProtocolStore for InMemoryRepository {
                         )));
                     }
                 }
-                if let Some((other, _)) = staged.registered_models.iter().find(|(other, table)| {
-                    other.topology == *topology
-                        && *table == &declaration.table
-                        && other.model != declaration.model
-                }) {
+                if let Some((other, _)) =
+                    protocol.registered_models.iter().find(|(other, table)| {
+                        other.topology == *topology
+                            && *table == &declaration.table
+                            && other.model != declaration.model
+                    })
+                {
                     return Err(ProjectionProtocolError::InvalidBatch(format!(
                         "projection table `{}` is already registered for model `{}`",
                         declaration.table, other.model
                     )));
                 }
-                staged
-                    .registered_models
-                    .insert(key.clone(), declaration.table.clone());
-                staged
-                    .authoritative_table_owners
-                    .insert(declaration.table.clone(), key);
             }
             let mut causal_tables = self
                 .causal_tables
                 .write()
                 .map_err(|_| RepositoryError::LockPoisoned("causal table marker write"))?;
-            *protocol = staged;
+            // Nothing below can fail.
+            protocol.registered_topologies.insert(topology.clone());
+            for declaration in ownership {
+                let key = RegisteredModelKey {
+                    topology: topology.clone(),
+                    model: declaration.model.clone(),
+                };
+                protocol
+                    .registered_models
+                    .insert(key.clone(), declaration.table.clone());
+                protocol
+                    .authoritative_table_owners
+                    .insert(declaration.table.clone(), key);
+            }
             causal_tables.extend(
                 ownership
                     .iter()
@@ -88,7 +112,7 @@ impl ProjectionProtocolStore for InMemoryRepository {
 
     fn commit_projection(
         &self,
-        batch: ProjectionCommitBatch,
+        mut batch: ProjectionCommitBatch,
     ) -> impl Future<Output = Result<ProjectionCommitResult, ProjectionProtocolError>> + Send + '_
     {
         async move {
@@ -112,48 +136,45 @@ impl ProjectionProtocolStore for InMemoryRepository {
                 .write()
                 .map_err(|_| RepositoryError::LockPoisoned("projection inbox write"))?;
 
-            protocol.validate_partition(&partition_key, &batch.input, &batch.change_epoch)?;
-            match protocol.classify_input(
-                &batch.input.cursor,
-                batch.input.fingerprint,
-                &batch.input.message_id,
-                &batch.input.causation_id,
-                batch.input.generation,
-                batch.input.gap_free,
-            )? {
-                InputDisposition::Duplicate(checkpoint) => {
+            let change_epoch = protocol.change_epoch(&partition_key);
+            let redelivery = match protocol.input_disposition(&batch.input)? {
+                ProjectionInputDisposition::Duplicate(checkpoint) => {
                     return Ok(ProjectionCommitResult::not_applied(
                         ProjectionCommitOutcome::Duplicate,
                         Some(checkpoint),
                     ));
                 }
-                InputDisposition::Stale(checkpoint) => {
+                ProjectionInputDisposition::Stale(checkpoint) => {
                     return Ok(ProjectionCommitResult::not_applied(
                         ProjectionCommitOutcome::StaleInput,
                         Some(checkpoint),
                     ));
                 }
-                InputDisposition::New => {
-                    protocol.validate_pending_retry(&partition_key, &batch.input)?;
+                ProjectionInputDisposition::Pending => false,
+                ProjectionInputDisposition::Redelivery => {
+                    batch.mutations.clear();
+                    batch.observations.clear();
+                    true
                 }
-            }
+            };
 
             let receipt = batch.input.inbox_receipt();
             receipt.validate()?;
-            if inbox.contains(&(receipt.consumer.clone(), receipt.message_id.clone())) {
+            if !redelivery
+                && inbox.contains(&(receipt.consumer.clone(), receipt.message_id.clone()))
+            {
                 return Err(ProjectionProtocolError::MessageIdReuse {
                     message_id: batch.input.message_id.clone(),
                 });
             }
 
-            let mut staged_protocol = protocol.clone();
-            let mut staged_inbox = inbox.clone();
-            staged_protocol.ensure_partition(&partition_key, &batch.change_epoch)?;
-            staged_protocol
-                .gap_free_capabilities
-                .entry(SourceCapabilityKey::new(&batch.input.cursor))
-                .or_insert(batch.input.gap_free);
-            staged_protocol.register_ownership(&partition_key, &batch)?;
+            // Everything fallible runs against the stored state and stages
+            // what this commit adds; the stores change only after it all passed.
+            let partition = protocol.partitions.get(&partition_key);
+            let mut head = partition.map_or(0, |partition| partition.change_head);
+            protocol.check_ownership(&partition_key, &batch)?;
+            let mut staged_records = HashMap::with_capacity(batch.mutations.len());
+            let mut staged_observations = HashMap::new();
 
             let mut touched_rows = HashSet::with_capacity(batch.mutations.len());
             for mutation in &batch.mutations {
@@ -175,19 +196,29 @@ impl ProjectionProtocolStore for InMemoryRepository {
             let mut changes =
                 Vec::with_capacity(batch.mutations.len() + batch.observations.len().max(1));
             for mutation in &batch.mutations {
-                let (revision, tombstone) = staged_protocol.next_record(
+                let current = staged_records
+                    .get(&mutation.scope)
+                    .or_else(|| protocol.records.get(&mutation.scope));
+                validate_physical_row(
                     &mutation.scope,
-                    &mutation.expectation,
-                    mutation.kind,
-                )?;
-                staged_protocol.validate_physical_record(
-                    &mutation.scope,
-                    &mutation.expectation,
-                    mutation.kind,
+                    current,
                     staged_rows.contains_key(&mutation.mutation.lock_key()),
                 )?;
-                let change = staged_protocol.append_change(
+                let (revision, tombstone) = next_record(
+                    &mutation.scope,
+                    &mutation.expectation,
+                    mutation.kind,
+                    current,
+                    mutation.source_snapshot.is_some(),
+                )?;
+                crate::projection_protocol::validate_snapshot_write(
+                    current,
+                    mutation.source_snapshot.as_ref(),
+                )?;
+                let change = next_change(
                     &partition_key,
+                    &change_epoch,
+                    &mut head,
                     PendingChange {
                         kind: change_kind_for_mutation(mutation.kind),
                         causation_id: batch.input.causation_id.clone(),
@@ -195,17 +226,21 @@ impl ProjectionProtocolStore for InMemoryRepository {
                         scope: Some(mutation.scope.clone()),
                         revision: Some(revision.clone()),
                         failure_id: None,
+                        program_id: program_id_for_model(&batch.ownership, mutation.scope.model()),
                     },
                 )?;
                 let metadata = ProjectionRecordMetadata {
                     revision,
                     tombstone,
                     change: change.cursor.clone(),
+                    source_snapshot: mutation.source_snapshot.clone(),
                 };
-                staged_protocol.ensure_live_record_identity_available(&metadata)?;
-                staged_protocol
-                    .records
-                    .insert(mutation.scope.clone(), metadata.clone());
+                ensure_live_record_identity_available(
+                    &protocol.records,
+                    &staged_records,
+                    &metadata,
+                )?;
+                staged_records.insert(mutation.scope.clone(), metadata.clone());
                 records.push(metadata);
                 changes.push(change);
             }
@@ -222,9 +257,9 @@ impl ProjectionProtocolStore for InMemoryRepository {
             )?;
             for mutation in &batch.mutations {
                 let row_exists = staged_rows.contains_key(&mutation.mutation.lock_key());
-                let should_exist = !matches!(mutation.kind, ProjectionMutationKind::Delete);
+                let should_exist = !matches!(mutation.kind, RecordTransition::Delete);
                 if row_exists != should_exist {
-                    return Err(ProjectionProtocolError::InvalidBatch(format!(
+                    return Err(corrupt_storage(format!(
                         "projection table mutation left model `{}` physical row {}",
                         mutation.scope.model(),
                         if row_exists {
@@ -237,50 +272,31 @@ impl ProjectionProtocolStore for InMemoryRepository {
             }
 
             for request in &batch.observations {
-                let (scope, revision, staged_change) = match &request.target {
-                    ProjectionObservationTarget::StagedRecord(scope) => {
-                        let metadata = staged_protocol
-                            .records
-                            .get(scope)
-                            .expect("batch validation requires a staged record");
-                        (
-                            scope.clone(),
-                            Some(metadata.revision.clone()),
-                            Some(metadata.change.clone()),
-                        )
-                    }
-                    ProjectionObservationTarget::ExistingRecord(expected) => {
-                        let Some(metadata) = staged_protocol.records.get(expected.scope()) else {
-                            return Err(ProjectionProtocolError::RecordMissing {
-                                model: expected.scope().model().to_string(),
-                            });
-                        };
-                        if &metadata.revision != expected {
-                            return Err(ProjectionProtocolError::RecordRevisionConflict {
-                                model: expected.scope().model().to_string(),
-                                expected_incarnation: expected.incarnation(),
-                                expected_revision: expected.revision(),
-                                actual_incarnation: metadata.revision.incarnation(),
-                                actual_revision: metadata.revision.revision(),
-                            });
-                        }
-                        (expected.scope().clone(), Some(expected.clone()), None)
-                    }
-                    ProjectionObservationTarget::Dependency(scope) => (scope.clone(), None, None),
-                };
+                let scope = request.scope().clone();
+                let (revision, staged_change) = resolve_observation(
+                    &request.target,
+                    staged_records
+                        .get(&scope)
+                        .or_else(|| protocol.records.get(&scope)),
+                )?;
                 let observation_key = ObservationKey {
                     causation_id: batch.input.causation_id.clone(),
                     scope: scope.clone(),
                     kind: request.kind,
                 };
-                if staged_protocol.observations.contains_key(&observation_key) {
+                if protocol.observations.contains_key(&observation_key)
+                    || staged_observations.contains_key(&observation_key)
+                {
                     continue;
                 }
+                let program_id = program_id_for_model(&batch.ownership, scope.model());
                 let change_cursor = match staged_change {
                     Some(cursor) => cursor,
                     None => {
-                        let change = staged_protocol.append_change(
+                        let change = next_change(
                             &partition_key,
+                            &change_epoch,
+                            &mut head,
                             PendingChange {
                                 kind: ProjectionChangeKind::Observation,
                                 causation_id: batch.input.causation_id.clone(),
@@ -288,6 +304,7 @@ impl ProjectionProtocolStore for InMemoryRepository {
                                 scope: Some(scope.clone()),
                                 revision: revision.clone(),
                                 failure_id: None,
+                                program_id,
                             },
                         )?;
                         let cursor = change.cursor.clone();
@@ -301,15 +318,16 @@ impl ProjectionProtocolStore for InMemoryRepository {
                     revision,
                     scope,
                     change: change_cursor,
+                    program_id,
                 };
-                staged_protocol
-                    .observations
-                    .insert(observation_key, observation);
+                staged_observations.insert(observation_key, observation);
             }
 
             if changes.is_empty() {
-                changes.push(staged_protocol.append_change(
+                changes.push(next_change(
                     &partition_key,
+                    &change_epoch,
+                    &mut head,
                     PendingChange {
                         kind: ProjectionChangeKind::Checkpoint,
                         causation_id: batch.input.causation_id.clone(),
@@ -317,6 +335,7 @@ impl ProjectionProtocolStore for InMemoryRepository {
                         scope: None,
                         revision: None,
                         failure_id: None,
+                        program_id: None,
                     },
                 )?);
             }
@@ -329,41 +348,10 @@ impl ProjectionProtocolStore for InMemoryRepository {
                     .clone(),
                 batch.input.gap_free,
             )?;
-            let input_key = InputKey::new(&batch.input.cursor, batch.input.generation);
-            staged_protocol.inputs.insert(
-                input_key,
-                StoredInput {
-                    cursor: batch.input.cursor.clone(),
-                    fingerprint: batch.input.fingerprint,
-                    message_id: batch.input.message_id.clone(),
-                    causation_id: batch.input.causation_id.clone(),
-                    checkpoint: checkpoint.clone(),
-                    gap_free: batch.input.gap_free,
-                },
-            );
-            staged_protocol.persist_input_identity(&batch.input);
-            staged_protocol.applied_receipts.insert(
-                CursorReceiptKey::new(&batch.input.cursor, batch.input.generation),
-                AppliedInputReceipt {
-                    fingerprint: batch.input.fingerprint,
-                    message_id: batch.input.message_id.clone(),
-                    causation_id: batch.input.causation_id.clone(),
-                    gap_free: batch.input.gap_free,
-                    checkpoint: checkpoint.clone(),
-                },
-            );
-            staged_protocol
-                .partitions
-                .get_mut(&partition_key)
-                .expect("successful projection partition is initialized")
-                .pending_retry_failure_id = None;
-            staged_protocol
-                .retain_change_suffix(&partition_key, self.projection_change_retention)?;
-            staged_inbox.insert((receipt.consumer, receipt.message_id));
+            let through = retained_through(partition, head, self.projection_change_retention)?;
 
-            // No fallible operations below this point. Merge only touched rows,
-            // then publish the staged protocol/inbox maps while all guards remain
-            // held. The row write guard is declared first and releases last.
+            // Nothing below can fail. The row write guard is declared first
+            // and releases last.
             for key in touched_rows {
                 match staged_rows.remove(&key) {
                     Some(row) => {
@@ -374,11 +362,46 @@ impl ProjectionProtocolStore for InMemoryRepository {
                     }
                 }
             }
-            *protocol = staged_protocol;
-            *inbox = staged_inbox;
+            let protocol = &mut *protocol;
+            let partition = protocol.partition_mut(&partition_key, &change_epoch);
+            partition.append(changes.iter().cloned());
+            partition.compact(through);
+            partition.pending_retry_failure_id = None;
+            protocol
+                .gap_free_capabilities
+                .entry(SourceCapabilityKey::new(&batch.input.cursor))
+                .or_insert(batch.input.gap_free);
+            protocol
+                .ownership
+                .extend(batch.ownership.iter().map(|declaration| {
+                    (
+                        OwnershipKey {
+                            partition: partition_key.clone(),
+                            model: declaration.model.clone(),
+                        },
+                        declaration.table.clone(),
+                    )
+                }));
+            protocol.records.extend(staged_records);
+            protocol.observations.extend(staged_observations);
+            let applied = (batch.input.clone(), checkpoint.change().clone());
+            protocol.inputs.insert(
+                InputKey::new(&batch.input.cursor, batch.input.generation),
+                applied.clone(),
+            );
+            protocol.persist_input_identity(&batch.input);
+            protocol.applied_receipts.insert(
+                CursorReceiptKey::new(&batch.input.cursor, batch.input.generation),
+                applied,
+            );
+            inbox.insert((receipt.consumer, receipt.message_id));
 
             Ok(ProjectionCommitResult {
-                outcome: ProjectionCommitOutcome::Applied,
+                outcome: if redelivery {
+                    ProjectionCommitOutcome::Duplicate
+                } else {
+                    ProjectionCommitOutcome::Applied
+                },
                 checkpoint: Some(checkpoint),
                 records,
                 changes,
@@ -411,36 +434,27 @@ impl ProjectionProtocolStore for InMemoryRepository {
                 .map_err(|_| RepositoryError::LockPoisoned("projection failure inbox write"))?;
 
             protocol.require_registered_topology(batch.input.cursor.topology())?;
-            protocol.validate_known_input_identity(&batch.input)?;
-            if let Some(partition) = protocol.partitions.get(&partition_key) {
-                if batch.input.generation != partition.active_generation {
-                    return Err(ProjectionProtocolError::GenerationFenced {
-                        expected: partition.active_generation.get(),
-                        actual: batch.input.generation.get(),
-                    });
-                }
-                protocol.validate_gap_free(&batch.input.cursor, batch.input.gap_free)?;
-                protocol.validate_input_identity(&batch.input)?;
-                if let Some(stopped_failure_id) = &partition.stopped_failure_id {
-                    if stopped_failure_id == &batch.failure_id {
-                        if let Some(existing) = protocol.failures.get(stopped_failure_id) {
-                            if failure_matches_batch(existing, &batch)
-                                && protocol.failure_inputs.get(stopped_failure_id).is_some_and(
-                                    |fence| {
-                                        fence.generation == batch.input.generation
-                                            && fence.matches_retry(&batch.input)
-                                    },
-                                )
-                                && protocol.has_exact_message_identity(&batch.input)
-                            {
-                                return Ok(existing.clone());
-                            }
-                        }
+            let partition = protocol.partitions.get(&partition_key);
+            protocol.validate_input_identity(&batch.input)?;
+            ensure_active_input(
+                &batch.input,
+                protocol.active_generation(&partition_key),
+                None,
+            )?;
+            if let Some(stopped) =
+                partition.and_then(|partition| partition.stopped_failure_id.as_ref())
+            {
+                return match protocol.failures.get(stopped) {
+                    Some(existing) if failure_matches_batch(existing, &batch) => {
+                        Ok(existing.clone())
                     }
-                    return Err(ProjectionProtocolError::PartitionStopped {
-                        failure_id: stopped_failure_id.clone(),
-                    });
-                }
+                    Some(_) => Err(ProjectionProtocolError::PartitionStopped {
+                        failure_id: stopped.clone(),
+                    }),
+                    None => Err(corrupt_storage(format!(
+                        "stopped projection failure `{stopped}` is missing"
+                    ))),
+                };
             }
             if protocol.failures.contains_key(&batch.failure_id) {
                 return Err(ProjectionProtocolError::InvalidBatch(format!(
@@ -448,24 +462,10 @@ impl ProjectionProtocolStore for InMemoryRepository {
                     batch.failure_id
                 )));
             }
-
-            protocol.validate_partition(&partition_key, &batch.input, &batch.change_epoch)?;
-            match protocol.classify_input(
-                &batch.input.cursor,
-                batch.input.fingerprint,
-                &batch.input.message_id,
-                &batch.input.causation_id,
-                batch.input.generation,
-                batch.input.gap_free,
-            )? {
-                InputDisposition::New => {
-                    protocol.validate_pending_retry(&partition_key, &batch.input)?;
-                }
-                InputDisposition::Duplicate(_) | InputDisposition::Stale(_) => {
-                    return Err(ProjectionProtocolError::InvalidBatch(
-                        "cannot record terminal failure for an already processed input".into(),
-                    ));
-                }
+            if protocol.classify_input(&batch.input)? != ProjectionInputDisposition::Pending {
+                return Err(ProjectionProtocolError::InvalidBatch(
+                    "cannot record terminal failure for an already processed input".into(),
+                ));
             }
 
             let receipt = batch.input.inbox_receipt();
@@ -476,15 +476,13 @@ impl ProjectionProtocolStore for InMemoryRepository {
                 });
             }
 
-            let mut staged_protocol = protocol.clone();
-            let mut staged_inbox = inbox.clone();
-            staged_protocol.ensure_partition(&partition_key, &batch.change_epoch)?;
-            staged_protocol
-                .gap_free_capabilities
-                .entry(SourceCapabilityKey::new(&batch.input.cursor))
-                .or_insert(batch.input.gap_free);
-            let change = staged_protocol.append_change(
+            // As in a commit: compute against stored state, then apply.
+            let change_epoch = protocol.change_epoch(&partition_key);
+            let mut head = partition.map_or(0, |partition| partition.change_head);
+            let change = next_change(
                 &partition_key,
+                &change_epoch,
+                &mut head,
                 PendingChange {
                     kind: ProjectionChangeKind::Failure,
                     causation_id: batch.input.causation_id.clone(),
@@ -492,6 +490,7 @@ impl ProjectionProtocolStore for InMemoryRepository {
                     scope: None,
                     revision: None,
                     failure_id: Some(batch.failure_id.clone()),
+                    program_id: None,
                 },
             )?;
             let failure = ProjectionFailure {
@@ -505,32 +504,24 @@ impl ProjectionProtocolStore for InMemoryRepository {
                 failure_code: batch.failure_code,
                 failure_bytes: batch.failure_bytes,
                 failure_digest: batch.failure_digest,
-                change: change.cursor,
+                change: change.cursor.clone(),
             };
-            staged_protocol
-                .partitions
-                .get_mut(&partition_key)
-                .expect("failure partition was initialized")
-                .stopped_failure_id = Some(batch.failure_id.clone());
-            staged_protocol
-                .partitions
-                .get_mut(&partition_key)
-                .expect("failure partition was initialized")
-                .pending_retry_failure_id = None;
-            staged_protocol.persist_input_identity(&batch.input);
-            staged_protocol.failure_inputs.insert(
-                batch.failure_id.clone(),
-                FailedInputFence::from_input(&batch.input),
-            );
-            staged_protocol
-                .failures
-                .insert(batch.failure_id, failure.clone());
-            staged_protocol
-                .retain_change_suffix(&partition_key, self.projection_change_retention)?;
-            staged_inbox.insert((receipt.consumer, receipt.message_id));
+            let through = retained_through(partition, head, self.projection_change_retention)?;
 
-            *protocol = staged_protocol;
-            *inbox = staged_inbox;
+            // Nothing below can fail.
+            let protocol = &mut *protocol;
+            let partition = protocol.partition_mut(&partition_key, &change_epoch);
+            partition.append([change]);
+            partition.compact(through);
+            partition.stopped_failure_id = Some(batch.failure_id.clone());
+            partition.pending_retry_failure_id = None;
+            protocol
+                .gap_free_capabilities
+                .entry(SourceCapabilityKey::new(&batch.input.cursor))
+                .or_insert(batch.input.gap_free);
+            protocol.persist_input_identity(&batch.input);
+            protocol.failures.insert(batch.failure_id, failure.clone());
+            inbox.insert((receipt.consumer, receipt.message_id));
             Ok(failure)
         }
     }
@@ -546,7 +537,7 @@ impl ProjectionProtocolStore for InMemoryRepository {
                 .projection_protocol
                 .read()
                 .map_err(|_| RepositoryError::LockPoisoned("projection checkpoint read"))?;
-            let Some(input) = protocol
+            let Some((input, change)) = protocol
                 .inputs
                 .get(&InputKey::new(cursor_scope, generation))
             else {
@@ -558,7 +549,11 @@ impl ProjectionProtocolStore for InMemoryRepository {
             ) {
                 return Err(ProjectionProtocolError::IncomparableInput);
             }
-            Ok(Some(input.checkpoint.clone()))
+            Ok(Some(ProjectionCheckpoint::new(
+                input.cursor.clone(),
+                change.clone(),
+                input.gap_free,
+            )?))
         }
     }
 
@@ -587,61 +582,7 @@ impl ProjectionProtocolStore for InMemoryRepository {
                 .projection_protocol
                 .read()
                 .map_err(|_| RepositoryError::LockPoisoned("projection input disposition read"))?;
-            protocol.require_registered_topology(input.cursor.topology())?;
-            protocol.validate_known_input_identity(input)?;
-            let partition_key = PartitionKey::from_input(&input.cursor);
-            let Some(partition) = protocol.partitions.get(&partition_key) else {
-                if input.generation != ProjectionGeneration::initial() {
-                    return Err(ProjectionProtocolError::GenerationFenced {
-                        expected: ProjectionGeneration::initial().get(),
-                        actual: input.generation.get(),
-                    });
-                }
-                protocol.validate_gap_free(&input.cursor, input.gap_free)?;
-                protocol.validate_input_identity(input)?;
-                return Ok(ProjectionInputDisposition::Pending);
-            };
-            if input.generation != partition.active_generation {
-                return Err(ProjectionProtocolError::GenerationFenced {
-                    expected: partition.active_generation.get(),
-                    actual: input.generation.get(),
-                });
-            }
-            if !protocol.generations.contains_key(&GenerationKey {
-                partition: partition_key.clone(),
-                generation: input.generation,
-            }) {
-                return Err(ProjectionProtocolError::InvalidBatch(format!(
-                    "active projection generation {} has no durable lineage",
-                    input.generation.get()
-                )));
-            }
-            protocol.validate_gap_free(&input.cursor, input.gap_free)?;
-            protocol.validate_input_identity(input)?;
-            if let Some(failure_id) = &partition.stopped_failure_id {
-                return Err(ProjectionProtocolError::PartitionStopped {
-                    failure_id: failure_id.clone(),
-                });
-            }
-            match protocol.classify_input(
-                &input.cursor,
-                input.fingerprint,
-                &input.message_id,
-                &input.causation_id,
-                input.generation,
-                input.gap_free,
-            )? {
-                InputDisposition::Duplicate(checkpoint) => {
-                    Ok(ProjectionInputDisposition::Duplicate(checkpoint))
-                }
-                InputDisposition::Stale(checkpoint) => {
-                    Ok(ProjectionInputDisposition::Stale(checkpoint))
-                }
-                InputDisposition::New => {
-                    protocol.validate_pending_retry(&partition_key, input)?;
-                    Ok(ProjectionInputDisposition::Pending)
-                }
-            }
+            protocol.input_disposition(input)
         }
     }
 
@@ -670,33 +611,6 @@ impl ProjectionProtocolStore for InMemoryRepository {
         }
     }
 
-    fn projection_query_snapshot_batch<'a>(
-        &'a self,
-        request: &'a ProjectionQuerySnapshotBatchRequest,
-    ) -> impl Future<Output = Result<ProjectionQuerySnapshotBatch, ProjectionProtocolError>> + Send + 'a
-    {
-        async move {
-            request.validate()?;
-            // Use the same writer lock order as the one-row primitive and hold
-            // both guards for the entire plan, not once per row.
-            let rows =
-                self.model_store.relational_rows.read().map_err(|_| {
-                    RepositoryError::LockPoisoned("projection query batch rows read")
-                })?;
-            let protocol = self.projection_protocol.read().map_err(|_| {
-                RepositoryError::LockPoisoned("projection query batch protocol read")
-            })?;
-            let snapshots = request
-                .requests
-                .iter()
-                .map(|row_request| {
-                    read_projection_query_snapshot_from_state(&rows, &protocol, row_request)
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            Ok(ProjectionQuerySnapshotBatch { snapshots })
-        }
-    }
-
     fn projection_execution_snapshot_batch<'a>(
         &'a self,
         request: &'a ProjectionExecutionSnapshotBatchRequest,
@@ -715,43 +629,6 @@ impl ProjectionProtocolStore for InMemoryRepository {
         }
     }
 
-    fn projection_graph_snapshot<'a>(
-        &'a self,
-        request: &'a ProjectionGraphSnapshotRequest,
-    ) -> impl Future<Output = Result<ProjectionGraphSnapshot, ProjectionProtocolError>> + Send + 'a
-    {
-        async move {
-            validate_projection_graph_snapshot_request(request)?;
-            let rows = self.model_store.relational_rows.read().map_err(|_| {
-                RepositoryError::LockPoisoned("projection graph snapshot rows read")
-            })?;
-            let protocol = self.projection_protocol.read().map_err(|_| {
-                RepositoryError::LockPoisoned("projection graph snapshot protocol read")
-            })?;
-            read_projection_graph_snapshot_from_state(&rows, &protocol, request)
-        }
-    }
-
-    fn projection_obligation_evidence_batch<'a>(
-        &'a self,
-        request: &'a ProjectionObligationEvidenceBatchRequest,
-    ) -> impl Future<Output = Result<ProjectionObligationEvidenceBatch, ProjectionProtocolError>>
-           + Send
-           + 'a {
-        async move {
-            request.validate()?;
-            let protocol = self.projection_protocol.read().map_err(|_| {
-                RepositoryError::LockPoisoned("projection obligation evidence read")
-            })?;
-            let evidence = request
-                .requests
-                .iter()
-                .map(|probe| read_projection_obligation_evidence_from_state(&protocol, probe))
-                .collect::<Result<Vec<_>, _>>()?;
-            Ok(ProjectionObligationEvidenceBatch { evidence })
-        }
-    }
-
     fn projection_causation_evidence<'a>(
         &'a self,
         request: &'a ProjectionCausationEvidenceRequest,
@@ -764,7 +641,7 @@ impl ProjectionProtocolStore for InMemoryRepository {
                 .projection_protocol
                 .read()
                 .map_err(|_| RepositoryError::LockPoisoned("projection causation evidence read"))?;
-            let mut observations = protocol
+            let observations = protocol
                 .observations
                 .values()
                 .filter(|observation| {
@@ -791,23 +668,6 @@ impl ProjectionProtocolStore for InMemoryRepository {
                 )?;
                 validate_observation_from_state(&protocol, &probe, observation)?;
             }
-            observations.sort_by(|left, right| {
-                (
-                    left.scope.topology().canonical_bytes(),
-                    left.scope.projection_partition().canonical_bytes(),
-                    left.scope.model(),
-                    left.kind.as_storage_str(),
-                    left.scope.canonical_key_bytes(),
-                )
-                    .cmp(&(
-                        right.scope.topology().canonical_bytes(),
-                        right.scope.projection_partition().canonical_bytes(),
-                        right.scope.model(),
-                        right.kind.as_storage_str(),
-                        right.scope.canonical_key_bytes(),
-                    ))
-            });
-
             let mut terminal_failure_topologies = Vec::new();
             for failure in protocol.failures.values().filter(|failure| {
                 failure.causation_id == request.causation_id
@@ -821,9 +681,7 @@ impl ProjectionProtocolStore for InMemoryRepository {
                     failure.input.projection_partition(),
                 );
                 let partition = protocol.partitions.get(&key).ok_or_else(|| {
-                    ProjectionProtocolError::InvalidBatch(
-                        "stored projection failure has no partition state".into(),
-                    )
+                    corrupt_storage("stored projection failure has no partition state")
                 })?;
                 if partition.stopped_failure_id.as_deref() != Some(&failure.failure_id) {
                     continue;
@@ -833,8 +691,8 @@ impl ProjectionProtocolStore for InMemoryRepository {
                     || failure.change.epoch() != &partition.change_epoch
                     || failure.change.position() > partition.change_head
                 {
-                    return Err(ProjectionProtocolError::InvalidBatch(
-                        "stored stopped projection failure lies outside its partition".into(),
+                    return Err(corrupt_storage(
+                        "stored stopped projection failure lies outside its partition",
                     ));
                 }
                 if !terminal_failure_topologies
@@ -851,38 +709,19 @@ impl ProjectionProtocolStore for InMemoryRepository {
                     MAX_PROJECTION_EVIDENCE_BATCH_ITEMS
                 )));
             }
-            terminal_failure_topologies.sort_by_key(ProjectorTopologyId::canonical_bytes);
-            Ok(ProjectionCausationEvidenceBatch {
+            let mut evidence = ProjectionCausationEvidenceBatch {
                 observations,
                 terminal_failure_topologies,
-            })
-        }
-    }
-
-    fn projection_live_record_batch<'a>(
-        &'a self,
-        request: &'a ProjectionLiveRecordBatchRequest,
-    ) -> impl Future<Output = Result<ProjectionLiveRecordBatch, ProjectionProtocolError>> + Send + 'a
-    {
-        async move {
-            request.validate()?;
-            let protocol = self
-                .projection_protocol
-                .read()
-                .map_err(|_| RepositoryError::LockPoisoned("projection live-record read"))?;
-            let records = request
-                .requests
-                .iter()
-                .map(|probe| read_projection_live_record_from_state(&protocol, probe))
-                .collect::<Result<Vec<_>, _>>()?;
-            Ok(ProjectionLiveRecordBatch { records })
+            };
+            sort_causation_evidence(&mut evidence);
+            Ok(evidence)
         }
     }
 
     fn projection_partition_runtime_state<'a>(
         &'a self,
         topology: &'a ProjectorTopologyId,
-        partition: &'a ProjectionPartition,
+        partition: &'a PartitionId,
     ) -> impl Future<Output = Result<Option<ProjectionPartitionRuntimeState>, ProjectionProtocolError>>
            + Send
            + 'a {
@@ -899,13 +738,8 @@ impl ProjectionProtocolStore for InMemoryRepository {
             let pending_retry = match &state.pending_retry_failure_id {
                 Some(failure_id) => {
                     let failure = protocol.failures.get(failure_id).ok_or_else(|| {
-                        ProjectionProtocolError::InvalidBatch(format!(
+                        corrupt_storage(format!(
                             "pending projection retry failure `{failure_id}` is missing"
-                        ))
-                    })?;
-                    let fence = protocol.failure_inputs.get(failure_id).ok_or_else(|| {
-                        ProjectionProtocolError::InvalidBatch(format!(
-                            "pending projection retry failure `{failure_id}` has no input fence"
                         ))
                     })?;
                     if state.stopped_failure_id.is_some()
@@ -913,14 +747,8 @@ impl ProjectionProtocolStore for InMemoryRepository {
                         || failure.input.topology() != topology
                         || failure.input.projection_partition() != partition
                         || failure.generation.checked_next()? != state.active_generation
-                        || fence.cursor != failure.input
-                        || fence.fingerprint != failure.input_fingerprint
-                        || fence.message_id != failure.message_id
-                        || fence.causation_id != failure.causation_id
-                        || fence.generation != failure.generation
-                        || fence.gap_free != failure.gap_free
                     {
-                        return Err(ProjectionProtocolError::InvalidBatch(format!(
+                        return Err(corrupt_storage(format!(
                             "pending projection retry failure `{failure_id}` is corrupt"
                         )));
                     }
@@ -970,7 +798,7 @@ impl ProjectionProtocolStore for InMemoryRepository {
     fn projection_changes<'a>(
         &'a self,
         topology: &'a ProjectorTopologyId,
-        partition: &'a ProjectionPartition,
+        partition: &'a PartitionId,
         after: Option<&'a ProjectionChangeCursor>,
         limit: usize,
     ) -> impl Future<Output = Result<ProjectionChangeRead, ProjectionProtocolError>> + Send + 'a
@@ -980,80 +808,37 @@ impl ProjectionProtocolStore for InMemoryRepository {
                 .projection_protocol
                 .read()
                 .map_err(|_| RepositoryError::LockPoisoned("projection changes read"))?;
-            let key = PartitionKey::new(topology, partition);
-            let Some(state) = protocol.partitions.get(&key) else {
-                return Ok(match after {
-                    Some(_) => ProjectionChangeRead::ResetRequired {
-                        head: None,
-                        compacted_through: 0,
-                    },
-                    None => ProjectionChangeRead::Changes {
-                        head: None,
-                        compacted_through: 0,
-                        changes: Vec::new(),
-                    },
-                });
-            };
-            let head = if state.change_head == 0 {
-                None
-            } else {
-                Some(ProjectionChangeCursor::new(
-                    topology.clone(),
-                    partition.clone(),
-                    state.change_epoch.clone(),
+            let state = protocol
+                .partitions
+                .get(&PartitionKey::new(topology, partition));
+            let window = state.map(|state| {
+                (
+                    &state.change_epoch,
                     state.change_head,
-                )?)
+                    state.compacted_through,
+                )
+            });
+            let start = match change_read_window(topology, partition, window, after, limit)? {
+                std::ops::ControlFlow::Break(read) => return Ok(read),
+                std::ops::ControlFlow::Continue(start) => start,
             };
-            let after_position = match after {
-                None if state.compacted_through > 0 => {
-                    return Ok(ProjectionChangeRead::ResetRequired {
-                        head,
-                        compacted_through: state.compacted_through,
-                    });
-                }
-                None => 0,
-                Some(cursor)
-                    if cursor.topology() != topology
-                        || cursor.projection_partition() != partition
-                        || cursor.epoch() != &state.change_epoch
-                        || cursor.position() > state.change_head
-                        // `compacted_through` is the last removed change. An
-                        // exact cursor at that watermark is therefore the safe
-                        // boundary for resuming at the first retained change.
-                        || cursor.position() < state.compacted_through =>
-                {
-                    return Ok(ProjectionChangeRead::ResetRequired {
-                        head,
-                        compacted_through: state.compacted_through,
-                    });
-                }
-                Some(cursor) => cursor.position(),
-            };
-            let changes = if limit == 0 {
-                Vec::new()
-            } else {
-                state
-                    .changes
-                    .range((
-                        std::ops::Bound::Excluded(after_position),
-                        std::ops::Bound::Unbounded,
-                    ))
-                    .take(limit)
-                    .map(|(_, change)| change.clone())
-                    .collect()
-            };
-            Ok(ProjectionChangeRead::Changes {
-                head,
-                compacted_through: state.compacted_through,
-                changes,
-            })
+            let (state, window) = state
+                .zip(window)
+                .expect("a change read past its window decision has a partition");
+            let changes = state
+                .changes
+                .range((std::ops::Bound::Excluded(start), std::ops::Bound::Unbounded))
+                .take(limit)
+                .map(|(_, change)| change.clone())
+                .collect();
+            change_page(topology, partition, window, start, changes)
         }
     }
 
     fn repair_projection<'a>(
         &'a self,
         topology: &'a ProjectorTopologyId,
-        partition: &'a ProjectionPartition,
+        partition: &'a PartitionId,
         failure_id: &'a str,
     ) -> impl Future<Output = Result<ProjectionGeneration, ProjectionProtocolError>> + Send + 'a
     {
@@ -1068,61 +853,20 @@ impl ProjectionProtocolStore for InMemoryRepository {
                     "cannot repair an unknown projection partition".into(),
                 ));
             };
-            match &state.stopped_failure_id {
-                Some(stopped) if stopped == failure_id => {}
-                Some(stopped) => {
-                    return Err(ProjectionProtocolError::PartitionStopped {
-                        failure_id: stopped.clone(),
-                    });
-                }
-                None => {
-                    return Err(ProjectionProtocolError::InvalidBatch(
-                        "projection partition is not stopped".into(),
-                    ));
-                }
-            }
-            let Some(failure) = protocol.failures.get(failure_id) else {
-                return Err(ProjectionProtocolError::InvalidBatch(format!(
-                    "stopped projection failure `{failure_id}` is missing"
-                )));
-            };
-            if failure.input.topology() != topology
-                || failure.input.projection_partition() != partition
-            {
-                return Err(ProjectionProtocolError::ScopeMismatch {
-                    field: "projection repair failure",
-                });
-            }
-            if failure.generation != state.active_generation {
-                return Err(ProjectionProtocolError::InvalidBatch(format!(
-                    "stopped failure generation {} differs from active generation {}",
-                    failure.generation.get(),
-                    state.active_generation.get()
-                )));
-            }
-            let Some(failure_fence) = protocol.failure_inputs.get(failure_id) else {
-                return Err(ProjectionProtocolError::InvalidBatch(format!(
-                    "stopped projection failure `{failure_id}` has no exact input fence"
-                )));
-            };
-            if failure_fence.generation != state.active_generation
-                || failure_fence.cursor != failure.input
-                || failure_fence.fingerprint != failure.input_fingerprint
-                || failure_fence.message_id != failure.message_id
-                || failure_fence.causation_id != failure.causation_id
-            {
-                return Err(ProjectionProtocolError::InvalidBatch(format!(
-                    "stopped projection failure `{failure_id}` input fence is corrupt"
-                )));
-            }
-
             let current_generation = state.active_generation;
-            let next_generation = current_generation.checked_next()?;
+            let next_generation = plan_repair(
+                topology,
+                partition,
+                current_generation,
+                state.stopped_failure_id.as_deref(),
+                failure_id,
+                protocol.failures.get(failure_id),
+            )?;
             if protocol.generations.contains_key(&GenerationKey {
                 partition: key.clone(),
                 generation: next_generation,
             }) {
-                return Err(ProjectionProtocolError::InvalidBatch(format!(
+                return Err(corrupt_storage(format!(
                     "projection repair generation {} already exists",
                     next_generation.get()
                 )));
@@ -1135,7 +879,7 @@ impl ProjectionProtocolStore for InMemoryRepository {
                         && lineage.retry_of_failure_id.as_deref() == Some(failure_id)
                 })
             {
-                return Err(ProjectionProtocolError::InvalidBatch(format!(
+                return Err(corrupt_storage(format!(
                     "stopped failure `{failure_id}` already has a repair generation"
                 )));
             }
@@ -1145,37 +889,35 @@ impl ProjectionProtocolStore for InMemoryRepository {
                 .filter(|(input_key, _)| {
                     input_key.partition == key && input_key.generation == current_generation
                 })
-                .map(|(input_key, input)| {
+                .map(|(input_key, applied)| {
                     (
                         InputKey {
                             partition: input_key.partition.clone(),
                             source: input_key.source.clone(),
                             generation: next_generation,
                         },
-                        input.clone(),
+                        applied.clone(),
                     )
                 })
                 .collect::<Vec<_>>();
 
-            let mut staged = protocol.clone();
-            for (input_key, input) in copied_inputs {
-                staged.inputs.insert(input_key, input);
-            }
-            staged.generations.insert(
+            // Nothing below can fail.
+            let protocol = &mut *protocol;
+            let state = protocol
+                .partitions
+                .get_mut(&key)
+                .expect("the repaired partition was read above under this guard");
+            state.active_generation = next_generation;
+            state.stopped_failure_id = None;
+            state.pending_retry_failure_id = Some(failure_id.to_string());
+            protocol.inputs.extend(copied_inputs);
+            protocol.generations.insert(
                 GenerationKey {
                     partition: key.clone(),
                     generation: next_generation,
                 },
                 GenerationLineage::retry_of(current_generation, failure_id.to_string()),
             );
-            let state = staged
-                .partitions
-                .get_mut(&key)
-                .expect("repair partition exists in staged state");
-            state.active_generation = next_generation;
-            state.stopped_failure_id = None;
-            state.pending_retry_failure_id = Some(failure_id.to_string());
-            *protocol = staged;
             Ok(next_generation)
         }
     }
@@ -1212,7 +954,7 @@ impl ProjectionProtocolStore for InMemoryRepository {
     fn projection_failure<'a>(
         &'a self,
         topology: &'a ProjectorTopologyId,
-        partition: &'a ProjectionPartition,
+        partition: &'a PartitionId,
         failure_id: &'a str,
     ) -> impl Future<Output = Result<Option<ProjectionFailure>, ProjectionProtocolError>> + Send + 'a
     {
@@ -1251,5 +993,42 @@ impl ProjectionProtocolStore for InMemoryRepository {
                     partition: failure.input.projection_partition().clone(),
                 }))
         }
+    }
+
+    fn stopped_projection_failures<'a>(
+        &'a self,
+        topology: &'a ProjectorTopologyId,
+    ) -> impl Future<Output = Result<Vec<String>, ProjectionProtocolError>> + Send + 'a {
+        async move {
+            let protocol = self
+                .projection_protocol
+                .read()
+                .map_err(|_| RepositoryError::LockPoisoned("stopped projection failures read"))?;
+            let mut stopped: Vec<String> = protocol
+                .partitions
+                .iter()
+                .filter(|(key, _)| &key.topology == topology)
+                .filter_map(|(_, partition)| partition.stopped_failure_id.clone())
+                .collect();
+            stopped.sort();
+            Ok(stopped)
+        }
+    }
+}
+
+#[cfg(test)]
+impl InMemoryRepository {
+    /// Create a projection partition the way an earlier release did, with
+    /// the change epoch its application declared.
+    pub(crate) fn insert_projection_partition(
+        &self,
+        topology: &ProjectorTopologyId,
+        partition: &PartitionId,
+        epoch: &ProjectionEpoch,
+    ) {
+        self.projection_protocol
+            .write()
+            .unwrap()
+            .partition_mut(&PartitionKey::new(topology, partition), epoch);
     }
 }

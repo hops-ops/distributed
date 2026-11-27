@@ -6,7 +6,7 @@ struct Point {
     y: u8,
 }
 
-#[sourced(entity)]
+#[sourced(entity, aggregate_type = "point")]
 impl Point {
     // A tuple pattern has no single name to record in the event payload, so
     // the parameter cannot round-trip through replay. Parameters must be

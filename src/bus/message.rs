@@ -25,19 +25,6 @@ impl MessageKind {
             MessageKind::Event => "event",
         }
     }
-
-    /// Parse a wire token back into a kind, defaulting to [`MessageKind::Event`]
-    /// for anything that is not exactly `"command"`.
-    ///
-    /// The bias toward `Event` is deliberate: every transport that round-trips
-    /// the kind already did so, and treating an unrecognized token as a fan-out
-    /// event is the safe default for delivery.
-    pub fn from_str_lossy(value: &str) -> MessageKind {
-        match value {
-            "command" => MessageKind::Command,
-            _ => MessageKind::Event,
-        }
-    }
 }
 
 /// Transport subscription metadata derived from a router's registered handlers.
@@ -117,20 +104,11 @@ impl Message {
     /// suffix, Kafka topic, RabbitMQ routing/binding key). A `.` is a routing
     /// *segment separator* on topic transports, so it changes routing
     /// granularity rather than being an opaque label — see
-    /// [`validate_message_name`](super::validate_message_name).
+    /// [`validate_message_name`](super::validate_message_name), which
+    /// [`WireEnvelope::validate`](super::WireEnvelope::validate) applies at
+    /// every publish boundary.
     pub fn name(&self) -> &str {
         &self.name
-    }
-
-    /// Validate this message's name for use as a transport routing identifier.
-    ///
-    /// Delegates to [`validate_message_name`](super::validate_message_name):
-    /// rejects empty, over-long, control-character-bearing, or wildcard-bearing
-    /// (`*`/`#`/`>`) names. Publish boundaries call this before a name becomes a
-    /// subject/topic/routing key; the inbound Knative ingress calls it on the
-    /// `ce-type` it reads off the wire.
-    pub fn validate_name(&self) -> Result<(), super::MessageNameError> {
-        super::validate_message_name(&self.name).map(|_| ())
     }
 
     /// Get the raw payload bytes.
@@ -199,46 +177,13 @@ impl Message {
     }
 }
 
-/// Assemble a canonical [`Message`] from a broker delivery's name, payload, and
-/// header pairs: an `id_key` entry becomes [`Message::id`], a `kind_key` entry
-/// becomes the [`MessageKind`] (defaulting to `Event` via
-/// [`MessageKind::from_str_lossy`]), and every other header becomes metadata.
-///
-/// Transports that carry the id outside the headers (RabbitMQ's `message_id`
-/// property) pass `id_key: None` and set the id on the returned message.
-#[cfg(any(feature = "nats", feature = "kafka", feature = "rabbitmq"))]
-pub(crate) fn message_from_wire(
-    name: String,
-    payload: Vec<u8>,
-    id_key: Option<&str>,
-    kind_key: &str,
-    headers: impl IntoIterator<Item = (String, String)>,
-) -> Message {
-    let mut id = None;
-    let mut kind = MessageKind::Event;
-    let mut metadata = Vec::new();
-    for (key, value) in headers {
-        if id_key == Some(key.as_str()) {
-            id = Some(value);
-        } else if key == kind_key {
-            kind = MessageKind::from_str_lossy(&value);
-        } else {
-            metadata.push((key, value));
-        }
-    }
-    let mut message = Message::new(name, kind, payload);
-    message.id = id;
-    message.metadata = metadata;
-    message
-}
-
-/// Derive a message name from a transport address (NATS subject, Kafka topic,
-/// or AMQP routing key) by stripping the publisher's `prefix`.
+/// Derive a message name from a transport address (NATS subject or AMQP
+/// routing key) by stripping the publisher's `prefix`.
 ///
 /// Takes ownership of `address` so the common `None`/no-match paths reuse the
 /// existing allocation instead of cloning. When `prefix` is set but does not
 /// match, the full address is returned unchanged.
-#[cfg(any(feature = "nats", feature = "kafka", feature = "rabbitmq"))]
+#[cfg(any(feature = "nats", feature = "rabbitmq"))]
 pub(crate) fn strip_address_prefix(address: String, prefix: Option<&str>) -> String {
     match prefix {
         Some(prefix) => address

@@ -7,13 +7,19 @@ use super::*;
 pub struct SqlxRepository<DB: sqlx::Database> {
     pub(super) pool: Pool<DB>,
     pub(super) read_model_schemas: Arc<RwLock<TableSchemaRegistry>>,
-    pub(super) read_model_change_tx: tokio::sync::broadcast::Sender<crate::ReadModelChange>,
+    pub(super) read_model_change_tx:
+        tokio::sync::broadcast::Sender<crate::read_model::ReadModelChange>,
     /// When false, skips Postgres `pg_notify` (local broadcast still fires).
     /// Opt-out via [`SqlxRepository::without_read_model_change_notify`]. Writers
     /// that opt out silently break cross-process GraphQL subscriptions.
     pub(super) notify_enabled: bool,
     pub(super) projection_change_retention: ProjectionChangeRetention,
     pub(super) causal_storage_identity: CausalStorageIdentity,
+    pub(super) verified_registrations: VerifiedRegistrations,
+    /// A [`ScheduleWorker`](crate::microsvc::schedule::ScheduleWorker) was
+    /// attached: routes may require
+    /// [`Capability::Scheduling`](crate::schedule::Capability::Scheduling).
+    pub(super) schedule_dispatch: bool,
 }
 
 impl<DB: sqlx::Database> Clone for SqlxRepository<DB> {
@@ -25,6 +31,8 @@ impl<DB: sqlx::Database> Clone for SqlxRepository<DB> {
             notify_enabled: self.notify_enabled,
             projection_change_retention: self.projection_change_retention,
             causal_storage_identity: self.causal_storage_identity,
+            verified_registrations: self.verified_registrations.clone(),
+            schedule_dispatch: self.schedule_dispatch,
         }
     }
 }
@@ -62,6 +70,8 @@ where
             notify_enabled: true,
             projection_change_retention: ProjectionChangeRetention::default(),
             causal_storage_identity: CausalStorageIdentity::new(),
+            verified_registrations: VerifiedRegistrations::default(),
+            schedule_dispatch: false,
         }
     }
 
@@ -74,7 +84,9 @@ where
     ///
     /// Lagging receivers observe [`tokio::sync::broadcast::error::RecvError::Lagged`]
     /// and should treat that as all-dirty for subscription invalidation.
-    pub fn read_model_changes(&self) -> tokio::sync::broadcast::Receiver<crate::ReadModelChange> {
+    pub fn read_model_changes(
+        &self,
+    ) -> tokio::sync::broadcast::Receiver<crate::read_model::ReadModelChange> {
         self.read_model_change_tx.subscribe()
     }
 
@@ -100,12 +112,16 @@ where
         self
     }
 
-    pub fn publish_read_model_change(&self, change: crate::ReadModelChange) {
+    pub fn publish_read_model_change(&self, change: crate::read_model::ReadModelChange) {
         if change.is_empty() {
             return;
         }
         // Zero receivers is a no-op (broadcast::send returns Err).
         let _ = self.read_model_change_tx.send(change);
+    }
+
+    pub(crate) fn verified_registrations(&self) -> &VerifiedRegistrations {
+        &self.verified_registrations
     }
 
     pub(crate) fn projection_notify_enabled(&self) -> bool {
@@ -118,11 +134,12 @@ where
 
     /// Open a pool without applying migrations.
     pub async fn connect(database_url: &str) -> Result<Self, RepositoryError> {
-        let pool = PoolOptions::<DB>::new()
-            .max_connections(DB::default_pool_size(database_url))
-            .connect(database_url)
-            .await
-            .map_err(|err| repository_storage_error::<DB>("connect", err))?;
+        let pool = DB::pool_options(
+            PoolOptions::<DB>::new().max_connections(DB::default_pool_size(database_url)),
+        )
+        .connect(database_url)
+        .await
+        .map_err(|err| repository_storage_error::<DB>("connect", err))?;
         Ok(Self::new(pool))
     }
 
@@ -167,11 +184,6 @@ where
         &self.pool
     }
 
-    /// SQL artifact adapter for registered table/read-model schemas.
-    pub fn table_schema_adapter(&self) -> TableSqlSchemaAdapter {
-        table_schema_adapter::<DB>()
-    }
-
     /// Generate SQL statements for registered table/read-model schemas.
     pub fn generate_table_migration_artifacts(
         &self,
@@ -211,35 +223,6 @@ where
     pub fn pool(&self) -> &Pool<DB> {
         &self.pool
     }
-
-    /// SQL artifact adapter for registered table/read-model schemas.
-    pub fn table_schema_adapter(&self) -> TableSqlSchemaAdapter {
-        table_schema_adapter::<DB>()
-    }
-
-    /// Generate SQL statements for registered table/read-model schemas.
-    pub fn generate_table_migration_artifacts(
-        &self,
-        registry: &TableSchemaRegistry,
-    ) -> Result<Vec<TableMigrationArtifact>, TableStoreError> {
-        generate_table_migration_artifacts(registry, DB::TABLE_DIALECT)
-    }
-
-    /// Explicit dev/test bootstrap for registered table/read-model schemas.
-    pub async fn bootstrap_table_schema_for_dev(
-        &self,
-        registry: &TableSchemaRegistry,
-    ) -> Result<TableSchemaBootstrap, TableStoreError> {
-        bootstrap_table_schema(&self.pool, registry).await?;
-        Ok(table_schema_bootstrap_result(registry))
-    }
-}
-
-fn table_schema_adapter<DB: SqlxRepoBackend>() -> TableSqlSchemaAdapter {
-    match DB::TABLE_DIALECT {
-        TableSqlDialect::Postgres => TableSqlSchemaAdapter::postgres(),
-        TableSqlDialect::Sqlite => TableSqlSchemaAdapter::sqlite(),
-    }
 }
 
 async fn bootstrap_table_schema<DB>(
@@ -251,7 +234,13 @@ where
     for<'c> &'c Pool<DB>: Executor<'c, Database = DB>,
     DB::Arguments: IntoArguments<DB>,
 {
-    for statement in table_schema_statements(registry, DB::TABLE_DIALECT)? {
+    let statements = table_schema_statements(registry, DB::TABLE_DIALECT)?
+        .into_iter()
+        .chain(crate::table::text_collation_upgrades(
+            registry,
+            DB::TABLE_DIALECT,
+        )?);
+    for statement in statements {
         sqlx::query(audited_table_schema_sql(statement))
             .execute(pool)
             .await
