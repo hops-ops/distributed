@@ -1,6 +1,6 @@
 mod aggregate;
 
-use aggregate::{TodoV1, TodoV2, TodoV3};
+use aggregate::{TodoV1, TodoV2, TodoV2Event, TodoV3};
 use distributed::{
     hydrate, hydrate_from_snapshot, upcast_events, Aggregate, AggregateBuilder, Entity,
     EventRecord, EventUpcaster, InMemoryRepository, RepositoryError, SnapshotRecord, SnapshotStore,
@@ -274,6 +274,33 @@ fn upcast_events_standalone() {
     assert_eq!(user, "user1");
     assert_eq!(task, "task1");
     assert_eq!(priority, 0);
+}
+
+#[test]
+fn v2_try_from_event_record() {
+    let payload = bitcode::serialize(&(
+        "t1".to_string(),
+        "alice".to_string(),
+        "Task".to_string(),
+        3u8,
+    ))
+    .unwrap();
+    let record = EventRecord::new_versioned("initialized", payload, 1, 2);
+    let event = TodoV2Event::try_from(&record).unwrap();
+    match event {
+        TodoV2Event::Initialized {
+            id,
+            user_id,
+            task,
+            priority,
+        } => {
+            assert_eq!(id, "t1");
+            assert_eq!(user_id, "alice");
+            assert_eq!(task, "Task");
+            assert_eq!(priority, 3);
+        }
+        _ => panic!("Expected Initialized"),
+    }
 }
 
 #[test]

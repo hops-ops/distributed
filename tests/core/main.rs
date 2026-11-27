@@ -16,7 +16,6 @@ mod replay_property;
 mod snapshots;
 mod sourced;
 mod sourced_snapshot;
-mod sourced_upcasting;
 #[cfg(all(feature = "graphql", feature = "sqlite"))]
 mod typed_commands;
 mod upcasting;
