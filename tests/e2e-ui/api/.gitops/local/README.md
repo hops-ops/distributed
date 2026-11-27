@@ -9,7 +9,14 @@ gateway forwards UI/auth to same-pod SvelteKit at 127.0.0.1:5180; it never
 uses the public UI Service as its upstream. PUBLIC_ORIGIN and Auth.js use
 the public UI Service URL, so existing OIDC callbacks stay on that origin.
 
-Hops supplies the source mount or sync delivery. A Node init container places
+Hops supplies the source mount or sync delivery. Since hops-cli v0.48.0 the
+injected `sourceDelivery.hostPath` is the Environment root, which is this
+fixture's directory (`tests/e2e-ui`), while the build needs the repository
+around it (the `distributed` crate and `js/`). With hostPath delivery the
+chart therefore mounts the containing checkout: hostPath without
+`sourceDelivery.checkoutSubpath`, at `/workspace`. Sync delivery copies only
+the Environment root to `/workspace`, so it cannot run this fixture with
+hops-cli v0.57.1; CI uses hostPath on kind. A Node init container places
 the pinned Node/npm toolchain beside the Rust toolchain without a custom local
 image or chart-level package installer. The linked framework package pins and
 installs its required `wasm-pack` compiler, so declared Rust/WASM pures are

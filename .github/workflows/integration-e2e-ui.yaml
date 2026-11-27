@@ -581,6 +581,16 @@ jobs:
               echo "e2e-ui API listener is ready"
               break
             fi
+            # The Deployment has no readiness probe, so Available holds while
+            # the application container crash-loops; fail on that at once.
+            waiting_reason="$(k -n local get pods -l app.kubernetes.io/name=e2e-ui-api \
+              -o jsonpath='{.items[*].status.containerStatuses[?(@.name=="application")].state.waiting.reason}' \
+              2>/dev/null || true)"
+            if [[ "$waiting_reason" == *CrashLoopBackOff* ]]; then
+              echo "e2e-ui API container is in CrashLoopBackOff" >&2
+              k -n local logs deployment/e2e-ui-api -c application --previous --tail=200 >&2 || true
+              exit 1
+            fi
             if [ $((attempt % 15)) -eq 0 ]; then
               echo "Waiting for e2e-ui API listener (attempt $attempt/450)"
             fi

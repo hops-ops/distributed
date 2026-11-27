@@ -49,3 +49,26 @@ app.kubernetes.io/managed-by: {{ .Release.Service }}
       key: attribute.client_id
 {{- end }}
 {{- end -}}
+
+{{/*
+Host directory of the checkout that contains this fixture: the injected
+sourceDelivery.hostPath (the Environment root) without checkoutSubpath.
+*/}}
+{{- define "e2e-ui-api.sourceCheckoutPath" -}}
+{{- $sd := .Values.sourceDelivery -}}
+{{- $sub := trimAll "/" (toString $sd.checkoutSubpath) -}}
+{{- if not $sub -}}
+{{- fail "sourceDelivery.checkoutSubpath must name this fixture's path in the checkout" -}}
+{{- end -}}
+{{- $workingDir := printf "%s/%s" (trimSuffix "/" $sd.mountPath) $sub -}}
+{{- if ne .Values.clusterDev.workingDir $workingDir -}}
+{{- fail (printf "clusterDev.workingDir %q must be %q (mountPath/checkoutSubpath)" .Values.clusterDev.workingDir $workingDir) -}}
+{{- end -}}
+{{- $host := trimSuffix "/" (toString $sd.hostPath) -}}
+{{- $suffix := printf "/%s" $sub -}}
+{{- $checkout := trimSuffix $suffix $host -}}
+{{- if or (not (hasSuffix $suffix $host)) (not $checkout) -}}
+{{- fail (printf "sourceDelivery.hostPath %q must be a directory ending in %q (the Environment root)" $host $suffix) -}}
+{{- end -}}
+{{- $checkout -}}
+{{- end -}}

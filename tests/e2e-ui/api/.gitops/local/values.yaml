@@ -62,9 +62,13 @@ secretEnv:
     key: ZITADEL_SERVICE_USER_TOKEN
 
 sourceDelivery:
-  # Hops local gitops replaces this sentinel with the Cluster mountRoot
-  # hostPath before applying the Deployment. The chart is intentionally not a
-  # standalone Helm checkout; its command expects the mounted workspace.
+  # Hops injects `mode` and `hostPath`. Since hops-cli v0.48.0, hostPath is
+  # the Environment root: this fixture's directory, never above it. The
+  # application builds against the repository's crates and js/ above that
+  # directory, so the chart mounts the checkout that contains it (hostPath
+  # without `checkoutSubpath`) at mountPath; clusterDev.workingDir must be
+  # mountPath/checkoutSubpath. The chart is not a standalone Helm checkout.
   mode: none
   hostPath: ""
+  checkoutSubpath: tests/e2e-ui
   mountPath: /workspace
