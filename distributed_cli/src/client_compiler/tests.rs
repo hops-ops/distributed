@@ -168,7 +168,7 @@ fn order_semantics() -> JsonValue {
     })
 }
 
-fn normalized_list_relationship() -> JsonValue {
+pub(super) fn normalized_list_relationship() -> JsonValue {
     json!({
         "name": "owner",
         "target_model": "Todo",
