@@ -278,18 +278,37 @@ mod tests {
     }
 
     #[test]
-    fn traceparent_validation_accepts_w3c_shape() {
-        assert!(is_valid_traceparent(TRACEPARENT_VALUE));
-    }
-
-    #[test]
-    fn traceparent_validation_rejects_zero_ids() {
-        assert!(!is_valid_traceparent(
-            "00-00000000000000000000000000000000-00f067aa0ba902b7-01"
-        ));
-        assert!(!is_valid_traceparent(
-            "00-4bf92f3577b34da6a3ce929d0e0e4736-0000000000000000-01"
-        ));
+    fn traceparent_validation_accepts_the_w3c_shape_and_rejects_zero_ids() {
+        struct Case {
+            name: &'static str,
+            traceparent: &'static str,
+            valid: bool,
+        }
+        const CASES: &[Case] = &[
+            Case {
+                name: "the W3C shape",
+                traceparent: TRACEPARENT_VALUE,
+                valid: true,
+            },
+            Case {
+                name: "an all-zero trace id",
+                traceparent: "00-00000000000000000000000000000000-00f067aa0ba902b7-01",
+                valid: false,
+            },
+            Case {
+                name: "an all-zero parent id",
+                traceparent: "00-4bf92f3577b34da6a3ce929d0e0e4736-0000000000000000-01",
+                valid: false,
+            },
+        ];
+        for case in CASES {
+            assert_eq!(
+                is_valid_traceparent(case.traceparent),
+                case.valid,
+                "{}",
+                case.name
+            );
+        }
     }
 
     #[test]
