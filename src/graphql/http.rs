@@ -28,7 +28,7 @@ const GRAPHIQL_DEV_ROLE: &str = "user";
 /// HTML for the GraphiQL IDE served on `GET /graphql` when GraphiQL is enabled.
 ///
 /// Default identity headers (`x-roles: user`, `x-user-id: demo`) are injected
-/// only for local exploration. Production scaffolds use `OidcBearer` (D6) —
+/// only for local exploration. Production services use `OidcBearer` (D6) —
 /// these headers are **not** a security mechanism. GraphiQL is off under
 /// production env policy (`graphiql_enabled_from_env`).
 ///

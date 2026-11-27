@@ -166,7 +166,6 @@ struct ClientLifecycle {
 pub fn discover_lifecycle_project(
     requested: impl AsRef<Path>,
     executable: impl AsRef<Path>,
-    command_prefix: &[&str],
     out: Option<&Path>,
 ) -> Result<DiscoveredLifecycleProject, LifecycleError> {
     let requested = requested.as_ref();
@@ -361,7 +360,6 @@ pub fn discover_lifecycle_project(
         javascript.as_ref(),
         client_lifecycle.is_some(),
         &executable,
-        command_prefix,
     );
     let cargo_relative = root.strip_prefix(&lifecycle_root).map_err(|_| {
         LifecycleError::new("Cargo workspace escapes the application lifecycle root")
@@ -371,21 +369,17 @@ pub fn discover_lifecycle_project(
     } else {
         format!("{{root}}/{}/Cargo.toml", portable_path(cargo_relative)?)
     };
-    let mut describe_args = command_prefix
-        .iter()
-        .map(|arg| (*arg).to_string())
-        .chain([
-            "describe".to_string(),
-            "--manifest-path".to_string(),
-            cargo_manifest,
-            "--package".to_string(),
-            application.package.clone(),
-            "--entrypoint".to_string(),
-            entrypoint.clone(),
-            "--distributed-path".to_string(),
-            distributed_root.to_string_lossy().into_owned(),
-        ])
-        .collect::<Vec<_>>();
+    let mut describe_args = Vec::from([
+        "describe".to_string(),
+        "--manifest-path".to_string(),
+        cargo_manifest,
+        "--package".to_string(),
+        application.package.clone(),
+        "--entrypoint".to_string(),
+        entrypoint.clone(),
+        "--distributed-path".to_string(),
+        distributed_root.to_string_lossy().into_owned(),
+    ]);
     if let Some(wasm_pack_launcher) = javascript
         .as_ref()
         .zip(ui_root)
@@ -1070,7 +1064,6 @@ fn lifecycle_dev(
     javascript: Option<&JavascriptFrameworkPackage>,
     lifecycle_owns_client_compile: bool,
     executable: &Path,
-    command_prefix: &[&str],
 ) -> LifecycleDevConfig {
     let bind = std::env::var("BIND").unwrap_or_else(|_| api_bind.to_string());
     let api_address = loopback_address(&bind);
@@ -1102,7 +1095,7 @@ fn lifecycle_dev(
             ready_after_ms: 100,
             ready: Some(LifecycleDevProbe {
                 program: executable.to_string_lossy().into_owned(),
-                args: probe_args(command_prefix, api_address),
+                args: probe_args(api_address),
                 interval_ms: 250,
                 // `cargo run` may populate an empty target directory in a fresh
                 // worktree or development container. A real process failure is
@@ -1178,10 +1171,7 @@ fn lifecycle_dev(
                 ready_after_ms: 100,
                 ready: Some(LifecycleDevProbe {
                     program: executable.to_string_lossy().into_owned(),
-                    args: probe_args(
-                        command_prefix,
-                        loopback_address(&socket_address(&ui_bind, &ui_port)),
-                    ),
+                    args: probe_args(loopback_address(&socket_address(&ui_bind, &ui_port))),
                     interval_ms: 250,
                     timeout_ms: 60_000,
                 }),
@@ -1189,17 +1179,13 @@ fn lifecycle_dev(
         );
     }
     if let Some(package_root) = javascript.and_then(JavascriptFrameworkPackage::local_root) {
-        let args = command_prefix
-            .iter()
-            .map(|arg| (*arg).to_string())
-            .chain([
-                "__js-watch".to_string(),
-                "--package-root".to_string(),
-                package_root.to_string_lossy().into_owned(),
-                "--project-root".to_string(),
-                cargo_root.to_string_lossy().into_owned(),
-            ])
-            .collect();
+        let args = Vec::from([
+            "__js-watch".to_string(),
+            "--package-root".to_string(),
+            package_root.to_string_lossy().into_owned(),
+            "--project-root".to_string(),
+            cargo_root.to_string_lossy().into_owned(),
+        ]);
         processes.insert(
             "framework-js".to_string(),
             LifecycleDevProcess {
@@ -1227,12 +1213,8 @@ fn lifecycle_dev(
     }
 }
 
-fn probe_args(command_prefix: &[&str], address: String) -> Vec<String> {
-    command_prefix
-        .iter()
-        .map(|arg| (*arg).to_string())
-        .chain(["__probe".to_string(), "--address".to_string(), address])
-        .collect()
+fn probe_args(address: String) -> Vec<String> {
+    vec!["__probe".to_string(), "--address".to_string(), address]
 }
 
 fn loopback_address(bind: &str) -> String {
@@ -1328,8 +1310,8 @@ mod tests {
         assert_eq!(loopback_address("[::1]:8791"), "[::1]:8791");
         assert_eq!(socket_address("localhost", "5180"), "localhost:5180");
         assert_eq!(
-            probe_args(&["service"], "localhost:5180".to_string()),
-            ["service", "__probe", "--address", "localhost:5180"]
+            probe_args("localhost:5180".to_string()),
+            ["__probe", "--address", "localhost:5180"]
         );
     }
 
@@ -1443,7 +1425,6 @@ mod tests {
             None,
             false,
             &executable,
-            &[],
         );
 
         config.validate().unwrap();
@@ -1477,7 +1458,6 @@ mod tests {
             None,
             false,
             &executable,
-            &[],
         );
         assert_eq!(
             conventional.processes["ui"]
@@ -1549,7 +1529,6 @@ mod tests {
             Some(&javascript),
             true,
             &executable,
-            &[],
         );
 
         config.validate().unwrap();
@@ -1678,7 +1657,6 @@ mod tests {
             None,
             true,
             &executable,
-            &[],
         );
 
         config.validate().unwrap();

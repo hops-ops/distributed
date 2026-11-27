@@ -82,11 +82,11 @@ protocol key on every replica serving the same endpoint.
 ### GraphiQL (local visual explorer)
 
 ```bash
-# Framework playground (seeded orders, no scaffold needed):
+# Framework playground (seeded orders, no service needed):
 cargo run --example graphiql --features "graphql,sqlite"
 # → http://127.0.0.1:4000/graphql
 
-# Or run your scaffolded service and open GET /graphql
+# Or run your service and open GET /graphql
 GRAPHIQL=0 cargo run   # disable IDE in production
 ```
 
@@ -95,10 +95,10 @@ Headers panel. See `README § GraphQL query service`.
 
 ### Identity (public GraphQL)
 
-Scaffold **always** wires `public_oidc_identity_from_env()` → **`OidcBearer`** +
+A public service **always** wires `public_oidc_identity_from_env()` → **`OidcBearer`** +
 `require_auth=true` (D6). Set `OIDC_ISSUER` + `OIDC_AUDIENCE` (or `OIDC_CLIENT_ID`).
 If unset, placeholder issuer still uses OidcBearer (401 without Bearer) — **never**
-ambient `DevHeaders` on the public scaffold path.
+ambient `DevHeaders` on a public endpoint.
 
 | Mode | Use |
 |---|---|
@@ -179,15 +179,6 @@ git diff --exit-code schema.graphql
 ```
 
 `--dialect` is ignored with `--format graphql` (dialect-independent core surface).
-
-## Scaffold
-
-```bash
-distributed scaffold my-service --query-api --read-models --store sqlite
-```
-
-Emits typed causal handlers, a service-derived GraphQL engine, `src/query/`
-permissions, the `graphql` feature, and repository/token-key wiring.
 
 ## Client / replica drift (dogfood)
 

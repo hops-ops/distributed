@@ -97,7 +97,7 @@ pub(crate) fn is_pure_introspection_request(request: &mut Request) -> bool {
 
 /// Resolve whether GraphiQL should be enabled from environment variables.
 ///
-/// Policy (scaffold + operators):
+/// Policy:
 /// - `GRAPHIQL` if set: on unless value is `0` / `false` / `off` / `no` (case-insensitive)
 /// - else: **off** when `RUST_ENV` / `ENV` / `APP_ENV` is `production` or `prod`
 /// - else: **on** (local/dev default)
