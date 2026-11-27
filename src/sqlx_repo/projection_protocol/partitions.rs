@@ -72,11 +72,38 @@ where
     })
 }
 
+/// Lock a partition for a write that declares `change_epoch`, which must be
+/// the epoch the partition was created with.
 pub(super) async fn lock_partition_in_tx<DB>(
     tx: &mut Transaction<'_, DB>,
     topology: &ProjectorTopologyId,
     partition: &crate::projection_protocol::PartitionId,
     change_epoch: &ProjectionEpoch,
+) -> Result<PartitionState, ProjectionProtocolError>
+where
+    DB: SqlxRepoBackend,
+    for<'c> &'c mut DB::Connection: Executor<'c, Database = DB>,
+    DB::Arguments: IntoArguments<DB>,
+    for<'q> i64: Encode<'q, DB> + Type<DB> + sqlx::Decode<'q, DB>,
+    for<'q> String: Type<DB> + sqlx::Decode<'q, DB>,
+    for<'q> Vec<u8>: Type<DB> + sqlx::Decode<'q, DB>,
+    for<'q> &'q str: Encode<'q, DB> + Type<DB>,
+    for<'q> &'q [u8]: Encode<'q, DB> + Type<DB>,
+    for<'r> &'r str: sqlx::ColumnIndex<DB::Row>,
+{
+    let state = lock_stored_partition_in_tx(tx, topology, partition, change_epoch).await?;
+    ensure_change_epoch(&state.change_epoch, change_epoch)?;
+    Ok(state)
+}
+
+/// Lock a partition and return its stored state. `new_epoch` is used only to
+/// create a partition that does not exist yet; an existing partition keeps
+/// the epoch it was created with, whatever the caller declares.
+pub(super) async fn lock_stored_partition_in_tx<DB>(
+    tx: &mut Transaction<'_, DB>,
+    topology: &ProjectorTopologyId,
+    partition: &crate::projection_protocol::PartitionId,
+    new_epoch: &ProjectionEpoch,
 ) -> Result<PartitionState, ProjectionProtocolError>
 where
     DB: SqlxRepoBackend,
@@ -105,7 +132,7 @@ where
     builder.push(", ");
     builder.push_bind(partition_hash.as_slice());
     builder.push(", 1, ");
-    builder.push_bind(change_epoch.as_str());
+    builder.push_bind(new_epoch.as_str());
     builder.push(
         ") ON CONFLICT (topology_hash, partition_hash) DO UPDATE \
          SET topology_hash = excluded.topology_hash \
@@ -118,7 +145,6 @@ where
         .await
         .map_err(|error| protocol_storage_error::<DB>("lock projection partition", error))?;
     let state = decode_partition_row::<DB>(&row, topology, partition)?;
-    ensure_change_epoch(&state.change_epoch, change_epoch)?;
 
     if generation_exists_in_tx::<DB>(tx, topology, partition, state.active_generation).await? {
         return Ok(state);

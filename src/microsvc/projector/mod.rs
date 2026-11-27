@@ -14,7 +14,7 @@ mod registration;
 mod runtime;
 
 pub use context::{CausalProjectorContext, LoadedProjection};
-pub use handle::{ProjectionRepairHandle, ProjectionRepairHandleParseError};
+pub use handle::{ProjectionRepairHandle, ProjectionRepairHandleParseError, StoppedProjection};
 pub use registration::CausalProjectorRouteBuilder;
 #[cfg(feature = "graphql")]
 pub(super) use registration::ModeledProjectorHandlerFn;
@@ -25,7 +25,7 @@ pub(super) use errors::projection_error_is_retryable;
 #[cfg(feature = "graphql")]
 pub(super) use runtime::RegisteredModeledProjector;
 pub(super) use runtime::{
-    ErasedProjectorHandler, ProjectorRegistration, ProjectorRepairFuture,
+    ErasedProjectorHandler, ProjectorDispatchFuture, ProjectorRegistration, ProjectorRepairFuture,
     ProjectorRepairLookupFuture,
 };
 

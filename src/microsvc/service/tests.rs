@@ -839,6 +839,13 @@ impl ProjectionProtocolStore for AmbiguousCommitRepository {
            + 'a {
         self.inner.projection_failure_location(failure_id)
     }
+
+    fn stopped_projection_failures<'a>(
+        &'a self,
+        topology: &'a ProjectorTopologyId,
+    ) -> impl Future<Output = Result<Vec<String>, ProjectionProtocolError>> + Send + 'a {
+        self.inner.stopped_projection_failures(topology)
+    }
 }
 
 impl CommandLedgerStore for AmbiguousCommitRepository {
@@ -2838,7 +2845,7 @@ async fn graphql_succeeded_status_evaluates_retained_projection_evidence() {
     )
     .unwrap();
     service
-        .dispatch_ordered_message(&Message::from(pending[0].clone()), Some(&ordered))
+        .dispatch_projector(0, &Message::from(pending[0].clone()), Some(&ordered))
         .await
         .expect("the real modeled projector should commit its evidence");
 

@@ -435,10 +435,10 @@ impl ProjectionProtocolStore for InMemoryRepository {
                 .map_err(|_| RepositoryError::LockPoisoned("projection failure inbox write"))?;
 
             protocol.require_registered_topology(batch.input.cursor.topology())?;
+            // A failure is recorded in the partition's stored epoch: the
+            // projector that cannot write under its declared epoch must still
+            // be able to stop its partition durably.
             let partition = protocol.partitions.get(&partition_key);
-            if let Some(partition) = partition {
-                ensure_change_epoch(&partition.change_epoch, &batch.change_epoch)?;
-            }
             protocol.validate_input_identity(&batch.input)?;
             ensure_active_input(
                 &batch.input,
@@ -484,7 +484,7 @@ impl ProjectionProtocolStore for InMemoryRepository {
             let mut head = partition.map_or(0, |partition| partition.change_head);
             let change = next_change(
                 &partition_key,
-                &batch.change_epoch,
+                partition.map_or(&batch.change_epoch, |partition| &partition.change_epoch),
                 &mut head,
                 PendingChange {
                     kind: ProjectionChangeKind::Failure,
@@ -995,6 +995,26 @@ impl ProjectionProtocolStore for InMemoryRepository {
                     topology: failure.input.topology().clone(),
                     partition: failure.input.projection_partition().clone(),
                 }))
+        }
+    }
+
+    fn stopped_projection_failures<'a>(
+        &'a self,
+        topology: &'a ProjectorTopologyId,
+    ) -> impl Future<Output = Result<Vec<String>, ProjectionProtocolError>> + Send + 'a {
+        async move {
+            let protocol = self
+                .projection_protocol
+                .read()
+                .map_err(|_| RepositoryError::LockPoisoned("stopped projection failures read"))?;
+            let mut stopped: Vec<String> = protocol
+                .partitions
+                .iter()
+                .filter(|(key, _)| &key.topology == topology)
+                .filter_map(|(_, partition)| partition.stopped_failure_id.clone())
+                .collect();
+            stopped.sort();
+            Ok(stopped)
         }
     }
 }

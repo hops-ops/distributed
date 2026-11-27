@@ -119,6 +119,12 @@ where
             let Err(error) = build_service().run(options).await else {
                 return;
             };
+            // A run that ends on shutdown still reports a projector that had
+            // stopped; that is not a reason to wait and restart.
+            if shutdown.is_triggered() {
+                tracing::error!(%error, "bus consumer ended with a stopped projector");
+                return;
+            }
             if started.elapsed() > crate::bus::DEFAULT_RETRY_BACKOFF_MAX {
                 failures = 0;
             }

@@ -37,6 +37,18 @@ impl ProjectionRepairHandle {
     }
 }
 
+/// A projection that a durable failure has stopped, as
+/// [`Service::stopped_projections`](crate::microsvc::Service::stopped_projections)
+/// reports it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StoppedProjection {
+    /// The stopped projector's topology name.
+    pub projection: String,
+    /// What [`Service::repair_projection`](crate::microsvc::Service::repair_projection)
+    /// takes to let it resume from its failed input.
+    pub repair: ProjectionRepairHandle,
+}
+
 impl fmt::Debug for ProjectionRepairHandle {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter

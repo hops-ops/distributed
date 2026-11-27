@@ -4,8 +4,8 @@ One durable consumer (`listen`/`subscribe` group) delivers messages in broker
 order and, by default, runs every registered route for a message before it
 receives the next one. That is the simplest ordering contract, but it couples
 latency across unrelated work: a process-manager policy that only turns a fact
-into the next idempotent command waits behind every projection and slow
-external effect registered for earlier messages. It also lets one message
+into the next idempotent command waits behind every slow external effect
+registered for earlier messages. It also lets one message
 that keeps failing monopolize the consumer.
 
 ## Retry backoff for retryable failures
@@ -27,6 +27,15 @@ replays the same rejection on every retry. The handler must return a
 permanent error, which the configured failure policy (dead-letter by default)
 settles and records in transport metrics. Transient infrastructure failures
 stay retryable.
+
+## Projectors are not in this consumer
+
+This page is about a service's event handlers (`.event(..)` routes). A
+projector never shares their consumer: `Service::run` gives every projector a
+durable consumer of its own, in the group `<group>-<projector>`. A projector
+that stops on a terminal failure stops alone, and a slow projector delays
+only itself. Lanes therefore partition event handlers only. See
+[projections and read models](guides/projections-and-read-models.md#eventual-projection).
 
 ## Lanes
 

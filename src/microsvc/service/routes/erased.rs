@@ -20,8 +20,8 @@ use crate::command_ledger::{CausalStorageIdentity, CommandLedgerError};
 use crate::command_ledger::{CommandContractFingerprint, CommandId, CommandLedgerKey};
 use crate::microsvc::cell_host::CellCommandIdentity;
 use crate::microsvc::projector::{
-    ProjectionRepairHandle, ProjectorRegistration, ProjectorRepairFuture,
-    ProjectorRepairLookupFuture,
+    ProjectionRepairHandle, ProjectorDispatchFuture, ProjectorRegistration, ProjectorRepairFuture,
+    ProjectorRepairLookupFuture, StoppedProjection,
 };
 use crate::microsvc::session::Session;
 use crate::repository::StreamIdentity;
@@ -33,6 +33,14 @@ use std::pin::Pin;
 #[cfg(any(feature = "graphql", feature = "runtime-tokio"))]
 use std::sync::Arc;
 use std::time::Duration;
+
+pub(in crate::microsvc) type StoppedProjectionsFuture<'a> = Pin<
+    Box<
+        dyn Future<Output = Result<Vec<StoppedProjection>, crate::microsvc::HandlerError>>
+            + Send
+            + 'a,
+    >,
+>;
 
 #[derive(Clone, Copy)]
 pub(in crate::microsvc::service) struct CausalCommandPolicy {
@@ -221,7 +229,13 @@ pub(in crate::microsvc::service) trait ErasedRoutes:
 
     fn bootstrap_projectors(&self) -> ProjectorBootstrapFuture<'_>;
 
-    fn is_causal_projector(&self, message: &Message) -> bool;
+    /// Run one projector, named by its topology, for one delivered event.
+    fn dispatch_projector<'a>(
+        &'a self,
+        projector: &'a str,
+        message: &'a Message,
+        ordered: Option<&'a OrderedDelivery>,
+    ) -> ProjectorDispatchFuture<'a>;
 
     fn repair_projection<'a>(
         &'a self,
@@ -233,18 +247,21 @@ pub(in crate::microsvc::service) trait ErasedRoutes:
         handle: &'a ProjectionRepairHandle,
     ) -> ProjectorRepairLookupFuture<'a>;
 
+    /// Every projector of this bundle that a durable failure has stopped.
+    fn stopped_projections(&self) -> StoppedProjectionsFuture<'_>;
+
     #[cfg(feature = "graphql")]
     fn bind_typed_command_contracts(
         &mut self,
         contracts: &BTreeMap<String, TypedCommandContract>,
     ) -> Result<(), super::super::causal::GraphqlServiceBindError>;
 
+    /// Run the event handler registered for `message`.
     fn dispatch<'a>(
         &'a self,
         message: &'a Message,
         input: Value,
         session: Session,
-        ordered: Option<&'a OrderedDelivery>,
     ) -> HandlerFuture<'a>;
 
     #[allow(clippy::too_many_arguments)]

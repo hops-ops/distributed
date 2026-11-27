@@ -656,8 +656,12 @@ where
                 .map_err(|error| protocol_storage_error::<DB>("begin projection failure", error))?;
             verify_registered_topology_in_tx(&mut tx, self.verified_registrations(), &topology)
                 .await?;
+            // A failure is recorded in the partition's stored epoch: the
+            // projector that cannot write under its declared epoch must still
+            // be able to stop its partition durably.
             let mut state =
-                lock_partition_in_tx(&mut tx, &topology, &partition, &batch.change_epoch).await?;
+                lock_stored_partition_in_tx(&mut tx, &topology, &partition, &batch.change_epoch)
+                    .await?;
             validate_input_identity_in_tx(&mut tx, &batch.input).await?;
             ensure_active_input(&batch.input, state.active_generation, None)?;
             if let Some(stopped) = &state.stopped_failure_id {
@@ -1360,6 +1364,35 @@ where
                 topology,
                 partition,
             }))
+        }
+    }
+
+    fn stopped_projection_failures<'a>(
+        &'a self,
+        topology: &'a ProjectorTopologyId,
+    ) -> impl Future<Output = Result<Vec<String>, ProjectionProtocolError>> + Send + 'a {
+        async move {
+            let topology_hash = topology.digest();
+            let mut builder = QueryBuilder::<DB>::new(
+                "SELECT stopped_failure_id FROM projection_partitions \
+                 WHERE stopped_failure_id IS NOT NULL AND topology_hash = ",
+            );
+            builder.push_bind(topology_hash.as_slice());
+            builder.push(" ORDER BY stopped_failure_id");
+            builder
+                .build()
+                .fetch_all(self.pool())
+                .await
+                .map_err(|error| {
+                    protocol_storage_error::<DB>("list stopped projection failures", error)
+                })?
+                .iter()
+                .map(|row| {
+                    row.try_get("stopped_failure_id").map_err(|error| {
+                        protocol_storage_error::<DB>("decode stopped projection failure", error)
+                    })
+                })
+                .collect()
         }
     }
 }
