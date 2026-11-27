@@ -363,6 +363,8 @@ impl Module {
     pub(crate) fn typed_command_contracts(&self) -> Result<Vec<TypedCommandContract>, String> {
         let mut contracts = Vec::with_capacity(self.definitions.len());
         for definition in &self.definitions {
+            // CommandDefinition derives its spec from the typed contract at
+            // construction and never changes either, so they cannot disagree.
             let Some(contract) = definition.typed_contract() else {
                 return Err(format!(
                     "module `{}` command `{}` has no retained typed command contract",
@@ -370,15 +372,6 @@ impl Module {
                     definition.spec().id
                 ));
             };
-            let expected = CommandSpec::from_contract(contract)
-                .map_err(|error| format!("cannot compile typed command contract: {error}"))?;
-            if expected != *definition.spec() {
-                return Err(format!(
-                    "module `{}` command `{}` has a stale portable spec beside its typed command contract",
-                    self.id(),
-                    definition.spec().id
-                ));
-            }
             contracts.push(contract.clone());
         }
         Ok(contracts)
@@ -469,54 +462,15 @@ impl ModuleBuilder {
             command.validate_fingerprint()?;
         }
 
-        for definition in &definitions {
-            if let Some(contract) = definition.typed_contract() {
-                let expected = CommandSpec::from_contract(contract)?;
-                if expected != *definition.spec() {
-                    return Err(ApplicationError::Collision {
-                        kind: "command",
-                        identity: definition.spec().id.clone(),
-                        reason: "typed command contract and portable spec disagree".into(),
-                    });
-                }
-            }
-        }
-
+        // Every CommandDefinition constructor proves its spec equals the one
+        // derived from its typed contract and the one its mount carries, and
+        // neither can change afterwards; command ids are unique above, so the
+        // mounts (at most one per definition) are unique too.
         let mut mounts = definitions
             .iter()
             .filter_map(|definition| definition.mount().cloned())
             .collect::<Vec<_>>();
-        let command_ids = commands
-            .iter()
-            .map(|command| command.id.as_str())
-            .collect::<BTreeSet<_>>();
-        for mount in &mounts {
-            if !command_ids.contains(mount.spec().id.as_str()) {
-                return Err(ApplicationError::Missing {
-                    kind: "command",
-                    identity: mount.spec().id.clone(),
-                });
-            }
-            let Some(command) = commands
-                .iter()
-                .find(|command| command.id == mount.spec().id)
-            else {
-                continue;
-            };
-            if command.fingerprint != mount.spec().fingerprint {
-                return Err(ApplicationError::Collision {
-                    kind: "command",
-                    identity: command.id.clone(),
-                    reason: "executable mount spec differs from module command spec".into(),
-                });
-            }
-        }
-
         mounts.sort_by(|left, right| left.spec().id.cmp(&right.spec().id));
-        validate_unique(
-            "command mount",
-            mounts.iter().map(|mount| mount.spec().id.clone()),
-        )?;
 
         let mut surfaces = self.surfaces;
         surfaces.sort_by(|left, right| left.id.cmp(&right.id));
