@@ -191,6 +191,24 @@ pub fn discover_lifecycle_project(
     }
 
     let metadata = cargo_metadata(&manifest)?;
+    discover_from_metadata(
+        &requested,
+        metadata,
+        executable.as_ref(),
+        command_prefix,
+        out,
+    )
+}
+
+/// Plan the project `cargo metadata` describes. `requested` is the canonical
+/// directory the caller named; it must be the Cargo workspace root.
+fn discover_from_metadata(
+    requested: &Path,
+    metadata: CargoMetadata,
+    executable: &Path,
+    command_prefix: &[&str],
+    out: Option<&Path>,
+) -> Result<DiscoveredLifecycleProject, LifecycleError> {
     let root = metadata.workspace_root.canonicalize().map_err(|error| {
         LifecycleError::new(format!("failed to resolve Cargo workspace root: {error}"))
     })?;
@@ -225,7 +243,7 @@ pub fn discover_lifecycle_project(
         .parent()
         .ok_or_else(|| LifecycleError::new("Distributed Cargo.toml has no parent directory"))?
         .to_path_buf();
-    let executable = executable.as_ref().canonicalize().map_err(|error| {
+    let executable = executable.canonicalize().map_err(|error| {
         LifecycleError::new(format!(
             "failed to resolve the distributed executable: {error}"
         ))
