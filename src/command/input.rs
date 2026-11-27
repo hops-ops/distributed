@@ -673,4 +673,336 @@ mod tests {
         assert_eq!(typed.wire(), &json!({ "wireId": "one" }));
         assert_eq!(typed.hash().len(), "sha256:".len() + 64);
     }
+
+    fn scalar(type_name: &str) -> CommandTypeDef {
+        CommandTypeDef::new(
+            "ScalarInput",
+            vec![field("value", type_name, false, false, false, None)],
+        )
+    }
+
+    #[test]
+    fn scalar_leaves_are_normalized_or_rejected_at_their_path() {
+        struct Case {
+            name: &'static str,
+            type_name: &'static str,
+            value: Value,
+            expected: Result<Value, &'static str>,
+        }
+        let cases = [
+            Case {
+                name: "integer id becomes a string",
+                type_name: "ID",
+                value: json!(7),
+                expected: Ok(json!("7")),
+            },
+            Case {
+                name: "string id",
+                type_name: "ID",
+                value: json!("a"),
+                expected: Ok(json!("a")),
+            },
+            Case {
+                name: "fractional id",
+                type_name: "ID",
+                value: json!(1.5),
+                expected: Err("must be a string or integer ID"),
+            },
+            Case {
+                name: "string",
+                type_name: "String",
+                value: json!(1),
+                expected: Err("must be a string"),
+            },
+            Case {
+                name: "timestamp",
+                type_name: "Timestamptz",
+                value: json!("2024-02-29T23:59:60.5+05:30"),
+                expected: Ok(json!("2024-02-29T23:59:60.5+05:30")),
+            },
+            Case {
+                name: "timestamp, not rfc 3339",
+                type_name: "Timestamptz",
+                value: json!("2023-02-29T00:00:00Z"),
+                expected: Err("must be an RFC 3339 timestamp"),
+            },
+            Case {
+                name: "boolean",
+                type_name: "Boolean",
+                value: json!("true"),
+                expected: Err("must be a boolean"),
+            },
+            Case {
+                name: "big int",
+                type_name: "BigInt",
+                value: json!(u64::MAX),
+                expected: Ok(json!(u64::MAX)),
+            },
+            Case {
+                name: "big int from string",
+                type_name: "BigInt",
+                value: json!("1"),
+                expected: Err("must be an integer"),
+            },
+            Case {
+                name: "int from string",
+                type_name: "Int",
+                value: json!("1"),
+                expected: Err("must be a 32-bit integer"),
+            },
+            Case {
+                name: "int at the lower bound",
+                type_name: "Int",
+                value: json!(i32::MIN),
+                expected: Ok(json!(i32::MIN)),
+            },
+            Case {
+                name: "float",
+                type_name: "Float",
+                value: json!(2),
+                expected: Ok(json!(2.0)),
+            },
+            Case {
+                name: "float from string",
+                type_name: "Float",
+                value: json!("2"),
+                expected: Err("must be a number"),
+            },
+            Case {
+                name: "base64",
+                type_name: "Bytea",
+                value: json!("aGk="),
+                expected: Ok(json!("aGk=")),
+            },
+            Case {
+                name: "base64, not canonical",
+                type_name: "Bytea",
+                value: json!("aGk"),
+                expected: Err("must be canonical base64"),
+            },
+            Case {
+                name: "base64 from number",
+                type_name: "Bytea",
+                value: json!(1),
+                expected: Err("must be a base64 string"),
+            },
+            Case {
+                name: "json keeps any value",
+                type_name: "JSON",
+                value: json!([{"b": 1, "a": 2}]),
+                expected: Ok(json!([{"a": 2, "b": 1}])),
+            },
+        ];
+        for case in cases {
+            let result =
+                canonicalize_command_input(&scalar(case.type_name), json!({ "value": case.value }));
+            match (result, case.expected) {
+                (Ok(input), Ok(expected)) => {
+                    assert_eq!(input.wire()["value"], expected, "{}", case.name);
+                }
+                (Err(error), Err(detail)) => assert_eq!(
+                    error,
+                    CommandInputError::at("$.value", detail),
+                    "{}",
+                    case.name
+                ),
+                (result, expected) => panic!("{}: got {result:?}, want {expected:?}", case.name),
+            }
+        }
+    }
+
+    #[test]
+    fn malformed_definitions_and_shapes_are_rejected() {
+        let mut unsigned_string = field("value", "String", false, false, false, None);
+        unsigned_string.unsigned_integer = Some(crate::command::CommandUnsignedInteger::U8);
+        let cases = [
+            (
+                "input is not an object",
+                scalar("String"),
+                json!([1]),
+                CommandInputError::at("$", "must be an object"),
+            ),
+            (
+                "nested input is not an object",
+                definition(),
+                json!({ "id": "one", "tags": [], "nested": 1 }),
+                CommandInputError::at("$.nested", "must be an object"),
+            ),
+            (
+                "list field given a scalar",
+                definition(),
+                json!({ "id": "one", "tags": "a", "nested": { "count": 1 } }),
+                CommandInputError::at("$.tags", "must be a list"),
+            ),
+            (
+                "repeated field",
+                CommandTypeDef::new(
+                    "Twice",
+                    vec![
+                        field("value", "String", false, false, false, None),
+                        field("value", "String", false, false, false, None),
+                    ],
+                ),
+                json!({ "value": "a" }),
+                CommandInputError::configuration("`Twice` repeats field `value`"),
+            ),
+            (
+                "unsupported scalar",
+                scalar("Vector"),
+                json!({ "value": 1 }),
+                CommandInputError::configuration(
+                    "`Vector` field `value` uses unsupported scalar `Vector`",
+                ),
+            ),
+            (
+                "unsigned refinement on a string",
+                CommandTypeDef::new("Unsigned", vec![unsigned_string]),
+                json!({ "value": 1 }),
+                CommandInputError::at("$.value", "unsigned refinement requires BigInt"),
+            ),
+        ];
+        for (name, definition, input, expected) in cases {
+            assert_eq!(
+                canonicalize_command_input(&definition, input).unwrap_err(),
+                expected,
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn nullable_list_items_are_kept_as_null() {
+        let definition = CommandTypeDef::new(
+            "Items",
+            vec![field("items", "BigInt", false, true, true, None)],
+        );
+        let input = canonicalize_command_input(&definition, json!({ "items": [1, null] })).unwrap();
+        assert_eq!(input.wire()["items"], json!([1, null]));
+    }
+
+    #[test]
+    fn errors_name_the_value_path_or_the_definition() {
+        assert_eq!(
+            CommandInputError::at("$.id", "is required").to_string(),
+            "command input `$.id` is required"
+        );
+        assert_eq!(
+            CommandInputError::configuration("is broken").describe("command output"),
+            "command output definition is broken"
+        );
+    }
+
+    #[test]
+    fn rfc3339_timestamps_are_checked_field_by_field() {
+        let cases = [
+            ("utc", "2026-01-31T12:30:45Z", true),
+            ("lower-case separators", "2026-01-31t12:30:45z", true),
+            ("fraction and offset", "2026-01-31T12:30:45.123-08:00", true),
+            ("leap day in a leap year", "2000-02-29T00:00:00Z", true),
+            ("leap second", "2026-06-30T23:59:60Z", true),
+            ("leap day in a century year", "1900-02-29T00:00:00Z", false),
+            ("day 31 of a 30-day month", "2026-04-31T00:00:00Z", false),
+            ("day zero", "2026-01-00T00:00:00Z", false),
+            ("month 13", "2026-13-01T00:00:00Z", false),
+            ("hour 24", "2026-01-01T24:00:00Z", false),
+            ("minute 60", "2026-01-01T00:60:00Z", false),
+            ("second 61", "2026-01-01T00:00:61Z", false),
+            ("space separator", "2026-01-01 00:00:00Z", false),
+            ("no zone", "2026-01-01T00:00:00", false),
+            ("empty fraction", "2026-01-01T00:00:00.Z", false),
+            ("trailing text", "2026-01-01T00:00:00Zx", false),
+            ("offset without colon", "2026-01-01T00:00:00+0000", false),
+            ("offset hour 24", "2026-01-01T00:00:00+24:00", false),
+            ("offset minute 60", "2026-01-01T00:00:00+00:60", false),
+            ("non-digit year", "2O26-01-01T00:00:00Z", false),
+        ];
+        for (name, value, expected) in cases {
+            assert_eq!(is_rfc3339_timestamp(value), expected, "{name}: {value}");
+        }
+    }
+
+    fn default(
+        generator: super::super::InputDefaultGenerator,
+        path: &[&str],
+    ) -> super::super::CommandInputDefault {
+        super::super::CommandInputDefault {
+            generator,
+            path: path.iter().map(|segment| segment.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn stamp_now_overwrites_the_client_value_and_keeps_the_submitted_digest() {
+        use super::super::InputDefaultGenerator::{Now, Ulid};
+        let definition = CommandTypeDef::new(
+            "Stamped",
+            vec![
+                field("at", "String", false, false, false, None),
+                field("id", "String", false, false, false, None),
+            ],
+        );
+        let submitted =
+            canonicalize_command_input(&definition, json!({ "at": "1", "id": "client" })).unwrap();
+        let submitted_hash = submitted.hash();
+        let clock = std::time::UNIX_EPOCH + std::time::Duration::from_millis(1_700_000_000_123);
+        let stamped = submitted
+            .stamp_now(
+                &[default(Ulid, &["id"]), default(Now, &["at"])],
+                Some(clock),
+            )
+            .unwrap();
+        assert_eq!(
+            stamped.wire(),
+            &json!({ "at": "1700000000123", "id": "client" })
+        );
+        assert_eq!(
+            stamped.hash(),
+            submitted_hash,
+            "the digest names the submitted input"
+        );
+        assert_eq!(stamped.bytes, serde_json::to_vec(stamped.wire()).unwrap());
+
+        let unstamped =
+            canonicalize_command_input(&definition, json!({ "at": "1", "id": "client" })).unwrap();
+        let untouched = unstamped
+            .clone()
+            .stamp_now(&[default(Ulid, &["id"])], None)
+            .unwrap();
+        assert_eq!(untouched, unstamped, "no now() default needs no clock");
+    }
+
+    #[test]
+    fn stamp_now_rejects_nested_targets_and_a_missing_clock() {
+        use super::super::InputDefaultGenerator::Now;
+        let input =
+            || canonicalize_command_input(&scalar("String"), json!({ "value": "1" })).unwrap();
+        let before_epoch = std::time::UNIX_EPOCH - std::time::Duration::from_secs(1);
+        let cases = [
+            (
+                "nested path",
+                default(Now, &["a", "b"]),
+                Some(std::time::SystemTime::now()),
+                "now() default must target one top-level field",
+            ),
+            (
+                "no host clock",
+                default(Now, &["value"]),
+                None,
+                "now() default requires the host clock",
+            ),
+            (
+                "clock before 1970",
+                default(Now, &["value"]),
+                Some(before_epoch),
+                "host clock is before 1970",
+            ),
+        ];
+        for (name, default, clock, detail) in cases {
+            assert_eq!(
+                input().stamp_now(&[default], clock).unwrap_err(),
+                CommandInputError::configuration(detail),
+                "{name}"
+            );
+        }
+    }
 }
