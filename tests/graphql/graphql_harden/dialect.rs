@@ -3,11 +3,10 @@
 //! SQLite engines must not expose Postgres jsonb operators on
 //! `JSON_comparison_exp`. Failure is GraphQL unknown-field (type honesty),
 //! with compile-time reject remaining as defense-in-depth.
+//! The naming policy behind it (`comparison_op_fields`) is unit-tested in
+//! `src/graphql/naming.rs`.
 
 use async_graphql::Request;
-use distributed::graphql::naming::{
-    comparison_op_fields, include_postgres_json_comparison_ops, POSTGRES_JSON_COMPARISON_OPS,
-};
 use distributed::graphql::IdentityConfig;
 use distributed::graphql::{read, GraphqlEngine, ModelPermissions};
 use distributed::read_model::ReadModel;
@@ -37,16 +36,6 @@ async fn engine() -> GraphqlEngine {
         .model::<DocView>(ModelPermissions::new().grant("user", read().all_columns()))
         .build()
         .unwrap()
-}
-
-/// Matrix helper: shared naming policy says SQLite omits PG JSON ops.
-#[test]
-fn naming_matrix_sqlite_omits_pg_json_ops() {
-    assert!(!include_postgres_json_comparison_ops(false));
-    let fields = comparison_op_fields("JSON", false);
-    for op in POSTGRES_JSON_COMPARISON_OPS {
-        assert!(!fields.contains(op), "unexpected {op} in SQLite JSON ops");
-    }
 }
 
 /// SQLite runtime: `_contains` is not a field on JSON_comparison_exp.
