@@ -1807,3 +1807,86 @@ fn a7_role_dialect_parity_inventory_and_sdl_ops() {
         }
     }
 }
+
+/// The application manifest is compiled from this Surface IR: its model
+/// relationships and modeled projector owners must reach the portable
+/// contract intact and pass manifest validation (otherwise only the e2e-ui
+/// application exercised this conversion).
+#[cfg(feature = "graphql")]
+#[test]
+fn application_contract_keeps_relationships_and_modeled_owners() {
+    use crate::application::{Application, ApplicationManifest, SurfaceSpec};
+
+    let mut parent = direct_model("ParentView", "parents");
+    parent.relationships = vec![RelationshipDef {
+        references: None,
+        field_name: "children".into(),
+        kind: RelationshipKind::HasMany,
+        target_model: "ChildView".into(),
+        foreign_key: Some("parent_id".into()),
+        through: None,
+        target_foreign_key: None,
+    }];
+    let mut child = direct_model("ChildView", "children");
+    child
+        .columns
+        .push(TableColumn::new("parent_id", "parent_id", ColumnType::Text));
+    let modeled = modeled_direct_projection(
+        "parents-owner",
+        "parents-program",
+        parent.clone(),
+        DirectModeledBinding::active("parents-topology"),
+    );
+    let program_id = modeled.program_id().to_string();
+    let surface = build_surface(&[parent, child], &SurfaceOptions::sqlite())
+        .unwrap()
+        .with_projection_owners([SurfaceDirectProjection::new("parents-owner")
+            .modeled(modeled)
+            .into()])
+        .unwrap();
+
+    let spec = SurfaceSpec::from_surface("web", &surface).unwrap();
+    let parent = spec
+        .contract
+        .models
+        .iter()
+        .find(|model| model.id == "ParentView")
+        .expect("parent model contract");
+    let children = parent
+        .relationships
+        .iter()
+        .find(|relationship| relationship.name == "children")
+        .expect("children relationship contract");
+    assert_eq!(children.target_model, "ChildView");
+    assert!(children.list);
+    assert_eq!(
+        children.keys,
+        serde_json::json!({"kind": "direct", "local": ["id"], "remote": ["parent_id"]})
+    );
+    let argument_kinds = children
+        .arguments
+        .iter()
+        .map(|argument| argument.kind.as_str())
+        .collect::<BTreeSet<_>>();
+    assert!(
+        ["filter", "order", "limit", "offset"]
+            .iter()
+            .all(|kind| argument_kinds.contains(kind)),
+        "{argument_kinds:?}"
+    );
+
+    let [projection] = spec.contract.projections.as_slice() else {
+        panic!("one projector owner: {:?}", spec.contract.projections);
+    };
+    assert_eq!(projection.id, "parents-owner");
+    assert_eq!(projection.models, ["ParentView"]);
+    assert_eq!(projection.modeled_programs, [program_id]);
+    assert_eq!(projection.modeled.len(), 1);
+
+    let application = Application::try_new("relationships", [], [spec]).unwrap();
+    let bytes = application.manifest().canonical_bytes().unwrap();
+    assert_eq!(
+        &ApplicationManifest::from_canonical_bytes(&bytes).unwrap(),
+        application.manifest()
+    );
+}
