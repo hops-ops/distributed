@@ -67,7 +67,9 @@ The shapes behind the table:
   name in the `x-distributed-name` header. A consumer acknowledges names it
   does not handle. A consumer is idle once it has joined its group and read
   every partition assigned to it to its end (a topic that does not exist yet
-  assigns none); the fetch timeout (8 s) only bounds one wait on the broker,
+  assigns none), and the broker's high watermarks show nothing past what it
+  has read, so a drain that looks again after another consumer's dispatch
+  sees what that dispatch produced; the fetch timeout (8 s) only bounds one wait on the broker,
   for the group to be joined or for the next record, so a broker that stops
   answering cannot hang a drain.
 - **RabbitMQ** declares one queue per command name on send, so a command

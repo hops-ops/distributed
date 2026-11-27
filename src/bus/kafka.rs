@@ -10,7 +10,7 @@
 //! [`KafkaSource`] consumes with a consumer group (auto-commit disabled) and
 //! settles by offset: ack→commit the offset, nack→seek back so the record is
 //! re-read. It is idle once it has read every partition assigned to it to
-//! its end.
+//! its end and the broker holds nothing past what it has read.
 //!
 //! [`KafkaBus`]: super::KafkaBus
 //! [`SOURCE_AGGREGATE_ID`]: crate::outbox_worker::SOURCE_AGGREGATE_ID
@@ -134,7 +134,12 @@ pub(super) const DEFAULT_FETCH_TIMEOUT: Duration = Duration::from_secs(8);
 /// [`recv`](MessageSource::recv) returns `Ok(None)` (idle) once the consumer
 /// has joined its group and has read every partition assigned to it to its
 /// end; a group with no partition assigned, or a topic that does not exist
-/// yet, is idle at once. The fetch timeout bounds one wait on the broker: for
+/// yet, is idle at once. Once caught up, each `recv` asks the broker for the
+/// partitions' high watermarks, so a record produced since is read rather
+/// than missed: a drain of several consumers
+/// ([`RunUntil::AllIdle`](super::RunUntil::AllIdle)) looks again after
+/// another consumer's dispatch, and what that dispatch produced must be
+/// there. The fetch timeout bounds one wait on the broker: for
 /// the group to be joined, for the next record or end of partition, and in
 /// [`ready`](MessageSource::ready) for the next record once caught up. A wait that runs out also returns `Ok(None)`,
 /// so a broker that stops answering does not hang a run.
@@ -147,6 +152,10 @@ pub struct KafkaSource {
     redelivery: Redelivery,
     /// What [`ready`](MessageSource::ready) received, for the next `recv`.
     pending: Option<KafkaResult<KafkaReceived>>,
+    /// Whether a partition with no committed offset is read from its start
+    /// (`auto.offset.reset` earliest), so its low watermark is where an
+    /// unread partition starts.
+    resets_to_earliest: bool,
 }
 
 /// Receive errors in a row after which `recv` stops retrying and fails.
@@ -271,6 +280,10 @@ impl KafkaSource {
             consecutive_errors: 0,
             redelivery: Redelivery::default(),
             pending: None,
+            resets_to_earliest: matches!(
+                config.get("auto.offset.reset"),
+                Some("earliest" | "smallest" | "beginning")
+            ),
         })
     }
 
@@ -315,6 +328,37 @@ impl KafkaSource {
         }))
     }
 
+    /// Whether the broker holds a record this caught-up consumer has not
+    /// read: on some assigned partition the high watermark is past the
+    /// offset the consumer reads next. A caught-up consumer learns of a
+    /// record produced since only from a later fetch, so it asks.
+    ///
+    /// The next offset is the consumer's position; on a partition it has
+    /// read nothing from, the committed offset, else the low watermark when
+    /// the group resets to earliest. When that cannot be told, or the broker
+    /// does not answer, the answer is yes: `recv` then waits for the next
+    /// event, bounded by `deadline`, rather than miss a record.
+    async fn unread_on_broker(&self, deadline: Instant) -> bool {
+        let consumer = Arc::clone(&self.consumer);
+        let resets_to_earliest = self.resets_to_earliest;
+        let timeout = deadline.saturating_duration_since(Instant::now());
+        let checked = tokio::task::spawn_blocking(move || {
+            unread_records(&consumer, resets_to_earliest, timeout)
+        })
+        .await;
+        match checked {
+            Ok(Ok(unread)) => unread,
+            Ok(Err(error)) => {
+                tracing::warn!(%error, "kafka high watermarks unavailable; waiting for the next record");
+                true
+            }
+            Err(error) => {
+                tracing::warn!(%error, "kafka high watermark check did not finish");
+                true
+            }
+        }
+    }
+
     /// Account for one receive error: `Err` when `recv` must fail now (an
     /// error retrying cannot fix, or [`MAX_CONSECUTIVE_RECV_ERRORS`] in a
     /// row), else a logged retry.
@@ -335,6 +379,43 @@ impl KafkaSource {
         tracing::warn!(%error, "kafka receive failed; retrying");
         Ok(())
     }
+}
+
+/// See [`KafkaSource::unread_on_broker`]. Blocks on the broker, up to
+/// `timeout` per request.
+fn unread_records(
+    consumer: &SourceConsumer,
+    resets_to_earliest: bool,
+    timeout: Duration,
+) -> KafkaResult<bool> {
+    let positions = consumer.position()?;
+    let mut committed = None;
+    for element in positions.elements() {
+        let (topic, partition) = (element.topic(), element.partition());
+        let (low, high) = consumer.fetch_watermarks(topic, partition, timeout)?;
+        let next = match element.offset() {
+            Offset::Offset(next) => next,
+            _ => {
+                if committed.is_none() {
+                    committed = Some(consumer.committed(timeout)?);
+                }
+                let committed = committed
+                    .as_ref()
+                    .and_then(|list| list.find_partition(topic, partition))
+                    .map(|element| element.offset());
+                match committed {
+                    Some(Offset::Offset(next)) => next,
+                    _ if resets_to_earliest => low,
+                    // Where the consumer started is not known here.
+                    _ => return Ok(true),
+                }
+            }
+        };
+        if high > next {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// Whether a receive error will come back however often the consumer retries:
@@ -371,7 +452,9 @@ impl MessageSource for KafkaSource {
         loop {
             let event = match self.pending.take() {
                 Some(event) => event,
-                None if self.progress.caught_up() => return Ok(None),
+                None if self.progress.caught_up() && !self.unread_on_broker(deadline).await => {
+                    return Ok(None)
+                }
                 None => match self.next_event(deadline).await {
                     Some(event) => event,
                     None => {

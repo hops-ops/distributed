@@ -16,8 +16,8 @@ use std::time::{Duration, Instant};
 use common::env as env_support;
 use common::ids::unique;
 use distributed::bus::{
-    run_source, Handlers, KafkaPublisher, KafkaSource, Message, MessageKind, MessageSource,
-    ReceivedMessage, RunOptions, Shutdown, TransportError,
+    run_source, Handlers, IdleGroup, KafkaPublisher, KafkaSource, Message, MessageKind,
+    MessageSource, ReceivedMessage, RunOptions, RunUntil, Shutdown, TransportError,
 };
 
 /// Far longer than joining a group and reading a topic take, even on a
@@ -238,4 +238,96 @@ async fn a_caught_up_run_until_shutdown_does_not_spin() {
     // seconds. A source that did not wait in `ready` makes thousands.
     let calls = calls.load(Ordering::Relaxed);
     assert!(calls <= 10, "{calls} recv calls in {watched:?}");
+}
+
+/// A source that has caught up sees a record produced since on its next
+/// `recv`, without waiting in `ready` first: a drain looks again after
+/// another consumer's dispatch (`RunUntil::AllIdle`), and what that dispatch
+/// produced must be there.
+#[tokio::test]
+async fn a_caught_up_source_sees_a_record_produced_since_on_its_next_recv() {
+    let Some(topic) = Topic::create(3).await else {
+        return;
+    };
+    let mut source = topic.source(LONG).await;
+    assert!(
+        drain(&mut source).await.is_empty(),
+        "caught up on an empty topic"
+    );
+
+    topic.produce(&["late".to_string()]).await;
+    let started = Instant::now();
+    assert_eq!(drain(&mut source).await, ["late"]);
+    let took = started.elapsed();
+    assert!(
+        took < LONG / 2,
+        "read after {took:?}, fetch timeout {LONG:?}"
+    );
+}
+
+/// Two consumers drain together: one handles a trigger by producing to the
+/// topic the other reads, after the other has already caught up. One drain
+/// delivers that record, and ends well inside the fetch timeout.
+#[tokio::test]
+async fn a_drain_of_two_consumers_reads_what_one_produced_for_the_other() {
+    let (Some(triggers), Some(facts)) = (Topic::create(1).await, Topic::create(1).await) else {
+        return;
+    };
+    triggers.produce(&["trigger".to_string()]).await;
+    let publisher = Arc::new(
+        KafkaPublisher::connect(&facts.brokers)
+            .await
+            .expect("connect publisher"),
+    );
+    let facts_topic = facts.name.clone();
+    let handler = Arc::new(Handlers::new().named("drain-handler").on_event(
+        NAME,
+        move |_: &Message| {
+            let publisher = Arc::clone(&publisher);
+            let topic = facts_topic.clone();
+            async move {
+                // Long enough for the other consumer to catch up first.
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                let fact = Message::new(NAME, MessageKind::Event, b"{}".to_vec()).with_id("late");
+                publisher.send_to(&topic, fact).await
+            }
+        },
+    ));
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let record = Arc::clone(&seen);
+    let projector = Arc::new(Handlers::new().named("drain-projector").on_event(
+        NAME,
+        move |message: &Message| {
+            record
+                .lock()
+                .unwrap()
+                .push(message.id().unwrap_or_default().to_string());
+            ready(Ok(()))
+        },
+    ));
+    let drain = IdleGroup::new();
+    let options = || RunOptions {
+        until: RunUntil::AllIdle(drain.member()),
+        ..RunOptions::until_idle()
+    };
+
+    let started = Instant::now();
+    let (handled, projected) = tokio::time::timeout(
+        LONG,
+        futures_util::future::join(
+            run_source(handler, triggers.source(LONG).await, options()),
+            run_source(projector, facts.source(LONG).await, options()),
+        ),
+    )
+    .await
+    .expect("the drain ended");
+    handled.expect("handler run");
+    projected.expect("projector run");
+
+    assert_eq!(*seen.lock().unwrap(), ["late"]);
+    let took = started.elapsed();
+    assert!(
+        took < LONG / 2,
+        "drained after {took:?}, fetch timeout {LONG:?}"
+    );
 }

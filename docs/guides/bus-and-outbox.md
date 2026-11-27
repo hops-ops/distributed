@@ -268,7 +268,8 @@ bus.listen(
   `RunOptions::until_idle()` returns as soon as nothing is available; it is for
   tests and one-shot drains. On Kafka "nothing is available" means the
   consumer has joined its group and read every assigned partition to its
-  end, not that the topic was quiet for a while; `with_fetch_timeout` (8 s by
+  end (checked against the broker's high watermarks each time it is asked),
+  not that the topic was quiet for a while; `with_fetch_timeout` (8 s by
   default) only bounds one wait on the broker, for the group to be joined or
   for the next record.
 - **Retries.** A retryable failure (for example a transient `NotFound`) is
