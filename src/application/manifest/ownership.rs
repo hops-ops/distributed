@@ -606,4 +606,55 @@ mod tests {
         );
         assert!(with(1, release).framework_compatibility().is_ok());
     }
+
+    #[test]
+    fn module_events_and_projection_facts_compose_in_canonical_order() {
+        let emitting = |id: &str, events: Vec<EventSpec>| {
+            let mut spec = command(&[]);
+            spec.id = id.into();
+            spec.field_name = id.replace('.', "_");
+            spec.emits = events;
+            spec.fingerprint = sha256_fingerprint(&spec.canonical_bytes().unwrap());
+            CommandDefinition::contract(spec)
+        };
+        let named = |name: &str| EventSpec {
+            name: name.into(),
+            ..event('a')
+        };
+        let projection = ProjectionSpec::try_new(
+            "todos",
+            ["todo.renamed", "todo.created"],
+            Vec::<String>::new(),
+        )
+        .unwrap();
+        let module = Module::new("todo")
+            .command_definitions([
+                emitting("todo.rename", vec![named("todo.renamed")]),
+                emitting("todo.create", vec![named("todo.created")]),
+            ])
+            .projection(projection)
+            .build()
+            .unwrap();
+        let manifest = Application::try_new("app", [module], [])
+            .unwrap()
+            .manifest()
+            .clone();
+        assert_eq!(
+            manifest
+                .events
+                .iter()
+                .map(|event| event.name.as_str())
+                .collect::<Vec<_>>(),
+            ["todo.created", "todo.renamed"]
+        );
+        assert_eq!(
+            manifest.projections[0].facts,
+            ["todo.created", "todo.renamed"]
+        );
+        manifest.validate().unwrap();
+        let decoded =
+            ApplicationManifest::from_canonical_bytes(&manifest.canonical_bytes().unwrap())
+                .unwrap();
+        assert_eq!(decoded, manifest);
+    }
 }
