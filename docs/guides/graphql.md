@@ -10,7 +10,7 @@ This is the public query/command edge for full-stack apps. The companion
 TypeScript package [`@hops-ops/distributed`](../../js/) (see
 [`js/README.md`](../../js/README.md)) supplies transport, a normalized causal replica,
 command runtime, diagnostics, and a SvelteKit adapter. End-to-end template:
-[`tests/e2e-ui/`](../../tests/e2e-ui/). Scaffold with `distributed scaffold … --query-api`.
+[`tests/e2e-ui/`](../../tests/e2e-ui/).
 Example playground: `cargo run --example graphiql --features "graphql,sqlite"`.
 
 ## Enable
@@ -238,7 +238,7 @@ resolve an unverified session that serves queries and subscriptions under RLS.
 `public_oidc_identity_from_env()` builds `OidcBearer` with `require_auth` from
 `OIDC_ISSUER` / `OIDC_AUDIENCE` (falling back to `OIDC_CLIENT_ID`) and
 optional `OIDC_JWKS_URI`; with them unset it uses a placeholder issuer, so
-every request still needs a bearer and fails closed. Scaffolds use it, never
+every request still needs a bearer and fails closed. Public services use it, never
 DevHeaders.
 
 Credentials never enter the `Session` handed to command handlers:
@@ -308,7 +308,7 @@ playground sends default `x-roles` / `x-user-id` headers. For real services:
 - Pass **`graphiql(false)`** or `graphiql_enabled_from_env()` (`GRAPHIQL=0` /
   `false` / `off` / `no` disables it; otherwise it is off when `RUST_ENV`,
   `ENV` or `APP_ENV` is `production` / `prod`) so production never ships the IDE.
-- Treat GraphiQL + DevHeaders as local-only; pair public scaffolds with
+- Treat GraphiQL + DevHeaders as local-only; pair public services with
   `OidcBearer`.
 
 ## Client surfaces, generated artifacts, and CI

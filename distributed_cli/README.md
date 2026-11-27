@@ -1,7 +1,7 @@
 # distributed_cli (`distributed`)
 
 Service tooling for [Distributed](https://crates.io/crates/distributed): a `distributed`
-binary — and a library — that scaffolds service crates, inspects a service's
+binary — and a library — that builds and runs applications, inspects a service's
 logical ApplicationManifest, and renders physical read-model schema artifacts
 (SQL or an Atlas Operator resource).
 
@@ -15,12 +15,6 @@ cargo run -p distributed_cli --bin distributed -- <command>
 
 Once a matching release is published, `cargo install distributed_cli
 --version <x.y.z>` installs the `distributed` binary.
-
-It is also a library, so another CLI can mount its commands instead of
-reimplementing them. `hops`, for example, exposes the same surface under
-`hops service` by depending on this crate, mounting `DistributedArgs` and
-dispatching with `distributed_cli::run(&args, &["service"])`. **Everything below documented as `distributed <cmd>` is also
-available as `hops service <cmd>`.**
 
 ## `distributed build` — one coherent application generation
 
@@ -38,8 +32,8 @@ process-supervisor JSON.
 
 The CLI asks Cargo for the workspace model, locates the crate that exports the
 typed `ApplicationManifest`, locates the runtime binary, and detects
-`ui/package.json`. A generated scaffold records the two Rust targets in Cargo
-package metadata. Existing workspaces with one conventional `*-service` library
+`ui/package.json`. A single-crate service names the two Rust targets in Cargo
+package metadata (`[package.metadata.distributed.application]` and `.runtime`). Existing workspaces with one conventional `*-service` library
 and one runtime binary need no metadata at all.
 
 The typed application export is the semantic boundary. It is composed from the
@@ -153,29 +147,6 @@ selective restarts, readiness, cancellation, and descendant cleanup:
 make test-cli-lifecycle
 ```
 
-## `distributed scaffold <name>` — generate a service crate
-
-```bash
-distributed scaffold orders --store postgres --transport http --gitops
-```
-
-Writes a ready-to-build Distributed service under `./<name>` (override with
-`--path`). Common flags: `--store <postgres|sqlite|in-memory>`, `--transport
-<http|knative>`, `--model <name>` (repeatable), `--read-models`, `--command` /
-`--event` (repeatable), `--bus <rabbitmq|kafka|psql|nats>`, `--gitops`,
-`--metrics prometheus`, `--tracing` / `--otel`, `--gitops-promote <argo|flux>`,
-`--github OWNER/REPO`, `--force`. See `distributed scaffold --help` for the full list.
-
-When used with `--gitops`, `--metrics prometheus` emits Prometheus Operator
-`ServiceMonitor` and `PrometheusRule` templates for HTTP services. The
-generated values default both resources to disabled; enable them only in
-clusters with the Prometheus Operator CRDs installed. Plain `--gitops` does not
-emit `monitoring.coreos.com` resources.
-
-`--tracing` enables Distributed's optional `otel` span feature, emits a default
-OTLP tracing setup in the generated `main.rs`, and renders OTLP environment
-values in the Helm chart without hard-coding an endpoint.
-
 ## `distributed skills init` — extract agent skills into a project
 
 ```bash
@@ -184,11 +155,11 @@ distributed skills list                    # names + descriptions of the embedde
 ```
 
 Materializes the **agent skills** embedded in the binary — markdown guidance
-for coding agents on using Distributed (`distributed-usage`, `distributed-ci`,
+for coding agents on using Distributed (`distributed-usage`, `distributed-deploy`,
 `distributed-schema`) — into `.distributed/skills/<name>/SKILL.md` (override
 the container with `--path <dir>`, which yields `<dir>/skills/...`). No network
-and no repo checkout: the binary that scaffolded your service carries the
-matching guidance for it.
+and no repo checkout: the binary carries the guidance that matches its
+own version.
 
 `--agents <list>` wires the skills for native discovery by agent harnesses.
 The canonical files live under the container; each harness location gets a

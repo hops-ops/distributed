@@ -181,7 +181,7 @@ fn session_from_headers(headers: &HeaderMap, secret: Option<&HeaderName>) -> Ses
 pub const UNSET_OIDC_ISSUER: &str = "http://localhost/unset-oidc-issuer";
 pub const UNSET_OIDC_AUDIENCE: &str = "unset-audience";
 
-/// Public GraphQL scaffold identity (D6/D7): always **`OidcBearer`** + `require_auth=true`.
+/// Public GraphQL identity (D6/D7): always **`OidcBearer`** + `require_auth=true`.
 ///
 /// Pure inputs so tests do not mutate process env. See [`public_oidc_identity_from_env`].
 ///

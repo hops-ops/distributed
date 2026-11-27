@@ -732,7 +732,7 @@ The principles above are the short version. The guides are the reference.
 | [Projections and read models](docs/guides/projections-and-read-models.md) | Read-model rows, typed JSON columns, Atomic and Eventual projections, source-snapshot fencing, rebuilds |
 | [GraphQL](docs/guides/graphql.md) | The generated query API, permissions, identity (OIDC), live queries, client surfaces |
 | [Outbox, bus and transports](docs/guides/bus-and-outbox.md) | The outbox, schedules and sagas, the bus facade and its adapters, retries and dead letters |
-| [The `distributed` CLI](docs/guides/cli.md) | `build` / `dev`, scaffolding, manifests, schema output, metrics |
+| [The `distributed` CLI](docs/guides/cli.md) | `build` / `dev`, manifests, schema output, metrics |
 | [Testing](docs/guides/testing.md) | Test suites, live identity-provider stacks, broker integration tests, coverage |
 | [JavaScript client](js/README.md) | `@hops-ops/distributed`: transport, replica, commands, SvelteKit adapter |
 | [Multiplayer games](distributed_game/README.md) | `distributed_game`: zones, replication, prediction, cells |
