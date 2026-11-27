@@ -159,15 +159,55 @@ mod graphiql_env_tests {
         ));
     }
 
+    /// Without `GRAPHIQL`, GraphiQL is on unless `RUST_ENV`, `ENV` or
+    /// `APP_ENV` names production.
     #[test]
-    fn non_production_enables_graphiql_by_default() {
-        assert!(graphiql_enabled_from_env_vars(
-            None,
-            Some("development"),
-            None,
-            None
-        ));
-        assert!(graphiql_enabled_from_env_vars(None, None, None, None));
+    fn graphiql_is_on_unless_env_or_app_env_names_production() {
+        struct Case {
+            name: &'static str,
+            rust_env: Option<&'static str>,
+            env: Option<&'static str>,
+            app_env: Option<&'static str>,
+            enabled: bool,
+        }
+        const CASES: &[Case] = &[
+            Case {
+                name: "RUST_ENV=development enables it",
+                rust_env: Some("development"),
+                env: None,
+                app_env: None,
+                enabled: true,
+            },
+            Case {
+                name: "no environment variable enables it",
+                rust_env: None,
+                env: None,
+                app_env: None,
+                enabled: true,
+            },
+            Case {
+                name: "ENV=production disables it",
+                rust_env: None,
+                env: Some("production"),
+                app_env: None,
+                enabled: false,
+            },
+            Case {
+                name: "APP_ENV=prod disables it",
+                rust_env: None,
+                env: None,
+                app_env: Some("prod"),
+                enabled: false,
+            },
+        ];
+        for case in CASES {
+            assert_eq!(
+                graphiql_enabled_from_env_vars(None, case.rust_env, case.env, case.app_env),
+                case.enabled,
+                "{}",
+                case.name
+            );
+        }
     }
 
     #[test]
@@ -189,22 +229,6 @@ mod graphiql_env_tests {
             None,
             None,
             None
-        ));
-    }
-
-    #[test]
-    fn env_and_app_env_aliases() {
-        assert!(!graphiql_enabled_from_env_vars(
-            None,
-            None,
-            Some("production"),
-            None
-        ));
-        assert!(!graphiql_enabled_from_env_vars(
-            None,
-            None,
-            None,
-            Some("prod")
         ));
     }
 }
