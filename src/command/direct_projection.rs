@@ -1,8 +1,6 @@
 use std::any::TypeId;
-use std::marker::PhantomData;
 use std::sync::Arc;
 
-use super::effect_wire::{EffectWireCompatible, EffectWireString, TypedEffectExpression};
 use super::effects::EffectExpression;
 use super::projection_proof::canonical_json;
 use crate::microsvc::Session;
@@ -12,7 +10,6 @@ use crate::projection_protocol::{
     PartitionId, ProjectionModelOwnership, ProjectionPartitionSpec, ProjectionProtocolError,
     ProjectionScopeCodec, ProjectorTopologyId, SameTransactionProjectionBatch,
 };
-use crate::read_model::RelationalReadModel;
 use crate::table::{TableMutation, TableSchema};
 
 /// Compiler-retained relational identity for one ordinary `Atomic<M>`
@@ -231,59 +228,6 @@ impl CommandDirectProjectionTarget {
             modeled_program_id: self.modeled_program_id,
         })
     }
-}
-
-/// Opaque compiler product attached to a typed projected command.
-#[doc(hidden)]
-pub struct CompiledDirectProjectionTarget<I, M>(
-    pub(super) CommandDirectProjectionTarget,
-    PhantomData<fn(I) -> M>,
-);
-
-impl<I, M> CompiledDirectProjectionTarget<I, M> {
-    /// Generated declarations may resolve the registered projection partition
-    /// from one typed canonical input expression.
-    #[doc(hidden)]
-    pub fn partition<Wire>(mut self, partition: TypedEffectExpression<String, Wire>) -> Self
-    where
-        Wire: EffectWireCompatible<EffectWireString>,
-    {
-        self.0.partition = Some(partition.__into_ir());
-        self
-    }
-}
-
-pub(crate) fn compiled_direct_projection_target<I, M>(
-    projector: &str,
-    facts: &[String],
-    models: &[String],
-    projector_partition: &ProjectionPartitionSpec,
-) -> CompiledDirectProjectionTarget<I, M>
-where
-    M: RelationalReadModel + 'static,
-{
-    let schema = M::schema();
-    let mut projected = CommandProjectedModel::new(TypeId::of::<M>(), schema);
-    if let ProjectionPartitionSpec::Constant { value } = projector_partition {
-        projected.partition = Some(EffectExpression::Constant {
-            value: value.clone(),
-        });
-    }
-    CompiledDirectProjectionTarget(
-        projected.bind(
-            projector,
-            facts,
-            models,
-            projector_partition,
-            vec![
-                ProjectionModelOwnership::new(&schema.model_name, &schema.table_name)
-                    .expect("validated relational schema has bounded model/table names"),
-            ],
-            None,
-            None,
-        ),
-        PhantomData,
-    )
 }
 
 pub(crate) struct ResolvedDirectProjectionTarget {

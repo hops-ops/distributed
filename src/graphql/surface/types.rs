@@ -395,21 +395,6 @@ impl SurfaceProjector {
         self.owner.partition = ProjectionPartitionSpec::constant(value);
         self
     }
-
-    /// Compiler seam for binding one `Atomic<M>` command to this exact
-    /// registered topology. Ordinary handlers never receive or construct it.
-    #[doc(hidden)]
-    pub fn __distributed_direct_projection<I, M>(&self) -> CompiledDirectProjectionTarget<I, M>
-    where
-        M: crate::read_model::RelationalReadModel + 'static,
-    {
-        compiled_direct_projection_target(
-            &self.owner.name,
-            &self.owner.facts,
-            &self.owner.models,
-            &self.owner.partition,
-        )
-    }
 }
 
 impl From<SurfaceProjector> for SurfaceProjectionOwner {

@@ -90,29 +90,6 @@ impl CommandTypeDef {
         self.type_id = Some(id);
         self
     }
-
-    /// Transitive nested type defs (depth-first, deduped by name).
-    pub fn transitive_nested(&self) -> Vec<CommandTypeDef> {
-        let mut out = Vec::new();
-        let mut seen = std::collections::BTreeSet::new();
-        self.collect_nested(&mut out, &mut seen);
-        out
-    }
-
-    fn collect_nested(
-        &self,
-        out: &mut Vec<CommandTypeDef>,
-        seen: &mut std::collections::BTreeSet<String>,
-    ) {
-        for field in &self.fields {
-            if let Some(nested) = &field.nested {
-                if seen.insert(nested.name.clone()) {
-                    out.push((**nested).clone());
-                    nested.collect_nested(out, seen);
-                }
-            }
-        }
-    }
 }
 
 /// Structural description of the serialized input accepted by a command.
