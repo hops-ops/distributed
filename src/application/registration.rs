@@ -317,3 +317,128 @@ impl ContractCompiler {
             .ok_or_else(|| "ContractCompiler requires one bound Surface contract".into())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::graphql::surface::{build_surface, SurfaceOptions};
+    use crate::table::{ColumnType, PrimaryKey, TableColumn, TableKind, TableSchema};
+
+    fn table(model: &str, table: &str) -> TableSchema {
+        TableSchema {
+            model_name: model.into(),
+            table_name: table.into(),
+            columns: vec![TableColumn {
+                primary_key: true,
+                ..TableColumn::new("id", "id", ColumnType::Text)
+            }],
+            primary_key: PrimaryKey::new(["id"]),
+            version_column: None,
+            indexes: Vec::new(),
+            relationships: Vec::new(),
+            kind: TableKind::ReadModel,
+        }
+    }
+
+    fn surface(models: &[(&str, &str)]) -> Arc<Surface> {
+        let tables = models
+            .iter()
+            .map(|(model, name)| table(model, name))
+            .collect::<Vec<_>>();
+        Arc::new(build_surface(&tables, &SurfaceOptions::sqlite()).unwrap())
+    }
+
+    const UNBOUND: &str = "ContractCompiler requires one bound Surface contract";
+
+    #[test]
+    fn an_unbound_compiler_produces_nothing() {
+        let compiler = ContractCompiler::new("contracts");
+        assert_eq!(compiler.surface().unwrap_err(), UNBOUND);
+        assert_eq!(compiler.graphql_sdl().unwrap_err(), UNBOUND);
+        assert_eq!(compiler.client_manifest().unwrap_err().0, UNBOUND);
+        assert_eq!(
+            compiler.manifest().unwrap_err(),
+            crate::application::ApplicationError::InvalidSpec(UNBOUND.into())
+        );
+        assert_eq!(
+            compiler.compile().unwrap_err(),
+            crate::application::ApplicationError::InvalidSpec(UNBOUND.into())
+        );
+    }
+
+    #[test]
+    fn a_compiler_binds_exactly_one_surface() {
+        let todos = surface(&[("TodoView", "todos")]);
+        let bound = ContractCompiler::from_surface("contracts", "web", Arc::clone(&todos)).unwrap();
+        let again = ContractCompiler::from_surface("contracts", "web", Arc::clone(&todos))
+            .unwrap()
+            .with_surface("web", Arc::clone(&todos))
+            .err();
+        assert_eq!(
+            again.as_deref(),
+            Some("ContractCompiler accepts exactly one authoritative Surface contract")
+        );
+        let other = bound
+            .with_surface("web", surface(&[("ChatView", "chats")]))
+            .err();
+        assert_eq!(
+            other.as_deref(),
+            Some("ContractCompiler already has a different authoritative Surface contract")
+        );
+    }
+
+    #[test]
+    fn compile_pins_the_application_to_the_bound_surface() {
+        let todos = surface(&[("TodoView", "todos")]);
+        let compiler = ContractCompiler::from_surface("contracts", "web", Arc::clone(&todos))
+            .unwrap()
+            .modules(Vec::new());
+        assert_eq!(
+            SurfaceSpec::from_surface("web", &compiler.surface().unwrap()).unwrap(),
+            SurfaceSpec::from_surface("web", &todos).unwrap()
+        );
+        let application = compiler.compile().unwrap();
+        assert_eq!(application.name(), "contracts");
+        assert!(application.modules().is_empty());
+        let expected = SurfaceSpec::from_surface("web", &todos).unwrap();
+        assert_eq!(application.surfaces(), std::slice::from_ref(&expected));
+        assert_eq!(application.manifest(), &compiler.manifest().unwrap());
+        assert_eq!(
+            application.fingerprint().unwrap(),
+            application.manifest().fingerprint().unwrap()
+        );
+    }
+
+    #[test]
+    fn the_builder_records_extensions_and_provenance_in_the_fingerprint() {
+        let spec = SurfaceSpec::from_surface("web", &surface(&[("TodoView", "todos")])).unwrap();
+        let plain = Application::new("app")
+            .surfaces([spec.clone()])
+            .build()
+            .unwrap();
+        let extension =
+            ApplicationExtension::try_new("ui", 1, serde_json::json!({"theme": "dark"})).unwrap();
+        let provenance = ManifestProvenance {
+            generator: "test".into(),
+            source_revision: Some("git:abc".into()),
+            sources: Vec::new(),
+        };
+        let annotated = Application::new("app")
+            .surfaces([spec])
+            .extensions([extension.clone()])
+            .provenance(provenance.clone())
+            .build()
+            .unwrap();
+        assert!(annotated.manifest().extensions.contains(&extension));
+        assert_eq!(annotated.manifest().provenance, provenance);
+        assert_ne!(
+            annotated.fingerprint().unwrap(),
+            plain.fingerprint().unwrap()
+        );
+        let copy = annotated.clone();
+        assert_eq!(
+            copy.canonical_bytes().unwrap(),
+            annotated.canonical_bytes().unwrap()
+        );
+    }
+}
