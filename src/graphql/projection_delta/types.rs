@@ -117,7 +117,6 @@ pub enum ProjectionDeltaSurfaceIdentity {
 pub struct ProjectionDeltaProjectionIdentity {
     pub program_id: String,
     pub binding_id: String,
-    pub epoch: String,
     pub program_ir_version: u16,
     pub operation_semantics_version: u16,
 }
@@ -516,7 +515,6 @@ impl ProjectionDeltaProjectionIdentity {
         for (field, value) in [
             ("program_id", self.program_id.as_str()),
             ("binding_id", self.binding_id.as_str()),
-            ("epoch", self.epoch.as_str()),
         ] {
             validate_identity(field, value)?;
         }
@@ -544,8 +542,6 @@ impl ProjectionDeltaProjectionIdentity {
                 field: "binding_id",
             },
         )?;
-        crate::projection_protocol::ProjectionEpoch::new(&self.epoch)
-            .map_err(|_| ProjectionDeltaError::InvalidIdentity { field: "epoch" })?;
         Ok(())
     }
 }

@@ -61,7 +61,6 @@ test('metadata validates identity, expiry, obligations, and canonical replay byt
 			{
 				programId: projection.program_id,
 				bindingId: projection.binding_id,
-				epoch: projection.epoch,
 				programIrVersion: 1,
 				operationSemanticsVersion: 1
 			}
@@ -318,7 +317,6 @@ function projectionArtifact() {
 			{
 				programId: `pp1:sha256:${'1'.repeat(64)}`,
 				bindingId: `pb1:sha256:${'2'.repeat(64)}`,
-				epoch: 'todos-v1',
 				programIrVersion: 1,
 				operationSemanticsVersion: 1
 			}
@@ -377,19 +375,9 @@ function projectionArtifact() {
 	};
 }
 
-test('projection artifact enforces Rust-aligned epoch/model and 4 KiB preview bounds', () => {
+test('projection artifact enforces Rust-aligned model and 4 KiB preview bounds', () => {
 	assert.doesNotThrow(() =>
 		validateCommandProjectionArtifact(projectionArtifact())
-	);
-
-	const epoch = projectionArtifact();
-	epoch.projections[0].epoch = 'e'.repeat(129);
-	assert.throws(() => validateCommandProjectionArtifact(epoch), /epoch/);
-
-	const controlEpoch = projectionArtifact();
-	controlEpoch.projections[0].epoch = `todos\u0000v1`;
-	assert.throws(() =>
-		validateCommandProjectionArtifact(controlEpoch)
 	);
 
 	const model = projectionArtifact();

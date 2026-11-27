@@ -113,13 +113,8 @@ pub(super) fn command_direct_projection_extension(
             // exact without revealing that hidden ownership inventory.
         }
         [owner] if owner.name == topology.name() => {
-            if !target.topology_matches(
-                &owner.name,
-                &owner.facts,
-                &owner.models,
-                &owner.partition,
-                owner.change_epoch.as_deref(),
-            ) || !target.protocol_topology_matches(topology)
+            if !target.topology_matches(&owner.name, &owner.facts, &owner.models, &owner.partition)
+                || !target.protocol_topology_matches(topology)
             {
                 return Err(ClientManifestError(format!(
                     "typed projected command `{}` direct target differs from visible owner `{}`",
@@ -150,12 +145,6 @@ pub(super) fn command_direct_projection_extension(
         }
     }
 
-    let change_epoch = target.change_epoch.clone().ok_or_else(|| {
-        ClientManifestError(format!(
-            "typed projected command `{}` direct target has no registered change-log epoch",
-            command.command_name
-        ))
-    })?;
     let partition = target.partition.clone().map(|partition| match partition {
         EffectExpression::Constant { value } => EffectExpression::Constant {
             value: canonical_json_value(value),
@@ -175,7 +164,6 @@ pub(super) fn command_direct_projection_extension(
         },
         model: target.model.clone(),
         partition,
-        change_epoch,
     }))
 }
 pub(super) fn command_trusted_preset_descriptors(

@@ -73,20 +73,6 @@ pub(crate) fn validate_input_identity(
     Ok(())
 }
 
-/// A partition's change epoch is fixed when the partition is created.
-pub(crate) fn ensure_change_epoch(
-    partition: &ProjectionEpoch,
-    requested: &ProjectionEpoch,
-) -> Result<(), ProjectionProtocolError> {
-    if partition == requested {
-        Ok(())
-    } else {
-        Err(ProjectionProtocolError::ScopeMismatch {
-            field: "projection change epoch",
-        })
-    }
-}
-
 /// Fence an input to its partition's active generation and stop state. A
 /// partition with no durable state is at the initial generation, not stopped.
 pub(crate) fn ensure_active_input(

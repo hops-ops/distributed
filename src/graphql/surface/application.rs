@@ -257,7 +257,6 @@ pub fn surface_for_role(
             facts: selected_facts,
             models: selected_models,
             dependencies,
-            change_epoch: projector.change_epoch.clone(),
             partition: projector.partition.clone(),
             kind: projector.kind,
             modeled,

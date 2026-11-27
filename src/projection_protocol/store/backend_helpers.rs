@@ -81,14 +81,8 @@ mod tests {
             true,
         )
         .unwrap();
-        ProjectionFailureBatch::new(
-            input,
-            ProjectionEpoch::new("changes-v1").unwrap(),
-            "failure-1",
-            "decode_error",
-            b"bad payload".to_vec(),
-        )
-        .unwrap()
+        ProjectionFailureBatch::new(input, "failure-1", "decode_error", b"bad payload".to_vec())
+            .unwrap()
     }
 
     #[test]
@@ -108,7 +102,7 @@ mod tests {
             change: ProjectionChangeCursor::new(
                 topology(),
                 partition(),
-                batch.change_epoch.clone(),
+                ProjectionEpoch::new("changes-v1").unwrap(),
                 1,
             )
             .unwrap(),

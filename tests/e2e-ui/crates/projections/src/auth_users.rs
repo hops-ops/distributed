@@ -66,7 +66,6 @@ distributed::projection! {
     pub const AUTH_USERS: ProjectionDescriptor<EventualOnly> = {
         name: "project_auth_users",
         version: 1,
-        epoch: "e2e-ui-auth-users-v1",
         model: AuthUsers,
         on {
             events: [ZitadelUserProfile],

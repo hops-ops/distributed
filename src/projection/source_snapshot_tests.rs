@@ -52,7 +52,7 @@ impl DomainEventContract for ExternalRow {
 }
 crate::projection! {
     const EXTERNAL_SNAPSHOTS: ProjectionDescriptor<EventualOnly> = {
-        name: "external-rebuild-test", version: 1, epoch: "external-rebuild-v1", model: SnapshotRow,
+        name: "external-rebuild-test", version: 1, model: SnapshotRow,
         source: external_snapshot,
         on { events: [ExternalRow], mutation: SaveSnapshot, input: { row: body }, },
     };
@@ -103,7 +103,6 @@ crate::projection! {
     const SNAPSHOTS: ProjectionDescriptor<EventualOnly> = {
         name: "source-snapshot-test",
         version: 1,
-        epoch: "snapshot-v1",
         model: SnapshotRow,
         source: aggregate_snapshot,
         on { events: [Changed], mutation: SaveSnapshot, input: { row: body }, },
@@ -195,13 +194,7 @@ impl Harness {
             false,
         )
         .unwrap();
-        let mut workspace = ProjectionWorkspace::new(
-            self.codec.clone(),
-            None,
-            input,
-            ProjectionEpoch::new("snapshot-v1").unwrap(),
-        )
-        .unwrap();
+        let mut workspace = ProjectionWorkspace::new(self.codec.clone(), None, input).unwrap();
         let lowered = SNAPSHOTS
             .server_executor()
             .unwrap()

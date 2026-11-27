@@ -11,7 +11,7 @@ use std::sync::Arc;
 #[cfg(any(feature = "graphql", test))]
 use super::ProjectionExecutionSnapshotBatchRequest;
 use super::{
-    ProjectionCommitBatch, ProjectionEpoch, ProjectionModelOwnership, ProjectionObservationKind,
+    ProjectionCommitBatch, ProjectionModelOwnership, ProjectionObservationKind,
     ProjectionObservationRequest, ProjectionObservationTarget, ProjectionProtocolError,
     ProjectionQuerySnapshotRequest, ProjectionRecordExpectation, ProjectionRecordMutation,
     ProjectionRecordScope, ProjectionScopeCodec, RecordRevision, RecordTransition,
@@ -34,7 +34,6 @@ pub struct ProjectionWorkspace {
     codec: Arc<ProjectionScopeCodec>,
     partition_value: Option<serde_json::Value>,
     input: TrustedProjectionInput,
-    change_epoch: ProjectionEpoch,
     program_id: Option<ProjectionProgramId>,
     ownership: BTreeMap<String, String>,
     mutations: Vec<ProjectionRecordMutation>,
@@ -47,16 +46,14 @@ impl ProjectionWorkspace {
         codec: Arc<ProjectionScopeCodec>,
         partition_value: Option<serde_json::Value>,
         input: TrustedProjectionInput,
-        change_epoch: ProjectionEpoch,
     ) -> Result<Self, ProjectionProtocolError> {
-        Self::new_with_program_id(codec, partition_value, input, change_epoch, None)
+        Self::new_with_program_id(codec, partition_value, input, None)
     }
 
     pub(crate) fn new_with_program_id(
         codec: Arc<ProjectionScopeCodec>,
         partition_value: Option<serde_json::Value>,
         input: TrustedProjectionInput,
-        change_epoch: ProjectionEpoch,
         program_id: Option<ProjectionProgramId>,
     ) -> Result<Self, ProjectionProtocolError> {
         if codec.topology() != input.cursor.topology() {
@@ -76,7 +73,6 @@ impl ProjectionWorkspace {
             codec,
             partition_value,
             input,
-            change_epoch,
             program_id,
             ownership: BTreeMap::new(),
             mutations: Vec::new(),
@@ -364,7 +360,6 @@ impl ProjectionWorkspace {
         let ownership = self.ownership()?;
         let batch = ProjectionCommitBatch {
             input: self.input,
-            change_epoch: self.change_epoch,
             ownership,
             mutations: self.mutations,
             observations: self.observations,
@@ -517,8 +512,8 @@ fn validate_execution_mutation_shape(
 mod tests {
     use super::*;
     use crate::projection_protocol::{
-        ProjectionGeneration, ProjectionInputCursor, ProjectionInputFingerprint, ProjectionSource,
-        ProjectorTopologyId,
+        ProjectionEpoch, ProjectionGeneration, ProjectionInputCursor, ProjectionInputFingerprint,
+        ProjectionSource, ProjectorTopologyId,
     };
     use crate::table::{ColumnType, PrimaryKey, RowValue, RowValues, TableColumn, TableKind};
 
@@ -590,13 +585,7 @@ mod tests {
             true,
         )
         .unwrap();
-        ProjectionWorkspace::new(
-            Arc::new(codec),
-            partition_value,
-            input,
-            ProjectionEpoch::new("changes-v1").unwrap(),
-        )
-        .unwrap()
+        ProjectionWorkspace::new(Arc::new(codec), partition_value, input).unwrap()
     }
 
     #[test]

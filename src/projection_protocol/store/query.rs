@@ -160,6 +160,9 @@ pub(crate) struct ProjectionQuerySnapshot {
 #[cfg_attr(not(feature = "graphql"), allow(dead_code))]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ProjectionPartitionSnapshot {
+    /// The partition's stored change epoch. `None` until its first write
+    /// creates the partition.
+    pub(crate) epoch: Option<ProjectionEpoch>,
     pub(crate) head: Option<ProjectionChangeCursor>,
     pub(crate) compacted_through: u64,
 }

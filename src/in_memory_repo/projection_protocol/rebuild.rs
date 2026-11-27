@@ -12,10 +12,9 @@ fn inventory(
     let mut records = Vec::new();
     for (scope, record) in &protocol.records {
         if scope.topology() == context.compiled.topology() {
-            if scope.projection_partition() != &partition || record.change.epoch() != &context.epoch
-            {
+            if scope.projection_partition() != &partition {
                 return Err(invalid(
-                    "snapshot rebuild requires the registered unit partition and epoch",
+                    "snapshot rebuild requires the registered unit partition",
                 ));
             }
             records.push(record.clone());
@@ -58,9 +57,7 @@ impl InMemoryRepository {
             PartitionKey::new(plan.context.compiled.topology(), &plan.context.partition()?);
         // As in a commit: compute against stored state, then apply.
         let state = protocol.partitions.get(&partition);
-        if let Some(state) = state {
-            ensure_change_epoch(&state.change_epoch, &plan.context.epoch)?;
-        }
+        let change_epoch = protocol.change_epoch(&partition);
         let mut head = state.map_or(0, |state| state.change_head);
         for owner in plan.context.compiled.ownership() {
             let registered = RegisteredModelKey {
@@ -84,7 +81,7 @@ impl InMemoryRepository {
             let (revision, tombstone) = next_record(&row.scope, &expectation, kind, current, true)?;
             let change = next_change(
                 &partition,
-                &plan.context.epoch,
+                &change_epoch,
                 &mut head,
                 PendingChange {
                     kind: change_kind_for_mutation(kind),
@@ -133,7 +130,7 @@ impl InMemoryRepository {
             }
         }
         let protocol = &mut *protocol;
-        let state = protocol.partition_mut(&partition, &plan.context.epoch);
+        let state = protocol.partition_mut(&partition, &change_epoch);
         state.append(changes);
         state.compact(through);
         protocol

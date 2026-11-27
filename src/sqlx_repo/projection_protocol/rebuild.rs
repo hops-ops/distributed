@@ -20,6 +20,7 @@ where
     async fn rebuild_inventory(
         tx: &mut Transaction<'_, DB>,
         context: &RebuildContext,
+        change_epoch: &ProjectionEpoch,
     ) -> Result<Vec<ProjectionRecordMetadata>, ProjectionProtocolError> {
         let topology = context.compiled.topology();
         let hash = topology.digest();
@@ -58,7 +59,7 @@ where
             )?;
             let scope =
                 ProjectionRecordScope::new(topology.clone(), partition.clone(), model, bytes)?;
-            records.push(decode_record_row::<DB>(&key, &scope, &context.epoch)?.metadata);
+            records.push(decode_record_row::<DB>(&key, &scope, change_epoch)?.metadata);
         }
         Ok(records)
     }
@@ -78,14 +79,10 @@ where
             context.compiled.topology(),
         )
         .await?;
-        lock_partition_in_tx(
-            &mut tx,
-            context.compiled.topology(),
-            &context.partition()?,
-            &context.epoch,
-        )
-        .await?;
-        let records = Self::rebuild_inventory(&mut tx, context).await?;
+        let state =
+            lock_partition_in_tx(&mut tx, context.compiled.topology(), &context.partition()?)
+                .await?;
+        let records = Self::rebuild_inventory(&mut tx, context, &state.change_epoch).await?;
         // No bootstrap, metadata changes, or maintenance locks survive capture.
         tx.rollback()
             .await
@@ -108,8 +105,10 @@ where
             .await
             .map_err(|e| protocol_storage_error::<DB>("begin snapshot rebuild", e))?;
         verify_registered_topology_in_tx(&mut tx, self.verified_registrations(), topology).await?;
-        let mut state = lock_partition_in_tx(&mut tx, topology, &partition, &context.epoch).await?;
-        plan.verify_inventory(&Self::rebuild_inventory(&mut tx, context).await?)?;
+        let mut state = lock_partition_in_tx(&mut tx, topology, &partition).await?;
+        plan.verify_inventory(
+            &Self::rebuild_inventory(&mut tx, context, &state.change_epoch).await?,
+        )?;
         ensure_partition_ownership_in_tx(
             &mut tx,
             self.verified_registrations(),
@@ -128,7 +127,7 @@ where
         let mut changes = Vec::with_capacity(plan.rows.len());
         let mut records = Vec::with_capacity(plan.rows.len());
         for row in &plan.rows {
-            let current = stored_record::<DB>(&record_rows, &row.scope, &context.epoch)?;
+            let current = stored_record::<DB>(&record_rows, &row.scope, &state.change_epoch)?;
             let metadata = current.as_ref().map(|r| &r.metadata);
             row.verify_physical(
                 metadata,

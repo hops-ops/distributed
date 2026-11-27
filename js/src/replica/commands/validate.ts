@@ -453,7 +453,6 @@ export function validateDirectProjection<TInput, TOutput>(
 	nonempty(direct.topology.name, 'artifact.directProjection.topology.name');
 	hash(direct.topology.digest, 'artifact.directProjection.topology.digest');
 	nonempty(direct.model, 'artifact.directProjection.model');
-	nonempty(direct.changeEpoch, 'artifact.directProjection.changeEpoch');
 	if (
 		!Array.isArray(direct.identityFields) ||
 		direct.identityFields.length === 0 ||

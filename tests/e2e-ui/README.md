@@ -171,7 +171,6 @@ projection! {
     pub const TODOS: ProjectionDescriptor<EventualOnly> = {
         name: "project_todos",
         version: 1,
-        epoch: "e2e-ui-todos-v2",
         model: Todos,
         on {
             events: [
@@ -432,6 +431,5 @@ GraphQL row grants enforce `owner_id = claim("x-user-id")`; the admin mutation
 tree is a separate generated application surface. Disable GraphiQL outside
 local development.
 
-See [PROJECTION_ROLLOUT.md](PROJECTION_ROLLOUT.md) for compatibility probes,
-remote activation, drain, rebuild/import, rollback, and obligation-minting
-controls.
+See [PROJECTION_ROLLOUT.md](PROJECTION_ROLLOUT.md) for how to change a
+projection: additive columns, breaking changes and a stopped projector.

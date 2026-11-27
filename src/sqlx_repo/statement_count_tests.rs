@@ -247,10 +247,6 @@ impl Fixture {
             .unwrap()
     }
 
-    fn epoch(&self) -> ProjectionEpoch {
-        ProjectionEpoch::new("changes-v1").unwrap()
-    }
-
     fn upsert(schema: &'static TableSchema, id: &str, value: &str) -> TableMutation {
         let mut values = RowValues::new();
         values.insert("id", RowValue::String(id.into()));
@@ -293,7 +289,6 @@ impl Fixture {
                 true,
             )
             .unwrap(),
-            change_epoch: self.epoch(),
             ownership: vec![self.ownership()],
             mutations: vec![ProjectionRecordMutation::new(
                 scope.clone(),
@@ -464,7 +459,6 @@ where
     let direct = SameTransactionProjectionBatch::single_upsert(
         fixture.topology.clone(),
         fixture.partition(),
-        fixture.epoch(),
         fixture.ownership(),
         fixture
             .codec()

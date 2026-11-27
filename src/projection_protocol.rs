@@ -517,6 +517,14 @@ impl ProjectionEpoch {
         .map(Self)
     }
 
+    /// Mint the change epoch of a partition that is being created.
+    ///
+    /// The value is a random identity. The store keeps it with the partition
+    /// and every later reader and writer uses the stored value.
+    pub(crate) fn mint() -> Self {
+        Self(format!("projection-{}", uuid::Uuid::now_v7()))
+    }
+
     pub fn as_str(&self) -> &str {
         &self.0
     }

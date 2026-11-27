@@ -218,7 +218,6 @@ crate::projection! {
     const CAUSAL_DIRECT_PROJECTION: crate::projection::lower::ProjectionDescriptor< crate::projection::lower::DirectCandidate, > = {
         name: "project_causal_direct",
         version: 1,
-        epoch: "causal-direct-v1",
         model: CausalProjectionObligationView,
         program: causal_direct_v1_program,
     };
@@ -235,7 +234,6 @@ crate::projection! {
     const CAUSAL_ROGUE_DIRECT_PROJECTION: crate::projection::lower::ProjectionDescriptor< crate::projection::lower::DirectCandidate, > = {
         name: "project_causal_direct",
         version: 2,
-        epoch: "causal-direct-v1",
         model: CausalProjectionObligationView,
         program: causal_direct_v2_program,
     };
@@ -277,7 +275,6 @@ crate::projection! {
     const CAUSAL_SIBLING_DIRECT_PROJECTION: crate::projection::lower::ProjectionDescriptor< crate::projection::lower::DirectCandidate, > = {
         name: "project_causal_direct_sibling",
         version: 1,
-        epoch: "causal-direct-v1",
         model: CausalProjectionSiblingView,
         program: causal_sibling_program,
     };
@@ -316,7 +313,6 @@ crate::projection! {
     const CAUSAL_LIFECYCLE_PROJECTION: crate::projection::lower::ProjectionDescriptor< crate::projection::lower::EventualOnly, > = {
         name: "project_causal_lifecycle",
         version: 1,
-        epoch: "causal-lifecycle-v1",
         model: CausalLifecycleView,
         program: causal_lifecycle_program,
     };
@@ -328,7 +324,6 @@ fn modeled_direct_registration(
         crate::projection::lower::DirectCandidate,
     >,
     owner: &str,
-    epoch: &str,
     topology_name: &str,
     topology_digest: u8,
     schema: crate::table::TableSchema,
@@ -361,23 +356,17 @@ fn modeled_direct_registration(
     let catalog =
         crate::projection::catalog::ProjectionCatalog::try_new(vec![binding.clone()]).unwrap();
     let active = catalog
-        .activate(
-            vec![
-                crate::projection::catalog::ProjectionBindingActivation::new(
-                    binding.id(),
-                    binding.program_id(),
-                    crate::projection_protocol::ProjectionEpoch::new(epoch).unwrap(),
-                    crate::projection::placement::ProjectionBindingState::Active,
-                    Some(
-                        crate::projection::placement::ProjectionExecutorRoute::local(
-                            "causal-direct",
-                        )
+        .activate(vec![
+            crate::projection::catalog::ProjectionBindingActivation::new(
+                binding.id(),
+                binding.program_id(),
+                crate::projection::placement::ProjectionBindingState::Active,
+                Some(
+                    crate::projection::placement::ProjectionExecutorRoute::local("causal-direct")
                         .unwrap(),
-                    ),
                 ),
-            ],
-            None,
-        )
+            ),
+        ])
         .unwrap();
     crate::graphql::SurfaceModeledProjection::try_from_descriptor(
         descriptor,
@@ -424,22 +413,14 @@ fn modeled_lifecycle_projector(
     let catalog =
         crate::projection::catalog::ProjectionCatalog::try_new(vec![binding.clone()]).unwrap();
     let active = catalog
-        .activate(
-            vec![
-                crate::projection::catalog::ProjectionBindingActivation::new(
-                    binding.id(),
-                    binding.program_id(),
-                    crate::projection_protocol::ProjectionEpoch::new("causal-lifecycle-v1")
-                        .unwrap(),
-                    state,
-                    Some(
-                        crate::projection::placement::ProjectionExecutorRoute::local(route)
-                            .unwrap(),
-                    ),
-                ),
-            ],
-            None,
-        )
+        .activate(vec![
+            crate::projection::catalog::ProjectionBindingActivation::new(
+                binding.id(),
+                binding.program_id(),
+                state,
+                Some(crate::projection::placement::ProjectionExecutorRoute::local(route).unwrap()),
+            ),
+        ])
         .unwrap();
     SurfaceProjector::new("project_causal_lifecycle").modeled(
         crate::graphql::SurfaceModeledProjection::try_from_descriptor(
@@ -2982,7 +2963,6 @@ async fn engine_rejects_incompatible_direct_owner_before_typed_command_binding()
     let first = modeled_direct_registration(
         CAUSAL_DIRECT_PROJECTION,
         "project_causal_direct",
-        "causal-direct-v1",
         "first-direct-topology",
         1,
         <CausalProjectionObligationView as crate::read_model::RelationalReadModel>::schema()
@@ -2991,7 +2971,6 @@ async fn engine_rejects_incompatible_direct_owner_before_typed_command_binding()
     let second = modeled_direct_registration(
         CAUSAL_SIBLING_DIRECT_PROJECTION,
         "project_causal_direct",
-        "causal-direct-v1",
         "second-direct-topology",
         2,
         <CausalProjectionSiblingView as crate::read_model::RelationalReadModel>::schema().clone(),
@@ -3111,23 +3090,17 @@ async fn projected_command_auto_binds_bootstraps_and_replays_exact_direct_eviden
     let catalog =
         crate::projection::catalog::ProjectionCatalog::try_new(vec![binding.clone()]).unwrap();
     let active = catalog
-        .activate(
-            vec![
-                crate::projection::catalog::ProjectionBindingActivation::new(
-                    binding.id(),
-                    binding.program_id(),
-                    crate::projection_protocol::ProjectionEpoch::new("causal-direct-v1").unwrap(),
-                    crate::projection::placement::ProjectionBindingState::Active,
-                    Some(
-                        crate::projection::placement::ProjectionExecutorRoute::local(
-                            "causal-direct",
-                        )
+        .activate(vec![
+            crate::projection::catalog::ProjectionBindingActivation::new(
+                binding.id(),
+                binding.program_id(),
+                crate::projection::placement::ProjectionBindingState::Active,
+                Some(
+                    crate::projection::placement::ProjectionExecutorRoute::local("causal-direct")
                         .unwrap(),
-                    ),
                 ),
-            ],
-            None,
-        )
+            ),
+        ])
         .unwrap();
     let modeled = crate::graphql::SurfaceModeledProjection::try_from_descriptor(
         CAUSAL_DIRECT_PROJECTION,
@@ -3167,21 +3140,13 @@ async fn projected_command_auto_binds_bootstraps_and_replays_exact_direct_eviden
     target
         .resolve(&json!({}), Some(&Session::new()))
         .unwrap()
-        .validate_modeled_owner(
-            legitimate_executor.name,
-            legitimate_executor.epoch,
-            legitimate_executor.program_id,
-        )
+        .validate_modeled_owner(legitimate_executor.name, legitimate_executor.program_id)
         .unwrap();
     let rogue_executor = CAUSAL_ROGUE_DIRECT_PROJECTION.server_executor().unwrap();
     let rogue_error = target
         .resolve(&json!({}), Some(&Session::new()))
         .unwrap()
-        .validate_modeled_owner(
-            rogue_executor.name,
-            rogue_executor.epoch,
-            rogue_executor.program_id,
-        )
+        .validate_modeled_owner(rogue_executor.name, rogue_executor.program_id)
         .unwrap_err();
     assert!(
         rogue_error.to_string().contains("program"),

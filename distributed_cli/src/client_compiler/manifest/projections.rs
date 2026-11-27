@@ -27,7 +27,6 @@ pub(crate) fn validate_projection_manifest(
         (
             &left.program_id,
             &left.binding_id,
-            &left.epoch,
             left.placement as u8,
             left.execution_class as u8,
             left.state as u8,
@@ -35,7 +34,6 @@ pub(crate) fn validate_projection_manifest(
             .cmp(&(
                 &right.program_id,
                 &right.binding_id,
-                &right.epoch,
                 right.placement as u8,
                 right.execution_class as u8,
                 right.state as u8,
@@ -424,8 +422,7 @@ fn validate_binding(binding: &ClientProjectionBinding) -> Result<(), ClientCompi
         ));
     }
     validate_binding_id(&binding.binding_id)?;
-    validate_program_id(&binding.program_id)?;
-    validate_projection_epoch(&binding.epoch, "projection binding epoch")
+    validate_program_id(&binding.program_id)
 }
 
 fn validate_operation(

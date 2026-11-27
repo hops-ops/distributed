@@ -196,7 +196,6 @@ function projectionArtifact(operations, capabilities, recoveries = []) {
 			Object.freeze({
 				programId: PROGRAM,
 				bindingId: BINDING,
-				epoch: 'todos-v1',
 				programIrVersion: 1,
 				operationSemanticsVersion: 1
 			})
@@ -324,7 +323,6 @@ function projectedArtifact(directOverrides = {}) {
 			model: 'Todo',
 			identityFields: ['id'],
 			partition: inputValue(['meta', 'count']),
-			changeEpoch: 'todos-v1',
 			...directOverrides
 		}
 	});

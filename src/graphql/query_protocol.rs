@@ -21,9 +21,8 @@ use super::surface::{Surface, SurfaceProjectionOwner, SurfaceRowPolicy};
 use crate::projection::placement::ProjectionBindingState;
 use crate::projection_protocol::{
     CompiledProjectionTopology, PartitionId, ProjectionChangeCursor, ProjectionChangeRead,
-    ProjectionEpoch, ProjectionLiveRecordBatchRequest, ProjectionLiveRecordRequest,
-    ProjectionPartitionSnapshot, ProjectionPartitionSpec, ProjectionProtocolError,
-    ProjectionScopeCodec, ProjectorTopologyId,
+    ProjectionLiveRecordBatchRequest, ProjectionLiveRecordRequest, ProjectionPartitionSnapshot,
+    ProjectionPartitionSpec, ProjectionProtocolError, ProjectionScopeCodec, ProjectorTopologyId,
 };
 #[cfg(any(feature = "sqlite", feature = "postgres"))]
 use crate::sqlx_repo::projection_protocol::{
@@ -38,7 +37,6 @@ pub(crate) struct QueryProjectorRuntime {
     pub(crate) name: String,
     pub(crate) codec: Arc<ProjectionScopeCodec>,
     pub(crate) static_partition: Option<PartitionId>,
-    pub(crate) change_epoch: Option<ProjectionEpoch>,
     models: BTreeSet<String>,
     dependencies: BTreeSet<String>,
     /// Public causal-observation identity for each output model. Modeled
@@ -52,7 +50,7 @@ pub(crate) struct QueryProjectorRuntime {
 
 impl QueryProjectorRuntime {
     pub(crate) fn supports_resume(&self) -> bool {
-        self.static_partition.is_some() && self.change_epoch.is_some()
+        self.static_partition.is_some()
     }
 
     pub(crate) fn public_projection_for_model(&self, model: &str) -> Option<&str> {
@@ -168,7 +166,7 @@ impl QueryProtocolRuntime {
     }
 
     /// Build one conservative vector over every physical dependency touched by
-    /// an exact query plan. Missing, denied, dynamic, epochless, or ambiguous
+    /// an exact query plan. Missing, denied, dynamic, or ambiguous
     /// ownership makes the vector incomparable; no scalar maximum is invented.
     ///
     /// Tables with **zero** surface projectors are skipped rather than failing
@@ -316,22 +314,10 @@ fn compile_legacy_query_projector(
             projector.name
         )
     })?;
-    let change_epoch = projector
-        .change_epoch
-        .as_deref()
-        .map(ProjectionEpoch::new)
-        .transpose()
-        .map_err(|error| {
-            format!(
-                "query protocol projector `{}` has invalid change epoch: {error}",
-                projector.name
-            )
-        })?;
     Ok(Arc::new(QueryProjectorRuntime {
         name: projector.name.clone(),
         codec,
         static_partition,
-        change_epoch,
         models: projector.models.iter().cloned().collect(),
         dependencies: projector.dependencies.iter().cloned().collect(),
         public_projection_by_model: projector
@@ -406,14 +392,6 @@ fn compile_modeled_query_projector(
                 projector.name
             ));
         }
-        if modeled.epoch() != first.epoch() {
-            return Err(format!(
-                "query protocol modeled owner `{}` has incompatible active change epochs `{}` and `{}`",
-                projector.name,
-                first.epoch().as_str(),
-                modeled.epoch().as_str()
-            ));
-        }
         if binding.partition() != first_binding.partition()
             || program.partition() != first_program.partition()
         {
@@ -478,12 +456,6 @@ fn compile_modeled_query_projector(
     } else {
         None
     };
-    let change_epoch = ProjectionEpoch::new(first.epoch().as_str()).map_err(|error| {
-        format!(
-            "query protocol modeled owner `{}` has invalid active change epoch: {error}",
-            projector.name
-        )
-    })?;
     let dependencies = models
         .iter()
         .map(|model| {
@@ -500,7 +472,6 @@ fn compile_modeled_query_projector(
         name: projector.name.clone(),
         codec,
         static_partition,
-        change_epoch: Some(change_epoch),
         models,
         dependencies,
         public_projection_by_model,
@@ -607,16 +578,11 @@ where
             .static_partition
             .as_ref()
             .expect("comparable index plans retain a static partition");
-        let epoch = projector
-            .change_epoch
-            .as_ref()
-            .expect("comparable index plans retain a change epoch");
         partitions.push(
             read_projection_partition_snapshot_in_executor::<DB>(
                 connection,
                 projector.codec.topology(),
                 partition,
-                epoch,
             )
             .await?,
         );
@@ -766,10 +732,7 @@ where
             .static_partition
             .as_ref()
             .expect("comparable live plans retain a static partition");
-        let epoch = projector
-            .change_epoch
-            .as_ref()
-            .expect("comparable live plans retain a change epoch");
+        let epoch = partition_snapshot.epoch.as_ref();
         let position = partition_snapshot
             .head
             .as_ref()
@@ -825,10 +788,7 @@ where
                 .static_partition
                 .as_ref()
                 .expect("comparable live plans retain a static partition");
-            let epoch = projector
-                .change_epoch
-                .as_ref()
-                .expect("comparable live plans retain a change epoch");
+            let epoch = partition_snapshot.epoch.as_ref();
             if accumulator
                 .verify_live_resume_position(
                     &supplied,
@@ -848,14 +808,18 @@ where
             let after = if position == 0 {
                 None
             } else {
-                match ProjectionChangeCursor::new(
-                    projector.codec.topology().clone(),
-                    partition.clone(),
-                    epoch.clone(),
-                    position,
-                ) {
-                    Ok(cursor) => Some(cursor),
-                    Err(_) => {
+                // A position past zero names a change, so its partition and
+                // epoch exist.
+                match epoch.map(|epoch| {
+                    ProjectionChangeCursor::new(
+                        projector.codec.topology().clone(),
+                        partition.clone(),
+                        epoch.clone(),
+                        position,
+                    )
+                }) {
+                    Some(Ok(cursor)) => Some(cursor),
+                    Some(Err(_)) | None => {
                         reset = true;
                         continue;
                     }
@@ -1047,22 +1011,14 @@ fn wire_query_snapshot(
             .static_partition
             .as_ref()
             .expect("comparable index plans retain a static partition");
-        let epoch = projector
-            .change_epoch
-            .as_ref()
-            .expect("comparable index plans retain a change epoch");
+        let epoch = partition_snapshot.epoch.as_ref();
         let position = partition_snapshot
             .head
             .as_ref()
             .map(|cursor| cursor.position())
             .unwrap_or(0);
         let scope_token = accumulator
-            .issue_index_scope_parts(
-                &snapshot_scope,
-                projector.codec.topology(),
-                partition,
-                epoch,
-            )
+            .issue_index_scope_parts(&snapshot_scope, projector.codec.topology(), partition)
             .map_err(|error| ProjectionProtocolError::InvalidBatch(error.to_string()))?;
         let resume = if issue_index_resumes {
             Some(
@@ -1340,7 +1296,6 @@ mod tests {
             expected_version: ExpectedVersion::Any,
             mode: RowWriteMode::Upsert,
         });
-        let change_epoch = ProjectionEpoch::new("query-wire-modeled-v1").unwrap();
         let input = TrustedProjectionInput::mint(
             ProjectionInputCursor::new(
                 topology.clone(),
@@ -1360,7 +1315,6 @@ mod tests {
         let commit = repository
             .commit_projection(ProjectionCommitBatch {
                 input,
-                change_epoch: change_epoch.clone(),
                 ownership: vec![ownership],
                 mutations: vec![ProjectionRecordMutation::new(
                     scope.clone(),
@@ -1419,7 +1373,6 @@ mod tests {
             name: "wire-physical-projector".into(),
             codec: Arc::clone(&codec),
             static_partition: Some(partition.clone()),
-            change_epoch: Some(change_epoch.clone()),
             models: BTreeSet::from(["WireView".into()]),
             dependencies: BTreeSet::from(["wire_views".into()]),
             public_projection_by_model: BTreeMap::from([(
@@ -1435,11 +1388,12 @@ mod tests {
                 &snapshot_scope,
                 runtime.codec.topology(),
                 &partition,
-                &change_epoch,
+                Some(stored_change.cursor.epoch()),
                 0,
             )
             .unwrap();
         let partition_snapshot = ProjectionPartitionSnapshot {
+            epoch: Some(stored_change.cursor.epoch().clone()),
             head: Some(stored_change.cursor.clone()),
             compacted_through: 0,
         };

@@ -150,13 +150,6 @@ pub(crate) fn validate_direct_projection(
             command.name
         ),
     )?;
-    validate_projection_epoch(
-        &direct.change_epoch,
-        &format!(
-            "manifest command `{}` direct projection change_epoch",
-            command.name
-        ),
-    )?;
     validate_graphql_name(
         &direct.model,
         &format!(
@@ -288,20 +281,6 @@ pub(crate) fn validate_projection_name(value: &str, label: &str) -> Result<(), C
         return Err(ClientCompileError::manifest(
             "client.manifest.direct_projection_topology",
             format!("{label} must be at most 128 bytes without whitespace or control characters"),
-        ));
-    }
-    Ok(())
-}
-
-pub(crate) fn validate_projection_epoch(
-    value: &str,
-    label: &str,
-) -> Result<(), ClientCompileError> {
-    validate_nonempty(value, label)?;
-    if value.len() > 128 || value.chars().any(char::is_control) {
-        return Err(ClientCompileError::manifest(
-            "client.manifest.direct_projection_epoch",
-            format!("{label} must be at most 128 bytes without control characters"),
         ));
     }
     Ok(())

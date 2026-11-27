@@ -1,4 +1,10 @@
-//! Saga - event-sourced process managers for cross-cell workflows.
+//! Saga - an event-sourced, ordered sequence of steps across cells, with
+//! compensation.
+//!
+//! A saga is not a process manager. A process that joins events from several
+//! streams, in any order, for as long as it matters is an ordinary aggregate
+//! fed by event handlers and needs no type from this module; see
+//! `docs/coordination-primitives.md`.
 //!
 //! A cell has one atomic boundary. Anything that must change state in two
 //! cells (moving an account between shards, transferring a balance,

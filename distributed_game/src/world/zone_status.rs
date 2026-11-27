@@ -128,7 +128,6 @@ distributed::projection! {
     pub const ZONE_LEASES: ProjectionDescriptor<EventualOnly> = {
         name: "project_zone_leases",
         version: 1,
-        epoch: "zone-leases-v1",
         model: ZoneLeases,
         on {
             events: [
@@ -146,7 +145,6 @@ distributed::projection! {
     pub const ZONE_SNAPSHOTS: ProjectionDescriptor<EventualOnly> = {
         name: "project_zone_snapshots",
         version: 1,
-        epoch: "zone-snapshots-v1",
         model: ZoneSnapshots,
         on {
             events: [ZoneStateSavedDomainEvent, ZoneStateDeletedDomainEvent],
@@ -160,7 +158,6 @@ distributed::projection! {
     pub const ZONE_ACTIVITIES: ProjectionDescriptor<EventualOnly> = {
         name: "project_zone_activities",
         version: 1,
-        epoch: "zone-activities-v1",
         model: ZoneActivities,
         on {
             events: [ZoneActivityActivityChangedDomainEvent],

@@ -1,8 +1,8 @@
 //! Projection deployment identity, placement, and active executor routing.
 //!
 //! A binding describes durable ownership and compatibility. Executor routes
-//! and epochs are deliberately separate: a route may move without changing
-//! ownership semantics, while an epoch fences one physical incarnation.
+//! are deliberately separate: a route may move without changing ownership
+//! semantics.
 
 use std::collections::BTreeSet;
 use std::fmt;
@@ -529,8 +529,8 @@ impl ProjectionRelationshipBinding {
 /// canonical projection catalog.
 ///
 /// This is a logical scope-codec/storage compatibility pin. It is not an
-/// executor route or physical incarnation and therefore contains no endpoint
-/// or epoch.
+/// executor route or physical incarnation and therefore contains no
+/// endpoint.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct ProjectionPhysicalTopology {
     version: u32,

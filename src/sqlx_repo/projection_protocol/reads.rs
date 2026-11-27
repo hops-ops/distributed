@@ -175,8 +175,7 @@ where
     );
     write_plan.validate()?;
     verify_registered_topology_in_tx(tx, verified, &batch.topology).await?;
-    let mut state =
-        lock_partition_in_tx(tx, &batch.topology, &batch.partition, &batch.change_epoch).await?;
+    let mut state = lock_partition_in_tx(tx, &batch.topology, &batch.partition).await?;
     if let Some(failure_id) = &state.stopped_failure_id {
         return Err(ProjectionProtocolError::PartitionStopped {
             failure_id: failure_id.clone(),

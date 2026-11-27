@@ -2,7 +2,7 @@
 //! repository by [`repository_conformance_tests!`](crate::repository_conformance_tests).
 
 pub mod checkout;
-pub mod checkout_saga;
+pub mod checkout_process;
 pub mod inbox;
 pub mod outbox;
 pub mod read_models;

@@ -8,7 +8,7 @@ use distributed::{
 use tokio::sync::Barrier;
 
 use super::checkout::{CHECKOUT_SEAT_RESERVED_STATUS, SEAT_RESERVED_STATUS};
-use super::checkout_saga::CheckoutSaga;
+use super::checkout_process::CheckoutProcess;
 use super::seat::Seat;
 use super::snapshots::Tally;
 
@@ -43,10 +43,10 @@ where
 
     let completed = record_seat_reserved(repo.clone(), seat_reserved)
         .await
-        .expect("checkout saga should record reservation");
+        .expect("checkout process should record reservation");
     assert_eq!(completed.seat_id, seat_id);
 
-    let checkout_repo = repo.clone().aggregate::<CheckoutSaga>();
+    let checkout_repo = repo.clone().aggregate::<CheckoutProcess>();
     let loaded_checkout = checkout_repo
         .get(&checkout_id)
         .await
@@ -148,7 +148,7 @@ where
         .expect("winner commit should succeed");
 
     let checkout_id = unique_id("rollback-checkout");
-    let mut checkout = CheckoutSaga::default();
+    let mut checkout = CheckoutProcess::default();
     checkout
         .start(
             checkout_id.clone(),
@@ -159,7 +159,7 @@ where
 
     let stale_identity = StreamIdentity::new(Seat::aggregate_type(), &seat_id)
         .expect("stale identity should be valid");
-    let checkout_identity = StreamIdentity::new(CheckoutSaga::aggregate_type(), &checkout_id)
+    let checkout_identity = StreamIdentity::new(CheckoutProcess::aggregate_type(), &checkout_id)
         .expect("checkout identity should be valid");
     let err = repo
         .commit_batch(CommitBatch {
@@ -173,7 +173,7 @@ where
             snapshots: vec![SnapshotWrite::Save {
                 identity: checkout_identity.clone(),
                 record: SnapshotRecord::new(
-                    CheckoutSaga::aggregate_type(),
+                    CheckoutProcess::aggregate_type(),
                     checkout_id,
                     1,
                     1,
@@ -328,7 +328,7 @@ where
     let id = unique_id("snapshot");
     let seat_identity =
         StreamIdentity::new(Seat::aggregate_type(), &id).expect("seat identity should be valid");
-    let checkout_identity = StreamIdentity::new(CheckoutSaga::aggregate_type(), &id)
+    let checkout_identity = StreamIdentity::new(CheckoutProcess::aggregate_type(), &id)
         .expect("checkout identity should be valid");
 
     repo.save_snapshot(
@@ -339,7 +339,7 @@ where
     .expect("seat snapshot should save");
     repo.save_snapshot(
         &checkout_identity,
-        SnapshotRecord::new(CheckoutSaga::aggregate_type(), id, 2, 1, vec![2]),
+        SnapshotRecord::new(CheckoutProcess::aggregate_type(), id, 2, 1, vec![2]),
     )
     .await
     .expect("checkout snapshot should save");
@@ -361,7 +361,7 @@ where
     assert_eq!(loaded_checkout.version, 2);
     assert_eq!(
         loaded_checkout.aggregate_type,
-        CheckoutSaga::aggregate_type()
+        CheckoutProcess::aggregate_type()
     );
     assert_eq!(loaded_checkout.payload, vec![2]);
 }
@@ -503,11 +503,11 @@ async fn start_checkout<R>(
 where
     R: TransactionalCommit + Clone + Send + Sync + 'static,
 {
-    let mut checkout = CheckoutSaga::default();
+    let mut checkout = CheckoutProcess::default();
     checkout
         .start(checkout_id.clone(), seat_id.clone(), seat_category.clone())
         .map_err(|err| RepositoryError::Model(err.to_string()))?;
-    repo.aggregate::<CheckoutSaga>()
+    repo.aggregate::<CheckoutProcess>()
         .commit(&mut checkout)
         .await?;
     Ok(super::checkout::CheckoutStarted {
@@ -554,7 +554,7 @@ async fn record_seat_reserved<R>(
 where
     R: GetStream + TransactionalCommit + Clone + Send + Sync + 'static,
 {
-    let checkout_repo = repo.aggregate::<CheckoutSaga>();
+    let checkout_repo = repo.aggregate::<CheckoutProcess>();
     let mut checkout = checkout_repo
         .get(&event.checkout_id)
         .await?

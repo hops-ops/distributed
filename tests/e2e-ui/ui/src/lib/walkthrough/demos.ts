@@ -297,7 +297,6 @@ fn record_completed(&mut self) {
   pub const TODOS: ProjectionDescriptor<EventualOnly> = {
     name: "project_todos",
     version: 1,
-    epoch: "e2e-ui-todos-v2",
     model: Todos,
     on {
       events: [
@@ -642,7 +641,6 @@ fn record_posted(
   pub const CHAT_MESSAGES: ProjectionDescriptor<DirectCandidate> = {
     name: "project_chat_messages",
     version: 1,
-    epoch: "e2e-ui-chat-v2",
     model: ChatMessages,
     on {
       events: [ChatMessagePostedDomainEvent],
@@ -976,7 +974,6 @@ distributed::wasm_pure! {
   pub const BLOB_GAMES: ProjectionDescriptor<DirectCandidate> = {
     name: "project_blob",
     version: 1,
-    epoch: "e2e-ui-blob-v2",
     model: BlobGames,
     on {
       events: [
@@ -1243,7 +1240,6 @@ fn record_force_archived(&mut self) {
   pub const TODOS: ProjectionDescriptor<EventualOnly> = {
     name: "project_todos",
     version: 1,
-    epoch: "e2e-ui-todos-v2",
     model: Todos,
     on {
       events: [
@@ -1545,7 +1541,6 @@ distributed::projection! {
   pub const AUTH_USERS: ProjectionDescriptor<EventualOnly> = {
     name: "project_auth_users",
     version: 1,
-    epoch: "e2e-ui-auth-users-v1",
     model: AuthUsers,
     on {
       events: [ZitadelUserProfile],

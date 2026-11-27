@@ -1,5 +1,5 @@
 mod checkout;
-mod checkout_saga_service;
+mod checkout_process_service;
 use common::commands;
 use common::env as env_support;
 use common::ids;
@@ -21,7 +21,7 @@ use checkout::{
     SeatReservationCompleted, SeatReserved, CHECKOUT_STARTED, RESERVING_SEAT_MESSAGE,
     SEAT_AVAILABLE,
 };
-use checkout_saga_service::CheckoutSaga;
+use checkout_process_service::CheckoutProcess;
 use distributed::microsvc::{Context, Routes, Service, Session};
 use distributed::outbox::OutboxMessage;
 use distributed::outbox_worker::OutboxStore;
@@ -121,11 +121,11 @@ async fn run_persistent_checkout_flow<R, CheckoutOutbox, SeatOutbox>(
 
     let loaded_checkout = checkout_repo
         .clone()
-        .aggregate::<CheckoutSaga>()
+        .aggregate::<CheckoutProcess>()
         .get(&ids.checkout_id)
         .await
-        .expect("checkout saga should reload")
-        .expect("checkout saga should exist");
+        .expect("checkout process should reload")
+        .expect("checkout process should exist");
     assert_eq!(loaded_checkout.status, CHECKOUT_SEAT_RESERVED);
     assert_eq!(loaded_checkout.reserved_seat_id, ids.seat_id);
 
@@ -172,13 +172,14 @@ async fn start_checkout<R>(
 where
     R: Clone + TransactionalCommit + Send + Sync + 'static,
 {
-    let mut saga = CheckoutSaga::default();
-    saga.start(
-        checkout_id.to_string(),
-        seat_id.to_string(),
-        seat_category.to_string(),
-    )
-    .expect("checkout should be valid");
+    let mut process = CheckoutProcess::default();
+    process
+        .start(
+            checkout_id.to_string(),
+            seat_id.to_string(),
+            seat_category.to_string(),
+        )
+        .expect("checkout should be valid");
     let event = CheckoutStarted {
         checkout_id: checkout_id.to_string(),
         seat_id: seat_id.to_string(),
@@ -188,9 +189,9 @@ where
         .expect("checkout started outbox should encode");
 
     repo.clone()
-        .aggregate::<CheckoutSaga>()
+        .aggregate::<CheckoutProcess>()
         .outbox(outbox.clone())
-        .commit(&mut saga)
+        .commit(&mut process)
         .await
         .expect("checkout start should commit");
     outbox
@@ -240,17 +241,18 @@ where
 {
     let msg: SeatReserved = serde_json::from_slice(&seat_reserved.payload)
         .expect("seat reserved payload should decode");
-    let mut saga = repo
+    let mut process = repo
         .clone()
-        .aggregate::<CheckoutSaga>()
+        .aggregate::<CheckoutProcess>()
         .get(&msg.checkout_id)
         .await
-        .expect("checkout saga should load")
-        .expect("checkout saga should exist");
-    assert_eq!(saga.status, CHECKOUT_STARTED);
+        .expect("checkout process should load")
+        .expect("checkout process should exist");
+    assert_eq!(process.status, CHECKOUT_STARTED);
 
-    saga.set_reserved_seat(msg.seat_id.clone())
-        .expect("checkout saga should record reserved seat");
+    process
+        .set_reserved_seat(msg.seat_id.clone())
+        .expect("checkout process should record reserved seat");
     let event = SeatReservationCompleted {
         checkout_id: msg.checkout_id.clone(),
         seat_id: msg.seat_id.clone(),
@@ -264,11 +266,11 @@ where
     .expect("seat reservation completed outbox should encode");
 
     repo.clone()
-        .aggregate::<CheckoutSaga>()
+        .aggregate::<CheckoutProcess>()
         .outbox(outbox.clone())
-        .commit(&mut saga)
+        .commit(&mut process)
         .await
-        .expect("checkout saga update should commit");
+        .expect("checkout process update should commit");
     outbox
 }
 
@@ -485,7 +487,7 @@ async fn publish_pending_outbox(
 }
 
 #[tokio::test]
-async fn seat_checkout_saga_reserves_seat_and_projects_user_screen() {
+async fn seat_checkout_process_reserves_seat_and_projects_user_screen() {
     use distributed::bus::InMemoryBus;
 
     let ids = FlowIds {
@@ -495,7 +497,7 @@ async fn seat_checkout_saga_reserves_seat_and_projects_user_screen() {
     };
     let checkout_store = InMemoryRepository::new();
     let checkout_service =
-        checkout_saga_service::service(checkout_store.clone().queued().aggregate());
+        checkout_process_service::service(checkout_store.clone().queued().aggregate());
     let seat_store = InMemoryRepository::new();
     let seat_service = seat_inventory_service::service(seat_store.clone().queued().aggregate());
     let read_store = InMemoryReadModelStore::new();
@@ -540,7 +542,7 @@ async fn seat_checkout_saga_reserves_seat_and_projects_user_screen() {
         .expect("projection drains the reservation");
     bus.subscribe(checkout_service.clone(), RunOptions::until_idle())
         .await
-        .expect("saga records the seat reservation");
+        .expect("process records the seat reservation");
 
     publish_pending_outbox(&checkout_store.outbox_store(), &bus).await;
     bus.subscribe(projection_svc.clone(), RunOptions::until_idle())
@@ -561,16 +563,16 @@ async fn seat_checkout_saga_reserves_seat_and_projects_user_screen() {
         .expect("seat should be projected");
     assert_projected_seat(&seat, &ids);
 
-    let checkout_saga = checkout_store
+    let checkout_process = checkout_store
         .clone()
         .queued()
-        .aggregate::<CheckoutSaga>()
+        .aggregate::<CheckoutProcess>()
         .peek(&ids.checkout_id)
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(checkout_saga.status, CHECKOUT_SEAT_RESERVED);
-    assert_eq!(checkout_saga.reserved_seat_id, ids.seat_id);
+    assert_eq!(checkout_process.status, CHECKOUT_SEAT_RESERVED);
+    assert_eq!(checkout_process.reserved_seat_id, ids.seat_id);
 
     let seat = seat_store
         .clone()
@@ -662,8 +664,8 @@ async fn postgres_checkout_flow_projects_relational_read_models() {
 async fn checkout_commands_can_be_http_service() {
     let checkout_store = InMemoryRepository::new();
     let checkout_service =
-        checkout_saga_service::service(checkout_store.clone().queued().aggregate());
-    let base = checkout_saga_service::start_http_service(checkout_service.clone()).await;
+        checkout_process_service::service(checkout_store.clone().queued().aggregate());
+    let base = checkout_process_service::start_http_service(checkout_service.clone()).await;
 
     let client = reqwest::Client::new();
     let started = client
@@ -683,14 +685,14 @@ async fn checkout_commands_can_be_http_service() {
         .expect("HTTP checkout service should accept start request");
     assert_eq!(started.status(), 200);
 
-    let saga = checkout_store
+    let process = checkout_store
         .queued()
-        .aggregate::<CheckoutSaga>()
+        .aggregate::<CheckoutProcess>()
         .peek("checkout-http")
         .await
         .expect("HTTP write-side load should succeed")
         .expect("HTTP write-side checkout should exist");
-    assert_eq!(saga.status, checkout::CHECKOUT_STARTED);
+    assert_eq!(process.status, checkout::CHECKOUT_STARTED);
 }
 
 #[cfg(feature = "grpc")]
@@ -698,8 +700,8 @@ async fn checkout_commands_can_be_http_service() {
 async fn checkout_commands_can_be_grpc_service() {
     let checkout_store = InMemoryRepository::new();
     let checkout_service =
-        checkout_saga_service::service(checkout_store.clone().queued().aggregate());
-    let mut client = checkout_saga_service::start_grpc_service(checkout_service.clone()).await;
+        checkout_process_service::service(checkout_store.clone().queued().aggregate());
+    let mut client = checkout_process_service::start_grpc_service(checkout_service.clone()).await;
 
     let started = client
         .dispatch(distributed::microsvc::grpc::GrpcRequest {
@@ -721,14 +723,14 @@ async fn checkout_commands_can_be_grpc_service() {
         .into_inner();
     assert_eq!(started.status, 200);
 
-    let saga = checkout_store
+    let process = checkout_store
         .queued()
-        .aggregate::<CheckoutSaga>()
+        .aggregate::<CheckoutProcess>()
         .peek("checkout-grpc")
         .await
         .expect("gRPC write-side load should succeed")
         .expect("gRPC write-side checkout should exist");
-    assert_eq!(saga.status, checkout::CHECKOUT_STARTED);
+    assert_eq!(process.status, checkout::CHECKOUT_STARTED);
 }
 
 use std::collections::HashMap as StdHashMap;

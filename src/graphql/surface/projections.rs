@@ -9,7 +9,6 @@ use crate::projection::{
     MutationKind, ProjectionField, ProjectionInvalidation, ProjectionKeyField, ProjectionOperation,
     ProjectionPartition, ProjectionProgram, ProjectionProgramId, ProjectionRelationshipEffect,
 };
-use crate::projection_protocol::ProjectionEpoch;
 
 use super::types::{SurfaceProjectionOwner, SurfaceProjectionOwnerKind};
 use super::{SurfaceModel, SurfaceRelationshipKeys};
@@ -64,7 +63,6 @@ pub struct SurfaceModeledProjection {
     placement: ProjectionPlacement,
     execution_class: ProjectionExecutionClass,
     state: ProjectionBindingState,
-    epoch: ProjectionEpoch,
     route: ProjectionExecutorRoute,
     output_models: Vec<String>,
     raw_program: Option<ProjectionProgram>,
@@ -81,7 +79,6 @@ impl PartialEq for SurfaceModeledProjection {
             && self.placement == other.placement
             && self.execution_class == other.execution_class
             && self.state == other.state
-            && self.epoch == other.epoch
             && self.route == other.route
             && self.output_models == other.output_models
             && self.raw_program == other.raw_program
@@ -105,7 +102,6 @@ impl std::fmt::Debug for SurfaceModeledProjection {
             .field("placement", &self.placement)
             .field("execution_class", &self.execution_class)
             .field("state", &self.state)
-            .field("epoch", &self.epoch.as_str())
             .field("output_models", &self.output_models)
             .finish_non_exhaustive()
     }
@@ -149,7 +145,6 @@ impl SurfaceModeledProjection {
             "placement": self.placement,
             "execution_class": self.execution_class,
             "state": self.state,
-            "epoch": self.epoch.as_str(),
             "output_models": self.output_models,
             "program": program,
             "binding": binding,
@@ -173,8 +168,6 @@ impl SurfaceModeledProjection {
             placement,
             execution_class,
             state,
-            epoch: ProjectionEpoch::new("client-manifest-test-v1")
-                .expect("test epoch is canonical"),
             route: ProjectionExecutorRoute::local("client-manifest-test")
                 .expect("test route is canonical"),
             output_models,
@@ -190,7 +183,7 @@ impl SurfaceModeledProjection {
     ///
     /// This is the only public authority path. Arbitrary
     /// `ProjectionBindingActivation::new(...)` values cannot bypass catalog
-    /// writer-conflict, route, placement, or epoch-takeover validation.
+    /// writer-conflict, route, or placement validation.
     pub fn try_from_catalog(
         program: ProjectionProgram,
         catalog: &ProjectionCatalog,
@@ -231,7 +224,6 @@ impl SurfaceModeledProjection {
             placement: binding.placement(),
             execution_class: binding.execution_class(),
             state: activation.state(),
-            epoch: activation.epoch().clone(),
             route,
             output_models,
             raw_program: Some(program),
@@ -245,7 +237,7 @@ impl SurfaceModeledProjection {
     /// binding that will host it.
     ///
     /// This is the mountable form used by the projection service runtime.
-    /// Program digest, output schemas, route, and epoch are all validated
+    /// Program digest, output schemas and route are all validated
     /// before a transport subscription can be planned.
     pub fn try_from_descriptor<D>(
         descriptor: crate::projection::lower::ProjectionDescriptor<D>,
@@ -262,7 +254,6 @@ impl SurfaceModeledProjection {
             .raw()
             .ok_or_else(|| "mountable modeled projection lost its raw binding".to_owned())?;
         if executor.program_id != modeled.program_id
-            || executor.epoch != modeled.epoch.as_str()
             || executor.outputs.models.len() != binding.outputs().len()
             || executor.outputs.models.iter().any(|output| {
                 !binding.outputs().iter().any(|bound| {
@@ -273,7 +264,7 @@ impl SurfaceModeledProjection {
             })
         {
             return Err(
-                "generated projection executor differs from its exact binding digest, epoch, or outputs"
+                "generated projection executor differs from its exact binding digest or outputs"
                     .into(),
             );
         }
@@ -294,11 +285,6 @@ impl SurfaceModeledProjection {
     /// Return active or draining state.
     pub fn state(&self) -> ProjectionBindingState {
         self.state
-    }
-
-    /// Return the exact physical incarnation.
-    pub fn epoch(&self) -> &ProjectionEpoch {
-        &self.epoch
     }
 
     /// Return the exact validated executor route.
@@ -530,21 +516,6 @@ pub(crate) fn validate_direct_modeled_owner_compatibility(
             .iter()
             .filter(|modeled| modeled.state() == ProjectionBindingState::Active)
             .collect::<Vec<_>>();
-        let active_epochs = active
-            .iter()
-            .map(|modeled| modeled.epoch().as_str())
-            .collect::<BTreeSet<_>>();
-        if active_epochs.len() > 1 {
-            return Err(format!(
-                "direct modeled projection owner `{}` has mixed active change epochs: {}",
-                owner.name,
-                active_epochs
-                    .into_iter()
-                    .map(|epoch| format!("`{epoch}`"))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ));
-        }
         let Some(first) = active.first() else {
             continue;
         };
@@ -771,7 +742,6 @@ fn server_executor_eq(
         (Some(left), Some(right)) => {
             left.name == right.name
                 && left.version == right.version
-                && left.epoch == right.epoch
                 && left.program_id == right.program_id
                 && left.outputs == right.outputs
         }

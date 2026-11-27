@@ -4,7 +4,6 @@ use super::*;
 #[derive(Debug)]
 pub(crate) struct ProjectionCommitBatch {
     pub(crate) input: TrustedProjectionInput,
-    pub(crate) change_epoch: ProjectionEpoch,
     pub(crate) ownership: Vec<ProjectionModelOwnership>,
     pub(crate) mutations: Vec<ProjectionRecordMutation>,
     pub(crate) observations: Vec<ProjectionObservationRequest>,
@@ -140,7 +139,6 @@ pub(crate) struct SameTransactionProjectionMutation {
 pub(crate) struct SameTransactionProjectionBatch {
     pub(crate) topology: ProjectorTopologyId,
     pub(crate) partition: PartitionId,
-    pub(crate) change_epoch: ProjectionEpoch,
     pub(crate) ownership: Vec<ProjectionModelOwnership>,
     pub(crate) causation_id: String,
     pub(crate) mutations: Vec<SameTransactionProjectionMutation>,
@@ -151,7 +149,6 @@ impl SameTransactionProjectionBatch {
     pub(crate) fn single_upsert(
         topology: ProjectorTopologyId,
         partition: PartitionId,
-        change_epoch: ProjectionEpoch,
         ownership: ProjectionModelOwnership,
         scope: ProjectionRecordScope,
         mutation: TableMutation,
@@ -164,7 +161,6 @@ impl SameTransactionProjectionBatch {
         let batch = Self {
             topology,
             partition,
-            change_epoch,
             ownership: vec![ownership],
             causation_id: bounded_opaque(
                 "projection causation ID",
@@ -240,7 +236,6 @@ impl SameTransactionProjectionBatch {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ProjectionFailureBatch {
     pub(crate) input: TrustedProjectionInput,
-    pub(crate) change_epoch: ProjectionEpoch,
     pub(crate) failure_id: String,
     pub(crate) failure_code: String,
     pub(crate) failure_bytes: Vec<u8>,
@@ -258,7 +253,6 @@ impl ProjectionFailureBatch {
 
     pub(crate) fn new(
         input: TrustedProjectionInput,
-        change_epoch: ProjectionEpoch,
         failure_id: impl Into<String>,
         failure_code: impl Into<String>,
         failure_bytes: impl Into<Vec<u8>>,
@@ -267,7 +261,6 @@ impl ProjectionFailureBatch {
         let failure_digest = Self::fingerprint_bytes(&failure_bytes);
         let batch = Self {
             input,
-            change_epoch,
             failure_id: failure_id.into(),
             failure_code: failure_code.into(),
             failure_bytes,

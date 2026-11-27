@@ -13,7 +13,8 @@ pub(in crate::in_memory_repo) fn stage_same_transaction_projection(
     protocol.require_registered_topology(&batch.topology)?;
 
     let partition_key = PartitionKey::new(&batch.topology, &batch.partition);
-    protocol.ensure_partition(&partition_key, &batch.change_epoch)?;
+    let change_epoch = protocol.change_epoch(&partition_key);
+    protocol.partition_mut(&partition_key, &change_epoch);
     if let Some(failure_id) = protocol
         .partitions
         .get(&partition_key)

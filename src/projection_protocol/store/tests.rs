@@ -83,14 +83,8 @@ fn failure_batch() -> ProjectionFailureBatch {
         true,
     )
     .unwrap();
-    ProjectionFailureBatch::new(
-        input,
-        ProjectionEpoch::new("changes-v1").unwrap(),
-        "failure-1",
-        "decode_error",
-        b"bad payload".to_vec(),
-    )
-    .unwrap()
+    ProjectionFailureBatch::new(input, "failure-1", "decode_error", b"bad payload".to_vec())
+        .unwrap()
 }
 
 #[test]

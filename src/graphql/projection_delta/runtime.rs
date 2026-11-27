@@ -454,7 +454,6 @@ impl ProtocolProjectionRequestSeed {
                 projection.is_causally_eligible()
                     && projection.program_id().to_string() == identity.program_id
                     && projection.binding_id().to_string() == identity.binding_id
-                    && projection.epoch().as_str() == identity.epoch
                     && projection.selected_program().is_some_and(|selected| {
                         selected.ir_version == identity.program_ir_version
                             && selected.operation_semantics_version
@@ -488,7 +487,6 @@ impl ProtocolProjectionRequestSeed {
                 projection.is_causal_evidence_eligible()
                     && projection.program_id().to_string() == identity.program_id
                     && projection.binding_id().to_string() == identity.binding_id
-                    && projection.epoch().as_str() == identity.epoch
                     && projection.selected_program().is_some_and(|selected| {
                         selected.ir_version == identity.program_ir_version
                             && selected.operation_semantics_version
@@ -706,7 +704,6 @@ impl ProtocolProjectionRequestSeed {
                 .any(|projection| {
                     projection.program_id().to_string() == identity.program_id
                         && projection.binding_id().to_string() == identity.binding_id
-                        && projection.epoch().as_str() == identity.epoch
                         && projection.selected_program().is_some_and(|program| {
                             program.ir_version == identity.program_ir_version
                                 && program.operation_semantics_version
@@ -939,7 +936,6 @@ pub(crate) struct ProtocolProjectionProgramRegistry {
 struct ProjectionRegistryKey {
     program_id: String,
     binding_id: String,
-    epoch: String,
 }
 
 #[derive(Clone)]
@@ -1001,7 +997,7 @@ impl ProtocolProjectionProgramRegistry {
             };
             if entries.insert(key, entry).is_some() {
                 return Err(ProjectionRuntimeAuthorityError::Registry(
-                    "modeled projection registry repeats one exact program/binding/epoch".into(),
+                    "modeled projection registry repeats one exact program/binding".into(),
                 ));
             }
         }
@@ -1108,7 +1104,6 @@ impl ProtocolProjectionProgramRegistry {
                 .position(|modeled| {
                     modeled.program_id().to_string() == projection.program_id
                         && modeled.binding_id().to_string() == projection.binding_id
-                        && modeled.epoch().as_str() == projection.epoch
                 })
                 .ok_or(ProjectionRuntimeAuthorityError::InvalidAuthority)?;
             used.insert(index);
@@ -1159,7 +1154,6 @@ impl ProtocolProjectionProgramRegistry {
                     .find(|projection| {
                         projection.program_id().to_string() == identity.program_id
                             && projection.binding_id().to_string() == identity.binding_id
-                            && projection.epoch().as_str() == identity.epoch
                     })
                     .ok_or(ProjectionRuntimeAuthorityError::InvalidAuthority)?;
                 let entry = self.exact(projection)?;
@@ -1232,7 +1226,6 @@ impl ProtocolProjectionProgramRegistry {
                     .position(|modeled| {
                         modeled.program_id().to_string() == identity.program_id
                             && modeled.binding_id().to_string() == identity.binding_id
-                            && modeled.epoch().as_str() == identity.epoch
                     })
                     .ok_or(ProjectionRuntimeAuthorityError::InvalidObservation)?;
                 let plan = resolved
@@ -1301,10 +1294,9 @@ impl ProtocolProjectionProgramRegistry {
     ) -> Result<&ProtocolProjectionProgram, ProjectionRuntimeAuthorityError> {
         let entry = self.entries.get(&registry_key(projection)).ok_or_else(|| {
             ProjectionRuntimeAuthorityError::Registry(format!(
-                "selected modeled projection `{}` / `{}` / `{}` is not mounted",
+                "selected modeled projection `{}` / `{}` is not mounted",
                 projection.program_id(),
-                projection.binding_id(),
-                projection.epoch().as_str()
+                projection.binding_id()
             ))
         })?;
         if entry.route != *projection.route()
@@ -1439,7 +1431,6 @@ fn registry_key(projection: &SurfaceModeledProjection) -> ProjectionRegistryKey 
     ProjectionRegistryKey {
         program_id: projection.program_id().to_string(),
         binding_id: projection.binding_id().to_string(),
-        epoch: projection.epoch().as_str().to_owned(),
     }
 }
 
@@ -1658,7 +1649,6 @@ impl ProtocolProjectionDeltaRequestAuthority {
             let eligible_projection = eligible.iter().find(|modeled| {
                 modeled.program_id().to_string() == projection.program_id
                     && modeled.binding_id().to_string() == projection.binding_id
-                    && modeled.epoch().as_str() == projection.epoch
             });
             if observation.scope.model() != observation.model
                 || observation.scope.topology().name() != observation.projector
@@ -1775,7 +1765,6 @@ impl ProtocolProjectionDeltaRequestAuthority {
                 Ok(super::ProjectionDeltaProjectionIdentity {
                     program_id: projection.program_id().to_string(),
                     binding_id: projection.binding_id().to_string(),
-                    epoch: projection.epoch().as_str().to_owned(),
                     program_ir_version: selected.ir_version,
                     operation_semantics_version: selected.operation_semantics_version,
                 })

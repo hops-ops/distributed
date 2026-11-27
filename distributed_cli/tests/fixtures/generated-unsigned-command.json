@@ -226,7 +226,6 @@
     "projections": [
       {
         "bindingId": "pb1:sha256:2222222222222222222222222222222222222222222222222222222222222222",
-        "epoch": "todos-projection-v2",
         "operationSemanticsVersion": 1,
         "programId": "pp1:sha256:1111111111111111111111111111111111111111111111111111111111111111",
         "programIrVersion": 1
@@ -237,7 +236,7 @@
   "protocol": {
     "operation": "sha256:9b2ba78faeaad3b384d74519aff78252c2f7f0305db1ac0dda9833ba25af58e5",
     "protocolHash": "sha256:0dfa8a3f49e17d8d99c5c095c1ed14f528cae3e55fbc2f2b852975a50936ec5b",
-    "schemaHash": "sha256:63964e9d521d18982b4653331f5967d1066abf09792d2c49c0aab177cd7de4fd",
+    "schemaHash": "sha256:bcf1f144a553d644dd3ff4a9f0c4cad48ddacb4d3bcc64f3a8e82b491a9abb96",
     "surface": {
       "kind": "role",
       "name": "user"

@@ -111,8 +111,7 @@ export function resolveDirectProjection(
 		topology: Object.freeze({ ...direct.topology }),
 		model: direct.model,
 		identityFields: Object.freeze([...direct.identityFields]),
-		...(partition === undefined ? {} : { partition }),
-		changeEpoch: direct.changeEpoch
+		...(partition === undefined ? {} : { partition })
 	});
 }
 

@@ -48,7 +48,6 @@ pub(super) fn projection_manifest(
                 version: CLIENT_PROJECTION_BINDING_VERSION,
                 binding_id: modeled.binding_id().to_string(),
                 program_id: modeled.program_id().to_string(),
-                epoch: modeled.epoch().as_str().to_owned(),
                 state: modeled.state(),
                 placement: modeled.placement(),
                 execution_class: modeled.execution_class(),
@@ -76,7 +75,6 @@ pub(super) fn projection_manifest(
         left.program_id
             .cmp(&right.program_id)
             .then_with(|| left.binding_id.cmp(&right.binding_id))
-            .then_with(|| left.epoch.cmp(&right.epoch))
     });
     Ok((programs.into_values().collect(), bindings))
 }

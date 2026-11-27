@@ -646,7 +646,6 @@ fn direct_projection_json(
     if let Some(partition) = &direct.partition {
         result.insert("partition".into(), effect_expression_json(partition));
     }
-    result.insert("changeEpoch".into(), serde_json::json!(direct.change_epoch));
     Ok(JsonValue::Object(result))
 }
 

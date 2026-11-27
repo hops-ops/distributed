@@ -6,7 +6,7 @@ use serde_json::Value;
 
 use crate::bus::{Message, MessageKind, OrderedDelivery};
 use crate::projection_protocol::{
-    CompiledProjectionTopology, ProjectionEpoch, ProjectionGeneration, ProjectionInputCursor,
+    CompiledProjectionTopology, ProjectionGeneration, ProjectionInputCursor,
     ProjectionInputDisposition, ProjectionModelOwnership, ProjectionProtocolError,
     ProjectionProtocolStore, ProjectionWorkspace, ProjectorTopologyId, TrustedProjectionInput,
 };
@@ -84,14 +84,12 @@ pub(in crate::microsvc) struct ProjectorRegistration {
 
 pub(super) struct RegisteredProjector<I> {
     pub(super) compiled: CompiledProjectionTopology,
-    pub(super) change_epoch: ProjectionEpoch,
     pub(super) handle: Arc<ProjectorHandlerFn<I>>,
 }
 
 #[cfg(feature = "graphql")]
 pub(in crate::microsvc) struct RegisteredModeledProjector {
     pub(in crate::microsvc) compiled: CompiledProjectionTopology,
-    pub(in crate::microsvc) change_epoch: ProjectionEpoch,
     pub(in crate::microsvc) executor: crate::projection::lower::ProjectionServerExecutorDescriptor,
     pub(in crate::microsvc) handle: Option<Arc<ModeledProjectorHandlerFn>>,
 }
@@ -207,7 +205,6 @@ where
                     return record_ingress_failure(
                         store,
                         &self.compiled,
-                        self.change_epoch.clone(),
                         message,
                         ordered,
                         message_id,
@@ -222,7 +219,6 @@ where
                     return record_ingress_failure(
                         store,
                         &self.compiled,
-                        self.change_epoch.clone(),
                         message,
                         ordered,
                         message_id,
@@ -239,7 +235,6 @@ where
                         return record_ingress_failure(
                             store,
                             &self.compiled,
-                            self.change_epoch.clone(),
                             message,
                             ordered,
                             message_id,
@@ -321,7 +316,6 @@ where
                     store
                         .commit_projection(crate::projection_protocol::ProjectionCommitBatch {
                             input: trusted,
-                            change_epoch: self.change_epoch.clone(),
                             ownership: self.compiled.ownership().to_vec(),
                             mutations: Vec::new(),
                             observations: Vec::new(),
@@ -338,7 +332,6 @@ where
                 self.compiled.codec(),
                 partition_value,
                 trusted,
-                self.change_epoch.clone(),
                 Some(self.executor.program_id),
             )?;
             let (context, workspace) =
@@ -347,20 +340,13 @@ where
                 let (projection, applied) =
                     ModeledProjection::new(self.executor.program_id, lowered);
                 if let Err(error) = handle(context, projection).await {
-                    return handle_projector_error(
-                        store,
-                        failure_input,
-                        self.change_epoch.clone(),
-                        "modeled_handler",
-                        error,
-                    )
-                    .await;
+                    return handle_projector_error(store, failure_input, "modeled_handler", error)
+                        .await;
                 }
                 if !applied.load(std::sync::atomic::Ordering::Acquire) {
                     return handle_projector_error(
                         store,
                         failure_input,
-                        self.change_epoch.clone(),
                         "modeled_handler",
                         HandlerError::Rejected(
                             "modeled projector handler returned without applying its projection"
@@ -371,14 +357,8 @@ where
                 }
             } else if let Some(lowered) = lowered {
                 if let Err(error) = context.apply_portable(lowered).await {
-                    return handle_projector_error(
-                        store,
-                        failure_input,
-                        self.change_epoch.clone(),
-                        "modeled_apply",
-                        error,
-                    )
-                    .await;
+                    return handle_projector_error(store, failure_input, "modeled_apply", error)
+                        .await;
                 }
             }
             let workspace = workspace
@@ -392,7 +372,6 @@ where
                     return record_terminal_protocol_failure(
                         store,
                         failure_input,
-                        self.change_epoch.clone(),
                         "modeled_workspace_seal",
                         error,
                     )
@@ -409,7 +388,6 @@ where
                     record_terminal_protocol_failure(
                         store,
                         failure_input,
-                        self.change_epoch.clone(),
                         "modeled_commit_projection",
                         error,
                     )
@@ -529,7 +507,6 @@ where
                             return record_ingress_failure(
                                 dependencies.__causal_projection_store(),
                                 &self.compiled,
-                                self.change_epoch.clone(),
                                 message,
                                 ordered,
                                 message_id,
@@ -543,7 +520,6 @@ where
                         return record_ingress_failure(
                             dependencies.__causal_projection_store(),
                             &self.compiled,
-                            self.change_epoch.clone(),
                             message,
                             ordered,
                             message_id,
@@ -613,7 +589,6 @@ where
                     store
                         .commit_projection(crate::projection_protocol::ProjectionCommitBatch {
                             input: trusted,
-                            change_epoch: self.change_epoch.clone(),
                             ownership: self.compiled.ownership().to_vec(),
                             mutations: Vec::new(),
                             observations: Vec::new(),
@@ -634,7 +609,6 @@ where
                         return handle_projector_error(
                             store,
                             failure_input,
-                            self.change_epoch.clone(),
                             "json_decode",
                             HandlerError::from(error),
                         )
@@ -648,30 +622,18 @@ where
                     return handle_projector_error(
                         store,
                         failure_input,
-                        self.change_epoch.clone(),
                         "typed_decode",
                         HandlerError::from(error),
                     )
                     .await
                 }
             };
-            let workspace = ProjectionWorkspace::new(
-                self.compiled.codec(),
-                partition_value,
-                trusted,
-                self.change_epoch.clone(),
-            )?;
+            let workspace =
+                ProjectionWorkspace::new(self.compiled.codec(), partition_value, trusted)?;
             let (context, workspace) =
                 CausalProjectorContext::new(message, D::Store::clone(store), workspace);
             if let Err(error) = (self.handle)(context, input).await {
-                return handle_projector_error(
-                    store,
-                    failure_input,
-                    self.change_epoch.clone(),
-                    "handler_error",
-                    error,
-                )
-                .await;
+                return handle_projector_error(store, failure_input, "handler_error", error).await;
             }
             let workspace = workspace
                 .lock()
@@ -684,7 +646,6 @@ where
                     return record_terminal_protocol_failure(
                         store,
                         failure_input,
-                        self.change_epoch.clone(),
                         "workspace_seal",
                         error,
                     )
@@ -701,7 +662,6 @@ where
                     record_terminal_protocol_failure(
                         store,
                         failure_input,
-                        self.change_epoch.clone(),
                         "commit_projection",
                         error,
                     )

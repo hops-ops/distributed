@@ -757,7 +757,7 @@ impl CausalWorkspaceParts {
             target
                 .as_ref()
                 .ok_or(CommandCommitProofError::MissingDirectProjectionTarget)?
-                .validate_modeled_owner(executor.name, executor.epoch, executor.program_id)
+                .validate_modeled_owner(executor.name, executor.program_id)
                 .map_err(|error| CommandCommitProofError::DirectProjection(error.to_string()))?;
         }
         prepared.seal_direct_projection(
@@ -1023,7 +1023,6 @@ mod tests {
         > = {
             name: "modeled-direct-workspace",
             version: 1,
-            epoch: "modeled-direct-workspace-v1",
             model: ModeledDirectView,
             program: modeled_direct_program,
         };

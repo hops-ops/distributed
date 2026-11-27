@@ -9,9 +9,8 @@ use crate::microsvc::Session;
 use crate::projection::executor::resolved_partition_json;
 use crate::projection::{ProjectionProgramId, ResolvedProjectionPlan};
 use crate::projection_protocol::{
-    PartitionId, ProjectionEpoch, ProjectionModelOwnership, ProjectionPartitionSpec,
-    ProjectionProtocolError, ProjectionScopeCodec, ProjectorTopologyId,
-    SameTransactionProjectionBatch,
+    PartitionId, ProjectionModelOwnership, ProjectionPartitionSpec, ProjectionProtocolError,
+    ProjectionScopeCodec, ProjectorTopologyId, SameTransactionProjectionBatch,
 };
 use crate::read_model::RelationalReadModel;
 use crate::table::{TableMutation, TableSchema};
@@ -71,7 +70,6 @@ impl CommandProjectedModel {
         facts: &[String],
         models: &[String],
         projector_partition: &ProjectionPartitionSpec,
-        change_epoch: Option<&str>,
         mut ownership: Vec<ProjectionModelOwnership>,
         protocol_topology: Option<ProjectorTopologyId>,
         modeled_program_id: Option<ProjectionProgramId>,
@@ -93,7 +91,6 @@ impl CommandProjectedModel {
             ),
             protocol_topology,
             partition: self.partition.clone(),
-            change_epoch: change_epoch.map(str::to_string),
             schema: self.schema,
             ownership,
             modeled_program_id,
@@ -118,7 +115,6 @@ pub(crate) struct CommandDirectProjectionTarget {
     /// resolve into a direct projection participant.
     protocol_topology: Option<ProjectorTopologyId>,
     pub(crate) partition: Option<EffectExpression>,
-    pub(crate) change_epoch: Option<String>,
     pub(crate) schema: &'static TableSchema,
     /// Complete frozen model → physical-table inventory owned by the
     /// projector topology. Bootstrap claims this entire set atomically even
@@ -145,7 +141,6 @@ impl CommandDirectProjectionTarget {
             "model": self.model,
             "table": self.table,
             "partition": self.partition,
-            "change_epoch": self.change_epoch,
             "ownership": self.ownership.iter().map(|owner| serde_json::json!({
                 "model": owner.model,
                 "table": owner.table,
@@ -160,11 +155,9 @@ impl CommandDirectProjectionTarget {
         facts: &[String],
         models: &[String],
         projector_partition: &ProjectionPartitionSpec,
-        change_epoch: Option<&str>,
     ) -> bool {
         self.projector_topology
             == ProjectorTopologyIdentity::new(name, facts, models, projector_partition)
-            && self.change_epoch.as_deref() == change_epoch
     }
 
     pub(crate) fn protocol_topology_matches(&self, topology: &ProjectorTopologyId) -> bool {
@@ -185,20 +178,6 @@ impl CommandDirectProjectionTarget {
         canonical_wire_input: &serde_json::Value,
         session: Option<&Session>,
     ) -> Result<ResolvedDirectProjectionTarget, DirectProjectionTargetResolutionError> {
-        let change_epoch = self.change_epoch.as_ref().ok_or_else(|| {
-            DirectProjectionTargetResolutionError::InvalidTarget {
-                projector: self.projector.clone(),
-                model: self.model.clone(),
-                reason: "registered projector has no change-log epoch".into(),
-            }
-        })?;
-        let change_epoch = ProjectionEpoch::new(change_epoch.clone()).map_err(|error| {
-            DirectProjectionTargetResolutionError::InvalidTarget {
-                projector: self.projector.clone(),
-                model: self.model.clone(),
-                reason: error.to_string(),
-            }
-        })?;
         let topology = self.protocol_topology.clone().ok_or_else(|| {
             DirectProjectionTargetResolutionError::InvalidTarget {
                 projector: self.projector.clone(),
@@ -245,7 +224,6 @@ impl CommandDirectProjectionTarget {
             codec: Arc::new(codec),
             partition_value,
             partition,
-            change_epoch,
             model: self.model.clone(),
             table: self.table.clone(),
             schema: self.schema,
@@ -280,7 +258,6 @@ pub(crate) fn compiled_direct_projection_target<I, M>(
     facts: &[String],
     models: &[String],
     projector_partition: &ProjectionPartitionSpec,
-    change_epoch: Option<&str>,
 ) -> CompiledDirectProjectionTarget<I, M>
 where
     M: RelationalReadModel + 'static,
@@ -298,7 +275,6 @@ where
             facts,
             models,
             projector_partition,
-            change_epoch,
             vec![
                 ProjectionModelOwnership::new(&schema.model_name, &schema.table_name)
                     .expect("validated relational schema has bounded model/table names"),
@@ -314,7 +290,6 @@ pub(crate) struct ResolvedDirectProjectionTarget {
     codec: Arc<ProjectionScopeCodec>,
     partition_value: Option<serde_json::Value>,
     partition: PartitionId,
-    change_epoch: ProjectionEpoch,
     model: String,
     table: String,
     schema: &'static TableSchema,
@@ -330,19 +305,12 @@ impl ResolvedDirectProjectionTarget {
     pub(crate) fn validate_modeled_owner(
         &self,
         projection_name: &str,
-        projection_epoch: &str,
         program_id: ProjectionProgramId,
     ) -> Result<(), ProjectionProtocolError> {
         if self.codec.topology().name() != projection_name {
             return Err(ProjectionProtocolError::InvalidBatch(format!(
                 "modeled direct projection `{projection_name}` does not match compiled owner `{}`",
                 self.codec.topology().name()
-            )));
-        }
-        if self.change_epoch.as_str() != projection_epoch {
-            return Err(ProjectionProtocolError::InvalidBatch(format!(
-                "modeled direct projection epoch `{projection_epoch}` does not match compiled owner epoch `{}`",
-                self.change_epoch.as_str()
             )));
         }
         match self.modeled_program_id {
@@ -397,7 +365,6 @@ impl ResolvedDirectProjectionTarget {
         SameTransactionProjectionBatch::single_upsert(
             self.codec.topology().clone(),
             self.partition,
-            self.change_epoch,
             ownership,
             scope,
             mutation,

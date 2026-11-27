@@ -463,7 +463,6 @@ mod tests {
                 binding_id:
                     "pb1:sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
                         .into(),
-                epoch: "todos-v1".into(),
                 program_ir_version: crate::projection::PROJECTION_PROGRAM_IR_VERSION,
                 operation_semantics_version:
                     crate::projection::PROJECTION_OPERATION_SEMANTICS_VERSION,

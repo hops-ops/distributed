@@ -101,7 +101,6 @@ mod postgres_tests {
         };
         let batch = |input| ProjectionCommitBatch {
             input,
-            change_epoch: ProjectionEpoch::new("changes-v1").unwrap(),
             ownership: vec![ownership()],
             mutations: Vec::new(),
             observations: Vec::new(),
@@ -189,10 +188,6 @@ mod postgres_tests {
         ProjectionScopeCodec::new(topology())
             .encode_partition(Some(&serde_json::json!("postgres-runtime-tenant")))
             .unwrap()
-    }
-
-    fn change_epoch() -> ProjectionEpoch {
-        ProjectionEpoch::new("postgres-changes-v1").unwrap()
     }
 
     fn schema() -> &'static TableSchema {
@@ -347,7 +342,6 @@ mod postgres_tests {
     ) -> ProjectionCommitBatch {
         ProjectionCommitBatch {
             input,
-            change_epoch: change_epoch(),
             ownership: vec![ownership()],
             mutations,
             observations: Vec::new(),
@@ -780,7 +774,6 @@ mod postgres_tests {
             .record_projection_failure(
                 ProjectionFailureBatch::new(
                     failed_input.clone(),
-                    change_epoch(),
                     "postgres-failure-9",
                     "decode_error",
                     b"bad postgres payload".to_vec(),
@@ -1175,7 +1168,6 @@ mod postgres_tests {
         let direct = SameTransactionProjectionBatch::single_upsert(
             topology(),
             partition(),
-            change_epoch(),
             ownership(),
             scope(),
             upsert_table_mutation("direct"),
@@ -1211,9 +1203,13 @@ mod postgres_tests {
         };
         assert!(compacted_through > 0);
         assert_eq!(head.position(), compacted_through + 3);
-        let boundary =
-            ProjectionChangeCursor::new(topology(), partition(), change_epoch(), compacted_through)
-                .unwrap();
+        let boundary = ProjectionChangeCursor::new(
+            topology(),
+            partition(),
+            head.epoch().clone(),
+            compacted_through,
+        )
+        .unwrap();
         match repository
             .projection_changes(&topology(), &partition(), Some(&boundary), 100)
             .await
@@ -1224,7 +1220,7 @@ mod postgres_tests {
                 compacted_through: retained_watermark,
                 changes,
             } => {
-                assert_eq!(retained_head, Some(head));
+                assert_eq!(retained_head, Some(head.clone()));
                 assert_eq!(retained_watermark, compacted_through);
                 assert_eq!(changes.len(), 3);
                 assert_eq!(changes[0].cursor.position(), compacted_through + 1);
@@ -1235,14 +1231,14 @@ mod postgres_tests {
         let resume_after = ProjectionChangeCursor::new(
             topology(),
             partition(),
-            change_epoch(),
+            head.epoch().clone(),
             compacted_through + 1,
         )
         .unwrap();
         let compact_through = ProjectionChangeCursor::new(
             topology(),
             partition(),
-            change_epoch(),
+            head.epoch().clone(),
             compacted_through + 2,
         )
         .unwrap();
@@ -1513,6 +1509,37 @@ mod postgres_tests {
             .await
             .unwrap();
             assert_eq!(removed.rows_affected(), 1);
+        }
+
+        async fn stored_change_epoch(&self, store: &Self::Store) -> Option<ProjectionEpoch> {
+            let (topology_hash, partition_hash) = self.partition_hashes();
+            sqlx::query_scalar::<_, String>(
+                "SELECT change_epoch FROM projection_partitions \
+                 WHERE topology_hash = $1 AND partition_hash = $2",
+            )
+            .bind(topology_hash)
+            .bind(partition_hash)
+            .fetch_optional(store.pool())
+            .await
+            .unwrap()
+            .map(|epoch| ProjectionEpoch::new(epoch).unwrap())
+        }
+
+        async fn insert_partition(&self, store: &Self::Store, epoch: &ProjectionEpoch) {
+            let (topology_hash, partition_hash) = self.partition_hashes();
+            sqlx::query(
+                "INSERT INTO projection_partitions \
+                 (topology_bytes, topology_hash, partition_bytes, partition_hash, change_epoch) \
+                 VALUES ($1, $2, $3, $4, $5)",
+            )
+            .bind(self.topology().canonical_bytes())
+            .bind(topology_hash)
+            .bind(self.partition().canonical_bytes().to_vec())
+            .bind(partition_hash)
+            .bind(epoch.as_str())
+            .execute(store.pool())
+            .await
+            .unwrap();
         }
 
         async fn stored_change_positions(&self, store: &Self::Store) -> Vec<u64> {

@@ -2,10 +2,9 @@ use sha2::{Digest, Sha256};
 
 use crate::bus::{Message, OrderedDelivery};
 use crate::projection_protocol::{
-    CompiledProjectionTopology, PartitionId, ProjectionEpoch, ProjectionFailureBatch,
-    ProjectionGeneration, ProjectionInputCursor, ProjectionInputFingerprint,
-    ProjectionPartitionRuntimeState, ProjectionProtocolError, ProjectionProtocolStore,
-    ProjectorTopologyId, TrustedProjectionInput,
+    CompiledProjectionTopology, PartitionId, ProjectionFailureBatch, ProjectionGeneration,
+    ProjectionInputCursor, ProjectionInputFingerprint, ProjectionPartitionRuntimeState,
+    ProjectionProtocolError, ProjectionProtocolStore, ProjectorTopologyId, TrustedProjectionInput,
 };
 
 use super::super::HandlerError;
@@ -18,7 +17,6 @@ use super::handle::ProjectionRepairHandle;
 pub(super) async fn record_ingress_failure<S>(
     store: &S,
     compiled: &CompiledProjectionTopology,
-    change_epoch: ProjectionEpoch,
     message: &Message,
     ordered: &OrderedDelivery,
     message_id: &str,
@@ -62,7 +60,7 @@ where
         generation,
         false,
     )?;
-    handle_projector_error(store, input, change_epoch, "ingress_partition", error).await
+    handle_projector_error(store, input, "ingress_partition", error).await
 }
 
 pub(super) fn preflight_runtime_state(
@@ -98,7 +96,6 @@ pub(super) fn preflight_runtime_state(
 pub(super) async fn handle_projector_error<S>(
     store: &S,
     input: TrustedProjectionInput,
-    change_epoch: ProjectionEpoch,
     code: &'static str,
     error: HandlerError,
 ) -> Result<(), HandlerError>
@@ -110,15 +107,13 @@ where
     }
     let detail = error.to_string();
     let topology = input.cursor.topology().clone();
-    let failure_id =
-        record_terminal_failure(store, input, change_epoch, code, detail.as_bytes()).await?;
+    let failure_id = record_terminal_failure(store, input, code, detail.as_bytes()).await?;
     Err(terminal_recorded(&topology, failure_id))
 }
 
 pub(super) async fn record_terminal_protocol_failure<S>(
     store: &S,
     input: TrustedProjectionInput,
-    change_epoch: ProjectionEpoch,
     code: &'static str,
     error: ProjectionProtocolError,
 ) -> Result<(), HandlerError>
@@ -133,15 +128,13 @@ where
     }
     let detail = error.to_string();
     let topology = input.cursor.topology().clone();
-    let failure_id =
-        record_terminal_failure(store, input, change_epoch, code, detail.as_bytes()).await?;
+    let failure_id = record_terminal_failure(store, input, code, detail.as_bytes()).await?;
     Err(terminal_recorded(&topology, failure_id))
 }
 
 async fn record_terminal_failure<S>(
     store: &S,
     input: TrustedProjectionInput,
-    change_epoch: ProjectionEpoch,
     code: &'static str,
     detail: &[u8],
 ) -> Result<String, HandlerError>
@@ -157,13 +150,7 @@ where
     } else {
         detail
     };
-    let batch = ProjectionFailureBatch::new(
-        input,
-        change_epoch,
-        failure_id.clone(),
-        code,
-        detail.to_vec(),
-    )?;
+    let batch = ProjectionFailureBatch::new(input, failure_id.clone(), code, detail.to_vec())?;
     match store.record_projection_failure(batch).await {
         Ok(_) => Ok(failure_id),
         // Another worker can durably stop this partition between our preflight

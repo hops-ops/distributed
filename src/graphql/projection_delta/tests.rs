@@ -41,7 +41,7 @@ use crate::projection::{
 use crate::projection::{
     ProjectionArm, ProjectionField, ProjectionOperation, ProjectionPartition, ProjectionTarget,
 };
-use crate::projection_protocol::{ProjectionEpoch, ProjectorTopologyId};
+use crate::projection_protocol::ProjectorTopologyId;
 use crate::table::{
     ColumnType, PrimaryKey, RelationshipDef, RelationshipKind, TableColumn, TableKind, TableSchema,
 };
@@ -3553,16 +3553,12 @@ fn modeled_direct_fixture() -> ModeledFixture {
     let catalog =
         crate::projection::catalog::ProjectionCatalog::try_new(vec![binding.clone()]).unwrap();
     let active = catalog
-        .activate(
-            vec![ProjectionBindingActivation::new(
-                binding.id(),
-                binding.program_id(),
-                ProjectionEpoch::new("projection-delta-direct-v1").unwrap(),
-                ProjectionBindingState::Active,
-                Some(ProjectionExecutorRoute::local("delta-service").unwrap()),
-            )],
-            None,
-        )
+        .activate(vec![ProjectionBindingActivation::new(
+            binding.id(),
+            binding.program_id(),
+            ProjectionBindingState::Active,
+            Some(ProjectionExecutorRoute::local("delta-service").unwrap()),
+        )])
         .unwrap();
     let modeled = crate::graphql::SurfaceModeledProjection::try_from_catalog(
         program.clone(),
@@ -3642,16 +3638,12 @@ fn modeled_join_fixture() -> ModeledFixture {
     let catalog =
         crate::projection::catalog::ProjectionCatalog::try_new(vec![binding.clone()]).unwrap();
     let active = catalog
-        .activate(
-            vec![ProjectionBindingActivation::new(
-                binding.id(),
-                binding.program_id(),
-                ProjectionEpoch::new("projection-delta-join-v1").unwrap(),
-                ProjectionBindingState::Active,
-                Some(ProjectionExecutorRoute::local("delta-service").unwrap()),
-            )],
-            None,
-        )
+        .activate(vec![ProjectionBindingActivation::new(
+            binding.id(),
+            binding.program_id(),
+            ProjectionBindingState::Active,
+            Some(ProjectionExecutorRoute::local("delta-service").unwrap()),
+        )])
         .unwrap();
     let modeled = crate::graphql::SurfaceModeledProjection::try_from_catalog(
         program.clone(),
@@ -3822,16 +3814,12 @@ fn modeled_fixture_deployment(
     let catalog =
         crate::projection::catalog::ProjectionCatalog::try_new(vec![binding.clone()]).unwrap();
     let active = catalog
-        .activate(
-            vec![ProjectionBindingActivation::new(
-                binding.id(),
-                binding.program_id(),
-                ProjectionEpoch::new("projection-delta-v1").unwrap(),
-                state,
-                Some(ProjectionExecutorRoute::local(route).unwrap()),
-            )],
-            None,
-        )
+        .activate(vec![ProjectionBindingActivation::new(
+            binding.id(),
+            binding.program_id(),
+            state,
+            Some(ProjectionExecutorRoute::local(route).unwrap()),
+        )])
         .unwrap();
     let modeled = crate::graphql::SurfaceModeledProjection::try_from_catalog(
         program.clone(),
@@ -3948,25 +3936,20 @@ fn fanout_fixture_states(
     ])
     .unwrap();
     let active = catalog
-        .activate(
-            vec![
-                ProjectionBindingActivation::new(
-                    todo_binding.id(),
-                    todo_binding.program_id(),
-                    ProjectionEpoch::new("projection-delta-fanout-v1").unwrap(),
-                    todo_state,
-                    Some(ProjectionExecutorRoute::local("delta-service").unwrap()),
-                ),
-                ProjectionBindingActivation::new(
-                    user_binding.id(),
-                    user_binding.program_id(),
-                    ProjectionEpoch::new("projection-delta-fanout-v1").unwrap(),
-                    user_state,
-                    Some(ProjectionExecutorRoute::local("delta-service").unwrap()),
-                ),
-            ],
-            None,
-        )
+        .activate(vec![
+            ProjectionBindingActivation::new(
+                todo_binding.id(),
+                todo_binding.program_id(),
+                todo_state,
+                Some(ProjectionExecutorRoute::local("delta-service").unwrap()),
+            ),
+            ProjectionBindingActivation::new(
+                user_binding.id(),
+                user_binding.program_id(),
+                user_state,
+                Some(ProjectionExecutorRoute::local("delta-service").unwrap()),
+            ),
+        ])
         .unwrap();
     let todo_modeled = crate::graphql::SurfaceModeledProjection::try_from_catalog(
         todo_program.clone(),

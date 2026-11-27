@@ -380,7 +380,7 @@ fn modeled_surface_with_base(
     use crate::projection::{
         ProjectionArm, ProjectionField, ProjectionOperation, ProjectionTarget,
     };
-    use crate::projection_protocol::{ProjectionEpoch, ProjectorTopologyId};
+    use crate::projection_protocol::ProjectorTopologyId;
 
     let selector = crate::projection::ProjectionEventSelector::try_from_descriptor(
         &<ManifestTodoProjected as crate::domain_event::DomainEvent>::DESCRIPTOR,
@@ -439,16 +439,12 @@ fn modeled_surface_with_base(
     let catalog =
         crate::projection::catalog::ProjectionCatalog::try_new(vec![binding.clone()]).unwrap();
     let active = catalog
-        .activate(
-            vec![ProjectionBindingActivation::new(
-                binding.id(),
-                binding.program_id(),
-                ProjectionEpoch::new("todos-modeled-v1").unwrap(),
-                state,
-                Some(ProjectionExecutorRoute::local("todos-service").unwrap()),
-            )],
-            None,
-        )
+        .activate(vec![ProjectionBindingActivation::new(
+            binding.id(),
+            binding.program_id(),
+            state,
+            Some(ProjectionExecutorRoute::local("todos-service").unwrap()),
+        )])
         .unwrap();
     let modeled = crate::graphql::SurfaceModeledProjection::try_from_catalog(
         program,
@@ -541,8 +537,7 @@ fn projected_surface() -> Surface {
         .with_projectors([SurfaceProjector::new("project_todo_domain")
             .facts(["todo.changed", "user.changed"])
             .models(["TodoView", "UserView"])
-            .partition_by(["todo_id"])
-            .change_epoch("todo-domain-v1")])
+            .partition_by(["todo_id"])])
         .expect("projected topology")
 }
 
@@ -585,7 +580,6 @@ fn projected_command_exports_opaque_role_safe_direct_target() {
             path: vec!["todo_id".into()]
         })
     );
-    assert_eq!(direct.change_epoch, "todo-domain-v1");
 
     let direct_wire = serde_json::to_value(direct).expect("direct target wire");
     assert_eq!(
@@ -595,7 +589,7 @@ fn projected_command_exports_opaque_role_safe_direct_target() {
             .keys()
             .map(String::as_str)
             .collect::<BTreeSet<_>>(),
-        BTreeSet::from(["change_epoch", "model", "partition", "topology"])
+        BTreeSet::from(["model", "partition", "topology"])
     );
     let wire = serde_json::to_string(&manifest).expect("client manifest wire");
     assert!(!wire.contains("UserView"));
@@ -1618,13 +1612,11 @@ fn query_protocol_capabilities_are_complete_or_explicitly_revalidate() {
         .with_projectors([
             SurfaceProjector::new("project_todos")
                 .facts(["todo.changed"])
-                .models(["TodoView"])
-                .change_epoch("todos-v1"),
+                .models(["TodoView"]),
             SurfaceProjector::new("project_users")
                 .facts(["user.changed"])
                 .models(["UserView"])
-                .partition_constant(serde_json::json!({"scope": "all"}))
-                .change_epoch("users-v1"),
+                .partition_constant(serde_json::json!({"scope": "all"})),
         ])
         .unwrap();
     let fully_owned = manifest_for_all_models("query-capabilities", "user", &fully_owned);
@@ -1647,8 +1639,7 @@ fn query_protocol_capabilities_are_complete_or_explicitly_revalidate() {
         .with_projectors([SurfaceProjector::new("project_users")
             .facts(["user.changed"])
             .models(["UserView"])
-            .partition_by(["tenant_id"])
-            .change_epoch("users-v1")])
+            .partition_by(["tenant_id"])])
         .unwrap();
     let dynamic = manifest_for_all_models("query-capabilities", "user", &dynamic);
     assert!(dynamic.capabilities.record_revisions);
@@ -1660,8 +1651,7 @@ fn query_protocol_capabilities_are_complete_or_explicitly_revalidate() {
         .unwrap()
         .with_projectors([SurfaceProjector::new("project_users")
             .facts(["user.changed"])
-            .models(["UserView"])
-            .change_epoch("users-v1")])
+            .models(["UserView"])])
         .unwrap();
     let row_filtered = surface_for_role(
         &row_filtered,
@@ -1685,18 +1675,6 @@ fn query_protocol_capabilities_are_complete_or_explicitly_revalidate() {
         "partition-wide positions and changes must not cross a row-authorization boundary"
     );
 
-    let epochless = build_surface(&[users()], &SurfaceOptions::sqlite())
-        .unwrap()
-        .with_projectors([SurfaceProjector::new("project_users")
-            .facts(["user.changed"])
-            .models(["UserView"])])
-        .unwrap();
-    let epochless = manifest_for_all_models("query-capabilities", "user", &epochless);
-    assert!(epochless.capabilities.record_revisions);
-    assert!(epochless.capabilities.tombstones);
-    assert!(!epochless.capabilities.live_resume);
-    assert_eq!(epochless.capabilities.query_fallback, "revalidate");
-
     let unowned = build_surface(&[users()], &SurfaceOptions::sqlite()).unwrap();
     let unowned = manifest_for_all_models("query-capabilities", "user", &unowned);
     assert!(!unowned.capabilities.record_revisions);
@@ -1712,8 +1690,7 @@ fn query_protocol_capabilities_are_complete_or_explicitly_revalidate() {
         .unwrap()
         .with_projectors([SurfaceProjector::new("project_todos")
             .facts(["todo.changed"])
-            .models(["TodoView"])
-            .change_epoch("todos-v1")])
+            .models(["TodoView"])])
         .unwrap();
     let mixed = manifest_for_all_models("query-capabilities", "user", &mixed);
     assert!(!mixed.capabilities.record_revisions);
@@ -1739,12 +1716,10 @@ fn query_protocol_capabilities_are_complete_or_explicitly_revalidate() {
     .with_projectors([
         SurfaceProjector::new("project_teams")
             .facts(["team.changed"])
-            .models(["TeamView"])
-            .change_epoch("teams-v1"),
+            .models(["TeamView"]),
         SurfaceProjector::new("project_users")
             .facts(["user.changed"])
-            .models(["UserView"])
-            .change_epoch("users-v1"),
+            .models(["UserView"]),
     ])
     .unwrap();
     let uncovered_join = manifest_for_all_models("query-capabilities", "user", &uncovered_join);
@@ -1759,8 +1734,7 @@ fn query_protocol_capabilities_are_complete_or_explicitly_revalidate() {
         .unwrap()
         .with_projectors([SurfaceProjector::new("project_users")
             .facts(["user.changed"])
-            .models(["UserView"])
-            .change_epoch("users-v1")])
+            .models(["UserView"])])
         .unwrap();
     let query_only = manifest_for_all_models("query-capabilities", "user", &query_only);
     assert!(query_only.capabilities.record_revisions);

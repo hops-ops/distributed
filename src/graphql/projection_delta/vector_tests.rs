@@ -809,7 +809,6 @@ fn projection_identity(index: usize) -> ProjectionDeltaProjectionIdentity {
     ProjectionDeltaProjectionIdentity {
         program_id: format!("pp1:sha256:{nibble:0>64}"),
         binding_id: format!("pb1:sha256:{nibble:0>64}"),
-        epoch: format!("projection-delta-vector-{index:03}"),
         program_ir_version: crate::projection::PROJECTION_PROGRAM_IR_VERSION,
         operation_semantics_version: crate::projection::PROJECTION_OPERATION_SEMANTICS_VERSION,
     }

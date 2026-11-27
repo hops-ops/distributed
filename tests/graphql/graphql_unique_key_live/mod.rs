@@ -45,7 +45,6 @@ fn projector() -> SurfaceProjector {
     SurfaceProjector::new("publish_revision")
         .facts(["revision.published"])
         .models(["ReferenceView", "RevisionView"])
-        .change_epoch("revision-test-v1")
 }
 
 async fn publish(repository: &SqliteRepository, bus: &InMemoryBus, revision: &str) {

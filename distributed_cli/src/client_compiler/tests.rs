@@ -434,7 +434,6 @@ fn install_create_projection(value: &mut JsonValue) {
         "version": 1,
         "binding_id": BINDING_ID,
         "program_id": PROGRAM_ID,
-        "epoch": "todos-projection-v2",
         "state": "active",
         "placement": "eventual",
         "execution_class": "causal"
@@ -621,8 +620,7 @@ fn projected_manifest() -> JsonValue {
                     "digest": fingerprint("todos topology")
                 },
                 "model": "Todo",
-                "partition": {"kind": "input", "path": ["tenantId"]},
-                "change_epoch": "todos-v1"
+                "partition": {"kind": "input", "path": ["tenantId"]}
             }
         }
     }]);
@@ -4152,7 +4150,6 @@ fn projected_command_requires_exact_role_safe_direct_projection() {
     assert_eq!(direct.topology.version, 1);
     assert_eq!(direct.topology.name, "todos");
     assert_eq!(direct.model, "Todo");
-    assert_eq!(direct.change_epoch, "todos-v1");
     assert!(matches!(
         direct.partition,
         Some(super::manifest::EffectExpression::Input { ref path })

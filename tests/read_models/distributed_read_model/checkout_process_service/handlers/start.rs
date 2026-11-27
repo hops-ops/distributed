@@ -5,7 +5,7 @@ use serde::Serialize;
 use crate::distributed_read_model::checkout::{
     checkout_command, checkout_event, json_outbox_event, CheckoutStarted, StartCheckout,
 };
-use crate::distributed_read_model::checkout_saga_service::CheckoutSaga;
+use crate::distributed_read_model::checkout_process_service::CheckoutProcess;
 
 pub const COMMAND: &str = checkout_command::START;
 
@@ -19,11 +19,11 @@ pub fn command() -> TypedCommand<StartCheckout, Succeeded<Output>> {
 }
 
 pub async fn handle(
-    ctx: &CausalCommandContext<'_, CheckoutSaga>,
+    ctx: &CausalCommandContext<'_, CheckoutProcess>,
     msg: StartCheckout,
 ) -> Result<PreparedCommand<Succeeded<Output>>, HandlerError> {
-    let mut saga = ctx.repo().create();
-    saga.start(
+    let mut process = ctx.repo().create();
+    process.start(
         msg.checkout_id.clone(),
         msg.seat_id.clone(),
         msg.seat_category.clone(),
@@ -35,7 +35,7 @@ pub async fn handle(
         seat_category: msg.seat_category.clone(),
     };
     let out = json_outbox_event(&msg.checkout_id, checkout_event::STARTED, &event)?;
-    ctx.repo().outbox(out).commit(saga)?.succeeded(Output {
+    ctx.repo().outbox(out).commit(process)?.succeeded(Output {
         checkout_id: msg.checkout_id,
     })
 }

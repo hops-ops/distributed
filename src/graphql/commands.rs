@@ -168,13 +168,6 @@ impl TypedCommandInventory {
                     ));
                 }
             };
-            let binding_change_epoch = projector.binding_change_epoch();
-            if binding_change_epoch.is_none() {
-                return Err(format!(
-                    "typed projected command `{name}` owner `{}` has no registered change-log epoch",
-                    projector.name
-                ));
-            }
             let registered_schema = model_schemas
                 .get(&projected.model)
                 .expect("projector ownership above requires a registered model schema");
@@ -203,7 +196,6 @@ impl TypedCommandInventory {
                 &binding_facts,
                 &binding_models,
                 &projector.partition,
-                binding_change_epoch.as_deref(),
                 ownership.clone(),
                 Some(protocol_topology.clone()),
                 projector.active_modeled_program_id_for(&projected.model),

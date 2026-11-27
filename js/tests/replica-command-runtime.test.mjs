@@ -213,7 +213,6 @@ function projection(operation = 'upsert', model = Todo) {
 			Object.freeze({
 				programId: PROGRAM,
 				bindingId: BINDING,
-				epoch: 'todos-v1',
 				programIrVersion: 1,
 				operationSemanticsVersion: 1
 			})
@@ -311,8 +310,7 @@ function directProjectionArtifact() {
 					digest: HASH_D
 				}),
 				model: Todo.id,
-				identityFields: Todo.identityFields,
-				changeEpoch: 'todos-v1'
+				identityFields: Todo.identityFields
 			})
 		}),
 		output: Object.freeze({
@@ -451,7 +449,6 @@ function commandMetadata(request, options = {}) {
 				{
 					program_id: PROGRAM,
 					binding_id: options.bindingId ?? BINDING,
-					epoch: 'todos-v1',
 					program_ir_version: 1,
 					operation_semantics_version: 1
 				}
@@ -1412,8 +1409,7 @@ for (const edit of ['done', 'reopen']) {
 						directProjection: Object.freeze({
 							topology: Object.freeze({ version: 1, name: 'todos', digest: HASH_D }),
 							model: TodoModel.id,
-							identityFields: TodoModel.identityFields,
-							changeEpoch: 'todos-v1'
+							identityFields: TodoModel.identityFields
 						})
 					}),
 					output: Object.freeze({
@@ -3699,8 +3695,7 @@ test('Atomic with portable preview IR does not require an eventual projection-de
 					digest: HASH_D
 				}),
 				model: Todo.id,
-				identityFields: Todo.identityFields,
-				changeEpoch: 'todos-v1'
+				identityFields: Todo.identityFields
 			})
 		}),
 		output: Object.freeze({
@@ -3825,8 +3820,7 @@ async function directProjectionRuntime() {
 					digest: HASH_D
 				}),
 				model: Todo.id,
-				identityFields: Todo.identityFields,
-				changeEpoch: 'todos-v1'
+				identityFields: Todo.identityFields
 			})
 		}),
 		output: Object.freeze({

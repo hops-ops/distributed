@@ -74,7 +74,7 @@ struct LiveResumeTokenMaterial<'a> {
     projection: &'a str,
     topology: &'a crate::projection_protocol::ProjectorTopologyId,
     partition: &'a crate::projection_protocol::PartitionId,
-    epoch: &'a str,
+    epoch: Option<&'a str>,
     position: String,
 }
 
@@ -426,6 +426,9 @@ impl ProtocolResponseAccumulator {
 
     /// Stable exact-index scope. The current head is excluded so later
     /// positions within the same projector/partition/query window compare.
+    /// The change epoch is excluded as well: a partition has none until its
+    /// first write, and position zero before that write must compare as
+    /// before every position after it.
     #[cfg(test)]
     pub(crate) fn issue_index_scope(
         &self,
@@ -436,7 +439,6 @@ impl ProtocolResponseAccumulator {
             snapshot_scope,
             cursor.topology(),
             cursor.projection_partition(),
-            cursor.epoch(),
         )
     }
 
@@ -445,7 +447,6 @@ impl ProtocolResponseAccumulator {
         snapshot_scope: &OpaqueProtocolToken,
         topology: &crate::projection_protocol::ProjectorTopologyId,
         partition: &crate::projection_protocol::PartitionId,
-        epoch: &crate::projection_protocol::ProjectionEpoch,
     ) -> Result<OpaqueProtocolToken, ProtocolAccumulatorError> {
         #[derive(Serialize)]
         struct Material<'a> {
@@ -456,7 +457,6 @@ impl ProtocolResponseAccumulator {
             snapshot_scope: &'a str,
             topology: &'a crate::projection_protocol::ProjectorTopologyId,
             partition: &'a crate::projection_protocol::PartitionId,
-            epoch: &'a str,
         }
 
         self.with_envelope(|envelope| {
@@ -472,7 +472,6 @@ impl ProtocolResponseAccumulator {
                         snapshot_scope: snapshot_scope.as_str(),
                         topology,
                         partition,
-                        epoch: epoch.as_str(),
                     },
                 )
                 .map_err(|_| ProtocolAccumulatorError::Encoding)
@@ -491,7 +490,7 @@ impl ProtocolResponseAccumulator {
             snapshot_scope,
             cursor.topology(),
             cursor.projection_partition(),
-            cursor.epoch(),
+            Some(cursor.epoch()),
             cursor.position(),
         )
     }
@@ -502,7 +501,7 @@ impl ProtocolResponseAccumulator {
         snapshot_scope: &OpaqueProtocolToken,
         topology: &crate::projection_protocol::ProjectorTopologyId,
         partition: &crate::projection_protocol::PartitionId,
-        epoch: &crate::projection_protocol::ProjectionEpoch,
+        epoch: Option<&crate::projection_protocol::ProjectionEpoch>,
         position: u64,
     ) -> Result<DistributedLiveCursor, ProtocolAccumulatorError> {
         let token = self.live_resume_token(
@@ -539,7 +538,7 @@ impl ProtocolResponseAccumulator {
             &supplied.projection,
             expected.topology(),
             expected.projection_partition(),
-            expected.epoch(),
+            Some(expected.epoch()),
             expected.position(),
         )
     }
@@ -552,31 +551,41 @@ impl ProtocolResponseAccumulator {
         projection: &str,
         topology: &crate::projection_protocol::ProjectorTopologyId,
         partition: &crate::projection_protocol::PartitionId,
-        epoch: &crate::projection_protocol::ProjectionEpoch,
+        epoch: Option<&crate::projection_protocol::ProjectionEpoch>,
         position: u64,
     ) -> Result<(), ProtocolTokenError> {
         if supplied.projection != projection || supplied.position != position.to_string() {
             return Err(ProtocolTokenError::Mismatch);
         }
-        self.with_envelope(|envelope| {
-            self.inner.codec.verify(
-                &supplied.token,
-                ProtocolTokenPurpose::LiveResume,
-                &LiveResumeTokenMaterial {
-                    domain: "distributed.graphql.live-resume",
-                    version: 1,
-                    cache_scope: envelope.cache_scope.as_str(),
-                    schema_hash: &envelope.schema_hash,
-                    snapshot_scope: snapshot_scope.as_str(),
-                    projection,
-                    topology,
-                    partition,
-                    epoch: epoch.as_str(),
-                    position: position.to_string(),
-                },
-            )
-        })
-        .map_err(|_| ProtocolTokenError::InvalidMaterial)?
+        let verify = |epoch: Option<&crate::projection_protocol::ProjectionEpoch>| {
+            self.with_envelope(|envelope| {
+                self.inner.codec.verify(
+                    &supplied.token,
+                    ProtocolTokenPurpose::LiveResume,
+                    &LiveResumeTokenMaterial {
+                        domain: "distributed.graphql.live-resume",
+                        version: 1,
+                        cache_scope: envelope.cache_scope.as_str(),
+                        schema_hash: &envelope.schema_hash,
+                        snapshot_scope: snapshot_scope.as_str(),
+                        projection,
+                        topology,
+                        partition,
+                        epoch: epoch.map(crate::projection_protocol::ProjectionEpoch::as_str),
+                        position: position.to_string(),
+                    },
+                )
+            })
+            .map_err(|_| ProtocolTokenError::InvalidMaterial)?
+        };
+        // A cursor issued before the partition existed names no epoch and
+        // sits at position zero. It is the position before the first write of
+        // the epoch the partition is born with, so it stays valid after that
+        // write. A cursor that names an epoch is valid in that epoch only.
+        match verify(epoch) {
+            Err(_) if epoch.is_some() && position == 0 => verify(None),
+            verified => verified,
+        }
     }
 
     fn live_resume_token(
@@ -585,7 +594,7 @@ impl ProtocolResponseAccumulator {
         snapshot_scope: &OpaqueProtocolToken,
         topology: &crate::projection_protocol::ProjectorTopologyId,
         partition: &crate::projection_protocol::PartitionId,
-        epoch: &crate::projection_protocol::ProjectionEpoch,
+        epoch: Option<&crate::projection_protocol::ProjectionEpoch>,
         position: u64,
     ) -> Result<OpaqueProtocolToken, ProtocolAccumulatorError> {
         self.with_envelope(|envelope| {
@@ -602,7 +611,7 @@ impl ProtocolResponseAccumulator {
                         projection,
                         topology,
                         partition,
-                        epoch: epoch.as_str(),
+                        epoch: epoch.map(crate::projection_protocol::ProjectionEpoch::as_str),
                         position: position.to_string(),
                     },
                 )

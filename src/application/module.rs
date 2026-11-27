@@ -115,7 +115,6 @@ pub struct ProjectionSpec {
     pub models: Vec<String>,
     pub dependencies: Vec<String>,
     pub direct: bool,
-    pub change_epoch: Option<String>,
     pub modeled_programs: Vec<String>,
     /// Canonical behavior-affecting program/binding material selected from the
     /// authoritative Surface IR. Runtime routes and physical service config
@@ -142,7 +141,6 @@ impl ProjectionSpec {
             models: models.into_iter().map(Into::into).collect(),
             dependencies: Vec::new(),
             direct: false,
-            change_epoch: None,
             modeled_programs: Vec::new(),
             modeled: Vec::new(),
             partition: serde_json::Value::Null,
@@ -169,7 +167,6 @@ impl ProjectionSpec {
             models: owner.models.clone(),
             dependencies: owner.dependencies.clone(),
             direct: owner.is_direct(),
-            change_epoch: owner.change_epoch.clone(),
             modeled_programs: owner
                 .modeled
                 .iter()

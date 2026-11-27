@@ -1,7 +1,7 @@
 //! e2e-ui projection mounts — product declaration only.
 //!
 //! Each projection is mounted from its `projection!` descriptor, which names
-//! it, pins its epoch and its model. Topology, catalog activation, and Surface
+//! it and its model. Topology, catalog activation, and Surface
 //! packaging come from [`distributed::projection::LocalProjectionMounts`].
 
 use distributed::projection::LocalProjectionMounts;

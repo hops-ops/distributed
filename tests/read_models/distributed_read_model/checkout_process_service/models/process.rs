@@ -2,10 +2,10 @@ use distributed::{sourced, Entity, Snapshot};
 
 use crate::distributed_read_model::checkout::{CHECKOUT_SEAT_RESERVED, CHECKOUT_STARTED};
 
-/// Checkout saga aggregate, keyed by checkout id. It records checkout-process
-/// facts and emits saga events; it does not call the seat aggregate directly.
+/// Checkout process aggregate, keyed by checkout id. It records checkout-process
+/// facts and emits process events; it does not call the seat aggregate directly.
 #[derive(Default, Snapshot)]
-pub struct CheckoutSaga {
+pub struct CheckoutProcess {
     pub entity: Entity,
     pub checkout_id: String,
     pub seat_id: String,
@@ -14,8 +14,8 @@ pub struct CheckoutSaga {
     pub reserved_seat_id: String,
 }
 
-#[sourced(entity, aggregate_type = "checkout_saga")]
-impl CheckoutSaga {
+#[sourced(entity, aggregate_type = "checkout_process")]
+impl CheckoutProcess {
     #[event("started", when = !checkout_id.is_empty() && !seat_id.is_empty())]
     pub fn start(&mut self, checkout_id: String, seat_id: String, seat_category: String) {
         self.entity.set_id(&checkout_id);
@@ -26,7 +26,7 @@ impl CheckoutSaga {
     }
 
     #[event(
-        "checkout_saga.seat_reservation_completed",
+        "checkout_process.seat_reservation_completed",
         when = self.status == CHECKOUT_STARTED && self.seat_id == seat_id
     )]
     pub fn set_reserved_seat(&mut self, seat_id: String) {

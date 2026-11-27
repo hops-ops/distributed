@@ -80,10 +80,6 @@ mod tests {
         .unwrap()
     }
 
-    fn change_epoch() -> ProjectionEpoch {
-        ProjectionEpoch::new("changes-v1").unwrap()
-    }
-
     fn schema() -> &'static TableSchema {
         static SCHEMA: LazyLock<TableSchema> = LazyLock::new(|| TableSchema {
             model_name: "SqlTodoView".into(),
@@ -296,6 +292,37 @@ mod tests {
             assert_eq!(removed.rows_affected(), 1);
         }
 
+        async fn stored_change_epoch(&self, store: &Self::Store) -> Option<ProjectionEpoch> {
+            let (topology_hash, partition_hash) = self.partition_hashes();
+            sqlx::query_scalar::<_, String>(
+                "SELECT change_epoch FROM projection_partitions \
+                 WHERE topology_hash = ? AND partition_hash = ?",
+            )
+            .bind(topology_hash)
+            .bind(partition_hash)
+            .fetch_optional(store.pool())
+            .await
+            .unwrap()
+            .map(|epoch| ProjectionEpoch::new(epoch).unwrap())
+        }
+
+        async fn insert_partition(&self, store: &Self::Store, epoch: &ProjectionEpoch) {
+            let (topology_hash, partition_hash) = self.partition_hashes();
+            sqlx::query(
+                "INSERT INTO projection_partitions \
+                 (topology_bytes, topology_hash, partition_bytes, partition_hash, change_epoch) \
+                 VALUES (?, ?, ?, ?, ?)",
+            )
+            .bind(self.topology().canonical_bytes())
+            .bind(topology_hash)
+            .bind(self.partition().canonical_bytes().to_vec())
+            .bind(partition_hash)
+            .bind(epoch.as_str())
+            .execute(store.pool())
+            .await
+            .unwrap();
+        }
+
         async fn stored_change_positions(&self, store: &Self::Store) -> Vec<u64> {
             let (topology_hash, partition_hash) = self.partition_hashes();
             sqlx::query_scalar::<_, i64>(
@@ -471,7 +498,6 @@ mod tests {
     ) -> ProjectionCommitBatch {
         ProjectionCommitBatch {
             input: trusted,
-            change_epoch: change_epoch(),
             ownership: vec![ownership()],
             mutations,
             observations,
@@ -611,7 +637,6 @@ mod tests {
         moved_repository
             .commit_projection(ProjectionCommitBatch {
                 input: new_input,
-                change_epoch: change_epoch(),
                 ownership: vec![ownership()],
                 mutations: vec![ProjectionRecordMutation::new(
                     new_scope.clone(),
@@ -722,7 +747,6 @@ mod tests {
                     "semantic-identity-cause-a",
                     ProjectionGeneration::initial(),
                 ),
-                change_epoch: change_epoch(),
                 ownership: vec![ownership().with_program_id(program_a)],
                 mutations: vec![mutation(
                     ProjectionRecordExpectation::Missing,
@@ -944,7 +968,6 @@ mod tests {
             SameTransactionProjectionBatch::single_upsert(
                 topology(),
                 partition(),
-                change_epoch(),
                 ownership(),
                 record_scope(),
                 upsert_table_mutation("todo-1"),
@@ -1082,7 +1105,6 @@ mod tests {
                                 "wait-cause-2",
                                 ProjectionGeneration::initial(),
                             ),
-                            change_epoch(),
                             "wait-failure",
                             "decode_error",
                             b"bad payload".to_vec(),
@@ -1289,7 +1311,6 @@ mod tests {
             SameTransactionProjectionBatch::single_upsert(
                 topology(),
                 partition(),
-                change_epoch(),
                 ownership(),
                 record_scope(),
                 upsert_table_mutation("todo-1"),
@@ -1412,7 +1433,6 @@ mod tests {
         let direct = SameTransactionProjectionBatch::single_upsert(
             topology(),
             partition(),
-            change_epoch(),
             ownership(),
             record_scope(),
             upsert_table_mutation("todo-1"),
@@ -1497,7 +1517,6 @@ mod tests {
         let failed_direct = SameTransactionProjectionBatch::single_upsert(
             topology(),
             partition(),
-            change_epoch(),
             ownership(),
             record_scope(),
             upsert_table_mutation("todo-1"),
@@ -1593,7 +1612,6 @@ mod tests {
         let fenced_direct = SameTransactionProjectionBatch::single_upsert(
             topology(),
             partition(),
-            change_epoch(),
             ownership(),
             record_scope(),
             upsert_table_mutation("todo-1"),
