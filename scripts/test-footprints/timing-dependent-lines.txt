@@ -14,6 +14,9 @@
 # a process readiness probe times out only on a slow machine
 distributed_cli/src/lifecycle/dev.rs:1139	}
 distributed_cli/src/lifecycle/dev.rs:1176	return Err(readiness_timeout(name, probe.timeout_ms));
+# (the probe exited after the deadline; lost with no distributed_cli change
+# at ed321d18 in tasks/test-suite-audit-8 and at accafcc0 in -9)
+distributed_cli/src/lifecycle/dev.rs:1208	return Err(readiness_timeout(name, probe.timeout_ms));
 
 # the host drops a slow bot client (below) and its membership
 distributed_game/src/host/membership.rs:358	return;
