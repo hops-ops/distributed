@@ -1142,3 +1142,148 @@ mod commit_evidence {
         );
     }
 }
+
+mod pure_reduce_validation {
+    use super::*;
+
+    fn hand() -> CommandProjectionPureReduce {
+        CommandProjectionPureReduce::client_module("todo::rename", "pures/todo", "rename", "Todo")
+            .key_input("id", ["todoId"])
+            .arg_input("title", ["title"])
+            .assign(["title", "title"])
+    }
+
+    fn validate(
+        reduces: Vec<CommandProjectionPureReduce>,
+    ) -> Result<CommandProjectionEvents, String> {
+        let mut command = typed_command::<Input, Succeeded<Payload>>("todo.rename");
+        for reduce in reduces {
+            command = command.preview_reduce_known_record(reduce);
+        }
+        let mut projections = command.into_contract().projections;
+        projections
+            .canonicalize_and_validate("todo.rename")
+            .map(|()| projections)
+    }
+
+    fn arg(source: CommandProjectionPreviewSource) -> CommandProjectionPureArg {
+        CommandProjectionPureArg {
+            name: "extra".into(),
+            source,
+        }
+    }
+
+    #[test]
+    fn a_hand_module_reduce_is_canonicalized() {
+        let reduce = hand().arg_input("b_arg", ["b"]).arg_input("a_arg", ["a"]);
+        let projections = validate(vec![reduce]).unwrap();
+        let reduce = &projections.pure_reduces[0];
+        assert_eq!(
+            reduce
+                .args
+                .iter()
+                .map(|arg| arg.name.as_str())
+                .collect::<Vec<_>>(),
+            ["a_arg", "b_arg", "title"]
+        );
+        assert_eq!(reduce.assign, ["title"]);
+    }
+
+    #[test]
+    fn each_malformed_reduce_is_rejected() {
+        type Edit = fn(&mut CommandProjectionPureReduce);
+        let cases: Vec<(&str, Edit, &str)> = vec![
+            (
+                "empty fn name",
+                |r| r.fn_name = " ".into(),
+                "requires non-empty fn and model",
+            ),
+            (
+                "empty model",
+                |r| r.model = String::new(),
+                "requires non-empty fn and model",
+            ),
+            (
+                "neither a hand module nor wasm",
+                |r| {
+                    r.client_module.clear();
+                    r.client_export.clear();
+                },
+                "must declare either client_module+client_export or wasm_package+wasm_export",
+            ),
+            (
+                "both a hand module and wasm",
+                |r| r.wasm_package = "wasm/todo".into(),
+                "must declare either client_module+client_export or wasm_package+wasm_export",
+            ),
+            (
+                "hand module without an export",
+                |r| r.client_export.clear(),
+                "client module requires non-empty client_module and client_export",
+            ),
+            (
+                "wasm package without an export",
+                |r| {
+                    r.client_module.clear();
+                    r.client_export.clear();
+                    r.wasm_package = "wasm/todo".into();
+                },
+                "wasm package requires non-empty wasm_package and wasm_export",
+            ),
+            (
+                "no key field",
+                |r| r.key.clear(),
+                "requires at least one key field",
+            ),
+            (
+                "no assigned field",
+                |r| r.assign.clear(),
+                "requires at least one assign field",
+            ),
+            (
+                "empty input path segment",
+                |r| {
+                    r.args
+                        .push(arg(CommandProjectionPreviewSource::input(["a", " "])))
+                },
+                "pure reduce path must contain only non-empty segments",
+            ),
+            (
+                "trusted preset without a codec",
+                |r| {
+                    r.args
+                        .push(arg(CommandProjectionPreviewSource::TrustedPreset {
+                            name: "tenant".into(),
+                            codec: String::new(),
+                        }))
+                },
+                "pure reduce trusted preset name and codec must not be empty",
+            ),
+            (
+                "server-only source",
+                |r| r.args.push(arg(CommandProjectionPreviewSource::ServerOnly)),
+                "arg `extra` uses unsupported source ServerOnly",
+            ),
+            (
+                "a typed declaration error",
+                |r| r.declaration_errors.push("row type mismatch".into()),
+                "pure reduce is invalid: row type mismatch",
+            ),
+        ];
+        for (name, edit, expected) in cases {
+            let mut reduce = hand();
+            edit(&mut reduce);
+            let error = validate(vec![reduce]).unwrap_err();
+            assert!(error.contains(expected), "{name}: {error}");
+        }
+    }
+
+    #[test]
+    fn two_reduces_may_not_share_a_fn_name() {
+        let error = validate(vec![hand(), hand()]).unwrap_err();
+        assert!(error.contains("repeats pure reduce fn name"), "{error}");
+        let mut other = hand();
+        other.fn_name = "todo::retitle".into();
+        assert!(validate(vec![hand(), other]).is_ok());
+    }
+}
