@@ -89,6 +89,17 @@ pub(crate) fn build_declared_wasm_pures(
         return Ok(0);
     }
     let metadata = cargo_metadata(cargo_manifest)?;
+    build_wasm_pures(&pures, &metadata, wasm_pack_launcher, stop)
+}
+
+/// Compile `pures` for the workspace `metadata` describes, skipping each
+/// whose stamp and outputs are current.
+fn build_wasm_pures(
+    pures: &BTreeSet<WasmPure>,
+    metadata: &CargoMetadata,
+    wasm_pack_launcher: Option<&Path>,
+    stop: Option<&AtomicBool>,
+) -> Result<usize, Box<dyn Error>> {
     let project_root = &metadata.workspace_root;
     let Some(ui) = crate::lifecycle::discover_ui(&metadata.metadata, project_root)? else {
         return Ok(0);
@@ -99,7 +110,7 @@ pub(crate) fn build_declared_wasm_pures(
         .ok_or("browser WASM pures require @hops-ops/distributed in the application UI")?;
     let compiler_identity = compiler_identity(wasm_pack_launcher)?;
     let mut outputs = BTreeMap::<PathBuf, &WasmPure>::new();
-    for pure in &pures {
+    for pure in pures {
         let relative = portable_import_path(&pure.import)?;
         let destination = ui_lib.join(relative.parent().ok_or_else(|| {
             format!(
@@ -121,7 +132,7 @@ pub(crate) fn build_declared_wasm_pures(
     }
 
     for (destination, pure) in outputs {
-        let package = resolve_local_package(&metadata, pure)?;
+        let package = resolve_local_package(metadata, pure)?;
         if !package.features.contains_key("wasm") {
             return Err(format!(
                 "WASM pure `{}` requires package `{}` to define a `wasm` Cargo feature",
@@ -135,7 +146,7 @@ pub(crate) fn build_declared_wasm_pures(
             .ok_or_else(|| format!("WASM import `{}` has no UTF-8 output name", pure.import))?;
         let stamp = WasmStamp {
             schema_version: 2,
-            source_identity: package_source_identity(&metadata, &package.id)?,
+            source_identity: package_source_identity(metadata, &package.id)?,
             compiler_identity: compiler_identity.clone(),
             rust_package: pure.rust_package.clone(),
             import: pure.import.clone(),
