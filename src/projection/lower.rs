@@ -12,15 +12,14 @@ use std::marker::PhantomData;
 use std::sync::{OnceLock, RwLock};
 
 use super::ResolvedProjectionField;
-use crate::domain_event::{DomainEvent, DomainEventOccurrence, DomainState};
+use crate::domain_event::{DomainEventOccurrence, DomainState};
 use crate::projection::{
-    MutationKind, ProjectionArm, ProjectionAssignment, ProjectionEventSelector, ProjectionEventSet,
-    ProjectionExpression, ProjectionField, ProjectionInvalidation, ProjectionKeyField,
-    ProjectionOperation, ProjectionPartition, ProjectionPlanTemplate, ProjectionProgram,
-    ProjectionProgramError, ProjectionProgramId, ProjectionRelationship,
-    ProjectionRelationshipEffect, ProjectionTarget, ProjectionValue, ProjectionValueRef,
-    ProjectionValueType, ResolvedProjectionKey, ResolvedProjectionMutation, ResolvedProjectionPlan,
-    ResolvedProjectionValue,
+    MutationKind, ProjectionAssignment, ProjectionEventSelector, ProjectionExpression,
+    ProjectionField, ProjectionInvalidation, ProjectionKeyField, ProjectionOperation,
+    ProjectionPartition, ProjectionProgram, ProjectionProgramError, ProjectionProgramId,
+    ProjectionRelationship, ProjectionRelationshipEffect, ProjectionTarget, ProjectionValue,
+    ProjectionValueRef, ProjectionValueType, ResolvedProjectionKey, ResolvedProjectionMutation,
+    ResolvedProjectionPlan, ResolvedProjectionValue,
 };
 use crate::read_model::{ReadModelWritePlanBuilder, RelationalReadModel};
 #[cfg(any(feature = "graphql", test))]
@@ -767,45 +766,6 @@ where
     )
 }
 
-/// Build an exact typed domain-event selector.
-///
-/// # Errors
-///
-/// Returns descriptor validation failures.
-#[doc(hidden)]
-pub fn event_selector<E>() -> Result<ProjectionEventSelector, ProjectionProgramError>
-where
-    E: DomainEvent,
-{
-    ProjectionEventSelector::try_from_descriptor(&E::DESCRIPTOR)
-}
-
-/// Build an exact sourced deletion selector without a duplicate event DTO.
-///
-/// # Errors
-///
-/// Returns descriptor validation failures.
-#[doc(hidden)]
-pub fn deletion_selector<I>(
-    name: &'static str,
-    version: u64,
-) -> Result<ProjectionEventSelector, ProjectionProgramError>
-where
-    I: ProjectionDeletionMetadata,
-{
-    ProjectionEventSelector::try_from_descriptor(&crate::domain_event::DomainEventDescriptor {
-        name: std::borrow::Cow::Borrowed(name),
-        version,
-        body: crate::domain_event::DomainEventBodyDescriptor::distributed_json(
-            crate::domain_event::DomainEventBodyKind::Deletion,
-            I::BODY_TYPE_NAME,
-            1,
-            I::BODY_SCHEMA,
-            I::BODY_FINGERPRINT,
-        ),
-    })
-}
-
 /// Construct a model target from the existing ORM schema.
 ///
 /// # Errors
@@ -818,50 +778,6 @@ where
 {
     let schema = projection_schema::<M>()?;
     ProjectionTarget::try_new(schema.model_name.clone(), schema.table_name.clone())
-}
-
-/// Construct the exact common full-state upsert operation.
-///
-/// # Errors
-///
-/// Returns invalid body/model metadata or task-7 operation validation failures.
-#[doc(hidden)]
-pub fn state_upsert_operation<S, M>(
-    operation_id: &'static str,
-    staging_ordinal: u32,
-) -> Result<ProjectionOperation, ProjectionProgramError>
-where
-    S: DomainState + ProjectionBodyMetadata,
-    M: ProjectionReadModelMetadata,
-{
-    let schema = projection_schema::<M>()?;
-    let mut key = Vec::with_capacity(schema.primary_key.columns.len());
-    for (ordinal, column) in schema.primary_key.columns.iter().enumerate() {
-        let model_field = model_field_for_column::<M>(column)?;
-        key.push(ProjectionKeyField::try_new(
-            ordinal as u32,
-            model_field.field_name,
-            body_path_for_model_field::<S>(model_field)?,
-        )?);
-    }
-    let mut fields = Vec::with_capacity(M::PROJECTION_FIELDS.len());
-    for (ordinal, model_field) in M::PROJECTION_FIELDS.iter().enumerate() {
-        fields.push(ProjectionField::try_new(
-            ordinal as u32,
-            model_field.field_name,
-            ProjectionAssignment::Set(body_path_for_model_field::<S>(model_field)?),
-        )?);
-    }
-    ProjectionOperation::try_new(
-        operation_id,
-        staging_ordinal,
-        MutationKind::Upsert,
-        projection_target::<M>()?,
-        key,
-        fields,
-        Vec::new(),
-        Vec::new(),
-    )
 }
 
 /// Construct one explicit model operation from closed expressions.
@@ -1193,25 +1109,6 @@ where
             operation: "read-model metadata".to_owned(),
             reason: format!("column `{column}` has no portable field metadata"),
         })
-}
-
-fn body_path_for_model_field<B>(
-    model: &ProjectionModelFieldMetadata,
-) -> Result<ProjectionExpression, ProjectionProgramError>
-where
-    B: ProjectionBodyMetadata,
-{
-    let body = B::PROJECTION_FIELDS
-        .iter()
-        .find(|field| field.present && field.wire_name == model.field_name)
-        .ok_or_else(|| ProjectionProgramError::RequiredValueAbsent {
-            path: model.field_name.to_owned(),
-        })?;
-    ProjectionExpression::body_path(value_type_for_model(model), [body.wire_name])
-}
-
-fn value_type_for_model(model: &ProjectionModelFieldMetadata) -> ProjectionValueType {
-    projection_value_type(model.portable_type)
 }
 
 fn build_model_operation<M>(
@@ -1646,57 +1543,6 @@ fn projection_value_to_json(
                 .collect::<Result<serde_json::Map<_, _>, ProjectionLoweringError>>()?,
         ),
     })
-}
-
-/// Construct a complete projection program from generated arms.
-///
-/// # Errors
-///
-/// Returns task-7 validation failures.
-#[doc(hidden)]
-pub fn projection_program(
-    name: &'static str,
-    version: u64,
-    partition: ProjectionPartition,
-    arms: Vec<ProjectionArm>,
-) -> Result<ProjectionProgram, ProjectionProgramError> {
-    ProjectionProgram::try_new(name, version, partition, arms)
-}
-
-/// Resolve through an exact generated event-set marker.
-///
-/// # Errors
-///
-/// Returns event-set, selector, expression, or logical-plan failures.
-#[doc(hidden)]
-pub fn resolve_typed<E>(
-    program: ProjectionProgram,
-    occurrence: &DomainEventOccurrence,
-) -> Result<ResolvedProjectionPlan, ProjectionProgramError>
-where
-    E: ProjectionEventSet,
-{
-    ProjectionPlanTemplate::<E>::try_new(program)?.resolve(occurrence)
-}
-
-/// Build a canonical relationship output entry.
-///
-/// # Errors
-///
-/// Returns invalid ORM relationship metadata.
-#[doc(hidden)]
-pub fn output_relationship<R>() -> Result<ProjectionRelationship, ProjectionLoweringError>
-where
-    R: ProjectionRelationshipMetadata,
-{
-    let source = ReadModelWritePlanBuilder::projection_validated_schema::<R::Source>()?;
-    let target = ReadModelWritePlanBuilder::projection_validated_schema::<R::Target>()?;
-    ReadModelWritePlanBuilder::projection_relationship_for(source, R::FIELD, target)?;
-    Ok(ProjectionRelationship::try_new(
-        source.model_name.clone(),
-        R::FIELD,
-        target.model_name.clone(),
-    )?)
 }
 
 #[cfg(test)]
