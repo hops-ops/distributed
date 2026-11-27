@@ -12,7 +12,7 @@ This project tracks its work in GitKB; see `.kb/AGENTS.md` for that workflow.
 |---|---|
 | `src/` | The `distributed` crate. `src/lib.rs` includes `README.md` as crate docs, so README Rust blocks are doctests. |
 | `distributed_macros/` | Proc macros, re-exported by `distributed`. Generated code names `distributed::…` paths, so it only works from another crate. |
-| `distributed_cli/` | The `distributed` CLI (`build`, `dev`, `scaffold`, `describe`, …) and its library. |
+| `distributed_cli/` | The `distributed` CLI (`build`, `dev`, `describe`, `schema`, …) and its library. |
 | `distributed_game/`, `distributed_game_macros/` | The multiplayer zone runtime. |
 | `distributed_leaderboard/` | Leaderboards as a projection target. |
 | `tests/common/` | Shared test support: fixtures (the Todo aggregate, ids, service guard) and the conformance suites every backend instantiates (repository, bus, lock, lease, schedule, GraphQL dialects). |

@@ -30,6 +30,21 @@ pub(in crate::microsvc) type ProjectorRepairFuture<'a> =
     Pin<Box<dyn Future<Output = Result<Option<ProjectionGeneration>, HandlerError>> + Send + 'a>>;
 pub(in crate::microsvc) type ProjectorRepairLookupFuture<'a> =
     Pin<Box<dyn Future<Output = Result<bool, HandlerError>> + Send + 'a>>;
+pub(in crate::microsvc) type ProjectorStoppedFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<Vec<ProjectionRepairHandle>, HandlerError>> + Send + 'a>>;
+
+/// The repair handles of the failures stopping `topology` in `store`.
+async fn stopped_failures<S: ProjectionProtocolStore>(
+    store: &S,
+    topology: &ProjectorTopologyId,
+) -> Result<Vec<ProjectionRepairHandle>, HandlerError> {
+    Ok(store
+        .stopped_projection_failures(topology)
+        .await?
+        .into_iter()
+        .map(ProjectionRepairHandle::for_failure)
+        .collect())
+}
 
 pub(in crate::microsvc) trait ErasedProjectorHandler<D>: Send + Sync {
     fn dispatch<'a>(
@@ -54,6 +69,9 @@ pub(in crate::microsvc) trait ErasedProjectorHandler<D>: Send + Sync {
         dependencies: &'a D,
         handle: &'a ProjectionRepairHandle,
     ) -> ProjectorRepairLookupFuture<'a>;
+
+    /// The failures stopping this projector's partitions now.
+    fn stopped<'a>(&'a self, dependencies: &'a D) -> ProjectorStoppedFuture<'a>;
 }
 
 #[derive(Clone)]
@@ -135,6 +153,13 @@ where
                 .as_ref()
                 .is_some_and(|location| &location.topology == self.compiled.topology()))
         })
+    }
+
+    fn stopped<'a>(&'a self, dependencies: &'a D) -> ProjectorStoppedFuture<'a> {
+        Box::pin(stopped_failures(
+            dependencies.__causal_projection_store(),
+            self.compiled.topology(),
+        ))
     }
 
     fn dispatch<'a>(
@@ -437,6 +462,13 @@ where
                 .as_ref()
                 .is_some_and(|location| &location.topology == self.compiled.topology()))
         })
+    }
+
+    fn stopped<'a>(&'a self, dependencies: &'a D) -> ProjectorStoppedFuture<'a> {
+        Box::pin(stopped_failures(
+            dependencies.__causal_projection_store(),
+            self.compiled.topology(),
+        ))
     }
 
     fn dispatch<'a>(

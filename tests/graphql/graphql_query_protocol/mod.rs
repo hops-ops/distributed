@@ -263,6 +263,13 @@ async fn protocol_fixture_with_rows(db: Db) -> ProtocolFixture {
 }
 
 async fn protocol_fixture_with_retention(db: Db, retention: u64) -> ProtocolFixture {
+    let fixture = protocol_fixture_before_the_first_write(db, retention).await;
+    project_item(&fixture.repository, &fixture.bus, 1, "causal row").await;
+    fixture
+}
+
+/// The projector's partition does not exist until its first write.
+async fn protocol_fixture_before_the_first_write(db: Db, retention: u64) -> ProtocolFixture {
     let repository = db.with_projection_change_retention(
         ProjectionChangeRetention::new(retention)
             .expect("positive retained projection change count"),
@@ -277,7 +284,6 @@ async fn protocol_fixture_with_retention(db: Db, retention: u64) -> ProtocolFixt
 
     let bus = InMemoryBus::new();
     let declaration = projector();
-    project_item(&repository, &bus, 1, "causal row").await;
 
     let engine = GraphqlEngine::builder(repository.pool())
         .identity(IdentityConfig::dev_headers())
@@ -765,6 +771,47 @@ pub async fn live_subscription_accepts_an_exact_resume_without_reset(db: Db) {
         resumed_cursors, initial_cursors,
         "an exact reconnect must remain in the same operation and projection scope"
     );
+}
+
+/// A live query opened before the projection's first write is positioned
+/// before that write: it receives the write as an ordinary replayed update.
+pub async fn live_subscription_opened_before_the_first_write_receives_it_without_reset(db: Db) {
+    let fixture = protocol_fixture_before_the_first_write(db, 8).await;
+    let mut stream = fixture
+        .engine
+        .execute_stream(&user_session(), Request::new(LIVE_SUBSCRIPTION));
+    let empty = next_wire_frame(&mut stream).await;
+    assert_eq!(empty["data"]["causal_query_views"], json!([]), "{empty}");
+    let before = distributed_envelope(&empty);
+    assert_eq!(before["live"]["mode"], "resumable", "{empty}");
+    assert_eq!(before["live"]["reset"], false, "{empty}");
+    assert_eq!(before["live"]["cursors"][0]["position"], "0", "{empty}");
+    assert_eq!(before["snapshot"]["indexesComparable"], true, "{empty}");
+    let scope_before_the_partition = before["snapshot"]["indexes"][0]["scopeToken"].clone();
+
+    project_item(&fixture.repository, &fixture.bus, 1, "first row").await;
+
+    let first = next_wire_frame(&mut stream).await;
+    assert_live_frame(&first, "causal_query_views", "first row", "1", false);
+    let after = distributed_envelope(&first);
+    assert_eq!(
+        after["snapshot"]["indexes"][0]["scopeToken"], scope_before_the_partition,
+        "the position before the first write and the positions after it are one comparable scope"
+    );
+    assert_eq!(
+        after["snapshot"]["observations"].as_array().map(Vec::len),
+        Some(1),
+        "the first write is replayed as a change, not hidden behind a reset: {first}"
+    );
+
+    // A client that kept the cursor issued before the partition existed and
+    // reconnects after the write resumes from it as well.
+    let mut reconnected = fixture.engine.execute_stream(
+        &user_session(),
+        request_with_resume(LIVE_SUBSCRIPTION, before["live"]["cursors"].clone()),
+    );
+    let resumed = next_wire_frame(&mut reconnected).await;
+    assert_live_frame(&resumed, "causal_query_views", "first row", "1", false);
 }
 
 pub async fn live_subscription_tampering_and_wrong_scope_reset_without_errors(db: Db) {
@@ -2808,6 +2855,7 @@ on_each_dialect! { ;
     query_evidence_chunks_129_unique_rows_inside_one_snapshot,
     matching_query_and_live_plans_share_snapshot_scope_not_operation_hash,
     live_subscription_accepts_an_exact_resume_without_reset,
+    live_subscription_opened_before_the_first_write_receives_it_without_reset,
     live_subscription_tampering_and_wrong_scope_reset_without_errors,
     live_subscription_out_of_window_resume_resets_to_current_snapshot,
     live_subscription_frames_keep_data_and_metadata_in_fifo_order,

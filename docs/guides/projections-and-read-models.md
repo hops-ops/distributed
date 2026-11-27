@@ -225,11 +225,26 @@ each keeps its own cursor, retry and dead-letter path and sees its events in
 broker order. Event handlers registered with `.event(..)` share the service's
 own consumer and never wait behind a projector.
 
+A projector is itself a handler of the event, and the framework sets no order
+between it and any other handler. A handler must not depend on a read-model
+row written by the same event: take what it needs from the event or the
+aggregate, or react to a later domain event.
+
+`RunOptions::until_idle()` drains all of these consumers together. The run
+ends when every consumer is idle at the same time, so an event a handler
+publishes during the run is projected in that run.
+
 A projector that cannot accept an input records a durable failure for that
 partition and its consumer stops, retaining the failed delivery. The other
 projectors keep consuming, and `run` returns the stopped projector's error
 when they finish. The error names the projection and carries a
-`ProjectionRepairHandle`. Fix the cause, call
+`ProjectionRepairHandle`.
+
+A long-running service does not finish, so do not wait for that error. Ask
+instead: `Service::stopped_projections()` reads the stops from the projection
+store and returns each stopped projection's name and repair handle. Any
+service built over the same stores answers, in any process, before and after
+a restart; an empty list means none is stopped. Fix the cause, call
 `Service::repair_projection(&handle)`, and restart consumption: the projector
 resumes from its failed input, so no later event passes it.
 
@@ -248,7 +263,9 @@ rebuild them explicitly (see above).
 A projection declares no epoch. The store gives each partition's change log
 a random identity when the first write creates the partition, and every
 later reader and writer uses the stored one. A partition created by an
-earlier release keeps the epoch it was created with.
+earlier release keeps the epoch it was created with. A live query opened
+before that first write is positioned before it: it receives the first write
+as an ordinary update, with no reset.
 
 ### Atomic Commits (Read Model + Aggregate)
 

@@ -20,8 +20,8 @@ it (the table below), and add a case there.
 | A macro must reject an input with a clear error | a compile-fail fixture with a pinned `.stderr` | `distributed_macros/tests/compile_fail/` |
 | Macro argument parsing | a unit test in the macro crate | `distributed_macros/src/entry_tests.rs` |
 | A wire format or schema that must not drift | a golden test against a fixture in `tests/fixtures/` | `tests/core/core_command_contract.rs` with `tests/fixtures/core-command-contract-v1.json` |
-| What the CLI writes | a unit test of the generator | `distributed_cli/src/generate/` |
-| What the CLI does when run: arguments, exit codes, files on disk | an integration test that runs the built binary | `distributed_cli/tests/cli_scaffold.rs` |
+| What the CLI writes | a unit test of the generator | `distributed_cli/src/client_compiler/tests.rs`; `distributed_cli/src/atlas.rs` (`mod tests`) |
+| What the CLI does when run: arguments, exit codes, files on disk | an integration test that runs the built binary | `distributed_cli/tests/cli_skills_init.rs` |
 | JS client logic | `js/tests/*.test.mjs`; a contract with several implementations is a conformance file there | `js/tests/cache-engine-conformance.test.mjs`; `js/tests/island-adapter-conformance.test.mjs` |
 
 Add a test at a second layer only for a different trust boundary (a test that

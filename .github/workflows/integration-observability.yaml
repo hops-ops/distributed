@@ -4,11 +4,8 @@ name: Observability Integration Tests
 # from both the PR-quality and push-to-main pipelines.
 #
 # Everything here is docker-level on purpose: promtool validates the Prometheus
-# exposition with Prometheus's own parser, a real OpenTelemetry Collector
-# receives OTLP spans, and kubeconform validates the scaffolded Prometheus
-# Operator manifests against published CRD schemas. Whether an operator
-# actually reconciles the ServiceMonitor is a platform concern, verified on a
-# live cluster — not re-proven per PR here.
+# exposition with Prometheus's own parser, and a real OpenTelemetry Collector
+# receives OTLP spans.
 on:
   workflow_call:
 
@@ -24,7 +21,7 @@ jobs:
   # runner slots are what a pull request waits for. Every check runs even
   # when an earlier one fails, so one run lists every failure.
   observability:
-    name: Observability (promtool, OTLP collector, kubeconform)
+    name: Observability (promtool, OTLP collector)
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -46,13 +43,6 @@ jobs:
             | tar -xz -C /tmp "prometheus-${VERSION}.linux-amd64/promtool"
           sudo mv "/tmp/prometheus-${VERSION}.linux-amd64/promtool" /usr/local/bin/promtool
           promtool --version
-      - name: Install kubeconform
-        run: |
-          VERSION=0.7.0
-          curl -sSfL "https://github.com/yannh/kubeconform/releases/download/v${VERSION}/kubeconform-linux-amd64.tar.gz" \
-            | tar -xz -C /tmp kubeconform
-          sudo mv /tmp/kubeconform /usr/local/bin/kubeconform
-          kubeconform -v
       # The collector needs a config file mount, which `services:` containers
       # can't express, so start it as a step. `--user 0` lets its file exporter
       # write to the bind-mounted output dir regardless of host uid mapping.
@@ -85,27 +75,3 @@ jobs:
         # Live (`#[ignore = "live: ..."]`): fails without the two variables;
         # the script fails the step unless exactly one test passed.
         run: 'scripts/expect-tests-passed.sh 1 cargo test --test observability --features http,otel --verbose otel_export:: -- --ignored'
-      - name: Scaffold service with metrics and tracing
-        if: ${{ !cancelled() }}
-        run: |
-          cargo run -p distributed_cli --bin distributed -- scaffold observability-orders \
-            --path target/tmp/scaffold-observability \
-            --store in-memory --transport http \
-            --metrics prometheus --tracing --gitops \
-            --force --distributed-path .
-      - name: Render chart and validate against CRD schemas
-        if: ${{ !cancelled() }}
-        run: |
-          helm template obs target/tmp/scaffold-observability/.gitops/deploy \
-            --set image.tag=ci-test \
-            --set serviceMonitor.enabled=true \
-            --set prometheusRule.enabled=true \
-            --set observability.tracing.enabled=true \
-            > target/tmp/rendered.yaml
-          grep -q "kind: ServiceMonitor" target/tmp/rendered.yaml
-          grep -q "kind: PrometheusRule" target/tmp/rendered.yaml
-          grep -q "OTEL_SERVICE_NAME" target/tmp/rendered.yaml
-          kubeconform -strict -summary \
-            -schema-location default \
-            -schema-location 'https://raw.githubusercontent.com/datreeio/CRDs-catalog/main/{{.Group}}/{{.ResourceKind}}_{{.ResourceAPIVersion}}.json' \
-            target/tmp/rendered.yaml

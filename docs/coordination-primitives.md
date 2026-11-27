@@ -8,7 +8,8 @@ twice.
 
 | Need | Primitive | Module |
 |------|-----------|--------|
-| Change state in two cells with rollback | Saga / process manager | `distributed::saga` |
+| Change state in two cells with rollback | Saga | `distributed::saga` |
+| React to events from several streams, in any order | Process manager: an aggregate fed by event handlers | No module; see below |
 | Run something at a time in the future, across restarts | `Schedule` (`ctx.schedule`) | `distributed::schedule` |
 | A cell schedules its own future or recurring work | Re-armable cell alarm | `distributed::microsvc::cell_host` |
 | One owner per key, with stale writers rejected | Lease with fencing token | `distributed::lease` |
@@ -160,6 +161,41 @@ This is a sibling of `distributed::lock`, not an extension of it. The lock
 module is `QueuedRepository`'s internal mutual-exclusion optimization. Its
 `Lock` trait has no holder identity, renewal or token, and it deletes
 `aggregate_locks` rows on release, which would reset a token.
+
+## Saga or process manager
+
+These are two patterns, and the names are often used for each other.
+
+| | Saga | Process manager |
+|---|---|---|
+| Shape | A fixed, ordered sequence of steps | A join across streams that stays open |
+| Input | Started once; then replies to its own commands | Domain events, in any order |
+| Failure | A compensating command per step | Whatever the aggregate decides |
+| Ends | Yes: completed, compensated or stuck | When the process says so; it may never end |
+| In the framework | `Saga<D>` | An ordinary aggregate; no special type |
+
+Use a **saga** when you know the steps and each can be undone: moving a
+balance between two cells. `tests/services/saga_transfer/mod.rs` is the worked
+example.
+
+Use a **process manager** when the next action depends on facts that arrive
+from different places in no fixed order: "this ref moved" and "this pull
+request watches that ref". It is built from pieces you already have:
+
+- an aggregate that holds what the process has seen so far, keyed by what the
+  facts have in common;
+- one event handler per fact, registered in that aggregate's own service, that
+  loads the aggregate and records the fact;
+- an event the aggregate emits when it has what it needs, carrying everything
+  the reaction needs.
+
+Do not complete such a join by reading a read model from a handler. Handlers
+of one event have no order, so a handler can run before the projection of the
+same event and find no row.
+
+`tests/read_models/distributed_read_model/checkout_process_service` is a small
+example: `CheckoutProcess` is started by a command, an event handler records
+the seat reservation on it, and it emits `checkout_process.seat_reservation_completed`.
 
 ## Sagas
 

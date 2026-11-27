@@ -3,7 +3,7 @@ mod service;
 pub mod handlers;
 pub mod models;
 
-pub use models::CheckoutSaga;
+pub use models::CheckoutProcess;
 pub use service::service;
 
 #[cfg(feature = "grpc")]
@@ -15,4 +15,4 @@ use distributed::lock::InMemoryLockManager;
 use distributed::{AggregateRepository, InMemoryRepository, QueuedRepository};
 
 pub type CheckoutRepo =
-    AggregateRepository<QueuedRepository<InMemoryRepository, InMemoryLockManager>, CheckoutSaga>;
+    AggregateRepository<QueuedRepository<InMemoryRepository, InMemoryLockManager>, CheckoutProcess>;

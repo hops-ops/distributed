@@ -10,7 +10,23 @@
 //!
 //! [atlas-operator]: https://github.com/ariga/atlas-operator
 
-use crate::ScaffoldError;
+/// An `AtlasSchema` rendering error (bad spec value).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AtlasSchemaError(pub String);
+
+impl std::fmt::Display for AtlasSchemaError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for AtlasSchemaError {}
+
+impl AtlasSchemaError {
+    fn new(message: impl Into<String>) -> Self {
+        Self(message.into())
+    }
+}
 
 /// How the generated `AtlasSchema` reaches its target database URL.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -48,14 +64,14 @@ pub struct AtlasSchemaSpec {
 ///
 /// Returns an error for an empty name or empty schema SQL (nothing to apply), or
 /// an incompletely specified database reference.
-pub fn render_atlas_schema(spec: &AtlasSchemaSpec) -> Result<String, ScaffoldError> {
+pub fn render_atlas_schema(spec: &AtlasSchemaSpec) -> Result<String, AtlasSchemaError> {
     validate_k8s_name(&spec.name, "AtlasSchema name")?;
     if let Some(namespace) = trimmed_non_empty(spec.namespace.as_deref()) {
         validate_k8s_name(namespace, "AtlasSchema namespace")?;
     }
     let name = spec.name.trim();
     if spec.sql.trim().is_empty() {
-        return Err(ScaffoldError::new(
+        return Err(AtlasSchemaError::new(
             "AtlasSchema has no schema SQL to apply (no tables registered?)",
         ));
     }
@@ -75,7 +91,7 @@ pub fn render_atlas_schema(spec: &AtlasSchemaSpec) -> Result<String, ScaffoldErr
             let secret = secret.trim();
             let key = key.trim();
             if secret.is_empty() || key.is_empty() {
-                return Err(ScaffoldError::new(
+                return Err(AtlasSchemaError::new(
                     "AtlasSchema secret reference needs both a secret name and a key",
                 ));
             }
@@ -87,7 +103,7 @@ pub fn render_atlas_schema(spec: &AtlasSchemaSpec) -> Result<String, ScaffoldErr
         AtlasDatabaseUrl::Inline(url) => {
             let url = url.trim();
             if url.is_empty() {
-                return Err(ScaffoldError::new(
+                return Err(AtlasSchemaError::new(
                     "AtlasSchema inline database URL is empty",
                 ));
             }
@@ -123,21 +139,21 @@ fn trimmed_non_empty(value: Option<&str>) -> Option<&str> {
 /// with a clear message rather than emitting YAML the API server would reject —
 /// and rejects names with characters (newlines, colons, quotes) that would also
 /// break the document itself.
-fn validate_k8s_name(value: &str, field: &str) -> Result<(), ScaffoldError> {
+fn validate_k8s_name(value: &str, field: &str) -> Result<(), AtlasSchemaError> {
     let name = value.trim();
     if name.is_empty() {
-        return Err(ScaffoldError::new(format!("{field} must not be empty")));
+        return Err(AtlasSchemaError::new(format!("{field} must not be empty")));
     }
     if !name
         .chars()
         .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
     {
-        return Err(ScaffoldError::new(format!(
+        return Err(AtlasSchemaError::new(format!(
             "{field} `{name}` must contain only lowercase letters, digits, and hyphens"
         )));
     }
     if name.starts_with('-') || name.ends_with('-') {
-        return Err(ScaffoldError::new(format!(
+        return Err(AtlasSchemaError::new(format!(
             "{field} `{name}` must not start or end with a hyphen"
         )));
     }

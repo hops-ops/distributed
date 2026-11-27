@@ -1,6 +1,6 @@
 ---
 name: distributed-usage
-description: Build Distributed CQRS/event-sourced Rust services where you mostly write models and handlers while the framework and distributed generate persistence, transports, manifests, and deploy wiring. Use model-first TDD to specify plain aggregate behavior with fast unit tests before implementing models and thin handlers. Use when designing, testing, writing, or modifying a Distributed service or domain model.
+description: Build Distributed CQRS/event-sourced Rust services where you mostly write models and handlers while the framework and distributed supply persistence, transports, manifests, and schema. Use model-first TDD to specify plain aggregate behavior with fast unit tests before implementing models and thin handlers. Use when creating, designing, testing, writing, or modifying a Distributed service or domain model.
 ---
 
 # Using the Distributed framework
@@ -10,13 +10,12 @@ description: Build Distributed CQRS/event-sourced Rust services where you mostly
 **The model-first advantage: specify and exhaustively test plain domain models
 first, then write thin handlers around proven behavior.**
 
-Everything else — service wiring, transports, persistence, manifests, schema,
-CI/GitOps — is deterministic structure the framework, macros, and `distributed`
-generate. Your authored surface is deliberately small: aggregate models
+Everything else — transports, persistence, manifests, schema — is
+deterministic structure the framework, macros, and `distributed` supply. Your authored surface is deliberately small: aggregate models
 (`#[sourced]` event methods), command/event handler bodies, and read-model
-shapes. If you find yourself hand-writing service plumbing, routing, broker
-topology, or deploy YAML, stop — the framework or CLI almost certainly
-generates it, and hand-rolled copies drift.
+shapes. If you find yourself hand-writing routing, replay, subscription plans or
+broker topology, stop — the framework almost certainly does it, and
+hand-rolled copies drift.
 
 **Composition (logical app vs runtime):** see
 [docs/application-composition.md](../../../docs/application-composition.md).
@@ -48,18 +47,86 @@ traits — production swaps are one constructor line, never a handler change.
 
 ## Workflow
 
-1. Scaffold a service instead of hand-rolling layout:
-   `distributed scaffold <name> --model <agg> --command <agg.action> --event <fact.happened> --store postgres --transport http --bus nats --gitops`
-   (from an event-storming board: aggregates → `--model`, commands →
-   `--command`, events/policies → `--event`, query views → `--read-models`).
+1. Lay a new crate out as in **Project layout** below.
 2. Write failing, colocated unit tests against the aggregate command API you
    want. Exercise the plain model directly, without a handler or infrastructure.
 3. Implement the model fields, event methods, validation, and guards until the
    contract tests pass. Refactor while they stay green.
-4. Implement thin handlers around the proven model behavior. Keep the generated
-   structure around them.
+4. Implement thin handlers around the proven model behavior.
 5. Start in-memory (`InMemoryRepository`, `InMemoryBus`); swap constructors for
    Postgres/a broker when deploying. Handlers do not change.
+
+## Project layout
+
+There is no generator. Write a new service crate in this shape:
+
+```text
+orders/
+  Cargo.toml
+  src/
+    lib.rs          # modules + the three exported functions
+    main.rs         # read the listen address, build the service, serve
+    manifest.rs     # application_manifest, read_model_catalog, service_descriptor
+    service.rs      # Service + Routes, and the ServiceDescriptor
+    models/         # #[sourced] aggregates, command input/output types
+    handlers/       # one module per command or event
+    read_models/    # #[derive(ReadModel)] structs (when the service has queries)
+    query/          # GraphQL roles and permissions (see distributed-graphql)
+```
+
+`Cargo.toml` tells `distributed build`, `dev`, `describe` and `schema` where to
+look. Enable only the features the executable needs (`http`, one of
+`sqlite`/`postgres`, `graphql`, a bus):
+
+```toml
+[package.metadata.distributed.application]
+entrypoint = "application_manifest"
+
+[package.metadata.distributed.runtime]
+binary = "orders"
+
+[dependencies]
+distributed = { version = "<same version as the CLI>", features = ["http", "postgres"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread"] }
+```
+
+`lib.rs` re-exports the entrypoints the CLI calls:
+
+```rust
+pub use manifest::{application_manifest, read_model_catalog, service_descriptor};
+```
+
+`service.rs` is the one place routes are wired:
+
+```rust
+pub fn build(repo: ServiceRepo) -> Arc<Service> {
+    let service = Service::new()
+        .named("orders")
+        // Under `distributed dev`, only the active generation may write.
+        .with_lifecycle(distributed::microsvc::LifecycleGate::from_env())
+        .with_http_command_routes()
+        .routes(
+            Routes::new()
+                .with_repo(AggregateRepository::<_, Order>::new(repo.clone()))
+                .typed_command(handlers::order_place::command())
+                .handle(handlers::order_place::handle),
+        )
+        .routes(distributed::routes!(
+            Routes::new().with_dependencies(repo.clone()),
+            event handlers::order_placed,
+        ));
+    Arc::new(service)
+}
+```
+
+`main.rs` stays a few lines: read `BIND` (default `127.0.0.1:3000`), call
+`service::build`, then `distributed::microsvc::serve(service, &addr).await`.
+
+From an event-storming board: aggregates → `models/`, commands → one handler
+module each, events and policies → event handlers, query views →
+`read_models/`. Deployment is covered by the `distributed-deploy` skill.
 
 ## Model-first TDD
 
@@ -290,7 +357,7 @@ Gotchas:
   app/environment. Names are validated: portable IDs only (`A-Za-z0-9_-`,
   `.` also allowed in namespaces, max 128 bytes).
 - Generic `microsvc` command routes do **not** authenticate themselves. Protect
-  intentional non-GraphQL routes at a trusted edge. Public GraphQL scaffolds
+  intentional non-GraphQL routes at a trusted edge. Public GraphQL services
   instead wire `OidcBearer` validation; generic command POST routes stay off;
   never trust client-supplied identity headers.
 - `connect_and_migrate` applies migrations; plain `connect` does not create
@@ -355,5 +422,5 @@ Keep it updated when adding read models or tables; see the
 - Framework guide: the `distributed` crate README (https://crates.io/crates/distributed)
 - Read models: `README § Read Models`; transports: `README § Event Bus / transports`;
   repositories: `README § Repositories` in the Distributed repo
-- CI/GitOps scaffolding: the `distributed-ci` skill
+- Deployment: the `distributed-deploy` skill
 - Schema and manifest tooling: the `distributed-schema` skill

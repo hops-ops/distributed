@@ -102,7 +102,7 @@ pub use lifecycle::LifecycleGate;
 pub use message_router::ProjectorConsumer;
 pub use projector::{
     CausalProjectorContext, CausalProjectorRouteBuilder, LoadedProjection, ProjectionRepairHandle,
-    ProjectionRepairHandleParseError,
+    ProjectionRepairHandleParseError, StoppedProjection,
 };
 #[cfg(feature = "graphql")]
 pub use projector::{ModeledProjection, ModeledProjectorRouteBuilder};

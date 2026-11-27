@@ -994,6 +994,26 @@ impl ProjectionProtocolStore for InMemoryRepository {
                 }))
         }
     }
+
+    fn stopped_projection_failures<'a>(
+        &'a self,
+        topology: &'a ProjectorTopologyId,
+    ) -> impl Future<Output = Result<Vec<String>, ProjectionProtocolError>> + Send + 'a {
+        async move {
+            let protocol = self
+                .projection_protocol
+                .read()
+                .map_err(|_| RepositoryError::LockPoisoned("stopped projection failures read"))?;
+            let mut stopped: Vec<String> = protocol
+                .partitions
+                .iter()
+                .filter(|(key, _)| &key.topology == topology)
+                .filter_map(|(_, partition)| partition.stopped_failure_id.clone())
+                .collect();
+            stopped.sort();
+            Ok(stopped)
+        }
+    }
 }
 
 #[cfg(test)]

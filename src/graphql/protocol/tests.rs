@@ -342,6 +342,66 @@ fn revision_and_resume_tokens_are_scoped_comparable_and_tamper_evident() {
 }
 
 #[test]
+fn a_cursor_issued_before_the_partition_existed_precedes_its_first_write() {
+    let accumulator = accumulator(31, "principal-a", "sha256:schema-a");
+    let snapshot_scope = accumulator
+        .issue_query_snapshot_scope(&("sha256:operation-a", "window-a"))
+        .unwrap();
+    let born = change_cursor(1);
+    let (topology, partition) = (born.topology(), born.projection_partition());
+    let verify = |cursor: &DistributedLiveCursor, epoch: Option<&ProjectionEpoch>, position| {
+        accumulator.verify_live_resume_position(
+            cursor,
+            &snapshot_scope,
+            "todos",
+            topology,
+            partition,
+            epoch,
+            position,
+        )
+    };
+
+    let before_the_partition = accumulator
+        .issue_live_resume_position("todos", &snapshot_scope, topology, partition, None, 0)
+        .unwrap();
+    verify(&before_the_partition, None, 0).unwrap();
+    verify(&before_the_partition, Some(born.epoch()), 0).unwrap();
+
+    // Naming no epoch says nothing about any later position.
+    let mut forged = before_the_partition.clone();
+    forged.position = "1".into();
+    assert!(verify(&forged, Some(born.epoch()), 1).is_err());
+
+    // A cursor that names an epoch stays in it, at position zero as well.
+    let recreated = ProjectionEpoch::new("todos-recreated").unwrap();
+    for position in [0, 1] {
+        let in_the_first_epoch = accumulator
+            .issue_live_resume_position(
+                "todos",
+                &snapshot_scope,
+                topology,
+                partition,
+                Some(born.epoch()),
+                position,
+            )
+            .unwrap();
+        verify(&in_the_first_epoch, Some(born.epoch()), position).unwrap();
+        assert!(verify(&in_the_first_epoch, Some(&recreated), position).is_err());
+        assert!(verify(&in_the_first_epoch, None, position).is_err());
+    }
+
+    // The index scope is the same before and after the partition is born.
+    assert_eq!(
+        accumulator
+            .issue_index_scope_parts(&snapshot_scope, topology, partition)
+            .unwrap(),
+        accumulator
+            .issue_index_scope(&snapshot_scope, &born)
+            .unwrap()
+    );
+}
+
+#[test]
 fn query_snapshot_merge_preserves_comparable_indexes_when_only_records_are_incomplete() {
     let accumulator = accumulator(47, "principal-a", "sha256:schema-a");
     let mut record_incomplete = query_snapshot(&accumulator, "operation-a", 1);

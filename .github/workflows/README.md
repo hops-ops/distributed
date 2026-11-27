@@ -172,4 +172,4 @@ quality contract.
 ## Out of scope (for now)
 
 - crates.io publish reusable (framework still uses `unbounded-tech` publish helpers in `on-v-tag-publish.yaml`)
-- image / GitOps promote (service scaffolds via `distributed`)
+- image build and GitOps promotion

@@ -369,7 +369,7 @@
                   "projection": "todos-projector",
                   "token": "v1.live-resume.wnTnR1_S3NoFT9Etj2FeGw7OHgMFJdMlxiy4IW8Oyzo"
                 },
-                "scopeToken": "v1.query-index.hNn39BQAqcOQA4dyzt7LfI92OCjNzeBE_y8RPOyUsIE"
+                "scopeToken": "v1.query-index.lXykjmM1Rv8CBlNSMWrnIApu3_MPJP2lMEZ6NZTeVIc"
               }
             ],
             "indexesComparable": true,
@@ -474,7 +474,7 @@
                   "projection": "todos-projector",
                   "token": "v1.live-resume.APMEJsAMVfOcKow3PduylNBBIhze165zTNroNM0REOU"
                 },
-                "scopeToken": "v1.query-index.hNn39BQAqcOQA4dyzt7LfI92OCjNzeBE_y8RPOyUsIE"
+                "scopeToken": "v1.query-index.lXykjmM1Rv8CBlNSMWrnIApu3_MPJP2lMEZ6NZTeVIc"
               }
             ],
             "indexesComparable": true,
@@ -535,7 +535,7 @@
                   "projection": "todos-projector",
                   "token": "v1.live-resume.G-VUB4HgF4pXhWQgVHJLG7ahUps5doS0FQW9TwAzsVg"
                 },
-                "scopeToken": "v1.query-index.hNn39BQAqcOQA4dyzt7LfI92OCjNzeBE_y8RPOyUsIE"
+                "scopeToken": "v1.query-index.lXykjmM1Rv8CBlNSMWrnIApu3_MPJP2lMEZ6NZTeVIc"
               }
             ],
             "indexesComparable": true,
@@ -636,7 +636,7 @@
                 "projection": "todos-projector",
                 "token": "v1.live-resume.hjiTeKRQrkR2L407VC-oB1JKwmXDkxoCld_K7DwJCHY"
               },
-              "scopeToken": "v1.query-index.hNn39BQAqcOQA4dyzt7LfI92OCjNzeBE_y8RPOyUsIE"
+              "scopeToken": "v1.query-index.lXykjmM1Rv8CBlNSMWrnIApu3_MPJP2lMEZ6NZTeVIc"
             }
           ],
           "indexesComparable": true,

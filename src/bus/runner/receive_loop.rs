@@ -29,7 +29,8 @@ use crate::bus::{Message, MessageKind, OrderedDelivery, TransportError, Transpor
 ///
 /// The run returns `Ok(())` when its shutdown signal is triggered (after
 /// settling the delivery in hand) or, with [`RunUntil::Idle`], when the source
-/// has nothing to deliver. A receive or settle error ends the run with that
+/// has nothing to deliver ([`RunUntil::AllIdle`]: when its whole group has
+/// nothing to deliver). A receive or settle error ends the run with that
 /// error; effects already committed make the redelivery safe.
 ///
 /// When the router declares several [delivery lanes](MessageRouter::delivery_lanes)
@@ -46,10 +47,16 @@ where
     R: MessageRouter,
     S: MessageSource,
 {
-    if router.delivery_lanes() > 1 && source.settles_independently() {
-        return LaneRun::new(router, source, options).run().await;
+    let until = options.until.clone();
+    let outcome = if router.delivery_lanes() > 1 && source.settles_independently() {
+        LaneRun::new(router, source, options).run().await
+    } else {
+        run_sequential(router, source, options).await
+    };
+    if let RunUntil::AllIdle(member) = &until {
+        member.leave();
     }
-    run_sequential(router, source, options).await
+    outcome
 }
 
 async fn run_sequential<R, S>(
@@ -75,6 +82,7 @@ where
     S: MessageSource,
 {
     let service = router.consumer_group();
+    let consumer = consumer_name(router);
     let transport = source.transport_name();
 
     while let Some(received) = next_delivery(source, &options.until, service, transport).await? {
@@ -84,11 +92,29 @@ where
             settle_ignored(service, transport, received).await?;
             continue;
         } else {
+            let _dispatching = dispatching(&options.until);
             dispatch(router, received.message(), received.ordered_delivery()).await
         };
-        settle_result(service, transport, options, received, result).await?;
+        settle_result(
+            service,
+            consumer.as_deref(),
+            transport,
+            options,
+            received,
+            result,
+        )
+        .await?;
     }
     Ok(())
+}
+
+/// The durable consumer `router` runs as: its group, with its scope. A
+/// service runs several consumers in one group name, so a dead letter names
+/// the consumer, not the service.
+fn consumer_name<R: MessageRouter>(router: &R) -> Option<String> {
+    router
+        .consumer_group()
+        .map(|group| crate::bus::topology::scoped_group(group, router))
 }
 
 /// End a run: let the source write what it still holds. The run's own error
@@ -107,13 +133,48 @@ async fn finish<S: MessageSource>(
     }
 }
 
+/// Give every other future of the task one turn.
+///
+/// A source may hand a failed delivery straight back (the in-memory bus
+/// ignores the redelivery delay, and [`RetryBackoff::immediate`] asks for
+/// none), so a consumer that keeps retrying would otherwise never return
+/// `Pending`: the consumers run beside it, and the timers that would stop
+/// it, would never be polled again.
+///
+/// [`RetryBackoff::immediate`]: crate::bus::RetryBackoff::immediate
+async fn yield_now() {
+    let mut yielded = false;
+    poll_fn(|cx| {
+        if yielded {
+            return Poll::Ready(());
+        }
+        yielded = true;
+        cx.waker().wake_by_ref();
+        Poll::Pending
+    })
+    .await
+}
+
+/// Mark a dispatch for the run's [`IdleGroup`](crate::bus::IdleGroup), if it
+/// has one.
+fn dispatching(until: &RunUntil) -> Option<crate::bus::idle::Dispatching> {
+    match until {
+        RunUntil::AllIdle(member) => Some(member.dispatching()),
+        RunUntil::Idle | RunUntil::Shutdown(_) => None,
+    }
+}
+
 /// The next delivery, or `None` when the run should end.
+///
+/// Yields first, so a run returns to its executor at least once per delivery
+/// whatever the source does.
 async fn next_delivery<S: MessageSource>(
     source: &mut S,
     until: &RunUntil,
     service: Option<&str>,
     transport: &str,
 ) -> Result<Option<S::Received>, TransportError> {
+    yield_now().await;
     let recv_error = |error: TransportError| {
         record_transport_failure(
             service,
@@ -125,6 +186,16 @@ async fn next_delivery<S: MessageSource>(
     };
     let shutdown = match until {
         RunUntil::Idle => return source.recv().await.map_err(recv_error),
+        RunUntil::AllIdle(member) => loop {
+            let activity = member.activity();
+            if let Some(received) = source.recv().await.map_err(recv_error)? {
+                return Ok(Some(received));
+            }
+            if member.found_empty(activity) {
+                return Ok(None);
+            }
+            select(pin!(source.ready()), pin!(member.changed(activity))).await;
+        },
         RunUntil::Shutdown(shutdown) => shutdown,
     };
     loop {
@@ -167,6 +238,7 @@ async fn settle_ignored<M: ReceivedMessage>(
 /// Returns `Err` when the run must end.
 async fn settle_result<M: ReceivedMessage>(
     service: Option<&str>,
+    consumer: Option<&str>,
     transport: &str,
     options: &RunOptions,
     received: M,
@@ -214,7 +286,7 @@ async fn settle_result<M: ReceivedMessage>(
             let dead = DeadLetter {
                 message: received.message().clone(),
                 reason: error.to_string(),
-                consumer: service.unwrap_or_default().to_owned(),
+                consumer: consumer.unwrap_or_default().to_owned(),
                 attempts,
             };
             if let Err(sink_error) = sink.dead_letter(dead).await {
@@ -400,8 +472,10 @@ where
             let router = Arc::clone(&self.router);
             let message = Arc::clone(&entry.message);
             let ordered = entry.ordered.clone();
+            let dispatching = dispatching(&self.options.until);
             self.lane_busy[lane] = true;
             self.running.push(Box::pin(async move {
+                let _dispatching = dispatching;
                 let result = dispatch_lane(router.as_ref(), &message, ordered.as_ref(), lane).await;
                 (sequence, lane, result)
             }));
@@ -424,8 +498,16 @@ where
         };
         if let Some(error) = received.decode_error() {
             let error = TransportError::new(error.kind(), error.message());
-            let outcome =
-                settle_result(service, self.transport, &self.options, received, Err(error)).await;
+            let consumer = consumer_name(self.router.as_ref());
+            let outcome = settle_result(
+                service,
+                consumer.as_deref(),
+                self.transport,
+                &self.options,
+                received,
+                Err(error),
+            )
+            .await;
             self.record_stop(outcome);
             return;
         }
@@ -504,8 +586,10 @@ where
         };
         let error = entry.stop.or(entry.retryable).or(extra).or(entry.permanent);
         let service = self.service();
+        let consumer = consumer_name(self.router.as_ref());
         let outcome = settle_result(
             service.as_deref(),
+            consumer.as_deref(),
             self.transport,
             &self.options,
             entry.received,

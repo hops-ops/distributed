@@ -11,8 +11,8 @@ pub mod checkout_command {
 }
 
 pub mod checkout_event {
-    pub const STARTED: &str = "checkout_saga.started";
-    pub const SEAT_RESERVATION_COMPLETED: &str = "checkout_saga.seat_reservation_completed";
+    pub const STARTED: &str = "checkout_process.started";
+    pub const SEAT_RESERVATION_COMPLETED: &str = "checkout_process.seat_reservation_completed";
 }
 
 pub mod seat_command {

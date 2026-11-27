@@ -1179,6 +1179,15 @@ where
         .await
         .expect_err("the stop survives a restart");
     assert_eq!(repair_handle(&still_stopped), handle);
+    // A host learns of the stop from the store, without the run's error.
+    let stopped_service = two_projector_service(&repository, true, &applied);
+    assert_eq!(
+        stopped_service.stopped_projections().await.unwrap(),
+        [crate::microsvc::StoppedProjection {
+            projection: "task15_a_primary".into(),
+            repair: handle.clone(),
+        }]
+    );
     let while_stopped = take(&applied);
     assert_eq!(ids("secondary", &while_stopped), ["d"]);
     assert!(ids("primary", &while_stopped).is_empty());
@@ -1186,6 +1195,7 @@ where
     // The release is corrected and the operator repairs the failure.
     let repaired = two_projector_service(&repository, false, &applied);
     assert_eq!(repaired.repair_projection(&handle).await.unwrap().get(), 2);
+    assert!(repaired.stopped_projections().await.unwrap().is_empty());
     repaired
         .with_bus(bus.clone())
         .run(RunOptions::until_idle())
@@ -1198,6 +1208,205 @@ where
         "the repaired projector resumes from its failed input"
     );
     assert!(ids("secondary", &after).is_empty());
+}
+
+/// A long-running service does not return when a projector stops. A host
+/// still learns which projector stopped, and gets its repair handle, from
+/// the store, while the other projector keeps running.
+#[tokio::test]
+async fn a_long_running_host_can_ask_which_projectors_are_stopped() {
+    let repository = InMemoryRepository::new();
+    let bus = InMemoryBus::new();
+    let applied = Arc::new(Mutex::new(Vec::new()));
+    let secondary = |applied: &Arc<Mutex<Vec<(&'static str, String)>>>| -> Vec<String> {
+        applied
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(name, _)| *name == "secondary")
+            .map(|(_, id)| id.clone())
+            .collect()
+    };
+
+    bus.publish_message(fact_message("a", "before the rollout"))
+        .await
+        .unwrap();
+    two_projector_service(&repository, false, &applied)
+        .with_bus(bus.clone())
+        .run(RunOptions::until_idle())
+        .await
+        .unwrap();
+
+    let shutdown = crate::bus::Shutdown::new();
+    let running = tokio::spawn(
+        two_projector_service(&repository, true, &applied)
+            .with_bus(bus.clone())
+            .run(RunOptions::until_shutdown(shutdown.clone())),
+    );
+    // The host's own service over the same stores, as its API process has.
+    let host = two_projector_service(&repository, true, &applied);
+    assert!(host.stopped_projections().await.unwrap().is_empty());
+
+    bus.publish_message(fact_message("b", "after the rollout"))
+        .await
+        .unwrap();
+    let stopped = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            let stopped = host.stopped_projections().await.unwrap();
+            if !stopped.is_empty() {
+                break stopped;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the stop is visible while the service runs");
+    assert_eq!(stopped.len(), 1);
+    assert_eq!(stopped[0].projection, "task15_a_primary");
+    assert!(!running.is_finished(), "the service keeps running");
+
+    bus.publish_message(fact_message("c", "while stopped"))
+        .await
+        .unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while secondary(&applied) != ["a", "b", "c"] {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the other projector keeps delivering");
+
+    shutdown.trigger();
+    let error = running
+        .await
+        .unwrap()
+        .expect_err("the run reports the stop when it ends");
+    assert_eq!(repair_handle(&error), stopped[0].repair);
+}
+
+/// An event handler that retries until a projector has projected the same
+/// event. The in-memory bus hands a failed delivery straight back, so the
+/// handler's consumer must still let the projector's consumer run.
+#[tokio::test]
+async fn a_retrying_handler_does_not_starve_the_projector_it_waits_for() {
+    let repository = InMemoryRepository::new();
+    let bus = InMemoryBus::new();
+    let projected = Arc::new(AtomicBool::new(false));
+    let retries = Arc::new(AtomicUsize::new(0));
+    let (mark_projected, wait_for_projection, count_retries) = (
+        Arc::clone(&projected),
+        Arc::clone(&projected),
+        Arc::clone(&retries),
+    );
+    let service = Service::new()
+        .named("task15-starvation")
+        .routes(
+            Routes::new()
+                .with_read_model_store(repository.clone())
+                .causal_projector::<TodoChanged>(primary_projector())
+                .model::<PrimaryView>()
+                .handle(move |context: CausalProjectorContext, fact: TodoChanged| {
+                    let projected = Arc::clone(&mark_projected);
+                    async move {
+                        context
+                            .project(&PrimaryView {
+                                id: fact.id,
+                                title: fact.title,
+                            })
+                            .await?;
+                        projected.store(true, Ordering::SeqCst);
+                        Ok(())
+                    }
+                }),
+        )
+        .routes(Routes::new().with_dependencies(()).event(FACT_NAME).handle(
+            move |_: &crate::microsvc::Context<()>| {
+                let projected = Arc::clone(&wait_for_projection);
+                let retries = Arc::clone(&count_retries);
+                async move {
+                    if projected.load(Ordering::SeqCst) {
+                        return Ok(serde_json::json!({}));
+                    }
+                    retries.fetch_add(1, Ordering::SeqCst);
+                    Err(HandlerError::Other("the row is not projected yet".into()))
+                }
+            },
+        ))
+        .with_bus(bus.clone());
+
+    bus.publish_message(fact_message("a", "awaited"))
+        .await
+        .unwrap();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        service.run(RunOptions::until_idle()),
+    )
+    .await
+    .expect("the retrying handler let the projector run")
+    .unwrap();
+
+    assert!(projected.load(Ordering::SeqCst));
+    assert!(
+        retries.load(Ordering::SeqCst) > 0,
+        "the handler ran before the projection and retried"
+    );
+}
+
+/// A handler publishes the fact a projector consumes, after that projector's
+/// consumer has already found nothing to do. One drain still projects it.
+#[tokio::test]
+async fn one_drain_projects_what_a_handler_published_during_it() {
+    const TRIGGER: &str = "task15.trigger";
+    let repository = InMemoryRepository::new();
+    let bus = InMemoryBus::new();
+    let projected = Arc::new(Mutex::new(Vec::new()));
+    let record = Arc::clone(&projected);
+    let publisher = bus.clone();
+    let service = Service::new()
+        .named("task15-drain")
+        .routes(
+            Routes::new()
+                .with_read_model_store(repository.clone())
+                .causal_projector::<TodoChanged>(primary_projector())
+                .model::<PrimaryView>()
+                .handle(move |context: CausalProjectorContext, fact: TodoChanged| {
+                    let record = Arc::clone(&record);
+                    async move {
+                        context
+                            .project(&PrimaryView {
+                                id: fact.id.clone(),
+                                title: fact.title,
+                            })
+                            .await?;
+                        record.lock().unwrap().push(fact.id);
+                        Ok(())
+                    }
+                }),
+        )
+        .routes(Routes::new().with_dependencies(()).event(TRIGGER).handle(
+            move |_: &crate::microsvc::Context<()>| {
+                let publisher = publisher.clone();
+                async move {
+                    // Long enough for the projector's consumer to go idle.
+                    for _ in 0..8 {
+                        tokio::task::yield_now().await;
+                    }
+                    publisher
+                        .publish_message(fact_message("late", "published by a handler"))
+                        .await
+                        .map_err(|error| HandlerError::Other(Box::new(error)))?;
+                    Ok(serde_json::json!({}))
+                }
+            },
+        ))
+        .with_bus(bus.clone());
+
+    bus.publish_message(Message::new(TRIGGER, MessageKind::Event, b"{}".to_vec()).with_id("t-1"))
+        .await
+        .unwrap();
+    service.run(RunOptions::until_idle()).await.unwrap();
+
+    assert_eq!(*projected.lock().unwrap(), ["late"]);
 }
 
 fn malformed_service(repository: InMemoryRepository, invoked: Arc<AtomicUsize>) -> Service {

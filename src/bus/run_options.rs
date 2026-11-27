@@ -6,7 +6,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use super::{DeadLetterSink, FailurePolicy, Shutdown};
+use super::{DeadLetterSink, FailurePolicy, IdleMember, Shutdown};
 
 /// Default first redelivery delay; it doubles with each delivery.
 pub const DEFAULT_RETRY_BACKOFF_BASE: Duration = Duration::from_millis(50);
@@ -65,6 +65,12 @@ pub enum RunUntil {
     /// Return as soon as the source has nothing to deliver. For tests and
     /// one-shot drains.
     Idle,
+    /// Return when every consumer of the member's [`IdleGroup`] has nothing
+    /// to deliver and none is handling a delivery. For draining several
+    /// consumers that publish to each other.
+    ///
+    /// [`IdleGroup`]: super::IdleGroup
+    AllIdle(IdleMember),
 }
 
 /// Policy for one consumer run.
