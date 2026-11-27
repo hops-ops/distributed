@@ -52,6 +52,11 @@ jobs:
   wasm32-domains:
     uses: ./.github/workflows/integration-wasm32-domains.yaml
 
+  # Workspace coverage (coverage.yaml). Not in version-and-tag's `needs`:
+  # a release never waits on the instrumented build.
+  coverage:
+    uses: ./.github/workflows/coverage.yaml
+
   # This uses commit logs and tags from git to determine the next version number and create a tag for the release.
   # Some commits such as chore: will not trigger a version bump and tag; this is by design.
   version-and-tag:

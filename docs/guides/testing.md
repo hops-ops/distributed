@@ -322,18 +322,59 @@ observability, e2e-ui, JS, game demos, celld and wasm32 domains.
 
 ## Coverage Reporting
 
-This project uses [`cargo-llvm-cov`](https://github.com/taiki-e/cargo-llvm-cov):
+`make coverage-local` gives one line coverage number for the workspace's
+production code. It starts the compose services, recreates the test databases
+and exports the service variables as `make test-local` does (one shared
+definition in the `Makefile`), runs the same nextest suite under
+[`cargo-llvm-cov`](https://github.com/taiki-e/cargo-llvm-cov), and prints the
+lines covered per crate and in total:
 
 ```bash
 rustup component add llvm-tools-preview
-cargo install cargo-llvm-cov
-
-cargo llvm-cov --all-features --summary-only
-cargo llvm-cov --all-features --lcov --output-path lcov.info
+cargo install cargo-llvm-cov cargo-nextest --locked
+make coverage-local        # KEEP_COMPOSE=1 keeps the services up afterwards
 ```
 
-On push to `main`, CI (`.github/workflows/rust.yml`) publishes `lcov.info` as a
-workflow artifact and attempts an optional Codecov upload.
+It honours `CARGO_TEST_ARGS` (default `--workspace --all-features`) and
+writes `target/coverage/lcov.info` (for an editor or another tool) and
+`target/coverage/summary.json`. Tests ignored by default (the live tests) do
+not run. It builds in `target/llvm-cov-target`, cargo-llvm-cov's default and
+the directory `make test-footprints` uses: their dependency builds are the
+same, so each reuses the other's. Every run first removes old profiles and
+the workspace crates' artifacts (`cargo llvm-cov clean --workspace`), so the
+workspace crates rebuild each time and no earlier run leaks into the number.
+Do not run the two at once.
+
+What the number counts:
+
+- Test files are excluded: everything
+  [`classify.py`](../../scripts/test-footprints/classify.py) calls test or
+  example code (`tests/`, `benches/`, `examples/`, `tests.rs`,
+  `*_test(s).rs`, `test_*.rs`, modules declared under `#[cfg(test)]`).
+  [`ignore_regex.py`](../../scripts/coverage/ignore_regex.py) turns that
+  classification into the `--ignore-filename-regex` both reports use, and
+  [`summary.py`](../../scripts/coverage/summary.py) fails if the report still
+  holds a file the classifier calls test code. `tests/common`,
+  `examples/quickstart` and `tests/fixtures/renamed-dependency` are workspace
+  members made only of such files, so they are not reported.
+- Inline `#[cfg(test)] mod tests { ... }` blocks cannot be excluded by file
+  name: they count as production lines, so this number sits slightly above
+  true production coverage. The footprint tool (next section) subtracts them
+  and is the exact figure.
+- Doctests are not included (stable cargo-llvm-cov cannot instrument them).
+- `distributed_macros` and `distributed_game_macros` are proc-macro crates,
+  which run inside rustc: their figure is their expansion while the workspace
+  builds plus their own unit tests.
+
+CI runs `make coverage-local` in
+[`coverage.yaml`](../../.github/workflows/coverage.yaml) on every push to
+`v5` and `main` (not on pull requests: the instrumented build roughly doubles
+the services job). The job summary shows the per-crate table and the TOTAL,
+and `lcov.info` is uploaded as the `workspace-coverage-lcov` artifact.
+Release tagging does not wait on it. The pull request `quality` job reports
+no coverage.
+
+Scripts tested by `python3 -m unittest discover -s scripts/coverage`.
 
 ## Per-test coverage footprints
 

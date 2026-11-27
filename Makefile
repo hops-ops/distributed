@@ -52,6 +52,21 @@ TEST_SERVICES_ENV = \
 	export DISTRIBUTED_UNIQUE_KEY_TEST_POSTGRES_URL="$(POSTGRES_ADMIN_URL)/distributed_unique_key_test"; \
 	export DISTRIBUTED_REQUIRE_SERVICES="$(REQUIRED_SERVICES)";
 
+# Shell fragment that starts the compose services and, unless KEEP_COMPOSE=1,
+# stops them when the recipe exits. Same rules as TEST_SERVICES_ENV, which
+# follows it: `set -eu; $(COMPOSE_SESSION) $(TEST_SERVICES_ENV) ...`.
+COMPOSE_SESSION = \
+	if [ "$(KEEP_COMPOSE)" != "1" ]; then \
+		cleanup() { \
+			$(DOCKER_COMPOSE) down $(COMPOSE_DOWN_FLAGS); \
+		}; \
+		trap cleanup EXIT HUP INT TERM; \
+	fi; \
+	$(DOCKER_COMPOSE) up $(COMPOSE_UP_FLAGS);
+
+# `make coverage-local` writes lcov.info and summary.json here.
+COVERAGE_DIR = target/coverage
+
 # Per-test coverage footprints (docs/guides/testing.md). The full run writes
 # FOOTPRINTS_DIR; a partial run (ARGS=...) must name its own OUT=.
 FOOTPRINTS_DIR = target/test-footprints
@@ -59,7 +74,7 @@ FOOTPRINTS_ALLOWLIST = scripts/test-footprints/timing-dependent-lines.txt
 
 test: test-local
 
-.PHONY: test test-local test-cargo test-cli-lifecycle test-footprints test-footprints-diff compose-up compose-down
+.PHONY: test test-local coverage-local test-cargo test-cli-lifecycle test-footprints test-footprints-diff compose-up compose-down
 
 ## The whole workspace against real services. This is what CI runs.
 ## Tests run under cargo-nextest, one process per test (.config/nextest.toml;
@@ -67,16 +82,41 @@ test: test-local
 ## doctests, so `cargo test --doc` follows.
 test-local:
 	set -eu; \
-	if [ "$(KEEP_COMPOSE)" != "1" ]; then \
-		cleanup() { \
-			$(DOCKER_COMPOSE) down $(COMPOSE_DOWN_FLAGS); \
-		}; \
-		trap cleanup EXIT HUP INT TERM; \
-	fi; \
-	$(DOCKER_COMPOSE) up $(COMPOSE_UP_FLAGS); \
+	$(COMPOSE_SESSION) \
 	$(TEST_SERVICES_ENV) \
 	$(CARGO) nextest run $(CARGO_TEST_ARGS) --all-targets; \
 	$(CARGO) test $(CARGO_TEST_ARGS) --doc
+
+## `test-local`'s nextest run under cargo-llvm-cov, then one line coverage
+## number for the workspace's production code: per crate and TOTAL, with
+## COVERAGE_DIR/lcov.info. Test files are dropped by the footprint
+## classifier (scripts/coverage/ignore_regex.py); doctests do not run. Builds
+## in cargo-llvm-cov's default target/llvm-cov-target, which `make
+## test-footprints` also uses: dependencies stay warm for both, but every run
+## first removes old profiles and the workspace crates' artifacts (`llvm-cov
+## clean --workspace`), so the proc-macro crates' build-time expansion is
+## measured afresh and no earlier run leaks in. Run one at a time. The
+## reports cover the packages CARGO_TEST_ARGS selects (`--workspace`, `-p`;
+## `llvm-cov report` takes no `--exclude`).
+coverage-local:
+	set -eu; \
+	$(COMPOSE_SESSION) \
+	$(TEST_SERVICES_ENV) \
+	$(CARGO) llvm-cov clean --workspace; \
+	$(CARGO) llvm-cov nextest --no-report $(CARGO_TEST_ARGS) --all-targets; \
+	select=; set -- $(CARGO_TEST_ARGS); \
+	while [ $$# -gt 0 ]; do \
+		case "$$1" in \
+			--workspace | -p?* | --package=*) select="$$select $$1" ;; \
+			-p | --package) select="$$select $$1 $${2-}"; shift ;; \
+		esac; \
+		shift; \
+	done; \
+	ignore=$$(python3 -B scripts/coverage/ignore_regex.py); \
+	mkdir -p $(COVERAGE_DIR); \
+	$(CARGO) llvm-cov report $$select --lcov --output-path $(COVERAGE_DIR)/lcov.info --ignore-filename-regex "$$ignore"; \
+	$(CARGO) llvm-cov report $$select --json --summary-only --output-path $(COVERAGE_DIR)/summary.json --ignore-filename-regex "$$ignore"; \
+	python3 -B scripts/coverage/summary.py $(COVERAGE_DIR)/summary.json
 
 test-cargo:
 	$(CARGO) nextest run $(CARGO_TEST_ARGS) --all-targets

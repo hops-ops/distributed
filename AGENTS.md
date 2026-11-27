@@ -58,6 +58,7 @@ of layers and examples is in
 | Target | What it does |
 |---|---|
 | `make test` (alias of `make test-local`) | Starts `compose.yaml`, recreates the test databases, and runs `cargo nextest run --workspace --all-features --all-targets` (one process per test, `.config/nextest.toml`) and then `cargo test --workspace --all-features --doc` against real services with `DISTRIBUTED_REQUIRE_SERVICES` set. The compose stack is torn down afterwards; `KEEP_COMPOSE=1` keeps it. This is what CI's services job runs (with `NEXTEST_PROFILE=ci`). Needs `cargo-nextest`. |
+| `make coverage-local` | `make test-local`'s nextest run under `cargo-llvm-cov`: line coverage of production code per crate and TOTAL, plus `target/coverage/lcov.info` (see `docs/guides/testing.md`, Coverage Reporting). CI runs it on push to `v5` and `main`. Needs `cargo-llvm-cov` and `llvm-tools-preview`. |
 | `make test-cargo` | The same cargo commands without starting compose; set the service URLs yourself. |
 | `make test-cli-lifecycle` | Builds the CLI and runs the bats lifecycle suite (`distributed_cli/tests/bats/lifecycle.bats`). |
 | `make compose-up` / `make compose-down` | Start or stop the services alone. |
@@ -124,8 +125,12 @@ doctests; mark a fragment that cannot compile on its own `rust,ignore`.
 ## CI
 
 `.github/workflows/on-pr-quality.yaml` runs on every pull request. It calls
-the shared quality workflow (build, test, clippy, fmt), then one workflow
+the shared quality workflow (`cargo build` and `cargo test` of the root
+package, default features), then one workflow
 per area: `test-all-features.yaml` (each feature alone, plus the docs path
 check), `integration-services.yaml` (`make test-local`), and
 `integration-{gateway,distributed-cli,observability,graphql,e2e-ui,js,game-demos,celld,wasm32-domains}.yaml`.
+On push to `v5` (this workflow) and `main`
+(`on-push-main-version-and-tag.yaml`), `coverage.yaml` also runs
+`make coverage-local`; release tagging does not wait on it.
 Run the matching local command above before pushing a change in that area.
