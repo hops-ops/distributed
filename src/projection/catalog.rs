@@ -1778,4 +1778,329 @@ mod tests {
 
         assert_ne!(schema, todo_schema("todos"));
     }
+
+    /// Placement rules: topology identities, output pins, binding ids,
+    /// direct eligibility and the decoded-binding field checks.
+    mod placement_validation {
+        use super::*;
+        use crate::projection::placement::{
+            ProjectionBindingId, ProjectionPartitionBinding, ProjectionPlacement,
+        };
+
+        fn direct_error(program: ProjectionProgram) -> ProjectionTopologyError {
+            let descriptor = TestDescriptor(program);
+            ProjectionBinding::materialize_direct(
+                DirectProjectionPlacement::new(&descriptor),
+                ProjectionSourceBinding::try_new("todo-domain", "ordered-domain-events", 1)
+                    .unwrap(),
+                ProjectionOwner::try_new("todo-direct").unwrap(),
+                "distributed-projection-partition",
+                1,
+                vec![ProjectionOutput::try_new("Todos", "todos", todo_schema("todos")).unwrap()],
+                vec![],
+                None,
+            )
+            .unwrap_err()
+        }
+
+        fn constant(value: &str) -> ProjectionAssignment {
+            ProjectionAssignment::Set(ProjectionExpression::constant(ProjectionValue::string(
+                value,
+            )))
+        }
+
+        /// A complete upsert keyed by `key`, whose key expression equals the
+        /// value it sets (`todo_id` is "todo-1", `title` is "t").
+        fn upsert(id: &str, ordinal: u32, key: &str) -> ProjectionOperation {
+            let key_value = if key == "title" { "t" } else { "todo-1" };
+            ProjectionOperation::try_new(
+                id,
+                ordinal,
+                MutationKind::Upsert,
+                ProjectionTarget::try_new("Todos", "todos").unwrap(),
+                vec![ProjectionKeyField::try_new(
+                    0,
+                    key,
+                    ProjectionExpression::constant(ProjectionValue::string(key_value)),
+                )
+                .unwrap()],
+                vec![
+                    ProjectionField::try_new(0, "todo_id", constant("todo-1")).unwrap(),
+                    ProjectionField::try_new(1, "title", constant("t")).unwrap(),
+                ],
+                vec![],
+                vec![],
+            )
+            .unwrap()
+        }
+
+        fn program_of(operations: Vec<ProjectionOperation>) -> ProjectionProgram {
+            let selector = crate::projection::ProjectionEventSelector::try_new(
+                DOMAIN_EVENT_OCCURRENCE_VERSION,
+                "todo.completed",
+                1,
+                DomainEventBodyKind::State,
+                "TodoState",
+                1,
+                "distributed.domain-state:tests::TodoState",
+                FINGERPRINT_A,
+                "distributed-json",
+                1,
+            )
+            .unwrap();
+            let arm = ProjectionArm::try_new("completed", selector, operations).unwrap();
+            ProjectionProgram::try_new("project_todos", 1, ProjectionPartition::Unit, vec![arm])
+                .unwrap()
+        }
+
+        #[test]
+        fn topology_names_reject_each_unportable_shape() {
+            let invalid = ProjectionTopologyError::InvalidName {
+                field: "projection source",
+            };
+            let cases = [
+                (
+                    "empty",
+                    String::new(),
+                    ProjectionTopologyError::Empty {
+                        field: "projection source",
+                    },
+                ),
+                (
+                    "too long",
+                    "a".repeat(129),
+                    ProjectionTopologyError::TooLong {
+                        field: "projection source",
+                        len: 129,
+                        max: 128,
+                    },
+                ),
+                ("whitespace", "todo domain".into(), invalid.clone()),
+                ("control", "todo\u{7}".into(), invalid.clone()),
+                ("url", "https://todo".into(), invalid.clone()),
+                ("credentials", "user@todo".into(), invalid.clone()),
+                ("path", "todo/domain".into(), invalid.clone()),
+                ("windows path", "todo\\domain".into(), invalid.clone()),
+                ("query", "todo?x".into(), invalid.clone()),
+                ("fragment", "todo#x".into(), invalid),
+            ];
+            for (name, value, expected) in cases {
+                assert_eq!(
+                    ProjectionSourceBinding::try_new(value, "codec", 1).unwrap_err(),
+                    expected,
+                    "{name}"
+                );
+            }
+            assert!(ProjectionSourceBinding::try_new("a".repeat(128), "codec", 1).is_ok());
+            assert_eq!(
+                ProjectionSourceBinding::try_new("todo", "codec", 0).unwrap_err(),
+                ProjectionTopologyError::ZeroVersion {
+                    field: "projection source codec version"
+                }
+            );
+            assert_eq!(
+                ProjectionPartitionBinding::try_from_program(
+                    &ProjectionPartition::Unit,
+                    "codec",
+                    0
+                )
+                .unwrap_err(),
+                ProjectionTopologyError::ZeroVersion {
+                    field: "projection partition codec version"
+                }
+            );
+            let partition = ProjectionPartitionBinding::try_from_program(
+                &ProjectionPartition::Unit,
+                "codec",
+                2,
+            )
+            .unwrap();
+            assert_eq!(partition.codec(), "codec");
+            assert_eq!(partition.codec_version(), 2);
+            assert_eq!(
+                partition.expression(),
+                &serde_json::to_value(ProjectionPartition::Unit).unwrap()
+            );
+        }
+
+        #[test]
+        fn an_output_must_name_its_own_schema() {
+            assert_eq!(
+                ProjectionOutput::try_new("Other", "todos", todo_schema("todos")).unwrap_err(),
+                ProjectionTopologyError::ModelSchemaMismatch {
+                    declared: "Other".into(),
+                    schema: "Todos".into(),
+                }
+            );
+            assert_eq!(
+                ProjectionOutput::try_new("Todos", "others", todo_schema("todos")).unwrap_err(),
+                ProjectionTopologyError::StorageSchemaMismatch {
+                    declared: "others".into(),
+                    schema: "todos".into(),
+                }
+            );
+            let mut keyless = todo_schema("todos");
+            keyless.primary_key = PrimaryKey::new(Vec::<String>::new());
+            assert!(matches!(
+                ProjectionOutput::try_new("Todos", "todos", keyless).unwrap_err(),
+                ProjectionTopologyError::InvalidSchema { model, .. } if model == "Todos"
+            ));
+        }
+
+        #[test]
+        fn binding_ids_parse_only_canonical_text() {
+            let id = eventual(
+                &program("project_todos", FINGERPRINT_A),
+                "todo-projector",
+                ProjectionExecutionClass::Causal,
+            )
+            .id();
+            assert_eq!(ProjectionBindingId::parse(&id.to_string()).unwrap(), id);
+            let hex = "ab".repeat(32);
+            for (name, value) in [
+                ("missing prefix", hex.clone()),
+                ("other prefix", format!("pb2:sha256:{hex}")),
+                ("short", format!("pb1:sha256:{}", &hex[..62])),
+                ("long", format!("pb1:sha256:{hex}00")),
+                ("uppercase", format!("pb1:sha256:{}", hex.to_uppercase())),
+                ("non-hex", format!("pb1:sha256:{}", "zz".repeat(32))),
+            ] {
+                assert_eq!(
+                    ProjectionBindingId::parse(&value).unwrap_err(),
+                    ProjectionTopologyError::InvalidBindingId,
+                    "{name}"
+                );
+            }
+            let parsed = ProjectionBindingId::parse(&format!("pb1:sha256:{hex}")).unwrap();
+            assert_eq!(parsed.as_bytes(), &[0xab; 32]);
+        }
+
+        #[test]
+        fn direct_placement_rejects_each_ineligible_program() {
+            let cases = [
+                (
+                    "two operations in one arm",
+                    program_of(vec![
+                        upsert("first", 0, "todo_id"),
+                        upsert("second", 1, "todo_id"),
+                    ]),
+                    "event arm `completed` must resolve exactly one operation",
+                ),
+                (
+                    "another primary key",
+                    program_of(vec![upsert("upsert", 0, "title")]),
+                    "event arm `completed` does not provide the exact registered primary key",
+                ),
+            ];
+            for (name, program, reason) in cases {
+                assert_eq!(
+                    direct_error(program),
+                    ProjectionTopologyError::DirectIneligible {
+                        reason: reason.into()
+                    },
+                    "{name}"
+                );
+            }
+            assert!(
+                ProjectionBinding::materialize_direct(
+                    DirectProjectionPlacement::new(&TestDescriptor(program_of(vec![upsert(
+                        "upsert", 0, "todo_id"
+                    )]))),
+                    ProjectionSourceBinding::try_new("todo-domain", "ordered-domain-events", 1)
+                        .unwrap(),
+                    ProjectionOwner::try_new("todo-direct").unwrap(),
+                    "distributed-projection-partition",
+                    1,
+                    vec![
+                        ProjectionOutput::try_new("Todos", "todos", todo_schema("todos")).unwrap()
+                    ],
+                    vec![],
+                    None,
+                )
+                .is_ok(),
+                "the eligible shape materializes"
+            );
+        }
+
+        #[test]
+        fn a_decoded_binding_is_revalidated_field_by_field() {
+            let binding = eventual(
+                &program("project_todos", FINGERPRINT_A),
+                "todo-projector",
+                ProjectionExecutionClass::Background,
+            );
+            let wire = serde_json::to_value(&binding).unwrap();
+            let decode = |value: serde_json::Value| {
+                serde_json::from_value::<ProjectionBinding>(value)
+                    .unwrap()
+                    .validate()
+            };
+            assert_eq!(decode(wire.clone()), Ok(()));
+            let cases = [
+                (
+                    "identity version",
+                    "identity_version",
+                    serde_json::json!(99),
+                    ProjectionTopologyError::UnsupportedVersion {
+                        field: "projection binding identity",
+                        expected: binding_identity_version(&wire),
+                        actual: 99,
+                    },
+                ),
+                (
+                    "program IR version",
+                    "program_ir_version",
+                    serde_json::json!(0),
+                    ProjectionTopologyError::ZeroVersion {
+                        field: "projection program IR version",
+                    },
+                ),
+                (
+                    "operation semantics version",
+                    "operation_semantics_version",
+                    serde_json::json!(0),
+                    ProjectionTopologyError::ZeroVersion {
+                        field: "projection operation semantics version",
+                    },
+                ),
+                (
+                    "no events",
+                    "events",
+                    serde_json::json!([]),
+                    ProjectionTopologyError::Empty {
+                        field: "projection event inventory",
+                    },
+                ),
+                (
+                    "no outputs",
+                    "outputs",
+                    serde_json::json!([]),
+                    ProjectionTopologyError::Empty {
+                        field: "projection output inventory",
+                    },
+                ),
+                (
+                    "direct background",
+                    "placement",
+                    serde_json::to_value(ProjectionPlacement::Direct).unwrap(),
+                    ProjectionTopologyError::DirectBackground,
+                ),
+                (
+                    "binding id of other fields",
+                    "binding_id",
+                    serde_json::json!(format!("pb1:sha256:{}", "0".repeat(64))),
+                    ProjectionTopologyError::BindingIdMismatch,
+                ),
+            ];
+            for (name, field, value, expected) in cases {
+                let mut tampered = wire.clone();
+                tampered[field] = value;
+                assert_eq!(decode(tampered), Err(expected), "{name}");
+            }
+        }
+
+        fn binding_identity_version(wire: &serde_json::Value) -> u16 {
+            u16::try_from(wire["identity_version"].as_u64().unwrap()).unwrap()
+        }
+    }
 }
