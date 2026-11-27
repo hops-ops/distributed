@@ -81,3 +81,15 @@ binary_id(distributed)
   | test(=sqlx_repo::projection_protocol::postgres_tests::postgres_redelivery_identity_is_atomic_across_partition_and_cursor_races))
 '''
 test-group = "postgres-projection-views"
+
+# `make test-footprints` (scripts/test-footprints): one instrumented process
+# per test. It inherits the default profile's overrides, so the test groups
+# above stay in force; instrumented binaries run slower, so slow tests get
+# more time before they are killed.
+[profile.footprints]
+fail-fast = false
+slow-timeout = { period = "120s", terminate-after = 5 }
+
+[profile.footprints.junit]
+# Written to target/nextest/footprints/junit.xml.
+path = "junit.xml"

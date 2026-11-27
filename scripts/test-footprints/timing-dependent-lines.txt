@@ -1,0 +1,82 @@
+# Production lines whose coverage differs between two runs of the same
+# commit (timing, retries, scheduling). `make test-footprints-diff` does not
+# fail when one of these is lost. One entry per line: `path:line`, a tab, and
+# the line's text. An entry matches only while the baseline's source holds
+# that text at that line; when the code moves, the diff reports the line
+# again and the entry needs updating. Add a line only with the evidence that
+# it flaps (two runs of one commit that disagree on it).
+#
+# Measured 2026-11-26 at b4d6a7db and f2b3e12e: five full runs, load average 17 to 59 on
+# 18 cores. Each line below was covered in some runs and not in others while
+# every test reaching it passed. Lines a run lost only because a test failed
+# are not listed: the diff warns about failed tests instead.
+
+# a process readiness probe times out only on a slow machine
+distributed_cli/src/lifecycle/dev.rs:1139	}
+distributed_cli/src/lifecycle/dev.rs:1176	return Err(readiness_timeout(name, probe.timeout_ms));
+
+# the host drops a slow bot client (below) and its membership
+distributed_game/src/host/membership.rs:358	return;
+
+# a slow bot client is dropped when its outbound queue fills
+distributed_game/src/net/zone_task.rs:818	let out = conns.remove(&client).expect("present");
+distributed_game/src/net/zone_task.rs:819	let _ = out.try_send(ConnOut::Close);
+distributed_game/src/net/zone_task.rs:820	host.disconnect(client, false);
+
+# the consumer has not joined its group within the fetch timeout
+src/bus/kafka.rs:209	fn joined(&self) -> bool {
+src/bus/kafka.rs:210	self.0
+src/bus/kafka.rs:211	.lock()
+src/bus/kafka.rs:212	.unwrap_or_else(PoisonError::into_inner)
+src/bus/kafka.rs:213	.is_some()
+src/bus/kafka.rs:214	}
+src/bus/kafka.rs:378	if !self.progress.joined() {
+src/bus/kafka.rs:379	tracing::warn!(
+src/bus/kafka.rs:383	}
+src/bus/kafka.rs:384	self.consecutive_errors = 0;
+src/bus/kafka.rs:385	return Ok(None);
+
+# the RabbitMQ consumer sleeps a poll interval only when no message is ready
+src/bus/rabbitmq.rs:204	async fn ready(&mut self) {
+src/bus/rabbitmq.rs:205	tokio::time::sleep(POLL_INTERVAL).await
+src/bus/rabbitmq.rs:206	}
+
+# the SQL bus consumer sleeps a poll interval only when it finds no row ready
+src/bus/sql_bus_common.rs:1339	async fn ready(&mut self) {
+src/bus/sql_bus_common.rs:1340	tokio::time::sleep(self.poll_interval).await
+src/bus/sql_bus_common.rs:1341	}
+
+# group lease renewal runs only when a SQL bus test outlives the renewal
+# interval (covered in the run at load 59 only)
+src/bus/sql_bus_common.rs:788	async fn renew_group_lease(
+src/bus/sql_bus_common.rs:789	pool: &Pool<Self>,
+src/bus/sql_bus_common.rs:790	consumer: &str,
+src/bus/sql_bus_common.rs:791	holder: &str,
+src/bus/sql_bus_common.rs:792	lease_secs: f64,
+src/bus/sql_bus_common.rs:793	) -> Result<bool, TransportError> {
+src/bus/sql_bus_common.rs:794	let mut query = QueryBuilder::<DB>::new("UPDATE bus_consumer_lease SET locked_until = ");
+src/bus/sql_bus_common.rs:795	DB::push_clock_plus(&mut query, lease_secs);
+src/bus/sql_bus_common.rs:796	query
+src/bus/sql_bus_common.rs:797	.push(" WHERE consumer = ")
+src/bus/sql_bus_common.rs:798	.push_bind(consumer.to_string());
+src/bus/sql_bus_common.rs:799	query.push(" AND holder = ").push_bind(holder.to_string());
+src/bus/sql_bus_common.rs:800	query.push(" RETURNING holder");
+src/bus/sql_bus_common.rs:801	let renewed = query
+src/bus/sql_bus_common.rs:802	.build()
+src/bus/sql_bus_common.rs:803	.fetch_optional(pool)
+src/bus/sql_bus_common.rs:804	.await
+src/bus/sql_bus_common.rs:806	Ok(renewed.is_some())
+src/bus/sql_bus_common.rs:807	}
+src/bus/sql_bus_common.rs:1498	move || {
+src/bus/sql_bus_common.rs:1499	let (pool, consumer, holder) = (pool.clone(), consumer.clone(), holder.clone());
+src/bus/sql_bus_common.rs:1500	async move {
+src/bus/sql_bus_common.rs:1501	DB::renew_group_lease(&pool, &consumer, &holder, lease.as_secs_f64()).await
+src/bus/sql_bus_common.rs:1502	}
+src/bus/sql_bus_common.rs:1503	},
+
+# a SQL bus read fails while a distributed_game::zone_status test runs
+# (covered in one run of five, every test passing)
+src/bus/runner/receive_loop.rs:137	Either::Left((Err(error), _)) => return Err(recv_error(error)),
+src/bus/sql_bus_common.rs:133	TransportErrorKind::Permanent
+src/bus/sql_bus_common.rs:717	.map_err(|err| db_err::<DB>("take group lease", err))?
+src/bus/sql_bus_common.rs:745	.map_err(|err| db_err::<DB>("commit log read", err))?;

@@ -334,3 +334,92 @@ cargo llvm-cov --all-features --lcov --output-path lcov.info
 
 On push to `main`, CI (`.github/workflows/rust.yml`) publishes `lcov.info` as a
 workflow artifact and attempts an optional Codecov upload.
+
+## Per-test coverage footprints
+
+`make test-footprints` records which production lines each test executes. Use
+it before deleting or merging tests (no covered line may be lost), to find
+tests whose lines another test already covers, and to find uncovered code.
+It is a local tool, not part of CI. The scripts are in
+[`scripts/test-footprints/`](../../scripts/test-footprints/).
+
+```bash
+make compose-up                    # the services make test-local uses
+make test-footprints               # every test, one instrumented process each
+                                   #   -> target/test-footprints/
+cp -R target/test-footprints target/test-footprints-base   # keep a baseline
+# ... change tests ...
+make test-footprints
+make test-footprints-diff BASE=target/test-footprints-base
+```
+
+It needs `cargo-nextest`, `cargo-llvm-cov` and `rustup component add
+llvm-tools-preview`, and on macOS a bash outside the system paths
+(`brew install bash`; see `scripts/test-footprints/runner.sh` for why).
+The target recreates the test databases and exports the service variables as
+`make test-local` does, builds instrumented into `target/llvm-cov-target`
+(the normal `target/` build stays warm), and runs nextest's `footprints`
+profile (`.config/nextest.toml`), which keeps the test groups. A failing test
+does not stop the run; it is listed in `summary.txt`. The make target fails
+only when the tooling does.
+
+Each run replaces `target/test-footprints/`, so copy a baseline aside before
+the next run. `ARGS="..."` passes arguments to nextest; such a partial run
+must name its own output directory with `OUT=`, and never writes over the
+full run:
+
+```bash
+make test-footprints ARGS="-p distributed_macros" OUT=target/footprints-macros
+make test-footprints ARGS="-p distributed_cli --run-ignored all" OUT=target/footprints-cli-all
+```
+
+`--run-ignored all` runs the live tests of the selected packages too, so
+select packages whose ignored tests can run here (see
+[Live tests and services](#live-tests-and-services)).
+
+Outputs, in the output directory:
+
+| File | Contents |
+|---|---|
+| `summary.txt` | commit, tests listed / run / failed / without coverage, production line coverage by crate and module, the unit/integration layer split, minimal cover sizes, overlap counts, failed tests, wall time |
+| `per_test.csv` | `binary`, `test`, `group`, `layer`, `production_lines`, `unique_lines` (lines no other test reaches), `single_containing_test` (the smallest test whose lines include all of this one's), `in_minimal_cover`, `seconds`, `footprint_hash`, `status` (`passed`, `failed`, or `no-coverage` when the test left no profile, for example when it was killed) |
+| `lines/` | one file per test, `<binary>__<test>.txt` (`/` written `%2F`), its production lines as sorted `path:line` |
+| `identical_groups.txt` | tests with the same non-empty footprint, one group per line: the line count, then each test (`<binary> <test>`), tab-separated |
+| `cross_binary_pairs.csv` | `test`, `containing_test`: a test whose lines all lie inside one test of another binary |
+| `covered_lines.txt` | every covered production line, `path:line` |
+| `uncovered_by_file.csv` | `file`, `lines`, `covered`, most uncovered first |
+| `uncovered_ranges.txt` | `path:start-end` for each run of uncovered production lines |
+| `sources.tar.gz` | the production sources measured, which the diff uses to follow lines that moved |
+
+Production lines exclude test files (`tests/`, `benches/`, `tests.rs`,
+`*_test(s).rs`, `test_*.rs`), modules declared under a test-only cfg
+(`#[cfg(test)] mod x;`), and items under one (`#[cfg(test)] mod tests { .. }`).
+Examples are reported apart. The rules are
+[`classify.py`](../../scripts/test-footprints/classify.py), tested by
+`python3 -m unittest discover -s scripts/test-footprints`.
+
+`make test-footprints-diff BASE=<dir> [OUT=<dir>]` prints the production
+lines covered in `BASE` and not now, with the tests that covered each before,
+the tests added and removed, and the change in total coverage. It exits
+non-zero when a covered line was lost. Lines that moved because a file was
+edited are compared at their new number; lines whose text changed are listed
+apart and do not fail the diff.
+
+Two runs of one commit do not cover exactly the same lines: timeouts, slow
+consumers and lease renewals run only on a slow or loaded machine. Lines seen
+to flap are listed with their text in
+`scripts/test-footprints/timing-dependent-lines.txt`; the diff reports them
+but does not fail on them. An entry matches only while the baseline holds
+that text at that line, so when the code moves the line is reported again and
+the entry needs updating. More runs keep finding a few more such lines; a
+lost line none of whose covering tests was removed is marked in the output as
+possibly timing-dependent, and is added to the list only after two runs of
+one commit disagree on it. A test that fails in either run loses the lines only
+it reaches: the diff names such tests in a warning, and the comparison is only
+meaningful between two runs without failures.
+
+What a footprint cannot show: what a test asserts (two tests with the same
+lines can check different things), code a macro expands into the test crate,
+and third-party code. Proc-macro crates run at compile time, so their
+footprints understate them. Per-test seconds include process start and
+instrumentation and are only comparable with each other.
