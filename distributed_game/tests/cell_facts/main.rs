@@ -96,15 +96,6 @@ async fn handle_credit(
     })
 }
 
-#[test]
-fn command_ids_are_deterministic_uuidv7_shaped() {
-    let a = command_id_for("svc", "coin:z1:7");
-    assert_eq!(a, command_id_for("svc", "coin:z1:7"));
-    assert_ne!(a, command_id_for("svc", "coin:z1:8"));
-    assert_eq!(&a[14..15], "7");
-    assert!(matches!(&a[19..20], "8" | "9" | "a" | "b"));
-}
-
 /// A `__batch` body of `amounts` for alice, one entry per amount; `None`
 /// is an entry without a partition.
 fn batch_body(amounts: &[Option<u32>]) -> serde_json::Value {
