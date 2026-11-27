@@ -351,7 +351,8 @@ mod postgres {
 /// `false` capability leaves out the cases that need it. `queued: true`
 /// states that `$backend`'s repository is a [`QueuedRepository`], whose
 /// locking reads serialize racers instead of letting them conflict, so it
-/// runs the queued cases in place of the optimistic race.
+/// runs the queued cases in place of the optimistic race and of the raw
+/// stream cases that hold two loads of one stream at once.
 ///
 /// ```ignore
 /// common::repository_conformance_tests!(common::repository::Sqlite, sql_faults: true, durable: true, queued: false);
@@ -460,6 +461,21 @@ macro_rules! repository_conformance_tests {
             #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
             racing_commits_one_wins_one_conflicts(b) =>
                 $crate::repository::scenario::racing_commits_one_wins_one_conflicts(b.repository(), 8);
+            #[tokio::test]
+            load_modify_commit_cycles_append_to_the_stream(b) =>
+                $crate::repository::storage::load_modify_commit_cycles_append_to_the_stream(b.repository());
+            #[tokio::test]
+            an_empty_commit_leaves_the_stream_unchanged(b) =>
+                $crate::repository::storage::an_empty_commit_leaves_the_stream_unchanged(b.repository());
+            #[tokio::test]
+            commit_and_load_track_the_committed_version(b) =>
+                $crate::repository::storage::commit_and_load_track_the_committed_version(b.repository());
+            #[tokio::test]
+            a_stale_commit_reports_the_stream_and_both_versions(b) =>
+                $crate::repository::storage::a_stale_commit_reports_the_stream_and_both_versions(b.repository());
+            #[tokio::test]
+            a_conflict_in_one_stream_rolls_back_the_whole_batch(b) =>
+                $crate::repository::storage::a_conflict_in_one_stream_rolls_back_the_whole_batch(b.repository());
         }
         $crate::conformance_cases! { @if $queued $crate::repository::RepositoryBackend, $backend, open;
             #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

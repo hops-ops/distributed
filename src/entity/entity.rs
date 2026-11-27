@@ -638,6 +638,19 @@ mod tests {
     }
 
     #[test]
+    fn digest_adds_events_with_correct_sequences() {
+        let mut entity = Entity::with_id("e1");
+        entity.digest("initialized", &"data1").unwrap();
+        entity.digest("updated", &"data2").unwrap();
+        entity.digest("updated", &"data3").unwrap();
+
+        assert_eq!(entity.events().len(), 3);
+        assert_eq!(entity.events()[0].sequence, 1);
+        assert_eq!(entity.events()[1].sequence, 2);
+        assert_eq!(entity.events()[2].sequence, 3);
+    }
+
+    #[test]
     fn digest_returns_serialization_errors_without_mutating_entity() {
         let mut entity = Entity::new();
 
