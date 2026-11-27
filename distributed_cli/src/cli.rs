@@ -2028,12 +2028,17 @@ pub(crate) fn resolve_distributed_path(
         return validate_distributed_path(Path::new(&path));
     }
 
-    let mut roots = Vec::new();
-    roots.extend(anchor.ancestors().map(Path::to_path_buf));
-    roots.extend(std::env::current_dir()?.ancestors().map(Path::to_path_buf));
+    let current = std::env::current_dir()?;
+    find_distributed_crate(anchor.ancestors().chain(current.ancestors()))
+}
 
+/// The first `root` or `root/distributed` holding the `distributed` crate,
+/// searching `roots` in order.
+fn find_distributed_crate<'a>(
+    roots: impl IntoIterator<Item = &'a Path>,
+) -> Result<PathBuf, Box<dyn Error>> {
     for root in roots {
-        for candidate in [root.clone(), root.join("distributed")] {
+        for candidate in [root.to_path_buf(), root.join("distributed")] {
             if candidate.join("Cargo.toml").exists()
                 && cargo_toml_package_name(&candidate.join("Cargo.toml")).as_deref()
                     == Some("distributed")
