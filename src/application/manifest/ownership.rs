@@ -106,44 +106,10 @@ pub(super) fn validate_manifest_ownership(manifest: &ApplicationManifest) -> App
         .iter()
         .map(|model| (model.id.as_str(), model))
         .collect::<std::collections::BTreeMap<_, _>>();
-    let projections = manifest
-        .projections
-        .iter()
-        .map(|projection| (projection.id.as_str(), projection))
-        .collect::<std::collections::BTreeMap<_, _>>();
+    // Every surface model and projection is already inside the closed
+    // inventories checked above: models dedup to one declaration per id or
+    // collide, projection ids are unique. No per-surface comparison remains.
     for surface in &manifest.surfaces {
-        for exposed in &surface.contract.models {
-            let Some(authoritative) = models.get(exposed.id.as_str()) else {
-                return Err(ApplicationError::Missing {
-                    kind: "model",
-                    identity: exposed.id.clone(),
-                });
-            };
-            if *authoritative != exposed {
-                return Err(ApplicationError::Collision {
-                    kind: "model",
-                    identity: exposed.id.clone(),
-                    reason: "surface model differs from the application model declaration".into(),
-                });
-            }
-        }
-        for exposed in &surface.contract.projections {
-            let Some(authoritative) = projections.get(exposed.id.as_str()) else {
-                return Err(ApplicationError::Missing {
-                    kind: "projection",
-                    identity: exposed.id.clone(),
-                });
-            };
-            if *authoritative != exposed {
-                return Err(ApplicationError::Collision {
-                    kind: "projection",
-                    identity: exposed.id.clone(),
-                    reason:
-                        "surface projection differs from the application projection declaration"
-                            .into(),
-                });
-            }
-        }
         let expected_command_ids = surface_command_closure(surface, &manifest.commands)?;
         let actual_command_ids = surface
             .contract
