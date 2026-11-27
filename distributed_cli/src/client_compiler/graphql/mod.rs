@@ -27,6 +27,8 @@ mod operation;
 mod query_plan;
 mod types;
 mod validation;
+#[cfg(test)]
+mod validation_tests;
 mod variables;
 mod window;
 
