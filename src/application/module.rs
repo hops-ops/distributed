@@ -123,8 +123,6 @@ pub struct ProjectionSpec {
     pub modeled: Vec<serde_json::Value>,
     #[serde(default)]
     pub partition: serde_json::Value,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub catalog_fingerprint: Option<String>,
     pub fingerprint: String,
 }
 
@@ -144,7 +142,6 @@ impl ProjectionSpec {
             modeled_programs: Vec::new(),
             modeled: Vec::new(),
             partition: serde_json::Value::Null,
-            catalog_fingerprint: None,
             fingerprint: String::new(),
         };
         spec.canonicalize();
@@ -179,25 +176,9 @@ impl ProjectionSpec {
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(ApplicationError::InvalidSpec)?,
             partition: serde_json::to_value(&owner.partition)?,
-            catalog_fingerprint: None,
             fingerprint: String::new(),
         };
         spec.canonicalize();
-        spec.refresh_fingerprint()?;
-        Ok(spec)
-    }
-
-    /// Reference an existing canonical projection catalog without copying
-    /// executable routes or handler values into the module artifact.
-    pub fn from_catalog(
-        id: impl Into<String>,
-        catalog: &crate::projection::catalog::ProjectionCatalog,
-    ) -> ApplicationResult<Self> {
-        let bytes = catalog
-            .canonical_bytes()
-            .map_err(|error| ApplicationError::Canonical(error.to_string()))?;
-        let mut spec = Self::try_new(id, Vec::<String>::new(), Vec::<String>::new())?;
-        spec.catalog_fingerprint = Some(sha256_fingerprint(&bytes));
         spec.refresh_fingerprint()?;
         Ok(spec)
     }

@@ -396,9 +396,6 @@ pub(super) fn validate_projection(
             reason: "modeled projection program identities are stale or incomplete".into(),
         });
     }
-    if let Some(catalog) = &projection.catalog_fingerprint {
-        validate_sha256_text("projection catalog fingerprint", catalog)?;
-    }
     for dependency in &projection.dependencies {
         if let Some(identity) = dependency.strip_prefix("projection:") {
             LogicalId::try_new("projection", identity.to_owned())?;
