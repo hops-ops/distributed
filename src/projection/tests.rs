@@ -1647,3 +1647,177 @@ fn resolved_plans_match_the_shared_fixture() -> Result<(), Box<dyn Error>> {
     }
     Ok(())
 }
+
+/// Expression resolution over one occurrence: every envelope field, and the
+/// composite expressions' value, absence and rejection rules.
+mod expression_resolution {
+    use super::*;
+
+    fn resolve(
+        expression: &ProjectionExpression,
+        occurrence: &DomainEventOccurrence,
+        body: &Value,
+    ) -> Result<ResolvedProjectionValue, ProjectionProgramError> {
+        expression.resolve(occurrence, body)
+    }
+
+    fn value(value: ProjectionValue) -> ResolvedProjectionValue {
+        ResolvedProjectionValue::Value(value)
+    }
+
+    fn fixture() -> Result<(DomainEventOccurrence, Value), Box<dyn Error>> {
+        let body = json!({"title": "write tests", "nested": {"title": "inner"}});
+        let occurrence = occurrence(
+            descriptor(
+                "todo.renamed",
+                DomainEventBodyKind::Event,
+                "TodoRenamed",
+                PATCH_FP,
+            ),
+            &body,
+        )?;
+        Ok((occurrence, body))
+    }
+
+    #[test]
+    fn every_envelope_field_resolves_from_the_occurrence() -> Result<(), Box<dyn Error>> {
+        use ProjectionEnvelopeField as F;
+        let (occurrence, body) = fixture()?;
+        let string = |text: &str| ProjectionValue::string(text);
+        let cases = [
+            (
+                F::OccurrenceVersion,
+                ProjectionValue::unsigned(occurrence.occurrence_version().into()),
+            ),
+            (F::OccurrenceId, string(occurrence.id())),
+            (F::EventName, string("todo.renamed")),
+            (F::EventVersion, ProjectionValue::unsigned(1)),
+            (F::BodyFingerprint, string(PATCH_FP)),
+            (F::BodyKind, string("event")),
+            (F::BodyTypeName, string("TodoRenamed")),
+            (F::BodyVersion, ProjectionValue::unsigned(1)),
+            (
+                F::BodySchema,
+                string("urn:distributed:test:projection-body:v1"),
+            ),
+            (F::BodyCodec, string(DOMAIN_EVENT_BODY_CODEC)),
+            (
+                F::BodyCodecVersion,
+                ProjectionValue::unsigned(DOMAIN_EVENT_BODY_CODEC_VERSION.into()),
+            ),
+            (F::AggregateType, string("todo")),
+            (F::AggregateId, string("todo-001")),
+            (F::AggregateSequence, ProjectionValue::unsigned(7)),
+            (F::PublicationOrdinal, ProjectionValue::unsigned(2)),
+        ];
+        for (field, expected) in cases {
+            assert_eq!(
+                resolve(&ProjectionExpression::envelope(field), &occurrence, &body)?,
+                value(expected),
+                "{field:?}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn composite_expressions_resolve_or_propagate_absence() -> Result<(), Box<dyn Error>> {
+        let (occurrence, body) = fixture()?;
+        let title = || body_path(&["title"]);
+        let missing = || body_path(&["missing"]);
+        let constant = |text: &str| ProjectionExpression::constant(ProjectionValue::string(text));
+        let concat = |arguments| {
+            ProjectionExpression::transform(ProjectionScalarTransform::StringConcat, arguments)
+        };
+        let first = |arguments| {
+            ProjectionExpression::transform(ProjectionScalarTransform::FirstPresent, arguments)
+        };
+        let null = || ProjectionExpression::constant(ProjectionValue::null());
+        let absent = ResolvedProjectionValue::Absent;
+        let cases = [
+            (
+                "list",
+                ProjectionExpression::list(vec![title()?, constant("x")])?,
+                value(ProjectionValue::try_from_json(json!(["write tests", "x"]))?),
+            ),
+            (
+                "list with an absent element",
+                ProjectionExpression::list(vec![title()?, missing()?])?,
+                absent.clone(),
+            ),
+            (
+                "object",
+                ProjectionExpression::object([("b", constant("x")), ("a", title()?)])?,
+                value(ProjectionValue::try_from_json(
+                    json!({"a": "write tests", "b": "x"}),
+                )?),
+            ),
+            (
+                "object with an absent field",
+                ProjectionExpression::object([("a", missing()?)])?,
+                absent.clone(),
+            ),
+            (
+                "enum",
+                ProjectionExpression::enum_variant("Status", "Open")?,
+                value(ProjectionValue::enum_variant("Status", "Open")),
+            ),
+            (
+                "nested body path",
+                body_path(&["nested", "title"])?,
+                value(ProjectionValue::string("inner")),
+            ),
+            (
+                "path through a scalar",
+                body_path(&["title", "inner"])?,
+                absent.clone(),
+            ),
+            (
+                "string concat",
+                concat(vec![constant("todo:"), title()?])?,
+                value(ProjectionValue::string("todo:write tests")),
+            ),
+            (
+                "string concat with an absent argument",
+                concat(vec![constant("todo:"), missing()?])?,
+                absent.clone(),
+            ),
+            (
+                "first present skips absence",
+                first(vec![missing()?, title()?])?,
+                value(ProjectionValue::string("write tests")),
+            ),
+            (
+                "explicit null is present",
+                first(vec![null(), title()?])?,
+                value(ProjectionValue::null()),
+            ),
+            ("nothing present", first(vec![missing()?])?, absent),
+        ];
+        for (name, expression, expected) in cases {
+            assert_eq!(
+                resolve(&expression, &occurrence, &body)?,
+                expected,
+                "{name}"
+            );
+        }
+        assert!(matches!(
+            resolve(
+                &concat(vec![
+                    constant("n"),
+                    ProjectionExpression::constant(ProjectionValue::unsigned(1)),
+                ])?,
+                &occurrence,
+                &body,
+            ),
+            Err(ProjectionProgramError::InvalidOperation { reason, .. })
+                if reason == "all arguments must resolve to strings"
+        ));
+        assert!(matches!(
+            first(Vec::new()),
+            Err(ProjectionProgramError::InvalidOperation { reason, .. })
+                if reason == "scalar transforms require at least one argument"
+        ));
+        Ok(())
+    }
+}
