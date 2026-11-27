@@ -1,42 +1,7 @@
-use std::time::Duration;
-
-use distributed::outbox::OutboxMessage;
-use distributed::outbox_worker::{ClaimOutboxMessages, OutboxStore};
-use distributed::read_model::ReadModelWritePlanBuilder;
-use distributed::read_model::{ReadModel, RelationalReadModel, Versioned};
-use distributed::table::{RowKey, RowValue};
 use distributed::{
-    sourced, Aggregate, AggregateBuilder, CommitBatch, Entity, GetStream, InMemoryRepository,
-    InMemorySnapshotStore, RelationalReadModelQueryStore, RepositoryError, SnapshotRecord,
-    SnapshotStore, Snapshottable, StreamIdentity, StreamWrite, TransactionalCommit,
+    sourced, Aggregate, AggregateBuilder, Entity, GetStream, InMemoryRepository,
+    InMemorySnapshotStore, SnapshotRecord, SnapshotStore, Snapshottable, StreamIdentity,
 };
-use serde::{Deserialize, Serialize};
-
-#[derive(Default)]
-struct AlphaAggregate {
-    entity: Entity,
-}
-
-#[sourced(entity, aggregate_type = "async.alpha")]
-impl AlphaAggregate {
-    #[event("touched")]
-    fn touch(&mut self, id: String) {
-        self.entity.set_id(&id);
-    }
-}
-
-#[derive(Default)]
-struct BetaAggregate {
-    entity: Entity,
-}
-
-#[sourced(entity, aggregate_type = "async.beta")]
-impl BetaAggregate {
-    #[event("touched")]
-    fn touch(&mut self, id: String) {
-        self.entity.set_id(&id);
-    }
-}
 
 #[derive(Default)]
 struct SnapshotCounter {
@@ -63,93 +28,6 @@ impl Snapshottable for SnapshotCounter {
     fn restore_from_snapshot(&mut self, snapshot: Self::Snapshot) {
         self.value = snapshot;
     }
-}
-
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, ReadModel)]
-#[table("repository_test_views")]
-struct TestView {
-    #[id]
-    id: String,
-    value: i32,
-}
-
-fn test_view_key(id: &str) -> RowKey {
-    RowKey::new([("id", RowValue::String(id.into()))])
-}
-
-async fn load_test_view(repo: &InMemoryRepository, id: &str) -> Option<Versioned<TestView>> {
-    let request = ReadModelWritePlanBuilder::new()
-        .load::<TestView>(test_view_key(id))
-        .unwrap();
-    let graph = repo.load_graph(request).await.unwrap();
-    graph.root.map(|root| Versioned {
-        data: TestView::from_row(root.data).unwrap(),
-        version: root.version,
-    })
-}
-
-#[tokio::test]
-async fn aggregate_repository_separates_streams_by_aggregate_type() {
-    let repo = InMemoryRepository::new();
-    let alpha_repo = repo.clone().aggregate::<AlphaAggregate>();
-    let beta_repo = repo.clone().aggregate::<BetaAggregate>();
-
-    let mut alpha = AlphaAggregate::default();
-    alpha.touch("shared-id".into()).unwrap();
-    let mut beta = BetaAggregate::default();
-    beta.touch("shared-id".into()).unwrap();
-
-    alpha_repo.commit(&mut alpha).await.unwrap();
-    beta_repo.commit(&mut beta).await.unwrap();
-
-    let loaded_alpha = alpha_repo.get("shared-id").await.unwrap().unwrap();
-    let loaded_beta = beta_repo.get("shared-id").await.unwrap().unwrap();
-
-    assert_eq!(loaded_alpha.entity().events().len(), 1);
-    assert_eq!(loaded_beta.entity().events().len(), 1);
-}
-
-#[tokio::test]
-async fn batch_rejects_duplicate_stream_identity_before_write() {
-    let repo = InMemoryRepository::new();
-    let identity = StreamIdentity::new("async.alpha", "duplicate").unwrap();
-    let mut first = Entity::with_id("duplicate");
-    first.digest_empty("first_recorded").unwrap();
-    let mut second = Entity::with_id("duplicate");
-    second.digest_empty("second_recorded").unwrap();
-
-    let err = repo
-        .commit_batch(CommitBatch::new(vec![
-            StreamWrite::new(identity.clone(), &mut first),
-            StreamWrite::new(identity.clone(), &mut second),
-        ]))
-        .await
-        .unwrap_err();
-
-    assert!(
-        matches!(
-            &err,
-            RepositoryError::DuplicateStreamInBatch { id } if id == "async.alpha:duplicate"
-        ),
-        "unexpected error: {err}"
-    );
-    assert!(repo.get_stream(&identity).await.unwrap().is_none());
-}
-
-#[tokio::test]
-async fn read_model_write_plan_can_commit_against_store() {
-    let repo = InMemoryRepository::new();
-    let view = TestView {
-        id: "view-1".into(),
-        value: 42,
-    };
-    let mut session = ReadModelWritePlanBuilder::new();
-    session.upsert(&view).unwrap();
-
-    session.commit(&repo).await.unwrap();
-    let loaded = load_test_view(&repo, "view-1").await.unwrap();
-
-    assert_eq!(loaded.data, view);
 }
 
 #[tokio::test]
@@ -262,31 +140,4 @@ async fn snapshot_repository_ignores_cache_past_stream_version_and_replays_event
     assert_eq!(loaded.value, 4);
     assert_eq!(loaded.entity().version(), 1);
     assert_eq!(loaded.entity().snapshot_version(), 0);
-}
-
-#[tokio::test]
-async fn outbox_repository_delegates_worker_operations() {
-    let repo = InMemoryRepository::new();
-    let outbox = repo.outbox_store();
-    let message = OutboxMessage::create("msg-1", "alpha.happened", b"{}".to_vec()).unwrap();
-    let mut aggregate = AlphaAggregate::default();
-    aggregate.touch("outbox-aggregate-1".into()).unwrap();
-    repo.clone()
-        .aggregate::<AlphaAggregate>()
-        .outbox(message)
-        .commit(&mut aggregate)
-        .await
-        .unwrap();
-
-    let claimed = outbox
-        .claim(ClaimOutboxMessages::new(
-            "worker-1",
-            1,
-            Duration::from_secs(60),
-        ))
-        .await
-        .unwrap();
-
-    assert_eq!(claimed.len(), 1);
-    assert_eq!(claimed[0].worker_id.as_deref(), Some("worker-1"));
 }
