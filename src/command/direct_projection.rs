@@ -567,3 +567,511 @@ impl ProjectorTopologyIdentity {
         }))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::read_model::RelationalReadModel;
+    use crate::table::{DeleteTableRowMutation, ExpectedVersion, RowWriteMode, TableRowMutation};
+    use serde::{Deserialize, Serialize};
+    use serde_json::{json, Value};
+
+    #[derive(Clone, Serialize, Deserialize, crate::read_model::ReadModel)]
+    #[readmodel(table = "direct_boards", primary_key = ["id"])]
+    struct DirectBoard {
+        #[readmodel(id)]
+        id: String,
+        title: String,
+    }
+
+    #[derive(Clone, Serialize, Deserialize, crate::read_model::ReadModel)]
+    #[readmodel(table = "direct_cards", primary_key = ["id"])]
+    struct DirectCard {
+        #[readmodel(id)]
+        id: String,
+    }
+
+    const PROGRAM_A: &str =
+        "pp1:sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const PROGRAM_B: &str =
+        "pp1:sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+    fn program(id: &str) -> ProjectionProgramId {
+        ProjectionProgramId::parse(id).unwrap()
+    }
+
+    fn topology() -> ProjectorTopologyId {
+        ProjectorTopologyId::new(1, "boards", [0x21; 32]).unwrap()
+    }
+
+    fn board_model(partition: Option<EffectExpression>) -> CommandProjectedModel {
+        let mut model =
+            CommandProjectedModel::new(TypeId::of::<DirectBoard>(), DirectBoard::schema());
+        model.partition = partition;
+        model
+    }
+
+    fn target(
+        partition: Option<EffectExpression>,
+        protocol_topology: Option<ProjectorTopologyId>,
+        program_id: Option<ProjectionProgramId>,
+    ) -> CommandDirectProjectionTarget {
+        board_model(partition).bind(
+            "boards",
+            &["board.created".to_string()],
+            &["DirectBoard".to_string()],
+            &ProjectionPartitionSpec::Unit,
+            vec![ProjectionModelOwnership::new("DirectBoard", "direct_boards").unwrap()],
+            protocol_topology,
+            program_id,
+        )
+    }
+
+    fn input(path: &[&str]) -> EffectExpression {
+        EffectExpression::Input {
+            path: path.iter().map(|segment| segment.to_string()).collect(),
+        }
+    }
+
+    fn session(entries: &[(&str, &str)]) -> Session {
+        let mut session = Session::new();
+        for (key, value) in entries {
+            session.set(*key, *value);
+        }
+        session
+    }
+
+    fn upsert<M: RelationalReadModel>(model: &M) -> TableMutation {
+        TableMutation::UpsertRow(TableRowMutation {
+            schema: M::schema(),
+            key: model.primary_key().unwrap(),
+            values: model.to_row().unwrap(),
+            expected_version: ExpectedVersion::Any,
+            mode: RowWriteMode::Upsert,
+        })
+    }
+
+    fn board() -> DirectBoard {
+        DirectBoard {
+            id: "b1".into(),
+            title: "Roadmap".into(),
+        }
+    }
+
+    #[test]
+    fn trusted_presets_resolve_only_canonical_values_of_the_expected_scalar() {
+        struct Case {
+            name: &'static str,
+            scalar: &'static str,
+            raw: &'static str,
+            expected: Option<Value>,
+        }
+        let cases = [
+            Case {
+                name: "id",
+                scalar: "ID",
+                raw: "u-1",
+                expected: Some(json!("u-1")),
+            },
+            Case {
+                name: "string",
+                scalar: "String",
+                raw: "x",
+                expected: Some(json!("x")),
+            },
+            Case {
+                name: "timestamp is carried verbatim",
+                scalar: "Timestamptz",
+                raw: "2026-01-01T00:00:00Z",
+                expected: Some(json!("2026-01-01T00:00:00Z")),
+            },
+            Case {
+                name: "canonical base64",
+                scalar: "Bytea",
+                raw: "aGk=",
+                expected: Some(json!("aGk=")),
+            },
+            Case {
+                name: "unpadded base64",
+                scalar: "Bytea",
+                raw: "aGk",
+                expected: None,
+            },
+            Case {
+                name: "not base64",
+                scalar: "Bytea",
+                raw: "!!",
+                expected: None,
+            },
+            Case {
+                name: "true",
+                scalar: "Boolean",
+                raw: "true",
+                expected: Some(json!(true)),
+            },
+            Case {
+                name: "false",
+                scalar: "Boolean",
+                raw: "false",
+                expected: Some(json!(false)),
+            },
+            Case {
+                name: "boolean spelling",
+                scalar: "Boolean",
+                raw: "TRUE",
+                expected: None,
+            },
+            Case {
+                name: "int",
+                scalar: "Int",
+                raw: "-42",
+                expected: Some(json!(-42)),
+            },
+            Case {
+                name: "int leading zero",
+                scalar: "Int",
+                raw: "042",
+                expected: None,
+            },
+            Case {
+                name: "int overflow",
+                scalar: "Int",
+                raw: "2147483648",
+                expected: None,
+            },
+            Case {
+                name: "bigint at the safe limit",
+                scalar: "BigInt",
+                raw: "9007199254740991",
+                expected: Some(json!(9_007_199_254_740_991_i64)),
+            },
+            Case {
+                name: "bigint past the safe limit",
+                scalar: "BigInt",
+                raw: "9007199254740992",
+                expected: None,
+            },
+            Case {
+                name: "bigint plus sign",
+                scalar: "BigInt",
+                raw: "+1",
+                expected: None,
+            },
+            Case {
+                name: "float",
+                scalar: "Float",
+                raw: "1.5",
+                expected: Some(json!(1.5)),
+            },
+            Case {
+                name: "float nan",
+                scalar: "Float",
+                raw: "NaN",
+                expected: None,
+            },
+            Case {
+                name: "float infinity",
+                scalar: "Float",
+                raw: "inf",
+                expected: None,
+            },
+            Case {
+                name: "json",
+                scalar: "JSON",
+                raw: r#"{"a":[1]}"#,
+                expected: Some(json!({"a": [1]})),
+            },
+            Case {
+                name: "malformed json",
+                scalar: "JSON",
+                raw: "{",
+                expected: None,
+            },
+            Case {
+                name: "unknown scalar",
+                scalar: "Vector",
+                raw: "1",
+                expected: None,
+            },
+        ];
+        for case in cases {
+            let session = session(&[("claim", case.raw)]);
+            assert_eq!(
+                resolve_trusted_preset(Some(&session), "claim", case.scalar),
+                case.expected,
+                "{}",
+                case.name
+            );
+        }
+        assert_eq!(
+            resolve_trusted_preset(Some(&session(&[])), "claim", "String"),
+            None,
+            "absent claim"
+        );
+        assert_eq!(
+            resolve_trusted_preset(None, "claim", "String"),
+            None,
+            "no session"
+        );
+    }
+
+    #[test]
+    fn partition_matches_only_the_projector_partition_kind_it_can_supply() {
+        let constant = |value: Value| Some(EffectExpression::Constant { value });
+        let cases = [
+            ("unit, none", None, ProjectionPartitionSpec::Unit, true),
+            (
+                "unit, mapped",
+                Some(input(&["board"])),
+                ProjectionPartitionSpec::Unit,
+                false,
+            ),
+            (
+                "same constant",
+                constant(json!("eu")),
+                ProjectionPartitionSpec::Constant { value: json!("eu") },
+                true,
+            ),
+            (
+                "other constant",
+                constant(json!("us")),
+                ProjectionPartitionSpec::Constant { value: json!("eu") },
+                false,
+            ),
+            (
+                "constant, none",
+                None,
+                ProjectionPartitionSpec::Constant { value: json!("eu") },
+                false,
+            ),
+            (
+                "input path, mapped",
+                Some(input(&["board"])),
+                ProjectionPartitionSpec::InputPath {
+                    path: vec!["board".into()],
+                },
+                true,
+            ),
+            (
+                "input path, none",
+                None,
+                ProjectionPartitionSpec::InputPath {
+                    path: vec!["board".into()],
+                },
+                false,
+            ),
+            (
+                "modeled inactive",
+                Some(input(&["board"])),
+                ProjectionPartitionSpec::ModeledInactive,
+                false,
+            ),
+        ];
+        for (name, partition, spec, expected) in cases {
+            assert_eq!(
+                board_model(partition).partition_matches(&spec),
+                expected,
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn topology_identity_ignores_fact_and_model_order_and_duplicates() {
+        let target = target(None, Some(topology()), None);
+        let facts = ["board.created".to_string(), "board.created".to_string()];
+        let models = ["DirectBoard".to_string()];
+        assert!(target.topology_matches("boards", &facts, &models, &ProjectionPartitionSpec::Unit));
+        assert!(!target.topology_matches("cards", &facts, &models, &ProjectionPartitionSpec::Unit));
+        assert!(!target.topology_matches(
+            "boards",
+            &["board.renamed".to_string()],
+            &models,
+            &ProjectionPartitionSpec::Unit
+        ));
+        assert!(!target.topology_matches(
+            "boards",
+            &facts,
+            &models,
+            &ProjectionPartitionSpec::Constant { value: json!("eu") }
+        ));
+        assert!(target.protocol_topology_matches(&topology()));
+        assert!(!target.protocol_topology_matches(
+            &ProjectorTopologyId::new(1, "boards", [0x22; 32]).unwrap()
+        ));
+    }
+
+    #[test]
+    fn resolution_rejects_unbound_targets_and_unresolvable_partitions() {
+        let preset = Some(EffectExpression::TrustedPreset {
+            name: "tenant".into(),
+        });
+        let missing = |path: &[&str]| DirectProjectionTargetResolutionError::MissingInputPath {
+            projector: "boards".into(),
+            model: "DirectBoard".into(),
+            target: "partition".into(),
+            path: path.iter().map(|segment| segment.to_string()).collect(),
+        };
+        let cases = [
+            (
+                "empty input path",
+                Some(input(&[])),
+                json!({}),
+                missing(&[]),
+            ),
+            (
+                "absent input field",
+                Some(input(&["board"])),
+                json!({}),
+                missing(&["board"]),
+            ),
+            (
+                "path through a scalar",
+                Some(input(&["board", "id"])),
+                json!({"board": "b1"}),
+                missing(&["board", "id"]),
+            ),
+            (
+                "trusted preset without a session claim",
+                preset,
+                json!({}),
+                DirectProjectionTargetResolutionError::TrustedPresetUnavailable {
+                    projector: "boards".into(),
+                    model: "DirectBoard".into(),
+                    target: "partition".into(),
+                    preset: "tenant".into(),
+                },
+            ),
+        ];
+        for (name, partition, wire, expected) in cases {
+            let error = target(partition, Some(topology()), None)
+                .resolve(&wire, None)
+                .err()
+                .unwrap_or_else(|| panic!("{name}: resolved"));
+            assert_eq!(error, expected, "{name}");
+        }
+
+        let unbound = target(None, None, None).resolve(&json!({}), None).err();
+        assert!(
+            matches!(
+                unbound,
+                Some(DirectProjectionTargetResolutionError::InvalidTarget { .. })
+            ),
+            "a target without its compiled topology does not resolve: {unbound:?}"
+        );
+    }
+
+    #[test]
+    fn resolution_encodes_the_partition_each_expression_names() {
+        let codec =
+            ProjectionScopeCodec::with_models(topology(), [("DirectBoard", DirectBoard::schema())])
+                .unwrap();
+        let tenant = session(&[("tenant", "acme")]);
+        let cases = [
+            ("unit", None, None),
+            (
+                "input path",
+                Some(input(&["board", "tenant"])),
+                Some(json!("north")),
+            ),
+            (
+                "constant",
+                Some(EffectExpression::Constant { value: json!("eu") }),
+                Some(json!("eu")),
+            ),
+            ("null", Some(EffectExpression::Null), Some(Value::Null)),
+            (
+                "trusted preset",
+                Some(EffectExpression::TrustedPreset {
+                    name: "tenant".into(),
+                }),
+                Some(json!("acme")),
+            ),
+        ];
+        for (name, partition, expected) in cases {
+            let resolved = target(partition, Some(topology()), None)
+                .resolve(&json!({"board": {"tenant": "north"}}), Some(&tenant))
+                .unwrap_or_else(|error| panic!("{name}: {error}"));
+            assert_eq!(resolved.partition_value, expected, "{name}");
+            assert_eq!(
+                resolved.partition,
+                codec.encode_partition(expected.as_ref()).unwrap(),
+                "{name}"
+            );
+            assert_eq!(resolved.registration().0, &topology(), "{name}");
+        }
+    }
+
+    #[test]
+    fn modeled_owner_requires_the_compiled_projection_and_exact_program() {
+        let resolve = |program_id| {
+            target(None, Some(topology()), program_id)
+                .resolve(&json!({}), None)
+                .unwrap()
+        };
+        let bound = resolve(Some(program(PROGRAM_A)));
+        assert!(bound
+            .validate_modeled_owner("boards", program(PROGRAM_A))
+            .is_ok());
+        for (name, resolved, projection, program_id) in [
+            (
+                "other projection",
+                resolve(Some(program(PROGRAM_A))),
+                "cards",
+                PROGRAM_A,
+            ),
+            (
+                "other program",
+                resolve(Some(program(PROGRAM_A))),
+                "boards",
+                PROGRAM_B,
+            ),
+            (
+                "legacy owner without a program",
+                resolve(None),
+                "boards",
+                PROGRAM_A,
+            ),
+        ] {
+            assert!(
+                matches!(
+                    resolved.validate_modeled_owner(projection, program(program_id)),
+                    Err(ProjectionProtocolError::InvalidBatch(_))
+                ),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn seal_accepts_only_a_full_row_upsert_of_the_target_model() {
+        let resolve = || {
+            target(None, Some(topology()), Some(program(PROGRAM_A)))
+                .resolve(&json!({}), None)
+                .unwrap()
+        };
+        let batch = resolve().seal(upsert(&board()), "command-1").unwrap();
+        assert_eq!(batch.topology, topology());
+        assert_eq!(batch.causation_id, "command-1");
+        assert_eq!(batch.ownership.len(), 1);
+        assert_eq!(batch.ownership[0].program_id, Some(program(PROGRAM_A)));
+        assert_eq!(batch.mutations.len(), 1);
+        assert_eq!(batch.mutations[0].mutation, upsert(&board()));
+
+        let delete = TableMutation::DeleteRow(DeleteTableRowMutation {
+            schema: DirectBoard::schema(),
+            key: board().primary_key().unwrap(),
+            expected_version: ExpectedVersion::Any,
+        });
+        let other_model = upsert(&DirectCard { id: "c1".into() });
+        for (name, mutation) in [("delete", delete), ("other model", other_model)] {
+            assert!(
+                matches!(
+                    resolve().seal(mutation, "command-1"),
+                    Err(ProjectionProtocolError::InvalidBatch(_))
+                ),
+                "{name}"
+            );
+        }
+    }
+}
