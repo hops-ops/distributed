@@ -204,17 +204,40 @@ fn default_storage_name_infers_natural_plural_query_names() {
     assert_eq!(actual, expected);
 }
 
+/// The default table name is the snake-cased type name plus `s`; a `View`
+/// suffix means nothing special.
 #[test]
-fn default_storage_name_retains_the_singular_append_s_convention() {
-    assert_eq!(default_storage_name("CounterView"), "counter_views");
-}
-
-#[test]
-fn default_storage_name_does_not_assign_meaning_to_the_view_suffix() {
-    let actual = ["Todo", "TodoView"].map(default_storage_name);
-    let expected = ["todos".to_string(), "todo_views".to_string()];
-
-    assert_eq!(actual, expected);
+fn default_storage_name_snake_cases_the_type_and_appends_s() {
+    struct Case {
+        name: &'static str,
+        type_name: &'static str,
+        expected: &'static str,
+    }
+    const CASES: &[Case] = &[
+        Case {
+            name: "the singular append-s convention",
+            type_name: "CounterView",
+            expected: "counter_views",
+        },
+        Case {
+            name: "a type without the View suffix",
+            type_name: "Todo",
+            expected: "todos",
+        },
+        Case {
+            name: "the same type with the View suffix",
+            type_name: "TodoView",
+            expected: "todo_views",
+        },
+    ];
+    for case in CASES {
+        assert_eq!(
+            default_storage_name(case.type_name),
+            case.expected,
+            "{}",
+            case.name
+        );
+    }
 }
 
 #[test]
