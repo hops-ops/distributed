@@ -244,34 +244,6 @@ where
                     continue;
                 }
 
-                let mut table_registration = QueryBuilder::<DB>::new(
-                    "SELECT topology_bytes, model_name FROM projection_registered_models \
-                     WHERE topology_hash = ",
-                );
-                table_registration.push_bind(topology_hash.as_slice());
-                table_registration.push(" AND table_name = ");
-                table_registration.push_bind(declaration.table.as_str());
-                if let Some(row) = table_registration
-                    .build()
-                    .fetch_optional(&mut *tx)
-                    .await
-                    .map_err(|error| {
-                        protocol_storage_error::<DB>("load topology table registration", error)
-                    })?
-                {
-                    let bytes: Vec<u8> = row.try_get("topology_bytes").map_err(|error| {
-                        protocol_storage_error::<DB>("decode topology table registration", error)
-                    })?;
-                    verify_bytes(&bytes, &topology_bytes, "registered projector topology")?;
-                    let model: String = row.try_get("model_name").map_err(|error| {
-                        protocol_storage_error::<DB>("decode topology table registration", error)
-                    })?;
-                    return Err(ProjectionProtocolError::InvalidBatch(format!(
-                        "projection table `{}` is already registered for model `{model}`",
-                        declaration.table
-                    )));
-                }
-
                 let mut insert = QueryBuilder::<DB>::new(
                     "INSERT INTO projection_registered_models \
                      (topology_bytes, topology_hash, model_name, table_name) VALUES (",
