@@ -95,3 +95,67 @@ pub fn sha256_fingerprint(bytes: &[u8]) -> String {
     digest.update(bytes);
     format!("sha256:{:x}", digest.finalize())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn logical_ids_accept_portable_names_and_reject_each_other_shape() {
+        for value in ["todo", "todo.create", "a-b_c:d", "V2"] {
+            let id = LogicalId::try_new("command", value).unwrap();
+            assert_eq!(id.as_str(), value);
+            assert_eq!(id.to_string(), value);
+            assert_eq!(id.as_ref(), value);
+        }
+        let cases = [
+            ("empty", "", "must not be empty"),
+            (
+                "padded",
+                " todo",
+                "must not have leading or trailing whitespace",
+            ),
+            (
+                "leading separator",
+                ".todo",
+                "must not start, end, or repeat a separator",
+            ),
+            (
+                "trailing separator",
+                "todo.",
+                "must not start, end, or repeat a separator",
+            ),
+            (
+                "repeated separator",
+                "todo..create",
+                "must not start, end, or repeat a separator",
+            ),
+            (
+                "path",
+                "todo/create",
+                "may contain only ASCII letters, digits, '.', '_', '-', and ':'",
+            ),
+            (
+                "environment syntax",
+                "${TODO}",
+                "may contain only ASCII letters, digits, '.', '_', '-', and ':'",
+            ),
+            (
+                "inner space",
+                "todo create",
+                "may contain only ASCII letters, digits, '.', '_', '-', and ':'",
+            ),
+        ];
+        for (name, value, reason) in cases {
+            assert_eq!(
+                LogicalId::try_new("command", value).unwrap_err(),
+                ApplicationError::InvalidIdentity {
+                    kind: "command",
+                    value: value.into(),
+                    reason,
+                },
+                "{name}"
+            );
+        }
+    }
+}

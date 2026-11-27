@@ -73,3 +73,20 @@ const fn same_const_str(left: &str, right: &str) -> bool {
     }
     true
 }
+
+#[cfg(test)]
+mod tests {
+    use super::assert_unique_command_ids;
+
+    #[test]
+    fn unique_command_ids_pass_including_shared_prefixes() {
+        assert_unique_command_ids(&[]);
+        assert_unique_command_ids(&["todo.create", "todo.create2", "todo.creat"]);
+    }
+
+    #[test]
+    #[should_panic(expected = "duplicate command identity in module declaration")]
+    fn a_repeated_command_id_panics() {
+        assert_unique_command_ids(&["todo.create", "todo.rename", "todo.create"]);
+    }
+}
