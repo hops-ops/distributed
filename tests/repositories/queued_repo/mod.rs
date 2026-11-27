@@ -122,6 +122,13 @@ async fn peek_reads_without_acquiring_the_lock() {
         .expect("no_lock peek must not block on a held lock")
         .unwrap();
     assert!(peeked.is_some());
+
+    // Nor must a no-lock multi-read.
+    let peeked_all = tokio::time::timeout(Duration::from_millis(500), repo.peek_all(&["c1"]))
+        .await
+        .expect("no_lock peek_all must not block on a held lock")
+        .unwrap();
+    assert_eq!(peeked_all.len(), 1);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -288,9 +295,14 @@ async fn a_failed_commit_keeps_the_lock_until_the_aggregate_is_dropped() {
     let mut other = repo.peek("c1").await.unwrap().unwrap();
     other.increment("c1".into(), 7).unwrap();
     repo.commit(&mut other).await.unwrap();
-    repo.commit(&mut held)
+    let err = repo
+        .commit(&mut held)
         .await
         .expect_err("the stale commit conflicts");
+    assert!(
+        matches!(err, distributed::RepositoryError::ConcurrentWrite { .. }),
+        "expected ConcurrentWrite, got {err:?}"
+    );
 
     let blocked = tokio::time::timeout(Duration::from_millis(100), repo.get("c1")).await;
     assert!(blocked.is_err(), "the failed writer still holds the lock");
