@@ -721,3 +721,424 @@ mod wasm_pure_declarations {
             .any(|e| e.contains("assigns key column `board_id`")));
     }
 }
+
+mod commit_evidence {
+    use super::*;
+    use crate::projection_protocol::{
+        ProjectionModelOwnership, ProjectionPartitionSpec, ProjectorTopologyId,
+    };
+    use crate::read_model::RelationalReadModel;
+    use crate::table::{
+        DeleteTableRowMutation, ExpectedVersion, RowWriteMode, TableMutation, TableRowMutation,
+        TableWritePlan,
+    };
+
+    fn row(id: &str, count: i64) -> ProjectedRow {
+        ProjectedRow {
+            id: id.into(),
+            count,
+            note: None,
+            owner_id: "owner-1".into(),
+            owner: None,
+        }
+    }
+
+    fn write(row: &ProjectedRow, mode: RowWriteMode) -> TableMutation {
+        TableMutation::UpsertRow(TableRowMutation {
+            schema: ProjectedRow::schema(),
+            key: row.primary_key().unwrap(),
+            values: row.to_row().unwrap(),
+            expected_version: ExpectedVersion::Any,
+            mode,
+        })
+    }
+
+    fn upsert(row: &ProjectedRow) -> TableMutation {
+        write(row, RowWriteMode::Upsert)
+    }
+
+    fn proof(row: &ProjectedRow) -> ProjectionCommitProof {
+        ProjectionCommitProof::for_model(row).unwrap()
+    }
+
+    fn atomic_contract() -> TypedCommandContract {
+        typed_command::<Input, Atomic<ProjectedRow>>("row.project").into_contract()
+    }
+
+    fn direct_target(contract: &TypedCommandContract) -> CommandDirectProjectionTarget {
+        contract.projected_model.as_ref().unwrap().bind(
+            "rows",
+            &["row.projected".to_string()],
+            &["ProjectedRow".to_string()],
+            &ProjectionPartitionSpec::Unit,
+            vec![ProjectionModelOwnership::new("ProjectedRow", "projected_rows").unwrap()],
+            Some(ProjectorTopologyId::new(1, "rows", [0x31; 32]).unwrap()),
+            None,
+        )
+    }
+
+    fn resolved_target() -> ResolvedDirectProjectionTarget {
+        direct_target(&atomic_contract())
+            .resolve(&serde_json::json!({}), None)
+            .unwrap()
+    }
+
+    fn fact() -> OutboxMessage {
+        OutboxMessage::create("message-1", "row.projected", Vec::new()).unwrap()
+    }
+
+    #[test]
+    fn proof_matches_exactly_one_full_row_upsert_of_the_returned_row() {
+        let returned = row("r1", 1);
+        let delete = TableMutation::DeleteRow(DeleteTableRowMutation {
+            schema: ProjectedRow::schema(),
+            key: returned.primary_key().unwrap(),
+            expected_version: ExpectedVersion::Any,
+        });
+        let missing = CommandCommitProofError::ProjectionWriteMissing {
+            model: "ProjectedRow".into(),
+        };
+        let mismatch = CommandCommitProofError::ProjectionWriteMismatch {
+            model: "ProjectedRow".into(),
+        };
+        let conflict = CommandCommitProofError::ProjectionWriteConflict {
+            model: "ProjectedRow".into(),
+        };
+        type Case = (
+            &'static str,
+            TypeId,
+            Vec<TableMutation>,
+            Result<(), CommandCommitProofError>,
+        );
+        let cases: Vec<Case> = vec![
+            (
+                "exact upsert among other rows",
+                TypeId::of::<ProjectedRow>(),
+                vec![upsert(&row("r2", 9)), upsert(&returned)],
+                Ok(()),
+            ),
+            (
+                "proof for another Rust type",
+                TypeId::of::<Payload>(),
+                vec![upsert(&returned)],
+                Err(CommandCommitProofError::ProjectionOutputTypeMismatch),
+            ),
+            (
+                "nothing staged",
+                TypeId::of::<ProjectedRow>(),
+                vec![],
+                Err(missing.clone()),
+            ),
+            (
+                "only another key staged",
+                TypeId::of::<ProjectedRow>(),
+                vec![upsert(&row("r2", 1))],
+                Err(missing),
+            ),
+            (
+                "same key, different values",
+                TypeId::of::<ProjectedRow>(),
+                vec![upsert(&row("r1", 2))],
+                Err(mismatch.clone()),
+            ),
+            (
+                "insert instead of upsert",
+                TypeId::of::<ProjectedRow>(),
+                vec![write(&returned, RowWriteMode::Insert)],
+                Err(mismatch.clone()),
+            ),
+            (
+                "a delete of the returned key",
+                TypeId::of::<ProjectedRow>(),
+                vec![delete.clone()],
+                Err(mismatch),
+            ),
+            (
+                "a second mutation of the returned key",
+                TypeId::of::<ProjectedRow>(),
+                vec![upsert(&returned), delete],
+                Err(conflict),
+            ),
+        ];
+        for (name, output_type, mutations, expected) in cases {
+            let plan = TableWritePlan::new(mutations);
+            assert_eq!(
+                proof(&returned).validate(output_type, std::iter::once(&plan)),
+                expected,
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn extracting_the_upsert_removes_it_and_drops_an_emptied_plan() {
+        let returned = row("r1", 1);
+        let mut plans = vec![
+            TableWritePlan::new(vec![upsert(&row("r2", 2)), upsert(&returned)]),
+            TableWritePlan::new(vec![upsert(&row("r3", 3))]),
+        ];
+        let extracted = proof(&returned)
+            .extract_exact_upsert(TypeId::of::<ProjectedRow>(), &mut plans)
+            .unwrap();
+        assert_eq!(extracted, upsert(&returned));
+        assert_eq!(plans.len(), 2);
+        assert_eq!(plans[0].mutations, vec![upsert(&row("r2", 2))]);
+
+        let mut alone = vec![TableWritePlan::new(vec![upsert(&returned)])];
+        proof(&returned)
+            .extract_exact_upsert(TypeId::of::<ProjectedRow>(), &mut alone)
+            .unwrap();
+        assert!(alone.is_empty(), "an emptied plan is removed");
+
+        let mut none = Vec::new();
+        assert_eq!(
+            proof(&returned)
+                .extract_exact_upsert(TypeId::of::<ProjectedRow>(), &mut none)
+                .unwrap_err(),
+            CommandCommitProofError::ProjectionWriteMissing {
+                model: "ProjectedRow".into()
+            }
+        );
+    }
+
+    #[test]
+    fn commit_evidence_rejects_a_preparation_that_breaks_the_declaration() {
+        let payload = || Payload { id: "p".into() };
+        let eventual = PreparedCommand::<Eventual<Payload>>::prepare(payload()).unwrap();
+        let succeeded = typed_command::<Input, Succeeded<Payload>>("todo.check").into_contract();
+        assert_eq!(
+            eventual
+                .validate_commit_evidence(&succeeded, true, &[], &[], None)
+                .unwrap_err(),
+            CommandCommitProofError::ConsistencyMismatch {
+                declared: CommandConsistency::Succeeded,
+                prepared: CommandConsistency::Eventual,
+            }
+        );
+
+        let mut retyped = succeeded.clone();
+        retyped.output_type_id = TypeId::of::<Input>();
+        let prepared = PreparedCommand::<Succeeded<Payload>>::prepare(payload()).unwrap();
+        assert_eq!(
+            prepared
+                .validate_commit_evidence(&retyped, true, &[], &[], None)
+                .unwrap_err(),
+            CommandCommitProofError::OutputTypeMismatch
+        );
+    }
+
+    #[test]
+    fn atomic_commit_evidence_needs_a_durable_event_and_the_staged_row() {
+        let contract = atomic_contract();
+        let returned = row("r1", 1);
+        let prepared = PreparedCommand::<Atomic<ProjectedRow>>::prepare_atomic(
+            returned.clone(),
+            proof(&returned),
+        )
+        .unwrap();
+        let staged = vec![TableWritePlan::new(vec![upsert(&returned)])];
+
+        prepared
+            .validate_commit_evidence(&contract, false, &[fact()], &staged, None)
+            .unwrap();
+        prepared
+            .validate_commit_evidence(&contract, true, &[], &staged, None)
+            .unwrap();
+        assert_eq!(
+            prepared
+                .validate_commit_evidence(&contract, false, &[], &staged, None)
+                .unwrap_err(),
+            CommandCommitProofError::DurableEventMissing
+        );
+        assert_eq!(
+            prepared
+                .validate_commit_evidence(&contract, true, &[], &[], None)
+                .unwrap_err(),
+            CommandCommitProofError::ProjectionWriteMissing {
+                model: "ProjectedRow".into()
+            }
+        );
+        assert_eq!(
+            PreparedCommand::<Atomic<ProjectedRow>>::prepare_modeled_atomic()
+                .validate_commit_evidence(&contract, true, &[], &staged, None)
+                .unwrap_err(),
+            CommandCommitProofError::MissingProjectionProof
+        );
+    }
+
+    #[test]
+    fn sealing_moves_the_staged_row_into_the_direct_participant() {
+        let returned = row("r1", 1);
+        let prepared = PreparedCommand::<Atomic<ProjectedRow>>::prepare_atomic(
+            returned.clone(),
+            proof(&returned),
+        )
+        .unwrap();
+        let mut staged = vec![
+            TableWritePlan::new(vec![upsert(&returned)]),
+            TableWritePlan::new(vec![upsert(&row("r2", 2))]),
+        ];
+        let batch = prepared
+            .seal_direct_projection(Some(resolved_target()), &mut staged, None, "command-1")
+            .unwrap()
+            .expect("an atomic command seals one participant");
+        assert_eq!(batch.mutations.len(), 1);
+        assert_eq!(batch.mutations[0].mutation, upsert(&returned));
+        assert_eq!(batch.causation_id, "command-1");
+        assert_eq!(
+            staged,
+            vec![TableWritePlan::new(vec![upsert(&row("r2", 2))])],
+            "the returned row commits only through the participant"
+        );
+    }
+
+    #[test]
+    fn sealing_rejects_a_missing_or_unexpected_target() {
+        let returned = row("r1", 1);
+        let atomic = PreparedCommand::<Atomic<ProjectedRow>>::prepare_atomic(
+            returned.clone(),
+            proof(&returned),
+        )
+        .unwrap();
+        let staged = || vec![TableWritePlan::new(vec![upsert(&returned)])];
+        assert_eq!(
+            atomic
+                .seal_direct_projection(None, &mut staged(), None, "c")
+                .unwrap_err(),
+            CommandCommitProofError::MissingDirectProjectionTarget
+        );
+        assert_eq!(
+            PreparedCommand::<Atomic<ProjectedRow>>::prepare_modeled_atomic()
+                .seal_direct_projection(Some(resolved_target()), &mut staged(), None, "c")
+                .unwrap_err(),
+            CommandCommitProofError::MissingProjectionProof
+        );
+        let succeeded =
+            PreparedCommand::<Succeeded<Payload>>::prepare(Payload { id: "p".into() }).unwrap();
+        assert_eq!(
+            succeeded
+                .seal_direct_projection(Some(resolved_target()), &mut staged(), None, "c")
+                .unwrap_err(),
+            CommandCommitProofError::UnexpectedDirectProjectionTarget
+        );
+        assert!(succeeded
+            .seal_direct_projection(None, &mut staged(), None, "c")
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn modeled_payload_is_materialized_only_from_a_resolved_plan() {
+        let mut pending = PreparedCommand::<Atomic<ProjectedRow>>::prepare_modeled_atomic();
+        assert!(matches!(
+            pending.materialize_modeled_projection(None),
+            Err(CommandCommitProofError::DirectProjection(_))
+        ));
+        let returned = row("r1", 1);
+        let mut ready = PreparedCommand::<Atomic<ProjectedRow>>::prepare_atomic(
+            returned.clone(),
+            proof(&returned),
+        )
+        .unwrap();
+        ready.materialize_modeled_projection(None).unwrap();
+        assert_eq!(ready.serialized_payload()["id"], "r1");
+    }
+
+    #[test]
+    fn binding_rejects_each_inconsistent_contract() {
+        type Edit = fn(&mut Vec<TypedCommandContract>);
+        let succeeded = || typed_command::<Input, Succeeded<Payload>>("todo.check").into_contract();
+        let cases: Vec<(&str, Edit, &str)> = vec![
+            (
+                "empty command id",
+                |c| c[0].name = " ".into(),
+                "typed command id must not be empty",
+            ),
+            (
+                "duplicate command id",
+                |c| {
+                    let copy = c[0].clone();
+                    c.push(copy);
+                },
+                "duplicate typed command declaration",
+            ),
+            (
+                "output metadata for another type",
+                |c| c[0].output.type_id = Some(TypeId::of::<Input>()),
+                "output command metadata is missing or has a different Rust TypeId",
+            ),
+            (
+                "eventual without confirmations",
+                |c| c[0].consistency = CommandConsistency::Eventual,
+                "must declare at least one expected projector confirmation",
+            ),
+            (
+                "atomic without a retained model",
+                |c| {
+                    c[1].projected_model = None;
+                    c.remove(0);
+                },
+                "missing its compiler-retained relational model",
+            ),
+            (
+                "succeeded with a retained model",
+                |c| {
+                    c[0].projected_model = c[1].projected_model.clone();
+                    c.truncate(1);
+                },
+                "cannot carry direct projection metadata",
+            ),
+            (
+                "retained model for another output type",
+                |c| {
+                    c[1].projected_model.as_mut().unwrap().output_type_id = TypeId::of::<Payload>();
+                    c.remove(0);
+                },
+                "retained model has a different Rust output type",
+            ),
+            (
+                "retained model named differently",
+                |c| {
+                    c[1].projected_model.as_mut().unwrap().model = "Other".into();
+                    c.remove(0);
+                },
+                "retained model `Other` differs from output `ProjectedRow`",
+            ),
+            (
+                "direct target for another output type",
+                |c| {
+                    c[1].direct_projection.as_mut().unwrap().output_type_id =
+                        TypeId::of::<Payload>();
+                    c.remove(0);
+                },
+                "direct target has a different Rust output type",
+            ),
+            (
+                "direct target named differently",
+                |c| {
+                    c[1].direct_projection.as_mut().unwrap().model = "Other".into();
+                    c.remove(0);
+                },
+                "direct target model `Other` differs from output `ProjectedRow`",
+            ),
+        ];
+        let mut atomic = atomic_contract();
+        atomic.direct_projection = Some(direct_target(&atomic));
+        assert!(
+            TypedServiceCommandBinding::from_contracts("rows", &[succeeded(), atomic.clone()])
+                .is_ok(),
+            "the unedited contracts bind"
+        );
+        for (name, edit, expected) in cases {
+            let mut contracts = vec![succeeded(), atomic.clone()];
+            edit(&mut contracts);
+            let error = TypedServiceCommandBinding::from_contracts("rows", &contracts).unwrap_err();
+            assert!(error.contains(expected), "{name}: {error}");
+        }
+        assert!(
+            TypedServiceCommandBinding::from_contracts(" ", &[succeeded()])
+                .unwrap_err()
+                .contains("non-empty service ID")
+        );
+    }
+}
