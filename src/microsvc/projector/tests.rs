@@ -1298,7 +1298,23 @@ fn repair_handle_parser_rejects_noncanonical_or_non_hash_tokens() {
 
 #[tokio::test]
 async fn unrecorded_permanent_projector_failure_retains_and_stops_under_drop_policies() {
-    for policy in [FailurePolicy::DeadLetter, FailurePolicy::LogAndAck] {
+    let unqualified = || {
+        let message = Message::new(
+            FACT_NAME,
+            MessageKind::Event,
+            br#"{"id":"secret-tenant","title":"must not cross"}"#.to_vec(),
+        );
+        [
+            // No stable message ID.
+            message.clone(),
+            // A message ID but no causation ID.
+            message.with_id("fact-without-causation"),
+        ]
+    };
+    for (policy, message) in [FailurePolicy::DeadLetter, FailurePolicy::LogAndAck]
+        .into_iter()
+        .flat_map(|policy| unqualified().map(|message| (policy, message)))
+    {
         let repository = InMemoryRepository::new();
         let bus = InMemoryBus::new();
         let invoked = Arc::new(AtomicUsize::new(0));
@@ -1318,13 +1334,7 @@ async fn unrecorded_permanent_projector_failure_retains_and_stops_under_drop_pol
                     }),
             )
             .with_bus(bus.clone());
-        bus.publish_message(Message::new(
-            FACT_NAME,
-            MessageKind::Event,
-            br#"{"id":"secret-tenant","title":"must not cross"}"#.to_vec(),
-        ))
-        .await
-        .unwrap();
+        bus.publish_message(message).await.unwrap();
 
         let error = service
             .run(RunOptions::until_idle().with_failure_policy(policy))
@@ -1350,5 +1360,297 @@ async fn unrecorded_permanent_projector_failure_retains_and_stops_under_drop_pol
         );
         assert!(!error.to_string().contains("secret-tenant"));
         assert_eq!(invoked.load(Ordering::SeqCst), 0);
+    }
+}
+
+/// Input the projector cannot read is a deterministic failure: it is
+/// recorded at its exact position and stops the projector before its
+/// handler runs, without echoing the payload.
+#[tokio::test]
+async fn an_unreadable_input_stops_its_projector_with_a_recorded_failure_before_the_handler() {
+    struct Case {
+        name: &'static str,
+        partition_by_tenant: bool,
+        payload: &'static [u8],
+    }
+    let cases = [
+        Case {
+            name: "bytes that are not JSON",
+            partition_by_tenant: false,
+            payload: b"{secret-tenant",
+        },
+        Case {
+            name: "JSON that is not the projector's input type",
+            partition_by_tenant: false,
+            payload: br#"{"id":7,"title":"secret-tenant"}"#,
+        },
+        Case {
+            name: "JSON without its partition key",
+            partition_by_tenant: true,
+            payload: br#"{"id":"todo-1","title":"secret-tenant"}"#,
+        },
+    ];
+    for case in cases {
+        let invoked = Arc::new(AtomicUsize::new(0));
+        let handler_invoked = Arc::clone(&invoked);
+        let projector = if case.partition_by_tenant {
+            primary_projector().partition_by(["tenant"])
+        } else {
+            primary_projector()
+        };
+        let bus = InMemoryBus::new();
+        let service = Service::new()
+            .routes(
+                Routes::new()
+                    .with_read_model_store(InMemoryRepository::new())
+                    .causal_projector::<TodoChanged>(projector)
+                    .model::<PrimaryView>()
+                    .handle(move |_context, _fact| {
+                        let invoked = Arc::clone(&handler_invoked);
+                        async move {
+                            invoked.fetch_add(1, Ordering::SeqCst);
+                            Ok(())
+                        }
+                    }),
+            )
+            .with_bus(bus.clone());
+        bus.publish_message(
+            Message::new(FACT_NAME, MessageKind::Event, case.payload.to_vec())
+                .with_id("unreadable-1")
+                .with_metadata(crate::trace_context::CAUSATION_ID, "command-unreadable"),
+        )
+        .await
+        .unwrap();
+
+        let stopped = service
+            .run(RunOptions::until_idle())
+            .await
+            .expect_err(case.name);
+        assert!(
+            stopped.is_permanent() && stopped.should_retain_and_stop(),
+            "{}",
+            case.name
+        );
+        assert!(
+            matches!(
+                stopped
+                    .source()
+                    .and_then(|source| source.downcast_ref::<HandlerError>()),
+                Some(HandlerError::ProjectionTerminalRecorded { projection, .. })
+                    if projection == "task15_a_primary"
+            ),
+            "{}: {stopped}",
+            case.name
+        );
+        let _ = repair_handle(&stopped);
+        assert!(
+            !stopped.to_string().contains("secret-tenant"),
+            "{}",
+            case.name
+        );
+        assert_eq!(invoked.load(Ordering::SeqCst), 0, "{}", case.name);
+    }
+}
+
+#[cfg(feature = "graphql")]
+fn without_causation(mut message: Message) -> Message {
+    message
+        .metadata
+        .retain(|(key, _)| key != crate::trace_context::CAUSATION_ID);
+    message
+}
+
+/// A modeled projector service named `task11-explicit` whose handler applies
+/// its projection only when `applies`, counting its invocations.
+#[cfg(feature = "graphql")]
+fn explicit_modeled_service(
+    repository: &InMemoryRepository,
+    applies: bool,
+    invoked: &Arc<AtomicUsize>,
+) -> (Service, ProjectorTopologyId) {
+    use crate::projection::placement::ProjectionExecutorRoute;
+
+    let invoked = Arc::clone(invoked);
+    let (projector, topology) =
+        generated_modeled_projector(ProjectionExecutorRoute::local("task11-explicit").unwrap());
+    let routes = Routes::new()
+        .with_read_model_store(repository.clone())
+        .modeled_projector(projector)
+        .handle(move |context, projection| {
+            let invoked = Arc::clone(&invoked);
+            async move {
+                invoked.fetch_add(1, Ordering::SeqCst);
+                if applies {
+                    projection
+                        .apply(GENERATED_MODELED_PROJECTOR, &context)
+                        .await
+                } else {
+                    Ok(())
+                }
+            }
+        });
+    (
+        Service::new().named("task11-explicit").routes(routes),
+        topology,
+    )
+}
+
+/// A modeled handler must apply the projection it is handed. One that
+/// returns without doing so is a deterministic bug: the projector stops with
+/// a recorded failure, and resumes from that input once a corrected release
+/// repairs it.
+#[cfg(feature = "graphql")]
+#[tokio::test]
+async fn a_modeled_handler_that_skips_its_projection_stops_and_resumes_after_repair() {
+    let repository = InMemoryRepository::new();
+    let bus = InMemoryBus::new();
+    let invoked = Arc::new(AtomicUsize::new(0));
+    bus.publish_message(modeled_fact_message(
+        "todo-skipped",
+        "applied after repair",
+        1,
+    ))
+    .await
+    .unwrap();
+
+    let (broken, topology) = explicit_modeled_service(&repository, false, &invoked);
+    let stopped = broken
+        .with_bus(bus.clone())
+        .run(RunOptions::until_idle())
+        .await
+        .expect_err("a handler that skips its projection stops the projector");
+    assert!(stopped.is_permanent() && stopped.should_retain_and_stop());
+    assert!(matches!(
+        stopped
+            .source()
+            .and_then(|source| source.downcast_ref::<HandlerError>()),
+        Some(HandlerError::ProjectionTerminalRecorded { .. })
+    ));
+    let handle = repair_handle(&stopped);
+    let ordered = bus.ordered_topic_evidence(FACT_NAME, 0);
+    let request = modeled_snapshot_request(
+        &topology,
+        &ordered,
+        "PrimaryView",
+        PrimaryView::schema(),
+        "todo-skipped",
+    );
+    assert!(repository
+        .projection_query_snapshot(&request)
+        .await
+        .unwrap()
+        .row
+        .is_none());
+
+    let (fixed, _) = explicit_modeled_service(&repository, true, &invoked);
+    assert_eq!(fixed.repair_projection(&handle).await.unwrap().get(), 2);
+    fixed
+        .with_bus(bus.clone())
+        .run(RunOptions::until_idle())
+        .await
+        .unwrap();
+    assert_eq!(invoked.load(Ordering::SeqCst), 2, "once broken, once fixed");
+    assert_eq!(
+        repository
+            .projection_query_snapshot(&request)
+            .await
+            .unwrap()
+            .row
+            .as_ref()
+            .and_then(|row| row.get_serde::<String>("title").ok())
+            .as_deref(),
+        Some("applied after repair")
+    );
+}
+
+/// The modeled projector reads its event from the domain occurrence in the
+/// payload. An occurrence that is not one, or that disagrees with its
+/// transport envelope, is recorded and stops the projector before its
+/// handler runs.
+#[cfg(feature = "graphql")]
+#[tokio::test]
+async fn a_modeled_projector_records_an_event_whose_occurrence_it_cannot_trust() {
+    let not_an_occurrence = Message::new(
+        FACT_NAME,
+        MessageKind::Event,
+        br#"{"id":"todo-1","title":"secret-tenant"}"#.to_vec(),
+    )
+    .with_id("modeled-garbage")
+    .with_metadata(crate::trace_context::CAUSATION_ID, "command-garbage");
+    let cases = [
+        (
+            "a payload that is not a domain occurrence",
+            not_an_occurrence,
+        ),
+        (
+            "an occurrence whose ID differs from the message ID",
+            modeled_fact_message("todo-1", "secret-tenant", 1).with_id("another-message"),
+        ),
+        (
+            "an occurrence whose causation differs from the message's",
+            without_causation(modeled_fact_message("todo-1", "secret-tenant", 1))
+                .with_metadata(crate::trace_context::CAUSATION_ID, "command-other"),
+        ),
+    ];
+    for (name, message) in cases {
+        let invoked = Arc::new(AtomicUsize::new(0));
+        let bus = InMemoryBus::new();
+        bus.publish_message(message).await.unwrap();
+        let (service, _) = explicit_modeled_service(&InMemoryRepository::new(), true, &invoked);
+        let stopped = service
+            .with_bus(bus)
+            .run(RunOptions::until_idle())
+            .await
+            .expect_err(name);
+        assert!(
+            matches!(
+                stopped
+                    .source()
+                    .and_then(|source| source.downcast_ref::<HandlerError>()),
+                Some(HandlerError::ProjectionTerminalRecorded { .. })
+            ),
+            "{name}: {stopped}"
+        );
+        let _ = repair_handle(&stopped);
+        assert!(!stopped.to_string().contains("secret-tenant"), "{name}");
+        assert_eq!(invoked.load(Ordering::SeqCst), 0, "{name}");
+    }
+}
+
+/// Without a message ID or causation ID a delivery cannot be recorded at
+/// all: the modeled projector halts the runner instead of acknowledging it.
+#[cfg(feature = "graphql")]
+#[tokio::test]
+async fn a_modeled_projector_halts_on_a_delivery_it_cannot_identify() {
+    let message = modeled_fact_message("todo-1", "unidentified", 1);
+    let mut without_id = message.clone();
+    without_id.id = None;
+    for (name, message) in [
+        ("no message ID", without_id),
+        ("no causation ID", without_causation(message)),
+    ] {
+        let invoked = Arc::new(AtomicUsize::new(0));
+        let bus = InMemoryBus::new();
+        bus.publish_message(message).await.unwrap();
+        let (service, _) = explicit_modeled_service(&InMemoryRepository::new(), true, &invoked);
+        let halted = service
+            .with_bus(bus)
+            .run(RunOptions::until_idle())
+            .await
+            .expect_err(name);
+        assert!(halted.should_retain_and_stop(), "{name}");
+        let halted = halted
+            .source()
+            .and_then(|source| source.downcast_ref::<HandlerError>());
+        assert!(
+            matches!(
+                halted
+                    .and_then(|halted| halted.source())
+                    .and_then(|source| source.downcast_ref::<HandlerError>()),
+                Some(HandlerError::UnqualifiedProjectionDelivery(_))
+            ),
+            "{name}: {halted:?}"
+        );
+        assert_eq!(invoked.load(Ordering::SeqCst), 0, "{name}");
     }
 }

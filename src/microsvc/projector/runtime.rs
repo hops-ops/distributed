@@ -190,6 +190,9 @@ where
                     )
                     .await
                 }
+                // The same bytes never decode: a deterministic failure,
+                // recorded like any other undecodable input rather than
+                // retried.
                 Err(error) => {
                     return record_ingress_failure(
                         store,
@@ -198,7 +201,9 @@ where
                         ordered,
                         message_id,
                         causation_id,
-                        HandlerError::Other(Box::new(error)),
+                        HandlerError::DecodeFailed(format!(
+                            "domain occurrence could not be decoded: {error}"
+                        )),
                     )
                     .await
                 }
