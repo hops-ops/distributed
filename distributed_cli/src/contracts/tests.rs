@@ -309,6 +309,31 @@ fn client_inventory_validate_rejects_direct_secret_mutation() {
         .validate()
         .expect_err("validation must cover public mutations");
     assert_eq!(error.code(), ContractDiagnosticCode::EnvironmentValue);
+
+    // The JSON loader refuses credential-like strings before `validate`
+    // runs; a value built in code reaches only `validate`.
+    for (field, edit) in [
+        (
+            "module",
+            (|client: &mut ClientDeclaration| client.module = "$distributed/token=abc".into())
+                as fn(&mut ClientDeclaration),
+        ),
+        ("manifest entrypoint", |client| {
+            client.manifest_entrypoint = Some("bearer abc".into())
+        }),
+    ] {
+        let mut inventory =
+            ClientInventory::from_json_str(E2E_UI_CLIENTS).expect("client inventory");
+        edit(&mut inventory.clients[0]);
+        let error = inventory
+            .validate()
+            .expect_err("credential-like value must be refused");
+        assert_eq!(
+            error.code(),
+            ContractDiagnosticCode::EnvironmentValue,
+            "{field}"
+        );
+    }
 }
 
 #[test]
