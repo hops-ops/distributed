@@ -1093,6 +1093,16 @@ mod tests {
         assert!(!stamp_matches(&stamp_path, &destination, &edited).unwrap());
     }
 
+    /// Declared pures, the package features, an extra package, the launcher
+    /// and the expected refusal.
+    type PlanRow<'a> = (
+        BTreeSet<WasmPure>,
+        Value,
+        Option<Value>,
+        Option<&'a Path>,
+        &'a str,
+    );
+
     /// Each reason declared browser WASM cannot be planned, before any
     /// compiler runs.
     #[test]
@@ -1106,13 +1116,7 @@ mod tests {
             "source": null
         });
         let launcher = Some(workspace.launcher.as_path());
-        let rows: [(
-            BTreeSet<WasmPure>,
-            Value,
-            Option<Value>,
-            Option<&Path>,
-            &str,
-        ); 6] = [
+        let rows: [PlanRow; 6] = [
             (
                 pures(&[("blob-domain", "wasm/blob/blob_domain")]),
                 with_wasm.clone(),
