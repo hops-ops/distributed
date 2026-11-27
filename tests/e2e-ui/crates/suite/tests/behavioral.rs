@@ -126,7 +126,9 @@ fn id(prefix: &str) -> String {
         .unwrap()
         .as_nanos();
     let s = SEQ.fetch_add(1, Ordering::Relaxed);
-    format!("{prefix}-{n:x}-{s:x}")
+    // The process id keeps concurrent test processes apart: each restarts
+    // the sequence, and the clock can repeat between them.
+    format!("{prefix}-{n:x}-{:x}-{s:x}", std::process::id())
 }
 
 #[tokio::test]

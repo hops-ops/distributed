@@ -2,13 +2,16 @@
 //! with a real WebSocket client, tier-up events across hosts, hibernation,
 //! fenced ownership and the world content barrier. Hibernation runs on
 //! celld (`CellZoneOwnership` + `CellZoneStateStore` against
-//! `tests/celld/fact-worker`; skipped unless the worker is built and celld
-//! starts, required with `CELLD_FACTS_REQUIRED=1`).
+//! `tests/celld/fact-worker`). Those two tests are live
+//! (`#[ignore = "live: ..."]`): run them with `-- --ignored`; without a built
+//! worker or celld they fail.
 
 #[path = "../support/celld.rs"]
 mod celld_support;
 #[path = "../support/realm.rs"]
 mod realm;
+#[path = "../support/unique.rs"]
+mod unique;
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -517,10 +520,9 @@ async fn boss_defeat_tiers_up_to_parent_and_grandparent_across_hosts() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "live: needs a built tests/celld/fact-worker and celld"]
 async fn dormant_zone_hibernates_to_celld_and_restores() {
-    let Some(celld) = celld_support::Celld::start_new() else {
-        return;
-    };
+    let celld = celld_support::Celld::start_new();
     let (ownership, store) = on_celld(&celld, "host-a");
     let mut config = base_config();
     config.host.idle_tick_rate = None;
@@ -628,10 +630,9 @@ fn on_celld(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "live: needs a built tests/celld/fact-worker and celld"]
 async fn hibernation_saves_succeed_after_a_host_restart_on_the_same_store() {
-    let Some(celld) = celld_support::Celld::start_new() else {
-        return;
-    };
+    let celld = celld_support::Celld::start_new();
     let url_of = |addr: &str| format!("ws://{addr}/zones/realm.keep");
     let mut epochs = Vec::new();
     let mut count = 0u32;

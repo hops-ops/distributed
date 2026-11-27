@@ -4,7 +4,10 @@
 //! celld's R2 object storage), and both surviving a celld crash.
 //!
 //!   (cd tests/celld/fact-worker && worker-build --release)
-//!   cargo test -p distributed_game --features celld,runtime --test celld_zone_state
+//!   cargo test -p distributed_game --features celld,runtime --test celld_zone_state -- --ignored
+//!
+//! The test is live (`#[ignore = "live: ..."]`): without a built worker or
+//! celld it fails.
 
 use distributed::microsvc::cell_host::InternalHttpSecret;
 use distributed_game::celld::CellZoneStateStore;
@@ -13,6 +16,8 @@ use distributed_game::world::{state_store_conformance, StoredZoneState, ZoneStat
 
 #[path = "../support/celld.rs"]
 mod celld_support;
+#[path = "../support/unique.rs"]
+mod unique;
 use celld_support::{Celld, SECRET};
 
 fn store(base: &str) -> CellZoneStateStore {
@@ -26,10 +31,9 @@ fn store(base: &str) -> CellZoneStateStore {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "live: needs a built tests/celld/fact-worker and celld"]
 async fn snapshots_are_fenced_inline_and_in_object_storage_and_survive_a_crash() {
-    let Some(mut celld) = Celld::start_new() else {
-        return;
-    };
+    let mut celld = Celld::start_new();
     let states = store(&celld.base());
     state_store_conformance(&states, "grid.0.0", vec![1; 512]).await;
     let big: Vec<u8> = (0..ZONE_STATE_INLINE_MAX * 3)

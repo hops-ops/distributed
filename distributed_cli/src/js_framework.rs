@@ -1005,4 +1005,211 @@ mod tests {
             "junction\n"
         );
     }
+
+    /// Each UI dependency on the framework package that cannot be resolved,
+    /// and a UI with no dependency at all.
+    #[test]
+    fn a_ui_dependency_that_cannot_be_resolved_is_refused() {
+        let ui_package = |spec: &str| {
+            serde_json::json!({ "devDependencies": { (DISTRIBUTED_JS_PACKAGE): spec } }).to_string()
+        };
+        let fixture = tempfile::tempdir().unwrap();
+        let ui = fixture.path().join("ui");
+        write(&ui.join("package.json"), "{}");
+        assert!(discover_javascript_framework(&ui).unwrap().is_none());
+
+        write(&fixture.path().join("file-not-dir"), "");
+        let named = |name: &str, version: Option<&str>, build: bool| {
+            let mut manifest = serde_json::json!({ "name": name });
+            if let Some(version) = version {
+                manifest["version"] = version.into();
+            }
+            if build {
+                manifest["scripts"] = serde_json::json!({ "build": "tsc" });
+            }
+            manifest.to_string()
+        };
+        write(
+            &fixture.path().join("other/package.json"),
+            named("left-pad", Some("1"), true),
+        );
+        write(
+            &fixture.path().join("versionless/package.json"),
+            named(DISTRIBUTED_JS_PACKAGE, None, true),
+        );
+        write(
+            &fixture.path().join("unbuildable/package.json"),
+            named(DISTRIBUTED_JS_PACKAGE, Some("1"), false),
+        );
+        let rows = [
+            ("file:", "has an empty local file dependency"),
+            (
+                "file:../absent",
+                "failed to resolve local @hops-ops/distributed package",
+            ),
+            ("file:../file-not-dir", "is not a directory"),
+            ("file:../other", "declares package name `left-pad`"),
+            ("file:../versionless", "package has no version"),
+            ("file:../unbuildable", "has no `build` script"),
+            (
+                "^1.0.0",
+                "cannot resolve the installed @hops-ops/distributed version",
+            ),
+        ];
+        for (spec, expected) in rows {
+            write(&ui.join("package.json"), ui_package(spec));
+            let error = discover_javascript_framework(&ui).unwrap_err().to_string();
+            assert!(error.contains(expected), "{spec}: {error}");
+        }
+
+        // Without the package in the lockfile, the installed copy decides.
+        write(&ui.join("package-lock.json"), r#"{"packages":{}}"#);
+        write(
+            &ui.join("node_modules/@hops-ops/distributed/package.json"),
+            named(DISTRIBUTED_JS_PACKAGE, Some("1.2.3"), false),
+        );
+        assert_eq!(
+            discover_javascript_framework(&ui).unwrap().unwrap().version,
+            "1.2.3"
+        );
+        write(&ui.join("package-lock.json"), "not json");
+        let error = discover_javascript_framework(&ui).unwrap_err().to_string();
+        assert!(
+            error.contains("failed to parse npm package lock"),
+            "{error}"
+        );
+    }
+
+    /// The installed copy must be the declared release, published or local,
+    /// and must ship its exports.
+    #[test]
+    fn an_installed_package_that_differs_from_the_resolved_one_is_refused() {
+        let fixture = tempfile::tempdir().unwrap();
+        let ui = fixture.path().join("ui");
+        let installed = ui.join("node_modules/@hops-ops/distributed");
+        let registry = |version: &str| JavascriptFrameworkPackage {
+            version: version.to_string(),
+            source: JavascriptPackageSource::Registry,
+        };
+        fs::create_dir_all(&ui).unwrap();
+        let error = registry("0.1.0")
+            .verify_installed(&ui)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("failed to inspect installed"), "{error}");
+
+        write(&installed.join("package.json"), local_manifest());
+        write(&installed.join("dist/index.js"), "");
+        write(&installed.join("dist/index.d.ts"), "");
+        registry("0.1.0").verify_installed(&ui).unwrap();
+        let error = registry("0.2.0")
+            .verify_installed(&ui)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("version `0.1.0` does not match resolved version `0.2.0`"),
+            "{error}"
+        );
+
+        let local = JavascriptFrameworkPackage {
+            version: "0.1.0".to_string(),
+            source: JavascriptPackageSource::Local {
+                root: installed.canonicalize().unwrap(),
+            },
+        };
+        local.verify_installed(&ui).unwrap();
+        assert_eq!(
+            local.wasm_pack_launcher(&ui),
+            installed
+                .canonicalize()
+                .unwrap()
+                .join("node_modules/wasm-pack/run.js")
+        );
+        assert_eq!(
+            registry("0.1.0").wasm_pack_launcher(&ui),
+            ui.join("node_modules/wasm-pack/run.js")
+        );
+        let error = local
+            .verify_installed(&fixture.path().join("elsewhere"))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("failed to resolve installed local"),
+            "{error}"
+        );
+
+        #[cfg(unix)]
+        {
+            let linked_ui = fixture.path().join("linked-ui");
+            fs::create_dir_all(linked_ui.join("node_modules/@hops-ops")).unwrap();
+            std::os::unix::fs::symlink(
+                &installed,
+                linked_ui.join("node_modules/@hops-ops/distributed"),
+            )
+            .unwrap();
+            let error = registry("0.1.0")
+                .verify_installed(&linked_ui)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("is locally linked"), "{error}");
+        }
+
+        let exports = |value: Value| PackageJson {
+            name: None,
+            version: None,
+            dependencies: BTreeMap::new(),
+            dev_dependencies: BTreeMap::new(),
+            scripts: BTreeMap::new(),
+            exports: value,
+        };
+        for (value, expected) in [
+            (Value::Null, "declares no file exports"),
+            (serde_json::json!(["./dist/../../x.js"]), "is missing"),
+            (serde_json::json!({ "a": "./dist/absent.js" }), "is missing"),
+        ] {
+            let error = verify_exports(&installed, &exports(value.clone()))
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains(expected), "{value}: {error}");
+        }
+    }
+
+    /// What may be hashed as a package build input.
+    #[test]
+    fn build_inputs_are_bounded_regular_package_files() {
+        let fixture = tempfile::tempdir().unwrap();
+        let root = fixture.path();
+        let error = build_input_files(root).unwrap_err().to_string();
+        assert!(error.contains("has no build inputs"), "{error}");
+
+        write(&root.join("package.json"), "{}");
+        write(&root.join("tsconfig.build.json"), "{}");
+        write(&root.join("README.md"), "not an input");
+        let files = build_input_files(root).unwrap();
+        assert_eq!(
+            files,
+            [root.join("package.json"), root.join("tsconfig.build.json")]
+        );
+        assert!(hash_files(root, vec![PathBuf::from("/elsewhere/x")]).is_err());
+
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(root.join("README.md"), root.join("src")).unwrap();
+            let error = build_input_files(root).unwrap_err().to_string();
+            assert!(error.contains("must not be a symlink"), "{error}");
+        }
+        let mut files = Vec::new();
+        let error = collect_source_files(root, &root.join("absent"), &mut files)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("inspect JavaScript source"), "{error}");
+        let outside = tempfile::tempdir().unwrap();
+        let error = collect_source_files(root, outside.path(), &mut files)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("is not a package file or directory"),
+            "{error}"
+        );
+    }
 }

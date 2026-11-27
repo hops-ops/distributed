@@ -51,10 +51,16 @@ pub struct TodoV2 {
     pub completed: bool,
 }
 
+// The upcaster is named through `Self::`: the macro emits its wrapper inside
+// the impl, so an associated function works. TodoV3 names free functions.
 #[sourced(entity, aggregate_type = "Todo", upcasters(
-    ("initialized", 1 => 2, InitializedV1 => InitializedV2, upcast_initialized_v1_v2),
+    ("initialized", 1 => 2, InitializedV1 => InitializedV2, Self::upcast_initialized_v1_v2),
 ))]
 impl TodoV2 {
+    pub fn upcast_initialized_v1_v2(payload: InitializedV1) -> InitializedV2 {
+        upcast_initialized_v1_v2(payload)
+    }
+
     #[event("initialized", version = 2)]
     pub fn initialize(&mut self, id: String, user_id: String, task: String, priority: u8) {
         self.entity.set_id(&id);

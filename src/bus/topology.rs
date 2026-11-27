@@ -246,21 +246,31 @@ mod tests {
     }
 
     #[test]
-    fn resolve_consumer_group_prefers_explicit_bus_group() {
+    fn resolve_consumer_group_takes_the_bus_group_else_the_router_identity() {
+        struct Case {
+            name: &'static str,
+            bus_group: Option<&'static str>,
+            expected: &'static str,
+        }
+        const CASES: &[Case] = &[
+            Case {
+                name: "an explicit bus group wins over the router identity",
+                bus_group: Some("override"),
+                expected: "override",
+            },
+            Case {
+                name: "without a bus group the router identity is used",
+                bus_group: None,
+                expected: "service",
+            },
+        ];
         let router = TestRouter {
             group: Some("service"),
         };
-        let group = resolve_consumer_group(Some("override"), &router, "test").unwrap();
-        assert_eq!(group, "override");
-    }
-
-    #[test]
-    fn resolve_consumer_group_uses_router_identity() {
-        let router = TestRouter {
-            group: Some("service"),
-        };
-        let group = resolve_consumer_group(None, &router, "test").unwrap();
-        assert_eq!(group, "service");
+        for case in CASES {
+            let group = resolve_consumer_group(case.bus_group, &router, "test").unwrap();
+            assert_eq!(group, case.expected, "{}", case.name);
+        }
     }
 
     #[test]

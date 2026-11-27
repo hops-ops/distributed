@@ -1,4 +1,6 @@
 //! Always-on identity suite: fixtures F1–F10 against shipped identity path.
+//! The claim map alone (F1, F2 without a token) is unit-tested beside it, in
+//! `src/graphql/identity/claims.rs`; here F1 goes through token validation.
 //!
 //! No network / no Zitadel. Synthetic RSA JWKS + JWT via jsonwebtoken.
 
@@ -10,8 +12,8 @@ use axum::http::{HeaderMap, HeaderValue};
 use base64::Engine;
 use distributed::graphql::http::{graphql_router, graphql_router_composed};
 use distributed::graphql::{
-    extract_bearer, map_claims_to_session, read, AuthError, ClaimMapConfig, GraphqlEngine,
-    IdentityConfig, IdentityResolver, ModelPermissions, OidcConfig, OidcValidator, WebsocketLimits,
+    extract_bearer, read, AuthError, GraphqlEngine, IdentityConfig, IdentityResolver,
+    ModelPermissions, OidcConfig, OidcValidator, WebsocketLimits,
 };
 use distributed::microsvc::Session;
 use distributed::read_model::ReadModel;
@@ -126,50 +128,6 @@ fn bearer_headers(token: &str) -> HeaderMap {
         HeaderValue::from_str(&format!("Bearer {token}")).expect("bearer header"),
     );
     headers
-}
-
-// ── F1 / F2 claim map (shipped map_claims_to_session) ───────────────────────
-
-#[test]
-fn f1_zitadel_project_roles_session() {
-    let claims = json!({
-        "iss": "http://localhost:8080",
-        "aud": ["graphql-api", "123@graphql"],
-        "sub": "user-a-001",
-        "exp": 4102444800_i64,
-        "urn:zitadel:iam:org:project:roles": {
-            "customer": { "280664559058878577": "zitadel.localhost" },
-            "admin": { "280664559058878577": "zitadel.localhost" }
-        }
-    });
-    let cfg = ClaimMapConfig {
-        engine_roles: vec!["admin".into(), "customer".into(), "user".into()],
-        ..Default::default()
-    };
-    let session = map_claims_to_session(&claims, &cfg).unwrap();
-    assert_eq!(session.user_id(), Some("user-a-001"));
-    assert_eq!(session.get("x-roles"), Some("admin,customer"));
-    assert_eq!(session.role(), None);
-}
-
-#[test]
-fn f2_groups_array_session() {
-    let claims = json!({
-        "iss": "http://localhost:8080",
-        "aud": "graphql-api",
-        "sub": "user-b-002",
-        "exp": 4102444800_i64,
-        "groups": ["customer", "other-unmapped"]
-    });
-    let cfg = ClaimMapConfig {
-        engine_roles: vec!["admin".into(), "customer".into(), "user".into()],
-        ..Default::default()
-    };
-    let session = map_claims_to_session(&claims, &cfg).unwrap();
-    assert_eq!(session.user_id(), Some("user-b-002"));
-    assert_eq!(session.get("x-roles"), Some("customer"));
-    assert_eq!(session.roles(), vec!["customer"]);
-    assert_eq!(session.role(), Some("customer"));
 }
 
 #[test]

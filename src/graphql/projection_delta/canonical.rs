@@ -436,26 +436,88 @@ mod tests {
         assert_eq!(actual.mutation, expected);
     }
 
+    /// A later upsert, delete, link or unlink replaces whatever the record
+    /// or edge held before: the merged mutation is the incoming one.
     #[test]
-    fn patch_then_upsert_keeps_the_later_upsert() {
-        let scope = scope("Todos");
-        let expected = upsert(
-            &scope,
-            &[("status", "closed"), ("title", "new")],
-            &["status", "title"],
-        );
-        let actual = merge_pair(patch(&scope, &[("status", "open")], &[]), expected.clone());
+    fn a_later_replacing_mutation_wins_the_merge() {
+        struct Case {
+            name: &'static str,
+            existing: ProjectionDeltaMutation,
+            incoming: ProjectionDeltaMutation,
+        }
+        let (source, target) = (scope("Todos"), scope("Tags"));
+        let scope = source.clone();
+        let old_upsert = || {
+            upsert(
+                &scope,
+                &[("status", "open"), ("title", "old")],
+                &["status", "title"],
+            )
+        };
+        let new_upsert = || {
+            upsert(
+                &scope,
+                &[("status", "closed"), ("title", "new")],
+                &["status", "title"],
+            )
+        };
+        let link = || ProjectionDeltaMutation::Link {
+            relationship: "tags".to_owned(),
+            source: source.clone(),
+            target: target.clone(),
+        };
+        let unlink = || ProjectionDeltaMutation::Unlink {
+            relationship: "tags".to_owned(),
+            source: source.clone(),
+            target: target.clone(),
+        };
+        let cases = [
+            Case {
+                name: "patch then upsert keeps the later upsert",
+                existing: patch(&scope, &[("status", "open")], &[]),
+                incoming: new_upsert(),
+            },
+            Case {
+                name: "patch then delete keeps the delete",
+                existing: patch(&scope, &[("status", "open")], &[]),
+                incoming: delete(&scope),
+            },
+            Case {
+                name: "upsert then upsert keeps the later upsert",
+                existing: old_upsert(),
+                incoming: new_upsert(),
+            },
+            Case {
+                name: "upsert then delete keeps the delete",
+                existing: old_upsert(),
+                incoming: delete(&scope),
+            },
+            Case {
+                name: "delete then upsert keeps the recreating upsert",
+                existing: delete(&scope),
+                incoming: new_upsert(),
+            },
+            Case {
+                name: "delete then delete keeps the later delete",
+                existing: delete(&scope),
+                incoming: delete(&scope),
+            },
+            Case {
+                name: "link then unlink keeps the later edge state",
+                existing: link(),
+                incoming: unlink(),
+            },
+            Case {
+                name: "unlink then link keeps the later edge state",
+                existing: unlink(),
+                incoming: link(),
+            },
+        ];
 
-        assert_eq!(actual.mutation, expected);
-    }
-
-    #[test]
-    fn patch_then_delete_keeps_the_delete() {
-        let scope = scope("Todos");
-        let expected = delete(&scope);
-        let actual = merge_pair(patch(&scope, &[("status", "open")], &[]), expected.clone());
-
-        assert_eq!(actual.mutation, expected);
+        for case in cases {
+            let actual = merge_pair(case.existing, case.incoming.clone());
+            assert_eq!(actual.mutation, case.incoming, "{}", case.name);
+        }
     }
 
     #[test]
@@ -475,42 +537,6 @@ mod tests {
     }
 
     #[test]
-    fn upsert_then_upsert_keeps_the_later_upsert() {
-        let scope = scope("Todos");
-        let expected = upsert(
-            &scope,
-            &[("status", "closed"), ("title", "new")],
-            &["status", "title"],
-        );
-        let actual = merge_pair(
-            upsert(
-                &scope,
-                &[("status", "open"), ("title", "old")],
-                &["status", "title"],
-            ),
-            expected.clone(),
-        );
-
-        assert_eq!(actual.mutation, expected);
-    }
-
-    #[test]
-    fn upsert_then_delete_keeps_the_delete() {
-        let scope = scope("Todos");
-        let expected = delete(&scope);
-        let actual = merge_pair(
-            upsert(
-                &scope,
-                &[("status", "open"), ("title", "old")],
-                &["status", "title"],
-            ),
-            expected.clone(),
-        );
-
-        assert_eq!(actual.mutation, expected);
-    }
-
-    #[test]
     fn delete_then_patch_keeps_the_delete() {
         let scope = scope("Todos");
         let expected = delete(&scope);
@@ -518,28 +544,6 @@ mod tests {
             expected.clone(),
             patch(&scope, &[("status", "closed")], &[]),
         );
-
-        assert_eq!(actual.mutation, expected);
-    }
-
-    #[test]
-    fn delete_then_upsert_keeps_the_recreating_upsert() {
-        let scope = scope("Todos");
-        let expected = upsert(
-            &scope,
-            &[("status", "closed"), ("title", "new")],
-            &["status", "title"],
-        );
-        let actual = merge_pair(delete(&scope), expected.clone());
-
-        assert_eq!(actual.mutation, expected);
-    }
-
-    #[test]
-    fn delete_then_delete_keeps_the_later_delete() {
-        let scope = scope("Todos");
-        let expected = delete(&scope);
-        let actual = merge_pair(delete(&scope), expected.clone());
 
         assert_eq!(actual.mutation, expected);
     }
@@ -591,48 +595,6 @@ mod tests {
             (actual.occurrence_ordinal, actual.projection_refs),
             (7, vec![1, 2, 3])
         );
-    }
-
-    #[test]
-    fn link_then_unlink_keeps_the_later_edge_state() {
-        let source = scope("Todos");
-        let target = scope("Tags");
-        let expected = ProjectionDeltaMutation::Unlink {
-            relationship: "tags".to_owned(),
-            source: source.clone(),
-            target: target.clone(),
-        };
-        let actual = merge_pair(
-            ProjectionDeltaMutation::Link {
-                relationship: "tags".to_owned(),
-                source,
-                target,
-            },
-            expected.clone(),
-        );
-
-        assert_eq!(actual.mutation, expected);
-    }
-
-    #[test]
-    fn unlink_then_link_keeps_the_later_edge_state() {
-        let source = scope("Todos");
-        let target = scope("Tags");
-        let expected = ProjectionDeltaMutation::Link {
-            relationship: "tags".to_owned(),
-            source: source.clone(),
-            target: target.clone(),
-        };
-        let actual = merge_pair(
-            ProjectionDeltaMutation::Unlink {
-                relationship: "tags".to_owned(),
-                source,
-                target,
-            },
-            expected.clone(),
-        );
-
-        assert_eq!(actual.mutation, expected);
     }
 
     #[test]

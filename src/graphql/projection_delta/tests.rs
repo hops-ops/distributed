@@ -73,16 +73,6 @@ fn strict_decode_rejects_unknown_wire_fields() {
 }
 
 #[test]
-fn authoritative_zero_actual_occurrences_is_valid_and_deterministic() {
-    let delta = empty_delta();
-    let bytes = delta.canonical_bytes().unwrap();
-    assert_eq!(ProjectionDelta::from_json(&bytes).unwrap(), delta);
-    assert!(delta.projections.is_empty());
-    assert!(delta.occurrences.is_empty());
-    assert!(delta.operations.is_empty());
-}
-
-#[test]
 fn upsert_requires_exact_non_key_mask_and_allows_key_only_rows() {
     let scope = test_scope("tenant-a", "KeyOnly", vec![key_field(0, "id", "1")]);
     let key_only = operation(

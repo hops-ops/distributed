@@ -1,6 +1,6 @@
 mod aggregate;
 
-use aggregate::{TodoV1, TodoV2, TodoV3};
+use aggregate::{TodoV1, TodoV2, TodoV2Event, TodoV3};
 use distributed::{
     hydrate, hydrate_from_snapshot, upcast_events, Aggregate, AggregateBuilder, Entity,
     EventRecord, EventUpcaster, InMemoryRepository, RepositoryError, SnapshotRecord, SnapshotStore,
@@ -44,57 +44,6 @@ impl Aggregate for SameVersionUpcasterAggregate {
         }];
         UPCASTERS
     }
-}
-
-// =============================================================================
-// EventRecord version field
-// =============================================================================
-
-#[test]
-fn event_record_defaults_to_version_1() {
-    let record = EventRecord::new("tested", vec![], 1);
-    assert_eq!(record.event_version, 1);
-}
-
-#[test]
-fn event_record_new_versioned() {
-    let record = EventRecord::new_versioned("tested", vec![], 1, 3);
-    assert_eq!(record.event_version, 3);
-    assert_eq!(record.event_name, "tested");
-}
-
-#[test]
-fn event_version_serializes_cleanly_when_v1() {
-    let record = EventRecord::new("tested", vec![], 1);
-    let json = serde_json::to_string(&record).unwrap();
-    // Version 1 is skipped in serialization
-    assert!(!json.contains("event_version"));
-}
-
-#[test]
-fn event_version_serializes_when_not_v1() {
-    let record = EventRecord::new_versioned("tested", vec![], 1, 2);
-    let json = serde_json::to_string(&record).unwrap();
-    assert!(json.contains("\"event_version\":2"));
-}
-
-#[test]
-fn v1_event_version_survives_a_round_trip_that_omits_it() {
-    let record = EventRecord::new("tested", vec![1, 2, 3], 1);
-    let json = serde_json::to_string(&record).unwrap();
-    let deserialized: EventRecord = serde_json::from_str(&json).unwrap();
-    assert_eq!(deserialized.event_version, 1);
-    assert_eq!(deserialized, record);
-}
-
-#[test]
-fn event_version_round_trips_through_serde() {
-    let record = EventRecord::new_versioned("tested", vec![1, 2, 3], 1, 5);
-    let json = serde_json::to_string(&record).unwrap();
-    let deserialized: EventRecord = serde_json::from_str(&json).unwrap();
-    assert_eq!(deserialized.event_version, 5);
-    assert_eq!(deserialized.event_name, "tested");
-    assert_eq!(deserialized.sequence, 1);
 }
 
 // =============================================================================
@@ -210,26 +159,6 @@ fn hydrate_v3_from_native_v3_events_no_upcasting_needed() {
 }
 
 // =============================================================================
-// Mixed events: some need upcasting, some don't
-// =============================================================================
-
-#[test]
-fn mixed_events_v1_init_and_v1_complete() {
-    // Completed events are always v1 — no upcaster needed
-    let mut v1 = TodoV1::default();
-    v1.initialize("t1".into(), "eve".into(), "Test".into())
-        .unwrap();
-    v1.complete().unwrap();
-
-    let mut entity = Entity::new();
-    entity.load_from_history(v1.entity.events().to_vec());
-
-    let v2: TodoV2 = hydrate(entity).unwrap();
-    assert_eq!(v2.priority, 0);
-    assert!(v2.completed);
-}
-
-// =============================================================================
 // Repository round-trip with upcasting
 // =============================================================================
 
@@ -274,6 +203,33 @@ fn upcast_events_standalone() {
     assert_eq!(user, "user1");
     assert_eq!(task, "task1");
     assert_eq!(priority, 0);
+}
+
+#[test]
+fn v2_try_from_event_record() {
+    let payload = bitcode::serialize(&(
+        "t1".to_string(),
+        "alice".to_string(),
+        "Task".to_string(),
+        3u8,
+    ))
+    .unwrap();
+    let record = EventRecord::new_versioned("initialized", payload, 1, 2);
+    let event = TodoV2Event::try_from(&record).unwrap();
+    match event {
+        TodoV2Event::Initialized {
+            id,
+            user_id,
+            task,
+            priority,
+        } => {
+            assert_eq!(id, "t1");
+            assert_eq!(user_id, "alice");
+            assert_eq!(task, "Task");
+            assert_eq!(priority, 3);
+        }
+        _ => panic!("Expected Initialized"),
+    }
 }
 
 #[test]

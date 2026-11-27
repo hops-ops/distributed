@@ -1,27 +1,17 @@
-//! Authentik live e2e — E1–E8. Gate: `AUTHENTIK_E2E=1`.
+//! Authentik live e2e — E1–E8. Live (`#[ignore = "live: ..."]`): run with
+//! `--ignored` after `scripts/oidc-authentik-up.sh`; fails without `OIDC_ISSUER`.
 //! Mint: client_credentials ([[specs/query-layer/oidc-authentik]]).
 
+use common::env as env_support;
 use common::oidc;
 
 use distributed::graphql::OidcConfig;
 use serde_json::Value;
 
-fn e2e_enabled() -> bool {
-    oidc::gate_enabled("AUTHENTIK_E2E")
-}
-
 #[tokio::test]
+#[ignore = "live: needs a bootstrapped Authentik (scripts/oidc-authentik-up.sh, OIDC_ISSUER)"]
 async fn e1_through_e8_live() {
-    if !e2e_enabled() {
-        eprintln!("AUTHENTIK_E2E not set — skip");
-        return;
-    }
-    let iss = std::env::var("OIDC_ISSUER").unwrap_or_default();
-    if iss.is_empty() {
-        panic!(
-            "AUTHENTIK_E2E=1 requires OIDC_ISSUER (run ./scripts/oidc-authentik-up.sh to bootstrap)"
-        );
-    }
+    let iss = env_support::require_live("OIDC_ISSUER", "Authentik OIDC e2e");
     let jwks_uri = std::env::var("OIDC_JWKS_URI").unwrap_or_default();
     // GLOBAL issuer mode puts iss at origin; discovery/JWKS live under application slug.
     let discovery_ok = oidc::discovery_ready(&iss).await
@@ -54,7 +44,7 @@ async fn e1_through_e8_live() {
     let a_sec = std::env::var("AUTHENTIK_E2E_ADMIN_CLIENT_SECRET").expect("admin secret");
 
     if c_sec.is_empty() || a_sec.is_empty() {
-        panic!("AUTHENTIK_E2E=1 requires client secrets from bootstrap");
+        panic!("Authentik OIDC e2e requires client secrets from bootstrap");
     }
 
     let mut oidc = OidcConfig::new(&iss, &audience).with_extra_audiences([a_id.as_str()]);

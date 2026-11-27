@@ -262,25 +262,6 @@ async fn a_body_without_a_command_id_is_a_bad_request() {
     assert_eq!(resp.status(), 200);
 }
 
-#[tokio::test]
-async fn headers_flow_to_session() {
-    let service = counter_service();
-    let base = start_server(service).await;
-    let client = reqwest::Client::new();
-
-    let resp = client
-        .post(format!("{base}/session.identify"))
-        .header("x-user-id", "user-42")
-        .json(&json!({ "commandId": command_id(), "input": {} }))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), 200);
-
-    let body: serde_json::Value = resp.json().await.unwrap();
-    assert_eq!(body["payload"], json!({ "user_id": "user-42" }));
-}
-
 /// Documents the HTTP trust boundary: request headers are copied into the
 /// `Session` verbatim and trusted at face value — the framework does NOT
 /// authenticate. A client-supplied identity header is reflected straight

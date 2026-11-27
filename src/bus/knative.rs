@@ -95,17 +95,41 @@ pub fn knative_triggers(plan: &SubscriptionPlan, broker: &str, subscriber_servic
 mod tests {
     use super::*;
 
+    /// One Trigger per subscribed event on the given broker. The CloudEvent
+    /// type filter keeps the raw type; the resource name is sanitized.
     #[test]
-    fn triggers_render_from_subscription_plan() {
-        let plan = SubscriptionPlan {
-            commands: vec![],
-            events: vec!["seat.reserved".to_string()],
-        };
-        let yaml = knative_triggers(&plan, "default", "checkout-projection");
-        assert!(yaml.contains("kind: Trigger"));
-        assert!(yaml.contains("type: seat.reserved"));
-        assert!(yaml.contains("name: checkout-projection-seat-reserved"));
-        assert!(yaml.contains("broker: default"));
+    fn a_trigger_keeps_the_raw_event_type_under_a_sanitized_name() {
+        struct Case {
+            name: &'static str,
+            event: &'static str,
+            type_filter: &'static str,
+            trigger_name: &'static str,
+        }
+        const CASES: &[Case] = &[
+            Case {
+                name: "a lowercase dotted type",
+                event: "seat.reserved",
+                type_filter: "type: seat.reserved",
+                trigger_name: "name: checkout-projection-seat-reserved",
+            },
+            Case {
+                name: "a messy type is sanitized in the name only",
+                event: "Order.Created",
+                type_filter: "type: Order.Created",
+                trigger_name: "name: checkout-projection-order-created",
+            },
+        ];
+        for case in CASES {
+            let plan = SubscriptionPlan {
+                commands: vec![],
+                events: vec![case.event.to_string()],
+            };
+            let yaml = knative_triggers(&plan, "default", "checkout-projection");
+            assert!(yaml.contains("kind: Trigger"), "{}: {yaml}", case.name);
+            assert!(yaml.contains(case.type_filter), "{}: {yaml}", case.name);
+            assert!(yaml.contains(case.trigger_name), "{}: {yaml}", case.name);
+            assert!(yaml.contains("broker: default"), "{}: {yaml}", case.name);
+        }
     }
 
     #[test]
@@ -124,18 +148,6 @@ mod tests {
         assert!(!out.starts_with('-') && !out.ends_with('-'));
         // All-invalid degrades to a safe placeholder.
         assert_eq!(sanitize_k8s_name("..."), "x");
-    }
-
-    #[test]
-    fn trigger_name_is_sanitized_for_messy_event_types() {
-        let plan = SubscriptionPlan {
-            commands: vec![],
-            events: vec!["Order.Created".to_string()],
-        };
-        let yaml = knative_triggers(&plan, "default", "checkout-projection");
-        // The CloudEvent type filter keeps the raw type; the resource name is sanitized.
-        assert!(yaml.contains("type: Order.Created"));
-        assert!(yaml.contains("name: checkout-projection-order-created"));
     }
 
     #[test]

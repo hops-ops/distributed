@@ -168,7 +168,7 @@ fn order_semantics() -> JsonValue {
     })
 }
 
-fn normalized_list_relationship() -> JsonValue {
+pub(super) fn normalized_list_relationship() -> JsonValue {
     json!({
         "name": "owner",
         "target_model": "Todo",
@@ -440,7 +440,7 @@ fn install_create_projection(value: &mut JsonValue) {
     }]);
 }
 
-fn custom_scalar_manifest() -> JsonValue {
+pub(super) fn custom_scalar_manifest() -> JsonValue {
     let mut value = manifest();
     value["models"][0]["fields"]
         .as_array_mut()

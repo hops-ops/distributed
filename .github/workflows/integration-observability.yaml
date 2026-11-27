@@ -72,5 +72,6 @@ jobs:
         env:
           OTEL_EXPORTER_OTLP_TRACES_ENDPOINT: http://localhost:4318/v1/traces
           OTEL_COLLECTOR_TRACES_FILE: ${{ github.workspace }}/target/otel-out/traces.json
-          DISTRIBUTED_REQUIRE_SERVICES: OTEL_EXPORTER_OTLP_TRACES_ENDPOINT,OTEL_COLLECTOR_TRACES_FILE
-        run: 'cargo test --test observability --features http,otel --verbose otel_export::'
+        # Live (`#[ignore = "live: ..."]`): fails without the two variables;
+        # the script fails the step unless exactly one test passed.
+        run: 'scripts/expect-tests-passed.sh 1 cargo test --test observability --features http,otel --verbose otel_export:: -- --ignored'

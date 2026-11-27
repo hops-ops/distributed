@@ -1,6 +1,8 @@
 mod commands;
 mod leaderboards;
 mod model_validation;
+#[cfg(test)]
+mod model_validation_tests;
 mod parse;
 mod projections;
 mod projectors;

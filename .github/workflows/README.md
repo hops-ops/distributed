@@ -19,6 +19,7 @@ existing unbounded-tech quality provider plus the integration/* jobs below —
 | [`integration-celld.yaml`](./integration-celld.yaml) | yes | **This repo:** `tests/e2e-celld` workspace tests, celld storage and cell-alarm proofs (`celld dev`), live celld+NATS |
 | [`integration-wasm32-domains.yaml`](./integration-wasm32-domains.yaml) | yes | **This repo:** every domain crate builds for `wasm32-unknown-unknown` (`scripts/check-wasm32-domains.sh`), and a native-only fixture must fail |
 | [`integration-js.yaml`](./integration-js.yaml) | yes | **This repo:** install, typecheck, test, build, and packed-consumer smoke test for `js/` |
+| [`coverage.yaml`](./coverage.yaml) | yes | **This repo:** `make coverage-local` (the services suite under cargo-llvm-cov): production line coverage per crate and TOTAL in the job summary, `lcov.info` artifact. Push to `v5`/`main` only; not in `version-and-tag.needs` |
 | [`on-pr-quality.yaml`](./on-pr-quality.yaml) | entry | **This repo** PR gate (not the consumer quality contract) |
 | [`on-push-main-version-and-tag.yaml`](./on-push-main-version-and-tag.yaml) | entry | **This repo** main → **vnext** tag |
 | [`on-v-tag-publish.yaml`](./on-v-tag-publish.yaml) | entry | **This repo** crates.io + npm + `distributed` binary release |

@@ -29,21 +29,18 @@ mod typed_command;
 #[cfg(test)]
 mod tests;
 
-pub use direct_projection::CompiledDirectProjectionTarget;
 pub(crate) use direct_projection::{
-    compiled_direct_projection_target, CommandDirectProjectionTarget, CommandProjectedModel,
-    ResolvedDirectProjectionTarget,
+    CommandDirectProjectionTarget, CommandProjectedModel, ResolvedDirectProjectionTarget,
 };
 // Public seams used by derives / `command_input_defaults!` only.
 pub use effect_wire::{
     __command_input_defaults, __input_default_now, __input_default_ulid, __input_default_uuid_v7,
-    CombineEffectNullability, CommandInputDefault, CompiledInputDefault, CompiledInputDefaults,
-    EffectInputDescendableKind, EffectInputFieldMarker, EffectInputObjectKind, EffectInputPath,
-    EffectInputPathKind, EffectInputTerminalKind, EffectModelFieldMarker, EffectNullable,
-    EffectPathNullability, EffectRelationshipMarker, EffectRequired, EffectWireBigInt,
-    EffectWireBoolean, EffectWireBytea, EffectWireChecked, EffectWireCompatible, EffectWireFloat,
-    EffectWireJson, EffectWireList, EffectWireLiteral, EffectWireObject, EffectWireString,
-    EffectWireTimestamp, EffectWireUnsupported, InputDefaultGenerator, TypedEffectExpression,
+    CommandInputDefault, CompiledInputDefault, CompiledInputDefaults, EffectInputFieldMarker,
+    EffectInputObjectKind, EffectInputPathKind, EffectInputTerminalKind, EffectModelFieldMarker,
+    EffectNullable, EffectPathNullability, EffectRelationshipMarker, EffectRequired,
+    EffectWireBigInt, EffectWireBoolean, EffectWireBytea, EffectWireFloat, EffectWireJson,
+    EffectWireList, EffectWireObject, EffectWireString, EffectWireTimestamp, EffectWireUnsupported,
+    InputDefaultGenerator,
 };
 pub use effects::EffectExpression;
 pub use outcomes::{

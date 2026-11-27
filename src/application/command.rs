@@ -701,3 +701,352 @@ where
         CommandSpec::from_typed_command(self)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn field(name: &str, nested: Option<CommandTypeSpec>) -> CommandTypeField {
+        CommandTypeField {
+            name: name.into(),
+            type_name: "String".into(),
+            nullable: false,
+            list: false,
+            item_nullable: false,
+            unsigned_integer: None,
+            nested: nested.map(Box::new),
+        }
+    }
+
+    fn type_spec(name: &str, fields: Vec<CommandTypeField>) -> CommandTypeSpec {
+        CommandTypeSpec {
+            name: name.into(),
+            fields,
+        }
+    }
+
+    fn spec() -> CommandSpec {
+        CommandSpec::try_new(
+            "todo.create",
+            "todo_create",
+            type_spec("CreateTodo", vec![field("title", None)]),
+            type_spec("Todo", vec![field("id", None)]),
+            CommandConsistency::Succeeded,
+        )
+        .unwrap()
+    }
+
+    fn event(name: &str) -> EventSpec {
+        EventSpec {
+            name: name.into(),
+            version: 1,
+            body_type: "TodoCreated".into(),
+            body_version: 1,
+            body_schema: "{}".into(),
+            body_fingerprint: format!("sha256:{}", "ab".repeat(32)),
+            body_codec: "json".into(),
+            body_codec_version: 1,
+        }
+    }
+
+    fn invalid(reason: &str) -> ApplicationResult<()> {
+        Err(ApplicationError::InvalidSpec(reason.into()))
+    }
+
+    fn identity_error(kind: &'static str) -> impl Fn(&ApplicationResult<()>) -> bool {
+        move |result| matches!(result, Err(ApplicationError::InvalidIdentity { kind: k, .. }) if *k == kind)
+    }
+
+    #[test]
+    fn spec_validation_rejects_each_non_portable_part() {
+        type Edit = fn(&mut CommandSpec);
+        let exact: Vec<(&str, Edit, ApplicationResult<()>)> = vec![
+            (
+                "unsorted roles",
+                |s| s.roles = vec!["writer".into(), "admin".into()],
+                Err(ApplicationError::NonCanonical("command role ordering")),
+            ),
+            (
+                "repeated input field",
+                |s| s.input.fields.push(field("title", None)),
+                Err(ApplicationError::Duplicate {
+                    kind: "command type field",
+                    identity: "title".into(),
+                }),
+            ),
+            (
+                "input nested past the depth limit",
+                |s| {
+                    let mut nested = type_spec("Leaf", vec![field("leaf", None)]);
+                    for _ in 0..=super::super::manifest::MAX_MANIFEST_JSON_DEPTH {
+                        nested = type_spec("Level", vec![field("next", Some(nested))]);
+                    }
+                    s.input = nested;
+                },
+                invalid(&format!(
+                    "command input nesting exceeds {}",
+                    super::super::manifest::MAX_MANIFEST_JSON_DEPTH
+                )),
+            ),
+            (
+                "an event emitted twice",
+                |s| s.emits = vec![event("todo.created"), event("todo.created")],
+                Err(ApplicationError::Duplicate {
+                    kind: "command event",
+                    identity: "todo.created".into(),
+                }),
+            ),
+            (
+                "an event with version zero",
+                |s| {
+                    let mut zero = event("todo.created");
+                    zero.body_codec_version = 0;
+                    s.emits = vec![zero];
+                },
+                invalid("event `todo.created` versions must be non-zero"),
+            ),
+            (
+                "an event fingerprint in another form",
+                |s| {
+                    let mut other = event("todo.created");
+                    other.body_fingerprint = format!("sha256:{}", "AB".repeat(32));
+                    s.emits = vec![other];
+                },
+                invalid("event body fingerprint must use the sha256:<64 lowercase hex> form"),
+            ),
+            (
+                "an event fingerprint without the prefix",
+                |s| {
+                    let mut other = event("todo.created");
+                    other.body_fingerprint = "ab".repeat(32);
+                    s.emits = vec![other];
+                },
+                invalid("event body fingerprint must use the sha256:<64 lowercase hex> form"),
+            ),
+            (
+                "defaults with a NUL string",
+                |s| s.defaults = json!(["a\u{0}"]),
+                invalid("command defaults contains oversized or NUL string material"),
+            ),
+            (
+                "applies with a NUL object key",
+                |s| s.applies = json!({"a\u{0}": 1}),
+                invalid("command applies contains oversized or NUL object-key material"),
+            ),
+            (
+                "projection contract with too many values",
+                |s| {
+                    s.projection_contract = json!(vec![
+                        0;
+                        super::super::manifest::MAX_MANIFEST_COLLECTION_ITEMS
+                            + 1
+                    ])
+                },
+                invalid("command projection contract contains too many values"),
+            ),
+            (
+                "direct projection nested past the depth limit",
+                |s| {
+                    let mut deep = json!(null);
+                    for _ in 0..=super::super::manifest::MAX_MANIFEST_JSON_DEPTH {
+                        deep = json!([deep]);
+                    }
+                    s.direct_projection = Some(deep);
+                },
+                invalid(&format!(
+                    "command direct projection exceeds JSON depth {}",
+                    super::super::manifest::MAX_MANIFEST_JSON_DEPTH
+                )),
+            ),
+            (
+                "defaults over the byte budget",
+                |s| {
+                    let chunk = "x".repeat(super::super::manifest::MAX_MANIFEST_STRING_BYTES);
+                    s.defaults = json!(vec![chunk; 257]);
+                },
+                invalid(&format!(
+                    "command defaults exceeds {} JSON bytes",
+                    super::super::manifest::MAX_MANIFEST_JSON_BYTES
+                )),
+            ),
+        ];
+        for (name, edit, expected) in exact {
+            let mut spec = spec();
+            edit(&mut spec);
+            assert_eq!(spec.validate(), expected, "{name}");
+        }
+
+        let identity: Vec<(&str, Edit, &'static str)> = vec![
+            ("command id", |s| s.id = "todo create".into(), "command"),
+            (
+                "padded field name",
+                |s| s.field_name = " todo".into(),
+                "command field",
+            ),
+            (
+                "blank field type",
+                |s| s.output.fields[0].type_name = String::new(),
+                "command field type",
+            ),
+            ("role", |s| s.roles = vec!["a role".into()], "command role"),
+            (
+                "event name",
+                |s| s.emits = vec![event("todo created")],
+                "event",
+            ),
+            (
+                "event body codec",
+                |s| {
+                    let mut blank = event("todo.created");
+                    blank.body_codec = String::new();
+                    s.emits = vec![blank];
+                },
+                "event body codec",
+            ),
+            (
+                "projected model",
+                |s| s.projected_model = Some("a/b".into()),
+                "model",
+            ),
+        ];
+        for (name, edit, kind) in identity {
+            let mut spec = spec();
+            edit(&mut spec);
+            let result = spec.validate();
+            assert!(identity_error(kind)(&result), "{name}: {result:?}");
+        }
+    }
+
+    #[test]
+    fn construction_rejects_an_empty_field_name() {
+        assert_eq!(
+            CommandSpec::try_new(
+                "todo.create",
+                "",
+                type_spec("In", vec![]),
+                type_spec("Out", vec![]),
+                CommandConsistency::Succeeded,
+            )
+            .unwrap_err(),
+            ApplicationError::InvalidSpec("command field name must not be empty".into())
+        );
+    }
+
+    #[test]
+    fn fingerprint_names_the_canonical_spec() {
+        let spec = spec();
+        assert_eq!(spec.validate_fingerprint(), Ok(()));
+        let mut stale = spec.clone();
+        stale.roles = vec!["admin".into()];
+        assert_eq!(
+            stale.validate_fingerprint(),
+            Err(ApplicationError::NonCanonical("command fingerprint"))
+        );
+        stale.refresh_fingerprint().unwrap();
+        assert_eq!(stale.validate_fingerprint(), Ok(()));
+        assert_ne!(stale.fingerprint(), spec.fingerprint());
+        let mut empty = spec;
+        empty.fingerprint.clear();
+        assert_eq!(
+            empty.validate_fingerprint(),
+            Err(ApplicationError::NonCanonical("command fingerprint"))
+        );
+    }
+
+    #[test]
+    fn direct_projection_makes_the_command_atomic_and_changes_its_identity() {
+        let plain = spec();
+        let direct = plain
+            .clone()
+            .with_direct_projection("Todo", json!({"projector": "todos"}))
+            .unwrap();
+        assert_eq!(direct.consistency, CommandConsistency::Atomic);
+        assert_eq!(direct.projected_model.as_deref(), Some("Todo"));
+        assert_ne!(direct.fingerprint(), plain.fingerprint());
+        assert_eq!(direct.validate_fingerprint(), Ok(()));
+        assert!(matches!(
+            plain.with_direct_projection("a b", json!({})),
+            Err(ApplicationError::InvalidIdentity {
+                kind: "projected model",
+                ..
+            })
+        ));
+    }
+
+    fn exposed(spec: &CommandSpec) -> super::super::surface::SurfaceCommandSpec {
+        super::super::surface::SurfaceCommandSpec {
+            id: spec.id.clone(),
+            field_name: spec.field_name.clone(),
+            roles: vec!["writer".into()],
+            input: Some(spec.input.clone()),
+            output: Some(spec.output.clone()),
+            consistency: spec.consistency,
+            defaults: json!([]),
+            projection_contract: json!({"previews": [{"field": "title"}]}),
+            direct_projection: None,
+            projected_model: None,
+        }
+    }
+
+    #[test]
+    fn surface_binding_takes_the_compiled_material_of_the_same_command() {
+        let bound = spec().with_surface_binding(&exposed(&spec())).unwrap();
+        assert_eq!(bound.roles, ["writer"]);
+        assert_eq!(bound.applies, json!([{"field": "title"}]));
+        assert_eq!(bound.validate_fingerprint(), Ok(()));
+
+        let mut disagreeing = exposed(&spec());
+        disagreeing.id = "todo.rename".into();
+        disagreeing.field_name = "todo_rename".into();
+        disagreeing.consistency = CommandConsistency::Eventual;
+        assert_eq!(
+            spec().with_surface_binding(&disagreeing).unwrap_err(),
+            ApplicationError::Collision {
+                kind: "command",
+                identity: "todo.create".into(),
+                reason: "compiled Surface command disagrees on identity, field, consistency".into(),
+            }
+        );
+
+        let mut no_input = exposed(&spec());
+        no_input.input = None;
+        assert_eq!(
+            spec().with_surface_binding(&no_input).unwrap_err(),
+            ApplicationError::Missing {
+                kind: "command input",
+                identity: "todo.create".into()
+            }
+        );
+        let mut no_output = exposed(&spec());
+        no_output.output = None;
+        assert_eq!(
+            spec().with_surface_binding(&no_output).unwrap_err(),
+            ApplicationError::Missing {
+                kind: "command output",
+                identity: "todo.create".into()
+            }
+        );
+    }
+
+    #[test]
+    fn a_mount_must_carry_the_definition_spec() {
+        let spec = spec();
+        let definition =
+            CommandDefinition::with_mount(spec.clone(), CommandMount::contract(spec.clone()))
+                .unwrap();
+        assert_eq!(definition.mount().map(|mount| mount.spec()), Some(&spec));
+
+        let other = spec
+            .clone()
+            .with_direct_projection("Todo", json!({}))
+            .unwrap();
+        assert!(matches!(
+            CommandDefinition::with_mount(spec, CommandMount::contract(other)),
+            Err(ApplicationError::Collision {
+                kind: "command",
+                ..
+            })
+        ));
+    }
+}

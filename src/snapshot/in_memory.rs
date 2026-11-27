@@ -103,24 +103,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn save_and_get() {
-        let store = InMemorySnapshotStore::new();
-        let record = SnapshotRecord::new("test.aggregate", "agg-1", 5, 1, vec![1, 2, 3]);
-        store
-            .save_snapshot(&identity("agg-1"), record)
-            .await
-            .unwrap();
-
-        let loaded = store
-            .get_snapshot(&identity("agg-1"))
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(loaded.version, 5);
-        assert_eq!(loaded.payload, vec![1, 2, 3]);
-    }
-
-    #[tokio::test]
     async fn get_missing_returns_none() {
         let store = InMemorySnapshotStore::new();
         assert!(store

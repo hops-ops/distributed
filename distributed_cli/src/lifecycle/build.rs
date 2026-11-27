@@ -1436,4 +1436,261 @@ mod tests {
             .expect_err("file bound must reject rather than truncate");
         assert!(error.message().contains("exceeds the file bound"));
     }
+
+    fn build_config() -> LifecycleBuildConfig {
+        let source = crate::lifecycle::digest_bytes(b"source");
+        LifecycleBuildConfig {
+            schema_version: LIFECYCLE_BUILD_CONFIG_SCHEMA_VERSION,
+            application: "orders".into(),
+            source: DistributedSourceIdentity {
+                rust: source.clone(),
+                cli: source.clone(),
+                javascript: source,
+            },
+            roots: BTreeSet::from(["application".to_string()]),
+            executors: BTreeMap::from([(
+                "describe".to_string(),
+                LifecycleExecutor {
+                    identity: crate::lifecycle::digest_bytes(b"describe"),
+                    program: "distributed".into(),
+                    args: vec!["describe".into()],
+                    stdout: Some("application.json".into()),
+                },
+            )]),
+            dev: None,
+        }
+    }
+
+    fn executor(config: &mut LifecycleBuildConfig) -> &mut LifecycleExecutor {
+        config.executors.get_mut("describe").unwrap()
+    }
+
+    type BuildConfigEdit = fn(&mut LifecycleBuildConfig);
+
+    /// Each rule a build configuration and its executors must satisfy.
+    #[test]
+    fn a_build_configuration_that_breaks_a_rule_is_refused() {
+        build_config().validate().unwrap();
+        let rows: [(&str, BuildConfigEdit, &str); 10] = [
+            (
+                "schema version",
+                |c| c.schema_version = 2,
+                "unsupported lifecycle build config schema version 2",
+            ),
+            (
+                "mixed sources",
+                |c| c.source.cli = crate::lifecycle::digest_bytes(b"other"),
+                "mixed Distributed source identities",
+            ),
+            (
+                "no executors",
+                |c| c.executors.clear(),
+                "lifecycle executors must contain 1..=",
+            ),
+            (
+                "blank executor name",
+                |c| {
+                    let executor = c.executors.remove("describe").unwrap();
+                    c.executors.insert(String::new(), executor);
+                },
+                "lifecycle executor name must be",
+            ),
+            (
+                "identity that is not a digest",
+                |c| executor(c).identity = "v1".into(),
+                "lifecycle executor identity must be a sha256",
+            ),
+            (
+                "blank program",
+                |c| executor(c).program = " ".into(),
+                "lifecycle executor program must be",
+            ),
+            (
+                "too many arguments",
+                |c| executor(c).args = vec![String::new(); MAX_EXECUTOR_ARGS + 1],
+                "exceeds argument bounds",
+            ),
+            (
+                "NUL argument",
+                |c| executor(c).args = vec!["a\0".into()],
+                "contains a NUL argument",
+            ),
+            (
+                "escaping stdout",
+                |c| executor(c).stdout = Some("../out.json".into()),
+                "escapes the lifecycle root",
+            ),
+            (
+                "invalid dev section",
+                |c| {
+                    c.dev = Some(LifecycleDevConfig {
+                        poll_ms: 0,
+                        debounce_ms: 1,
+                        shutdown_ms: 1,
+                        prepare_ms: 1,
+                        processes: BTreeMap::new(),
+                    })
+                },
+                "poll interval must be within",
+            ),
+        ];
+        for (name, edit, expected) in rows {
+            let mut config = build_config();
+            edit(&mut config);
+            let error = config.validate().unwrap_err().to_string();
+            assert!(error.contains(expected), "{name}: {error}");
+        }
+    }
+
+    fn node(
+        id: &str,
+        dependencies: &[&str],
+        executor: &str,
+    ) -> (String, crate::lifecycle::LifecycleNode) {
+        (
+            id.to_string(),
+            crate::lifecycle::LifecycleNode {
+                id: id.into(),
+                owner: format!("owner/{id}"),
+                kind: crate::contracts::ContractArtifactKind::ApplicationManifest,
+                inputs: BTreeSet::new(),
+                outputs: BTreeSet::new(),
+                dependencies: dependencies
+                    .iter()
+                    .map(|dependency| (*dependency).into())
+                    .collect(),
+                executor: executor.into(),
+            },
+        )
+    }
+
+    /// A partial build selects known nodes closed under their dependants,
+    /// and every node's executor must be configured.
+    #[test]
+    fn node_selection_is_known_and_downstream_closed() {
+        let graph = LifecycleGraph {
+            schema_version: 1,
+            application: "orders".into(),
+            source_identity: String::new(),
+            roots: BTreeSet::new(),
+            nodes: BTreeMap::from([
+                node("application", &[], "describe"),
+                node("clients", &["application"], "compile"),
+            ]),
+            graph_id: String::new(),
+        };
+        let set = |nodes: &[&str]| {
+            nodes
+                .iter()
+                .map(|node| (*node).to_string())
+                .collect::<BTreeSet<_>>()
+        };
+        assert_eq!(
+            selected_nodes(None, &graph).unwrap(),
+            set(&["application", "clients"])
+        );
+        assert_eq!(
+            selected_nodes(Some(&set(&["clients"])), &graph).unwrap(),
+            set(&["clients"])
+        );
+        for (selection, expected) in [
+            (set(&[]), "node selection must not be empty"),
+            (set(&["plan", "clients"]), "selects unknown nodes: plan"),
+            (
+                set(&["application"]),
+                "not downstream-closed: `clients` depends on a selected node",
+            ),
+        ] {
+            let error = selected_nodes(Some(&selection), &graph)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains(expected), "{selection:?}: {error}");
+        }
+
+        let error = validate_executor_coverage(&graph, &build_config())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("missing executors: compile"), "{error}");
+    }
+
+    /// Reused outputs are copied as regular files and directories only.
+    #[test]
+    fn reused_outputs_copy_regular_trees_and_refuse_links() {
+        let fixture = tempfile::tempdir().unwrap();
+        let source = fixture.path().join("previous/clients");
+        fs::create_dir_all(source.join("nested")).unwrap();
+        fs::write(source.join("nested/a.ts"), "a").unwrap();
+        let target = fixture.path().join("stage/clients");
+        copy_path(&source, &target).unwrap();
+        assert_eq!(fs::read_to_string(target.join("nested/a.ts")).unwrap(), "a");
+
+        let error = copy_path(&fixture.path().join("absent"), &target).unwrap_err();
+        assert!(
+            error.to_string().contains("inspect reusable output"),
+            "{error}"
+        );
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(source.join("nested/a.ts"), source.join("link.ts")).unwrap();
+            let error = copy_path(&source, &fixture.path().join("again")).unwrap_err();
+            assert!(
+                error.to_string().contains("must not be a symlink"),
+                "{error}"
+            );
+        }
+    }
+
+    /// A build request is checked before anything is staged.
+    #[test]
+    fn a_build_request_outside_its_bounds_is_refused_before_staging() {
+        let fixture = tempfile::tempdir().unwrap();
+        let plan = |root: PathBuf| LifecycleProjectPlan {
+            root,
+            catalog: ContractCatalog {
+                schema_version: crate::contracts::CONTRACT_CATALOG_SCHEMA_VERSION,
+                entries: BTreeMap::new(),
+            },
+            config: build_config(),
+            out: PathBuf::from(".distributed/lifecycle"),
+            cli_executable: PathBuf::from("distributed"),
+        };
+        let request = |lock_timeout: Duration| LifecycleBuildRequest {
+            check: true,
+            lock_timeout,
+            nodes: None,
+            activation_inputs: None,
+            cancel: None,
+            activation: LifecycleActivation::Immediate,
+        };
+        let file = fixture.path().join("file");
+        fs::write(&file, "").unwrap();
+        for (root, timeout, expected) in [
+            (
+                fixture.path().to_path_buf(),
+                Duration::ZERO,
+                "lock timeout must be within",
+            ),
+            (
+                fixture.path().to_path_buf(),
+                Duration::from_secs(61),
+                "lock timeout must be within",
+            ),
+            (
+                fixture.path().join("absent"),
+                Duration::from_secs(1),
+                "failed to resolve lifecycle root",
+            ),
+            (
+                file,
+                Duration::from_secs(1),
+                "lifecycle root must be a directory",
+            ),
+        ] {
+            let error = run_lifecycle_project_build(&plan(root), &request(timeout))
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains(expected), "{error}");
+        }
+        assert!(!fixture.path().join(".distributed").exists());
+    }
 }

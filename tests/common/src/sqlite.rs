@@ -3,13 +3,10 @@
 //! across pools, so a file is required.
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::SqlitePool;
-
-static DB_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// A temp-file SQLite database, deleted (with its WAL/SHM sidecars) on drop.
 pub struct TempDb {
@@ -20,13 +17,8 @@ impl TempDb {
     /// Create a fresh database path under the system temp dir; `prefix` names
     /// the owning suite so leftover files are attributable.
     pub fn new(prefix: &str) -> Self {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("system clock should be after UNIX epoch")
-            .as_nanos();
-        let seq = DB_SEQ.fetch_add(1, Ordering::Relaxed);
         let mut path = std::env::temp_dir();
-        path.push(format!("{prefix}_{nanos}_{seq}.db"));
+        path.push(format!("{}.db", crate::ids::unique(prefix)));
         Self { path }
     }
 

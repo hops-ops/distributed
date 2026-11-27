@@ -16,21 +16,43 @@ is the demo.
 
 ## Option A — local cluster + environment GitOps
 
-Start the kind control plane, then run the cluster and environment watchers in
-separate terminals. Hops uses Dory's socket automatically when it is available
-on macOS; CI uses the host Docker daemon:
+This fixture declares its own disposable kind Cluster `e2e-ui` (kube context
+`kind-e2e-ui`), separate from the machine Cluster that `hops local up` manages.
+CI pins hops-cli v0.57.1. It runs on whichever Docker engine `DOCKER_HOST`
+(or the current docker context) names; CI uses the runner's daemon. Start
+the Cluster, then the Environment, in separate terminals:
 
 ```bash
 cd tests/e2e-ui
-hops local gitops cluster ./.gitops/local/cluster.yaml \
-  --cluster-provider kind --docker-provider docker \
-  --cluster-name e2e-ui --context kind-e2e-ui
+hops local gitops cluster ./.gitops/local/cluster.yaml
 
 hops local gitops environment ./.gitops/local/environment.yaml \
-  --context kind-e2e-ui
+  --name local --context kind-e2e-ui
 ```
 
-Both commands watch by default; use `--once` for CI or a single diagnostic
+`--context` keeps hops from falling back to the kubeconfig's current context
+when `kind-e2e-ui` does not exist yet. `--name local` gives the Environment the runtime name CI uses: namespace
+`local` and OIDC workspace `e2e-ui-local`. Without it the name is the
+checkout directory, `e2e-ui`. The Environment is not catalogued
+(`hops local env discover|enable` serve the machine Cluster), so the Cluster
+watcher does not reconcile it; its own watcher does.
+
+A fresh Cluster also needs live Secrets that no GitOps tree holds:
+`auth/zitadel-masterkey` and `default/aws-creds` before AuthStack reconciles,
+the Zitadel provider credentials, and `local/e2e-ui-oidc`, all before the
+Environment. The credentials come from AuthStack's PAT:
+
+```bash
+hops local zitadel --cluster-provider kind --docker-provider docker \
+  --cluster-name e2e-ui --context kind-e2e-ui --source-context kind-e2e-ui \
+  --source-namespace auth --domain zitadel-zitadel.auth.svc.cluster.local \
+  --port 8080 --insecure --refresh
+```
+
+The `local-gitops` job in `.github/workflows/integration-e2e-ui.yaml` is the
+exact sequence.
+
+The Cluster and Environment commands watch by default; use `--once` for CI or a single diagnostic
 reconcile. The cluster tree owns Crossplane, providers, AuthStack, and the
 serving PSQLCluster; the environment tree owns one coherent API+UI application
 deploy and the explicit test-user deploy. Change those GitOps trees rather
@@ -104,7 +126,7 @@ cd ../e2e-celld && make run
 
 `make up-celld-nats` starts celld (version pinned in `/.celld-version`) with its persistent local store, the Queue
 relay, and NATS (`celld-nats-profile/`). `make test-celld-nats` only validates
-an already-running profile. Neither command is `make run`. GraphQL wait-dispatches
+an already-running profile (it runs the ignored live smoke with `--ignored`). Neither command is `make run`. GraphQL wait-dispatches
 Todo create/complete and `chat.post` to cells (one SQLite shard per todo or
 message). GraphQL `@live`, Eventual projectors, Blob, and identity stay in
 the GraphQL process.

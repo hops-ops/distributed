@@ -25,8 +25,14 @@ services:
       POSTGRES_DB: distributed
     ports:
       - "5432:5432"
+    # Exec form, no shell. The postmaster is PID 1 and treats any child it
+    # did not start that exits with a code other than 0 or 1 as a crashed
+    # backend: it drops every connection and runs crash recovery. When a
+    # shell-form check times out, Docker kills the `sh`, its `pg_isready` is
+    # re-parented to PID 1 and exits 2 ("no response"). Killed directly,
+    # `pg_isready` is never Postgres's child.
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U sourced -d distributed"]
+      test: ["CMD", "pg_isready", "-h", "127.0.0.1", "-U", "sourced", "-d", "distributed"]
       interval: 2s
       timeout: 5s
       retries: 20
@@ -36,8 +42,12 @@ services:
     ports:
       - "5672:5672"   # AMQP
       - "15672:15672" # management UI
+    # The check runs as root with HOME=/var/lib/rabbitmq. Run before the
+    # server has written its Erlang cookie, `rabbitmq-diagnostics` creates
+    # one owned by root, mode 0400, and the server (user rabbitmq) exits
+    # with eacces. So the check waits for the server's cookie.
     healthcheck:
-      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      test: ["CMD-SHELL", "test -f /var/lib/rabbitmq/.erlang.cookie && rabbitmq-diagnostics -q ping"]
       interval: 5s
       timeout: 5s
       retries: 20

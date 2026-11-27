@@ -459,17 +459,47 @@ mod tests {
     use super::snake_to_pascal;
 
     #[test]
-    fn snake_table_names_become_rust_type_names() {
-        assert_eq!(snake_to_pascal("todos"), "Todos");
-        assert_eq!(snake_to_pascal("chat_messages"), "ChatMessages");
-        assert_eq!(snake_to_pascal("blob_games"), "BlobGames");
-        assert_eq!(snake_to_pascal("auth_users"), "AuthUsers");
-    }
-
-    #[test]
-    fn pascal_suffixes_stay_pascal() {
-        assert_eq!(snake_to_pascal("Todos"), "Todos");
-        assert_eq!(snake_to_pascal("ChatMessages"), "ChatMessages");
+    fn snake_table_names_become_pascal_rust_type_names() {
+        struct Case {
+            name: &'static str,
+            table: &'static str,
+            expected: &'static str,
+        }
+        const CASES: &[Case] = &[
+            Case {
+                name: "one word",
+                table: "todos",
+                expected: "Todos",
+            },
+            Case {
+                name: "two words",
+                table: "chat_messages",
+                expected: "ChatMessages",
+            },
+            Case {
+                name: "two words, blob",
+                table: "blob_games",
+                expected: "BlobGames",
+            },
+            Case {
+                name: "two words, auth",
+                table: "auth_users",
+                expected: "AuthUsers",
+            },
+            Case {
+                name: "a Pascal word stays Pascal",
+                table: "Todos",
+                expected: "Todos",
+            },
+            Case {
+                name: "Pascal words stay Pascal",
+                table: "ChatMessages",
+                expected: "ChatMessages",
+            },
+        ];
+        for case in CASES {
+            assert_eq!(snake_to_pascal(case.table), case.expected, "{}", case.name);
+        }
     }
 
     #[test]

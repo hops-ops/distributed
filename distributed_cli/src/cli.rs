@@ -1653,12 +1653,17 @@ pub(crate) fn resolve_distributed_path(
         return validate_distributed_path(Path::new(&path));
     }
 
-    let mut roots = Vec::new();
-    roots.extend(anchor.ancestors().map(Path::to_path_buf));
-    roots.extend(std::env::current_dir()?.ancestors().map(Path::to_path_buf));
+    let current = std::env::current_dir()?;
+    find_distributed_crate(anchor.ancestors().chain(current.ancestors()))
+}
 
+/// The first `root` or `root/distributed` holding the `distributed` crate,
+/// searching `roots` in order.
+fn find_distributed_crate<'a>(
+    roots: impl IntoIterator<Item = &'a Path>,
+) -> Result<PathBuf, Box<dyn Error>> {
     for root in roots {
-        for candidate in [root.clone(), root.join("distributed")] {
+        for candidate in [root.to_path_buf(), root.join("distributed")] {
             if candidate.join("Cargo.toml").exists()
                 && cargo_toml_package_name(&candidate.join("Cargo.toml")).as_deref()
                     == Some("distributed")
@@ -1871,5 +1876,213 @@ mod tests {
         let mut both = schema_args();
         both.db_url = Some("postgres://localhost/orders".to_string());
         assert!(atlas_spec_from_flags(&both, "sql".into()).is_err());
+    }
+
+    fn application_envelope() -> serde_json::Value {
+        serde_json::json!({
+            "schema_version": DISTRIBUTED_MANIFEST_SCHEMA_VERSION,
+            "name": "orders",
+            "modules": [],
+            "surfaces": [],
+            "extensions": [{
+                "id": "distributed.framework",
+                "version": 1,
+                "value": { "release": env!("CARGO_PKG_VERSION") }
+            }]
+        })
+    }
+
+    type EnvelopeEdit = fn(&mut serde_json::Value);
+
+    /// What `describe` accepts from the harness, and each reason it refuses
+    /// an envelope.
+    #[test]
+    fn application_manifest_envelopes_are_checked_field_by_field() {
+        validate_manifest_json(&application_envelope()).unwrap();
+        let rows: [(EnvelopeEdit, &str); 9] = [
+            (
+                |v| v["schema_version"] = "3".into(),
+                "missing numeric schema_version",
+            ),
+            (
+                |v| v["schema_version"] = 2.into(),
+                "unsupported Distributed manifest schema version 2; expected 3",
+            ),
+            (|v| v["name"] = "".into(), "missing non-empty string name"),
+            (|v| v["surfaces"] = 1.into(), "missing array surfaces"),
+            (
+                |v| v["models"] = serde_json::json!([]),
+                "contains redundant inventory models",
+            ),
+            (
+                |v| v["extensions"] = serde_json::json!([]),
+                "missing framework compatibility",
+            ),
+            (
+                |v| v["extensions"][0]["version"] = 2.into(),
+                "unsupported application framework compatibility record version",
+            ),
+            (
+                |v| v["extensions"][0]["value"]["release"] = "".into(),
+                "compatibility record is missing release",
+            ),
+            (
+                |v| v["extensions"][0]["value"]["release"] = "0.0.0-other".into(),
+                "framework release `0.0.0-other` does not match CLI release",
+            ),
+        ];
+        for (edit, expected) in rows {
+            let mut envelope = application_envelope();
+            edit(&mut envelope);
+            let error = validate_manifest_json(&envelope).unwrap_err().to_string();
+            assert!(error.contains(expected), "expected `{expected}`: {error}");
+        }
+    }
+
+    /// Roles come from the matching application surface; any other surface
+    /// yields none so the compiler reports the mismatch, and a matching
+    /// surface with unusable roles is an error.
+    #[test]
+    fn client_roles_come_from_the_matching_application_surface() {
+        let manifest = |surface: serde_json::Value| serde_json::json!({ "surface": surface });
+        let application = serde_json::json!({
+            "kind": "application",
+            "name": "orders",
+            "eligible_roles": ["user", "admin"],
+            "schema_roles": ["user"]
+        });
+        assert_eq!(
+            application_roles_from_manifest(&manifest(application.clone()), "orders").unwrap(),
+            (
+                vec!["user".to_string(), "admin".to_string()],
+                vec!["user".to_string()]
+            )
+        );
+        let none = (Vec::new(), Vec::new());
+        assert_eq!(
+            application_roles_from_manifest(&serde_json::json!({}), "orders").unwrap(),
+            none
+        );
+        assert_eq!(
+            application_roles_from_manifest(&manifest(application.clone()), "billing").unwrap(),
+            none
+        );
+        let mut role = application.clone();
+        role["kind"] = "role".into();
+        assert_eq!(
+            application_roles_from_manifest(&manifest(role), "orders").unwrap(),
+            none
+        );
+
+        let rows = [
+            (
+                "schema_roles",
+                serde_json::Value::Null,
+                "missing non-empty `schema_roles`",
+            ),
+            (
+                "eligible_roles",
+                serde_json::json!([1]),
+                "`eligible_roles` must be strings",
+            ),
+            (
+                "schema_roles",
+                serde_json::json!([]),
+                "`schema_roles` must not be empty",
+            ),
+        ];
+        for (field, value, expected) in rows {
+            let mut surface = application.clone();
+            surface[field] = value;
+            let error = application_roles_from_manifest(&manifest(surface), "orders")
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains(expected), "{field}: {error}");
+        }
+    }
+
+    /// The crate search takes the first root holding the `distributed`
+    /// package, directly or in a `distributed` child, and reads the package
+    /// name only from `[package]`.
+    #[test]
+    fn the_distributed_crate_is_found_by_its_package_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let write = |path: &str, contents: &str| {
+            let path = root.join(path);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, contents).unwrap();
+        };
+        write(
+            "app/Cargo.toml",
+            "[workspace]\nname = \"distributed\"\n[package]\nname = \"app\"\n",
+        );
+        write(
+            "app/distributed/Cargo.toml",
+            "[package]\nname=\"distributed\"\n",
+        );
+        write(
+            "other/Cargo.toml",
+            "[dependencies]\nname = \"distributed\"\n",
+        );
+        write("no-name/Cargo.toml", "[package]\nversion = \"1\"\n");
+
+        let app = root.join("app");
+        assert_eq!(
+            find_distributed_crate([app.as_path(), root.as_path()]).unwrap(),
+            app.join("distributed")
+        );
+        let error =
+            find_distributed_crate([root.join("other").as_path(), root.join("no-name").as_path()])
+                .unwrap_err();
+        assert!(
+            error.to_string().contains("pass --distributed-path"),
+            "{error}"
+        );
+
+        assert_eq!(
+            resolve_distributed_path(Some(&app.join("distributed")), &root).unwrap(),
+            app.join("distributed")
+        );
+        for (path, expected) in [
+            (root.clone(), "does not contain Cargo.toml"),
+            (app.clone(), "is not the Distributed crate"),
+        ] {
+            let error = resolve_distributed_path(Some(&path), &root)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains(expected), "{}: {error}", path.display());
+        }
+        assert!(resolve_distributed_path(Some(&root.join("absent")), &root).is_err());
+    }
+
+    /// Small path and input decisions shared by several commands.
+    #[test]
+    fn path_and_input_helpers_refuse_what_they_cannot_represent() {
+        assert_eq!(
+            portable_relative_path(Path::new("./src/routes/q.graphql")).unwrap(),
+            "src/routes/q.graphql"
+        );
+        for path in ["../q.graphql", "/abs/q.graphql", "."] {
+            assert!(portable_relative_path(Path::new(path)).is_err(), "{path}");
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("input.json");
+        fs::write(&file, "four").unwrap();
+        assert_eq!(read_utf8_bounded(&file, 4, "manifest").unwrap(), "four");
+        let error = read_utf8_bounded(&file, 3, "manifest")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("is 4 bytes; maximum supported size is 3"),
+            "{error}"
+        );
+        fs::write(&file, [0xff, 0xfe]).unwrap();
+        let error = read_utf8_bounded(&file, 4, "manifest")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("is not UTF-8"), "{error}");
+        assert!(read_utf8_bounded(&dir.path().join("absent"), 4, "manifest").is_err());
     }
 }

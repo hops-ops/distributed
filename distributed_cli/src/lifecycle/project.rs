@@ -190,6 +190,17 @@ pub fn discover_lifecycle_project(
     }
 
     let metadata = cargo_metadata(&manifest)?;
+    discover_from_metadata(&requested, metadata, executable.as_ref(), out)
+}
+
+/// Plan the project `cargo metadata` describes. `requested` is the canonical
+/// directory the caller named; it must be the Cargo workspace root.
+fn discover_from_metadata(
+    requested: &Path,
+    metadata: CargoMetadata,
+    executable: &Path,
+    out: Option<&Path>,
+) -> Result<DiscoveredLifecycleProject, LifecycleError> {
     let root = metadata.workspace_root.canonicalize().map_err(|error| {
         LifecycleError::new(format!("failed to resolve Cargo workspace root: {error}"))
     })?;
@@ -224,7 +235,7 @@ pub fn discover_lifecycle_project(
         .parent()
         .ok_or_else(|| LifecycleError::new("Distributed Cargo.toml has no parent directory"))?
         .to_path_buf();
-    let executable = executable.as_ref().canonicalize().map_err(|error| {
+    let executable = executable.canonicalize().map_err(|error| {
         LifecycleError::new(format!(
             "failed to resolve the distributed executable: {error}"
         ))
@@ -1760,5 +1771,711 @@ mod tests {
         assert!(error.contains("Run this checkout's CLI"));
         assert!(error.contains(checkout.path().to_string_lossy().as_ref()));
         assert!(!error.contains("cargo install distributed_cli --version 0.1.0"));
+    }
+
+    const CLI_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+    /// A Cargo workspace on disk with an application, a runtime and a
+    /// registry `distributed`, plus a `distributed` executable outside any
+    /// checkout, so all three framework members are the same release.
+    struct Workspace {
+        _dir: tempfile::TempDir,
+        _bin: tempfile::TempDir,
+        root: PathBuf,
+        executable: PathBuf,
+    }
+
+    impl Workspace {
+        fn new() -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().join("orders");
+            fs::create_dir_all(&root).unwrap();
+            let root = root.canonicalize().unwrap();
+            for path in ["service/src", "runner/src"] {
+                fs::create_dir_all(root.join(path)).unwrap();
+            }
+            for path in [
+                "Cargo.toml",
+                "Cargo.lock",
+                "service/Cargo.toml",
+                "runner/Cargo.toml",
+            ] {
+                fs::write(root.join(path), "").unwrap();
+            }
+            let bin = tempfile::tempdir().unwrap();
+            let executable = bin.path().join("distributed");
+            fs::write(&executable, "cli binary").unwrap();
+            Self {
+                _dir: dir,
+                _bin: bin,
+                root,
+                executable,
+            }
+        }
+
+        /// A conventional UI with a client inventory owned by the lifecycle,
+        /// depending on the published browser runtime when `dependency`.
+        fn with_client_ui(self, dependency: bool) -> Self {
+            let ui = self.root.join("ui");
+            fs::create_dir_all(ui.join("src/routes")).unwrap();
+            let dependencies = if dependency {
+                serde_json::json!({ "@hops-ops/distributed": CLI_VERSION })
+            } else {
+                serde_json::json!({})
+            };
+            fs::write(
+                ui.join("package.json"),
+                serde_json::json!({ "dependencies": dependencies }).to_string(),
+            )
+            .unwrap();
+            fs::write(
+                ui.join("package-lock.json"),
+                serde_json::json!({
+                    "packages": { "node_modules/@hops-ops/distributed": { "version": CLI_VERSION } }
+                })
+                .to_string(),
+            )
+            .unwrap();
+            fs::write(
+                ui.join("distributed.clients.json"),
+                serde_json::json!({
+                    "schema_version": 1,
+                    "clients": [{
+                        "module": "$distributed",
+                        "surface": "orders",
+                        "documents": ["src/routes/*.graphql"],
+                        "output": "src/lib/generated"
+                    }]
+                })
+                .to_string(),
+            )
+            .unwrap();
+            fs::write(
+                ui.join(CLIENT_CONFIG),
+                "export const distributedViteOptions = {};\n",
+            )
+            .unwrap();
+            self
+        }
+
+        fn metadata(&self) -> Value {
+            let member = |name: &str, directory: &str, target: &str, kind: &str| {
+                serde_json::json!({
+                    "id": format!("path+file://{}#{name}@0.1.0", self.root.display()),
+                    "name": name,
+                    "version": "0.1.0",
+                    "manifest_path": self.root.join(directory).join("Cargo.toml"),
+                    "source": null,
+                    "targets": [{ "name": target, "kind": [kind] }]
+                })
+            };
+            let service = member("orders-service", "service", "orders_service", "lib");
+            let runner = member("orders-runner", "runner", "orders", "bin");
+            serde_json::json!({
+                "workspace_root": self.root,
+                "workspace_members": [service["id"], runner["id"]],
+                "packages": [
+                    service,
+                    runner,
+                    {
+                        "id": format!("registry+https://github.com/rust-lang/crates.io-index#distributed@{CLI_VERSION}"),
+                        "name": "distributed",
+                        "version": CLI_VERSION,
+                        "manifest_path": format!("/registry/distributed-{CLI_VERSION}/Cargo.toml"),
+                        "source": "registry+https://github.com/rust-lang/crates.io-index",
+                        "targets": [{ "name": "distributed", "kind": ["lib"] }]
+                    }
+                ],
+                "metadata": null
+            })
+        }
+
+        fn discover(&self, metadata: Value) -> Result<DiscoveredLifecycleProject, LifecycleError> {
+            discover_from_metadata(
+                &self.root,
+                serde_json::from_value(metadata).unwrap(),
+                &self.executable,
+                None,
+            )
+        }
+    }
+
+    fn strings(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| (*value).to_string()).collect()
+    }
+
+    /// The whole plan for a project whose UI owns generated clients: both
+    /// catalog entries chained, the client tree as the only root, the
+    /// describe command with every argument, and the SvelteKit compiler.
+    #[test]
+    fn a_project_with_lifecycle_clients_plans_both_generators() {
+        let workspace = Workspace::new().with_client_ui(true);
+        let root = &workspace.root;
+        let ui = root.join("ui");
+        let project = workspace.discover(workspace.metadata()).unwrap();
+
+        assert_eq!(project.name, "orders");
+        assert_eq!(project.application_package, "orders-service");
+        assert_eq!(
+            project.application_entrypoint,
+            "orders_service::application_manifest"
+        );
+        assert_eq!(project.runtime_package, "orders-runner");
+        assert_eq!(project.runtime_binary, "orders");
+        assert!(matches!(
+            project.javascript.as_ref().map(|package| &package.source),
+            Some(JavascriptPackageSource::Registry)
+        ));
+
+        let plan = &project.plan;
+        assert_eq!(&plan.root, root);
+        assert_eq!(plan.out, root.join(".distributed/lifecycle"));
+        assert_eq!(
+            plan.catalog.entries["application"].provenance.sources,
+            BTreeSet::from(
+                [
+                    "Cargo.lock",
+                    "Cargo.toml",
+                    "runner/Cargo.toml",
+                    "runner/src",
+                    "service/Cargo.toml",
+                    "service/src"
+                ]
+                .map(String::from)
+            )
+        );
+        let clients = &plan.catalog.entries["clients"];
+        assert_eq!(
+            clients
+                .predecessor
+                .as_ref()
+                .map(|link| link.entry_id.as_str()),
+            Some("application")
+        );
+        assert!(clients.provenance.sources.contains(APPLICATION_OUTPUT));
+        assert!(clients.provenance.sources.contains("ui/src/routes"));
+        assert_eq!(plan.config.roots, BTreeSet::from(["clients".to_string()]));
+
+        let describe = &plan.config.executors["distributed.application-manifest"];
+        assert_eq!(
+            describe.program,
+            workspace
+                .executable
+                .canonicalize()
+                .unwrap()
+                .to_string_lossy()
+        );
+        assert_eq!(describe.stdout.as_deref(), Some(APPLICATION_OUTPUT));
+        assert_eq!(
+            describe.args,
+            [
+                strings(&[
+                    "describe",
+                    "--manifest-path",
+                    "{root}/Cargo.toml",
+                    "--package",
+                    "orders-service",
+                    "--entrypoint",
+                    "orders_service::application_manifest",
+                    "--distributed-path",
+                ]),
+                vec![format!("/registry/distributed-{CLI_VERSION}")],
+                strings(&["--wasm-pack-launcher"]),
+                vec![ui
+                    .join("node_modules/wasm-pack/run.js")
+                    .to_string_lossy()
+                    .into_owned()],
+            ]
+            .concat()
+        );
+        let compiler = &plan.config.executors["distributed.sveltekit-clients"];
+        assert_eq!(compiler.program, "node");
+        assert_eq!(
+            compiler.args,
+            [
+                ui.join("node_modules/@hops-ops/distributed/dist/sveltekit/lifecycle-compiler.js"),
+                ui.join(CLIENT_CONFIG),
+            ]
+            .map(|path| path.to_string_lossy().into_owned())
+        );
+        let dev = plan.config.dev.as_ref().unwrap();
+        assert_eq!(
+            dev.processes.keys().map(String::as_str).collect::<Vec<_>>(),
+            ["api", "ui"],
+            "a published browser runtime has no local watcher"
+        );
+
+        let custom = discover_from_metadata(
+            root,
+            serde_json::from_value(workspace.metadata()).unwrap(),
+            &workspace.executable,
+            Some(Path::new("state")),
+        )
+        .unwrap();
+        assert_eq!(custom.plan.out, root.join("state"));
+        assert_eq!(
+            custom.plan.config.executors["distributed.application-manifest"].args[0],
+            "describe"
+        );
+    }
+
+    /// A Rust-only project from a local checkout: one generator, no UI, and
+    /// every framework member identified by that checkout.
+    #[test]
+    fn a_checkout_project_without_a_ui_plans_only_the_application() {
+        let workspace = Workspace::new();
+        let checkout = workspace.root.parent().unwrap().join("framework");
+        fs::create_dir_all(checkout.join("distributed_cli")).unwrap();
+        fs::write(checkout.join("distributed_cli/Cargo.toml"), "").unwrap();
+        fs::write(checkout.join("Cargo.toml"), "").unwrap();
+        fs::create_dir_all(checkout.join("target")).unwrap();
+        let executable = checkout.join("target/distributed");
+        fs::write(&executable, "checkout cli").unwrap();
+        let mut metadata = workspace.metadata();
+        metadata["packages"][2]["source"] = Value::Null;
+        metadata["packages"][2]["manifest_path"] = serde_json::json!(checkout.join("Cargo.toml"));
+
+        let project = discover_from_metadata(
+            &workspace.root,
+            serde_json::from_value(metadata).unwrap(),
+            &executable,
+            None,
+        )
+        .unwrap();
+
+        assert!(project.ui.is_none() && project.javascript.is_none());
+        let config = &project.plan.config;
+        assert_eq!(config.roots, BTreeSet::from(["application".to_string()]));
+        assert_eq!(
+            config
+                .executors
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            ["distributed.application-manifest"]
+        );
+        assert!(!config.executors["distributed.application-manifest"]
+            .args
+            .contains(&"--wasm-pack-launcher".to_string()));
+        assert_eq!(config.source.rust, config.source.cli);
+        assert_eq!(
+            project
+                .plan
+                .catalog
+                .entries
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            ["application"]
+        );
+    }
+
+    type MetadataEdit = fn(&Workspace, &mut Value);
+
+    /// What stops a project from being planned, one row per reason.
+    #[test]
+    fn a_project_that_cannot_be_planned_names_the_reason() {
+        let rows: [(&str, bool, MetadataEdit, &str); 6] = [
+            (
+                "workspace root is not the requested directory",
+                false,
+                |workspace, metadata| {
+                    metadata["workspace_root"] = serde_json::json!(workspace.root.join("service"))
+                },
+                "run the command from the workspace root",
+            ),
+            (
+                "no distributed dependency",
+                false,
+                |_, metadata| {
+                    metadata["packages"].as_array_mut().unwrap().pop();
+                },
+                "does not depend on the `distributed` Rust package",
+            ),
+            (
+                "runtime bind that is not a string",
+                false,
+                |_, metadata| {
+                    metadata["metadata"] =
+                        serde_json::json!({ "distributed": { "runtime": { "bind": 8791 } } })
+                },
+                "runtime `bind` must be a string",
+            ),
+            (
+                "framework members of different releases",
+                false,
+                |_, metadata| metadata["packages"][2]["version"] = serde_json::json!("0.0.0-older"),
+                "incompatible Distributed framework members",
+            ),
+            (
+                "client inventory without the browser runtime",
+                true,
+                |_, _| {},
+                "distributed.clients.json requires @hops-ops/distributed",
+            ),
+            (
+                "explicit application package outside the workspace",
+                false,
+                |_, metadata| {
+                    metadata["metadata"] = serde_json::json!({
+                        "distributed": { "application": { "package": "billing", "entrypoint": "app" } }
+                    })
+                },
+                "application package is not a workspace member",
+            ),
+        ];
+        for (name, client_ui_without_runtime, edit, expected) in rows {
+            let mut workspace = Workspace::new();
+            if client_ui_without_runtime {
+                workspace = workspace.with_client_ui(false);
+            }
+            let mut metadata = workspace.metadata();
+            edit(&workspace, &mut metadata);
+            let error = workspace.discover(metadata).unwrap_err().to_string();
+            assert!(error.contains(expected), "{name}: {error}");
+        }
+
+        let workspace = Workspace::new();
+        let missing_executable = discover_from_metadata(
+            &workspace.root,
+            serde_json::from_value(workspace.metadata()).unwrap(),
+            &workspace.root.join("no-such-cli"),
+            None,
+        )
+        .unwrap_err();
+        assert!(
+            missing_executable
+                .to_string()
+                .contains("failed to resolve the distributed executable"),
+            "{missing_executable}"
+        );
+    }
+
+    /// The requested path is checked before `cargo metadata` runs.
+    #[test]
+    fn a_requested_path_that_is_not_a_cargo_workspace_is_refused_before_cargo_runs() {
+        let workspace = Workspace::new();
+        let cases = [
+            (
+                workspace.root.join("absent"),
+                "failed to resolve Distributed project",
+            ),
+            (workspace.root.join("Cargo.toml"), "is not a directory"),
+            (workspace.root.join("service/src"), "has no Cargo.toml"),
+        ];
+        for (path, expected) in cases {
+            let error = discover_lifecycle_project(&path, &workspace.executable, None)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains(expected), "{}: {error}", path.display());
+        }
+    }
+
+    /// The source identity of each framework member: a git source and a
+    /// local JavaScript checkout elsewhere are distinct members and are
+    /// refused; the checkout's own `js` directory is the same member.
+    #[test]
+    fn framework_members_are_identified_by_where_they_come_from() {
+        let checkout = tempfile::tempdir().unwrap();
+        let checkout_root = checkout.path().canonicalize().unwrap();
+        fs::create_dir_all(checkout_root.join("js")).unwrap();
+        fs::create_dir_all(checkout_root.join("distributed_cli")).unwrap();
+        fs::write(checkout_root.join("distributed_cli/Cargo.toml"), "").unwrap();
+        let executable = checkout_root.join("distributed");
+        fs::write(&executable, "").unwrap();
+        let local = package("distributed", Value::Null, &[]);
+        let javascript = |root: PathBuf| JavascriptFrameworkPackage {
+            version: "0.1.0".into(),
+            source: JavascriptPackageSource::Local { root },
+        };
+
+        let same = framework_identities(
+            &local,
+            &checkout_root,
+            &executable,
+            Some(&javascript(checkout_root.join("js"))),
+        )
+        .unwrap();
+        assert_eq!(same.rust.identity, same.javascript.identity);
+        assert_eq!(same.rust.identity, same.cli.identity);
+
+        let elsewhere = tempfile::tempdir().unwrap();
+        let error = framework_identities(
+            &local,
+            &checkout_root,
+            &executable,
+            Some(&javascript(elsewhere.path().canonicalize().unwrap())),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("javascript: local version=0.1.0 checkout="),
+            "{error}"
+        );
+        assert!(error.contains("Run this checkout's CLI"), "{error}");
+
+        let git = CargoPackage {
+            source: Some("git+https://example.invalid/distributed#abc".into()),
+            ..package("distributed", Value::Null, &[])
+        };
+        let error = framework_identities(&git, &checkout_root, &executable, None)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains(
+                "rust: external version=0.1.0 source=git+https://example.invalid/distributed#abc"
+            ),
+            "{error}"
+        );
+        assert!(error.contains("cargo install distributed_cli"), "{error}");
+    }
+
+    /// How the application and runtime targets are chosen, and each reason
+    /// none can be.
+    #[test]
+    fn application_and_runtime_targets_are_chosen_or_refused() {
+        let service = package("orders-service", Value::Null, &[("orders_service", "lib")]);
+        let runner = package(
+            "orders-runner",
+            Value::Null,
+            &[("orders", "bin"), ("admin", "bin")],
+        );
+        let packages = vec![&service, &runner];
+        let declared = serde_json::json!({ "distributed": {
+            "application": { "package": "orders-service", "entrypoint": "crate_app::manifest" },
+            "runtime": { "package": "orders-runner", "binary": "admin" }
+        }});
+        let application = discover_application(&declared, &packages).unwrap();
+        assert_eq!(application.entrypoint, "crate_app::manifest");
+        assert_eq!(
+            discover_runtime(&declared, &packages).unwrap().binary,
+            "admin"
+        );
+
+        let application_mark = |entrypoint: &str| serde_json::json!({ "distributed": { "application": { "entrypoint": entrypoint } } });
+        let runtime_mark = |binary: &str| serde_json::json!({ "distributed": { "runtime": { "binary": binary } } });
+        let first = package("a", application_mark("one"), &[("a", "lib")]);
+        let second = package("b", application_mark("two"), &[("b", "lib")]);
+        let headless = package("c", application_mark("three"), &[("c", "bin")]);
+        let runtime_a = package("ra", runtime_mark("x"), &[("x", "bin")]);
+        let runtime_b = package("rb", runtime_mark("y"), &[("y", "bin")]);
+        let missing_binary = package("rc", runtime_mark("absent"), &[("z", "bin")]);
+
+        let application_rows: [(&str, Vec<&CargoPackage>, &str); 3] = [
+            (
+                "two marked applications",
+                vec![&first, &second],
+                "more than one Distributed application",
+            ),
+            (
+                "no candidate",
+                vec![&runner],
+                "unable to locate one typed Distributed application",
+            ),
+            (
+                "marked package without a library",
+                vec![&headless],
+                "has no library target",
+            ),
+        ];
+        for (name, packages, expected) in application_rows {
+            let error = discover_application(&Value::Null, &packages)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains(expected), "{name}: {error}");
+        }
+        let runtime_rows: [(&str, Value, Vec<&CargoPackage>, &str); 4] = [
+            (
+                "two marked runtimes",
+                Value::Null,
+                vec![&runtime_a, &runtime_b],
+                "more than one Distributed runtime",
+            ),
+            (
+                "two unmarked binaries",
+                Value::Null,
+                vec![&runner],
+                "unable to locate one Distributed runtime binary",
+            ),
+            (
+                "marked binary absent from its package",
+                Value::Null,
+                vec![&missing_binary],
+                "has no `absent` binary target",
+            ),
+            (
+                "declared package outside the workspace",
+                serde_json::json!({ "distributed": { "runtime": { "package": "billing", "binary": "x" } } }),
+                vec![&runner],
+                "runtime package is not a workspace member",
+            ),
+        ];
+        for (name, metadata, packages, expected) in runtime_rows {
+            let error = discover_runtime(&metadata, &packages)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains(expected), "{name}: {error}");
+        }
+    }
+
+    /// Each UI declaration the adapter refuses.
+    #[test]
+    fn a_ui_declaration_that_cannot_be_used_is_refused() {
+        let project = tempfile::tempdir().unwrap();
+        let root = project.path().canonicalize().unwrap();
+        fs::create_dir_all(root.join("empty")).unwrap();
+        let rows = [
+            (serde_json::json!({ "path": "" }), "non-empty relative path"),
+            (
+                serde_json::json!({ "path": "/ui" }),
+                "non-empty relative path",
+            ),
+            (
+                serde_json::json!({ "package_manager": "" }),
+                "requires a `package_manager` and a `dev`",
+            ),
+            (
+                serde_json::json!({ "dev": [] }),
+                "requires a `package_manager` and a `dev`",
+            ),
+            (
+                serde_json::json!({ "path": "absent" }),
+                "failed to resolve Distributed UI",
+            ),
+            (
+                serde_json::json!({ "path": "empty" }),
+                "has no package.json",
+            ),
+        ];
+        for (declared, expected) in rows {
+            let error = discover_ui(
+                &serde_json::json!({ "distributed": { "ui": declared } }),
+                &root,
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(error.contains(expected), "{declared}: {error}");
+        }
+
+        // A sibling directory outside the workspace, with no Git repository
+        // around either.
+        let outside = tempfile::tempdir().unwrap();
+        fs::write(outside.path().join("package.json"), "{}").unwrap();
+        let sibling = format!(
+            "../{}",
+            outside.path().file_name().unwrap().to_string_lossy()
+        );
+        let error = discover_ui(
+            &serde_json::json!({ "distributed": { "ui": { "path": sibling } } }),
+            &root,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("requires the Cargo workspace to be inside a Git repository"),
+            "{error}"
+        );
+    }
+
+    /// Lifecycle roots and sources: a UI outside the workspace with no
+    /// shared repository has no root, and a package outside the lifecycle
+    /// root cannot be a source.
+    #[test]
+    fn lifecycle_roots_and_sources_stay_inside_one_tree() {
+        let workspace = tempfile::tempdir().unwrap();
+        let ui = tempfile::tempdir().unwrap();
+        let error = lifecycle_root(workspace.path(), Some(ui.path())).unwrap_err();
+        assert!(
+            error.to_string().contains("no shared lifecycle root"),
+            "{error}"
+        );
+        assert_eq!(
+            lifecycle_root(workspace.path(), Some(&workspace.path().join("ui"))).unwrap(),
+            workspace.path()
+        );
+
+        let stray = package("stray", Value::Null, &[]);
+        let error = workspace_sources(workspace.path(), workspace.path(), &[&stray]).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("package `stray` resolves outside"),
+            "{error}"
+        );
+        assert!(portable_path(Path::new("")).is_err());
+    }
+
+    /// How client documents outside the bounded source trees become
+    /// catalog sources, with a UI at the lifecycle root.
+    #[test]
+    fn client_documents_outside_src_become_bounded_sources() {
+        let ui = tempfile::tempdir().unwrap();
+        let ui = ui.path().canonicalize().unwrap();
+        fs::create_dir_all(ui.join("queries/[id]")).unwrap();
+        fs::write(ui.join("queries/[id].graphql"), "query Q { q }\n").unwrap();
+        let inventory = |documents: Value| {
+            serde_json::json!({
+                "schema_version": 1,
+                "clients": [{
+                    "module": "$distributed/app",
+                    "surface": "app",
+                    "documents": documents,
+                    "output": "generated"
+                }]
+            })
+            .to_string()
+        };
+        fs::write(
+            ui.join("distributed.clients.json"),
+            inventory(serde_json::json!(["queries/[id].graphql"])),
+        )
+        .unwrap();
+
+        let error = discover_client_lifecycle(&ui, Some(&ui)).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("requires sibling distributed.config.js"),
+            "{error}"
+        );
+
+        fs::write(ui.join(CLIENT_CONFIG), "").unwrap();
+        fs::write(
+            ui.join("distributed.clients.json"),
+            inventory(serde_json::json!([
+                "queries/[id].graphql",
+                "queries/*/item.graphql",
+                "other/*.gql"
+            ])),
+        )
+        .unwrap();
+        let lifecycle = discover_client_lifecycle(&ui, Some(&ui)).unwrap().unwrap();
+        assert_eq!(
+            lifecycle.sources,
+            BTreeSet::from(
+                [
+                    "distributed.clients.json",
+                    CLIENT_CONFIG,
+                    "queries/[[]id[]].graphql*",
+                    "queries",
+                    "other",
+                ]
+                .map(String::from)
+            )
+        );
+        assert_eq!(lifecycle.outputs["client-0"], "generated");
+
+        fs::write(
+            ui.join("distributed.clients.json"),
+            inventory(serde_json::json!(["q*/item.graphql"])),
+        )
+        .unwrap();
+        let error = discover_client_lifecycle(&ui, Some(&ui)).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("has no bounded source directory"),
+            "{error}"
+        );
     }
 }

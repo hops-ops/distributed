@@ -1,13 +1,15 @@
 apiVersion: hops.local/v1alpha1
 kind: Environment
 metadata:
+  # Template name. The runtime name defaults to the checkout directory
+  # (`e2e-ui`) and names the namespace and the OIDC workspace; CI and the
+  # README pass `--name local` (namespace `local`, `e2e-ui-local-*`).
   name: local
 spec:
   clusterRef:
     name: e2e-ui
-  # Paths resolve from the Cluster mount root (the distributed checkout).
-  # The resolved runtime Environment name defaults its namespace.
-  root: tests/e2e-ui
+  # Resolved from the checkout that holds .gitops/local (tests/e2e-ui).
+  root: .
   values:
     local: true
     preview: false

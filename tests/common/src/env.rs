@@ -1,5 +1,9 @@
-//! The service guard: every test that needs an external service reads its
-//! address through [`require_service`]. The crate's own unit tests use it too.
+//! The service guards. A test that needs a service `make test-local` starts
+//! reads its address through [`require_service`] (the crate's own unit tests
+//! use it too). A live test, one that needs a service `make test-local`
+//! cannot start (celld, an identity provider, an OTel collector), is
+//! `#[ignore = "live: needs ..."]`, runs only under `--ignored`, and reads its
+//! address through [`require_live`], which fails when it is missing.
 
 /// Names the services a run must have. `1`, `true` or `all` requires every
 /// service a test asks for; otherwise a comma-separated list of the env vars
@@ -25,6 +29,15 @@ pub fn require_service(var: &str, what: &str) -> Option<String> {
     }
     eprintln!("SKIPPED {what}: {var} is not set");
     None
+}
+
+/// Read `var`, which the live test described by `what` needs.
+///
+/// Panics when it is unset: a live test runs only when asked for
+/// (`--ignored`), so a missing service is a failure, never a skip.
+pub fn require_live(var: &str, what: &str) -> String {
+    std::env::var(var)
+        .unwrap_or_else(|_| panic!("{what} is a live test and needs {var}, which is not set"))
 }
 
 /// Whether a [`REQUIRE_SERVICES`] value names `var`.

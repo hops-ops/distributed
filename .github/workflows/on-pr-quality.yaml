@@ -34,6 +34,12 @@ jobs:
   # Framework monorepo keeps its existing quality provider. The reusable
   # quality.yaml in this directory is the contract for *consumers* (domain
   # crates / Distributed libraries), not for this workspace's entry pipeline.
+  #
+  # The external workflow runs `cargo build --verbose` and `cargo test
+  # --verbose`: the root package `distributed`, default features, no coverage
+  # and no pull request comment. The workspace's coverage number (all
+  # features, real services, production code only) is the `coverage` job
+  # below (coverage.yaml), on push to v5 and main.
   quality:
     if: ${{ !(github.event_name == 'pull_request' && github.head_ref == 'v5' && !github.event.pull_request.head.repo.fork) }}
     uses: unbounded-tech/workflows-rust/.github/workflows/quality.yaml@feat/cargo-publish
@@ -85,3 +91,7 @@ jobs:
   wasm32-domains:
     if: ${{ !(github.event_name == 'pull_request' && github.head_ref == 'v5' && !github.event.pull_request.head.repo.fork) }}
     uses: ./.github/workflows/integration-wasm32-domains.yaml
+
+  # Push to v5 only: coverage.yaml skips every other event itself.
+  coverage:
+    uses: ./.github/workflows/coverage.yaml

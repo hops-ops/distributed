@@ -22,6 +22,9 @@ mod postgres_tests {
 
     use crate::sqlx_repo::postgres_test_schema::postgres_test_schema;
 
+    /// Within one process; across processes the nextest
+    /// `postgres-projection-views` test group (`.config/nextest.toml`) holds
+    /// the tests that write `postgres_projection_views` apart.
     static POSTGRES_PROJECTION_TEST_LOCK: tokio::sync::Mutex<()> =
         tokio::sync::Mutex::const_new(());
 

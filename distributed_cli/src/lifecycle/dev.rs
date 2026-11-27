@@ -1514,4 +1514,200 @@ mod tests {
         assert!(!first_path.exists());
         assert!(second_path.exists());
     }
+
+    type ConfigEdit = fn(&mut LifecycleDevConfig);
+
+    fn api(config: &mut LifecycleDevConfig) -> &mut LifecycleDevProcess {
+        config.processes.get_mut("api").unwrap()
+    }
+
+    fn probe(config: &mut LifecycleDevConfig) -> &mut LifecycleDevProbe {
+        api(config).ready.as_mut().unwrap()
+    }
+
+    /// Each bound a dev configuration must stay within, one row per rule.
+    #[test]
+    fn a_dev_configuration_outside_its_bounds_is_refused() {
+        let valid = || config(BTreeMap::from([("api".to_string(), probed_process(1_000))]));
+        valid().validate().unwrap();
+        let rows: [(&str, ConfigEdit, &str); 21] = [
+            (
+                "zero poll",
+                |c| c.poll_ms = 0,
+                "poll interval must be within",
+            ),
+            (
+                "long prepare",
+                |c| c.prepare_ms = 30_001,
+                "prepare interval must be within",
+            ),
+            (
+                "no processes",
+                |c| c.processes.clear(),
+                "processes must contain 1..=",
+            ),
+            (
+                "too many processes",
+                |c| {
+                    let process = c.processes["api"].clone();
+                    for index in 0..=MAX_DEV_PROCESSES {
+                        c.processes.insert(format!("p{index}"), process.clone());
+                    }
+                },
+                "processes must contain 1..=",
+            ),
+            (
+                "blank name",
+                |c| {
+                    let process = c.processes.remove("api").unwrap();
+                    c.processes.insert(" ".into(), process);
+                },
+                "process name must be a non-empty",
+            ),
+            (
+                "blank program",
+                |c| api(c).program = String::new(),
+                "process program must be",
+            ),
+            (
+                "absolute cwd",
+                |c| api(c).cwd = Some("/tmp".into()),
+                "is not a portable relative path",
+            ),
+            (
+                "escaping cwd",
+                |c| api(c).cwd = Some("../ui".into()),
+                "escapes the lifecycle root",
+            ),
+            (
+                "relative external cwd",
+                |c| {
+                    api(c).cwd = Some("ui".into());
+                    api(c).external_cwd = true;
+                },
+                "external lifecycle dev process cwd must be an absolute path",
+            ),
+            (
+                "external without cwd",
+                |c| api(c).external_cwd = true,
+                "external lifecycle dev process cwd requires cwd",
+            ),
+            (
+                "environment key with a dash",
+                |c| {
+                    api(c).env.insert("NODE-ENV".into(), "dev".into());
+                },
+                "has invalid or oversized environment",
+            ),
+            (
+                "environment value with NUL",
+                |c| {
+                    api(c).env.insert("NODE_ENV".into(), "d\0ev".into());
+                },
+                "has invalid or oversized environment",
+            ),
+            (
+                "control character URL",
+                |c| api(c).url = Some("http://x\u{7}y".into()),
+                "contains control characters",
+            ),
+            (
+                "NUL argument",
+                |c| api(c).args = vec!["a\0b".into()],
+                "exceeds argument bounds",
+            ),
+            (
+                "too many arguments",
+                |c| api(c).args = vec![String::new(); 257],
+                "exceeds argument bounds",
+            ),
+            (
+                "zero ready delay",
+                |c| api(c).ready_after_ms = 0,
+                "readiness interval is out of bounds",
+            ),
+            (
+                "blank probe program",
+                |c| probe(c).program = " x".into(),
+                "readiness probe program must be",
+            ),
+            (
+                "zero probe interval",
+                |c| probe(c).interval_ms = 0,
+                "readiness probe is out of bounds",
+            ),
+            (
+                "probe interval above timeout",
+                |c| probe(c).interval_ms = 1_001,
+                "readiness probe is out of bounds",
+            ),
+            (
+                "NUL probe argument",
+                |c| probe(c).args = vec!["\0".into()],
+                "readiness probe is out of bounds",
+            ),
+            (
+                "blank restart node",
+                |c| {
+                    api(c).restart_on.insert(String::new());
+                },
+                "restart node must be",
+            ),
+        ];
+        for (name, edit, expected) in rows {
+            let mut config = valid();
+            edit(&mut config);
+            let error = config.validate().unwrap_err().to_string();
+            assert!(error.contains(expected), "{name}: {error}");
+        }
+
+        let mut external = valid();
+        api(&mut external).cwd = Some("/repository/ui".into());
+        api(&mut external).external_cwd = true;
+        api(&mut external).ready = None;
+        external.validate().unwrap();
+        assert_eq!(readiness_budget_ms(&external.processes["api"]), 100);
+    }
+
+    /// A working directory resolves inside the lifecycle root unless
+    /// discovery granted an external one, and must be a directory.
+    #[test]
+    fn working_directories_resolve_inside_the_root_unless_external() {
+        let project = tempfile::tempdir().unwrap();
+        let root = project.path().canonicalize().unwrap();
+        fs::create_dir_all(root.join("ui")).unwrap();
+        fs::write(root.join("file"), "").unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let outside = outside.path().canonicalize().unwrap();
+
+        assert_eq!(resolve_working_dir(&root, None, false).unwrap(), root);
+        assert_eq!(
+            resolve_working_dir(&root, Some("ui"), false).unwrap(),
+            root.join("ui")
+        );
+        let external = outside.to_string_lossy().into_owned();
+        assert_eq!(
+            resolve_working_dir(&root, Some(&external), true).unwrap(),
+            outside
+        );
+
+        for (cwd, external, expected) in [
+            (
+                Some("absent"),
+                false,
+                "failed to resolve lifecycle dev working directory",
+            ),
+            (Some("file"), false, "must be a permitted directory"),
+            (
+                Some(external.as_str()),
+                false,
+                "must be a permitted directory",
+            ),
+        ] {
+            let error = resolve_working_dir(&root, cwd, external)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains(expected), "{cwd:?}: {error}");
+        }
+    }
 }

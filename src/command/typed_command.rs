@@ -3,22 +3,20 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::marker::PhantomData;
 
 use serde::de::DeserializeOwned;
-use serde::Serialize;
 use sha2::{Digest, Sha256};
 
 use super::direct_projection::{
-    CommandDirectProjectionTarget, CommandProjectedModel, CompiledDirectProjectionTarget,
-    DirectProjectionTargetResolutionError, ResolvedDirectProjectionTarget,
+    CommandDirectProjectionTarget, CommandProjectedModel, DirectProjectionTargetResolutionError,
+    ResolvedDirectProjectionTarget,
 };
 use super::effect_wire::{CommandInputDefault, CompiledInputDefaults};
-use super::outcomes::{Atomic, CommandConsistency, CommandOutcome};
+use super::outcomes::{CommandConsistency, CommandOutcome};
 use super::projection_proof::{canonical_json, CommandCommitProofError};
 use super::projections::{
     CommandProjectionEvents, CommandProjectionPreview, CommandProjectionPureReduce,
 };
 use super::types::{CommandInputType, CommandTypeDef};
 use crate::microsvc::Session;
-use crate::read_model::RelationalReadModel;
 
 #[derive(Clone, Debug)]
 pub(crate) struct TypedCommandContract {
@@ -462,25 +460,5 @@ impl<I, K: CommandOutcome> TypedCommand<I, K> {
 
     pub(crate) fn into_parts(self) -> (&'static str, TypedCommandContract) {
         (self.route_name, self.contract)
-    }
-}
-
-impl<I, M> TypedCommand<I, Atomic<M>>
-where
-    I: CommandInputType + DeserializeOwned + Send + 'static,
-    M: RelationalReadModel + Serialize + Send + Sync + 'static,
-{
-    /// Attach compiler-generated direct projection ownership metadata.
-    ///
-    /// Application handlers do not call this; generated service inventory
-    /// binds it from the registered projector declaration and handlers use the
-    /// fluent direct-projection commit API.
-    #[doc(hidden)]
-    pub fn __direct_projection(mut self, target: CompiledDirectProjectionTarget<I, M>) -> Self {
-        if let Some(projected) = &mut self.contract.projected_model {
-            projected.partition = target.0.partition.clone();
-        }
-        self.contract.direct_projection = Some(target.0);
-        self
     }
 }

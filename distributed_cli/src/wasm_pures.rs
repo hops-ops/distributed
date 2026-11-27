@@ -89,6 +89,17 @@ pub(crate) fn build_declared_wasm_pures(
         return Ok(0);
     }
     let metadata = cargo_metadata(cargo_manifest)?;
+    build_wasm_pures(&pures, &metadata, wasm_pack_launcher, stop)
+}
+
+/// Compile `pures` for the workspace `metadata` describes, skipping each
+/// whose stamp and outputs are current.
+fn build_wasm_pures(
+    pures: &BTreeSet<WasmPure>,
+    metadata: &CargoMetadata,
+    wasm_pack_launcher: Option<&Path>,
+    stop: Option<&AtomicBool>,
+) -> Result<usize, Box<dyn Error>> {
     let project_root = &metadata.workspace_root;
     let Some(ui) = crate::lifecycle::discover_ui(&metadata.metadata, project_root)? else {
         return Ok(0);
@@ -99,7 +110,7 @@ pub(crate) fn build_declared_wasm_pures(
         .ok_or("browser WASM pures require @hops-ops/distributed in the application UI")?;
     let compiler_identity = compiler_identity(wasm_pack_launcher)?;
     let mut outputs = BTreeMap::<PathBuf, &WasmPure>::new();
-    for pure in &pures {
+    for pure in pures {
         let relative = portable_import_path(&pure.import)?;
         let destination = ui_lib.join(relative.parent().ok_or_else(|| {
             format!(
@@ -121,7 +132,7 @@ pub(crate) fn build_declared_wasm_pures(
     }
 
     for (destination, pure) in outputs {
-        let package = resolve_local_package(&metadata, pure)?;
+        let package = resolve_local_package(metadata, pure)?;
         if !package.features.contains_key("wasm") {
             return Err(format!(
                 "WASM pure `{}` requires package `{}` to define a `wasm` Cargo feature",
@@ -135,7 +146,7 @@ pub(crate) fn build_declared_wasm_pures(
             .ok_or_else(|| format!("WASM import `{}` has no UTF-8 output name", pure.import))?;
         let stamp = WasmStamp {
             schema_version: 2,
-            source_identity: package_source_identity(&metadata, &package.id)?,
+            source_identity: package_source_identity(metadata, &package.id)?,
             compiler_identity: compiler_identity.clone(),
             rust_package: pure.rust_package.clone(),
             import: pure.import.clone(),
@@ -975,5 +986,251 @@ mod tests {
         assert!(error
             .to_string()
             .contains("more than one local Cargo package"));
+    }
+
+    /// A workspace with a conventional UI, a local `blob-domain` package
+    /// with a `wasm` feature, and a fake wasm-pack package to fingerprint.
+    struct WasmWorkspace {
+        _dir: tempfile::TempDir,
+        root: PathBuf,
+        launcher: PathBuf,
+    }
+
+    impl WasmWorkspace {
+        fn new() -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().canonicalize().unwrap();
+            fs::create_dir_all(root.join("ui/src/lib")).unwrap();
+            fs::write(root.join("ui/package.json"), "{}").unwrap();
+            fs::create_dir_all(root.join("blob/src")).unwrap();
+            fs::write(root.join("blob/Cargo.toml"), "[package]\n").unwrap();
+            fs::write(root.join("blob/src/lib.rs"), "").unwrap();
+            let launcher = root.join("ui/node_modules/wasm-pack/run.js");
+            fs::create_dir_all(launcher.parent().unwrap()).unwrap();
+            fs::write(&launcher, "compiler").unwrap();
+            Self {
+                _dir: dir,
+                root,
+                launcher,
+            }
+        }
+
+        fn metadata(&self, features: Value, extra_package: Option<Value>) -> CargoMetadata {
+            let mut packages = vec![json!({
+                "id": "blob 0.1.0",
+                "name": "blob-domain",
+                "manifest_path": self.root.join("blob/Cargo.toml"),
+                "source": null,
+                "features": features,
+                "targets": [{ "name": "blob", "kind": ["lib"], "src_path": self.root.join("blob/src/lib.rs") }]
+            })];
+            packages.extend(extra_package);
+            serde_json::from_value(json!({
+                "workspace_root": self.root,
+                "packages": packages,
+                "resolve": { "nodes": [{ "id": "blob 0.1.0", "dependencies": [] }] },
+                "metadata": null
+            }))
+            .unwrap()
+        }
+    }
+
+    fn pures(imports: &[(&str, &str)]) -> BTreeSet<WasmPure> {
+        imports
+            .iter()
+            .map(|(rust_package, import)| WasmPure {
+                rust_package: (*rust_package).into(),
+                import: (*import).into(),
+            })
+            .collect()
+    }
+
+    /// A pure whose stamp and outputs are current is not rebuilt, so no
+    /// compiler runs; a stamp for other sources is not current.
+    #[test]
+    fn a_current_browser_wasm_build_is_reused() {
+        let workspace = WasmWorkspace::new();
+        let metadata = workspace.metadata(json!({ "wasm": [] }), None);
+        let declared = pures(&[("blob-domain", "wasm/blob/blob_domain")]);
+        let destination = workspace.root.join("ui/src/lib/wasm/blob");
+        fs::create_dir_all(&destination).unwrap();
+        for name in [
+            crate::lifecycle::GENERATED_DIRECTORY_MARKER,
+            "blob_domain_bg.wasm",
+            "blob_domain.js",
+        ] {
+            fs::write(destination.join(name), "").unwrap();
+        }
+        let stamp = WasmStamp {
+            schema_version: 2,
+            source_identity: package_source_identity(&metadata, "blob 0.1.0").unwrap(),
+            compiler_identity: compiler_identity(&workspace.launcher).unwrap(),
+            rust_package: "blob-domain".into(),
+            import: "wasm/blob/blob_domain".into(),
+        };
+        let stamp_path = workspace.root.join(".distributed/wasm").join(format!(
+            "{:x}.json",
+            Sha256::digest("wasm/blob/blob_domain".as_bytes())
+        ));
+        fs::create_dir_all(stamp_path.parent().unwrap()).unwrap();
+        fs::write(&stamp_path, serde_json::to_vec(&stamp).unwrap()).unwrap();
+
+        assert_eq!(
+            build_wasm_pures(&declared, &metadata, Some(&workspace.launcher), None).unwrap(),
+            1
+        );
+        assert!(stamp_matches(&stamp_path, &destination, &stamp).unwrap());
+
+        let mut edited = WasmStamp {
+            source_identity: "sha256:other".into(),
+            ..stamp
+        };
+        assert!(!stamp_matches(&stamp_path, &destination, &edited).unwrap());
+        edited.source_identity = package_source_identity(&metadata, "blob 0.1.0").unwrap();
+        fs::remove_file(destination.join("blob_domain.js")).unwrap();
+        assert!(!stamp_matches(&stamp_path, &destination, &edited).unwrap());
+        fs::write(&stamp_path, "not a stamp").unwrap();
+        assert!(!stamp_matches(&stamp_path, &destination, &edited).unwrap());
+    }
+
+    /// Declared pures, the package features, an extra package, the launcher
+    /// and the expected refusal.
+    type PlanRow<'a> = (
+        BTreeSet<WasmPure>,
+        Value,
+        Option<Value>,
+        Option<&'a Path>,
+        &'a str,
+    );
+
+    /// Each reason declared browser WASM cannot be planned, before any
+    /// compiler runs.
+    #[test]
+    fn browser_wasm_that_cannot_be_planned_is_refused() {
+        let workspace = WasmWorkspace::new();
+        let with_wasm = json!({ "wasm": [] });
+        let duplicate = json!({
+            "id": "blob 0.2.0",
+            "name": "blob-domain",
+            "manifest_path": workspace.root.join("blob/Cargo.toml"),
+            "source": null
+        });
+        let launcher = Some(workspace.launcher.as_path());
+        let rows: [PlanRow; 6] = [
+            (
+                pures(&[("blob-domain", "wasm/blob/blob_domain")]),
+                with_wasm.clone(),
+                None,
+                None,
+                "require @hops-ops/distributed in the application UI",
+            ),
+            (
+                pures(&[
+                    ("blob-domain", "wasm/blob/a"),
+                    ("blob-domain", "wasm/blob/b"),
+                ]),
+                with_wasm.clone(),
+                None,
+                launcher,
+                "claim the same output directory",
+            ),
+            (
+                pures(&[("billing", "wasm/billing/billing")]),
+                with_wasm.clone(),
+                None,
+                launcher,
+                "which is not a local application dependency",
+            ),
+            (
+                pures(&[("blob-domain", "wasm/blob/blob_domain")]),
+                with_wasm.clone(),
+                Some(duplicate),
+                launcher,
+                "more than one local Cargo package named `blob-domain`",
+            ),
+            (
+                pures(&[("blob-domain", "wasm/blob/blob_domain")]),
+                json!({}),
+                None,
+                launcher,
+                "to define a `wasm` Cargo feature",
+            ),
+            (
+                pures(&[("blob-domain", "wasm/blob/bad.name")]),
+                with_wasm,
+                None,
+                launcher,
+                "has an invalid output name",
+            ),
+        ];
+        for (declared, features, extra, launcher, expected) in rows {
+            let metadata = workspace.metadata(features, extra);
+            let error = build_wasm_pures(&declared, &metadata, launcher, None)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains(expected), "{expected}: {error}");
+        }
+
+        let missing = workspace.root.join("ui/node_modules/absent/run.js");
+        let error = build_wasm_pures(
+            &pures(&[("blob-domain", "wasm/blob/blob_domain")]),
+            &workspace.metadata(json!({ "wasm": [] }), None),
+            Some(&missing),
+            None,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("failed to resolve browser WASM compiler"),
+            "{error}"
+        );
+
+        // No UI: nothing to compile into.
+        fs::remove_file(workspace.root.join("ui/package.json")).unwrap();
+        assert_eq!(
+            build_wasm_pures(
+                &pures(&[("blob-domain", "wasm/blob/blob_domain")]),
+                &workspace.metadata(json!({}), None),
+                None,
+                None
+            )
+            .unwrap(),
+            0
+        );
+    }
+
+    /// Import paths and generated directories must be portable, real
+    /// directories inside the project.
+    #[test]
+    fn import_paths_and_generated_directories_stay_portable() {
+        for import in [
+            "module",
+            "/abs/module",
+            "wasm\\module",
+            "wasm/../module",
+            "wasm/mod ule",
+        ] {
+            assert!(portable_import_path(import).is_err(), "{import}");
+        }
+        assert_eq!(
+            portable_import_path("wasm/blob/blob_domain").unwrap(),
+            PathBuf::from("wasm/blob/blob_domain")
+        );
+
+        let fixture = tempfile::tempdir().unwrap();
+        let root = fixture.path().canonicalize().unwrap();
+        ensure_real_directory_path(&root, &root.join("ui/src/lib/wasm")).unwrap();
+        assert!(root.join("ui/src/lib/wasm").is_dir());
+        fs::write(root.join("file"), "").unwrap();
+        for (directory, expected) in [
+            (PathBuf::from("/elsewhere"), "escapes project"),
+            (root.join("file/child"), "must be a real directory"),
+            (root.join("ui/../x"), "is not a portable project path"),
+        ] {
+            let error = ensure_real_directory_path(&root, &directory)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains(expected), "{}: {error}", directory.display());
+        }
     }
 }

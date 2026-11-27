@@ -15,8 +15,9 @@ cluster/
   rbac/            # cluster-level access needed by local packages
 ```
 
-The pinned Crossplane seed is declared in `../cluster.yaml`; it is the only
-imperative substrate prerequisite. Application charts live under their own
+The Crossplane Helm seed is the only imperative substrate prerequisite.
+`../cluster.yaml` declares no `spec.controlPlane`, so hops installs its
+default (`crossplane-stable/crossplane` 2.4.0 in hops-cli v0.57.1). Application charts live under their own
 `.gitops/local` and `.gitops/deploy` roots.
 
 The environment's identity chart uses the auth-stack `HumanUser` and `Grant`

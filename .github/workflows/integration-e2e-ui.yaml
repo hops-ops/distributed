@@ -6,6 +6,7 @@ name: e2e-ui fixture (offline + browser + local GitOps)
 #   cd tests/e2e-ui && make ci-offline
 #   cd tests/e2e-ui && make up && make run   # distributed dev; then make test-browser
 #   cd tests/e2e-ui && hops local gitops cluster ./.gitops/local/cluster.yaml --once
+#   then the Secrets and Environment steps of the local-gitops job (tests/e2e-ui/README.md)
 on:
   workflow_call:
 
@@ -214,9 +215,9 @@ jobs:
       run:
         working-directory: tests/e2e-ui
     env:
-      # Explicit deploy renderer support is merged in hops-cli #102. Keep the
-      # exact commit here until that change is included in a tagged release.
-      HOPS_CLI_REV: 339b32a81caaadb35e46f8be4c895d5a5dcc42e7
+      # Released hops-cli binary (https://github.com/hops-ops/hops-cli/releases).
+      HOPS_CLI_VERSION: v0.57.1
+      # Also read by hops itself as its kube context.
       HOPS_KUBE_CONTEXT: kind-e2e-ui
       HOPS_CLUSTER_NAME: e2e-ui
 
@@ -279,19 +280,21 @@ jobs:
           export PATH="$HOME/bin:$PATH"
           kind version
 
-      - name: Build hops CLI with local GitOps support
+      - name: Install hops CLI
         run: |
           set -euo pipefail
-          cargo install \
-            --git https://github.com/hops-ops/hops-cli.git \
-            --rev "$HOPS_CLI_REV" \
-            --locked \
-            --root "$RUNNER_TEMP/hops-cli" \
-            --bin hops-cli
-          ln -sf "$RUNNER_TEMP/hops-cli/bin/hops-cli" "$RUNNER_TEMP/hops-cli/bin/hops"
-          echo "$RUNNER_TEMP/hops-cli/bin" >> "$GITHUB_PATH"
-          export PATH="$RUNNER_TEMP/hops-cli/bin:$PATH"
-          hops --version
+          asset=hops-cli-Linux-musl-x86_64.tar.gz
+          url="https://github.com/hops-ops/hops-cli/releases/download/$HOPS_CLI_VERSION/$asset"
+          dir="$RUNNER_TEMP/hops-cli"
+          mkdir -p "$dir/bin"
+          curl -fsSL "$url" -o "$dir/$asset"
+          curl -fsSL "$url.sha256" -o "$dir/$asset.sha256"
+          (cd "$dir" && sha256sum --check --strict "$asset.sha256")
+          tar -xzf "$dir/$asset" -C "$dir" hops-cli
+          install -m 0755 "$dir/hops-cli" "$dir/bin/hops"
+          echo "$dir/bin" >> "$GITHUB_PATH"
+          export PATH="$dir/bin:$PATH"
+          hops --version | grep -Fx "hops-cli ${HOPS_CLI_VERSION#v}"
 
       - name: Build Distributed CLI
         run: cargo build --manifest-path ../../Cargo.toml -p distributed_cli --bin distributed
@@ -314,15 +317,13 @@ jobs:
 
           k() { kubectl --context "$HOPS_KUBE_CONTEXT" "$@"; }
 
-          # Cluster reconciliation discovers the adjacent Environment
-          # definition automatically. Defer it until AuthStack's setup Job is
-          # complete; otherwise the instance Features MR and the setup Job race
-          # to own Login V2, leaving the provider unable to repair the
-          # singleton because it is protected by prevent_destroy.
-          environment_definition=.gitops/local/environment.yaml
-          deferred_environment="$RUNNER_TEMP/e2e-ui-environment.yaml"
-          test -f "$environment_definition"
-          mv "$environment_definition" "$deferred_environment"
+          # The Cluster controller reconciles only Environments enabled in the
+          # hops catalog (`hops local env enable`, hops-cli >= v0.52.0); this
+          # job enables none. The Environment is reconciled explicitly, after
+          # AuthStack's setup Job is complete; otherwise the instance Features
+          # MR and the setup Job race to own Login V2, leaving the provider
+          # unable to repair the singleton because it is protected by
+          # prevent_destroy.
 
           # AuthStack intentionally references live local secrets. Create only
           # disposable CI values once the API server exists, before the
@@ -441,10 +442,6 @@ jobs:
             exit 1
           fi
 
-          deferred_environment="$RUNNER_TEMP/e2e-ui-environment.yaml"
-          test -f "$deferred_environment"
-          mv "$deferred_environment" .gitops/local/environment.yaml
-
       - name: Materialize the Zitadel provider Secret with hops CLI
         run: |
           set -euo pipefail
@@ -493,7 +490,7 @@ jobs:
           k -n auth get secret login-client -o yaml || true
           exit 1
 
-      - name: Reconcile Cluster and Environment GitOps definitions
+      - name: Reconcile the Cluster, then the Environment
         run: |
           set -euo pipefail
           k() { kubectl --context "$HOPS_KUBE_CONTEXT" "$@"; }
@@ -509,19 +506,30 @@ jobs:
               succeeded=1
               break
             fi
-            echo "Cluster/Environment reconcile not ready (attempt $attempt/18); retrying"
+            echo "Cluster reconcile not ready (attempt $attempt/18); retrying"
             sleep 10
           done
           test "$succeeded" = 1
 
-          # Exercise the reusable Environment entry point explicitly as well;
-          # the Cluster controller also discovers this file automatically.
-          hops local gitops environment ./.gitops/local/environment.yaml \
-            --cluster-provider kind \
-            --docker-provider docker \
-            --cluster-name "$HOPS_CLUSTER_NAME" \
-            --context "$HOPS_KUBE_CONTEXT" \
-            --once
+          # The runtime name defaults to the checkout directory (`e2e-ui`,
+          # hops-cli >= v0.48.0). `--name local` keeps namespace `local` and
+          # the OIDC workspace `e2e-ui-local-*` that the steps below wait for.
+          succeeded=0
+          for attempt in $(seq 1 18); do
+            if hops local gitops environment ./.gitops/local/environment.yaml \
+              --name local \
+              --cluster-provider kind \
+              --docker-provider docker \
+              --cluster-name "$HOPS_CLUSTER_NAME" \
+              --context "$HOPS_KUBE_CONTEXT" \
+              --once; then
+              succeeded=1
+              break
+            fi
+            echo "Environment reconcile not ready (attempt $attempt/18); retrying"
+            sleep 10
+          done
+          test "$succeeded" = 1
 
       - name: Wait for app, identity, and auth services
         run: |
@@ -572,6 +580,16 @@ jobs:
               api_listener_ready=1
               echo "e2e-ui API listener is ready"
               break
+            fi
+            # The Deployment has no readiness probe, so Available holds while
+            # the application container crash-loops; fail on that at once.
+            waiting_reason="$(k -n local get pods -l app.kubernetes.io/name=e2e-ui-api \
+              -o jsonpath='{.items[*].status.containerStatuses[?(@.name=="application")].state.waiting.reason}' \
+              2>/dev/null || true)"
+            if [[ "$waiting_reason" == *CrashLoopBackOff* ]]; then
+              echo "e2e-ui API container is in CrashLoopBackOff" >&2
+              k -n local logs deployment/e2e-ui-api -c application --previous --tail=200 >&2 || true
+              exit 1
             fi
             if [ $((attempt % 15)) -eq 0 ]; then
               echo "Waiting for e2e-ui API listener (attempt $attempt/450)"

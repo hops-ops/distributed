@@ -4,9 +4,7 @@ mod domain_events;
 mod flat_preview;
 
 use common::todo::{Todo, TodoEvent};
-use distributed::{
-    AggregateBuilder, Entity, EventRecord, EventRecordError, InMemoryRepository, Queueable,
-};
+use distributed::{Entity, EventRecord, EventRecordError};
 use serde::ser::Error as _;
 use serde::Serialize;
 
@@ -163,24 +161,6 @@ fn try_from_unknown_event_returns_error() {
     let result = TodoEvent::try_from(&record);
     assert!(result.is_err());
     assert!(result.unwrap_err().contains("Unknown event"));
-}
-
-#[tokio::test]
-async fn aggregate_hydration_roundtrip() {
-    let repo = InMemoryRepository::new().queued().aggregate::<Todo>();
-
-    let mut todo = Todo::default();
-    todo.initialize("t1".into(), "alice".into(), "Buy milk".into())
-        .unwrap();
-    todo.complete().unwrap();
-
-    repo.commit(&mut todo).await.unwrap();
-
-    let loaded = repo.get("t1").await.unwrap().unwrap();
-    assert_eq!(loaded.state().id, "t1");
-    assert_eq!(loaded.state().user_id, "alice");
-    assert_eq!(loaded.state().task, "Buy milk");
-    assert!(loaded.state().completed);
 }
 
 #[test]

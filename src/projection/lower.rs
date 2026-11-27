@@ -12,15 +12,14 @@ use std::marker::PhantomData;
 use std::sync::{OnceLock, RwLock};
 
 use super::ResolvedProjectionField;
-use crate::domain_event::{DomainEvent, DomainEventOccurrence, DomainState};
+use crate::domain_event::{DomainEventOccurrence, DomainState};
 use crate::projection::{
-    MutationKind, ProjectionArm, ProjectionAssignment, ProjectionEventSelector, ProjectionEventSet,
-    ProjectionExpression, ProjectionField, ProjectionInvalidation, ProjectionKeyField,
-    ProjectionOperation, ProjectionPartition, ProjectionPlanTemplate, ProjectionProgram,
-    ProjectionProgramError, ProjectionProgramId, ProjectionRelationship,
-    ProjectionRelationshipEffect, ProjectionTarget, ProjectionValue, ProjectionValueRef,
-    ProjectionValueType, ResolvedProjectionKey, ResolvedProjectionMutation, ResolvedProjectionPlan,
-    ResolvedProjectionValue,
+    MutationKind, ProjectionAssignment, ProjectionEventSelector, ProjectionExpression,
+    ProjectionField, ProjectionInvalidation, ProjectionKeyField, ProjectionOperation,
+    ProjectionPartition, ProjectionProgram, ProjectionProgramError, ProjectionProgramId,
+    ProjectionRelationship, ProjectionRelationshipEffect, ProjectionTarget, ProjectionValue,
+    ProjectionValueRef, ProjectionValueType, ResolvedProjectionKey, ResolvedProjectionMutation,
+    ResolvedProjectionPlan, ResolvedProjectionValue,
 };
 use crate::read_model::{ReadModelWritePlanBuilder, RelationalReadModel};
 #[cfg(any(feature = "graphql", test))]
@@ -139,120 +138,6 @@ pub trait ProjectionDeletionMetadata {
     const BODY_SCHEMA: &'static str;
     /// Canonical SHA-256 body-schema fingerprint.
     const BODY_FINGERPRINT: &'static str;
-}
-
-/// Compile-time proof that the common state-upsert shorthand has exact flat
-/// coverage.
-///
-/// Renamed, missing, extra, omitted, nested, type-incompatible, or
-/// nullability-incompatible fields intentionally fail constant evaluation.
-#[doc(hidden)]
-pub const fn assert_state_upsert_compatible(
-    state: &[ProjectionBodyFieldMetadata],
-    model: &[ProjectionModelFieldMetadata],
-) {
-    let mut state_index = 0;
-    while state_index < state.len() {
-        if !state[state_index].present || !state[state_index].always_present {
-            panic!("projection state-upsert rejects omitted state fields");
-        }
-        state_index += 1;
-    }
-    if state.len() != model.len() {
-        panic!("projection state-upsert requires exact field coverage");
-    }
-
-    let mut model_index = 0;
-    while model_index < model.len() {
-        let model_field = &model[model_index];
-        let mut found = false;
-        let mut candidate_index = 0;
-        while candidate_index < state.len() {
-            let candidate = &state[candidate_index];
-            if candidate.present && const_str_eq(candidate.wire_name, model_field.field_name) {
-                if !const_str_eq(candidate.rust_name, candidate.wire_name) {
-                    panic!("projection state-upsert rejects renamed state fields");
-                }
-                if !const_str_eq(candidate.rust_type, model_field.rust_type)
-                    || !portable_type_eq(candidate.portable_type, model_field.portable_type)
-                {
-                    panic!("projection state-upsert field type mismatch");
-                }
-                if candidate.nullable != model_field.nullable {
-                    panic!("projection state-upsert field nullability mismatch");
-                }
-                if matches!(
-                    candidate.portable_type,
-                    ProjectionPortableType::Json | ProjectionPortableType::Bytes
-                ) {
-                    panic!(
-                        "projection state-upsert nested/collection fields require an explicit block"
-                    );
-                }
-                found = true;
-                break;
-            }
-            candidate_index += 1;
-        }
-        if !found {
-            panic!("projection state-upsert field is missing or renamed");
-        }
-        model_index += 1;
-    }
-}
-
-/// Compile-time proof for one explicit direct body-field mapping.
-#[doc(hidden)]
-pub const fn assert_explicit_field_compatible(
-    body: &[ProjectionBodyFieldMetadata],
-    source: &str,
-    model: &[ProjectionModelFieldMetadata],
-    target: &str,
-) {
-    let mut source_index = 0;
-    while source_index < body.len() && !const_str_eq(body[source_index].rust_name, source) {
-        source_index += 1;
-    }
-    if source_index == body.len() || !body[source_index].present {
-        panic!("projection body field does not exist");
-    }
-    let mut target_index = 0;
-    while target_index < model.len() && !const_str_eq(model[target_index].field_name, target) {
-        target_index += 1;
-    }
-    if target_index == model.len() {
-        panic!("projection read-model field does not exist");
-    }
-    let source_field = &body[source_index];
-    let target_field = &model[target_index];
-    if !const_str_eq(source_field.rust_type, target_field.rust_type)
-        || !portable_type_eq(source_field.portable_type, target_field.portable_type)
-    {
-        panic!("projection explicit field type mismatch");
-    }
-    if source_field.nullable && !target_field.nullable {
-        panic!("projection nullable body field cannot target a non-null read-model field");
-    }
-}
-
-const fn portable_type_eq(left: ProjectionPortableType, right: ProjectionPortableType) -> bool {
-    left as u8 == right as u8
-}
-
-const fn const_str_eq(left: &str, right: &str) -> bool {
-    let left = left.as_bytes();
-    let right = right.as_bytes();
-    if left.len() != right.len() {
-        return false;
-    }
-    let mut index = 0;
-    while index < left.len() {
-        if left[index] != right[index] {
-            return false;
-        }
-        index += 1;
-    }
-    true
 }
 
 /// Generated candidate for direct placement.
@@ -881,45 +766,6 @@ where
     )
 }
 
-/// Build an exact typed domain-event selector.
-///
-/// # Errors
-///
-/// Returns descriptor validation failures.
-#[doc(hidden)]
-pub fn event_selector<E>() -> Result<ProjectionEventSelector, ProjectionProgramError>
-where
-    E: DomainEvent,
-{
-    ProjectionEventSelector::try_from_descriptor(&E::DESCRIPTOR)
-}
-
-/// Build an exact sourced deletion selector without a duplicate event DTO.
-///
-/// # Errors
-///
-/// Returns descriptor validation failures.
-#[doc(hidden)]
-pub fn deletion_selector<I>(
-    name: &'static str,
-    version: u64,
-) -> Result<ProjectionEventSelector, ProjectionProgramError>
-where
-    I: ProjectionDeletionMetadata,
-{
-    ProjectionEventSelector::try_from_descriptor(&crate::domain_event::DomainEventDescriptor {
-        name: std::borrow::Cow::Borrowed(name),
-        version,
-        body: crate::domain_event::DomainEventBodyDescriptor::distributed_json(
-            crate::domain_event::DomainEventBodyKind::Deletion,
-            I::BODY_TYPE_NAME,
-            1,
-            I::BODY_SCHEMA,
-            I::BODY_FINGERPRINT,
-        ),
-    })
-}
-
 /// Construct a model target from the existing ORM schema.
 ///
 /// # Errors
@@ -932,50 +778,6 @@ where
 {
     let schema = projection_schema::<M>()?;
     ProjectionTarget::try_new(schema.model_name.clone(), schema.table_name.clone())
-}
-
-/// Construct the exact common full-state upsert operation.
-///
-/// # Errors
-///
-/// Returns invalid body/model metadata or task-7 operation validation failures.
-#[doc(hidden)]
-pub fn state_upsert_operation<S, M>(
-    operation_id: &'static str,
-    staging_ordinal: u32,
-) -> Result<ProjectionOperation, ProjectionProgramError>
-where
-    S: DomainState + ProjectionBodyMetadata,
-    M: ProjectionReadModelMetadata,
-{
-    let schema = projection_schema::<M>()?;
-    let mut key = Vec::with_capacity(schema.primary_key.columns.len());
-    for (ordinal, column) in schema.primary_key.columns.iter().enumerate() {
-        let model_field = model_field_for_column::<M>(column)?;
-        key.push(ProjectionKeyField::try_new(
-            ordinal as u32,
-            model_field.field_name,
-            body_path_for_model_field::<S>(model_field)?,
-        )?);
-    }
-    let mut fields = Vec::with_capacity(M::PROJECTION_FIELDS.len());
-    for (ordinal, model_field) in M::PROJECTION_FIELDS.iter().enumerate() {
-        fields.push(ProjectionField::try_new(
-            ordinal as u32,
-            model_field.field_name,
-            ProjectionAssignment::Set(body_path_for_model_field::<S>(model_field)?),
-        )?);
-    }
-    ProjectionOperation::try_new(
-        operation_id,
-        staging_ordinal,
-        MutationKind::Upsert,
-        projection_target::<M>()?,
-        key,
-        fields,
-        Vec::new(),
-        Vec::new(),
-    )
 }
 
 /// Construct one explicit model operation from closed expressions.
@@ -1307,25 +1109,6 @@ where
             operation: "read-model metadata".to_owned(),
             reason: format!("column `{column}` has no portable field metadata"),
         })
-}
-
-fn body_path_for_model_field<B>(
-    model: &ProjectionModelFieldMetadata,
-) -> Result<ProjectionExpression, ProjectionProgramError>
-where
-    B: ProjectionBodyMetadata,
-{
-    let body = B::PROJECTION_FIELDS
-        .iter()
-        .find(|field| field.present && field.wire_name == model.field_name)
-        .ok_or_else(|| ProjectionProgramError::RequiredValueAbsent {
-            path: model.field_name.to_owned(),
-        })?;
-    ProjectionExpression::body_path(value_type_for_model(model), [body.wire_name])
-}
-
-fn value_type_for_model(model: &ProjectionModelFieldMetadata) -> ProjectionValueType {
-    projection_value_type(model.portable_type)
 }
 
 fn build_model_operation<M>(
@@ -1762,53 +1545,144 @@ fn projection_value_to_json(
     })
 }
 
-/// Construct a complete projection program from generated arms.
-///
-/// # Errors
-///
-/// Returns task-7 validation failures.
-#[doc(hidden)]
-pub fn projection_program(
-    name: &'static str,
-    version: u64,
-    partition: ProjectionPartition,
-    arms: Vec<ProjectionArm>,
-) -> Result<ProjectionProgram, ProjectionProgramError> {
-    ProjectionProgram::try_new(name, version, partition, arms)
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-/// Resolve through an exact generated event-set marker.
-///
-/// # Errors
-///
-/// Returns event-set, selector, expression, or logical-plan failures.
-#[doc(hidden)]
-pub fn resolve_typed<E>(
-    program: ProjectionProgram,
-    occurrence: &DomainEventOccurrence,
-) -> Result<ResolvedProjectionPlan, ProjectionProgramError>
-where
-    E: ProjectionEventSet,
-{
-    ProjectionPlanTemplate::<E>::try_new(program)?.resolve(occurrence)
-}
+    fn json(value: serde_json::Value) -> ProjectionValue {
+        ProjectionValue::try_from_json(value).unwrap()
+    }
 
-/// Build a canonical relationship output entry.
-///
-/// # Errors
-///
-/// Returns invalid ORM relationship metadata.
-#[doc(hidden)]
-pub fn output_relationship<R>() -> Result<ProjectionRelationship, ProjectionLoweringError>
-where
-    R: ProjectionRelationshipMetadata,
-{
-    let source = ReadModelWritePlanBuilder::projection_validated_schema::<R::Source>()?;
-    let target = ReadModelWritePlanBuilder::projection_validated_schema::<R::Target>()?;
-    ReadModelWritePlanBuilder::projection_relationship_for(source, R::FIELD, target)?;
-    Ok(ProjectionRelationship::try_new(
-        source.model_name.clone(),
-        R::FIELD,
-        target.model_name.clone(),
-    )?)
+    #[test]
+    fn portable_values_lower_to_the_row_value_of_their_column() {
+        let object = json(serde_json::json!({"b": [1, -2], "a": {"on": true}, "f": 1.5}));
+        let cases = [
+            (
+                "null in any column",
+                ProjectionValue::null(),
+                ColumnType::Integer,
+                RowValue::Null,
+            ),
+            (
+                "boolean",
+                ProjectionValue::boolean(true),
+                ColumnType::Boolean,
+                RowValue::Bool(true),
+            ),
+            (
+                "signed",
+                ProjectionValue::signed(-7),
+                ColumnType::Integer,
+                RowValue::I64(-7),
+            ),
+            (
+                "unsigned within i64",
+                ProjectionValue::unsigned(7),
+                ColumnType::UnsignedInteger,
+                RowValue::I64(7),
+            ),
+            (
+                "unsigned above i64",
+                ProjectionValue::unsigned(u64::MAX),
+                ColumnType::UnsignedInteger,
+                RowValue::U64(u64::MAX),
+            ),
+            (
+                "float",
+                ProjectionValue::try_float(1.5).unwrap(),
+                ColumnType::Float,
+                RowValue::F64(1.5),
+            ),
+            (
+                "text",
+                ProjectionValue::string("hi"),
+                ColumnType::Text,
+                RowValue::String("hi".into()),
+            ),
+            (
+                "timestamp text",
+                ProjectionValue::string("2026-01-01T00:00:00Z"),
+                ColumnType::Timestamp,
+                RowValue::String("2026-01-01T00:00:00Z".into()),
+            ),
+            (
+                "enum variant as text",
+                ProjectionValue::enum_variant("Status", "Open"),
+                ColumnType::Text,
+                RowValue::String("Open".into()),
+            ),
+            (
+                "byte list",
+                json(serde_json::json!([0, 255])),
+                ColumnType::Bytes,
+                RowValue::Bytes(vec![0, 255]),
+            ),
+            (
+                "json object",
+                object,
+                ColumnType::Json,
+                RowValue::Json(serde_json::json!({"a": {"on": true}, "b": [1, -2], "f": 1.5})),
+            ),
+            (
+                "enum variant as json",
+                ProjectionValue::enum_variant("Status", "Open"),
+                ColumnType::Json,
+                RowValue::Json(serde_json::json!("Open")),
+            ),
+        ];
+        for (name, value, column, expected) in cases {
+            assert_eq!(
+                projection_value_to_row(&value, &column).unwrap(),
+                expected,
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_value_of_another_kind_is_rejected_by_its_column() {
+        let cases = [
+            (
+                "string into boolean",
+                ProjectionValue::string("true"),
+                ColumnType::Boolean,
+            ),
+            (
+                "unsigned into signed",
+                ProjectionValue::unsigned(7),
+                ColumnType::Integer,
+            ),
+            (
+                "signed into unsigned",
+                ProjectionValue::signed(-7),
+                ColumnType::UnsignedInteger,
+            ),
+            (
+                "byte above 255",
+                json(serde_json::json!([256])),
+                ColumnType::Bytes,
+            ),
+            (
+                "non-numeric byte",
+                json(serde_json::json!(["a"])),
+                ColumnType::Bytes,
+            ),
+            (
+                "unsupported column",
+                ProjectionValue::string("x"),
+                ColumnType::Unsupported("fn()".into()),
+            ),
+        ];
+        for (name, value, column) in cases {
+            let error = projection_value_to_row(&value, &column).unwrap_err();
+            assert!(
+                matches!(
+                    &error,
+                    ProjectionLoweringError::Table(TableStoreError::Metadata(reason))
+                        if reason.starts_with("portable projection value is incompatible with column type")
+                ),
+                "{name}: {error:?}"
+            );
+        }
+    }
 }

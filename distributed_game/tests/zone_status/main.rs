@@ -5,6 +5,9 @@
 //! `ZoneStatus::of` tells active, hibernated and cold zones apart without
 //! opening a cell.
 
+#[path = "../support/unique.rs"]
+mod unique;
+
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
@@ -306,14 +309,7 @@ async fn zone_activity_reports_project_into_zone_status() {
     );
     assert_eq!(cell.load().await.unwrap().unwrap().status(), "hibernated");
 
-    let dir = std::env::temp_dir().join(format!(
-        "zone-activity-{}-{}",
-        std::process::id(),
-        SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
+    let dir = std::env::temp_dir().join(unique::unique("zone-activity"));
     std::fs::create_dir_all(&dir).unwrap();
     let bus_url = format!("sqlite:{}?mode=rwc", dir.join("bus.db").display());
     let pool = sqlx::SqlitePool::connect(&bus_url).await.unwrap();

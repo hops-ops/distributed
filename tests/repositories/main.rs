@@ -8,7 +8,6 @@ mod aggregate_schedules;
 mod coordination_lease;
 #[cfg(feature = "sqlite")]
 mod durable_enqueue_sqlite;
-mod event_store;
 mod in_memory_repository_conformance;
 #[cfg(feature = "postgres")]
 mod postgres_repository;

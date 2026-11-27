@@ -106,44 +106,10 @@ pub(super) fn validate_manifest_ownership(manifest: &ApplicationManifest) -> App
         .iter()
         .map(|model| (model.id.as_str(), model))
         .collect::<std::collections::BTreeMap<_, _>>();
-    let projections = manifest
-        .projections
-        .iter()
-        .map(|projection| (projection.id.as_str(), projection))
-        .collect::<std::collections::BTreeMap<_, _>>();
+    // Every surface model and projection is already inside the closed
+    // inventories checked above: models dedup to one declaration per id or
+    // collide, projection ids are unique. No per-surface comparison remains.
     for surface in &manifest.surfaces {
-        for exposed in &surface.contract.models {
-            let Some(authoritative) = models.get(exposed.id.as_str()) else {
-                return Err(ApplicationError::Missing {
-                    kind: "model",
-                    identity: exposed.id.clone(),
-                });
-            };
-            if *authoritative != exposed {
-                return Err(ApplicationError::Collision {
-                    kind: "model",
-                    identity: exposed.id.clone(),
-                    reason: "surface model differs from the application model declaration".into(),
-                });
-            }
-        }
-        for exposed in &surface.contract.projections {
-            let Some(authoritative) = projections.get(exposed.id.as_str()) else {
-                return Err(ApplicationError::Missing {
-                    kind: "projection",
-                    identity: exposed.id.clone(),
-                });
-            };
-            if *authoritative != exposed {
-                return Err(ApplicationError::Collision {
-                    kind: "projection",
-                    identity: exposed.id.clone(),
-                    reason:
-                        "surface projection differs from the application projection declaration"
-                            .into(),
-                });
-            }
-        }
         let expected_command_ids = surface_command_closure(surface, &manifest.commands)?;
         let actual_command_ids = surface
             .contract
@@ -239,5 +205,456 @@ pub(super) fn surface_command_roles(
     match &surface.contract.selection {
         SurfaceSelectionSpec::Catalog => authoritative.roles.clone(),
         selection => selection.eligible_roles().to_vec(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+
+    use super::*;
+    use crate::application::command::{CommandTypeField, CommandTypeSpec, EventSpec};
+    use crate::application::module::ModelFieldSpec;
+    use crate::application::surface::SurfaceContract;
+    use crate::application::{Application, CommandDefinition};
+    use crate::command::CommandConsistency;
+    use crate::graphql::read;
+    use crate::graphql::surface::{build_surface, surface_for_role, Surface, SurfaceOptions};
+    use crate::table::{ColumnType, PrimaryKey, TableColumn, TableKind, TableSchema};
+
+    fn todos() -> Surface {
+        let table = TableSchema {
+            model_name: "TodoView".into(),
+            table_name: "todos".into(),
+            columns: vec![TableColumn {
+                primary_key: true,
+                ..TableColumn::new("id", "id", ColumnType::Text)
+            }],
+            primary_key: PrimaryKey::new(["id"]),
+            version_column: None,
+            indexes: Vec::new(),
+            relationships: Vec::new(),
+            kind: TableKind::ReadModel,
+        };
+        build_surface(&[table], &SurfaceOptions::sqlite()).unwrap()
+    }
+
+    fn reader_surface() -> SurfaceSpec {
+        let grants = BTreeMap::from([("TodoView".to_string(), read().all_columns())]);
+        let selected = surface_for_role(&todos(), "reader", &grants).unwrap();
+        SurfaceSpec::from_surface("web", &selected).unwrap()
+    }
+
+    fn command(roles: &[&str]) -> CommandSpec {
+        let field = |name: &str| CommandTypeField {
+            unsigned_integer: None,
+            name: name.into(),
+            type_name: "String".into(),
+            nullable: false,
+            list: false,
+            item_nullable: false,
+            nested: None,
+        };
+        let mut spec = CommandSpec::try_new(
+            "todo.create",
+            "todo_create",
+            CommandTypeSpec {
+                name: "TodoCreateInput".into(),
+                fields: vec![field("title")],
+            },
+            CommandTypeSpec {
+                name: "TodoCreateOutput".into(),
+                fields: vec![field("id")],
+            },
+            CommandConsistency::Eventual,
+        )
+        .unwrap();
+        spec.roles = roles.iter().map(|role| role.to_string()).collect();
+        spec.fingerprint = sha256_fingerprint(&spec.canonical_bytes().unwrap());
+        spec
+    }
+
+    fn module(roles: &[&str]) -> Module {
+        Module::new("todo")
+            .command_definition(CommandDefinition::contract(command(roles)))
+            .build()
+            .unwrap()
+    }
+
+    /// A valid manifest: an admin-only command beside an explicit reader
+    /// surface, which therefore exposes no command.
+    fn manifest() -> ApplicationManifest {
+        Application::try_new("app", [module(&["admin"])], [reader_surface()])
+            .unwrap()
+            .manifest()
+            .clone()
+    }
+
+    /// The same surface owned by the module instead of passed explicitly.
+    fn module_owned_surface_manifest() -> ApplicationManifest {
+        let module = Module::new("todo")
+            .surface(reader_surface())
+            .build()
+            .unwrap();
+        Application::try_new("app", [module], [])
+            .unwrap()
+            .manifest()
+            .clone()
+    }
+
+    fn id_field() -> ModelFieldSpec {
+        ModelFieldSpec {
+            name: "id".into(),
+            scalar: "String".into(),
+            nullable: false,
+        }
+    }
+
+    fn refresh(surface: &mut SurfaceSpec) {
+        surface.fingerprint = sha256_fingerprint(&surface.canonical_bytes().unwrap());
+    }
+
+    fn event(body_fingerprint: char) -> EventSpec {
+        EventSpec {
+            name: "todo.created".into(),
+            version: 1,
+            body_type: "TodoCreated".into(),
+            body_version: 1,
+            body_schema: "todo-created".into(),
+            body_fingerprint: format!("sha256:{}", body_fingerprint.to_string().repeat(64)),
+            body_codec: "json".into(),
+            body_codec_version: 1,
+        }
+    }
+
+    fn collision(kind: &'static str, identity: &str, reason: &str) -> ApplicationError {
+        ApplicationError::Collision {
+            kind,
+            identity: identity.into(),
+            reason: reason.into(),
+        }
+    }
+
+    #[test]
+    fn validation_rejects_each_inventory_that_disagrees_with_its_owners() {
+        type Base = fn() -> ApplicationManifest;
+        type Tamper = fn(&mut ApplicationManifest);
+        let cases: [(&str, Base, Tamper, ApplicationError); 7] = [
+            (
+                "command without a module owner",
+                manifest,
+                |manifest| manifest.commands.clear(),
+                collision(
+                    "command",
+                    "app",
+                    "application command inventory does not equal explicit module ownership",
+                ),
+            ),
+            (
+                "event without a module owner",
+                manifest,
+                |manifest| manifest.events.push(event('a')),
+                collision(
+                    "event",
+                    "app",
+                    "application event inventory does not equal explicit module ownership",
+                ),
+            ),
+            (
+                "projection without an owner",
+                manifest,
+                |manifest| {
+                    manifest.projections.push(
+                        ProjectionSpec::try_new("orphan", Vec::<String>::new(), ["TodoView"])
+                            .unwrap(),
+                    )
+                },
+                collision(
+                    "projection",
+                    "app",
+                    "application projection inventory is not closed over modules and surfaces",
+                ),
+            ),
+            (
+                "model without an owner",
+                manifest,
+                |manifest| {
+                    manifest.models.push(
+                        ModelSpec::try_new("Orphan", "orphans", [id_field()], ["id"]).unwrap(),
+                    )
+                },
+                collision(
+                    "model",
+                    "app",
+                    "application model inventory is not closed over modules and surfaces",
+                ),
+            ),
+            (
+                "module surface renamed in the application",
+                module_owned_surface_manifest,
+                |manifest| {
+                    manifest.surfaces[0].id = "other".into();
+                    refresh(&mut manifest.surfaces[0]);
+                },
+                ApplicationError::Missing {
+                    kind: "surface",
+                    identity: "web".into(),
+                },
+            ),
+            (
+                "module surface altered in the application",
+                module_owned_surface_manifest,
+                |manifest| {
+                    manifest.surfaces[0].contract.default_limit += 1;
+                    refresh(&mut manifest.surfaces[0]);
+                },
+                collision(
+                    "surface",
+                    "web",
+                    "surface ownership has incompatible canonical material",
+                ),
+            ),
+            (
+                "root over an undeclared model",
+                manifest,
+                |manifest| {
+                    manifest.surfaces[0].contract.roots[0].model = "Ghost".into();
+                    refresh(&mut manifest.surfaces[0]);
+                },
+                ApplicationError::Missing {
+                    kind: "model",
+                    identity: "Ghost".into(),
+                },
+            ),
+        ];
+        for (name, base, tamper, expected) in cases {
+            let mut manifest = base();
+            manifest
+                .validate()
+                .unwrap_or_else(|error| panic!("{name}: base {error}"));
+            tamper(&mut manifest);
+            manifest.fingerprints = ManifestFingerprint::default();
+            assert_eq!(manifest.validate().unwrap_err(), expected, "{name}");
+        }
+    }
+
+    #[test]
+    fn a_surface_must_expose_exactly_its_authorized_commands() {
+        // An unrestricted command is authorized for the reader surface, which
+        // was compiled without it.
+        assert_eq!(
+            Application::try_new("app", [module(&[])], [reader_surface()]).unwrap_err(),
+            collision(
+                "command",
+                "web",
+                "surface command inventory is not the exact authorized command closure",
+            )
+        );
+        let catalog = SurfaceSpec {
+            contract: SurfaceContract {
+                selection: SurfaceSelectionSpec::Catalog,
+                ..reader_surface().contract
+            },
+            ..reader_surface()
+        };
+        let cases = [
+            ("catalog", &catalog, &[][..], vec!["todo.create"]),
+            (
+                "role without the grant",
+                &reader_surface(),
+                &["admin"][..],
+                vec![],
+            ),
+            (
+                "unrestricted",
+                &reader_surface(),
+                &[][..],
+                vec!["todo.create"],
+            ),
+        ];
+        for (name, surface, roles, expected) in cases {
+            assert_eq!(
+                surface_command_closure(surface, &[command(roles)]).unwrap(),
+                expected,
+                "{name}"
+            );
+        }
+        let application = SurfaceSelectionSpec::Application {
+            name: "web".into(),
+            eligible_roles: vec!["admin".into(), "user".into()],
+            schema_roles: vec!["admin".into(), "user".into()],
+        };
+        let application = SurfaceSpec {
+            contract: SurfaceContract {
+                selection: application,
+                ..reader_surface().contract
+            },
+            ..reader_surface()
+        };
+        for (name, roles, expected) in [
+            (
+                "every schema role granted",
+                &["admin", "user"][..],
+                vec!["todo.create"],
+            ),
+            ("one schema role missing", &["admin"][..], vec![]),
+        ] {
+            assert_eq!(
+                surface_command_closure(&application, &[command(roles)]).unwrap(),
+                expected,
+                "{name}"
+            );
+        }
+        assert_eq!(
+            surface_command_roles(&catalog, &command(&["admin"])),
+            ["admin"]
+        );
+        assert_eq!(
+            surface_command_roles(&application, &command(&["admin"])),
+            ["admin", "user"]
+        );
+    }
+
+    #[test]
+    fn composition_rejects_incompatible_duplicates() {
+        assert_eq!(
+            dedup_events(vec![event('a'), event('a')]).unwrap(),
+            vec![event('a')],
+            "identical events collapse"
+        );
+        assert_eq!(
+            dedup_events(vec![event('b'), event('a')]).unwrap_err(),
+            collision(
+                "event",
+                "todo.created",
+                "same identity has incompatible event schemas"
+            )
+        );
+        let model =
+            |table: &str| ModelSpec::try_new("TodoView", table, [id_field()], ["id"]).unwrap();
+        assert_eq!(
+            dedup_models(vec![model("todos"), model("todos")]).unwrap(),
+            vec![model("todos")],
+            "identical models collapse"
+        );
+        assert_eq!(
+            dedup_models(vec![model("todos"), model("other")]).unwrap_err(),
+            collision(
+                "model",
+                "TodoView",
+                "same identity has incompatible model schemas"
+            )
+        );
+        assert_eq!(
+            Application::try_new("app", [module(&["admin"]), module(&["admin"])], []).unwrap_err(),
+            ApplicationError::Duplicate {
+                kind: "module",
+                identity: "todo".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn framework_compatibility_rejects_each_malformed_record() {
+        let base = manifest();
+        assert_eq!(base.module_ids(), ["todo"]);
+        assert_eq!(
+            base.framework_compatibility().unwrap(),
+            FrameworkCompatibility::current()
+        );
+        let with = |version: u32, value: serde_json::Value| {
+            let mut manifest = base.clone();
+            manifest
+                .extensions
+                .retain(|extension| extension.id != FRAMEWORK_COMPATIBILITY_EXTENSION_ID);
+            manifest.with_extension(ApplicationExtension {
+                id: FRAMEWORK_COMPATIBILITY_EXTENSION_ID.into(),
+                version,
+                value,
+            })
+        };
+        let release = serde_json::json!({"release": env!("CARGO_PKG_VERSION")});
+        let cases = [
+            (
+                "wrong version",
+                with(2, release.clone()),
+                "framework compatibility extension version must be 1",
+            ),
+            (
+                "not a record",
+                with(1, serde_json::json!("1.0")),
+                "invalid framework compatibility record",
+            ),
+        ];
+        for (name, manifest, expected) in cases {
+            let Err(ApplicationError::InvalidSpec(reason)) = manifest.framework_compatibility()
+            else {
+                panic!("{name}: expected InvalidSpec");
+            };
+            assert!(reason.starts_with(expected), "{name}: {reason}");
+        }
+        assert_eq!(
+            with(1, serde_json::json!({"release": ""}))
+                .framework_compatibility()
+                .unwrap_err(),
+            ApplicationError::InvalidIdentity {
+                kind: "framework release",
+                value: String::new(),
+                reason: "must be a bounded portable logical value",
+            },
+            "blank release"
+        );
+        assert!(with(1, release).framework_compatibility().is_ok());
+    }
+
+    #[test]
+    fn module_events_and_projection_facts_compose_in_canonical_order() {
+        let emitting = |id: &str, events: Vec<EventSpec>| {
+            let mut spec = command(&[]);
+            spec.id = id.into();
+            spec.field_name = id.replace('.', "_");
+            spec.emits = events;
+            spec.fingerprint = sha256_fingerprint(&spec.canonical_bytes().unwrap());
+            CommandDefinition::contract(spec)
+        };
+        let named = |name: &str| EventSpec {
+            name: name.into(),
+            ..event('a')
+        };
+        let projection = ProjectionSpec::try_new(
+            "todos",
+            ["todo.renamed", "todo.created"],
+            Vec::<String>::new(),
+        )
+        .unwrap();
+        let module = Module::new("todo")
+            .command_definitions([
+                emitting("todo.rename", vec![named("todo.renamed")]),
+                emitting("todo.create", vec![named("todo.created")]),
+            ])
+            .projection(projection)
+            .build()
+            .unwrap();
+        let manifest = Application::try_new("app", [module], [])
+            .unwrap()
+            .manifest()
+            .clone();
+        assert_eq!(
+            manifest
+                .events
+                .iter()
+                .map(|event| event.name.as_str())
+                .collect::<Vec<_>>(),
+            ["todo.created", "todo.renamed"]
+        );
+        assert_eq!(
+            manifest.projections[0].facts,
+            ["todo.created", "todo.renamed"]
+        );
+        manifest.validate().unwrap();
+        let decoded =
+            ApplicationManifest::from_canonical_bytes(&manifest.canonical_bytes().unwrap())
+                .unwrap();
+        assert_eq!(decoded, manifest);
     }
 }

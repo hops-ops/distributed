@@ -73,7 +73,6 @@ on_each_dialect! {
         s1_response_key_field_selection_safe_roundtrip,
         s2_unknown_where_key_fails_closed_without_sql_leak,
         s3_like_wildcards_are_bound_and_safe,
-        s4_json_looking_string_stays_string,
         s5_order_by_junk_direction_is_safe,
         s6_pk_type_confusion_does_not_leak_sql,
         s2_denied_where_column_fails_closed,

@@ -908,6 +908,7 @@ dependencies = [
  "distributed",
  "jsonwebtoken",
  "rand 0.8.8",
+ "rdkafka",
  "reqwest",
  "rsa",
  "serde",
@@ -915,6 +916,7 @@ dependencies = [
  "sqlx",
  "tokio",
  "tower",
+ "uuid",
 ]
 
 [[package]]

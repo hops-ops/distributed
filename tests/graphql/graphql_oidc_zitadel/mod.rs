@@ -1,6 +1,9 @@
 //! Zitadel live e2e — reference provider for [[specs/query-layer/oidc-e2e]] E1–E8.
-//! Gate: `ZITADEL_E2E=1`. Mint: JWT-bearer (adapter [[specs/query-layer/oidc-zitadel]]).
+//! Live (`#[ignore = "live: ..."]`): run with `--ignored` after
+//! `scripts/oidc-zitadel-up.sh`; fails without `OIDC_ISSUER`.
+//! Mint: JWT-bearer (adapter [[specs/query-layer/oidc-zitadel]]).
 
+use common::env as env_support;
 use common::oidc;
 
 use std::path::PathBuf;
@@ -9,18 +12,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use distributed::graphql::OidcConfig;
 use serde_json::{json, Value};
 
-fn e2e_enabled() -> bool {
-    oidc::gate_enabled("ZITADEL_E2E")
-}
-
 /// Live E1–E8 against real Zitadel issuer + shipped OidcBearer HTTP path.
 #[tokio::test]
+#[ignore = "live: needs a bootstrapped Zitadel (scripts/oidc-zitadel-up.sh, OIDC_ISSUER)"]
 async fn e1_through_e8_live() {
-    if !e2e_enabled() {
-        eprintln!("ZITADEL_E2E not set — skip live E1–E8");
-        return;
-    }
-    let iss = std::env::var("OIDC_ISSUER").expect("OIDC_ISSUER");
+    let iss = env_support::require_live("OIDC_ISSUER", "Zitadel OIDC e2e");
     assert!(
         oidc::discovery_ready(&iss).await || issuer_ready_debug(&iss).await,
         "issuer not ready: {iss}"

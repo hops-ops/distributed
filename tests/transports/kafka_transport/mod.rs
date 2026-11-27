@@ -3,8 +3,10 @@
 //!
 //! `unique` mixes wall-clock nanos into every namespace, so a fresh topic
 //! never holds a previous run's messages (Kafka keeps topics).
+//!
+//! Each test creates its topics first (`common::kafka::create_bus_topics`).
 
-use std::time::Duration;
+mod source;
 
 use common::env as env_support;
 use common::ids::unique;
@@ -39,10 +41,12 @@ impl BusHarness for Kafka {
     };
 
     async fn start() -> Option<Self> {
-        Some(Self {
+        let kafka = Self {
             brokers: env_support::require_service("KAFKA_BROKERS", "kafka transport test")?,
             namespace: unique("ns"),
-        })
+        };
+        common::kafka::create_bus_topics(&kafka.brokers, &kafka.namespace).await;
+        Some(kafka)
     }
 
     async fn bus(&self) -> KafkaBus {
@@ -50,7 +54,6 @@ impl BusHarness for Kafka {
             .namespace(&self.namespace)
             .await
             .expect("connect bus")
-            .with_fetch_timeout(Duration::from_secs(10))
     }
 }
 

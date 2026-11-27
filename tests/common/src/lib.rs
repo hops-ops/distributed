@@ -53,6 +53,8 @@ pub mod transport;
 
 #[cfg(all(feature = "graphql", feature = "sqlite"))]
 pub mod graphql;
+#[cfg(feature = "kafka")]
+pub mod kafka;
 #[cfg(any(feature = "sqlite", feature = "postgres"))]
 pub mod lock;
 #[cfg(all(feature = "graphql", feature = "sqlite"))]

@@ -123,8 +123,6 @@ pub struct ProjectionSpec {
     pub modeled: Vec<serde_json::Value>,
     #[serde(default)]
     pub partition: serde_json::Value,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub catalog_fingerprint: Option<String>,
     pub fingerprint: String,
 }
 
@@ -144,7 +142,6 @@ impl ProjectionSpec {
             modeled_programs: Vec::new(),
             modeled: Vec::new(),
             partition: serde_json::Value::Null,
-            catalog_fingerprint: None,
             fingerprint: String::new(),
         };
         spec.canonicalize();
@@ -179,25 +176,9 @@ impl ProjectionSpec {
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(ApplicationError::InvalidSpec)?,
             partition: serde_json::to_value(&owner.partition)?,
-            catalog_fingerprint: None,
             fingerprint: String::new(),
         };
         spec.canonicalize();
-        spec.refresh_fingerprint()?;
-        Ok(spec)
-    }
-
-    /// Reference an existing canonical projection catalog without copying
-    /// executable routes or handler values into the module artifact.
-    pub fn from_catalog(
-        id: impl Into<String>,
-        catalog: &crate::projection::catalog::ProjectionCatalog,
-    ) -> ApplicationResult<Self> {
-        let bytes = catalog
-            .canonical_bytes()
-            .map_err(|error| ApplicationError::Canonical(error.to_string()))?;
-        let mut spec = Self::try_new(id, Vec::<String>::new(), Vec::<String>::new())?;
-        spec.catalog_fingerprint = Some(sha256_fingerprint(&bytes));
         spec.refresh_fingerprint()?;
         Ok(spec)
     }
@@ -363,6 +344,8 @@ impl Module {
     pub(crate) fn typed_command_contracts(&self) -> Result<Vec<TypedCommandContract>, String> {
         let mut contracts = Vec::with_capacity(self.definitions.len());
         for definition in &self.definitions {
+            // CommandDefinition derives its spec from the typed contract at
+            // construction and never changes either, so they cannot disagree.
             let Some(contract) = definition.typed_contract() else {
                 return Err(format!(
                     "module `{}` command `{}` has no retained typed command contract",
@@ -370,15 +353,6 @@ impl Module {
                     definition.spec().id
                 ));
             };
-            let expected = CommandSpec::from_contract(contract)
-                .map_err(|error| format!("cannot compile typed command contract: {error}"))?;
-            if expected != *definition.spec() {
-                return Err(format!(
-                    "module `{}` command `{}` has a stale portable spec beside its typed command contract",
-                    self.id(),
-                    definition.spec().id
-                ));
-            }
             contracts.push(contract.clone());
         }
         Ok(contracts)
@@ -469,54 +443,15 @@ impl ModuleBuilder {
             command.validate_fingerprint()?;
         }
 
-        for definition in &definitions {
-            if let Some(contract) = definition.typed_contract() {
-                let expected = CommandSpec::from_contract(contract)?;
-                if expected != *definition.spec() {
-                    return Err(ApplicationError::Collision {
-                        kind: "command",
-                        identity: definition.spec().id.clone(),
-                        reason: "typed command contract and portable spec disagree".into(),
-                    });
-                }
-            }
-        }
-
+        // Every CommandDefinition constructor proves its spec equals the one
+        // derived from its typed contract and the one its mount carries, and
+        // neither can change afterwards; command ids are unique above, so the
+        // mounts (at most one per definition) are unique too.
         let mut mounts = definitions
             .iter()
             .filter_map(|definition| definition.mount().cloned())
             .collect::<Vec<_>>();
-        let command_ids = commands
-            .iter()
-            .map(|command| command.id.as_str())
-            .collect::<BTreeSet<_>>();
-        for mount in &mounts {
-            if !command_ids.contains(mount.spec().id.as_str()) {
-                return Err(ApplicationError::Missing {
-                    kind: "command",
-                    identity: mount.spec().id.clone(),
-                });
-            }
-            let Some(command) = commands
-                .iter()
-                .find(|command| command.id == mount.spec().id)
-            else {
-                continue;
-            };
-            if command.fingerprint != mount.spec().fingerprint {
-                return Err(ApplicationError::Collision {
-                    kind: "command",
-                    identity: command.id.clone(),
-                    reason: "executable mount spec differs from module command spec".into(),
-                });
-            }
-        }
-
         mounts.sort_by(|left, right| left.spec().id.cmp(&right.spec().id));
-        validate_unique(
-            "command mount",
-            mounts.iter().map(|mount| mount.spec().id.clone()),
-        )?;
 
         let mut surfaces = self.surfaces;
         surfaces.sort_by(|left, right| left.id.cmp(&right.id));
@@ -626,4 +561,236 @@ fn dedup_identical<T: PartialEq>(
     }
     out.extend(seen.into_values());
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::application::command::{CommandTypeField, CommandTypeSpec};
+    use crate::command::CommandConsistency;
+
+    fn field(name: &str) -> ModelFieldSpec {
+        ModelFieldSpec {
+            name: name.into(),
+            scalar: "String".into(),
+            nullable: false,
+        }
+    }
+
+    fn command(id: &str) -> CommandSpec {
+        let field = |name: &str| CommandTypeField {
+            unsigned_integer: None,
+            name: name.into(),
+            type_name: "String".into(),
+            nullable: false,
+            list: false,
+            item_nullable: false,
+            nested: None,
+        };
+        CommandSpec::try_new(
+            id,
+            id.replace('.', "_"),
+            CommandTypeSpec {
+                name: "Input".into(),
+                fields: vec![field("title")],
+            },
+            CommandTypeSpec {
+                name: "Output".into(),
+                fields: vec![field("id")],
+            },
+            CommandConsistency::Eventual,
+        )
+        .unwrap()
+    }
+
+    fn emitting(id: &str, body_fingerprint: char) -> CommandSpec {
+        let mut spec = command(id);
+        spec.emits = vec![EventSpec {
+            name: "todo.changed".into(),
+            version: 1,
+            body_type: "TodoChanged".into(),
+            body_version: 1,
+            body_schema: "todo-changed".into(),
+            body_fingerprint: format!("sha256:{}", body_fingerprint.to_string().repeat(64)),
+            body_codec: "json".into(),
+            body_codec_version: 1,
+        }];
+        spec.fingerprint = sha256_fingerprint(&spec.canonical_bytes().unwrap());
+        spec
+    }
+
+    fn collision(kind: &'static str, identity: &str, reason: &str) -> ApplicationError {
+        ApplicationError::Collision {
+            kind,
+            identity: identity.into(),
+            reason: reason.into(),
+        }
+    }
+
+    #[test]
+    fn model_specs_are_canonical_and_reject_missing_shape() {
+        let model = ModelSpec::try_new(
+            "TodoView",
+            "todos",
+            [field("title"), field("id")],
+            ["id", "id"],
+        )
+        .unwrap();
+        assert_eq!(
+            model
+                .fields
+                .iter()
+                .map(|f| f.name.as_str())
+                .collect::<Vec<_>>(),
+            ["id", "title"]
+        );
+        assert_eq!(model.primary_key, ["id"]);
+        assert_eq!(model.object, "TodoView");
+        let mut stale = model.clone();
+        stale.fingerprint.clear();
+        stale.refresh_fingerprint().unwrap();
+        assert_eq!(
+            stale.fingerprint, model.fingerprint,
+            "fingerprint is derived"
+        );
+
+        assert_eq!(
+            ModelSpec::try_new("TodoView", "todos", [], ["id"]).unwrap_err(),
+            ApplicationError::InvalidSpec(
+                "model `TodoView` must declare at least one field".into()
+            )
+        );
+        assert_eq!(
+            ModelSpec::try_new("TodoView", "todos", [field("id")], Vec::<String>::new())
+                .unwrap_err(),
+            ApplicationError::InvalidSpec("model `TodoView` must declare a primary key".into())
+        );
+        assert!(matches!(
+            ModelSpec::try_new("TodoView", "to dos", [field("id")], ["id"]).unwrap_err(),
+            ApplicationError::InvalidIdentity {
+                kind: "model table",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn marking_a_projection_direct_changes_its_identity() {
+        let projection = ProjectionSpec::try_new("todos", ["b", "a", "a"], ["TodoView"]).unwrap();
+        assert_eq!(projection.facts, ["a", "b"], "facts are canonical");
+        let direct = projection.clone().with_direct(true).unwrap();
+        assert!(direct.direct);
+        assert_ne!(direct.fingerprint, projection.fingerprint);
+        assert_eq!(
+            direct.with_direct(false).unwrap().fingerprint,
+            projection.fingerprint
+        );
+    }
+
+    #[test]
+    fn module_halves_keep_their_own_declarations() {
+        let model = ModelSpec::try_new("TodoView", "todos", [field("id")], ["id"]).unwrap();
+        let projection = ProjectionSpec::try_new("todos", ["a"], ["TodoView"]).unwrap();
+        let module = Module::builder("todo")
+            .command_definition(CommandDefinition::contract(command("todo.create")))
+            .projections([projection.clone()])
+            .model(model.clone())
+            .build()
+            .unwrap();
+        assert_eq!(module.id(), "todo");
+        assert_eq!(module.commands().len(), 1);
+        assert!(module.mounts().is_empty());
+        assert_eq!(module.definitions().len(), 1);
+        assert!(module.surfaces().is_empty());
+        assert_eq!(
+            module.module().canonical_bytes().unwrap(),
+            module.canonical_bytes().unwrap()
+        );
+        assert_eq!(
+            serde_json::to_value(&module).unwrap(),
+            serde_json::to_value(module.manifest()).unwrap(),
+            "a module serializes as its manifest"
+        );
+
+        let commands = module.commands_only().unwrap();
+        assert_eq!(commands.commands(), module.commands());
+        assert!(commands.manifest().projections.is_empty());
+        assert_eq!(commands.manifest().models, std::slice::from_ref(&model));
+
+        let projectors = module.projectors_only().unwrap();
+        assert!(projectors.commands().is_empty());
+        assert_eq!(projectors.manifest().projections, [projection]);
+        assert_eq!(projectors.manifest().models, [model]);
+
+        assert_eq!(
+            module.typed_command_contracts().unwrap_err(),
+            "module `todo` command `todo.create` has no retained typed command contract"
+        );
+        assert!(projectors.typed_command_contracts().unwrap().is_empty());
+    }
+
+    #[test]
+    fn build_rejects_each_conflicting_declaration() {
+        let model =
+            |table: &str| ModelSpec::try_new("TodoView", table, [field("id")], ["id"]).unwrap();
+        let projection =
+            |fact: &str| ProjectionSpec::try_new("todos", [fact], ["TodoView"]).unwrap();
+        let cases = [
+            (
+                "events with one name disagree",
+                Module::new("todo").command_definitions([
+                    CommandDefinition::contract(emitting("todo.create", 'a')),
+                    CommandDefinition::contract(emitting("todo.rename", 'b')),
+                ]),
+                collision(
+                    "event",
+                    "todo.changed",
+                    "event selectors with one name disagree",
+                ),
+            ),
+            (
+                "projections with one id disagree",
+                Module::new("todo").projections([projection("a"), projection("b")]),
+                collision(
+                    "projection",
+                    "todos",
+                    "same identity has incompatible portable definitions",
+                ),
+            ),
+            (
+                "models with one id disagree",
+                Module::new("todo").models([model("todos"), model("others")]),
+                collision(
+                    "model",
+                    "TodoView",
+                    "same identity has incompatible portable definitions",
+                ),
+            ),
+            (
+                "invalid module id",
+                Module::new("todo/app"),
+                ApplicationError::InvalidIdentity {
+                    kind: "module",
+                    value: "todo/app".into(),
+                    reason: "may contain only ASCII letters, digits, '.', '_', '-', and ':'",
+                },
+            ),
+        ];
+        for (name, builder, expected) in cases {
+            assert_eq!(builder.build().unwrap_err(), expected, "{name}");
+        }
+
+        let shared = Module::new("todo")
+            .command_definitions([
+                CommandDefinition::contract(emitting("todo.create", 'a')),
+                CommandDefinition::contract(emitting("todo.rename", 'a')),
+            ])
+            .models([model("todos"), model("todos")])
+            .projections([projection("a"), projection("a")])
+            .build()
+            .unwrap();
+        assert_eq!(shared.manifest().events.len(), 1, "identical events merge");
+        assert_eq!(shared.manifest().models.len(), 1, "identical models merge");
+        assert_eq!(shared.manifest().projections.len(), 1);
+    }
 }

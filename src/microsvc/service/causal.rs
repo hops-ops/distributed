@@ -1372,3 +1372,7 @@ pub(super) fn collapse_projection_evidence(
         CausalCommandPublicState::SucceededPendingProjection
     }
 }
+
+#[cfg(test)]
+#[path = "causal_tests.rs"]
+mod tests;

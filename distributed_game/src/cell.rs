@@ -187,3 +187,17 @@ fn batch_command(
         session,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::command_id_for;
+
+    #[test]
+    fn command_ids_are_deterministic_uuidv7_shaped() {
+        let a = command_id_for("svc", "coin:z1:7");
+        assert_eq!(a, command_id_for("svc", "coin:z1:7"));
+        assert_ne!(a, command_id_for("svc", "coin:z1:8"));
+        assert_eq!(&a[14..15], "7");
+        assert!(matches!(&a[19..20], "8" | "9" | "a" | "b"));
+    }
+}

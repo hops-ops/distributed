@@ -120,6 +120,10 @@ impl RunOptions {
 
     /// Return as soon as the source has nothing to deliver, and redeliver a
     /// failed message at once. For tests and one-shot drains.
+    ///
+    /// "Nothing to deliver" is the source's to say: a queue or table that is
+    /// empty, a log read to its end. A Kafka consumer is idle once it has
+    /// joined its group and read every partition assigned to it to its end.
     pub fn until_idle() -> Self {
         Self {
             until: RunUntil::Idle,

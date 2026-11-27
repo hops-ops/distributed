@@ -302,6 +302,9 @@ pub async fn by_pk_with_nested_children_returns_row(db: Db) {
     assert!(ids.contains(&"c1") && ids.contains(&"c2"), "{data}");
 }
 
+/// S4 / T1: a JSON-looking text column stays a GraphQL String (not
+/// re-typed). Regression test for the removed `deep_parse_json_strings`
+/// type confusion (tasks/graphql-qs-harden-3).
 pub async fn json_looking_string_column_stays_string(db: Db) {
     let pool = seed_orders(&db).await;
     let engine = engine_all_columns(pool);

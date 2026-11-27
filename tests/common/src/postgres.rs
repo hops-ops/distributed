@@ -1,15 +1,10 @@
 //! A throwaway Postgres schema per test.
 
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
-
 use distributed::PostgresRepository;
 use sqlx::postgres::PgPoolOptions;
 use sqlx::Executor;
 
 use crate::env as env_support;
-
-static NEXT_SCHEMA_ID: AtomicU64 = AtomicU64::new(1);
 
 /// A fresh schema of `DATABASE_URL`, dropped (with everything in it) when this
 /// value is dropped — including when the test panics.
@@ -135,14 +130,19 @@ impl Drop for PostgresTestSchema {
     }
 }
 
+/// Postgres truncates a longer identifier without an error, so two names that
+/// differ only past it would name one schema.
+const MAX_IDENTIFIER_BYTES: usize = 63;
+
+/// `sr_{prefix}_{token}`: at most 3 + 18 + 1 + 24 bytes plus the token's
+/// per-process sequence.
 fn unique_schema_name(prefix: &str) -> String {
-    let prefix = sanitize_prefix(prefix);
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("system time should be after epoch")
-        .as_nanos();
-    let sequence = NEXT_SCHEMA_ID.fetch_add(1, Ordering::Relaxed);
-    format!("sr_{prefix}_{nanos}_{sequence}")
+    let name = format!("sr_{}_{}", sanitize_prefix(prefix), crate::ids::token());
+    assert!(
+        name.len() <= MAX_IDENTIFIER_BYTES,
+        "schema name `{name}` exceeds Postgres's {MAX_IDENTIFIER_BYTES}-byte identifier limit"
+    );
+    name
 }
 
 fn sanitize_prefix(prefix: &str) -> String {

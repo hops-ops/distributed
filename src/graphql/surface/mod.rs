@@ -14,9 +14,8 @@ use sha2::{Digest, Sha256};
 
 use super::filter::{validate_row_policy_operand_literal, FilterExpr, Operand};
 use crate::command::{
-    compiled_direct_projection_target, CommandConsistency, CommandDirectProjectionTarget,
-    CommandInputDefault, CommandProjectedModel, CommandProjectionEvents,
-    CommandProjectionPreviewSource, CompiledDirectProjectionTarget, EffectExpression,
+    CommandConsistency, CommandDirectProjectionTarget, CommandInputDefault, CommandProjectedModel,
+    CommandProjectionEvents, CommandProjectionPreviewSource, EffectExpression,
 };
 use crate::projection_protocol::ProjectionModelOwnership;
 use crate::projection_protocol::ProjectionPartitionSpec;

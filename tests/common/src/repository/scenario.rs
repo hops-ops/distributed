@@ -373,7 +373,8 @@ where
 /// `ConcurrentWrite`. Crucially, the surviving stream must be gap-free and
 /// duplicate-free: this exercises the unique `(aggregate, sequence)` PK backstop
 /// behind the read-then-check version window under real concurrency (the
-/// existing `concurrent_writes_detected` test only races sequentially).
+/// sequential case, `a_stale_commit_reports_the_stream_and_both_versions`,
+/// does not race).
 ///
 /// `concurrency` must be >= 2 (the test asserts at least one conflict).
 pub async fn racing_commits_one_wins_one_conflicts<R>(repo: R, concurrency: usize)

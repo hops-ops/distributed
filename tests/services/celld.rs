@@ -1,8 +1,9 @@
 //! Live celld host: one Todo Durable Object per todo id, one Chat cell per
 //! message id.
 //!
-//! Every test runs only when `CELLD_URL`
-//! is set (operator started compose + `celld deploy`). See `tests/celld/README.md`.
+//! Every test is ignored (`live:`): run them with `--ignored` against a host
+//! at `CELLD_URL` (operator started compose + `celld deploy`); unset, they
+//! fail. See `tests/celld/README.md`.
 
 use std::time::Duration;
 
@@ -18,11 +19,9 @@ const TEST_PRINCIPAL_PARTITION: &str = "test-principal-alice";
 use common::env as env_support;
 
 #[tokio::test]
+#[ignore = "live: needs a celld host at CELLD_URL"]
 async fn live_cell_private_routes_reject_missing_forged_and_malformed_authority() {
-    let Some(base) = env_support::require_service("CELLD_URL", "celld live security boundary")
-    else {
-        return;
-    };
+    let base = env_support::require_live("CELLD_URL", "celld live security boundary");
     let base = base.trim_end_matches('/').to_string();
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(10))
@@ -83,10 +82,9 @@ async fn live_cell_private_routes_reject_missing_forged_and_malformed_authority(
 }
 
 #[tokio::test]
+#[ignore = "live: needs a celld host at CELLD_URL"]
 async fn live_todo_cell_create_complete_reopen_archive_and_isolate() {
-    let Some(base) = env_support::require_service("CELLD_URL", "celld live Todo cell") else {
-        return;
-    };
+    let base = env_support::require_live("CELLD_URL", "celld live Todo cell");
     let base = base.trim_end_matches('/').to_string();
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(10))
@@ -253,10 +251,9 @@ async fn live_todo_cell_create_complete_reopen_archive_and_isolate() {
 }
 
 #[tokio::test]
+#[ignore = "live: needs a celld host at CELLD_URL"]
 async fn live_independent_todo_cells_accept_bursts_while_queue_drain_is_busy() {
-    let Some(base) = env_support::require_service("CELLD_URL", "celld live Todo burst") else {
-        return;
-    };
+    let base = env_support::require_live("CELLD_URL", "celld live Todo burst");
     let base = base.trim_end_matches('/').to_string();
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(10))
@@ -265,10 +262,7 @@ async fn live_independent_todo_cells_accept_bursts_while_queue_drain_is_busy() {
 
     wait_healthy(&client, &base).await;
 
-    let nonce = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .expect("clock")
-        .as_nanos();
+    let nonce = common::ids::token();
     let ids = (0..6)
         .map(|index| format!("todo-burst-{nonce}-{index}"))
         .collect::<Vec<_>>();
@@ -352,10 +346,9 @@ async fn live_independent_todo_cells_accept_bursts_while_queue_drain_is_busy() {
 }
 
 #[tokio::test]
+#[ignore = "live: needs a celld host at CELLD_URL"]
 async fn live_chat_cell_post_and_isolate() {
-    let Some(base) = env_support::require_service("CELLD_URL", "celld live Chat cell") else {
-        return;
-    };
+    let base = env_support::require_live("CELLD_URL", "celld live Chat cell");
     let base = base.trim_end_matches('/').to_string();
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(10))
@@ -417,11 +410,8 @@ async fn live_chat_cell_post_and_isolate() {
 }
 
 fn unique_cell_pair(kind: &str) -> (String, String) {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .expect("clock")
-        .as_nanos();
-    (format!("{kind}-{nanos}-a"), format!("{kind}-{nanos}-b"))
+    let id = common::ids::unique_id(kind);
+    (format!("{id}-a"), format!("{id}-b"))
 }
 
 fn unix_millis() -> String {

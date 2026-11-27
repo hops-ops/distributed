@@ -135,6 +135,222 @@ where
     assert_eq!(loaded_seat.entity.events().len(), 1);
 }
 
+// --- Raw stream semantics: `commit_batch` and `get_stream` on one `Entity` ---
+
+const STREAM_TYPE: &str = "conformance.stream";
+
+/// A fresh stream id and its identity under [`STREAM_TYPE`].
+fn stream(prefix: &str) -> (String, StreamIdentity) {
+    let id = unique_id(prefix);
+    let identity = StreamIdentity::new(STREAM_TYPE, &id).expect("identity should be valid");
+    (id, identity)
+}
+
+async fn commit_stream<R>(
+    repo: &R,
+    identity: &StreamIdentity,
+    entity: &mut Entity,
+) -> Result<(), RepositoryError>
+where
+    R: TransactionalCommit,
+{
+    repo.commit_batch(CommitBatch::new(vec![StreamWrite::new(
+        identity.clone(),
+        entity,
+    )]))
+    .await
+}
+
+async fn load_stream<R: GetStream>(repo: &R, identity: &StreamIdentity) -> Entity {
+    repo.get_stream(identity)
+        .await
+        .expect("stream should load")
+        .expect("stream should exist")
+}
+
+/// Each load-modify-commit cycle appends only its new event.
+pub async fn load_modify_commit_cycles_append_to_the_stream<R>(repo: R)
+where
+    R: GetStream + TransactionalCommit + Send + Sync,
+{
+    let (id, identity) = stream("cycles");
+    let mut entity = Entity::with_id(&id);
+    entity.digest("initialized", &"v1").unwrap();
+    commit_stream(&repo, &identity, &mut entity)
+        .await
+        .expect("first commit");
+
+    let mut entity = load_stream(&repo, &identity).await;
+    assert_eq!(entity.events().len(), 1);
+    entity.digest("updated", &"v2").unwrap();
+    commit_stream(&repo, &identity, &mut entity)
+        .await
+        .expect("second commit");
+
+    let mut entity = load_stream(&repo, &identity).await;
+    assert_eq!(entity.events().len(), 2);
+    entity.digest("updated", &"v3").unwrap();
+    commit_stream(&repo, &identity, &mut entity)
+        .await
+        .expect("third commit");
+
+    let entity = load_stream(&repo, &identity).await;
+    let names: Vec<&str> = entity
+        .events()
+        .iter()
+        .map(|event| event.event_name.as_str())
+        .collect();
+    assert_eq!(names, ["initialized", "updated", "updated"]);
+    assert_eq!(entity.version(), 3);
+}
+
+/// Committing a loaded stream with no new events succeeds and writes nothing.
+pub async fn an_empty_commit_leaves_the_stream_unchanged<R>(repo: R)
+where
+    R: GetStream + TransactionalCommit + Send + Sync,
+{
+    let (id, identity) = stream("empty-commit");
+    let mut entity = Entity::with_id(&id);
+    entity.digest("initialized", &"v1").unwrap();
+    commit_stream(&repo, &identity, &mut entity)
+        .await
+        .expect("first commit");
+
+    let mut entity = load_stream(&repo, &identity).await;
+    assert!(entity.new_events().is_empty());
+    commit_stream(&repo, &identity, &mut entity)
+        .await
+        .expect("an empty commit should succeed");
+
+    assert_eq!(load_stream(&repo, &identity).await.events().len(), 1);
+}
+
+/// A commit marks the entity's events committed, and a load restores the
+/// committed version; neither touches the snapshot version.
+pub async fn commit_and_load_track_the_committed_version<R>(repo: R)
+where
+    R: GetStream + TransactionalCommit + Send + Sync,
+{
+    let (id, identity) = stream("versions");
+    let mut entity = Entity::with_id(&id);
+    entity.digest("first_recorded", &"a").unwrap();
+    entity.digest("second_recorded", &"b").unwrap();
+    assert_eq!(entity.committed_version(), 0);
+    assert_eq!(entity.new_events().len(), 2);
+
+    commit_stream(&repo, &identity, &mut entity)
+        .await
+        .expect("first commit");
+    assert_eq!(entity.committed_version(), 2);
+    assert_eq!(entity.snapshot_version(), 0);
+    assert!(entity.new_events().is_empty());
+
+    entity.digest("third_recorded", &"c").unwrap();
+    assert_eq!(entity.new_events().len(), 1);
+    assert_eq!(entity.new_events()[0].event_name, "third_recorded");
+
+    commit_stream(&repo, &identity, &mut entity)
+        .await
+        .expect("second commit");
+    assert_eq!(entity.committed_version(), 3);
+    assert_eq!(entity.snapshot_version(), 0);
+    assert!(entity.new_events().is_empty());
+
+    let loaded = load_stream(&repo, &identity).await;
+    assert_eq!(loaded.committed_version(), 3);
+    assert_eq!(loaded.snapshot_version(), 0);
+    assert_eq!(loaded.version(), 3);
+    assert!(loaded.new_events().is_empty());
+}
+
+/// Two loads of one version; the second commit is refused and names the
+/// stream, the version it loaded and the version storage now holds. (Two
+/// loads of one stream would wait on a queued repository's lock.)
+pub async fn a_stale_commit_reports_the_stream_and_both_versions<R>(repo: R)
+where
+    R: GetStream + TransactionalCommit + Send + Sync,
+{
+    let (id, identity) = stream("stale");
+    let mut entity = Entity::with_id(&id);
+    entity.digest("initialized", &"v1").unwrap();
+    commit_stream(&repo, &identity, &mut entity)
+        .await
+        .expect("first commit");
+
+    let mut first = load_stream(&repo, &identity).await;
+    let mut second = load_stream(&repo, &identity).await;
+    assert_eq!(first.committed_version(), 1);
+    assert_eq!(second.committed_version(), 1);
+    first.digest("updated_by_first", &"1").unwrap();
+    second.digest("updated_by_second", &"2").unwrap();
+
+    commit_stream(&repo, &identity, &mut first)
+        .await
+        .expect("the first writer commits");
+    let err = commit_stream(&repo, &identity, &mut second)
+        .await
+        .expect_err("the stale writer conflicts");
+    match err {
+        RepositoryError::ConcurrentWrite {
+            id: conflict,
+            expected,
+            actual,
+        } => {
+            assert_eq!(conflict, format!("{STREAM_TYPE}:{id}"));
+            assert_eq!(expected, 1);
+            assert_eq!(actual, 2);
+        }
+        other => panic!("expected ConcurrentWrite, got {other:?}"),
+    }
+}
+
+/// A batch whose second stream is stale fails as a whole: the first stream's
+/// append is not written either.
+pub async fn a_conflict_in_one_stream_rolls_back_the_whole_batch<R>(repo: R)
+where
+    R: GetStream + TransactionalCommit + Send + Sync,
+{
+    let (first_id, first) = stream("batch-first");
+    let (second_id, second) = stream("batch-second");
+    let mut e1 = Entity::with_id(&first_id);
+    e1.digest("initialized", &"v1").unwrap();
+    let mut e2 = Entity::with_id(&second_id);
+    e2.digest("initialized", &"v1").unwrap();
+    repo.commit_batch(CommitBatch::new(vec![
+        StreamWrite::new(first.clone(), &mut e1),
+        StreamWrite::new(second.clone(), &mut e2),
+    ]))
+    .await
+    .expect("both streams commit");
+
+    let mut e1_a = load_stream(&repo, &first).await;
+    let mut e2_a = load_stream(&repo, &second).await;
+    let mut e2_b = load_stream(&repo, &second).await;
+    e2_b.digest("conflicted", &"b").unwrap();
+    commit_stream(&repo, &second, &mut e2_b)
+        .await
+        .expect("the other writer commits");
+
+    e1_a.digest("updated", &"a").unwrap();
+    e2_a.digest("updated", &"a").unwrap();
+    let err = repo
+        .commit_batch(CommitBatch::new(vec![
+            StreamWrite::new(first.clone(), &mut e1_a),
+            StreamWrite::new(second.clone(), &mut e2_a),
+        ]))
+        .await
+        .expect_err("the stale batch conflicts");
+    match err {
+        RepositoryError::ConcurrentWrite { id, .. } => {
+            assert_eq!(id, format!("{STREAM_TYPE}:{second_id}"));
+        }
+        other => panic!("expected ConcurrentWrite, got {other:?}"),
+    }
+
+    assert_eq!(load_stream(&repo, &first).await.events().len(), 1);
+    assert_eq!(load_stream(&repo, &second).await.events().len(), 2);
+}
+
 /// 1000 events in one batch: more bind parameters than SQLite's historical
 /// limit of 999, so a SQL backend must chunk the insert.
 pub async fn commit_batch_with_1000_events_round_trips<R>(repo: R)

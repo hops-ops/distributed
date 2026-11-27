@@ -1117,12 +1117,12 @@ fn kafka_brokers() -> Option<String> {
 #[cfg(feature = "kafka")]
 async fn kafka_matrix_bus(ns: &str) -> distributed::bus::KafkaBus {
     let brokers = kafka_brokers().expect("KAFKA_BROKERS set");
+    common::kafka::create_bus_topics(&brokers, ns).await;
     distributed::bus::KafkaBus::connect(&brokers)
         .group("matrix")
         .namespace(ns)
         .await
         .expect("kafka connect")
-        .with_fetch_timeout(Duration::from_secs(10))
 }
 
 #[cfg(feature = "kafka")]

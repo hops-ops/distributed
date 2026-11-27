@@ -17,8 +17,8 @@ Optional profile:
 ```sh
 cd tests/e2e-ui
 make up-celld-nats     # celld local store + Queue relay + NATS
-make test-celld        # live `services` celld:: + GraphQL wait-path smoke (CI)
-make test-celld-nats   # GraphQL wait-path smoke + SQL list only
+make test-celld        # live `services` celld:: (4) + GraphQL wait-path smoke (1), `--ignored` (CI)
+make test-celld-nats   # GraphQL wait-path smoke + SQL list only (1)
 make down-celld-nats   # NATS only
 make down-celld        # celld; local state is preserved
 
@@ -86,12 +86,12 @@ docker compose -f tests/e2e-ui/celld-nats-profile/docker-compose.yml up -d
 export CELLD_URL=http://127.0.0.1:${CELLD_HTTP_PORT:-18880}
 export NATS_URL=nats://127.0.0.1:${NATS_PORT:-14222}
 
-cargo test --test services --features graphql,http,sqlite e2e_ui_celld_nats_profile::
+cargo test --test services --features graphql,http,sqlite e2e_ui_celld_nats_profile:: -- --ignored
 ```
 
-Without `CELLD_URL` **and** `NATS_URL`, the test still checks that the
-default host is one-process and this profile is documented; live smoke
-is skipped (`PCH-AC-006.1`).
+The smoke is a live test (`#[ignore = "live: ..."]`, `PCH-AC-006.1`): the
+root suite reports it ignored, and run with `--ignored` it fails unless
+`CELLD_URL` **and** `NATS_URL` are set.
 
 Tear down NATS only: `docker compose -f tests/e2e-ui/celld-nats-profile/docker-compose.yml down`.
 Do not use that as `make down` for the playground.

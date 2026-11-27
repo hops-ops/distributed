@@ -70,3 +70,6 @@ tests/celld/fact-worker/.celld/
 
 # Build output of CLI test fixture crates
 /distributed_cli/tests/fixtures/*/target/
+
+# Python bytecode (scripts/)
+__pycache__/

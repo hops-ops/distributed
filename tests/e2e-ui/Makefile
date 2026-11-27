@@ -212,22 +212,23 @@ down-celld:
 	fi; \
 	echo "celld stopped; $(CELLD_PROJECT)/.celld/dev preserved. NATS: make down-celld-nats."
 
-## Live celld tests (needs make up-celld-nats). Fixture-only checks still run
-## in root `cargo test` without CELLD_URL; these set CELLD_URL so HTTP runs.
+## Live celld tests (needs make up-celld-nats). They are ignored in the root
+## suite (`#[ignore = "live: ..."]`); these targets run them with `--ignored`
+## and fail unless exactly the expected number passed.
 test-celld: test-celld-http test-celld-nats
 
 test-celld-http:
 	cd $(REPO_ROOT) && \
 	  CELLD_URL="$(CELLD_URL)" \
 	  DISTRIBUTED_INTERNAL_SECRET="$(DISTRIBUTED_INTERNAL_SECRET)" \
-	  cargo test --test services celld:: -- --nocapture
+	  scripts/expect-tests-passed.sh 4 cargo test --test services celld:: -- --ignored --nocapture
 
 test-celld-nats:
 	@echo "optional profile smoke — default make test / make run unchanged"
 	cd $(REPO_ROOT) && \
 	  CELLD_URL="$(CELLD_URL)" NATS_URL="$(NATS_URL)" \
 	  DISTRIBUTED_INTERNAL_SECRET="$(DISTRIBUTED_INTERNAL_SECRET)" \
-	  cargo test --test services --features graphql,http,sqlite e2e_ui_celld_nats_profile:: -- --nocapture
+	  scripts/expect-tests-passed.sh 1 cargo test --test services --features graphql,http,sqlite e2e_ui_celld_nats_profile:: -- --ignored --nocapture
 
 application-build:
 	$(DISTRIBUTED) build .

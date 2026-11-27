@@ -867,6 +867,78 @@ pub(crate) async fn registered_table_ownership_rejects_other_topology(
     ));
 }
 
+/// Registering the same ownership again changes nothing; a model already
+/// owned through one table cannot be moved to a table another model owns.
+pub(crate) async fn re_registration_is_idempotent_and_never_moves_a_model(
+    scenario: impl ProjectionProtocolScenario,
+) {
+    let second = scenario_schema(
+        "RegisteredSecondView",
+        format!("{}_second", scenario.schema().table_name),
+    );
+    let repository = scenario.store(&[scenario.schema(), second]).await;
+    repository
+        .register_projection_models(&scenario.topology(), &[scenario.ownership()])
+        .await
+        .expect("registering the same ownership again is a no-op");
+    let moved =
+        ProjectionModelOwnership::new(&scenario.schema().model_name, &second.table_name).unwrap();
+    match repository
+        .register_projection_models(&scenario.topology(), &[moved])
+        .await
+    {
+        Err(ProjectionProtocolError::InvalidBatch(message)) => assert!(
+            message.contains(&second.table_name),
+            "the refusal names the contested table: {message}"
+        ),
+        other => panic!("moving a model onto another model's table: {other:?}"),
+    }
+    // The refused registration left the original ownership in force.
+    repository
+        .register_projection_models(&scenario.topology(), &[scenario.ownership()])
+        .await
+        .unwrap();
+}
+
+/// A recorded failure is found again by its ID alone: repair needs the
+/// partition it stopped, and an ID the store never recorded is no location.
+pub(crate) async fn a_recorded_failure_locates_the_partition_it_stopped(
+    scenario: impl ProjectionProtocolScenario,
+) {
+    let repository = scenario.repository().await;
+    let failure_id = scenario.failure_id("located-failure");
+    assert!(repository
+        .projection_failure_location(&failure_id)
+        .await
+        .unwrap()
+        .is_none());
+    repository
+        .record_projection_failure(scenario.failure(
+            scenario.input(
+                1,
+                b"located-failure",
+                "located-failure-message",
+                "located-failure-cause",
+                ProjectionGeneration::initial(),
+            ),
+            &failure_id,
+        ))
+        .await
+        .unwrap();
+    let location = repository
+        .projection_failure_location(&failure_id)
+        .await
+        .unwrap()
+        .expect("a recorded failure has a location");
+    assert_eq!(location.topology, scenario.topology());
+    assert_eq!(location.partition, scenario.partition());
+    assert!(repository
+        .projection_failure_location(&scenario.failure_id("never-recorded"))
+        .await
+        .unwrap()
+        .is_none());
+}
+
 pub(crate) async fn tombstone_requires_explicit_exact_recreation(
     scenario: impl ProjectionProtocolScenario,
 ) {
@@ -3537,6 +3609,8 @@ macro_rules! projection_protocol_scenario_tests {
             message_identity_is_topology_wide_across_projection_partitions,
             failure_recording_is_idempotent_for_exact_batch,
             registered_table_ownership_rejects_other_topology,
+            re_registration_is_idempotent_and_never_moves_a_model,
+            a_recorded_failure_locates_the_partition_it_stopped,
             tombstone_requires_explicit_exact_recreation,
             existing_record_observation_rejects_an_unfenced_tombstone,
             existing_record_observation_confirms_a_source_fenced_tombstone,

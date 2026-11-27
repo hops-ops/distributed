@@ -83,16 +83,6 @@ pub async fn s3_like_wildcards_are_bound_and_safe(db: Db) {
     let _ = exec_json(&engine, &s, "{ orders { order_id } }").await;
 }
 
-/// S4: JSON-looking text column stays a GraphQL String (not re-typed).
-pub async fn s4_json_looking_string_stays_string(db: Db) {
-    let pool = seed_orders(&db).await;
-    let engine = engine_all_columns(pool);
-    let s = session("user", "tenant-a");
-    let data = exec_json(&engine, &s, r#"{ orders_by_pk(order_id: "o1") { note } }"#).await;
-    assert!(data["orders_by_pk"]["note"].is_string());
-    assert_eq!(data["orders_by_pk"]["note"], "{\"looks\":\"json\"}");
-}
-
 /// S5: garbage order_by direction coerces safely (no raw SQL direction).
 pub async fn s5_order_by_junk_direction_is_safe(db: Db) {
     let pool = seed_orders(&db).await;

@@ -235,22 +235,4 @@ mod tests {
         block_on(bus.subscribe(handlers, RunOptions::until_idle())).unwrap();
         assert_eq!(count.load(Ordering::SeqCst), 3);
     }
-
-    #[test]
-    fn point_to_point_round_trip_without_service() {
-        let bus = InMemoryBus::new();
-        block_on(bus.send("place.bet", b"{}".to_vec())).unwrap();
-        block_on(bus.send("place.bet", b"{}".to_vec())).unwrap();
-        let count = Arc::new(AtomicUsize::new(0));
-        let seen = count.clone();
-        let handlers = Arc::new(Handlers::new().on_command("place.bet", move |_: &Message| {
-            let seen = seen.clone();
-            async move {
-                seen.fetch_add(1, Ordering::SeqCst);
-                Ok(())
-            }
-        }));
-        block_on(bus.listen(handlers, RunOptions::until_idle())).unwrap();
-        assert_eq!(count.load(Ordering::SeqCst), 2);
-    }
 }

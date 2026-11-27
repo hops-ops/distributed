@@ -732,6 +732,91 @@ mod tests {
         assert_ne!(old_scope, new_scope);
     }
 
+    /// A stored change row is decoded only when it still proves what was
+    /// written: a key or program identity altered behind the store's back is
+    /// corruption, never a change. (The model name is not covered by the key
+    /// digest, so a renamed model is not detected here.) The shape of a row (kind, scope,
+    /// revision, failure, position) is refused by the table's own CHECK
+    /// constraints before a reader can see it.
+    #[tokio::test]
+    async fn sqlite_change_rows_altered_behind_the_store_are_corruption() {
+        async fn committed() -> SqlxRepository<sqlx::Sqlite> {
+            let repository = repository().await;
+            repository
+                .commit_projection(batch(
+                    input(
+                        1,
+                        b"altered-change",
+                        "altered-change-message",
+                        "altered-change-cause",
+                        ProjectionGeneration::initial(),
+                    ),
+                    vec![mutation(
+                        ProjectionRecordExpectation::Missing,
+                        RecordTransition::Upsert,
+                    )],
+                    Vec::new(),
+                ))
+                .await
+                .unwrap();
+            repository
+        }
+        let decoded = [
+            (
+                "UPDATE projection_changes SET canonical_key_hash = zeroblob(32) WHERE change_kind = 'record_upsert'",
+                "projection change key",
+            ),
+            (
+                "UPDATE projection_changes SET program_id = 'not-a-program' WHERE change_kind = 'record_upsert'",
+                "invalid stored projection program identity",
+            ),
+        ];
+        for (alteration, expected) in decoded {
+            let repository = committed().await;
+            sqlx::query(alteration)
+                .execute(repository.pool())
+                .await
+                .unwrap();
+            match repository
+                .projection_changes(&topology(), &partition(), None, 100)
+                .await
+            {
+                Err(ProjectionProtocolError::StorageCorruption(message)) => assert!(
+                    message.contains(expected),
+                    "{alteration}: expected `{expected}`, got `{message}`"
+                ),
+                other => panic!("{alteration}: expected corruption, got {other:?}"),
+            }
+        }
+
+        let refused_by_schema = [
+            "UPDATE projection_changes SET change_kind = 'bogus' WHERE change_kind = 'record_upsert'",
+            "UPDATE projection_changes SET change_position = -1 WHERE change_kind = 'record_upsert'",
+            "UPDATE projection_changes SET failure_id = 'failure' WHERE change_kind = 'record_upsert'",
+            "UPDATE projection_changes SET incarnation = NULL WHERE change_kind = 'record_upsert'",
+            "UPDATE projection_changes SET scope_kind = 'record' WHERE change_kind = 'record_upsert'",
+            "UPDATE projection_changes SET model_name = NULL, canonical_key_bytes = NULL, \
+                 canonical_key_hash = NULL WHERE change_kind = 'record_upsert'",
+        ];
+        let repository = committed().await;
+        for alteration in refused_by_schema {
+            assert!(
+                sqlx::query(alteration)
+                    .execute(repository.pool())
+                    .await
+                    .is_err(),
+                "the schema refuses `{alteration}`"
+            );
+        }
+        assert!(matches!(
+            repository
+                .projection_changes(&topology(), &partition(), None, 100)
+                .await
+                .unwrap(),
+            ProjectionChangeRead::Changes { changes, .. } if changes.len() == 1
+        ));
+    }
+
     #[tokio::test]
     async fn sqlite_modeled_projection_identity_is_durable_across_restart_and_null_history_stays_readable(
     ) {

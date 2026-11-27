@@ -9,8 +9,10 @@ name: celld (live + e2e-celld)
 #   WATCH=0 WATCH_WORKER=0 make -C tests/e2e-celld run
 #   make -C tests/e2e-celld test-browser   # the full Playwright suite
 #
-# Default `cargo test` (quality) still runs fixture-only celld checks and
-# skips live HTTP unless CELLD_URL is set. This job sets CELLD_URL / NATS_URL.
+# The live celld tests are `#[ignore = "live: ..."]`, so `make test-local`
+# reports them ignored. This workflow runs them with `-- --ignored` through
+# scripts/expect-tests-passed.sh, which fails a step unless exactly the
+# expected number passed (a filter that matches nothing is green otherwise).
 on:
   workflow_call:
 
@@ -25,8 +27,6 @@ env:
   CELLD_URL: http://127.0.0.1:18880
   NATS_PORT: "14222"
   NATS_URL: nats://127.0.0.1:14222
-  # A live test that loses its service fails instead of skipping.
-  DISTRIBUTED_REQUIRE_SERVICES: CELLD_URL,NATS_URL
   DISTRIBUTED_INTERNAL_SECRET: test-only-internal-secret-change-me-2026
 
 jobs:
@@ -77,26 +77,19 @@ jobs:
         working-directory: tests/celld/fact-worker
         run: worker-build --release
       - name: Route zone facts to celld cells (CelldFactSink, outage and restart)
-        env:
-          CELLD_FACTS_REQUIRED: "1"
-        run: cargo test -p distributed_game --features celld,runtime --test celld_facts
+        run: scripts/expect-tests-passed.sh 1 cargo test -p distributed_game --features celld,runtime --test celld_facts -- --ignored
       - name: Zone leases in celld cells (CellZoneOwnership, alarm expiry, GameServer)
-        env:
-          CELLD_FACTS_REQUIRED: "1"
-        run: cargo test -p distributed_game --features celld,runtime,net --test celld_zone_lease
+        run: scripts/expect-tests-passed.sh 1 cargo test -p distributed_game --features celld,runtime,net --test celld_zone_lease -- --ignored
       - name: Zone hibernation state in celld cells (inline + R2 snapshots, crash, GameServer)
-        env:
-          CELLD_FACTS_REQUIRED: "1"
         run: |
-          cargo test -p distributed_game --features celld,runtime --test celld_zone_state
-          cargo test -p distributed_game --features celld,net,lease --test world
+          scripts/expect-tests-passed.sh 1 cargo test -p distributed_game --features celld,runtime --test celld_zone_state -- --ignored
+          # The other 19 world tests run in the services job (make test-local).
+          scripts/expect-tests-passed.sh 2 cargo test -p distributed_game --features celld,net,lease --test world -- --ignored
       - name: Build the celld zone host test Worker
         working-directory: tests/celld/zone-worker
         run: worker-build --release
       - name: Zones as celld objects (celld dev; 3-node fleet on RustFS, crash, facts exactly once)
-        env:
-          CELLD_ZONE_REQUIRED: "1"
-        run: cargo test -p distributed_game --features celld,net --test celld_zone
+        run: scripts/expect-tests-passed.sh 5 cargo test -p distributed_game --features celld,net --test celld_zone -- --ignored
       - name: Retain storage proof results and logs
         if: always()
         uses: actions/upload-artifact@v4

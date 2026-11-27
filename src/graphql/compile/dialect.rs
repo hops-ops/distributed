@@ -229,15 +229,34 @@ mod join_predicate_tests {
     use super::*;
 
     #[test]
-    fn has_many_join() {
-        let sql = join_predicate_direct(
-            RelationshipKind::HasMany,
-            "t0",
-            "t1",
-            &[DirectJoinPair::new("order_id", "order_id")],
-        )
-        .unwrap();
-        assert_eq!(sql, r#"t1."order_id" = t0."order_id""#);
+    fn has_many_join_equates_every_key_pair() {
+        struct Case {
+            name: &'static str,
+            pairs: &'static [(&'static str, &'static str)],
+            expected: &'static str,
+        }
+        const CASES: &[Case] = &[
+            Case {
+                name: "one key",
+                pairs: &[("order_id", "order_id")],
+                expected: r#"t1."order_id" = t0."order_id""#,
+            },
+            Case {
+                name: "a composite key ands the equalities",
+                pairs: &[("workspace_id", "workspace_id"), ("path", "path")],
+                expected: r#"t1."workspace_id" = t0."workspace_id" AND t1."path" = t0."path""#,
+            },
+        ];
+        for case in CASES {
+            let pairs: Vec<_> = case
+                .pairs
+                .iter()
+                .map(|&(foreign_key, primary_key)| DirectJoinPair::new(foreign_key, primary_key))
+                .collect();
+            let sql = join_predicate_direct(RelationshipKind::HasMany, "t0", "t1", &pairs)
+                .unwrap_or_else(|err| panic!("{}: {err}", case.name));
+            assert_eq!(sql, case.expected, "{}", case.name);
+        }
     }
 
     #[test]
@@ -250,24 +269,6 @@ mod join_predicate_tests {
         )
         .unwrap();
         assert_eq!(sql, r#"t1."customer_id" = t0."customer_id""#);
-    }
-
-    #[test]
-    fn direct_composite_join_ands_equalities() {
-        let sql = join_predicate_direct(
-            RelationshipKind::HasMany,
-            "t0",
-            "t1",
-            &[
-                DirectJoinPair::new("workspace_id", "workspace_id"),
-                DirectJoinPair::new("path", "path"),
-            ],
-        )
-        .unwrap();
-        assert_eq!(
-            sql,
-            r#"t1."workspace_id" = t0."workspace_id" AND t1."path" = t0."path""#
-        );
     }
 
     #[test]

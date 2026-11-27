@@ -1,7 +1,8 @@
 //! An isolated `celld dev` serving `tests/celld/fact-worker`, owned by one
 //! test: its own temp project, port and process tree (killed on drop; only
-//! processes this harness started). Skips (returns `None`) when the worker
-//! is not built or celld cannot start, unless `CELLD_FACTS_REQUIRED=1`.
+//! processes this harness started). The tests that use it are live
+//! (`#[ignore = "live: ..."]`, run with `--ignored`): a worker that is not
+//! built, or a celld that cannot start, panics with the reason.
 //! The port comes from [`ports`] (picked outside the ephemeral ranges; a
 //! start whose listener bind finds it taken is retried on a fresh one).
 
@@ -31,34 +32,20 @@ pub struct Celld {
 }
 
 impl Celld {
-    pub fn start_new() -> Option<Self> {
-        Self::start_worker(&worker_dir(), "CELLD_FACTS_REQUIRED")
+    pub fn start_new() -> Self {
+        Self::start_worker(&worker_dir())
     }
 
-    /// `celld dev` serving the built worker in `dir`; skips (None) when it
-    /// is not built or celld cannot start, unless env `required` is set.
-    pub fn start_worker(dir: &Path, required: &str) -> Option<Self> {
+    /// `celld dev` serving the built worker in `dir`; panics when it is not
+    /// built or celld cannot start.
+    pub fn start_worker(dir: &Path) -> Self {
         let build = dir.join("build");
-        if !build.join("worker/shim.mjs").exists() {
-            assert!(
-                std::env::var_os(required).is_none(),
-                "{required} is set but {} is not built",
-                dir.display()
-            );
-            eprintln!(
-                "skipping: build {} first (worker-build --release)",
-                dir.display()
-            );
-            return None;
-        }
-        let project = std::env::temp_dir().join(format!(
-            "distributed-celld-facts-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        assert!(
+            build.join("worker/shim.mjs").exists(),
+            "live celld test: build {} first (worker-build --release)",
+            dir.display()
+        );
+        let project = std::env::temp_dir().join(crate::unique::unique("distributed-celld-facts"));
         copy_dir(&build, &project.join("build"));
         std::fs::copy(dir.join("wrangler.jsonc"), project.join("wrangler.jsonc")).unwrap();
         let mut celld = Self {
@@ -72,14 +59,9 @@ impl Celld {
             celld.launch()
         });
         if let Err(reason) = started {
-            assert!(
-                std::env::var_os(required).is_none(),
-                "celld dev is required but did not start: {reason}"
-            );
-            eprintln!("skipping: {reason}");
-            return None;
+            panic!("live celld test: celld dev did not start: {reason}");
         }
-        Some(celld)
+        celld
     }
 
     pub fn base(&self) -> String {

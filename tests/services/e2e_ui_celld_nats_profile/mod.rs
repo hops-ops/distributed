@@ -1,5 +1,5 @@
-//! Optional celld+NATS e2e-ui profile: a live smoke that runs only when
-//! `CELLD_URL` and `NATS_URL` are set.
+//! Optional celld+NATS e2e-ui profile: a live smoke, ignored (`live:`); run
+//! it with `--ignored` against `CELLD_URL` and `NATS_URL`, which must be set.
 
 #[cfg(all(feature = "graphql", feature = "http", feature = "sqlite"))]
 use common::env as env_support;
@@ -153,15 +153,10 @@ mod live {
     }
 
     #[tokio::test]
+    #[ignore = "live: needs a celld host at CELLD_URL and NATS at NATS_URL"]
     async fn optional_profile_smoke_graphql_wait_path_and_sql_list() {
-        let Some(celld) = env_support::require_service("CELLD_URL", "optional celld+NATS smoke")
-        else {
-            return;
-        };
-        let Some(nats) = env_support::require_service("NATS_URL", "optional celld+NATS smoke")
-        else {
-            return;
-        };
+        let celld = env_support::require_live("CELLD_URL", "optional celld+NATS smoke");
+        let nats = env_support::require_live("NATS_URL", "optional celld+NATS smoke");
 
         let nats_addr = nats
             .trim()
@@ -174,13 +169,7 @@ mod live {
             .await
             .expect("NATS TCP");
 
-        let todo_id = format!(
-            "dcs6-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        );
+        let todo_id = common::ids::unique_id("dcs6");
         let celld = celld.trim_end_matches('/');
 
         let pool = sqlx::SqlitePool::connect_lazy("sqlite::memory:").unwrap();

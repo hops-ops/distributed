@@ -15,7 +15,7 @@ This project tracks its work in GitKB; see `.kb/AGENTS.md` for that workflow.
 | `distributed_cli/` | The `distributed` CLI (`build`, `dev`, `describe`, `schema`, …) and its library. |
 | `distributed_game/`, `distributed_game_macros/` | The multiplayer zone runtime. |
 | `distributed_leaderboard/` | Leaderboards as a projection target. |
-| `tests/common/` | Shared test support, including the bus conformance suite. |
+| `tests/common/` | Shared test support: fixtures (the Todo aggregate, ids, service guard) and the conformance suites every backend instantiates (repository, bus, lock, lease, schedule, GraphQL dialects). |
 | `tests/{core,gateway,graphql,observability,read_models,repositories,services,transports}/` | The eight integration test binaries of the `distributed` crate (`cargo test --test <name>`). |
 | `examples/quickstart/` | The no-Docker quickstart crate (workspace member). |
 | `js/` | `@hops-ops/distributed`, the JS/TS client. |
@@ -41,11 +41,24 @@ cargo fmt --all --check
 Tests that need a broker or Postgres return early when their URL is unset,
 unless `DISTRIBUTED_REQUIRE_SERVICES` names it, in which case they fail.
 
+### Where a test goes
+
+Each behaviour has one owning layer; add a case there, not a test at every
+layer. Pure logic: a unit test beside the code. A contract with several
+backends: a case in its conformance suite (`tests/common`), never a test on
+one backend. Components wired together: a scenario module in
+`tests/<area>/`. What only a deployed app shows: `tests/e2e-ui`. Inputs that
+differ only in data are one table-driven test. A test needing a service
+`make test-local` cannot start is `#[ignore = "<what it needs>"]`. The table
+of layers and examples is in
+[docs/guides/testing.md](docs/guides/testing.md#where-does-my-test-go).
+
 ### Root Makefile
 
 | Target | What it does |
 |---|---|
-| `make test` (alias of `make test-local`) | Starts `compose.yaml`, recreates the test databases, and runs `cargo test --workspace --all-features --all-targets` and `--doc` against real services with `DISTRIBUTED_REQUIRE_SERVICES` set. The compose stack is torn down afterwards; `KEEP_COMPOSE=1` keeps it. This is what CI's services job runs. |
+| `make test` (alias of `make test-local`) | Starts `compose.yaml`, recreates the test databases, and runs `cargo nextest run --workspace --all-features --all-targets` (one process per test, `.config/nextest.toml`) and then `cargo test --workspace --all-features --doc` against real services with `DISTRIBUTED_REQUIRE_SERVICES` set. The compose stack is torn down afterwards; `KEEP_COMPOSE=1` keeps it. This is what CI's services job runs (with `NEXTEST_PROFILE=ci`). Needs `cargo-nextest`. |
+| `make coverage-local` | `make test-local`'s nextest run under `cargo-llvm-cov`: line coverage of production code per crate and TOTAL, plus `target/coverage/lcov.info` (see `docs/guides/testing.md`, Coverage Reporting). CI runs it on push to `v5` and `main`. Needs `cargo-llvm-cov` and `llvm-tools-preview`. |
 | `make test-cargo` | The same cargo commands without starting compose; set the service URLs yourself. |
 | `make test-cli-lifecycle` | Builds the CLI and runs the bats lifecycle suite (`distributed_cli/tests/bats/lifecycle.bats`). |
 | `make compose-up` / `make compose-down` | Start or stop the services alone. |
@@ -112,8 +125,12 @@ doctests; mark a fragment that cannot compile on its own `rust,ignore`.
 ## CI
 
 `.github/workflows/on-pr-quality.yaml` runs on every pull request. It calls
-the shared quality workflow (build, test, clippy, fmt), then one workflow
+the shared quality workflow (`cargo build` and `cargo test` of the root
+package, default features), then one workflow
 per area: `test-all-features.yaml` (each feature alone, plus the docs path
 check), `integration-services.yaml` (`make test-local`), and
 `integration-{gateway,distributed-cli,observability,graphql,e2e-ui,js,game-demos,celld,wasm32-domains}.yaml`.
+On push to `v5` (this workflow) and `main`
+(`on-push-main-version-and-tag.yaml`), `coverage.yaml` also runs
+`make coverage-local`; release tagging does not wait on it.
 Run the matching local command above before pushing a change in that area.

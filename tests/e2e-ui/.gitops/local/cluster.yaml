@@ -4,8 +4,8 @@ metadata:
   name: e2e-ui
 spec:
   clusterProvider: kind
-  # Use the portable Docker engine declaration. On macOS Hops still
-  # auto-detects Dory's socket; CI uses the runner's Docker daemon.
+  # The Docker engine DOCKER_HOST (or the current docker context) names:
+  # the runner's daemon in CI; set DOCKER_HOST for Dory or OrbStack.
   dockerProvider: docker
   # Mount the distributed checkout so cluster-dev workloads can see both
   # shared packages (js/) and this fixture (tests/e2e-ui/).

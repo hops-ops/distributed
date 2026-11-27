@@ -7,7 +7,7 @@ use common::sqlite::TempDb;
 use common::transport::bus::{BusCapabilities, BusHarness, KindCapabilities};
 use distributed::bus::{Bus, SqliteBus, TransportError};
 use distributed::projection_protocol::ProjectionEpoch;
-use sqlx::SqlitePool;
+use sqlx::{SqliteConnection, SqlitePool};
 
 use crate::sql_bus_conformance::{sql_bus_conformance_tests, SqlBackend};
 
@@ -15,6 +15,14 @@ use crate::sql_bus_conformance::{sql_bus_conformance_tests, SqlBackend};
 struct Sqlite {
     _db: TempDb,
     pool: SqlitePool,
+    /// The one connection fault injection runs on. A SQLite connection
+    /// checks a statement's names against its cached schema when it prepares
+    /// it, and only a statement that runs re-reads a changed schema. Across
+    /// pooled connections, `DROP TABLE IF EXISTS bus_queue` on one and
+    /// `CREATE INDEX bus_queue_claim_idx` on another that last read the schema
+    /// before the drop failed with "index bus_queue_claim_idx already exists".
+    /// On one connection, the drop refreshes the cache the create then reads.
+    injector: tokio::sync::Mutex<SqliteConnection>,
 }
 
 impl BusHarness for Sqlite {
@@ -84,12 +92,17 @@ impl SqlBackend for Sqlite {
     async fn start_empty() -> Option<Self> {
         let db = TempDb::new("distributed_sqlite_bus_test");
         let pool = db.pool().await;
-        Some(Self { _db: db, pool })
+        let injector = pool.acquire().await.expect("sqlite connection").detach();
+        Some(Self {
+            _db: db,
+            pool,
+            injector: tokio::sync::Mutex::new(injector),
+        })
     }
 
     async fn execute(&self, sql: &str) -> Result<(), String> {
         sqlx::raw_sql(sqlx::AssertSqlSafe(sql.to_owned()))
-            .execute(&self.pool)
+            .execute(&mut *self.injector.lock().await)
             .await
             .map(|_| ())
             .map_err(|error| error.to_string())

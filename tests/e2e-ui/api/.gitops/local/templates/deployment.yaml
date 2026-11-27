@@ -118,7 +118,7 @@ spec:
         - name: source
           {{- if eq .Values.sourceDelivery.mode "hostPath" }}
           hostPath:
-            path: {{ .Values.sourceDelivery.hostPath | quote }}
+            path: {{ include "e2e-ui-api.sourceCheckoutPath" . | quote }}
             type: Directory
           {{- else }}
           emptyDir: {}
