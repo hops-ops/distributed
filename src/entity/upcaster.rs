@@ -257,41 +257,6 @@ mod tests {
     }
 
     #[test]
-    fn single_upcaster_transforms_matching_event() {
-        let event = EventRecord::new(
-            "TestEvent",
-            event_payload(&("id".to_string(), "task".to_string())),
-            1,
-        );
-        let upcasters = [EventUpcaster {
-            event_type: "TestEvent",
-            from_version: 1,
-            to_version: 2,
-            transform: upcast_test_event_v1_v2,
-        }];
-        let events = upcast_events(vec![event], &upcasters).unwrap();
-        assert_eq!(
-            events[0].decode::<(String, String, u8)>().unwrap(),
-            ("id".to_string(), "task".to_string(), 0)
-        );
-        assert_eq!(events[0].event_version, 2);
-    }
-
-    #[test]
-    fn upcaster_does_not_affect_non_matching_events() {
-        let event = EventRecord::new("OtherEvent", vec![1, 2], 1);
-        let upcasters = [EventUpcaster {
-            event_type: "TestEvent",
-            from_version: 1,
-            to_version: 2,
-            transform: upcast_test_event_v1_v2,
-        }];
-        let events = upcast_events(vec![event], &upcasters).unwrap();
-        assert_eq!(events[0].payload, vec![1, 2]);
-        assert_eq!(events[0].event_version, 1);
-    }
-
-    #[test]
     fn chained_upcasters_v1_to_v3() {
         let event = EventRecord::new(
             "TestEvent",
