@@ -186,7 +186,7 @@ Live queries share the one-shot RBAC path (compile once, full re-execution), so 
 - Category: B   Severity: low   Confidence: CONFIRMED
 - Where: `projection_delta/tests.rs` versus `vector_tests.rs`; `client_manifest/tests.rs`
 - What:
-  - Four tests in `tests.rs` are strict subsets of `vector_tests.rs`: `strict_decode_rejects_unknown_wire_fields` (65) ⊂ vector 240; `authoritative_zero_actual_occurrences_is_valid_and_deterministic` (74) ⊂ 218; `tagged_values_distinguish_null_absent_and_unset_and_bound_numbers` (131) ⊂ 381; `value_depth_key_partition_and_body_limits_fail_closed` (165) ⊂ 544.
+  - Four tests in `tests.rs` are strict subsets of `vector_tests.rs`: `strict_decode_rejects_unknown_wire_fields` (65) ⊂ vector 240; `authoritative_zero_actual_occurrences_is_valid_and_deterministic` (74) ⊂ 218 (removed, test-suite-audit-9); `tagged_values_distinguish_null_absent_and_unset_and_bound_numbers` (131) ⊂ 381; `value_depth_key_partition_and_body_limits_fail_closed` (165) ⊂ 544.
   - Several tests are 290–330 lines each, e.g. `wait_path_observation_proof_requires_the_persisted_semantic_program_identity` (1155), `active_metadata_revalidates_but_remains_queryable_while_projection_is_draining` (1718) and `lifecycle_status_rejects_changed_deployment_identity_and_mixed_fanout_tampering` (2019).
   - `users()`/`todos()` table fixtures are redefined in both test files.
   - Leak checks are `!json.contains("user_id")`-style at `client_manifest/tests.rs:603-605`, `945-947`, `2419-2421`; they pass vacuously if a field is renamed.
